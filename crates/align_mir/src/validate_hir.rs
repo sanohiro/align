@@ -603,6 +603,12 @@ fn summary_valid(
                                 &program.tuples,
                                 &program.enums,
                                 &program.tagged_types,
+                            ) || align_sema::ty_is_move(
+                                ty,
+                                &program.structs,
+                                &program.tuples,
+                                &program.enums,
+                                &program.tagged_types,
                             )
                         })
                     })
@@ -3394,6 +3400,11 @@ impl<'a> BodyValidator<'a> {
             || matches!(ty, Ty::Bool | Ty::Char)
     }
 
+    /// The source-owned plain element-store class plus this boundary's stored-width check.
+    fn indexed_element_store_ty_ok(&self, ty: Ty) -> bool {
+        align_sema::indexed_element_store_ok(ty) && self.store_width_ok(ty)
+    }
+
     /// A stored scalar's width is this validator's own structural business; anything else is
     /// already fixed-width by construction.
     fn store_width_ok(&self, ty: Ty) -> bool {
@@ -3513,7 +3524,8 @@ impl<'a> BodyValidator<'a> {
                 };
                 local.id == *base
                     && local.is_mut
-                    && index_element_ty(local.ty).is_some_and(|ty| self.primitive_store_ty_ok(ty))
+                    && index_element_ty(local.ty)
+                        .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
             }
             hir::Stmt::AssignVecLane { local, lane, .. } => {
                 let Some(function) = self.program.fns.get(context.function) else {
@@ -10453,7 +10465,7 @@ impl<'a> BodyValidator<'a> {
                 };
                 if index_flow.ty != i64_ty()
                     || !self.body_ty_matches(value_flow.ty, element_ty)
-                    || !self.primitive_store_ty_ok(element_ty)
+                    || !self.indexed_element_store_ty_ok(element_ty)
                 {
                     return false;
                 }
@@ -12061,6 +12073,10 @@ impl<'a> DelegatedGates<'a> {
 
     pub(crate) fn collection_element_read_ok(&self, elem: Ty) -> bool {
         self.0.collection_element_read_ok(elem)
+    }
+
+    pub(crate) fn indexed_element_store_ok(&self, elem: Ty) -> bool {
+        self.0.indexed_element_store_ty_ok(elem)
     }
 
     /// The four soa shape gates, in the order `soa_ok` (placement), `soa_type_ok`,

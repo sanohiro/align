@@ -211,7 +211,7 @@ concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed
 failures against `scripts/known-failures.txt` in both directions. That manifest —
 not this file — is the live baseline: a new failure is named, and a line whose
 test starts passing is red until the fixing change deletes it. The 2026-08-13
-baseline (#782, run 31669771705) is now burned down to 7 strict entries plus
+baseline (#782, run 31669771705) is now burned down to 6 strict entries plus
 one environment-dependent entry in two triage classes recorded in the manifest's
 own comment, and running
 `scripts/run-suite-binaries.sh` with no arguments reproduces the same judgement

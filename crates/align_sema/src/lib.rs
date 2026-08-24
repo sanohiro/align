@@ -1262,6 +1262,121 @@ pub fn expand_tagged_ty(ty: Ty, tagged_types: &[hir::TaggedType]) -> Ty {
     }
 }
 
+fn contiguous_indexed_element(ty: Ty, tagged_types: &[hir::TaggedType]) -> Option<Scalar> {
+    match expand_tagged_ty(ty, tagged_types) {
+        Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => Some(element),
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Some(Scalar::Struct(id)),
+        _ => None,
+    }
+}
+
+/// Whether a result owns or embeds its own top-level indexed allocation rather than forwarding an
+/// argument's storage header. The dynamic aggregate-array variants are distinct `Ty` shapes but
+/// have the same ownership rule as `DynArray`/`DynStructArray` here.
+fn materializes_indexed_result_storage(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    matches!(
+        expand_tagged_ty(ty, tagged_types),
+        Ty::Array(..)
+            | Ty::StructArray(..)
+            | Ty::DynSliceArray(_)
+            | Ty::DynArray(..)
+            | Ty::DynStructArray(..)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynResponseArray
+    )
+}
+
+/// Whether two values can name the same mutable buffer after a whole-header replacement.
+/// Fixed/dynamic arrays and slices share the contiguous representation for one element type;
+/// SoA columns only alias the same concrete SoA shape.
+fn indexed_backing_compatible(
+    destination: Ty,
+    source: Ty,
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    match (
+        contiguous_indexed_element(destination, tagged_types),
+        contiguous_indexed_element(source, tagged_types),
+    ) {
+        (Some(destination), Some(source)) => destination == source,
+        _ => {
+            let destination = expand_tagged_ty(destination, tagged_types);
+            let source = expand_tagged_ty(source, tagged_types);
+            matches!(
+                (destination, source),
+                (Ty::Soa(left), Ty::Soa(right)) if left == right
+            ) || matches!(
+                (destination, source),
+                (Ty::SoaParam(left), Ty::SoaParam(right)) if left == right
+            )
+        }
+    }
+}
+
+/// Whether a callee may install `source` as the complete post-call value of `destination`.
+///
+/// This is directional: a slice header can be replaced with a view of any compatible contiguous
+/// collection, while an owned dynamic array can only be replaced by the same owned type. Fixed
+/// arrays never retarget their inline storage and are handled by their callers before this test.
+fn mutable_replacement_backing_compatible(
+    destination: Ty,
+    source: Ty,
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let destination = expand_tagged_ty(destination, tagged_types);
+    let source = expand_tagged_ty(source, tagged_types);
+    match destination {
+        Ty::Slice(element) => contiguous_indexed_element(source, tagged_types) == Some(element),
+        Ty::DynArray(element) => matches!(source, Ty::DynArray(other) if other == element),
+        Ty::DynStructArray(id, layout) => {
+            matches!(source, Ty::DynStructArray(other, other_layout)
+                if other == id && other_layout == layout)
+        }
+        Ty::Soa(id) => matches!(source, Ty::Soa(other) if other == id),
+        Ty::SoaParam(id) => matches!(source, Ty::SoaParam(other) if other == id),
+        _ => destination == source,
+    }
+}
+
+/// Whether every reachable result path materializes fresh SoA column storage. Copying a header or
+/// receiving one from an unresolved producer must not mint a destination-local alias identity.
+fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => true,
+        ExprKind::OptionSome(inner)
+        | ExprKind::ResultOk(inner)
+        | ExprKind::ResultErr(inner)
+        | ExprKind::Try(inner) => materializes_fresh_soa_storage(inner),
+        ExprKind::Block(block)
+        | ExprKind::Unsafe(block)
+        | ExprKind::Arena(block)
+        | ExprKind::NamedArena { block, .. }
+        | ExprKind::TaskGroup(block) => block
+            .value
+            .as_deref()
+            .is_some_and(materializes_fresh_soa_storage),
+        ExprKind::If { then, els, .. } => [then, els].into_iter().all(|block| {
+            hir_block_diverges(block)
+                || block
+                    .value
+                    .as_deref()
+                    .is_some_and(materializes_fresh_soa_storage)
+        }),
+        ExprKind::Match { arms, .. } => !arms.is_empty()
+            && arms.iter().all(|arm| {
+                hir_expr_diverges(&arm.body) || materializes_fresh_soa_storage(&arm.body)
+            }),
+        ExprKind::ElseUnwrap { opt, fallback } => {
+            materializes_fresh_soa_storage(opt)
+                && materializes_fresh_soa_storage(fallback)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
@@ -2865,6 +2980,30 @@ pub fn collection_element_read_ok(
     !ty_capture_is_move(elem, structs, tuples, enums, tagged_types)
 }
 
+/// Whether a plain indexed element store may overwrite its destination without a per-element
+/// Drop or source-nulling operation.
+///
+/// Integer, float, bool, char, and borrowed `str` are Copy. Owned `string` is also representable
+/// as a [`PrimScalar`], but must stay excluded: `AssignIndex` lowers to a raw element store and
+/// cannot drop the old string or null a moved RHS. Source checking and the checked-HIR boundary
+/// both delegate to this classifier so borrowed-text support cannot drift into an internal error
+/// and Move text cannot be admitted by widening `scalar_to_prim`.
+///
+/// This class predicate assumes producer-validated scalar widths. The checked-HIR boundary retains
+/// its independent stored-width check for malformed input.
+pub fn indexed_element_store_ok(elem: Ty) -> bool {
+    matches!(
+        ty_to_scalar(elem).and_then(scalar_to_prim),
+        Some(
+            PrimScalar::Int(_)
+                | PrimScalar::Float(_)
+                | PrimScalar::Bool
+                | PrimScalar::Char
+                | PrimScalar::Str
+        )
+    )
+}
+
 /// Whether struct `id` has a recursive Drop plan. The canonical plan is cycle-safe and fail-closed
 /// for malformed definitions; the definition-validation pass emits the user-facing diagnostic.
 pub fn struct_is_move(
@@ -3191,6 +3330,18 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
     let ty = builtin_spelling_ty(head)?;
     Some(needs_drop_flag(ty, &[], &[], &[], &[]))
+}
+
+/// Whether an argument-independent builtin type spelling denotes a Move value.
+///
+/// This is the source-spelling bridge for interface validation, parallel to
+/// [`builtin_spelling_needs_return_cleanup`]. The two questions deliberately differ for
+/// region-owned values such as `box<T>`: they are Move, but carry no individual return-cleanup
+/// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
+/// builtin ownership table.
+pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    let ty = builtin_spelling_ty(head)?;
+    Some(ty_is_move(ty, &[], &[], &[], &[]))
 }
 
 /// Whether `ty` is one of the field types the `SoaPlain` bound admits — a fixed-width primitive or
@@ -8500,13 +8651,20 @@ fn run_body_analysis_passes(
             callable_target_ids: &callable.target_ids,
             callable_parallel_targets: &callable_parallel_targets,
             loop_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_borrow_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_value_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
-            loop_borrow_breaks: Vec::new(),
-            loop_value_breaks: Vec::new(),
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -8549,7 +8707,11 @@ fn run_body_analysis_passes(
                 collecting_walk_children: false,
                 walk_children: Vec::new(),
             };
-            ec.check();
+            ec.check_with_storage_provenance(&EscapeStorageProvenance {
+                named_return_borrow: &named_return_borrow,
+                callable_target_ids: &callable.target_ids,
+                callable_targets: &callable.targets_by_type,
+            });
             (ec.drop_region, ec.drop_individual, ec.drop_individual_exprs)
         };
         // Every resource-owning local gets a path-local MIR drop flag. The flag is set after a
@@ -10087,16 +10249,23 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             tagged_types: &program.tagged_types,
             fn_types: &program.fn_types,
             callable_targets: &callable.targets_by_type,
-            callable_target_ids: &callable.target_ids,
+                callable_target_ids: &callable.target_ids,
                 callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_borrow_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_value_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
-            loop_borrow_breaks: Vec::new(),
-            loop_value_breaks: Vec::new(),
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -10125,7 +10294,20 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => 0,
             };
             let explicit_params = (function.params.len() as u32).saturating_sub(capture_count);
-            let summary = summary_from_roots(&result.return_roots, explicit_params);
+            // Storage-generation roots are useful inside MoveCheck even for non-borrowing Move
+            // containers such as `array_builder<T>`, but the public return-borrow record may only
+            // describe a type that can actually carry a borrow.
+            let summary = if ty_may_borrow(
+                function.ret,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                summary_from_roots(&result.return_roots, explicit_params)
+            } else {
+                hir::ReturnBorrowSummary::None
+            };
             let parallel_summary = summary_from_roots(&result.parallel_transfer_roots, explicit_params);
             let return_changed = named.get(&function.name) != Some(&summary);
             let parallel_changed = named_parallel.get(&function.name) != Some(&parallel_summary);
@@ -13883,22 +14065,716 @@ impl Region {
     /// The shorter-lived (higher-ordinal) of two regions — a view over both lives only as
     /// long as the shorter source.
     fn shorter(self, other: Region) -> Region {
-        if self.ord() >= other.ord() {
-            self
-        } else {
-            other
+        match self.ord().cmp(&other.ord()) {
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Equal => match (self, other) {
+                (Region::Caller(left), Region::Caller(right)) => {
+                    Region::Caller(left.min(right))
+                }
+                _ => self,
+            },
+        }
+    }
+
+    /// The longer-lived (lower-ordinal) of two regions. Destination backing facts use this at a
+    /// control-flow join: a write must be valid for every possible reaching buffer, so the
+    /// longest-lived possible buffer is the strict target. Distinct caller parameters have the
+    /// same lifetime class; choose the lower position to keep joins commutative and stable.
+    fn longer(self, other: Region) -> Region {
+        match self.ord().cmp(&other.ord()) {
+            std::cmp::Ordering::Less => self,
+            std::cmp::Ordering::Greater => other,
+            std::cmp::Ordering::Equal => match (self, other) {
+                (Region::Caller(left), Region::Caller(right)) => {
+                    Region::Caller(left.min(right))
+                }
+                _ => self,
+            },
         }
     }
 }
 
-/// Path-sensitive escape provenance at one control-flow point. Both components form finite
-/// may-lattices: a local's joined region is the shortest region it may carry, and slice provenance
-/// is present when any reaching path may still borrow function-local storage. Owned provenance
-/// keeps both the must-individual and may-individual facts so a heap/arena join stays distinct from
-/// definite arena ownership.
+/// Backing storage selected by one writable array/slice value. `region` is where the buffer dies,
+/// independently of the views currently stored in it. `roots` are the local collection values
+/// whose contained-region state must observe an element mutation through an alias. Unknown facts
+/// retain any roots already proved on another reaching path, but use a process-lifetime target so
+/// a region-bearing write fails closed.
+#[derive(Clone, PartialEq, Eq)]
+struct EscapeBackingStorage {
+    region: Region,
+    roots: std::collections::BTreeSet<LocalId>,
+    known: bool,
+}
+
+impl EscapeBackingStorage {
+    fn known(region: Region) -> Self {
+        Self {
+            region,
+            roots: std::collections::BTreeSet::new(),
+            known: true,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            region: Region::Static,
+            roots: std::collections::BTreeSet::new(),
+            known: false,
+        }
+    }
+
+    fn rooted(mut self, root: LocalId) -> Self {
+        self.roots.insert(root);
+        self
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut roots = self.roots.clone();
+        roots.extend(other.roots.iter().copied());
+        Self {
+            region: self.region.longer(other.region),
+            roots,
+            known: self.known && other.known,
+        }
+    }
+
+    fn destination_region(&self) -> Region {
+        if self.known {
+            self.region
+        } else {
+            Region::Static
+        }
+    }
+}
+
+/// Escape facts captured when one eager call argument finishes. A later argument may reassign the
+/// same source local or slice alias, but the already-evaluated value keeps its pure element/content
+/// region, whole-value retained region, storage region, and selected mutable backing. The call
+/// action consumes the snapshots atomically.
+#[derive(Clone, PartialEq, Eq)]
+struct EscapeArgumentSnapshot {
+    content_region: Region,
+    retained_contained_region: Region,
+    storage_region: Region,
+    mutable_backing: EscapeBackingStorage,
+    /// Numeric and otherwise non-region-bearing slices still need the settled local-storage bit
+    /// when a parent completion fact is formed after a later eager child mutated live state.
+    storage_is_local: bool,
+    /// Allocation-mode provenance for an owned dynamic collection. These are the same must/may
+    /// halves carried by `EscapeState`: `(true, true)` is individually released, `(false, false)`
+    /// is region-owned, and `(false, true)` is path-dependent. Copy/view values leave both false.
+    individual: bool,
+    may_individual: bool,
+}
+
+impl EscapeArgumentSnapshot {
+    fn fail_closed() -> Self {
+        Self {
+            content_region: Region::Static,
+            retained_contained_region: Region::Static,
+            storage_region: Region::Static,
+            mutable_backing: EscapeBackingStorage::unknown(),
+            storage_is_local: true,
+            individual: false,
+            may_individual: true,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            content_region: self.content_region.shorter(other.content_region),
+            retained_contained_region: self
+                .retained_contained_region
+                .shorter(other.retained_contained_region),
+            storage_region: self.storage_region.shorter(other.storage_region),
+            mutable_backing: self.mutable_backing.join(&other.mutable_backing),
+            storage_is_local: self.storage_is_local || other.storage_is_local,
+            individual: self.individual && other.individual,
+            may_individual: self.may_individual || other.may_individual,
+        }
+    }
+}
+
+/// Projection-preserving non-storage lifetime facts used by the storage-generation lane of
+/// EscapeCheck. `direct` applies to the selected value itself; exact aggregate children retain
+/// their own entries so a later field/tuple/sum projection does not collapse sibling regions.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct EscapeRegionFact {
+    direct: Option<Region>,
+    projected: std::collections::BTreeMap<StoragePath, Region>,
+}
+
+impl EscapeRegionFact {
+    fn from_direct(region: Region) -> Self {
+        Self {
+            direct: Some(region),
+            projected: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let direct = match (self.direct, other.direct) {
+            (Some(left), Some(right)) => Some(left.shorter(right)),
+            (Some(region), None) | (None, Some(region)) => Some(region),
+            (None, None) => None,
+        };
+        let mut projected = self.projected.clone();
+        for (path, &region) in &other.projected {
+            projected
+                .entry(path.clone())
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        Self { direct, projected }
+    }
+
+    fn prefixed(mut self, projection: BorrowProjection) -> Self {
+        let mut projected = std::collections::BTreeMap::new();
+        if let Some(region) = self.direct.take() {
+            projected.insert(vec![projection], region);
+        }
+        for (mut path, region) in self.projected {
+            path.insert(0, projection);
+            projected
+                .entry(path)
+                .and_modify(|current: &mut Region| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        Self {
+            direct: None,
+            projected,
+        }
+    }
+
+    fn prefixed_path(self, path: &[BorrowProjection]) -> Self {
+        path.iter()
+            .rev()
+            .copied()
+            .fold(self, |fact, projection| fact.prefixed(projection))
+    }
+
+    fn at_path(path: &[BorrowProjection], region: Region) -> Self {
+        Self::from_direct(region).prefixed_path(path)
+    }
+
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        if path.is_empty() {
+            return self.clone();
+        }
+        let mut projected = std::collections::BTreeMap::new();
+        let mut direct = self.direct;
+        for (candidate, &region) in &self.projected {
+            let Some(suffix) = candidate.strip_prefix(path) else {
+                continue;
+            };
+            if suffix.is_empty() {
+                direct = Some(direct.map_or(region, |current| current.shorter(region)));
+            } else {
+                projected
+                    .entry(suffix.to_vec())
+                    .and_modify(|current: &mut Region| *current = current.shorter(region))
+                    .or_insert(region);
+            }
+        }
+        Self { direct, projected }
+    }
+
+    fn replace_path(&mut self, path: &[BorrowProjection], incoming: Self) {
+        if path.is_empty() {
+            *self = incoming;
+            return;
+        }
+        self.projected
+            .retain(|candidate, _| !candidate.starts_with(path));
+        if let Some(region) = incoming.direct {
+            self.projected.insert(path.to_vec(), region);
+        }
+        for (suffix, region) in incoming.projected {
+            let mut destination = path.to_vec();
+            destination.extend(suffix);
+            self.projected.insert(destination, region);
+        }
+    }
+
+    fn shortest_region(&self) -> Option<Region> {
+        self.direct
+            .into_iter()
+            .chain(self.projected.values().copied())
+            .reduce(Region::shorter)
+    }
+}
+
+/// Allocation provenance retained independently from lifetime regions. The two halves preserve
+/// the definite/maybe distinction across control joins and therefore distinguish heap, arena, and
+/// path-dependent storage without manufacturing a boolean default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EscapeAllocationMode {
+    individual: bool,
+    may_individual: bool,
+}
+
+impl EscapeAllocationMode {
+    fn join(self, other: Self) -> Self {
+        Self {
+            individual: self.individual && other.individual,
+            may_individual: self.may_individual || other.may_individual,
+        }
+    }
+}
+
+/// One completed escape value. Header identity is generation-based; ordinary region-bearing
+/// children stay projected separately. Locality and allocation mode describe the completed value,
+/// not whichever local happens to hold it after a later action.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct EscapeValueFact {
+    non_storage: EscapeRegionFact,
+    headers: ProjectedHeaderFact,
+    /// Ended/unknown selected content carried by scalar observations and forwarded aggregates.
+    /// These are separate from directory endings: reading one ended nested dependency does not
+    /// end the outer writable generation or poison an exact sibling field.
+    content_ended: std::collections::BTreeMap<StoragePath, BorrowEnd>,
+    content_unknown: std::collections::BTreeSet<StoragePath>,
+    storage_is_local: bool,
+    individual: bool,
+    may_individual: bool,
+}
+
+impl EscapeValueFact {
+    fn join(&self, other: &Self) -> Self {
+        let mut content_ended = self.content_ended.clone();
+        for (path, &incoming) in &other.content_ended {
+            content_ended
+                .entry(path.clone())
+                .and_modify(|current| *current = (*current).min(incoming))
+                .or_insert(incoming);
+        }
+        let mut content_unknown = self.content_unknown.clone();
+        content_unknown.extend(other.content_unknown.iter().cloned());
+        Self {
+            non_storage: self.non_storage.join(&other.non_storage),
+            headers: self.headers.join(&other.headers),
+            content_ended,
+            content_unknown,
+            storage_is_local: self.storage_is_local || other.storage_is_local,
+            individual: self.individual && other.individual,
+            may_individual: self.may_individual || other.may_individual,
+        }
+    }
+
+    fn prefixed(self, projection: BorrowProjection) -> Self {
+        let Self {
+            non_storage,
+            headers,
+            content_ended,
+            content_unknown,
+            storage_is_local,
+            individual,
+            may_individual,
+        } = self;
+        let content_ended = content_ended
+            .into_iter()
+            .map(|(mut path, ended)| {
+                path.insert(0, projection);
+                (path, ended)
+            })
+            .collect();
+        let content_unknown = content_unknown
+            .into_iter()
+            .map(|mut path| {
+                path.insert(0, projection);
+                path
+            })
+            .collect();
+        Self {
+            non_storage: non_storage.prefixed(projection),
+            headers: headers.prefixed(projection),
+            content_ended,
+            content_unknown,
+            storage_is_local,
+            individual,
+            may_individual,
+        }
+    }
+
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        let project_ended = |candidate: &StoragePath, &ended: &BorrowEnd| {
+            if candidate.is_empty() {
+                Some((Vec::new(), ended))
+            } else {
+                candidate
+                    .strip_prefix(path)
+                    .map(|suffix| (suffix.to_vec(), ended))
+            }
+        };
+        let project_unknown = |candidate: &StoragePath| {
+            if candidate.is_empty() {
+                Some(Vec::new())
+            } else {
+                candidate.strip_prefix(path).map(|suffix| suffix.to_vec())
+            }
+        };
+        Self {
+            non_storage: self.non_storage.project_path(path),
+            headers: self.headers.project_path(path),
+            content_ended: self
+                .content_ended
+                .iter()
+                .filter_map(|(candidate, ended)| project_ended(candidate, ended))
+                .collect(),
+            content_unknown: self
+                .content_unknown
+                .iter()
+                .filter_map(project_unknown)
+                .collect(),
+            storage_is_local: self.storage_is_local,
+            individual: self.individual,
+            may_individual: self.may_individual,
+        }
+    }
+
+    fn replace_path(&mut self, path: &[BorrowProjection], incoming: Self) {
+        let incoming_storage_is_local = incoming.storage_is_local;
+        let incoming_individual = incoming.individual;
+        let incoming_may_individual = incoming.may_individual;
+        self.non_storage
+            .replace_path(path, incoming.non_storage);
+        self.headers.replace_path(path, incoming.headers);
+        self.content_ended
+            .retain(|candidate, _| !candidate.starts_with(path));
+        self.content_unknown
+            .retain(|candidate| !candidate.starts_with(path));
+        self.content_ended.extend(
+            incoming
+                .content_ended
+                .into_iter()
+                .map(|(suffix, ended)| {
+                    let mut destination = path.to_vec();
+                    destination.extend(suffix);
+                    (destination, ended)
+                }),
+        );
+        self.content_unknown.extend(
+            incoming.content_unknown.into_iter().map(|suffix| {
+                let mut destination = path.to_vec();
+                destination.extend(suffix);
+                destination
+            }),
+        );
+        if path.is_empty() {
+            self.storage_is_local = incoming_storage_is_local;
+            self.individual = incoming_individual;
+            self.may_individual = incoming_may_individual;
+        } else {
+            self.storage_is_local |= incoming_storage_is_local;
+            self.individual &= incoming_individual;
+            self.may_individual |= incoming_may_individual;
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.headers.rename_generations(renames);
+    }
+
+    fn has_projected_evidence(&self, path: &[BorrowProjection]) -> bool {
+        self.non_storage.direct.is_some()
+            || !self.non_storage.project_path(path).eq(&EscapeRegionFact::default())
+            || self
+                .headers
+                .leaves
+                .keys()
+                .any(|candidate| candidate.starts_with(path))
+            || self.content_ended.keys().any(|candidate| {
+                candidate.is_empty() || candidate.starts_with(path)
+            })
+            || self.content_unknown.iter().any(|candidate| {
+                candidate.is_empty() || candidate.starts_with(path)
+            })
+    }
+}
+
+/// Release identities carried by EscapeCheck's directory. E1 only forms them; later slices attach
+/// install/replace/store/cleanup actions without changing the stable generation key.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum EscapeReleasePlace {
+    Local {
+        local: LocalId,
+        path: StoragePath,
+    },
+    Staging {
+        expression: usize,
+        operand: u32,
+        path: StoragePath,
+    },
+    Arena {
+        depth: u32,
+    },
+}
+
+/// Escape-side generation directory metadata. `storage_region` is the strict destination region:
+/// alternatives join toward the longer-lived buffer, while contained values join independently
+/// toward their shortest possible lifetime in [`EscapeGenerationContent`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct EscapeGenerationEntry {
+    descriptor: Option<StorageHeaderDescriptor>,
+    storage_region: Region,
+    allocation: EscapeAllocationMode,
+    releases: std::collections::BTreeSet<EscapeReleasePlace>,
+    ended: Option<BorrowEnd>,
+}
+
+impl EscapeGenerationEntry {
+    fn join(&self, other: &Self) -> Self {
+        let mut releases = self.releases.clone();
+        releases.extend(other.releases.iter().cloned());
+        Self {
+            descriptor: (self.descriptor == other.descriptor)
+                .then_some(self.descriptor)
+                .flatten(),
+            storage_region: self.storage_region.longer(other.storage_region),
+            allocation: self.allocation.join(other.allocation),
+            releases,
+            ended: match (self.ended, other.ended) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(ended), None) | (None, Some(ended)) => Some(ended),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+/// Contents selected by a storage generation. Regions and nested generation dependencies are
+/// projected independently so SoA columns and nested aggregate headers retain exact selectors.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct EscapeGenerationContent {
+    direct_regions: EscapeRegionFact,
+    dependencies: ProjectedHeaderFact,
+}
+
+impl EscapeGenerationContent {
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            direct_regions: self.direct_regions.join(&other.direct_regions),
+            dependencies: self.dependencies.join(&other.dependencies),
+        }
+    }
+
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        Self {
+            direct_regions: self.direct_regions.project_path(path),
+            dependencies: self.dependencies.project_path(path),
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.dependencies.rename_generations(renames);
+    }
+}
+
+/// Path-qualified content result. Unknownness and source endings stay on the exact selected
+/// subtree, so one unresolved SoA column or nested capture cannot poison an exact sibling.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct EscapeResolvedContent {
+    regions: EscapeRegionFact,
+    ended: std::collections::BTreeMap<StoragePath, BorrowEnd>,
+    unknown: std::collections::BTreeSet<StoragePath>,
+}
+
+impl EscapeResolvedContent {
+    fn join(&self, other: &Self) -> Self {
+        let mut ended = self.ended.clone();
+        for (path, &incoming) in &other.ended {
+            ended
+                .entry(path.clone())
+                .and_modify(|current| *current = (*current).min(incoming))
+                .or_insert(incoming);
+        }
+        let mut unknown = self.unknown.clone();
+        unknown.extend(other.unknown.iter().cloned());
+        Self {
+            regions: self.regions.join(&other.regions),
+            ended,
+            unknown,
+        }
+    }
+
+    fn prefixed_path(mut self, prefix: &[BorrowProjection]) -> Self {
+        self.regions = self.regions.prefixed_path(prefix);
+        self.ended = self
+            .ended
+            .into_iter()
+            .map(|(path, ended)| {
+                let mut destination = prefix.to_vec();
+                destination.extend(path);
+                (destination, ended)
+            })
+            .collect();
+        self.unknown = self
+            .unknown
+            .into_iter()
+            .map(|path| {
+                let mut destination = prefix.to_vec();
+                destination.extend(path);
+                destination
+            })
+            .collect();
+        self
+    }
+
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        if path.is_empty() {
+            return self.clone();
+        }
+        let project_ended = |candidate: &StoragePath, &ended: &BorrowEnd| {
+            if candidate.is_empty() {
+                Some((Vec::new(), ended))
+            } else {
+                candidate
+                    .strip_prefix(path)
+                    .map(|suffix| (suffix.to_vec(), ended))
+            }
+        };
+        let project_unknown = |candidate: &StoragePath| {
+            if candidate.is_empty() {
+                Some(Vec::new())
+            } else {
+                candidate.strip_prefix(path).map(|suffix| suffix.to_vec())
+            }
+        };
+        Self {
+            regions: self.regions.project_path(path),
+            ended: self
+                .ended
+                .iter()
+                .filter_map(|(candidate, ended)| project_ended(candidate, ended))
+                .collect(),
+            unknown: self
+                .unknown
+                .iter()
+                .filter_map(project_unknown)
+                .collect(),
+        }
+    }
+
+    fn unknown_root() -> Self {
+        Self {
+            unknown: [Vec::new()].into_iter().collect(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct EscapeResolvedStorage {
+    /// Header shape at this value use-site. A Slice/SoA forwarder may differ from the owned or
+    /// inline header shape stored in the generation directory.
+    value_descriptor: Option<StorageHeaderDescriptor>,
+    /// Underlying generation shape. Nested content dependencies never rewrite this metadata.
+    storage_descriptor: Option<StorageHeaderDescriptor>,
+    storage_region: Option<Region>,
+    content: EscapeResolvedContent,
+    dependencies: ProjectedHeaderFact,
+    allocation: Option<EscapeAllocationMode>,
+    releases: std::collections::BTreeSet<EscapeReleasePlace>,
+    ended: Option<BorrowEnd>,
+    /// Whether the writable backing identity and directory metadata are exact.
+    identity_known: bool,
+}
+
+impl EscapeResolvedStorage {
+    fn empty(identity_known: bool) -> Self {
+        Self {
+            value_descriptor: None,
+            storage_descriptor: None,
+            storage_region: None,
+            content: EscapeResolvedContent::default(),
+            dependencies: ProjectedHeaderFact::default(),
+            allocation: None,
+            releases: std::collections::BTreeSet::new(),
+            ended: None,
+            identity_known,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut releases = self.releases.clone();
+        releases.extend(other.releases.iter().cloned());
+        Self {
+            value_descriptor: match (self.value_descriptor, other.value_descriptor) {
+                (None, descriptor) | (descriptor, None) => descriptor,
+                (Some(left), Some(right)) if left == right => Some(left),
+                (Some(_), Some(_)) => None,
+            },
+            storage_descriptor: match (self.storage_descriptor, other.storage_descriptor) {
+                (None, descriptor) | (descriptor, None) => descriptor,
+                (Some(left), Some(right)) if left == right => Some(left),
+                (Some(_), Some(_)) => None,
+            },
+            storage_region: match (self.storage_region, other.storage_region) {
+                (Some(left), Some(right)) => Some(left.longer(right)),
+                (Some(region), None) | (None, Some(region)) => Some(region),
+                (None, None) => None,
+            },
+            content: self.content.join(&other.content),
+            dependencies: self.dependencies.join(&other.dependencies),
+            allocation: match (self.allocation, other.allocation) {
+                (Some(left), Some(right)) => Some(left.join(right)),
+                (Some(mode), None) | (None, Some(mode)) => Some(mode),
+                (None, None) => None,
+            },
+            releases,
+            ended: match (self.ended, other.ended) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(ended), None) | (None, Some(ended)) => Some(ended),
+                (None, None) => None,
+            },
+            identity_known: self.identity_known && other.identity_known,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum EscapeResolveKey {
+    Generation(StorageGenerationRef),
+    Local {
+        local: LocalId,
+        expected: Option<StorageHeaderDescriptor>,
+    },
+}
+
+/// Path-sensitive escape provenance at one control-flow point. Content regions and slice-locality
+/// form may-lattices, while backing storage is a separate destination lattice: roots union and the
+/// region joins toward the longest-lived possible buffer. Owned provenance keeps both the
+/// must-individual and may-individual facts so a heap/arena join stays distinct from definite arena
+/// ownership.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct EscapeState {
     region: std::collections::HashMap<LocalId, Region>,
+    /// Runtime sum variants known on every path reaching this state. This is kept alongside
+    /// projected storage so sum transformers do not manufacture an inactive payload subtree.
+    active_sum: std::collections::HashMap<
+        LocalId,
+        std::collections::BTreeSet<BorrowProjection>,
+    >,
+    /// Generation-based storage facts formed from the shared closed classifier. These coexist
+    /// with the legacy region/backing maps during E1, but already contain every value/completion
+    /// surface required for the later authority switch.
+    storage_values: std::collections::HashMap<LocalId, EscapeValueFact>,
+    storage: StorageGenerationTables<EscapeGenerationEntry, EscapeGenerationContent>,
+    storage_argument_snapshots: std::collections::HashMap<(usize, usize), EscapeValueFact>,
+    storage_completed_expressions: std::collections::HashMap<usize, EscapeValueFact>,
+    storage_callable_snapshots: std::collections::HashMap<usize, EscapeValueFact>,
+    backing_storage: std::collections::HashMap<LocalId, EscapeBackingStorage>,
+    /// Completion-time eager-argument facts, keyed by call-expression identity and argument
+    /// ordinal. Entries are overwritten on each loop iteration and consumed by `MutableCall`.
+    argument_snapshots: std::collections::HashMap<(usize, usize), EscapeArgumentSnapshot>,
+    /// Completion facts for every evaluated expression node. Parent expressions consume these
+    /// instead of re-reading child syntax from state already changed by a later eager sibling.
+    completed_expressions: std::collections::HashMap<usize, EscapeArgumentSnapshot>,
+    /// Return-relevant capture region of an indirect callee, frozen immediately after the callee
+    /// expression completes and before argument zero runs. The callable value itself may be
+    /// rebound by a later eager argument, but the runtime still invokes the completed value.
+    callable_capture_snapshots: std::collections::HashMap<usize, Region>,
     /// Region contributed to an indirect result by the selected callable's captured values. This
     /// is distinct from `region`: a capturing closure value is frame-local because its environment
     /// buffer lives in this frame, while a view returned from that environment may point into a
@@ -13915,10 +14791,103 @@ struct EscapeState {
 impl EscapeState {
     fn join(&self, other: &Self) -> Self {
         let mut joined = self.clone();
+        joined.active_sum.retain(|local, active| {
+            let Some(other) = other.active_sum.get(local) else {
+                return false;
+            };
+            active.extend(other.iter().copied());
+            true
+        });
         for (&local, &region) in &other.region {
             joined
                 .region
                 .entry(local)
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        for (&local, fact) in &other.storage_values {
+            joined
+                .storage_values
+                .entry(local)
+                .and_modify(|current| *current = current.join(fact))
+                .or_insert_with(|| fact.clone());
+        }
+        for (&key, fact) in &other.storage_argument_snapshots {
+            joined
+                .storage_argument_snapshots
+                .entry(key)
+                .and_modify(|current| *current = current.join(fact))
+                .or_insert_with(|| fact.clone());
+        }
+        for (&key, fact) in &other.storage_completed_expressions {
+            joined
+                .storage_completed_expressions
+                .entry(key)
+                .and_modify(|current| *current = current.join(fact))
+                .or_insert_with(|| fact.clone());
+        }
+        for (&key, fact) in &other.storage_callable_snapshots {
+            joined
+                .storage_callable_snapshots
+                .entry(key)
+                .and_modify(|current| *current = current.join(fact))
+                .or_insert_with(|| fact.clone());
+        }
+        for (generation, entry) in &other.storage.directory.entries {
+            joined
+                .storage
+                .directory
+                .entries
+                .entry(generation.clone())
+                .and_modify(|current| *current = current.join(entry))
+                .or_insert_with(|| entry.clone());
+        }
+        for (generation, content) in &other.storage.contents.entries {
+            joined
+                .storage
+                .contents
+                .entries
+                .entry(generation.clone())
+                .and_modify(|current| *current = current.join(content))
+                .or_insert_with(|| content.clone());
+        }
+        let backing_locals = self
+            .backing_storage
+            .keys()
+            .chain(other.backing_storage.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for local in backing_locals {
+            let backing = match (
+                self.backing_storage.get(&local),
+                other.backing_storage.get(&local),
+            ) {
+                (Some(left), Some(right)) => left.join(right),
+                (Some(known), None) | (None, Some(known)) => {
+                    known.join(&EscapeBackingStorage::unknown())
+                }
+                (None, None) => continue,
+            };
+            joined.backing_storage.insert(local, backing);
+        }
+        for (&key, snapshot) in &other.argument_snapshots {
+            joined
+                .argument_snapshots
+                .entry(key)
+                .and_modify(|current| *current = current.join(snapshot))
+                .or_insert_with(|| snapshot.clone());
+        }
+        for (&key, snapshot) in &other.completed_expressions {
+            joined
+                .completed_expressions
+                .entry(key)
+                .and_modify(|current| *current = current.join(snapshot))
+                .or_insert_with(|| snapshot.clone());
+        }
+        for (&call, &region) in &other.callable_capture_snapshots {
+            joined
+                .callable_capture_snapshots
+                .entry(call)
                 .and_modify(|current| *current = current.shorter(region))
                 .or_insert(region);
         }
@@ -13950,6 +14919,510 @@ impl EscapeState {
         }
         joined
     }
+
+    fn rename_storage_generations(&mut self, renames: &StorageGenerationRenames) {
+        if renames.origins.is_empty() {
+            return;
+        }
+        for fact in self.storage_values.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for fact in self.storage_argument_snapshots.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for fact in self.storage_completed_expressions.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for fact in self.storage_callable_snapshots.values_mut() {
+            fact.rename_generations(renames);
+        }
+        // Dependencies are value facts too. Rename them before folding the table keys so a carrier
+        // or nested header cannot retain a stale Current reference to the newly formed generation.
+        for content in self.storage.contents.entries.values_mut() {
+            content.rename_generations(renames);
+        }
+        self.storage
+            .directory
+            .rename_current_to_prior(renames, |existing, incoming| {
+                *existing = existing.join(&incoming);
+            });
+        self.storage
+            .contents
+            .rename_current_to_prior(renames, |existing, incoming| {
+                *existing = existing.join(&incoming);
+            });
+    }
+
+    fn add_nested_content(
+        into: &mut EscapeResolvedContent,
+        path: &[BorrowProjection],
+        nested: &EscapeResolvedStorage,
+    ) {
+        let mut selected = nested.content.clone();
+        // Inline-fixed dependencies are value producers whose elements are copied into the
+        // containing generation; their temporary slot does not become retained storage. Views and
+        // owned dynamic headers do retain the selected backing identity.
+        if nested
+            .value_descriptor
+            .or(nested.storage_descriptor)
+            .is_some_and(|descriptor| descriptor.kind != StorageHeaderKind::InlineFixed)
+            && let Some(region) = nested.storage_region
+        {
+            selected.regions = selected
+                .regions
+                .join(&EscapeRegionFact::from_direct(region));
+        }
+        if let Some(ended) = nested.ended {
+            selected.ended.insert(Vec::new(), ended);
+        }
+        if !nested.identity_known {
+            selected.unknown.insert(Vec::new());
+        }
+        *into = into.join(&selected.prefixed_path(path));
+    }
+
+    fn resolve_local_fallback(
+        &self,
+        local: LocalId,
+        expected: Option<StorageHeaderDescriptor>,
+        visiting: &mut Vec<EscapeResolveKey>,
+    ) -> EscapeResolvedStorage {
+        let key = EscapeResolveKey::Local { local, expected };
+        if visiting.contains(&key) {
+            let mut cycle = EscapeResolvedStorage::empty(false);
+            cycle.content = EscapeResolvedContent::unknown_root();
+            return cycle;
+        }
+        visiting.push(key.clone());
+        let mut resolved = EscapeResolvedStorage::empty(true);
+        let mut matched = false;
+        if let Some(value) = self.storage_values.get(&local) {
+            resolved.content.regions = value.non_storage.clone();
+            for leaf in value.headers.leaves.values() {
+                let compatible = match (expected, leaf.descriptor) {
+                    (Some(expected), Some(candidate)) => {
+                        storage_header_descriptors_compatible(expected, candidate, &[])
+                    }
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
+                if compatible {
+                    matched = true;
+                    resolved = resolved.join(&self.resolve_storage_leaf(leaf, visiting));
+                }
+            }
+        }
+        if !matched {
+            resolved.identity_known = false;
+            resolved.content.unknown.insert(Vec::new());
+        }
+        debug_assert_eq!(visiting.pop(), Some(key));
+        resolved
+    }
+
+    /// Resolve one conservative root without consulting the legacy region/backing lane. `Param`
+    /// is contained value provenance, while `ParamStorage` is a backing candidate; keeping them
+    /// distinct prevents a scalar dependency from manufacturing writable caller storage.
+    fn resolve_fallback_root(
+        &self,
+        root: BorrowRoot,
+        expected: Option<StorageHeaderDescriptor>,
+        visiting: &mut Vec<EscapeResolveKey>,
+    ) -> EscapeResolvedStorage {
+        let (live, ended, ends_storage) = match root {
+            BorrowRoot::EndedLocal(local, ended) => {
+                (BorrowRoot::Local(local), Some(ended), true)
+            }
+            BorrowRoot::EndedIterTemp(depth, ended) => {
+                (BorrowRoot::IterTemp(depth), Some(ended), true)
+            }
+            BorrowRoot::EndedParam(parameter, ended) => {
+                (BorrowRoot::Param(parameter), Some(ended), false)
+            }
+            BorrowRoot::EndedParamStorage(parameter, ended) => {
+                (BorrowRoot::ParamStorage(parameter), Some(ended), true)
+            }
+            live => (live, None, false),
+        };
+        let local_fallback = matches!(live, BorrowRoot::Local(_));
+        let mut resolved = match live {
+            BorrowRoot::Param(parameter) => {
+                let mut resolved = EscapeResolvedStorage::empty(false);
+                resolved.content.regions = EscapeRegionFact::from_direct(Region::Caller(parameter));
+                resolved
+            }
+            BorrowRoot::ParamStorage(parameter) => {
+                let mut resolved = EscapeResolvedStorage::empty(false);
+                resolved.storage_region = Some(Region::Caller(parameter));
+                resolved
+            }
+            BorrowRoot::Local(local) => self.resolve_local_fallback(local, expected, visiting),
+            BorrowRoot::IterTemp(_) => {
+                let mut resolved = EscapeResolvedStorage::empty(false);
+                resolved.content = EscapeResolvedContent::unknown_root();
+                resolved
+            }
+            BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => unreachable!(),
+        };
+        // A Local fallback contributes only its frozen region/content evidence. In particular it
+        // cannot acquire the candidate generation's release owner, allocation mode, descriptor,
+        // or directory ending merely because an unknown result retained the local as a fallback.
+        if local_fallback {
+            if let Some(ended) = resolved.ended.take() {
+                resolved.content.ended.insert(Vec::new(), ended);
+            }
+            resolved.storage_descriptor = None;
+            resolved.allocation = None;
+            resolved.releases.clear();
+        }
+        if resolved.value_descriptor.is_none() {
+            resolved.value_descriptor = expected;
+        }
+        resolved.identity_known = false;
+        if let Some(ended) = ended {
+            if ends_storage {
+                resolved.ended = Some(ended);
+            } else {
+                resolved.content.ended.insert(Vec::new(), ended);
+            }
+        }
+        resolved
+    }
+
+    fn resolve_storage_reference(
+        &self,
+        reference: &StorageGenerationRef,
+        visiting: &mut Vec<EscapeResolveKey>,
+    ) -> EscapeResolvedStorage {
+        let key = EscapeResolveKey::Generation(reference.clone());
+        if visiting.contains(&key) {
+            let mut cycle = EscapeResolvedStorage::empty(false);
+            cycle.content = EscapeResolvedContent::unknown_root();
+            return cycle;
+        }
+        visiting.push(key.clone());
+
+        let directory = self.storage.directory.entries.get(&reference.generation);
+        let content = self.storage.contents.entries.get(&reference.generation);
+        let mut resolved = EscapeResolvedStorage::empty(
+            directory.is_some_and(|entry| entry.descriptor.is_some()),
+        );
+        if let Some(directory) = directory {
+            resolved.storage_descriptor = directory.descriptor;
+            resolved.storage_region = Some(directory.storage_region);
+            resolved.allocation = Some(directory.allocation);
+            resolved.releases = directory.releases.clone();
+            resolved.ended = directory.ended;
+        }
+        if let Some(content) = content {
+            let content = content.project_path(&reference.content_path);
+            resolved.content.regions = content.direct_regions;
+            resolved.dependencies = content.dependencies.clone();
+            for (path, leaf) in &content.dependencies.leaves {
+                if !leaf.known {
+                    resolved.content.unknown.insert(path.clone());
+                }
+                for &root in &leaf.fallback_roots {
+                    let fallback = self.resolve_fallback_root(root, leaf.descriptor, visiting);
+                    Self::add_nested_content(&mut resolved.content, path, &fallback);
+                }
+                for dependency in &leaf.generations {
+                    let nested = self.resolve_storage_reference(dependency, visiting);
+                    // A nested header is content of this generation. Its storage lifetime and
+                    // recursively selected values shorten the parent content at `path`, but its
+                    // descriptor/allocation/releases/ending never become parent backing metadata.
+                    Self::add_nested_content(&mut resolved.content, path, &nested);
+                }
+            }
+        } else {
+            resolved.content.unknown.insert(Vec::new());
+        }
+        debug_assert_eq!(visiting.pop(), Some(key));
+        resolved
+    }
+
+    fn resolve_storage_leaf(
+        &self,
+        leaf: &StorageHeaderLeaf,
+        visiting: &mut Vec<EscapeResolveKey>,
+    ) -> EscapeResolvedStorage {
+        let mut resolved = EscapeResolvedStorage::empty(true);
+        for reference in &leaf.generations {
+            resolved = resolved.join(&self.resolve_storage_reference(reference, visiting));
+        }
+        for &root in &leaf.fallback_roots {
+            resolved = resolved.join(&self.resolve_fallback_root(root, leaf.descriptor, visiting));
+        }
+        if !leaf.known || leaf.generations.is_empty() {
+            resolved.identity_known = false;
+        }
+        if leaf.generations.is_empty() && leaf.fallback_roots.is_empty() {
+            resolved.content.unknown.insert(Vec::new());
+        }
+        resolved.identity_known &= leaf.descriptor.is_some();
+        resolved.value_descriptor = leaf.descriptor;
+        resolved
+    }
+
+    /// Resolve content selected through a header. Generation references carry the selector as
+    /// part of their stable identity; fallback roots are resolved first and then projected so an
+    /// unknown view cannot silently lose an ended/unknown scalar read or a nested header.
+    fn resolve_storage_leaf_content(
+        &self,
+        leaf: &StorageHeaderLeaf,
+        content_path: &[BorrowProjection],
+        visiting: &mut Vec<EscapeResolveKey>,
+    ) -> EscapeResolvedStorage {
+        let mut resolved = EscapeResolvedStorage::empty(true);
+        for reference in &leaf.generations {
+            let mut selected = reference.clone();
+            selected.content_path =
+                selected.select_content_path(content_path.iter().copied());
+            resolved = resolved.join(&self.resolve_storage_reference(&selected, visiting));
+        }
+        for &root in &leaf.fallback_roots {
+            let mut fallback = self.resolve_fallback_root(root, leaf.descriptor, visiting);
+            fallback.content = fallback.content.project_path(content_path);
+            fallback.dependencies = fallback.dependencies.project_path(content_path);
+            resolved = resolved.join(&fallback);
+        }
+        if !leaf.known || leaf.generations.is_empty() {
+            resolved.identity_known = false;
+        }
+        if leaf.generations.is_empty() && leaf.fallback_roots.is_empty() {
+            resolved.content.unknown.insert(Vec::new());
+        }
+        resolved.identity_known &= leaf.descriptor.is_some();
+        resolved.value_descriptor = leaf.descriptor;
+        resolved
+    }
+
+    /// Resolve every exact value-header path through the stable directory/content tables. The
+    /// recursion guard is reference-qualified (generation plus content selector) and path-local,
+    /// so two SoA columns of one generation do not suppress each other.
+    #[cfg(test)]
+    fn resolve_storage_headers(
+        &self,
+        headers: &ProjectedHeaderFact,
+    ) -> std::collections::BTreeMap<StoragePath, EscapeResolvedStorage> {
+        headers
+            .leaves
+            .iter()
+            .map(|(path, leaf)| {
+                (
+                    path.clone(),
+                    self.resolve_storage_leaf(
+                        leaf,
+                        &mut Vec::new(),
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+fn escape_storage_header_content_may_borrow(
+    header_ty: Ty,
+    context: StorageTypeContext<'_>,
+) -> bool {
+    let content_ty = match expand_tagged_ty(header_ty, context.tagged_types) {
+        Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+            Some(scalar_to_ty(element))
+        }
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => {
+            Some(Ty::Struct(id))
+        }
+        // The id is a symbolic row parameter, not a concrete StructDef index. Its closed bound
+        // admits borrow-bearing columns, so malformed/template HIR stays conservative.
+        Ty::SoaParam(_) => return true,
+        Ty::DynStructArray(_, Layout::Soa) => return true,
+        _ => None,
+    };
+    content_ty.is_some_and(|ty| {
+        ty_may_borrow(
+            ty,
+            context.structs,
+            context.tuples,
+            context.enums,
+            context.tagged_types,
+        )
+    })
+}
+
+/// Seed one parameter into the generation authority. Keeping this independent of the legacy
+/// escape maps makes the mode/path matrix directly testable and gives E2 one installation API.
+fn seed_escape_parameter_storage(
+    state: &mut EscapeState,
+    position: u32,
+    local: LocalId,
+    ty: Ty,
+    mode: ast::ParamMode,
+    context: StorageTypeContext<'_>,
+) {
+    let paths = storage_type_paths(ty, context);
+    if !paths.valid {
+        return;
+    }
+
+    let borrowed = !matches!(mode, ast::ParamMode::ByValue);
+    let generations = paths
+        .headers
+        .iter()
+        .map(|header| {
+            let generation = if borrowed || header.kind == StorageHeaderKind::View {
+                StorageGeneration::caller_storage(position, &header.path)
+            } else if header.kind == StorageHeaderKind::InlineFixed {
+                StorageGeneration::current(StorageOrigin::inline_place(local, &header.path))
+            } else {
+                StorageGeneration::parameter_value(position, &header.path)
+            };
+            (header.path.clone(), (generation, header.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let formations = generations
+        .iter()
+        .map(|(path, (generation, header))| {
+            let caller_storage = borrowed || header.kind == StorageHeaderKind::View;
+            let releases = if caller_storage {
+                std::collections::BTreeSet::new()
+            } else {
+                [EscapeReleasePlace::Local {
+                    local,
+                    path: path.clone(),
+                }]
+                .into_iter()
+                .collect()
+            };
+            let dependencies = generations
+                .iter()
+                .filter_map(|(candidate_path, (candidate, candidate_header))| {
+                    let suffix = candidate_path.strip_prefix(path.as_slice())?;
+                    (!suffix.is_empty()).then(|| {
+                        (
+                            suffix.to_vec(),
+                            StorageHeaderLeaf::known_typed(
+                                candidate.clone(),
+                                StorageHeaderDescriptor {
+                                    ty: candidate_header.ty,
+                                    kind: candidate_header.kind,
+                                },
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            let owns_dynamic = header.kind == StorageHeaderKind::OwnedDynamic && !borrowed;
+            StorageHeaderFormation {
+                path: path.clone(),
+                generation: generation.clone(),
+                directory: Some(EscapeGenerationEntry {
+                    descriptor: Some(StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    }),
+                    storage_region: if caller_storage {
+                        Region::Caller(position)
+                    } else {
+                        Region::Frame
+                    },
+                    allocation: EscapeAllocationMode {
+                        individual: owns_dynamic,
+                        may_individual: owns_dynamic,
+                    },
+                    releases,
+                    ended: None,
+                }),
+                content: Some(EscapeGenerationContent {
+                    direct_regions: if escape_storage_header_content_may_borrow(header.ty, context)
+                    {
+                        EscapeRegionFact::from_direct(Region::Caller(position))
+                    } else {
+                        EscapeRegionFact::default()
+                    },
+                    dependencies: ProjectedHeaderFact { leaves: dependencies },
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let headers = if formations.is_empty() {
+        ProjectedHeaderFact::default()
+    } else {
+        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
+            |formation| match &formation.generation {
+                StorageGeneration::Current(origin) => Some(origin.clone()),
+                StorageGeneration::Prior(_)
+                | StorageGeneration::ParameterValue { .. }
+                | StorageGeneration::CallerStorage { .. } => None,
+            },
+        ));
+        let mut next = state.storage.clone();
+        for content in next.contents.entries.values_mut() {
+            content.rename_generations(&renames);
+        }
+        let Ok(commit) = next.try_form_headers(
+            ty,
+            formations,
+            context,
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) else {
+            return;
+        };
+        state.rename_storage_generations(&commit.renames);
+        state.storage = next;
+        commit.headers
+    };
+    let owns_dynamic = !borrowed
+        && ty_owns_dyn_array_storage(
+            ty,
+            context.structs,
+            context.tuples,
+            context.enums,
+            context.tagged_types,
+        );
+    let non_storage = borrow_leaf_paths_for_type(
+        ty,
+        context.structs,
+        context.tuples,
+        context.enums,
+        context.tagged_types,
+    )
+    .into_iter()
+    .filter(|leaf| {
+        !paths
+            .headers
+            .iter()
+            .any(|header| leaf.starts_with(&header.path))
+    })
+    .fold(EscapeRegionFact::default(), |fact, leaf| {
+        fact.join(&EscapeRegionFact::at_path(
+            &leaf,
+            Region::Caller(position),
+        ))
+    });
+    state.storage_values.insert(
+        local,
+        EscapeValueFact {
+            non_storage,
+            headers,
+            content_ended: std::collections::BTreeMap::new(),
+            content_unknown: std::collections::BTreeSet::new(),
+            // A lone by-value owned/fixed header is frame-local. When an aggregate also carries an
+            // exact view header, however, that view has its own caller-storage generation and must
+            // not inherit the sibling owner's locality (including the self-relative move case).
+            storage_is_local: !borrowed
+                && !generations.is_empty()
+                && generations
+                    .values()
+                    .all(|(_, header)| header.kind != StorageHeaderKind::View),
+            individual: owns_dynamic,
+            may_individual: owns_dynamic,
+        },
+    );
 }
 
 type EscapeFlowBlockId = usize;
@@ -13973,11 +15446,16 @@ struct EscapeFlowBlock<'a> {
 #[derive(Clone)]
 enum EscapeFlowOp<'a> {
     Stmt(&'a Stmt, u32),
+    /// Clear a prior loop iteration's fact before this exact expression starts evaluating.
+    ExpressionStart(usize),
+    /// Publish the expression's four completion facts after every eager child and call action.
+    ExpressionComplete(&'a Expr, u32),
     /// Record heap-vs-arena provenance even when an owned expression is not assigned to a local.
     /// MIR needs this for synthetic owners of directly consumed temporaries.
     DropProvenance(&'a Expr, u32),
     MatchBindings {
         scrutinee: &'a Expr,
+        variants: &'a [u32],
         bindings: &'a [LocalId],
         borrowed_bindings: &'a [hir::BorrowedProjection],
         depth: u32,
@@ -14004,13 +15482,29 @@ enum EscapeFlowOp<'a> {
         value: &'a Expr,
         depth: u32,
     },
-    /// A returning `borrow mut` call replaces the destination's contained provenance with the
-    /// exact source arguments inferred from an available body, or every compatible argument when
-    /// the body/fact is unavailable. The source regions are captured before the destination state
-    /// changes so retaining the old destination is well-defined.
-    BorrowMutCall {
+    /// Capture an eager argument immediately after it finishes and before the next argument may
+    /// mutate any local used by its contained/storage/backing provenance.
+    ArgumentComplete {
+        call: usize,
+        index: usize,
+        argument: &'a Expr,
+        depth: u32,
+    },
+    /// Freeze the return-relevant capture selected by an already-evaluated function value before
+    /// any explicit argument can rebind the local or aggregate that produced it.
+    CallableCaptureComplete {
+        call: usize,
+        callee: &'a Expr,
+        depth: u32,
+    },
+    /// A returning `borrow mut`/`out` call installs contained provenance selected from the exact
+    /// same-program summary, or every compatible argument when the body/fact is unavailable. All
+    /// source and destination facts are captured before any destination changes. `borrow mut`
+    /// keeps whole-place replacement; `out` joins an element mutation into its backing roots.
+    MutableCall {
+        call: usize,
         args: &'a [Expr],
-        destinations: Vec<(usize, Vec<BorrowMutRetentionSource>)>,
+        destinations: Vec<(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)>,
         depth: u32,
     },
     /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
@@ -14130,6 +15624,13 @@ impl<'a> EscapeFlowCfg<'a> {
 /// ([`Region::outlives`]) forbids it being returned to / stored into a longer-lived location.
 /// A `box<T>` / arena-backed `str` is `Arena(k)`; a frame-local-backed `slice` is `Frame`.
 /// Regions are inferred — never written.
+struct EscapeStorageProvenance<'a> {
+    named_return_borrow:
+        &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    callable_target_ids: &'a std::collections::HashMap<String, u32>,
+    callable_targets: &'a [CallableTargetSet],
+}
+
 struct EscapeCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
@@ -14199,7 +15700,272 @@ struct EscapeCheck<'a> {
     walk_children: Vec<(&'a Expr, u32)>,
 }
 
+/// Resolve the statically active Option/Result payloads without recursing through accepted-depth
+/// HIR. EscapeCheck and MoveCheck supply their own fallthrough authority for match arms but share
+/// this topology, so a new transparent/control expression cannot diverge between the analyses.
+fn resolve_active_sum_paths(
+    expression: &Expr,
+    locals: &std::collections::HashMap<
+        LocalId,
+        std::collections::BTreeSet<BorrowProjection>,
+    >,
+    match_arm_falls_through: impl std::ops::Fn(&Expr) -> bool,
+) -> Option<std::collections::BTreeSet<BorrowProjection>> {
+    enum Work<'e> {
+        Eval(&'e Expr),
+        Join(usize),
+    }
+
+    let mut work = vec![Work::Eval(expression)];
+    let mut values = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Eval(expression) => {
+                if let Some(inner) = borrow_transparent_value(expression) {
+                    work.push(Work::Eval(inner));
+                    continue;
+                }
+                let one = |projection| Some([projection].into_iter().collect());
+                match &expression.kind {
+                    ExprKind::Local(local) => values.push(locals.get(local).cloned()),
+                    ExprKind::OptionSome(_) => {
+                        values.push(one(BorrowProjection::OptionSome));
+                    }
+                    ExprKind::OptionNone => values.push(Some(Default::default())),
+                    ExprKind::ResultOk(_) => values.push(one(BorrowProjection::ResultOk)),
+                    ExprKind::ResultErr(_) => values.push(one(BorrowProjection::ResultErr)),
+                    ExprKind::ResultMapErr { result, .. } => work.push(Work::Eval(result)),
+                    ExprKind::Block(block)
+                    | ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
+                    | ExprKind::TaskGroup(block)
+                    | ExprKind::Unsafe(block) => {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push(Work::Eval(value));
+                        } else {
+                            values.push(None);
+                        }
+                    }
+                    ExprKind::If { then, els, .. } => {
+                        work.push(Work::Join(2));
+                        for block in [then, els] {
+                            if let Some(value) = block.value.as_deref() {
+                                work.push(Work::Eval(value));
+                            } else {
+                                values.push(None);
+                            }
+                        }
+                    }
+                    ExprKind::Match { arms, .. } => {
+                        let selected = arms
+                            .iter()
+                            .filter(|arm| match_arm_falls_through(&arm.body))
+                            .map(|arm| &arm.body)
+                            .collect::<Vec<_>>();
+                        if selected.is_empty() {
+                            values.push(None);
+                        } else {
+                            work.push(Work::Join(selected.len()));
+                            work.extend(selected.into_iter().map(Work::Eval));
+                        }
+                    }
+                    _ => values.push(None),
+                }
+            }
+            Work::Join(count) => {
+                let start = values.len().checked_sub(count)?;
+                let mut joined = std::collections::BTreeSet::new();
+                for value in values.drain(start..) {
+                    joined.extend(value?);
+                }
+                values.push(Some(joined));
+            }
+        }
+    }
+    values.pop().flatten()
+}
+
 impl<'a> EscapeCheck<'a> {
+    fn storage_type_context(&self) -> StorageTypeContext<'_> {
+        StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        }
+    }
+
+    fn active_sum_paths(
+        &self,
+        expression: &Expr,
+    ) -> Option<std::collections::BTreeSet<BorrowProjection>> {
+        resolve_active_sum_paths(expression, &self.state.active_sum, |body| {
+            !hir_expr_diverges(body)
+        })
+    }
+
+    fn assign_active_sum(&mut self, local: LocalId, value: &Expr) {
+        if let Some(active) = self.active_sum_paths(value) {
+            self.state.active_sum.insert(local, active);
+        } else {
+            self.state.active_sum.remove(&local);
+        }
+    }
+
+    fn seed_parameter_storage(
+        &mut self,
+        position: u32,
+        local: LocalId,
+        mode: ast::ParamMode,
+    ) {
+        let Some(ty) = self.f.locals.get(local as usize).map(|record| record.ty) else {
+            return;
+        };
+        let context = StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        };
+        seed_escape_parameter_storage(
+            &mut self.state,
+            position,
+            local,
+            ty,
+            mode,
+            context,
+        );
+    }
+
+    fn indexed_backing_type(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..)
+        )
+    }
+
+    fn return_storage_compatible(&self, result: Ty, source: Ty) -> bool {
+        let result = expand_tagged_ty(result, self.tagged_types);
+        let source = expand_tagged_ty(source, self.tagged_types);
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            // An owned/fixed result materializes its own slot or buffer. A return summary may
+            // select an argument for element provenance without making that argument the result's
+            // storage owner.
+            return false;
+        }
+        result == source
+            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+                && indexed_backing_compatible(result, source, self.tagged_types))
+    }
+
+    /// Whether mutating this collection's contents can publish borrowed-region provenance into
+    /// its backing. A primitive slice or primitive-only SoA still has a borrowed header, but its
+    /// scalar elements/columns cannot retain an owner; whole-place `borrow mut` replacement is
+    /// handled separately and therefore must not be made conditional on this predicate.
+    fn indexed_content_may_retain_region(&self, ty: Ty) -> bool {
+        let element = match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                scalar_to_ty(element)
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => Ty::Struct(id),
+            // Abstract SoA is substituted before emitted HIR, but its closed bound admits `str`
+            // columns. Keep analysis conservative if malformed/template HIR reaches this pass.
+            Ty::SoaParam(_) => return true,
+            _ => return false,
+        };
+        ty_may_borrow(
+            element,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+    }
+
+    fn parameter_backing_storage(
+        &self,
+        local: LocalId,
+        position: usize,
+        ty: Ty,
+    ) -> EscapeBackingStorage {
+        let mode = self
+            .f
+            .param_modes
+            .get(position)
+            .copied()
+            .unwrap_or(ast::ParamMode::ByValue);
+        let caller_storage = matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+        )
+            || matches!(
+                mode,
+                ast::ParamMode::Borrow | ast::ParamMode::BorrowMut | ast::ParamMode::Out
+            );
+        EscapeBackingStorage::known(if caller_storage {
+            Region::Caller(position as u32)
+        } else {
+            Region::Frame
+        })
+        .rooted(local)
+    }
+
+    /// Whether every caller-backed parameter root has a post-call retention transition. A plain
+    /// by-value/shared slice can be copied into a `mut` local, but that must not manufacture the
+    /// `out`/`borrow mut` summary needed to keep a newly stored owner alive in the caller.
+    fn backing_retention_is_visible(&self, backing: &EscapeBackingStorage) -> bool {
+        backing.roots.iter().all(|root| {
+            let Some(position) = self
+                .f
+                .params
+                .iter()
+                .position(|parameter| parameter == root)
+            else {
+                return true;
+            };
+            let mode = self
+                .f
+                .param_modes
+                .get(position)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            let Some(ty) = self.f.locals.get(*root as usize).map(|local| local.ty) else {
+                return false;
+            };
+            let caller_backed = matches!(
+                expand_tagged_ty(ty, self.tagged_types),
+                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            ) || matches!(
+                mode,
+                ast::ParamMode::Borrow | ast::ParamMode::BorrowMut | ast::ParamMode::Out
+            );
+            !caller_backed
+                || matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+        })
+    }
+
+    /// Locals whose already-evaluated collection headers can observe a write to any selected
+    /// backing root. Known aliases and unresolved call-return aliases share the same root set; the
+    /// latter remain non-writable but still receive conservative content-region transitions.
+    fn backing_content_observers(
+        &self,
+        roots: &std::collections::BTreeSet<LocalId>,
+    ) -> std::collections::BTreeSet<LocalId> {
+        self.state
+            .backing_storage
+            .iter()
+            .filter_map(|(&local, backing)| {
+                (!backing.roots.is_disjoint(roots)).then_some(local)
+            })
+            .collect()
+    }
+
     fn borrowed_param_place(&self, expression: &Expr) -> bool {
         let root = match &expression.kind {
             ExprKind::Local(local) => *local,
@@ -14256,14 +16022,40 @@ impl<'a> EscapeCheck<'a> {
         .then(|| self.borrowed_storage_cap(argument))
     }
 
+    #[cfg(test)]
     fn check(&mut self) {
+        let named_return_borrow = std::collections::HashMap::new();
+        let callable_target_ids = std::collections::HashMap::new();
+        let callable_targets = Vec::new();
+        self.check_with_storage_provenance(&EscapeStorageProvenance {
+            named_return_borrow: &named_return_borrow,
+            callable_target_ids: &callable_target_ids,
+            callable_targets: &callable_targets,
+        });
+    }
+
+    fn check_with_storage_provenance(
+        &mut self,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) {
         for (position, &param) in self.f.params.iter().enumerate() {
+            let mode = self
+                .f
+                .param_modes
+                .get(position)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            self.seed_parameter_storage(position as u32, param, mode);
             let Some(local) = self.f.locals.get(param as usize) else {
                 continue;
             };
             // Parameters live the whole frame; recording depth 0 keeps the lexical-storage caps
             // from inheriting a use-site arena depth when a parameter is sliced inside one.
             self.decl_depth.insert(param, 0);
+            if self.indexed_backing_type(local.ty) {
+                let backing = self.parameter_backing_storage(param, position, local.ty);
+                self.state.backing_storage.insert(param, backing);
+            }
             // A by-value Move parameter owning dynamic-array storage is dropped at this frame's
             // exit, so its views are frame-local; borrowed modes view caller storage and stay
             // returnable through provenance.
@@ -14288,7 +16080,10 @@ impl<'a> EscapeCheck<'a> {
                     expand_tagged_ty(local.ty, self.tagged_types),
                     Ty::Resource(_)
                 )
-                && self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut);
+                && matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+                );
             let borrowed_dynamic_storage = matches!(
                 self.f.param_modes.get(position),
                 Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
@@ -14356,7 +16151,7 @@ impl<'a> EscapeCheck<'a> {
         if let Some(v) = &self.f.body.value {
             self.push_flow_op(EscapeFlowOp::ReturnEscape(v, 0));
         }
-        self.solve_flow();
+        self.solve_flow(storage_provenance);
     }
 
     fn push_flow_op(&mut self, op: EscapeFlowOp<'a>) {
@@ -14369,7 +16164,7 @@ impl<'a> EscapeCheck<'a> {
     /// Run the finite may-state worklist, then replay each reachable block once with its fixed input
     /// to emit diagnostics. The probe pass also derives idempotent cleanup metadata, but sends its
     /// diagnostics to a sink so loop iterations cannot duplicate user-facing errors.
-    fn solve_flow(&mut self) {
+    fn solve_flow(&mut self, storage_provenance: &EscapeStorageProvenance<'_>) {
         let mut inputs = vec![None; self.flow.blocks.len()];
         inputs[0] = Some(self.state.clone());
         let mut worklist = std::collections::VecDeque::from([0usize]);
@@ -14383,7 +16178,7 @@ impl<'a> EscapeCheck<'a> {
             let ops = self.flow.blocks[block].ops.clone();
             let successors = self.flow.blocks[block].successors.clone();
             for op in ops {
-                self.apply_flow_op(op, &mut state);
+                self.apply_flow_op(op, &mut state, storage_provenance);
             }
             for successor in successors {
                 let next = match &inputs[successor] {
@@ -14404,14 +16199,1862 @@ impl<'a> EscapeCheck<'a> {
                 continue;
             };
             let op = self.flow.blocks[block].ops[index].clone();
-            self.apply_flow_op(op, state);
+            self.apply_flow_op(op, state, storage_provenance);
         }
     }
 
-    fn apply_flow_op(&mut self, op: EscapeFlowOp<'a>, state: &mut EscapeState) {
+    fn escape_completion_snapshot(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let owns_dynamic_storage = ty_owns_dyn_array_storage(
+            expression.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        let (individual, may_individual) = if owns_dynamic_storage {
+            (
+                self.drop_is_individual(expression, depth),
+                self.drop_may_be_individual(expression, depth),
+            )
+        } else {
+            (false, false)
+        };
+        EscapeArgumentSnapshot {
+            // The recursive resolvers consult already-completed children, so a later eager sibling
+            // cannot rewrite the element, retained whole-value, storage, or backing fact.
+            content_region: self.region_of(expression, depth),
+            retained_contained_region: self.retained_contained_region(expression, depth),
+            storage_region: self.retained_storage_region(expression, depth),
+            mutable_backing: self.backing_storage_of_expr(expression, depth),
+            storage_is_local: self.slice_is_local(expression),
+            individual,
+            may_individual,
+        }
+    }
+
+    /// Select the post-call value facts named by a return summary. Mutable-call actions rewrite
+    /// `argument_snapshots` before this runs, so a callee that replaces `borrow mut dst` and then
+    /// returns `dst` cannot freeze the result to the pre-call actual. Content provenance and result
+    /// storage stay separate: a fresh `array<str>` may borrow a `str` argument while owning a new
+    /// buffer, whereas a returned slice/collection header selects the argument's storage too.
+    fn call_completion_snapshot(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let baseline = self.escape_completion_snapshot(expression, depth);
+        let call = Self::expr_key(expression);
+        let (args, selected, modes, capture_region): (
+            &[Expr],
+            Vec<usize>,
+            Vec<ast::ParamMode>,
+            Region,
+        ) = match &expression.kind {
+            ExprKind::Call { func, args, .. } => {
+                let selected = match self.named_return_region.get(func) {
+                    Some(hir::ReturnRegionSummary::Roots { params, .. }) => params
+                        .iter()
+                        .filter_map(|&index| usize::try_from(index).ok())
+                        .collect(),
+                    Some(hir::ReturnRegionSummary::None) => return baseline,
+                    None => (0..args.len()).collect(),
+                };
+                (
+                    args.as_slice(),
+                    selected,
+                    self.named_param_modes.get(func).cloned().unwrap_or_default(),
+                    Region::Static,
+                )
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                let (selected, modes, capture_region) = match self
+                    .callable_type_id(callee)
+                    .and_then(|id| self.fn_types.get(id as usize))
+                {
+                    Some(function) => match &function.return_region {
+                        hir::ReturnRegionSummary::None => return baseline,
+                        hir::ReturnRegionSummary::Roots { params, captures } => (
+                            params
+                                .iter()
+                                .filter_map(|&index| usize::try_from(index).ok())
+                                .collect(),
+                            function
+                                .params
+                                .iter()
+                                .map(|(mode, _)| *mode)
+                                .collect(),
+                            if captures.is_empty() {
+                                Region::Static
+                            } else {
+                                self.state
+                                    .callable_capture_snapshots
+                                    .get(&call)
+                                    .copied()
+                                    .unwrap_or(Region::Frame)
+                            },
+                        ),
+                    },
+                    None => (
+                        (0..args.len()).collect(),
+                        Vec::new(),
+                        self.state
+                            .callable_capture_snapshots
+                            .get(&call)
+                            .copied()
+                            .unwrap_or(Region::Frame),
+                    ),
+                };
+                (args.as_slice(), selected, modes, capture_region)
+            }
+            _ => return baseline,
+        };
+
+        let mut content_region = capture_region;
+        let mut storage_selected = Vec::new();
+        for &index in &selected {
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            let snapshot = self
+                .state
+                .argument_snapshots
+                .get(&(call, index))
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+            let cap = modes
+                .get(index)
+                .copied()
+                .and_then(|mode| self.call_return_root_cap(argument, mode));
+            content_region = content_region.shorter(
+                cap.map_or(snapshot.content_region, |cap| {
+                    snapshot.content_region.shorter(cap)
+                }),
+            );
+            if self.return_storage_compatible(expression.ty, argument.ty) {
+                storage_selected.push((snapshot, cap));
+            }
+        }
+
+        if storage_selected.is_empty() {
+            return EscapeArgumentSnapshot {
+                content_region,
+                retained_contained_region: if baseline.storage_is_local {
+                    content_region.shorter(baseline.storage_region)
+                } else {
+                    content_region
+                },
+                storage_region: baseline.storage_region.shorter(content_region),
+                ..baseline
+            };
+        }
+
+        let mut retained_contained_region = Region::Static;
+        let mut storage_region = Region::Static;
+        let mut storage_is_local = false;
+        let mut backing_roots = std::collections::BTreeSet::new();
+        for (snapshot, cap) in storage_selected {
+            let cap_region = |region: Region| cap.map_or(region, |cap| region.shorter(cap));
+            retained_contained_region = retained_contained_region
+                .shorter(cap_region(snapshot.retained_contained_region));
+            storage_region = storage_region.shorter(cap_region(snapshot.storage_region));
+            storage_is_local |= snapshot.storage_is_local
+                || cap.is_some_and(|cap| !cap.is_returnable());
+            backing_roots.extend(snapshot.mutable_backing.roots);
+        }
+        retained_contained_region = retained_contained_region.shorter(content_region);
+        storage_region = storage_region.shorter(content_region);
+        // A return summary proves dependency on the selected value, not exact writable-header
+        // identity. Preserve roots for observer propagation but keep direct writes fail-closed.
+        let mut mutable_backing = EscapeBackingStorage::unknown();
+        mutable_backing.roots = backing_roots;
+        EscapeArgumentSnapshot {
+            content_region,
+            retained_contained_region,
+            storage_region,
+            mutable_backing,
+            storage_is_local,
+            individual: baseline.individual,
+            may_individual: baseline.may_individual,
+        }
+    }
+
+    fn join_escape_value_facts(
+        facts: impl IntoIterator<Item = EscapeValueFact>,
+    ) -> EscapeValueFact {
+        let mut facts = facts.into_iter();
+        let Some(first) = facts.next() else {
+            return EscapeValueFact::default();
+        };
+        facts.fold(first, |current, incoming| current.join(&incoming))
+    }
+
+    fn storage_callable_target_id(
+        &self,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+        name: &str,
+    ) -> Option<u32> {
+        storage_provenance.callable_target_ids.get(name).copied()
+    }
+
+    fn fail_closed_escape_value(&self, ty: Ty, depth: u32) -> EscapeValueFact {
+        let context = StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        };
+        let paths = storage_type_paths(ty, context);
+        let headers = paths
+            .headers
+            .iter()
+            .map(|header| {
+                (
+                    header.path.clone(),
+                    StorageHeaderLeaf::unknown_typed(
+                        BorrowRoots::new(),
+                        StorageHeaderDescriptor {
+                            ty: header.ty,
+                            kind: header.kind,
+                        },
+                    ),
+                )
+            })
+            .collect();
+        let region = if depth == 0 {
+            Region::Frame
+        } else {
+            Region::Arena(depth)
+        };
+        let non_storage = borrow_leaf_paths_for_type(
+            ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+        .into_iter()
+        .filter(|leaf| {
+            !paths
+                .headers
+                .iter()
+                .any(|header| leaf.starts_with(&header.path))
+        })
+        .fold(EscapeRegionFact::default(), |fact, leaf| {
+            fact.join(&EscapeRegionFact::at_path(&leaf, region))
+        });
+        EscapeValueFact {
+            non_storage,
+            headers: ProjectedHeaderFact { leaves: headers },
+            content_ended: std::collections::BTreeMap::new(),
+            content_unknown: if paths.headers.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                [Vec::new()].into_iter().collect()
+            },
+            storage_is_local: true,
+            individual: false,
+            may_individual: true,
+        }
+    }
+
+    fn legacy_escape_value(&self, expression: &Expr) -> EscapeValueFact {
+        let snapshot = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+        let context = StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        };
+        let storage = storage_type_paths(expression.ty, context);
+        let non_storage = borrow_leaf_paths_for_type(
+            expression.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+        .into_iter()
+        .filter(|leaf| {
+            !storage
+                .headers
+                .iter()
+                .any(|header| leaf.starts_with(&header.path))
+        })
+        .fold(EscapeRegionFact::default(), |fact, leaf| {
+            fact.join(&EscapeRegionFact::at_path(
+                &leaf,
+                snapshot.content_region,
+            ))
+        });
+        EscapeValueFact {
+            non_storage,
+            headers: ProjectedHeaderFact::default(),
+            content_ended: std::collections::BTreeMap::new(),
+            content_unknown: std::collections::BTreeSet::new(),
+            storage_is_local: snapshot.storage_is_local,
+            individual: snapshot.individual,
+            may_individual: snapshot.may_individual,
+        }
+    }
+
+    fn completed_escape_value(&self, expression: &Expr) -> EscapeValueFact {
+        self.state
+            .storage_completed_expressions
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .or_else(|| match expression.kind {
+                ExprKind::Local(local) => self.state.storage_values.get(&local).cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.legacy_escape_value(expression))
+    }
+
+    /// Fold the generation authority back into the legacy completion shape while E2 removes its
+    /// remaining consumers. Owned/fixed header storage is not contained provenance; a View header
+    /// does retain its selected storage, and every header retains only its recursively resolved
+    /// element/content regions. This distinction is what permits a by-value self-relative
+    /// aggregate to move as a unit without treating its owned slot as a dangling local view.
+    fn storage_escape_snapshot(
+        &self,
+        ty: Ty,
+        value: &EscapeValueFact,
+        mut baseline: EscapeArgumentSnapshot,
+    ) -> EscapeArgumentSnapshot {
+        if value.headers.leaves.is_empty() {
+            // A scalar or carrier projection can retain only the resolved source-storage bit; it
+            // has no value header whose directory walk below could reconstruct that locality.
+            baseline.storage_is_local |= value.storage_is_local;
+        }
+        if value.headers.leaves.is_empty()
+            && value.non_storage == EscapeRegionFact::default()
+            && value.content_ended.is_empty()
+            && value.content_unknown.is_empty()
+        {
+            return baseline;
+        }
+
+        let mut content_region = value
+            .non_storage
+            .shortest_region()
+            .unwrap_or(Region::Static);
+        let mut retained_region = content_region;
+        let mut storage_region: Option<Region> = None;
+        let mut storage_is_local = if value.headers.leaves.is_empty() {
+            baseline.storage_is_local
+        } else {
+            value.storage_is_local
+        };
+        let mut allocation: Option<EscapeAllocationMode> = None;
+        let mut resolved_backing: Option<EscapeBackingStorage> = None;
+        let mut exact = true;
+        let value_headers = storage_type_paths(
+            ty,
+            self.storage_type_context(),
+        );
+
+        for (path, leaf) in &value.headers.leaves {
+            let resolved = self
+                .state
+                .resolve_storage_leaf(leaf, &mut Vec::new());
+            let lifetime_only = !leaf.known
+                && leaf.generations.is_empty()
+                && leaf.fallback_roots.is_empty()
+                && value
+                    .non_storage
+                    .project_path(path)
+                    .shortest_region()
+                    .is_some();
+            exact &= leaf.known && resolved.identity_known;
+            if let Some(region) = resolved.content.regions.shortest_region() {
+                content_region = content_region.shorter(region);
+                retained_region = retained_region.shorter(region);
+            }
+            if !resolved.content.ended.is_empty()
+                || (!lifetime_only && !resolved.content.unknown.is_empty())
+            {
+                content_region = content_region.shorter(Region::Frame);
+                retained_region = retained_region.shorter(Region::Frame);
+            }
+            if let Some(region) = resolved.storage_region {
+                storage_region = Some(storage_region.map_or(region, |current| {
+                    current.shorter(region)
+                }));
+                let is_value_header = value_headers.headers.iter().any(|header| {
+                    header.path == *path
+                        && leaf.descriptor.is_some_and(|descriptor| {
+                            descriptor.ty == header.ty && descriptor.kind == header.kind
+                        })
+                });
+                if !is_value_header
+                    || leaf
+                        .descriptor
+                        .is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::View)
+                {
+                    retained_region = retained_region.shorter(region);
+                    content_region = content_region.shorter(region);
+                    storage_is_local |= !region.is_returnable();
+                }
+                if leaf.descriptor.is_some_and(|descriptor| {
+                    matches!(
+                        descriptor.kind,
+                        StorageHeaderKind::View | StorageHeaderKind::OwnedDynamic
+                    )
+                }) {
+                    let mut backing = EscapeBackingStorage::known(region);
+                    backing.roots.extend(resolved.releases.iter().filter_map(|release| {
+                        match release {
+                            EscapeReleasePlace::Local { local, .. } => Some(*local),
+                            EscapeReleasePlace::Staging { .. }
+                            | EscapeReleasePlace::Arena { .. } => None,
+                        }
+                    }));
+                    resolved_backing = Some(resolved_backing.map_or(backing.clone(), |current| {
+                        current.join(&backing)
+                    }));
+                }
+                if leaf.descriptor.is_some_and(|descriptor| {
+                    descriptor.kind == StorageHeaderKind::OwnedDynamic
+                }) && resolved
+                    .allocation
+                    .is_some_and(|allocation| !allocation.may_individual)
+                {
+                    // Region-owned dynamic storage cannot transfer out of its caller/arena even
+                    // though an individually released heap result can. Retain that allocation
+                    // region in the value lifetime without conflating heap storage with contents.
+                    retained_region = retained_region.shorter(region);
+                    content_region = content_region.shorter(region);
+                }
+            }
+            if leaf
+                .descriptor
+                .is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::View)
+                && resolved
+                    .allocation
+                    .is_some_and(|allocation| allocation.may_individual)
+            {
+                // A view may join caller storage with a locally released generation. The backing
+                // directory's strict region joins toward the longer-lived alternative for writes,
+                // so preserve the independent may-individual bit for escape rejection.
+                storage_is_local = true;
+            }
+            if let Some(mode) = resolved.allocation
+                && leaf
+                    .descriptor
+                    .is_some_and(|descriptor| {
+                        descriptor.kind == StorageHeaderKind::OwnedDynamic
+                    })
+            {
+                allocation = Some(allocation.map_or(mode, |current| current.join(mode)));
+            }
+        }
+
+        if !value.content_ended.is_empty() || !value.content_unknown.is_empty() {
+            content_region = content_region.shorter(Region::Frame);
+            retained_region = retained_region.shorter(Region::Frame);
+            storage_is_local = true;
+        }
+        baseline.content_region = content_region;
+        baseline.retained_contained_region = retained_region;
+        baseline.storage_region = storage_region.unwrap_or(Region::Static);
+        baseline.storage_is_local = storage_is_local;
+        if let Some(mut backing) = resolved_backing {
+            backing.known &= exact;
+            // Caller-backed parameter generations intentionally have no callee release place.
+            // Keep the observer roots carried by the completed legacy snapshot so copying such a
+            // header cannot launder indexed mutation through a by-value/shared parameter, and so
+            // aliases that predate a store continue to observe its content transition.
+            backing
+                .roots
+                .extend(baseline.mutable_backing.roots.iter().copied());
+            baseline.mutable_backing = backing;
+        }
+        if let Some(allocation) = allocation {
+            baseline.individual = allocation.individual;
+            baseline.may_individual = allocation.may_individual;
+        }
+        baseline
+    }
+
+    fn block_escape_value(&self, block: &Block) -> EscapeValueFact {
+        block
+            .value
+            .as_deref()
+            .map_or_else(EscapeValueFact::default, |value| {
+                self.completed_escape_value(value)
+            })
+    }
+
+    fn retarget_escape_root_header(
+        &self,
+        mut value: EscapeValueFact,
+        result_ty: Ty,
+        content_suffix: &[BorrowProjection],
+    ) -> EscapeValueFact {
+        let paths = storage_type_paths(
+            result_ty,
+            StorageTypeContext {
+                structs: self.structs,
+                tuples: self.tuples,
+                enums: self.enums,
+                tagged_types: self.tagged_types,
+            },
+        );
+        let Some(header) = paths
+            .valid
+            .then_some(paths.headers)
+            .into_iter()
+            .flatten()
+            .find(|header| header.path.is_empty())
+        else {
+            value.headers = ProjectedHeaderFact::default();
+            return value;
+        };
+        let Some(mut leaf) = value.headers.leaves.get(&Vec::new()).cloned() else {
+            value.headers = ProjectedHeaderFact::default();
+            return value;
+        };
+        leaf.generations = std::mem::take(&mut leaf.generations)
+            .into_iter()
+            .map(|mut reference| {
+                reference.content_path =
+                    reference.select_content_path(content_suffix.iter().copied());
+                reference
+            })
+            .collect();
+        leaf.descriptor = Some(StorageHeaderDescriptor {
+            ty: header.ty,
+            kind: header.kind,
+        });
+        value.headers = ProjectedHeaderFact::from_leaf(Vec::new(), leaf);
+        value
+    }
+
+    fn indexed_escape_content(&self, expression: &Expr) -> EscapeValueFact {
+        let (recv, index, fields) = match &expression.kind {
+            ExprKind::Index { recv, index } => (recv.as_ref(), index.as_ref(), &[][..]),
+            ExprKind::ElemField {
+                recv, index, path, ..
+            } => (recv.as_ref(), index.as_ref(), path.as_slice()),
+            _ => return EscapeValueFact::default(),
+        };
+        let recv_value = self.completed_escape_value(recv);
+        let exact_index = match index.kind {
+            ExprKind::Int(value) if value >= 0 => Some(value as u128),
+            _ => None,
+        };
+        self.select_indexed_escape_content(
+            recv_value,
+            recv.ty,
+            exact_index,
+            fields,
+            expression.ty,
+        )
+    }
+
+    fn select_indexed_escape_content(
+        &self,
+        recv_value: EscapeValueFact,
+        recv_ty: Ty,
+        exact_index: Option<u128>,
+        fields: &[u32],
+        result_ty: Ty,
+    ) -> EscapeValueFact {
+        let element_paths = match expand_tagged_ty(recv_ty, self.tagged_types) {
+            Ty::Array(_, len) | Ty::StructArray(_, len) => match exact_index {
+                Some(value) if value < len as u128 => {
+                    vec![vec![BorrowProjection::ArrayElement(value as u32)]]
+                }
+                _ => (0..len)
+                    .map(|candidate| vec![BorrowProjection::ArrayElement(candidate)])
+                    .collect(),
+            },
+            _ => vec![Vec::new()],
+        };
+        let field_path = fields
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let result_paths = storage_type_paths(
+            result_ty,
+            StorageTypeContext {
+                structs: self.structs,
+                tuples: self.tuples,
+                enums: self.enums,
+                tagged_types: self.tagged_types,
+            },
+        );
+        let mut selected = Vec::new();
+        for leaf in recv_value.headers.leaves.values() {
+            for element_path in &element_paths {
+                let content_path = element_path
+                    .iter()
+                    .chain(&field_path)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let resolved = self.state.resolve_storage_leaf_content(
+                    leaf,
+                    &content_path,
+                    &mut Vec::new(),
+                );
+                let non_storage = resolved.content.regions;
+                let mut content_ended = resolved.content.ended;
+                if let Some(ended) = resolved.ended {
+                    content_ended
+                        .entry(Vec::new())
+                        .and_modify(|current| *current = (*current).min(ended))
+                        .or_insert(ended);
+                }
+                let mut content_unknown = resolved.content.unknown;
+                if !resolved.identity_known {
+                    content_unknown.insert(Vec::new());
+                }
+                let mut headers = resolved.dependencies;
+                if !content_unknown.is_empty() {
+                    for header in &result_paths.headers {
+                        headers.leaves.entry(header.path.clone()).or_insert_with(|| {
+                            StorageHeaderLeaf::unknown_typed(
+                                leaf.fallback_roots.clone(),
+                                StorageHeaderDescriptor {
+                                    ty: header.ty,
+                                    kind: header.kind,
+                                },
+                            )
+                        });
+                    }
+                }
+                selected.push(EscapeValueFact {
+                    non_storage,
+                    headers,
+                    content_ended,
+                    content_unknown,
+                    // The selected element retains the generation's contents, not the outer
+                    // collection's own backing lifetime. Nested header dependencies are resolved
+                    // from `headers` when the result snapshot is folded.
+                    storage_is_local: false,
+                    individual: false,
+                    may_individual: false,
+                });
+            }
+        }
+        if selected.is_empty() && !recv_value.headers.leaves.is_empty() {
+            let mut failed = self.fail_closed_escape_value(result_ty, 0);
+            failed.storage_is_local |= recv_value.storage_is_local;
+            failed
+        } else {
+            Self::join_escape_value_facts(selected)
+        }
+    }
+
+    fn borrowed_element_storage_path(
+        base: &hir::BorrowedElementBase,
+    ) -> Option<StoragePath> {
+        if base.path.first() != Some(&hir::BorrowedPathSegment::RootSlot) {
+            return None;
+        }
+        base.path
+            .iter()
+            .skip(1)
+            .map(|segment| match *segment {
+                hir::BorrowedPathSegment::RootSlot => None,
+                hir::BorrowedPathSegment::StructField(field) => {
+                    Some(BorrowProjection::StructField(field))
+                }
+                hir::BorrowedPathSegment::EnumPayload {
+                    variant,
+                    payload_ordinal,
+                } => Some(BorrowProjection::EnumPayload {
+                    variant,
+                    index: payload_ordinal,
+                }),
+                hir::BorrowedPathSegment::OptionSome => Some(BorrowProjection::OptionSome),
+                hir::BorrowedPathSegment::ResultOk => Some(BorrowProjection::ResultOk),
+                hir::BorrowedPathSegment::ResultErr => Some(BorrowProjection::ResultErr),
+            })
+            .collect()
+    }
+
+    fn forwarded_escape_value(
+        &self,
+        expression: &Expr,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> EscapeValueFact {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return self.completed_escape_value(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(local) => self
+                .state
+                .storage_values
+                .get(local)
+                .cloned()
+                .unwrap_or_else(|| self.legacy_escape_value(expression)),
+            ExprKind::ArrayToSlice(inner) => self.retarget_escape_root_header(
+                self.completed_escape_value(inner),
+                expression.ty,
+                &[],
+            ),
+            ExprKind::SliceRange { recv, .. } => self.retarget_escape_root_header(
+                self.completed_escape_value(recv),
+                expression.ty,
+                &[],
+            ),
+            ExprKind::Field { root, path } => self
+                .state
+                .storage_values
+                .get(root)
+                .cloned()
+                .unwrap_or_default()
+                .project_path(
+                    &path
+                        .iter()
+                        .copied()
+                        .map(BorrowProjection::StructField)
+                        .collect::<Vec<_>>(),
+                ),
+            ExprKind::TupleIndex { recv, index } => self
+                .completed_escape_value(recv)
+                .project_path(&[BorrowProjection::TupleElement(*index)]),
+            ExprKind::SoaColumn { base, field, .. } => self.retarget_escape_root_header(
+                self.state
+                    .storage_values
+                    .get(base)
+                    .cloned()
+                    .unwrap_or_default(),
+                expression.ty,
+                &[BorrowProjection::StructField(*field)],
+            ),
+            ExprKind::Index { .. } | ExprKind::ElemField { .. } => {
+                self.indexed_escape_content(expression)
+            }
+            ExprKind::IndexField { base, index, path } => {
+                let Some(recv_ty) = self.f.locals.get(*base as usize).map(|local| local.ty)
+                else {
+                    return self.fail_closed_escape_value(expression.ty, 0);
+                };
+                let recv_value = self
+                    .state
+                    .storage_values
+                    .get(base)
+                    .cloned()
+                    .unwrap_or_else(|| self.fail_closed_escape_value(recv_ty, 0));
+                self.select_indexed_escape_content(
+                    recv_value,
+                    recv_ty,
+                    Some(*index as u128),
+                    path,
+                    expression.ty,
+                )
+            }
+            ExprKind::BorrowedIndex { base, .. } => {
+                let Some(path) = Self::borrowed_element_storage_path(base) else {
+                    return self.fail_closed_escape_value(expression.ty, 0);
+                };
+                let recv_value = self
+                    .state
+                    .storage_values
+                    .get(&base.root_local)
+                    .cloned()
+                    .map(|value| value.project_path(&path))
+                    .unwrap_or_else(|| self.fail_closed_escape_value(base.array_ty, 0));
+                self.select_indexed_escape_content(
+                    recv_value,
+                    base.array_ty,
+                    None,
+                    &[],
+                    expression.ty,
+                )
+            }
+            ExprKind::StructLit { fields, .. } => Self::join_escape_value_facts(
+                fields.iter().enumerate().map(|(index, field)| {
+                    self.completed_escape_value(field)
+                        .prefixed(BorrowProjection::StructField(index as u32))
+                }),
+            ),
+            ExprKind::Tuple { elems, .. } => Self::join_escape_value_facts(
+                elems.iter().enumerate().map(|(index, element)| {
+                    self.completed_escape_value(element)
+                        .prefixed(BorrowProjection::TupleElement(index as u32))
+                }),
+            ),
+            ExprKind::OptionSome(value) => self
+                .completed_escape_value(value)
+                .prefixed(BorrowProjection::OptionSome),
+            ExprKind::ResultOk(value) => self
+                .completed_escape_value(value)
+                .prefixed(BorrowProjection::ResultOk),
+            ExprKind::ResultErr(value) => self
+                .completed_escape_value(value)
+                .prefixed(BorrowProjection::ResultErr),
+            ExprKind::EnumValue {
+                variant, payload, ..
+            } => Self::join_escape_value_facts(payload.iter().enumerate().map(
+                |(index, value)| {
+                    self.completed_escape_value(value).prefixed(
+                        BorrowProjection::EnumPayload {
+                            variant: *variant,
+                            index: index as u32,
+                        },
+                    )
+                },
+            )),
+            ExprKind::Closure { lifted, captures } => {
+                let Some(target) =
+                    self.storage_callable_target_id(storage_provenance, lifted)
+                else {
+                    return self.fail_closed_escape_value(expression.ty, 0);
+                };
+                Self::join_escape_value_facts(captures.iter().enumerate().map(
+                    |(index, capture)| {
+                        self.completed_escape_value(capture)
+                            .prefixed(BorrowProjection::ClosureCapture(index as u32))
+                            .prefixed(BorrowProjection::ClosureTarget(target))
+                    },
+                ))
+            }
+            ExprKind::Try(result) => self
+                .completed_escape_value(result)
+                .project_path(&[BorrowProjection::ResultOk]),
+            ExprKind::ResultMapErr { result, .. } => self.completed_escape_value(result),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let success_projection = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                    Ty::Option(_) => Some(BorrowProjection::OptionSome),
+                    Ty::Result(..) => Some(BorrowProjection::ResultOk),
+                    _ => None,
+                };
+                let success = success_projection.map_or_else(EscapeValueFact::default, |path| {
+                    self.completed_escape_value(opt).project_path(&[path])
+                });
+                success.join(&self.completed_escape_value(fallback))
+            }
+            ExprKind::If { then, els, .. } => Self::join_escape_value_facts(
+                [then, els].into_iter().map(|block| self.block_escape_value(block)),
+            ),
+            ExprKind::Match { arms, .. } => Self::join_escape_value_facts(
+                arms.iter().map(|arm| self.completed_escape_value(&arm.body)),
+            ),
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => self.block_escape_value(block),
+            ExprKind::TaskGet(inner) | ExprKind::BoxGet(inner) => {
+                self.completed_escape_value(inner)
+            }
+            _ => self.legacy_escape_value(expression),
+        }
+    }
+
+    fn escape_place_fallback_roots(&self, expression: &Expr) -> BorrowRoots {
+        let local_root = |local: LocalId| {
+            self.f
+                .params
+                .iter()
+                .position(|&parameter| parameter == local)
+                .and_then(|position| u32::try_from(position).ok())
+                .map_or(BorrowRoot::Local(local), BorrowRoot::ParamStorage)
+        };
+        let root = match &expression.kind {
+            ExprKind::Local(local)
+            | ExprKind::Field { root: local, .. }
+            | ExprKind::SoaColumn { base: local, .. }
+            | ExprKind::IndexField { base: local, .. }
+            | ExprKind::ArrayDictEncode { base: local, .. } => Some(local_root(*local)),
+            ExprKind::TupleIndex { recv, .. }
+            | ExprKind::Index { recv, .. }
+            | ExprKind::ElemField { recv, .. }
+            | ExprKind::ArrayToSlice(recv)
+            | ExprKind::TaskGet(recv)
+            | ExprKind::BoxGet(recv) => self.escape_place_fallback_roots(recv).into_iter().next(),
+            ExprKind::SliceRange { recv, .. } => {
+                self.escape_place_fallback_roots(recv).into_iter().next()
+            }
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .and_then(|value| self.escape_place_fallback_roots(value).into_iter().next()),
+            _ => None,
+        };
+        root.into_iter().collect()
+    }
+
+    fn escape_call_selection(
+        &self,
+        expression: &Expr,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> CallStorageSelection {
+        call_storage_selection(
+            expression,
+            storage_provenance.named_return_borrow,
+            storage_provenance.callable_targets,
+        )
+    }
+
+    fn selected_escape_call_values(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> Vec<EscapeValueFact> {
+        if let ExprKind::ResultMapErr { result, f } = &expression.kind {
+            let argument = self
+                .completed_escape_value(result)
+                .project_path(&[BorrowProjection::ResultErr]);
+            let callable = self.completed_escape_value(f);
+            let mut selection = self.escape_call_selection(expression, storage_provenance);
+            extend_call_storage_selection_from_targets(
+                &mut selection,
+                callable.headers.leaves.keys().filter_map(|path| match path.first() {
+                    Some(BorrowProjection::ClosureTarget(target)) => Some(*target),
+                    _ => None,
+                }),
+                1,
+                storage_provenance.named_return_borrow,
+                storage_provenance.callable_target_ids,
+            );
+            if !selection.fallback_all
+                && selection.sources.iter().any(|source| match source {
+                    CallSelectedSource::Capture { target, capture } => {
+                        !callable.has_projected_evidence(&[
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ])
+                    }
+                    CallSelectedSource::Argument(_) => false,
+                })
+            {
+                selection.fallback_all = true;
+            }
+            if selection.fallback_all {
+                return vec![argument, callable];
+            }
+            return selection
+                .sources
+                .iter()
+                .filter_map(|source| match source {
+                    CallSelectedSource::Argument(0) => Some(argument.clone()),
+                    CallSelectedSource::Argument(_) => None,
+                    CallSelectedSource::Capture { target, capture } => {
+                        Some(callable.project_path(&[
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ]))
+                    }
+                })
+                .collect();
+        }
+        let call = Self::expr_key(expression);
+        let mut selection = self.escape_call_selection(expression, storage_provenance);
+        let args = match &expression.kind {
+            ExprKind::Call { args, .. }
+            | ExprKind::CallFnValue { args, .. }
+            | ExprKind::RawCall { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        let callable = if let ExprKind::CallFnValue { callee, .. } = &expression.kind {
+            Some(
+                self.state
+                    .storage_callable_snapshots
+                    .get(&call)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.diags.error(
+                            "indirect callee did not produce a storage-generation completion snapshot"
+                                .to_string(),
+                            callee.span,
+                        );
+                        self.fail_closed_escape_value(callee.ty, depth)
+                    }),
+            )
+        } else {
+            None
+        };
+        if let Some(callable) = &callable {
+            extend_call_storage_selection_from_targets(
+                &mut selection,
+                callable.headers.leaves.keys().filter_map(|path| match path.first() {
+                    Some(BorrowProjection::ClosureTarget(target)) => Some(*target),
+                    _ => None,
+                }),
+                args.len(),
+                storage_provenance.named_return_borrow,
+                storage_provenance.callable_target_ids,
+            );
+        }
+        if !selection.fallback_all
+            && selection.sources.iter().any(|source| match source {
+                CallSelectedSource::Capture { target, capture } => callable.as_ref().is_none_or(
+                    |callable| {
+                        !callable.has_projected_evidence(&[
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ])
+                    },
+                ),
+                CallSelectedSource::Argument(_) => false,
+            })
+        {
+            selection.fallback_all = true;
+        }
+        let argument_indices = if selection.fallback_all {
+            (0..args.len()).collect::<std::collections::BTreeSet<_>>()
+        } else {
+            selection
+                .sources
+                .iter()
+                .filter_map(|source| match source {
+                    CallSelectedSource::Argument(index) => Some(*index),
+                    CallSelectedSource::Capture { .. } => None,
+                })
+                .collect()
+        };
+        let mut facts = Vec::new();
+        for index in argument_indices {
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            let fact = self
+                .state
+                .storage_argument_snapshots
+                .get(&(call, index))
+                .cloned()
+                .or_else(|| {
+                    self.state
+                        .storage_completed_expressions
+                        .get(&Self::expr_key(argument))
+                        .cloned()
+                })
+                .unwrap_or_else(|| {
+                    self.diags.error(
+                        "call argument did not produce a storage-generation completion snapshot"
+                            .to_string(),
+                        argument.span,
+                    );
+                    self.fail_closed_escape_value(argument.ty, depth)
+                });
+            facts.push(fact);
+        }
+        if let Some(callable) = callable {
+            if selection.fallback_all {
+                facts.push(callable);
+            } else {
+                facts.extend(selection.sources.iter().filter_map(|source| match source {
+                    CallSelectedSource::Capture { target, capture } => Some(
+                        callable.project_path(&[
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ]),
+                    ),
+                    CallSelectedSource::Argument(_) => None,
+                }));
+            }
+        }
+        facts
+    }
+
+    fn pipeline_storage_source<'b>(&self, expression: &'b Expr) -> Option<&'b Expr> {
+        match &expression.kind {
+            ExprKind::ArrayScan { source, .. }
+            | ExprKind::ArraySort { source, .. }
+            | ExprKind::ArraySortBy { source, .. }
+            | ExprKind::ArrayToArray { source, .. }
+            | ExprKind::ArrayParMap { source, .. }
+            | ExprKind::ArrayPartition { source, .. }
+            | ExprKind::ArrayToSoa { source, .. }
+            | ExprKind::ArrayChunks { source, .. } => Some(source),
+            ExprKind::RandSample { xs, .. } => Some(xs),
+            _ => None,
+        }
+    }
+
+    /// Select the value copied into one materialized pipeline element. In particular, a compiler
+    /// `Project` stage changes the semantic element before the destination generation is seeded;
+    /// retaining the unprojected source aggregate would make an unrelated sibling (or the source
+    /// array's own inline header) appear inside every scalar result element.
+    fn pipeline_escape_element_value(&self, source: &Expr, stages: &[Stage]) -> EscapeValueFact {
+        let element_ty = match expand_tagged_ty(source.ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                scalar_to_ty(element)
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
+            _ => source.ty,
+        };
+        let mut value = self.select_indexed_escape_content(
+            self.completed_escape_value(source),
+            source.ty,
+            None,
+            &[],
+            element_ty,
+        );
+        for stage in stages {
+            match &stage.kind {
+                StageKind::Project { field } => {
+                    value = value.project_path(&[BorrowProjection::StructField(*field)]);
+                }
+                StageKind::Map { captures, .. } => {
+                    // The flattened callable summary cannot distinguish element subpaths here.
+                    // Keep the established conservative union of the input and every capture;
+                    // the materialized result header remains independently fresh.
+                    value = captures.iter().fold(value, |current, capture| {
+                        current.join(&self.completed_escape_value(capture))
+                    });
+                }
+                StageKind::Where { .. }
+                | StageKind::WhereField { .. }
+                | StageKind::WhereStrContains { .. } => {}
+            }
+        }
+        value
+    }
+
+    fn escape_initializer_value(
+        &mut self,
+        expression: &Expr,
+        initializer: StorageContentInitializer,
+        depth: u32,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> EscapeValueFact {
+        match initializer {
+            StorageContentInitializer::FixedLiteral => match &expression.kind {
+                ExprKind::ArrayLit { elems, .. } | ExprKind::ConstArray { elems, .. } => {
+                    Self::join_escape_value_facts(elems.iter().enumerate().map(
+                        |(index, element)| {
+                            self.completed_escape_value(element)
+                                .prefixed(BorrowProjection::ArrayElement(index as u32))
+                        },
+                    ))
+                }
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::PipelineElement
+            | StorageContentInitializer::PartitionElement => {
+                let mut facts = Vec::new();
+                if let Some(source) = self.pipeline_storage_source(expression) {
+                    facts.push(self.pipeline_escape_element_value(
+                        source,
+                        pipeline_stages(&expression.kind).unwrap_or_default(),
+                    ));
+                }
+                facts.extend(
+                    node_captures(&expression.kind)
+                        .iter()
+                        .map(|capture| self.completed_escape_value(capture)),
+                );
+                if let ExprKind::ArrayScan { init, .. } = &expression.kind {
+                    facts.push(self.completed_escape_value(init));
+                }
+                Self::join_escape_value_facts(facts)
+            }
+            StorageContentInitializer::SoaColumns => match &expression.kind {
+                ExprKind::ArrayToSoa { source, .. } => self.completed_escape_value(source),
+                ExprKind::JsonDecodeSoa { input, .. } => self.completed_escape_value(input),
+                _ => EscapeValueFact::default(),
+            },
+            // `clone_in` recursively copies every view-bearing leaf into the named destination.
+            // Its fresh header/content therefore retain only that destination region, which the
+            // completion snapshot and generation directory already record; carrying the source
+            // value here would falsely keep a frame-local input alive through the explicit copy.
+            StorageContentInitializer::CloneIn => EscapeValueFact::default(),
+            StorageContentInitializer::JsonDecoded => match &expression.kind {
+                ExprKind::JsonDecode { input, .. }
+                | ExprKind::JsonOwnedDecode { input, .. }
+                | ExprKind::JsonDecodeArray { input, .. }
+                | ExprKind::JsonDecodeStructArray { input, .. }
+                | ExprKind::JsonDecodeUnion { input, .. } => self.completed_escape_value(input),
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::JsonDocElements => match &expression.kind {
+                ExprKind::JsonDocElems { doc } => self.completed_escape_value(doc),
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::GroupAggregation => match &expression.kind {
+                ExprKind::ArrayGroupAgg { base, .. }
+                | ExprKind::ArrayGroupAggMulti { base, .. } => self
+                    .state
+                    .storage_values
+                    .get(base)
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::CarrierSource => match &expression.kind {
+                ExprKind::ArrayChunks { source, .. } => self.completed_escape_value(source),
+                ExprKind::ArrayDictEncode { base, .. } => self
+                    .state
+                    .storage_values
+                    .get(base)
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::BuilderElement => match &expression.kind {
+                ExprKind::ArrayBuilderBuild(builder) => self.completed_escape_value(builder),
+                _ => EscapeValueFact::default(),
+            },
+            StorageContentInitializer::CallSummary => Self::join_escape_value_facts(
+                self.selected_escape_call_values(expression, depth, storage_provenance),
+            ),
+            StorageContentInitializer::Forwarded
+            | StorageContentInitializer::Aggregate => {
+                self.forwarded_escape_value(expression, storage_provenance)
+            }
+            StorageContentInitializer::UnknownView => {
+                Self::join_escape_value_facts(self.unknown_escape_sources(
+                    expression,
+                    depth,
+                    storage_provenance,
+                ))
+            }
+            StorageContentInitializer::None
+            | StorageContentInitializer::FreshEmpty
+            | StorageContentInitializer::Missing => EscapeValueFact::default(),
+        }
+    }
+
+    fn unknown_escape_sources(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> Vec<EscapeValueFact> {
+        match &expression.kind {
+            ExprKind::Call { .. }
+            | ExprKind::CallFnValue { .. }
+            | ExprKind::RawCall { .. }
+            | ExprKind::ResultMapErr { .. } => self.selected_escape_call_values(
+                expression,
+                depth,
+                storage_provenance,
+            ),
+            ExprKind::ResourceViewFromRaw { owner, .. } => {
+                vec![self.completed_escape_value(owner)]
+            }
+            ExprKind::BufferBytes { buffer } => vec![self.completed_escape_value(buffer)],
+            ExprKind::StrBytes { inner } => vec![self.completed_escape_value(inner)],
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+                vec![self.completed_escape_value(out)]
+            }
+            ExprKind::HttpRespBody { resp } => vec![self.completed_escape_value(resp)],
+            ExprKind::HttpCtxBody { ctx } => vec![self.completed_escape_value(ctx)],
+            _ => Vec::new(),
+        }
+    }
+
+    fn unknown_escape_fallback_roots(
+        &self,
+        expression: &Expr,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> BorrowRoots {
+        let mut roots = BorrowRoots::new();
+        match &expression.kind {
+            ExprKind::Call { args, .. }
+            | ExprKind::CallFnValue { args, .. }
+            | ExprKind::RawCall { args, .. } => {
+                let mut selection = self.escape_call_selection(expression, storage_provenance);
+                if !selection.fallback_all
+                    && let ExprKind::CallFnValue { .. } = &expression.kind
+                {
+                    let callable = self
+                        .state
+                        .storage_callable_snapshots
+                        .get(&Self::expr_key(expression));
+                    if selection.sources.iter().any(|source| match source {
+                        CallSelectedSource::Capture { target, capture } => callable.is_none_or(
+                            |callable| {
+                                !callable.has_projected_evidence(&[
+                                    BorrowProjection::ClosureTarget(*target),
+                                    BorrowProjection::ClosureCapture(*capture),
+                                ])
+                            },
+                        ),
+                        CallSelectedSource::Argument(_) => false,
+                    }) {
+                        selection.fallback_all = true;
+                    }
+                }
+                let selected = if selection.fallback_all {
+                    (0..args.len()).collect::<std::collections::BTreeSet<_>>()
+                } else {
+                    selection
+                        .sources
+                        .iter()
+                        .filter_map(|source| match source {
+                            CallSelectedSource::Argument(index) => Some(*index),
+                            CallSelectedSource::Capture { .. } => None,
+                        })
+                        .collect()
+                };
+                for index in selected {
+                    if let Some(argument) = args.get(index) {
+                        roots.extend(self.escape_place_fallback_roots(argument));
+                    }
+                }
+                if selection.fallback_all
+                    && let ExprKind::CallFnValue { callee, .. } = &expression.kind
+                {
+                    roots.extend(self.escape_place_fallback_roots(callee));
+                }
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                roots.extend(self.escape_place_fallback_roots(result));
+                roots.extend(self.escape_place_fallback_roots(f));
+            }
+            ExprKind::ResourceViewFromRaw { owner, .. } => {
+                roots.extend(self.escape_place_fallback_roots(owner));
+            }
+            ExprKind::BufferBytes { buffer } => {
+                roots.extend(self.escape_place_fallback_roots(buffer));
+            }
+            ExprKind::StrBytes { inner } => {
+                roots.extend(self.escape_place_fallback_roots(inner));
+            }
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+                roots.extend(self.escape_place_fallback_roots(out));
+            }
+            ExprKind::HttpRespBody { resp } => {
+                roots.extend(self.escape_place_fallback_roots(resp));
+            }
+            ExprKind::HttpCtxBody { ctx } => {
+                roots.extend(self.escape_place_fallback_roots(ctx));
+            }
+            _ => {}
+        }
+        roots
+    }
+
+    fn compatible_unknown_escape_leaf(
+        &self,
+        descriptor: StorageHeaderDescriptor,
+        sources: &[EscapeValueFact],
+        mut fallback_roots: BorrowRoots,
+    ) -> StorageHeaderLeaf {
+        let mut generations = std::collections::BTreeSet::new();
+        let mut matched = false;
+        let mut matched_exactly = true;
+        let mut matched_projected_candidate = false;
+        for source in sources {
+            for (path, leaf) in &source.headers.leaves {
+                let compatible = leaf.descriptor.is_some_and(|candidate| {
+                    storage_header_descriptors_compatible(
+                        descriptor,
+                        candidate,
+                        self.tagged_types,
+                    )
+                });
+                if compatible {
+                    matched = true;
+                    matched_projected_candidate |= !path.is_empty();
+                    matched_exactly &= leaf.known && !leaf.generations.is_empty();
+                    generations.extend(leaf.generations.iter().cloned());
+                    fallback_roots.extend(leaf.fallback_roots.iter().copied());
+                }
+            }
+        }
+        // A flattened summary cannot prove that a direct root view preserves its one input header,
+        // so that ordinary identity-call shape remains non-writable. When it selects an aggregate,
+        // however, the complete compatible projected candidate set is closed: a write may update
+        // every same-typed candidate while excluding different-typed sibling headers.
+        let known = matched
+            && matched_exactly
+            && matched_projected_candidate
+            && !generations.is_empty();
+        if known {
+            fallback_roots.clear();
+        }
+        StorageHeaderLeaf {
+            generations,
+            descriptor: Some(descriptor),
+            known,
+            fallback_roots,
+        }
+    }
+
+    /// `map_err` is a two-source sum result: the Ok subtree forwards the receiver, while the Err
+    /// subtree is the ordinary indirect-call result of invoking the mapper on the receiver's Err
+    /// payload. Keeping those halves separate prevents an owned input error from becoming the
+    /// mapped result generation and preserves exact argument/capture backing for view errors.
+    fn form_escape_result_map_err_completion(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> EscapeValueFact {
+        let ExprKind::ResultMapErr { result, .. } = &expression.kind else {
+            return EscapeValueFact::default();
+        };
+        let active = self.active_sum_paths(result);
+        let ok_active = active
+            .as_ref()
+            .is_none_or(|active| active.contains(&BorrowProjection::ResultOk));
+        let err_active = active
+            .as_ref()
+            .is_none_or(|active| active.contains(&BorrowProjection::ResultErr));
+        let baseline = self.legacy_escape_value(expression);
+        let mut value = EscapeValueFact {
+            non_storage: baseline.non_storage,
+            headers: if ok_active {
+                self.completed_escape_value(result)
+                    .project_path(&[BorrowProjection::ResultOk])
+                    .headers
+                    .prefixed(BorrowProjection::ResultOk)
+            } else {
+                ProjectedHeaderFact::default()
+            },
+            content_ended: baseline.content_ended,
+            content_unknown: baseline.content_unknown,
+            storage_is_local: baseline.storage_is_local,
+            individual: baseline.individual,
+            may_individual: baseline.may_individual,
+        };
+        if !err_active {
+            return value;
+        }
+
+        let context = StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        };
+        let paths = storage_type_paths(expression.ty, context);
+        if !paths.valid {
+            return self.fail_closed_escape_value(expression.ty, depth);
+        }
+        let sources = self.selected_escape_call_values(expression, depth, storage_provenance);
+        let initializer = Self::join_escape_value_facts(sources.iter().cloned());
+        let fallback_roots = self.unknown_escape_fallback_roots(expression, storage_provenance);
+        for path in paths
+            .carriers
+            .iter()
+            .filter(|path| path.starts_with(&[BorrowProjection::ResultErr]))
+        {
+            let carrier = path
+                .iter()
+                .rev()
+                .copied()
+                .fold(initializer.clone(), |fact, projection| fact.prefixed(projection));
+            value = value.join(&carrier);
+        }
+
+        let snapshot = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+        let mut formations = Vec::new();
+        for (ordinal, header) in paths
+            .headers
+            .into_iter()
+            .filter(|header| header.path.starts_with(&[BorrowProjection::ResultErr]))
+            .enumerate()
+        {
+            let descriptor = StorageHeaderDescriptor {
+                ty: header.ty,
+                kind: header.kind,
+            };
+            if header.kind == StorageHeaderKind::View {
+                value.headers.leaves.insert(
+                    header.path,
+                    self.compatible_unknown_escape_leaf(
+                        descriptor,
+                        &sources,
+                        fallback_roots.clone(),
+                    ),
+                );
+                continue;
+            }
+            let releases = match snapshot.storage_region {
+                Region::Arena(depth) => [EscapeReleasePlace::Arena { depth }]
+                    .into_iter()
+                    .collect(),
+                Region::Caller(_) => std::collections::BTreeSet::new(),
+                Region::Static | Region::Frame => [EscapeReleasePlace::Staging {
+                    expression: Self::expr_key(expression),
+                    operand: ordinal as u32,
+                    path: header.path.clone(),
+                }]
+                .into_iter()
+                .collect(),
+            };
+            formations.push(StorageHeaderFormation {
+                path: header.path.clone(),
+                generation: StorageGeneration::current(StorageOrigin::producer(
+                    expression,
+                    &header.path,
+                )),
+                directory: Some(EscapeGenerationEntry {
+                    descriptor: Some(descriptor),
+                    storage_region: snapshot.storage_region,
+                    allocation: EscapeAllocationMode {
+                        individual: snapshot.individual,
+                        may_individual: snapshot.may_individual,
+                    },
+                    releases,
+                    ended: None,
+                }),
+                content: Some(EscapeGenerationContent {
+                    direct_regions: initializer.non_storage.clone(),
+                    dependencies: initializer.headers.clone(),
+                }),
+            });
+        }
+        if formations.is_empty() {
+            return value;
+        }
+        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
+            |formation| match &formation.generation {
+                StorageGeneration::Current(origin) => Some(origin.clone()),
+                StorageGeneration::Prior(_)
+                | StorageGeneration::ParameterValue { .. }
+                | StorageGeneration::CallerStorage { .. } => None,
+            },
+        ));
+        let mut next = self.state.storage.clone();
+        for content in next.contents.entries.values_mut() {
+            content.rename_generations(&renames);
+        }
+        let Ok(commit) = next.try_form_headers(
+            expression.ty,
+            formations,
+            context,
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) else {
+            return self.fail_closed_escape_value(expression.ty, depth);
+        };
+        self.state.rename_storage_generations(&commit.renames);
+        self.state.storage = next;
+        value.headers = value.headers.join(&commit.headers);
+        value
+    }
+
+    fn form_escape_storage_completion(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) -> EscapeValueFact {
+        if matches!(expression.kind, ExprKind::ResultMapErr { .. }) {
+            return self.form_escape_result_map_err_completion(
+                expression,
+                depth,
+                storage_provenance,
+            );
+        }
+        let context = StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        };
+        let classification = classify_storage_expression(
+            expression,
+            context,
+            match &expression.kind {
+                ExprKind::Closure { lifted, .. } => {
+                    self.storage_callable_target_id(storage_provenance, lifted)
+                }
+                _ => None,
+            },
+        );
+        if !classification.valid {
+            return self.fail_closed_escape_value(expression.ty, depth);
+        }
+        if matches!(
+            classification.policy,
+            StorageVariantPolicy::Forward | StorageVariantPolicy::Aggregate
+        ) {
+            return self.forwarded_escape_value(expression, storage_provenance);
+        }
+
+        let baseline = self.legacy_escape_value(expression);
+        let baseline_content_region = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(expression))
+            .map(|snapshot| snapshot.content_region)
+            .unwrap_or(Region::Frame);
+        let mut value = EscapeValueFact {
+            non_storage: baseline.non_storage,
+            headers: ProjectedHeaderFact::default(),
+            content_ended: baseline.content_ended,
+            content_unknown: baseline.content_unknown,
+            storage_is_local: baseline.storage_is_local,
+            individual: baseline.individual,
+            may_individual: baseline.may_individual,
+        };
+        let mut formations = Vec::new();
+        for (ordinal, result) in classification.results.iter().enumerate() {
+            match result.role {
+                StorageExprRole::HeaderProducer => {
+                    let Some(descriptor) = result.header_ty.zip(result.header_kind).map(
+                        |(ty, kind)| StorageHeaderDescriptor { ty, kind },
+                    ) else {
+                        continue;
+                    };
+                    let unknown_identity = result.initializer
+                        == StorageContentInitializer::UnknownView
+                        || (result.header_kind == Some(StorageHeaderKind::View)
+                            && result.initializer == StorageContentInitializer::CallSummary);
+                    if unknown_identity {
+                        let sources = self.unknown_escape_sources(
+                            expression,
+                            depth,
+                            storage_provenance,
+                        );
+                        let mut fallback_roots = self.unknown_escape_fallback_roots(
+                            expression,
+                            storage_provenance,
+                        );
+                        let frozen =
+                            Self::join_escape_value_facts(sources.iter().cloned());
+                        // `str.bytes()` creates a slice header over a scalar `str` view. The
+                        // source has no same-typed header generation to forward, but its lifetime
+                        // region is still exact. Give the new view occurrence its own generation
+                        // so a static literal or caller-derived `str` does not become an unknown
+                        // Frame borrow merely because the source is headerless.
+                        if matches!(expression.kind, ExprKind::StrBytes { .. })
+                            && sources.iter().all(|source| {
+                                source.headers.leaves.is_empty()
+                                    && source.content_ended.is_empty()
+                                    && source.content_unknown.is_empty()
+                            })
+                            && let Some(storage_region) = frozen.non_storage.shortest_region()
+                        {
+                            formations.push(StorageHeaderFormation {
+                                path: result.path.clone(),
+                                generation: StorageGeneration::current(StorageOrigin::producer(
+                                    expression,
+                                    &result.path,
+                                )),
+                                directory: Some(EscapeGenerationEntry {
+                                    descriptor: Some(descriptor),
+                                    storage_region,
+                                    allocation: EscapeAllocationMode {
+                                        individual: false,
+                                        may_individual: false,
+                                    },
+                                    releases: std::collections::BTreeSet::new(),
+                                    ended: None,
+                                }),
+                                content: Some(EscapeGenerationContent {
+                                    direct_regions: EscapeRegionFact::default(),
+                                    dependencies: ProjectedHeaderFact::default(),
+                                }),
+                            });
+                            continue;
+                        }
+                        // A call summary can prove the returned view's lifetime without proving
+                        // writable header identity. Resource owners/references are the canonical
+                        // cases: their header type differs from the returned row view, while the
+                        // legacy return-region summary still identifies the exact caller lifetime.
+                        // Keep the leaf unknown for aliasing, but do not replace that region with a
+                        // synthetic local fallback.
+                        if sources.iter().all(|source| {
+                            source.content_ended.is_empty()
+                                && source.content_unknown.is_empty()
+                        }) {
+                            fallback_roots.clear();
+                            value.non_storage = value.non_storage.join(
+                                &EscapeRegionFact::at_path(
+                                    &result.path,
+                                    baseline_content_region,
+                                ),
+                            );
+                        }
+                        value.headers.leaves.insert(
+                            result.path.clone(),
+                            self.compatible_unknown_escape_leaf(
+                                descriptor,
+                                &sources,
+                                fallback_roots,
+                            ),
+                        );
+                        value.non_storage = value.non_storage.join(
+                            &frozen.non_storage.prefixed_path(&result.path),
+                        );
+                        continue;
+                    }
+
+                    let initializer =
+                        self.escape_initializer_value(
+                            expression,
+                            result.initializer,
+                            depth,
+                            storage_provenance,
+                        );
+                    let snapshot = self
+                        .state
+                        .completed_expressions
+                        .get(&Self::expr_key(expression))
+                        .cloned()
+                        .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+                    let storage_region = snapshot.storage_region;
+                    let releases = match storage_region {
+                        Region::Arena(depth) => [EscapeReleasePlace::Arena { depth }]
+                            .into_iter()
+                            .collect(),
+                        Region::Caller(_) => std::collections::BTreeSet::new(),
+                        Region::Static | Region::Frame => [EscapeReleasePlace::Staging {
+                            expression: Self::expr_key(expression),
+                            operand: ordinal as u32,
+                            path: result.path.clone(),
+                        }]
+                        .into_iter()
+                        .collect(),
+                    };
+                    let generation = StorageGeneration::current(StorageOrigin::producer(
+                        expression,
+                        &result.path,
+                    ));
+                    formations.push(StorageHeaderFormation {
+                        path: result.path.clone(),
+                        generation,
+                        directory: Some(EscapeGenerationEntry {
+                            descriptor: Some(descriptor),
+                            storage_region,
+                            allocation: EscapeAllocationMode {
+                                individual: snapshot.individual,
+                                may_individual: snapshot.may_individual,
+                            },
+                            releases,
+                            ended: None,
+                        }),
+                        content: Some(EscapeGenerationContent {
+                            direct_regions: initializer.non_storage,
+                            dependencies: initializer.headers,
+                        }),
+                    });
+                }
+                StorageExprRole::CarrierProducer => {
+                    let initializer =
+                        self.escape_initializer_value(
+                            expression,
+                            result.initializer,
+                            depth,
+                            storage_provenance,
+                        );
+                    let carrier = result.path.iter().rev().copied().fold(
+                        initializer,
+                        |fact, projection| fact.prefixed(projection),
+                    );
+                    value = value.join(&carrier);
+                }
+                StorageExprRole::HeaderForwarder => {
+                    value = value.join(
+                        &self.forwarded_escape_value(expression, storage_provenance),
+                    );
+                }
+                StorageExprRole::NoStorage => {
+                    if result.initializer == StorageContentInitializer::CallSummary {
+                        value = value.join(&self.escape_initializer_value(
+                            expression,
+                            result.initializer,
+                            depth,
+                            storage_provenance,
+                        ));
+                    }
+                }
+            }
+        }
+        if formations.is_empty() {
+            return value;
+        }
+
+        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
+            |formation| match &formation.generation {
+                StorageGeneration::Current(origin) => Some(origin.clone()),
+                StorageGeneration::Prior(_)
+                | StorageGeneration::ParameterValue { .. }
+                | StorageGeneration::CallerStorage { .. } => None,
+            },
+        ));
+        let mut next = self.state.storage.clone();
+        for content in next.contents.entries.values_mut() {
+            content.rename_generations(&renames);
+        }
+        let Ok(commit) = next.try_form_headers(
+            expression.ty,
+            formations,
+            context,
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) else {
+            return self.fail_closed_escape_value(expression.ty, depth);
+        };
+        self.state.rename_storage_generations(&commit.renames);
+        self.state.storage = next;
+        value.headers = value.headers.join(&commit.headers);
+        value
+    }
+
+    fn apply_flow_op(
+        &mut self,
+        op: EscapeFlowOp<'a>,
+        state: &mut EscapeState,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) {
         self.state = state.clone();
         match op {
             EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
+            EscapeFlowOp::ExpressionStart(expression) => {
+                self.state.completed_expressions.remove(&expression);
+                self.state.storage_completed_expressions.remove(&expression);
+                self.state
+                    .argument_snapshots
+                    .retain(|(call, _), _| *call != expression);
+                self.state
+                    .storage_argument_snapshots
+                    .retain(|(call, _), _| *call != expression);
+                self.state.callable_capture_snapshots.remove(&expression);
+                self.state.storage_callable_snapshots.remove(&expression);
+            }
+            EscapeFlowOp::ExpressionComplete(expression, depth) => {
+                let key = Self::expr_key(expression);
+                self.state.completed_expressions.remove(&key);
+                self.state.storage_completed_expressions.remove(&key);
+                let snapshot = self.call_completion_snapshot(expression, depth);
+                self.state
+                    .completed_expressions
+                    .insert(key, snapshot.clone());
+                let storage = self.form_escape_storage_completion(
+                    expression,
+                    depth,
+                    storage_provenance,
+                );
+                let snapshot =
+                    self.storage_escape_snapshot(expression.ty, &storage, snapshot);
+                self.state.completed_expressions.insert(key, snapshot);
+                self.state
+                    .storage_completed_expressions
+                    .insert(key, storage);
+                if matches!(
+                    expression.kind,
+                    ExprKind::Call { .. } | ExprKind::CallFnValue { .. } | ExprKind::RawCall { .. }
+                )
+                {
+                    self.state
+                        .argument_snapshots
+                        .retain(|(call, _), _| *call != key);
+                    self.state
+                        .storage_argument_snapshots
+                        .retain(|(call, _), _| *call != key);
+                }
+                if matches!(expression.kind, ExprKind::CallFnValue { .. }) {
+                    self.state.callable_capture_snapshots.remove(&key);
+                    self.state.storage_callable_snapshots.remove(&key);
+                }
+            }
             EscapeFlowOp::DropProvenance(expr, depth) => {
                 if self.aggregate_contains_mixed_ownership(expr, depth) {
                     self.diags.error(
@@ -14424,10 +18067,17 @@ impl<'a> EscapeCheck<'a> {
             }
             EscapeFlowOp::MatchBindings {
                 scrutinee,
+                variants,
                 bindings,
                 borrowed_bindings,
                 depth,
-            } => self.apply_match_bindings(scrutinee, bindings, borrowed_bindings, depth),
+            } => self.apply_match_bindings(
+                scrutinee,
+                variants,
+                bindings,
+                borrowed_bindings,
+                depth,
+            ),
             EscapeFlowOp::ArenaExit {
                 value,
                 value_depth,
@@ -14492,11 +18142,75 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
-            EscapeFlowOp::BorrowMutCall {
+            EscapeFlowOp::ArgumentComplete {
+                call,
+                index,
+                argument,
+                depth,
+            } => {
+                let snapshot = self
+                    .state
+                    .completed_expressions
+                    .get(&Self::expr_key(argument))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.diags.error(
+                            "call argument did not produce an escape completion snapshot"
+                                .to_string(),
+                            argument.span,
+                        );
+                        EscapeArgumentSnapshot::fail_closed()
+                    });
+                self.state
+                    .argument_snapshots
+                    .insert((call, index), snapshot);
+                let storage = self
+                    .state
+                    .storage_completed_expressions
+                    .get(&Self::expr_key(argument))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.diags.error(
+                            "call argument did not produce a storage-generation completion snapshot"
+                                .to_string(),
+                            argument.span,
+                        );
+                        self.fail_closed_escape_value(argument.ty, depth)
+                    });
+                self.state
+                    .storage_argument_snapshots
+                    .insert((call, index), storage);
+            }
+            EscapeFlowOp::CallableCaptureComplete {
+                call,
+                callee,
+                depth,
+            } => {
+                let capture = self.callable_capture_return_region(callee, depth);
+                self.state.callable_capture_snapshots.insert(call, capture);
+                let storage = self
+                    .state
+                    .storage_completed_expressions
+                    .get(&Self::expr_key(callee))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.diags.error(
+                            "indirect callee did not produce a storage-generation completion snapshot"
+                                .to_string(),
+                            callee.span,
+                        );
+                        self.fail_closed_escape_value(callee.ty, depth)
+                    });
+                self.state
+                    .storage_callable_snapshots
+                    .insert(call, storage);
+            }
+            EscapeFlowOp::MutableCall {
+                call,
                 args,
                 destinations,
                 depth,
-            } => self.apply_borrow_mut_calls(args, &destinations, depth),
+            } => self.apply_mutable_calls(call, args, &destinations, depth),
             EscapeFlowOp::RegionBuilderNonMutBorrow { builder, depth } => {
                 if !self.drop_is_individual(builder, depth) {
                     self.diags.error(
@@ -14838,6 +18552,20 @@ impl<'a> EscapeCheck<'a> {
     /// parameter-root summary), and a `slice` must not view a local array. The region-tracked
     /// diagnostic distinguishes a `Frame` borrow of local storage (use `.clone()`) from an arena
     /// allocation.
+    fn slices_an_unnamed_call_result(expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::ArrayToSlice(inner) | ExprKind::SliceRange { recv: inner, .. } => {
+                matches!(inner.kind, ExprKind::Call { .. } | ExprKind::CallFnValue { .. } | ExprKind::RawCall { .. })
+                    || Self::slices_an_unnamed_call_result(inner)
+            }
+            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .is_some_and(Self::slices_an_unnamed_call_result),
+            _ => false,
+        }
+    }
+
     fn check_return_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
         // The shared `array_builder<T>` type also has an individually owned heap constructor, which
@@ -14855,7 +18583,9 @@ impl<'a> EscapeCheck<'a> {
         // its dedicated message below; the region branch skips it so the diagnostic is unchanged and
         // not duplicated. An **arena-backed `bytes` view** (`fs.read_bytes_view`) is *not*
         // local-backed, so it flows to the region branch and gets the "allocated in an arena" message.
-        let local_backed = self.mentions_slice(e.ty) && self.slice_is_local(e);
+        let local_backed = self.mentions_slice(e.ty)
+            && self.slice_is_local(e)
+            && !Self::slices_an_unnamed_call_result(e);
         if self.region_bearing(e.ty) && !r.is_returnable() && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
@@ -15084,6 +18814,42 @@ impl<'a> EscapeCheck<'a> {
         self.tracks_region(ty) || self.mentions_slice(ty)
     }
 
+    /// Allocation ownership for fresh dynamic-storage producers whose element/content lifetime
+    /// may be shorter than the buffer lifetime. `region_of` deliberately joins both and therefore
+    /// cannot answer this question for a heap array materialized from an arena-borrowed slice.
+    /// Explicit-region clones and builder results have their own ownership rules below.
+    fn fresh_storage_is_individual(&self, expression: &Expr) -> Option<bool> {
+        if !ty_owns_dyn_array_storage(
+            expression.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) || !matches!(
+            storage_variant_policy(&expression.kind),
+            StorageVariantPolicy::Fresh(_)
+        ) || matches!(
+            expression.kind,
+            ExprKind::CloneIn { .. } | ExprKind::ArrayBuilderBuild(_)
+        ) {
+            return None;
+        }
+        if matches!(
+            &expression.kind,
+            ExprKind::ArrayParMap { source, stages, .. }
+                if par_map_parallelizable(
+                    source.ty,
+                    stages,
+                    self.structs,
+                    self.enums,
+                    self.tagged_types,
+                ) && par_map_result_is_plain_primitive(expression.ty)
+        ) {
+            return Some(true);
+        }
+        Some(!self.allocation_region(expression).is_region_owned())
+    }
+
     /// Whether an owned expression's storage is individually released rather than arena-bulk
     /// released. This is allocation provenance, deliberately separate from borrow/escape Region.
     fn drop_is_individual(&mut self, e: &Expr, depth: u32) -> bool {
@@ -15114,6 +18880,24 @@ impl<'a> EscapeCheck<'a> {
                         values.push(true);
                         continue;
                     }
+                    if ty_owns_dyn_array_storage(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) && let Some(snapshot) = self
+                        .state
+                        .completed_expressions
+                        .get(&Self::expr_key(expression))
+                    {
+                        values.push(snapshot.individual);
+                        continue;
+                    }
+                    if let Some(individual) = self.fresh_storage_is_individual(expression) {
+                        values.push(individual);
+                        continue;
+                    }
                     match &expression.kind {
                         ExprKind::Local(local) => values.push(
                             self.state
@@ -15142,6 +18926,11 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::RawCall { args, return_region, .. } => values.push(
                             !Self::return_region_selects_explicit_region(return_region, args),
                         ),
+                        // A dependent resource retains its parent's lifetime, but its own raw
+                        // handle still has an independent Drop hook. Borrow provenance must not
+                        // turn that cleanup bit off merely because `from_raw_borrowed` names a
+                        // frame-local parent.
+                        ExprKind::ResourceFromRaw { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -15332,7 +19121,24 @@ impl<'a> EscapeCheck<'a> {
                         values.push(true);
                         continue;
                     }
+                    if let Some(individual) = self.fresh_storage_is_individual(expression) {
+                        values.push(individual);
+                        continue;
+                    }
                     match &expression.kind {
+                        _ if ty_owns_dyn_array_storage(
+                            expression.ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        ) && let Some(snapshot) = self
+                            .state
+                            .completed_expressions
+                            .get(&Self::expr_key(expression)) =>
+                        {
+                            values.push(snapshot.may_individual);
+                        }
                         ExprKind::Local(local) => values.push(
                             self.state
                                 .individual_may
@@ -15354,6 +19160,7 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::Call { .. }
                         | ExprKind::CallFnValue { .. }
                         | ExprKind::RawCall { .. } => values.push(true),
+                        ExprKind::ResourceFromRaw { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -15937,6 +19744,32 @@ impl<'a> EscapeCheck<'a> {
         self.replace_callable_region_path(local, &path, value, depth);
     }
 
+    /// Contained region visible through one collection local. A sibling slice alias does not get a
+    /// bespoke write on every mutation; instead it resolves the shared backing roots here. This
+    /// keeps reads and returns through any alias synchronized with direct and `out` element stores.
+    fn local_contained_region(&self, local: LocalId) -> Region {
+        let mut region = self
+            .state
+            .region
+            .get(&local)
+            .copied()
+            .unwrap_or(Region::Static);
+        if let Some(backing) = self.state.backing_storage.get(&local) {
+            for root in &backing.roots {
+                if *root != local {
+                    region = region.shorter(
+                        self.state
+                            .region
+                            .get(root)
+                            .copied()
+                            .unwrap_or(Region::Static),
+                    );
+                }
+            }
+        }
+        region
+    }
+
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
@@ -15964,7 +19797,16 @@ impl<'a> EscapeCheck<'a> {
         let mut values = Vec::new();
         while let Some(item) = work.pop() {
             match item {
-                Work::Eval(expression, depth) => match &expression.kind {
+                Work::Eval(expression, depth) => {
+                    if let Some(snapshot) = self
+                        .state
+                        .completed_expressions
+                        .get(&Self::expr_key(expression))
+                    {
+                        values.push(snapshot.content_region);
+                        continue;
+                    }
+                    match &expression.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
             // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
             // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
@@ -16175,13 +20017,9 @@ impl<'a> EscapeCheck<'a> {
                         .then_some(Region::Frame),
                 )],
             ),
-            ExprKind::BorrowedIndex { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(&base.root_local)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::BorrowedIndex { base, .. } => {
+                values.push(self.local_contained_region(base.root_local));
+            }
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
@@ -16457,8 +20295,7 @@ impl<'a> EscapeCheck<'a> {
                 self.region_capabilities
                     .get(p)
                     .copied()
-                    .or_else(|| self.state.region.get(p).copied())
-                    .unwrap_or(Region::Static),
+                    .unwrap_or_else(|| self.local_contained_region(*p)),
             ),
             // A region builder and the array frozen from it are tied to the explicit destination
             // capability. The heap form has no region operand and remains independently owned.
@@ -16484,13 +20321,7 @@ impl<'a> EscapeCheck<'a> {
                     .collect(),
             ),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { root, .. } => values.push(
-                self.state
-                    .region
-                    .get(root)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::Field { root, .. } => values.push(self.local_contained_region(*root)),
             // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
             // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
@@ -16503,13 +20334,9 @@ impl<'a> EscapeCheck<'a> {
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
             // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
             // so inheriting is harmless — never checked.)
-            | ExprKind::SoaColumn { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(base)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            | ExprKind::SoaColumn { base, .. } => {
+                values.push(self.local_contained_region(*base));
+            }
             ExprKind::Block(block) => {
                 if let Some(value) = block.value.as_deref() {
                     work.push(Work::Eval(value, depth));
@@ -16581,13 +20408,9 @@ impl<'a> EscapeCheck<'a> {
             }
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
-            ExprKind::IndexField { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(base)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::IndexField { base, .. } => {
+                values.push(self.local_contained_region(*base));
+            }
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
             ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
@@ -16902,7 +20725,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
-                },
+                    }
+                }
                 Work::Shorter(count, initial) => {
                     let start = values
                         .len()
@@ -16943,6 +20767,16 @@ impl<'a> EscapeCheck<'a> {
     fn slice_is_local(&self, e: &Expr) -> bool {
         let mut work = vec![e];
         while let Some(expression) = work.pop() {
+            if let Some(snapshot) = self
+                .state
+                .completed_expressions
+                .get(&Self::expr_key(expression))
+            {
+                if snapshot.storage_is_local {
+                    return true;
+                }
+                continue;
+            }
             match &expression.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
             // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
@@ -17325,6 +21159,7 @@ impl<'a> EscapeCheck<'a> {
                         self.allocation_region_by_expr
                             .insert(Self::expr_key(expression), region);
                     }
+                    self.push_flow_op(EscapeFlowOp::ExpressionStart(Self::expr_key(expression)));
                     match &expression.kind {
                         ExprKind::Arena(block) => {
                             let inner = depth + 1;
@@ -17427,6 +21262,7 @@ impl<'a> EscapeCheck<'a> {
                         }
                         ExprKind::Call { func, args, .. } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let call = Self::expr_key(expression);
                             let borrows_args =
                                 matches!(func.as_str(), "print" | "hash64" | "hash128");
                             let modes = self.named_param_modes.get(func);
@@ -17440,11 +21276,20 @@ impl<'a> EscapeCheck<'a> {
                                         EscapeFlowOp::CallTransfer(argument, depth),
                                     ));
                                 }
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::ArgumentComplete {
+                                        call,
+                                        index,
+                                        argument,
+                                        depth,
+                                    },
+                                ));
                                 work.push(EscapeWalkItem::Expr(argument, depth));
                             }
                         }
                         ExprKind::CallFnValue { callee, args } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let call = Self::expr_key(expression);
                             let modes = match callee.ty {
                                 Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
                                     function
@@ -17465,9 +21310,45 @@ impl<'a> EscapeCheck<'a> {
                                         EscapeFlowOp::CallTransfer(argument, depth),
                                     ));
                                 }
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::ArgumentComplete {
+                                        call,
+                                        index,
+                                        argument,
+                                        depth,
+                                    },
+                                ));
+                                work.push(EscapeWalkItem::Expr(argument, depth));
+                            }
+                            work.push(EscapeWalkItem::Op(
+                                EscapeFlowOp::CallableCaptureComplete {
+                                    call,
+                                    callee,
+                                    depth,
+                                },
+                            ));
+                            work.push(EscapeWalkItem::Expr(callee, depth));
+                        }
+                        ExprKind::RawCall {
+                            guard, callee, args, ..
+                        } => {
+                            work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let call = Self::expr_key(expression);
+                            for (index, argument) in args.iter().enumerate().rev() {
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::ArgumentComplete {
+                                        call,
+                                        index,
+                                        argument,
+                                        depth,
+                                    },
+                                ));
                                 work.push(EscapeWalkItem::Expr(argument, depth));
                             }
                             work.push(EscapeWalkItem::Expr(callee, depth));
+                            if let Some(guard) = guard.as_deref() {
+                                work.push(EscapeWalkItem::Expr(guard, depth));
+                            }
                         }
                         ExprKind::Try(result) => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
@@ -17525,7 +21406,8 @@ impl<'a> EscapeCheck<'a> {
                                     .named_borrow_mut_retention
                                     .get(func)
                                     .cloned();
-                                self.record_borrow_mut_call_modes(
+                                self.record_mutable_call_modes(
+                                    Self::expr_key(expression),
                                     args,
                                     &modes,
                                     summary.as_ref(),
@@ -17543,7 +21425,8 @@ impl<'a> EscapeCheck<'a> {
                                         .collect::<Vec<_>>()
                                 })
                             {
-                                self.record_borrow_mut_call_modes(
+                                self.record_mutable_call_modes(
+                                    Self::expr_key(expression),
                                     args,
                                     &modes,
                                     None,
@@ -17553,6 +21436,10 @@ impl<'a> EscapeCheck<'a> {
                         }
                         _ => {}
                     }
+                    self.push_flow_op(EscapeFlowOp::ExpressionComplete(
+                        expression,
+                        depth,
+                    ));
                     if needs_drop_flag(
                         expression.ty,
                         self.structs,
@@ -17739,6 +21626,7 @@ impl<'a> EscapeCheck<'a> {
                     self.flow_current = entry;
                     self.push_flow_op(EscapeFlowOp::MatchBindings {
                         scrutinee,
+                        variants: &arm.variants,
                         bindings: &arm.bindings,
                         borrowed_bindings: &arm.borrowed_bindings,
                         depth,
@@ -17789,8 +21677,361 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    fn selected_explicit_region_backing(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> Option<EscapeBackingStorage> {
+        let hir::ReturnRegionSummary::Roots { params, .. } = summary else {
+            return None;
+        };
+        params
+            .iter()
+            .filter_map(|&index| {
+                let argument = args.get(index as usize)?;
+                (argument.ty == Ty::ArenaHandle)
+                    .then(|| EscapeBackingStorage::known(self.region_of(argument, depth)))
+            })
+            .reduce(|left, right| left.join(&right))
+    }
+
+    /// Possible collection roots selected by a call's return summary. A return-region summary
+    /// proves lifetime dependence, not that a returned slice preserves the exact writable header,
+    /// so these roots make an unresolved alias an observer without making it writable.
+    fn selected_return_backing_roots(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> (bool, std::collections::BTreeSet<LocalId>) {
+        let hir::ReturnRegionSummary::Roots { params, .. } = summary else {
+            return (false, std::collections::BTreeSet::new());
+        };
+        let mut selected_collection = false;
+        let mut roots = std::collections::BTreeSet::new();
+        for &index in params {
+            let Some(argument) = args.get(index as usize) else {
+                continue;
+            };
+            if self.indexed_backing_type(argument.ty) {
+                selected_collection = true;
+                roots.extend(self.backing_storage_of_expr(argument, depth).roots);
+            }
+        }
+        (selected_collection, roots)
+    }
+
+    fn call_backing_storage(
+        &self,
+        summary: Option<&hir::ReturnRegionSummary>,
+        args: &[Expr],
+        depth: u32,
+        owner_lexical: Option<Region>,
+    ) -> EscapeBackingStorage {
+        if let Some(lexical) = owner_lexical {
+            return summary
+                .and_then(|summary| {
+                    self.selected_explicit_region_backing(summary, args, depth)
+                })
+                .unwrap_or_else(|| EscapeBackingStorage::known(lexical));
+        }
+        let (selected_collection, roots) = summary.map_or_else(
+            || (false, std::collections::BTreeSet::new()),
+            |summary| self.selected_return_backing_roots(summary, args, depth),
+        );
+        if !selected_collection
+            && let Some(explicit) = summary.and_then(|summary| {
+                self.selected_explicit_region_backing(summary, args, depth)
+            })
+        {
+            return explicit;
+        }
+        let mut backing = EscapeBackingStorage::unknown();
+        if selected_collection {
+            backing.roots = roots;
+        }
+        backing
+    }
+
+    /// Resolve the writable storage selected by an array/slice expression. This deliberately
+    /// follows only value-preserving view wrappers and control-flow joins. A producer not named
+    /// here is unknown rather than inheriting its content region: for example, a call may return
+    /// a heap-owned array whose elements borrow an arena, and those are different lifetimes.
+    fn backing_storage_of_expr(&self, expression: &Expr, depth: u32) -> EscapeBackingStorage {
+        self.backing_storage_of_expr_with_owner(expression, depth, None)
+    }
+
+    /// Resolve an owned dynamic collection while it is being installed into a binding. Fresh
+    /// arena-free producers are individually freed with that binding, so their storage is the
+    /// binding's lexical region rather than `Static`. Keeping this fallback out of the general
+    /// resolver is essential: an unresolved slice/alias origin must remain fail-closed.
+    fn backing_storage_of_owned_expr(
+        &self,
+        expression: &Expr,
+        depth: u32,
+        lexical: Region,
+    ) -> EscapeBackingStorage {
+        self.backing_storage_of_expr_with_owner(expression, depth, Some(lexical))
+    }
+
+    fn backing_storage_of_expr_with_owner(
+        &self,
+        expression: &Expr,
+        depth: u32,
+        owner_lexical: Option<Region>,
+    ) -> EscapeBackingStorage {
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            Join(usize),
+        }
+
+        fn push_join<'e>(
+            work: &mut Vec<Work<'e>>,
+            children: Vec<(&'e Expr, u32)>,
+        ) {
+            work.push(Work::Join(children.len()));
+            work.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(child, depth)| Work::Eval(child, depth)),
+            );
+        }
+
+        let mut work = vec![Work::Eval(expression, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    if owner_lexical.is_none()
+                        && let Some(snapshot) = self
+                            .state
+                            .completed_expressions
+                            .get(&Self::expr_key(expression))
+                    {
+                        values.push(snapshot.mutable_backing.clone());
+                        continue;
+                    }
+                    match &expression.kind {
+                    ExprKind::Local(local) => values.push(
+                        self.state
+                            .backing_storage
+                            .get(local)
+                            .cloned()
+                            .unwrap_or_else(EscapeBackingStorage::unknown),
+                    ),
+                    ExprKind::ArrayToSlice(inner) | ExprKind::SliceRange { recv: inner, .. } => {
+                        work.push(Work::Eval(inner, depth));
+                    }
+                    ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push(Work::Eval(value, depth));
+                        } else {
+                            values.push(EscapeBackingStorage::unknown());
+                        }
+                    }
+                    ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
+                    | ExprKind::TaskGroup(block) => {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push(Work::Eval(value, depth + 1));
+                        } else {
+                            values.push(EscapeBackingStorage::unknown());
+                        }
+                    }
+                    ExprKind::If { then, els, .. } => push_join(
+                        &mut work,
+                        [then, els]
+                            .into_iter()
+                            .filter(|block| !hir_block_diverges(block))
+                            .filter_map(|block| {
+                                block.value.as_deref().map(|value| (value, depth))
+                            })
+                            .collect(),
+                    ),
+                    ExprKind::Match { arms, .. } => push_join(
+                        &mut work,
+                        arms.iter()
+                            .filter(|arm| !hir_expr_diverges(&arm.body))
+                            .map(|arm| (&arm.body, depth))
+                            .collect(),
+                    ),
+                    ExprKind::ArrayLit { .. } => values.push(EscapeBackingStorage::known(
+                        Region::Frame.shorter(Region::arena(depth)),
+                    )),
+                    ExprKind::ConstArray { .. } => {
+                        values.push(EscapeBackingStorage::known(Region::Static));
+                    }
+                    ExprKind::ArrayBuilderBuild(builder) => {
+                        let region = self.region_of(builder, depth);
+                        values.push(EscapeBackingStorage::known(
+                            if region == Region::Static {
+                                owner_lexical.unwrap_or(region)
+                            } else {
+                                region
+                            },
+                        ));
+                    }
+                    ExprKind::Try(inner) => work.push(Work::Eval(inner, depth)),
+                    ExprKind::Call { func, args, .. } => values.push(
+                        self.call_backing_storage(
+                            self.named_return_region.get(func),
+                            args,
+                            depth,
+                            owner_lexical,
+                        ),
+                    ),
+                    // Function-value results cannot select an explicit region capability, so an
+                    // owned collection result uses free-standing storage owned by the binding.
+                    ExprKind::CallFnValue { .. } => values.push(owner_lexical.map_or_else(
+                        EscapeBackingStorage::unknown,
+                        EscapeBackingStorage::known,
+                    )),
+                    ExprKind::RawCall {
+                        args,
+                        return_region,
+                        ..
+                    } => values.push(self.call_backing_storage(
+                        Some(return_region),
+                        args,
+                        depth,
+                        owner_lexical,
+                    )),
+                    // These collection producers materialize fresh buffers. Only an explicit
+                    // arena entry is useful here: `Static` is also the sentinel for an absent
+                    // allocation entry, while an arena-free dynamic buffer is individually freed
+                    // with its binding and must use that binding's lexical region below.
+                    ExprKind::ArrayToArray { .. }
+                    | ExprKind::ArrayScan { .. }
+                    | ExprKind::ArraySort { .. }
+                    | ExprKind::ArraySortBy { .. }
+                    | ExprKind::ArrayParMap { .. }
+                    | ExprKind::JsonDecodeArray { .. }
+                    | ExprKind::JsonDecodeStructArray { .. } => {
+                        let region = self.allocation_region(expression);
+                        values.push(if region == Region::Static {
+                            owner_lexical.map_or_else(
+                                EscapeBackingStorage::unknown,
+                                EscapeBackingStorage::known,
+                            )
+                        } else {
+                            EscapeBackingStorage::known(region)
+                        });
+                    }
+                    // These producers' column buffers are always allocated in the explicit current
+                    // arena. Their element/content region may additionally borrow an input, so use
+                    // allocation provenance and never `region_of(expression)` here.
+                    ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => {
+                        values.push(EscapeBackingStorage::known(
+                            self.allocation_region(expression),
+                        ));
+                    }
+                    _ => values.push(EscapeBackingStorage::unknown()),
+                    }
+                }
+                Work::Join(count) => {
+                    let Some(start) = values.len().checked_sub(count) else {
+                        values.push(EscapeBackingStorage::unknown());
+                        continue;
+                    };
+                    let mut children = values.drain(start..);
+                    let joined = children.next().map_or_else(
+                        EscapeBackingStorage::unknown,
+                        |first| children.fold(first, |fact, child| fact.join(&child)),
+                    );
+                    values.push(joined);
+                }
+            }
+        }
+        values
+            .pop()
+            .unwrap_or_else(EscapeBackingStorage::unknown)
+    }
+
+    /// Install the backing selected by a new/reassigned local. Slices copy their source fact.
+    /// Fixed and individually released arrays die with their binding. Pure region arrays and soa
+    /// buffers retain the exact allocation region, while the local remains a content-observation
+    /// root for later writes through aliases.
+    fn installed_dynamic_backing_storage(
+        &self,
+        local: LocalId,
+        selected: EscapeBackingStorage,
+        individual: bool,
+        may_individual: bool,
+        depth: u32,
+    ) -> EscapeBackingStorage {
+        let lexical = self.mutable_root_storage_region(local, depth);
+        let mut backing = if individual {
+            // A moved/free-standing dynamic buffer is released with its new binding, even if the
+            // source binding lived in a longer frame or arena.
+            EscapeBackingStorage::known(lexical)
+        } else if may_individual {
+            // A dynamic-cleanup value may select caller-owned region storage on one path and an
+            // individually freed buffer on another. Writes must satisfy the longer-lived target.
+            if selected.known {
+                EscapeBackingStorage::known(lexical.longer(selected.region))
+            } else {
+                EscapeBackingStorage::unknown()
+            }
+        } else if selected.known {
+            EscapeBackingStorage::known(selected.region)
+        } else {
+            // A definitely region-owned value without named allocation provenance is not assumed
+            // to belong to the current use-site arena. Region-bearing writes stay fail-closed.
+            EscapeBackingStorage::unknown()
+        };
+        // Moving an owned header transfers the storage identity to this exact destination. Source
+        // locals no longer observe the moved buffer and must not remain reverse-alias roots.
+        backing.roots.clear();
+        backing.roots.insert(local);
+        backing
+    }
+
+    fn install_local_backing_storage(&mut self, local: LocalId, value: &Expr, depth: u32) {
+        let Some(ty) = self.f.locals.get(local as usize).map(|local| local.ty) else {
+            return;
+        };
+        if !self.indexed_backing_type(ty) {
+            self.state.backing_storage.remove(&local);
+            return;
+        }
+
+        let expanded = expand_tagged_ty(ty, self.tagged_types);
+        let backing = match expanded {
+            Ty::Slice(..) => self.backing_storage_of_expr(value, depth),
+            Ty::Array(..) | Ty::StructArray(..) => {
+                EscapeBackingStorage::known(self.mutable_root_storage_region(local, depth))
+                    .rooted(local)
+            }
+            Ty::DynArray(..) | Ty::DynStructArray(..) => {
+                let lexical = self.mutable_root_storage_region(local, depth);
+                let selected = self.backing_storage_of_owned_expr(value, depth, lexical);
+                let individual = self.drop_is_individual(value, depth);
+                let may_individual = self.drop_may_be_individual(value, depth);
+                self.installed_dynamic_backing_storage(
+                    local,
+                    selected,
+                    individual,
+                    may_individual,
+                    depth,
+                )
+            }
+            Ty::Soa(..) | Ty::SoaParam(..) => {
+                let backing = self.backing_storage_of_expr(value, depth);
+                if materializes_fresh_soa_storage(value) {
+                    backing.rooted(local)
+                } else {
+                    backing
+                }
+            }
+            _ => EscapeBackingStorage::unknown(),
+        };
+        self.state.backing_storage.insert(local, backing);
+    }
+
     /// Storage region of a mutable place rooted at `root`: the symbolic caller place for a
-    /// `borrow mut` parameter, else the root's lexical frame/arena scope. This is the one
+    /// `borrow mut`/`out` parameter, else the root's lexical frame/arena scope. This is the one
     /// destination-side authority; every store path (`Assign`, `AssignField`, and call-site
     /// destination snapshots) must derive its target from here so the caller-place branch cannot
     /// be forgotten in one copy. An unrecorded declaration defaults to the *use-site* depth — the
@@ -17802,7 +22043,10 @@ impl<'a> EscapeCheck<'a> {
             .iter()
             .position(|&parameter| parameter == root)
             .filter(|&position| {
-                self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut)
+                matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+                )
             })
         {
             Region::Caller(position as u32)
@@ -17839,7 +22083,37 @@ impl<'a> EscapeCheck<'a> {
     /// region still bounds arena-owned contents, while the caller place bounds free-standing and
     /// inline storage that `region_of(Local)` otherwise classifies as `Static`.
     fn retained_storage_region(&self, argument: &Expr, depth: u32) -> Region {
+        if let Some(snapshot) = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(argument))
+        {
+            return snapshot.storage_region;
+        }
         let value_region = self.region_of(argument, depth);
+        if argument.ty.is_array_builder() {
+            // A builder's mutable storage belongs to its constructor-selected heap/region. The
+            // local is only the linear header, so applying the ordinary local declaration cap
+            // would turn a caller-region builder into false frame-local storage at every helper
+            // call that retains its existing contents.
+            return value_region;
+        }
+        if matches!(argument.kind, ExprKind::CloneIn { .. })
+            || matches!(argument.kind, ExprKind::ArrayBuilderBuild(_))
+                && value_region.is_region_owned()
+        {
+            // These allocations have no frame-owned hidden release: `clone_in` always copies into
+            // its explicit capability, and a region builder freezes the same caller/arena chunks.
+            // Applying the generic unbound-expression frame cap would erase that destination and
+            // immediately reject the explicit copy at its first aggregate store.
+            return value_region;
+        }
+        if self.indexed_backing_type(argument.ty) {
+            let backing = self.backing_storage_of_expr(argument, depth);
+            if backing.known {
+                return value_region.shorter(backing.region);
+            }
+        }
         if self.borrowed_param_place(argument) {
             return value_region;
         }
@@ -17870,6 +22144,13 @@ impl<'a> EscapeCheck<'a> {
     /// separate local-storage bit because their element type has no region; fold that parallel fact
     /// into the same lexical cap before a mutable destination can retain the slice.
     fn retained_contained_region(&self, argument: &Expr, depth: u32) -> Region {
+        if let Some(snapshot) = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(argument))
+        {
+            return snapshot.retained_contained_region;
+        }
         let value_region = self.region_of(argument, depth);
         if self.slice_is_local(argument) {
             value_region.shorter(self.retained_storage_region(argument, depth))
@@ -17878,56 +22159,487 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    fn apply_borrow_mut_calls(
-        &mut self,
+    #[allow(clippy::too_many_arguments)]
+    fn borrow_mut_replacement_snapshot(
+        &self,
+        destination: &Expr,
+        destination_root: Option<(LocalId, bool)>,
+        completion: Option<&EscapeArgumentSnapshot>,
+        sources: &[BorrowMutRetentionSource],
         args: &[Expr],
-        destinations: &[(usize, Vec<BorrowMutRetentionSource>)],
+        completed: &[Option<EscapeArgumentSnapshot>],
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let destination_ty = expand_tagged_ty(destination.ty, self.tagged_types);
+        // A fixed array's slot is the backing; whole-value assignment replaces elements but cannot
+        // retarget that storage. Header-bearing views and dynamic owners may select new storage.
+        if matches!(destination_ty, Ty::Array(..) | Ty::StructArray(..)) {
+            return completion
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+        }
+
+        let mut selected = std::collections::BTreeSet::new();
+        for source in sources {
+            let index = source.index();
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            if argument.ty == Ty::ArenaHandle
+                || mutable_replacement_backing_compatible(
+                    destination.ty,
+                    argument.ty,
+                    self.tagged_types,
+                )
+            {
+                selected.insert(index);
+            }
+        }
+        let selected_is_empty = selected.is_empty();
+        let mut replacement = selected
+            .into_iter()
+            .filter_map(|index| {
+                let argument = args.get(index)?;
+                let snapshot = completed.get(index)?.as_ref()?.clone();
+                if argument.ty == Ty::ArenaHandle {
+                    let region = snapshot.content_region;
+                    Some(EscapeArgumentSnapshot {
+                        content_region: Region::Static,
+                        retained_contained_region: region,
+                        storage_region: region,
+                        mutable_backing: EscapeBackingStorage::known(region),
+                        storage_is_local: !region.is_returnable(),
+                        individual: false,
+                        may_individual: false,
+                    })
+                } else {
+                    Some(snapshot)
+                }
+            })
+            .reduce(|left, right| left.join(&right))
+            .unwrap_or_else(|| {
+                completion
+                    .cloned()
+                    .unwrap_or_else(EscapeArgumentSnapshot::fail_closed)
+            });
+
+        if selected_is_empty
+            && matches!(destination_ty, Ty::DynArray(..) | Ty::DynStructArray(..))
+            && let Some((root, true)) = destination_root
+        {
+            // A changed owned destination with no retained input can install a fresh heap buffer;
+            // the self-only no-mutation sentinel was removed before this action was recorded. The
+            // caller must therefore treat the post-call owner as at least possibly individual even
+            // though the flattened retention summary has no source root to name.
+            let lexical = self.mutable_root_storage_region(root, depth);
+            replacement.content_region = Region::Static;
+            replacement.retained_contained_region = Region::Static;
+            replacement.storage_region = lexical;
+            replacement.mutable_backing = EscapeBackingStorage::known(lexical).rooted(root);
+            replacement.storage_is_local = true;
+            replacement.individual = true;
+            replacement.may_individual = true;
+        }
+
+        if matches!(destination_ty, Ty::DynArray(..) | Ty::DynStructArray(..))
+            && let Some((root, true)) = destination_root
+        {
+            let selected_backing = replacement.mutable_backing.clone();
+            let selected_storage = replacement.storage_region;
+            replacement.mutable_backing = self.installed_dynamic_backing_storage(
+                root,
+                selected_backing,
+                replacement.individual,
+                replacement.may_individual,
+                depth,
+            );
+            let lexical = self.mutable_root_storage_region(root, depth);
+            replacement.storage_region = if replacement.individual {
+                lexical
+            } else if replacement.may_individual {
+                lexical.shorter(selected_storage)
+            } else {
+                selected_storage
+            };
+            replacement.storage_is_local |= replacement.may_individual
+                || !replacement.mutable_backing.known
+                || !replacement.storage_region.is_returnable();
+        } else if replacement.mutable_backing.roots.is_empty()
+            && replacement.mutable_backing.known
+            && let Some((root, true)) = destination_root
+        {
+            // A region-selected fresh buffer has no source collection identity. The destination
+            // becomes its content-observation root after the strong header update.
+            replacement.mutable_backing = replacement.mutable_backing.rooted(root);
+        }
+        replacement
+    }
+
+    /// Mirror a successful whole-place `borrow mut` collection replacement into the escape
+    /// generation directory. The legacy call lane already computes the exact post-call allocation,
+    /// region, or selected view from the frozen arguments; this action installs that result
+    /// atomically so a later slice of the destination cannot observe its displaced generation.
+    fn apply_escape_mutable_generations(
+        &mut self,
+        call: usize,
+        args: &[Expr],
+        destinations: &[(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)],
+        frozen: &[Option<EscapeValueFact>],
+        post: &std::collections::HashMap<usize, EscapeArgumentSnapshot>,
+    ) {
+        for (index, mode, sources) in destinations {
+            if *mode != ast::ParamMode::BorrowMut {
+                continue;
+            }
+            let Some(Expr {
+                kind: ExprKind::Local(local),
+                ty,
+                ..
+            }) = args.get(*index)
+            else {
+                continue;
+            };
+            let typed = storage_type_paths(*ty, self.storage_type_context());
+            if !typed.valid || typed.headers.is_empty() {
+                continue;
+            }
+            let Some(post) = post.get(index) else {
+                continue;
+            };
+
+            let selected = Self::join_escape_value_facts(sources.iter().filter_map(|source| {
+                frozen.get(source.index()).and_then(Option::as_ref).cloned()
+            }));
+            if typed
+                .headers
+                .iter()
+                .all(|header| header.kind == StorageHeaderKind::View)
+            {
+                let fallback_roots: BorrowRoots = selected
+                    .headers
+                    .leaves
+                    .values()
+                    .flat_map(|leaf| leaf.fallback_roots.iter().copied())
+                    .collect();
+                let headers = ProjectedHeaderFact {
+                    leaves: typed
+                        .headers
+                        .iter()
+                        .map(|header| {
+                            let descriptor = StorageHeaderDescriptor {
+                                ty: header.ty,
+                                kind: header.kind,
+                            };
+                            (
+                                header.path.clone(),
+                                self.compatible_unknown_escape_leaf(
+                                    descriptor,
+                                    std::slice::from_ref(&selected),
+                                    fallback_roots.clone(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                };
+                let installed = EscapeValueFact {
+                    non_storage: selected.non_storage,
+                    headers,
+                    content_ended: selected.content_ended,
+                    content_unknown: selected.content_unknown,
+                    storage_is_local: post.storage_is_local,
+                    individual: false,
+                    may_individual: false,
+                };
+                self.state.storage_values.insert(*local, installed.clone());
+                self.state
+                    .storage_argument_snapshots
+                    .insert((call, *index), installed);
+                continue;
+            }
+            if typed
+                .headers
+                .iter()
+                .any(|header| header.kind != StorageHeaderKind::OwnedDynamic)
+            {
+                continue;
+            }
+            let origins = typed.headers.iter().map(|header| StorageOrigin::CallMutation {
+                call,
+                destination_parameter: *index as u32,
+                path: header.path.clone().into(),
+            });
+            let renames = StorageGenerationRenames::from_origins(origins);
+            self.state.rename_storage_generations(&renames);
+
+            let mut headers = ProjectedHeaderFact::default();
+            for header in &typed.headers {
+                for entry in self.state.storage.directory.entries.values_mut() {
+                    if entry.releases.contains(&EscapeReleasePlace::Local {
+                        local: *local,
+                        path: header.path.clone(),
+                    }) {
+                        entry.ended = Some(
+                            entry
+                                .ended
+                                .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
+                        );
+                    }
+                }
+                let generation = StorageGeneration::current(StorageOrigin::CallMutation {
+                    call,
+                    destination_parameter: *index as u32,
+                    path: header.path.clone().into(),
+                });
+                let releases = if post.may_individual {
+                    [EscapeReleasePlace::Local {
+                        local: *local,
+                        path: header.path.clone(),
+                    }]
+                    .into_iter()
+                    .collect()
+                } else {
+                    match post.storage_region {
+                        Region::Arena(depth) => [EscapeReleasePlace::Arena { depth }]
+                            .into_iter()
+                            .collect(),
+                        Region::Static | Region::Caller(_) | Region::Frame => {
+                            std::collections::BTreeSet::new()
+                        }
+                    }
+                };
+                let descriptor = StorageHeaderDescriptor {
+                    ty: header.ty,
+                    kind: header.kind,
+                };
+                self.state.storage.directory.entries.insert(
+                    generation.clone(),
+                    EscapeGenerationEntry {
+                        descriptor: Some(descriptor),
+                        storage_region: post.storage_region,
+                        allocation: EscapeAllocationMode {
+                            individual: post.individual,
+                            may_individual: post.may_individual,
+                        },
+                        releases,
+                        ended: None,
+                    },
+                );
+                self.state.storage.contents.entries.insert(
+                    generation.clone(),
+                    EscapeGenerationContent {
+                        direct_regions: if escape_storage_header_content_may_borrow(
+                            header.ty,
+                            self.storage_type_context(),
+                        ) {
+                            selected.non_storage.clone()
+                        } else {
+                            EscapeRegionFact::default()
+                        },
+                        dependencies: selected.headers.clone(),
+                    },
+                );
+                headers.leaves.insert(
+                    header.path.clone(),
+                    StorageHeaderLeaf::known_typed(generation, descriptor),
+                );
+            }
+            let installed = EscapeValueFact {
+                non_storage: EscapeRegionFact::default(),
+                headers,
+                content_ended: std::collections::BTreeMap::new(),
+                content_unknown: std::collections::BTreeSet::new(),
+                storage_is_local: post.storage_is_local,
+                individual: post.individual,
+                may_individual: post.may_individual,
+            };
+            self.state.storage_values.insert(*local, installed.clone());
+            self.state
+                .storage_argument_snapshots
+                .insert((call, *index), installed);
+        }
+    }
+
+    fn apply_mutable_calls(
+        &mut self,
+        call: usize,
+        args: &[Expr],
+        destinations: &[(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)],
         depth: u32,
     ) {
-        // Every summary source denotes the pre-call value. Snapshot the complete call before
-        // changing any destination: a callee may swap two mutable view-bearing places, and reading
-        // the second source after updating the first would validate the wrong arena lifetime.
-        let snapshots = destinations
-            .iter()
-            .filter_map(|(destination, sources)| {
-                let destination = args.get(*destination)?;
-                // A resource's region is the lifetime of its opaque parent handle. Mutating native
-                // resource state cannot replace that provenance with an ordinary call argument;
-                // doing so would suppress a child resource's Drop hook.
-                if matches!(
-                    expand_tagged_ty(destination.ty, self.tagged_types),
-                    Ty::Resource(_)
-                ) {
-                    return None;
-                }
-                let destination_region =
-                    self.mutable_destination_storage_region(destination, depth);
-                let source_regions = sources
-                    .iter()
-                    .filter_map(|&source| {
-                        let index = source.index();
-                        let argument = args.get(index)?;
-                        self.region_bearing(argument.ty).then(|| {
-                            let region = match source {
-                                BorrowMutRetentionSource::Contained(_) => {
-                                    self.retained_contained_region(argument, depth)
-                                }
-                                BorrowMutRetentionSource::Storage(_) => {
-                                    self.retained_storage_region(argument, depth)
-                                }
-                            };
-                            (index, region)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Some((destination, destination_region, source_regions))
+        struct DestinationSnapshot<'e> {
+            destination_index: usize,
+            mode: ast::ParamMode,
+            destination: &'e Expr,
+            destination_root: Option<(LocalId, bool)>,
+            whole_place_region: Option<Region>,
+            backing: Option<EscapeBackingStorage>,
+            completion: EscapeArgumentSnapshot,
+            replacement: Option<EscapeArgumentSnapshot>,
+            source_regions: Vec<(usize, Region, bool)>,
+            initial_contained_region: Region,
+            backing_observers: std::collections::BTreeSet<LocalId>,
+        }
+
+        // These entries were captured immediately after each argument completed. Keep the vector
+        // through `ExpressionComplete(Call)`: mutable destinations rewrite their entries to
+        // post-call values, and the return summary must select those rather than live syntax or
+        // pre-call actuals. `ExpressionStart` clears stale entries before a later loop iteration.
+        let argument_snapshots = (0..args.len())
+            .map(|index| self.state.argument_snapshots.get(&(call, index)).cloned())
+            .collect::<Vec<_>>();
+        let storage_argument_snapshots = (0..args.len())
+            .map(|index| {
+                self.state
+                    .storage_argument_snapshots
+                    .get(&(call, index))
+                    .cloned()
             })
             .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for (destination_index, mode, sources) in destinations {
+            let Some(destination) = args.get(*destination_index) else {
+                continue;
+            };
+            // A resource's region is the lifetime of its opaque parent handle. Mutating native
+            // resource state cannot replace that provenance with an ordinary call argument;
+            // doing so would suppress a child resource's Drop hook.
+            if matches!(
+                expand_tagged_ty(destination.ty, self.tagged_types),
+                Ty::Resource(_)
+            ) {
+                continue;
+            }
+            let completion = argument_snapshots
+                .get(*destination_index)
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+            let destination_root = self.mutable_destination_root(destination);
+            let replacement = (*mode == ast::ParamMode::BorrowMut
+                && self.indexed_backing_type(destination.ty))
+                .then(|| {
+                    self.borrow_mut_replacement_snapshot(
+                        destination,
+                        destination_root,
+                        Some(&completion),
+                        sources,
+                        args,
+                        &argument_snapshots,
+                        depth,
+                    )
+                });
+            let indexed_retention = self.indexed_backing_type(destination.ty)
+                && self.indexed_content_may_retain_region(destination.ty);
+            let backing = (matches!(mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut)
+                && indexed_retention)
+                .then(|| {
+                    if *mode == ast::ParamMode::BorrowMut {
+                        replacement.as_ref().map_or_else(
+                            || completion.mutable_backing.clone(),
+                            |replacement| {
+                                completion
+                                    .mutable_backing
+                                    .join(&replacement.mutable_backing)
+                            },
+                        )
+                    } else {
+                        completion.mutable_backing.clone()
+                    }
+                });
+            let source_regions = sources
+                .iter()
+                .filter_map(|&source| {
+                    let index = source.index();
+                    let argument = args.get(index)?;
+                    if !self.region_bearing(argument.ty) {
+                        return None;
+                    }
+                    let captured = argument_snapshots.get(index).and_then(Option::as_ref);
+                    let region = captured.map_or(Region::Static, |snapshot| match source {
+                        // `out` mutates elements in the captured destination backing; retaining
+                        // its pre-call elements does not retain the destination slice header.
+                        // Every other contained source is a whole evaluated value, so a numeric
+                        // slice must carry its selected storage lifetime as well as its elements.
+                        BorrowMutRetentionSource::Contained(_)
+                            if *mode == ast::ParamMode::Out
+                                && index == *destination_index =>
+                        {
+                            snapshot.content_region
+                        }
+                        BorrowMutRetentionSource::Contained(_) => {
+                            snapshot.retained_contained_region
+                        }
+                        BorrowMutRetentionSource::Storage(_) => snapshot.storage_region,
+                    });
+                    Some((index, region, captured.is_some()))
+                })
+                .collect::<Vec<_>>();
+            let initial_contained_region = match (*mode, destination_root) {
+                (ast::ParamMode::Out, _) => completion.content_region,
+                (ast::ParamMode::BorrowMut, Some((_, false))) => {
+                    completion.retained_contained_region
+                }
+                _ => Region::Static,
+            };
+            let whole_place_region = (*mode == ast::ParamMode::BorrowMut)
+                .then(|| self.mutable_destination_storage_region(destination, depth));
+            let mut backing_observers = std::collections::BTreeSet::new();
+            if let Some(backing) = &backing {
+                // Do not add the syntactic destination local unconditionally. An `out` slice
+                // header was captured by value when its argument completed; a later eager
+                // argument may legally rebind that local while the call still writes the old
+                // backing. Reverse selection adds the local only when its current fact continues
+                // to observe one of the captured roots. `borrow mut` keeps its separate strong
+                // place update below (and a later rebind is rejected by the place analysis).
+                backing_observers.extend(self.backing_content_observers(&backing.roots));
+            }
+            snapshots.push(DestinationSnapshot {
+                destination_index: *destination_index,
+                mode: *mode,
+                destination,
+                destination_root,
+                whole_place_region,
+                backing,
+                completion,
+                replacement,
+                source_regions,
+                initial_contained_region,
+                backing_observers,
+            });
+        }
 
         let mut updates = std::collections::HashMap::<LocalId, Region>::new();
-        for (destination, destination_region, source_regions) in snapshots {
-            for (source, region) in &source_regions {
-                if !region.outlives(destination_region)
+        let mut backing_updates =
+            std::collections::HashMap::<LocalId, EscapeBackingStorage>::new();
+        let mut local_backed_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut individual_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut individual_may_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut post_argument_updates = std::collections::HashMap::new();
+        for snapshot in snapshots {
+            if let Some(backing) = &snapshot.backing {
+                if !backing.known {
+                    self.diags.error(
+                        "cannot retain through this mutable call because the indexed destination's backing storage is unknown"
+                            .to_string(),
+                        snapshot.destination.span,
+                    );
+                } else if !self.backing_retention_is_visible(backing) {
+                    self.diags.error(
+                        "a caller-backed array element may retain a borrowed view only through an `out` or `borrow mut` parameter"
+                            .to_string(),
+                        snapshot.destination.span,
+                    );
+                }
+            }
+            for (source, region, captured) in &snapshot.source_regions {
+                let whole_place_ok = snapshot
+                    .whole_place_region
+                    .is_none_or(|destination| region.outlives(destination));
+                let backing_ok = snapshot
+                    .backing
+                    .as_ref()
+                    .is_none_or(|backing| !backing.known || region.outlives(backing.region));
+                if (!captured || !whole_place_ok || !backing_ok)
                     && let Some(source) = args.get(*source)
                 {
                     self.diags.error(
@@ -17937,33 +22649,156 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
-            if destination.ty.is_array_builder() {
+            if snapshot.destination.ty.is_array_builder() {
                 continue;
             }
-            let Some((root, whole_place)) = self.mutable_destination_root(destination) else {
-                continue;
-            };
-            let mut retained = if whole_place {
-                Region::Static
-            } else {
-                self.state.region.get(&root).copied().unwrap_or(Region::Static)
-            };
-            for (_, region) in source_regions {
-                retained = retained.shorter(region);
+            let mut retained = snapshot.initial_contained_region;
+            for (_, region, _) in &snapshot.source_regions {
+                retained = retained.shorter(*region);
             }
-            updates
-                .entry(root)
-                .and_modify(|current| *current = current.shorter(retained))
-                .or_insert(retained);
+
+            // `borrow mut` remains a strong whole-header/place update. Indexed mutable calls also
+            // may have changed elements, so every distinct backing root and existing alias joins
+            // the new contained region instead of losing its previous possible contents.
+            if snapshot.mode == ast::ParamMode::BorrowMut
+                && let Some((root, _)) = snapshot.destination_root
+            {
+                updates
+                    .entry(root)
+                    .and_modify(|existing| *existing = existing.shorter(retained))
+                    .or_insert(retained);
+                if self
+                    .f
+                    .locals
+                    .get(root as usize)
+                    .is_some_and(|local| self.indexed_backing_type(local.ty))
+                    && let Some(replacement) = &snapshot.replacement
+                {
+                    let backing = replacement.mutable_backing.clone();
+                    backing_updates
+                        .entry(root)
+                        .and_modify(|existing| *existing = existing.join(&backing))
+                        .or_insert(backing);
+                    if matches!(
+                        self.f.locals.get(root as usize).map(|local| {
+                            expand_tagged_ty(local.ty, self.tagged_types)
+                        }),
+                        Some(Ty::Slice(..))
+                    ) {
+                        local_backed_updates.insert(
+                            root,
+                            replacement.storage_is_local
+                                || !replacement.mutable_backing.known,
+                        );
+                    } else if matches!(
+                        self.f.locals.get(root as usize).map(|local| {
+                            expand_tagged_ty(local.ty, self.tagged_types)
+                        }),
+                        Some(Ty::DynArray(..) | Ty::DynStructArray(..))
+                    ) && snapshot.destination_root == Some((root, true))
+                    {
+                        local_backed_updates.insert(
+                            root,
+                            replacement.may_individual
+                                || replacement.storage_is_local
+                                || !replacement.mutable_backing.known,
+                        );
+                        individual_updates
+                            .entry(root)
+                            .and_modify(|current| *current &= replacement.individual)
+                            .or_insert(replacement.individual);
+                        individual_may_updates
+                            .entry(root)
+                            .and_modify(|current| *current |= replacement.may_individual)
+                            .or_insert(replacement.may_individual);
+                    }
+                }
+            }
+            if snapshot.mode == ast::ParamMode::Out
+                || (snapshot.mode == ast::ParamMode::BorrowMut
+                    && snapshot.backing.is_some())
+            {
+                for root in snapshot.backing_observers {
+                    if snapshot.mode == ast::ParamMode::BorrowMut
+                        && snapshot
+                            .destination_root
+                            .is_some_and(|(destination, _)| destination == root)
+                    {
+                        continue;
+                    }
+                    let current = self
+                        .state
+                        .region
+                        .get(&root)
+                        .copied()
+                        .unwrap_or(Region::Static);
+                    let next = current.shorter(retained);
+                    updates
+                        .entry(root)
+                        .and_modify(|existing| *existing = existing.shorter(next))
+                        .or_insert(next);
+                }
+            }
+
+            let post = match snapshot.mode {
+                ast::ParamMode::BorrowMut => {
+                    let mut post = snapshot
+                        .replacement
+                        .clone()
+                        .unwrap_or_else(|| snapshot.completion.clone());
+                    post.content_region = retained;
+                    post.retained_contained_region = retained;
+                    post.storage_region = post.storage_region.shorter(retained);
+                    post
+                }
+                ast::ParamMode::Out => {
+                    let mut post = snapshot.completion.clone();
+                    post.content_region = post.content_region.shorter(retained);
+                    post.retained_contained_region =
+                        post.retained_contained_region.shorter(retained);
+                    post.storage_region = post.storage_region.shorter(retained);
+                    post
+                }
+                ast::ParamMode::ByValue | ast::ParamMode::Borrow => {
+                    snapshot.completion.clone()
+                }
+            };
+            post_argument_updates
+                .entry(snapshot.destination_index)
+                .and_modify(|current: &mut EscapeArgumentSnapshot| {
+                    *current = current.join(&post)
+                })
+                .or_insert(post);
         }
         self.state.region.extend(updates);
+        self.state.backing_storage.extend(backing_updates);
+        self.state.individual.extend(individual_updates);
+        self.state.individual_may.extend(individual_may_updates);
+        for (local, is_local) in local_backed_updates {
+            if is_local {
+                self.state.local_backed_slice.insert(local);
+            } else {
+                self.state.local_backed_slice.remove(&local);
+            }
+        }
+        self.apply_escape_mutable_generations(
+            call,
+            args,
+            destinations,
+            &storage_argument_snapshots,
+            &post_argument_updates,
+        );
+        for (index, snapshot) in post_argument_updates {
+            self.state.argument_snapshots.insert((call, index), snapshot);
+        }
     }
 
     /// Record concrete caller-region checks for every region-bearing mutable destination. Exact
     /// same-program facts name only arguments retained after return; indirect/imported/malformed
     /// calls keep the conservative all-argument fallback.
-    fn record_borrow_mut_call_modes(
+    fn record_mutable_call_modes(
         &mut self,
+        call: usize,
         args: &'a [Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
@@ -17983,17 +22818,20 @@ impl<'a> EscapeCheck<'a> {
                 });
                 continue;
             }
-            if mode != ast::ParamMode::BorrowMut {
+            if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                 continue;
             }
-            if !self.region_bearing(destination.ty) {
+            if !self.region_bearing(destination.ty)
+                && !self.indexed_backing_type(destination.ty)
+            {
                 continue;
             }
             let sources = borrow_mut_source_indices(summary, index, args.len());
-            destinations.push((index, sources));
+            destinations.push((index, mode, sources));
         }
         if !destinations.is_empty() {
-            self.push_flow_op(EscapeFlowOp::BorrowMutCall {
+            self.push_flow_op(EscapeFlowOp::MutableCall {
+                call,
                 args,
                 destinations,
                 depth,
@@ -18001,9 +22839,464 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    fn direct_escape_storage_source(&self, value: &Expr) -> Option<LocalId> {
+        if let Some(inner) = borrow_transparent_value(value) {
+            return self.direct_escape_storage_source(inner);
+        }
+        match &value.kind {
+            ExprKind::Local(local) => Some(*local),
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .and_then(|tail| self.direct_escape_storage_source(tail)),
+            _ => None,
+        }
+    }
+
+    fn escape_projection_ty(&self, ty: Ty, projection: BorrowProjection) -> Option<Ty> {
+        match (expand_tagged_ty(ty, self.tagged_types), projection) {
+            (Ty::Struct(id), BorrowProjection::StructField(index)) => self
+                .structs
+                .get(id as usize)
+                .and_then(|def| def.fields.get(index as usize))
+                .map(|field| field.ty),
+            (Ty::Tuple(id), BorrowProjection::TupleElement(index)) => self
+                .tuples
+                .get(id as usize)
+                .and_then(|def| def.elems.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
+            (Ty::Array(element, len), BorrowProjection::ArrayElement(index)) if index < len => {
+                Some(scalar_to_ty(element))
+            }
+            (Ty::StructArray(id, len), BorrowProjection::ArrayElement(index)) if index < len => {
+                Some(Ty::Struct(id))
+            }
+            (Ty::Enum(id), BorrowProjection::EnumPayload { variant, index }) => self
+                .enums
+                .get(id as usize)
+                .and_then(|def| def.variants.get(variant as usize))
+                .and_then(|variant| variant.payload.get(index as usize))
+                .copied()
+                .map(scalar_to_ty),
+            (Ty::Option(payload), BorrowProjection::OptionSome) => Some(scalar_to_ty(payload)),
+            (Ty::Result(ok, _), BorrowProjection::ResultOk) => Some(scalar_to_ty(ok)),
+            (Ty::Result(_, err), BorrowProjection::ResultErr) => Some(scalar_to_ty(err)),
+            _ => None,
+        }
+    }
+
+    fn escape_projected_local_ty(
+        &self,
+        local: LocalId,
+        path: &[BorrowProjection],
+    ) -> Option<Ty> {
+        let mut ty = self.f.locals.get(local as usize)?.ty;
+        for &projection in path {
+            ty = self.escape_projection_ty(ty, projection)?;
+        }
+        Some(ty)
+    }
+
+    fn end_escape_release(&mut self, local: LocalId, path: &[BorrowProjection], how: BorrowEnd) {
+        for entry in self.state.storage.directory.entries.values_mut() {
+            if entry.releases.contains(&EscapeReleasePlace::Local {
+                local,
+                path: path.to_vec(),
+            }) {
+                entry.ended = Some(entry.ended.map_or(how, |ended| ended.min(how)));
+            }
+        }
+    }
+
+    /// Install one completed projected value into a local place. This is the Escape-side owner of
+    /// fixed-place generation rebasing, dynamic release transfer, replacement ending, and source
+    /// nulling; binding syntax supplies only the two selectors and whether the payload is moved.
+    #[allow(clippy::too_many_arguments)]
+    fn install_escape_projected_storage(
+        &mut self,
+        local: LocalId,
+        destination_prefix: &[BorrowProjection],
+        incoming: EscapeValueFact,
+        source: Option<(LocalId, StoragePath)>,
+        replacing: bool,
+        owns_selected_value: bool,
+        depth: u32,
+    ) {
+        let Some(destination_ty) = self.escape_projected_local_ty(local, destination_prefix) else {
+            return;
+        };
+        let typed = storage_type_paths(destination_ty, self.storage_type_context());
+        if !typed.valid {
+            let mut destination = self
+                .state
+                .storage_values
+                .get(&local)
+                .cloned()
+                .unwrap_or_default();
+            destination.replace_path(destination_prefix, EscapeValueFact::default());
+            self.state.storage_values.insert(local, destination);
+            return;
+        }
+
+        if replacing {
+            for header in &typed.headers {
+                if header.kind != StorageHeaderKind::OwnedDynamic {
+                    continue;
+                }
+                let mut path = destination_prefix.to_vec();
+                path.extend(&header.path);
+                self.end_escape_release(local, &path, BorrowEnd::Consumed);
+            }
+        }
+
+        let mut installed = incoming;
+        if typed.headers.is_empty()
+            && borrow_leaf_paths_for_type(
+                destination_ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            .is_empty()
+        {
+            // A direct fact on an indexed aggregate element conservatively applies to every
+            // runtime-selected alternative. Once match/destructuring selects a payload whose type
+            // cannot carry a borrow or storage header, that outer fact is no longer type-valid.
+            // Clear it at the common projected-install boundary so scalar siblings cannot inherit
+            // an arena or frame lifetime from a view-bearing alternative.
+            installed = EscapeValueFact::default();
+        }
+        for header in &typed.headers {
+            if header.kind != StorageHeaderKind::InlineFixed {
+                continue;
+            }
+            let source_leaf = installed.headers.leaves.get(&header.path).cloned();
+            let mut content = source_leaf
+                .iter()
+                .flat_map(|leaf| leaf.generations.iter())
+                .filter_map(|reference| {
+                    self.state
+                        .storage
+                        .contents
+                        .entries
+                        .get(&reference.generation)
+                        .map(|content| content.project_path(&reference.content_path))
+                })
+                .reduce(|left, right| left.join(&right))
+                .unwrap_or_default();
+            let mut destination_path = destination_prefix.to_vec();
+            destination_path.extend(&header.path);
+            let origin = StorageOrigin::inline_place(local, &destination_path);
+            let mut generation = StorageGeneration::current(origin.clone());
+            let preserves_live_destination = replacing
+                && self
+                    .state
+                    .storage
+                    .directory
+                    .entries
+                    .get(&generation)
+                    .is_some_and(|entry| {
+                        entry.ended.is_none()
+                            && entry.releases.contains(&EscapeReleasePlace::Local {
+                                local,
+                                path: destination_path.clone(),
+                            })
+                    });
+            if !preserves_live_destination
+                && (self
+                    .state
+                    .storage
+                    .directory
+                    .entries
+                    .contains_key(&generation)
+                    || self
+                        .state
+                        .storage
+                        .contents
+                        .entries
+                        .contains_key(&generation))
+            {
+                let renames = StorageGenerationRenames::from_origins([origin.clone()]);
+                self.state.rename_storage_generations(&renames);
+                content.rename_generations(&renames);
+                generation = StorageGeneration::current(origin);
+            }
+            self.state.storage.directory.entries.insert(
+                generation.clone(),
+                EscapeGenerationEntry {
+                    descriptor: Some(StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    }),
+                    storage_region: self.mutable_root_storage_region(local, depth),
+                    allocation: EscapeAllocationMode {
+                        individual: installed.individual,
+                        may_individual: installed.may_individual,
+                    },
+                    releases: [EscapeReleasePlace::Local {
+                        local,
+                        path: destination_path,
+                    }]
+                    .into_iter()
+                    .collect(),
+                    ended: None,
+                },
+            );
+            self.state
+                .storage
+                .contents
+                .entries
+                .insert(generation.clone(), content);
+            installed.headers.leaves.insert(
+                header.path.clone(),
+                StorageHeaderLeaf::known_typed(
+                    generation.clone(),
+                    StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    },
+                ),
+            );
+            if owns_selected_value {
+                for source_generation in source_leaf
+                    .iter()
+                    .flat_map(|leaf| leaf.generations.iter())
+                    .map(|reference| &reference.generation)
+                    .filter(|source_generation| **source_generation != generation)
+                {
+                    if let Some(entry) = self
+                        .state
+                        .storage
+                        .directory
+                        .entries
+                        .get_mut(source_generation)
+                    {
+                        entry.ended = Some(
+                            entry
+                                .ended
+                                .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
+                        );
+                    }
+                }
+            }
+        }
+
+        if owns_selected_value {
+            let lexical = self.mutable_root_storage_region(local, depth);
+            for header in &typed.headers {
+                if header.kind != StorageHeaderKind::OwnedDynamic {
+                    continue;
+                }
+                let Some(leaf) = installed.headers.leaves.get(&header.path) else {
+                    continue;
+                };
+                for reference in &leaf.generations {
+                    let Some(entry) = self
+                        .state
+                        .storage
+                        .directory
+                        .entries
+                        .get_mut(&reference.generation)
+                    else {
+                        continue;
+                    };
+                    let displaced = entry
+                        .releases
+                        .iter()
+                        .filter(|release| match source.as_ref() {
+                            Some((source, source_prefix)) => matches!(release,
+                                EscapeReleasePlace::Local { local, path }
+                                    if local == source && path.starts_with(source_prefix)),
+                            None => matches!(release,
+                                EscapeReleasePlace::Local { .. }
+                                    | EscapeReleasePlace::Staging { .. }),
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for release in displaced {
+                        entry.releases.remove(&release);
+                    }
+                    entry.storage_region = if entry.allocation.individual {
+                        lexical
+                    } else if entry.allocation.may_individual {
+                        entry.storage_region.longer(lexical)
+                    } else {
+                        entry.storage_region
+                    };
+                    let mut path = destination_prefix.to_vec();
+                    path.extend(&header.path);
+                    entry
+                        .releases
+                        .insert(EscapeReleasePlace::Local { local, path });
+                }
+            }
+        }
+
+        let mut destination = self
+            .state
+            .storage_values
+            .get(&local)
+            .cloned()
+            .unwrap_or_default();
+        destination.replace_path(destination_prefix, installed);
+        self.state.storage_values.insert(local, destination);
+
+        if owns_selected_value
+            && let Some((source, source_prefix)) = source
+            && source != local
+        {
+            let mut source_value = self
+                .state
+                .storage_values
+                .get(&source)
+                .cloned()
+                .unwrap_or_default();
+            source_value.replace_path(&source_prefix, EscapeValueFact::default());
+            self.state.storage_values.insert(source, source_value);
+        }
+    }
+
+    fn escape_match_binding_projection(
+        &self,
+        scrutinee_ty: Ty,
+        variants: &[u32],
+        binding_index: usize,
+    ) -> Option<BorrowProjection> {
+        let &variant = variants.first().filter(|_| variants.len() == 1)?;
+        match expand_tagged_ty(scrutinee_ty, self.tagged_types) {
+            Ty::Enum(_) => Some(BorrowProjection::EnumPayload {
+                variant,
+                index: binding_index as u32,
+            }),
+            Ty::Option(_) if variant == 0 && binding_index == 0 => {
+                Some(BorrowProjection::OptionSome)
+            }
+            Ty::Result(..) if variant == 0 && binding_index == 0 => {
+                Some(BorrowProjection::ResultOk)
+            }
+            Ty::Result(..) if variant == 1 && binding_index == 0 => {
+                Some(BorrowProjection::ResultErr)
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_escape_index_store(
+        &mut self,
+        base: LocalId,
+        index: &Expr,
+        fields: &[u32],
+        value: &Expr,
+    ) {
+        let Some(storage) = self.state.storage_values.get(&base).cloned() else {
+            return;
+        };
+        let incoming = self.completed_escape_value(value);
+        let incoming_content = EscapeGenerationContent {
+            direct_regions: incoming.non_storage,
+            dependencies: incoming.headers,
+        };
+        let exact_index = match index.kind {
+            ExprKind::Int(value) if value >= 0 => Some(value as u128),
+            _ => None,
+        };
+        let field_path = fields
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+
+        for leaf in storage.headers.leaves.values() {
+            for reference in &leaf.generations {
+                let descriptor = self
+                    .state
+                    .storage
+                    .directory
+                    .entries
+                    .get(&reference.generation)
+                    .and_then(|entry| entry.descriptor)
+                    .or(leaf.descriptor);
+                let Some(content) = self
+                    .state
+                    .storage
+                    .contents
+                    .entries
+                    .get_mut(&reference.generation)
+                else {
+                    continue;
+                };
+                let fixed_len = descriptor.and_then(|descriptor| {
+                    match expand_tagged_ty(descriptor.ty, self.tagged_types) {
+                        Ty::Array(_, len) | Ty::StructArray(_, len) => Some(len),
+                        _ => None,
+                    }
+                });
+                if let Some(len) = fixed_len {
+                    let indices: Box<dyn Iterator<Item = u32>> = match exact_index {
+                        Some(index) if index < u128::from(len) => {
+                            Box::new(std::iter::once(index as u32))
+                        }
+                        Some(_) => Box::new(std::iter::empty()),
+                        None => Box::new(0..len),
+                    };
+                    for selected in indices {
+                        let mut path = reference.content_path.clone();
+                        path.push(BorrowProjection::ArrayElement(selected));
+                        path.extend(&field_path);
+                        if exact_index.is_some() {
+                            content.direct_regions.replace_path(
+                                &path,
+                                incoming_content.direct_regions.clone(),
+                            );
+                            content.dependencies.replace_path(
+                                &path,
+                                incoming_content.dependencies.clone(),
+                            );
+                        } else {
+                            let selected = EscapeGenerationContent {
+                                direct_regions: incoming_content
+                                    .direct_regions
+                                    .clone()
+                                    .prefixed_path(&path),
+                                dependencies: path.iter().rev().copied().fold(
+                                    incoming_content.dependencies.clone(),
+                                    |fact, projection| fact.prefixed(projection),
+                                ),
+                            };
+                            *content = content.join(&selected);
+                        }
+                    }
+                } else {
+                    // A dynamic collection aliases all runtime indices. Preserve the previous
+                    // possible elements and add the installed value at the selected field path.
+                    let mut path = reference.content_path.clone();
+                    path.extend(&field_path);
+                    let selected = EscapeGenerationContent {
+                        direct_regions: incoming_content
+                            .direct_regions
+                            .clone()
+                            .prefixed_path(&path),
+                        dependencies: path.iter().rev().copied().fold(
+                            incoming_content.dependencies.clone(),
+                            |fact, projection| fact.prefixed(projection),
+                        ),
+                    };
+                    *content = content.join(&selected);
+                }
+            }
+        }
+    }
+
     fn apply_stmt(&mut self, s: &Stmt, depth: u32) {
         match s {
             Stmt::Let { local, init } => {
+                self.assign_active_sum(*local, init);
                 self.decl_depth.insert(*local, depth);
                 let callable = self.callable_region_fact(init, depth);
                 if callable.is_empty() {
@@ -18053,11 +23346,36 @@ impl<'a> EscapeCheck<'a> {
                 if self.dyn_storage_binding_is_local(init.ty, init, depth) {
                     self.state.local_backed_slice.insert(*local);
                 }
+                self.install_local_backing_storage(*local, init, depth);
+                let owns = self
+                    .f
+                    .locals
+                    .get(*local as usize)
+                    .is_some_and(|record| {
+                        ty_is_move(
+                            record.ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                    });
+                self.install_escape_projected_storage(
+                    *local,
+                    &[],
+                    self.completed_escape_value(init),
+                    self.direct_escape_storage_source(init)
+                        .map(|source| (source, Vec::new())),
+                    false,
+                    owns,
+                    depth,
+                );
             }
             // `base[index] = value` / `base[index].field = value`. The store itself targets the
             // element slot; recurse into the index/value for nested escapes, and — when the element
-            // is region-tracked (a `str` element) — reject storing a shorter-lived value into the
-            // longer-lived array (the `Assign`/`AssignField` region rule, extended to elements).
+            // is region-tracked — validate against the backing buffer rather than its previous
+            // contents. The content transition reaches the syntactic base and every collection root
+            // visible through an alias; backing lifetime remains unchanged.
             Stmt::AssignIndex {
                 base,
                 index: _,
@@ -18103,17 +23421,46 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 if self.region_bearing(value.ty) {
-                    let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
-                    if !self.retained_contained_region(value, depth).outlives(target) {
+                    let backing = self
+                        .state
+                        .backing_storage
+                        .get(base)
+                        .cloned()
+                        .unwrap_or_else(EscapeBackingStorage::unknown);
+                    let incoming = self.retained_contained_region(value, depth);
+                    if !backing.known {
+                        self.diags.error(
+                            "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
+                            value.span,
+                        );
+                    } else if !self.backing_retention_is_visible(&backing) {
+                        self.diags.error(
+                            "a caller-backed array element may retain a borrowed view only through an `out` or `borrow mut` parameter"
+                                .to_string(),
+                            value.span,
+                        );
+                    } else if !incoming.outlives(backing.destination_region()) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
                             value.span,
                         );
                     }
+                    let mut content_roots = self.backing_content_observers(&backing.roots);
+                    content_roots.insert(*base);
+                    for root in content_roots {
+                        let current = self
+                            .state
+                            .region
+                            .get(&root)
+                            .copied()
+                            .unwrap_or(Region::Static);
+                        self.state.region.insert(root, current.shorter(incoming));
+                    }
                 }
                 match s {
                     Stmt::AssignIndex { base, index, value } => {
                         self.replace_callable_array_path(*base, index, &[], value, depth);
+                        self.apply_escape_index_store(*base, index, &[], value);
                     }
                     Stmt::AssignElemField {
                         base,
@@ -18123,6 +23470,7 @@ impl<'a> EscapeCheck<'a> {
                         ..
                     } => {
                         self.replace_callable_array_path(*base, index, path, value, depth);
+                        self.apply_escape_index_store(*base, index, path, value);
                     }
                     Stmt::AssignElem {
                         base,
@@ -18131,12 +23479,16 @@ impl<'a> EscapeCheck<'a> {
                         ..
                     } => {
                         self.replace_callable_array_path(*base, index, &[], value, depth);
+                        self.apply_escape_index_store(*base, index, &[], value);
                     }
                     _ => unreachable!("array assignment group"),
                 }
             }
             Stmt::AssignVecLane { .. } => {}
             Stmt::Assign { local, value, drop_new, .. } => {
+                self.assign_active_sum(*local, value);
+                let exact_self_assignment =
+                    matches!(value.kind, ExprKind::Local(source) if source == *local);
                 let callable = self.callable_region_fact(value, depth);
                 if callable.is_empty() {
                     self.state.callable_capture_region.remove(local);
@@ -18180,8 +23532,34 @@ impl<'a> EscapeCheck<'a> {
                         self.state.local_backed_slice.remove(local);
                     }
                 }
+                self.install_local_backing_storage(*local, value, depth);
+                if !exact_self_assignment {
+                    let owns = self
+                        .f
+                        .locals
+                        .get(*local as usize)
+                        .is_some_and(|record| {
+                            ty_is_move(
+                                record.ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            )
+                        });
+                    self.install_escape_projected_storage(
+                        *local,
+                        &[],
+                        self.completed_escape_value(value),
+                        self.direct_escape_storage_source(value)
+                            .map(|source| (source, Vec::new())),
+                        true,
+                        owns,
+                        depth,
+                    );
+                }
                 if self.region_bearing(value.ty) {
-                    let r = self.retained_contained_region(value, depth);
+                    let retained = self.retained_contained_region(value, depth);
                     // The binding's scope through the one destination authority: the symbolic
                     // caller place for a `borrow mut` parameter, else at least the frame (a
                     // depth-0 binding lives the whole frame, region `Frame`), or the enclosing
@@ -18192,7 +23570,16 @@ impl<'a> EscapeCheck<'a> {
                     // binding stays rejected, and a frame-local view assigned whole into a
                     // `borrow mut` parameter place is rejected against its caller lifetime.
                     let target = self.mutable_root_storage_region(*local, depth);
-                    if !r.outlives(target) {
+                    let typed = storage_type_paths(value.ty, self.storage_type_context());
+                    let completed = self.completed_escape_value(value);
+                    let exact_local_generation = !matches!(target, Region::Caller(_))
+                        && !typed.headers.is_empty()
+                        && typed.headers.iter().all(|header| {
+                            completed.headers.leaves.get(&header.path).is_some_and(|leaf| {
+                                leaf.known && !leaf.generations.is_empty()
+                            })
+                        });
+                    if !retained.outlives(target) && !exact_local_generation {
                         let message = if matches!(target, Region::Caller(_)) {
                             "this value cannot be stored into a longer-lived mutable destination (it would escape its region)"
                         } else {
@@ -18204,7 +23591,17 @@ impl<'a> EscapeCheck<'a> {
                         // the shorter region from all reaching paths, while a straight-line overwrite
                         // can precisely replace an obsolete shorter-lived view. Owned Move locals may
                         // now change region: their path-local MIR flag keeps cleanup provenance exact.
-                        self.state.region.insert(*local, r);
+                        // A fully known generation may also flow into a lexically longer local: its
+                        // release action invalidates that local before any later out-of-region use.
+                        // Unknown headers and caller destinations still require the eager region
+                        // proof above because neither has an exact local invalidation authority.
+                        // The check above includes the assigned value's storage; this state records
+                        // only its contents because `backing_storage` owns the separate header/buffer
+                        // lifetime. Otherwise rebinding a slice to longer-lived storage would make
+                        // its static elements spuriously inherit that storage region.
+                        self.state
+                            .region
+                            .insert(*local, self.region_of(value, depth));
                     }
                 }
             }
@@ -18260,6 +23657,23 @@ impl<'a> EscapeCheck<'a> {
                     .map(BorrowProjection::StructField)
                     .collect::<Vec<_>>();
                 self.replace_callable_region_path(*root, &path, value, depth);
+                let owns = ty_is_move(
+                    value.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                );
+                self.install_escape_projected_storage(
+                    *root,
+                    &path,
+                    self.completed_escape_value(value),
+                    self.direct_escape_storage_source(value)
+                        .map(|source| (source, Vec::new())),
+                    true,
+                    owns,
+                    depth,
+                );
             }
             Stmt::Return(Some(e)) => {
                 // A returned value escapes to the caller: only a `Static` or caller-derived value
@@ -18335,6 +23749,29 @@ impl<'a> EscapeCheck<'a> {
                         self.state.callable_capture_region.insert(*local, selected);
                     }
                 }
+                let source = self.direct_escape_storage_source(init);
+                let completed = self.completed_escape_value(init);
+                let owns_selected = ty_is_move(
+                    init.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                );
+                for (index, local) in locals.iter().enumerate() {
+                    let Some(local) = local else { continue };
+                    let selector = [BorrowProjection::TupleElement(index as u32)];
+                    self.install_local_backing_storage(*local, init, depth);
+                    self.install_escape_projected_storage(
+                        *local,
+                        &[],
+                        completed.project_path(&selector),
+                        source.map(|source| (source, selector.to_vec())),
+                        false,
+                        owns_selected,
+                        depth,
+                    );
+                }
             }
             // `break e` carries `e` out of the loop, so `e` escapes the loop exactly as a returned
             // value escapes the function: it must be `Static`-region (a borrowed Frame/arena view
@@ -18354,6 +23791,7 @@ impl<'a> EscapeCheck<'a> {
     fn apply_match_bindings(
         &mut self,
         scrutinee: &Expr,
+        variants: &[u32],
         bindings: &[LocalId],
         borrowed_bindings: &[hir::BorrowedProjection],
         depth: u32,
@@ -18365,12 +23803,38 @@ impl<'a> EscapeCheck<'a> {
         let may_individual = self.drop_may_be_individual(scrutinee, depth);
         let local_slice =
             self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
-        for binding in bindings {
+        let completed = self.completed_escape_value(scrutinee);
+        let source = self.direct_escape_storage_source(scrutinee);
+        let scrutinee_is_move = ty_is_move(
+            scrutinee.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        for (binding_index, binding) in bindings.iter().enumerate() {
             self.decl_depth.insert(*binding, depth);
-            if borrowed_bindings
+            let borrowed = borrowed_bindings
                 .iter()
-                .any(|projection| projection.binding_local == *binding)
-            {
+                .any(|projection| projection.binding_local == *binding);
+            let selector = self
+                .escape_match_binding_projection(scrutinee.ty, variants, binding_index)
+                .map_or_else(Vec::new, |projection| vec![projection]);
+            let selected = if selector.is_empty() {
+                completed.clone()
+            } else {
+                completed.project_path(&selector)
+            };
+            self.install_escape_projected_storage(
+                *binding,
+                &[],
+                selected,
+                source.map(|source| (source, selector.clone())),
+                false,
+                scrutinee_is_move && !borrowed,
+                depth,
+            );
+            if borrowed {
                 continue;
             }
             if self.f.locals.get(*binding as usize).is_some_and(|local| {
@@ -18404,6 +23868,7 @@ impl<'a> EscapeCheck<'a> {
             if owns {
                 self.state.local_backed_slice.insert(*binding);
             }
+            self.install_local_backing_storage(*binding, scrutinee, depth);
         }
     }
 
@@ -19456,8 +24921,9 @@ struct MoveCheck<'a> {
     /// storage and therefore neither transfer ownership nor contribute their value facts as if
     /// they were by-value copies.
     named_param_modes: &'a std::collections::HashMap<String, Vec<ast::ParamMode>>,
-    /// Same-program exact post-call mutable-retention facts. Absence means the callee body is not
-    /// available and therefore selects the conservative all-compatible-input fallback.
+    /// Same-program exact post-call mutable-retention facts for `borrow mut` and `out`
+    /// destinations. Absence means the callee body is unavailable and therefore selects the
+    /// conservative all-compatible-input fallback.
     named_borrow_mut_retention: &'a BorrowMutRetentionMap,
     /// Direct named calls observed by the exhaustive expression walk. Present only while building
     /// the reverse worklist for named-return inference.
@@ -19480,10 +24946,18 @@ struct MoveCheck<'a> {
     callable_target_ids: &'a std::collections::HashMap<String, u32>,
     /// Parallel-transfer summaries keyed by the same stable target ordinals.
     callable_parallel_targets: &'a CallableTransferSet,
-    /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
-    /// every `break` bound to that loop; their union is the move state after the loop (code past a
-    /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
-    loop_breaks: Vec<Vec<MovedSet>>,
+    /// Reachable accepted-break edges for each enclosing loop, innermost last. Value headers and
+    /// their storage advances stay paired with moved/borrow state until the post-loop join.
+    loop_breaks: Vec<Vec<MoveControlEdge>>,
+    // The checked-HIR depth stress owner constructs MoveCheck directly from a sibling module.
+    // Keep its former fields test-only until that external constructor can use a shared helper;
+    // they are never read by the live control authority.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    loop_borrow_breaks: Vec<Vec<BorrowState>>,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    loop_value_breaks: Vec<BorrowFact>,
     /// Intra-frame borrow provenance and invalidation state. This shares MoveCheck's evaluation
     /// order and control-flow joins, so every consuming position has one source of truth.
     borrows: BorrowState,
@@ -19491,22 +24965,38 @@ struct MoveCheck<'a> {
     /// terminal argument. Snapshot roots live in `BorrowState`, so branch joins and owner
     /// invalidation use the same machinery as ordinary view locals.
     next_pipeline_snapshot: usize,
-    /// Borrow-state snapshots paired with [`Self::loop_breaks`] at each `break` edge.
-    loop_borrow_breaks: Vec<Vec<BorrowState>>,
-    /// Projection-preserving facts carried by value-bearing `break` edges for each active loop.
-    loop_value_breaks: Vec<BorrowFact>,
-    /// Settled value facts of each walked loop expression, keyed by source span.
-    loop_value_facts: std::collections::HashMap<Span, BorrowFact>,
+    /// Settled value facts of each walked loop expression, keyed by immutable HIR node identity.
+    loop_value_facts: std::collections::HashMap<usize, MoveValueFact>,
     /// Settled value facts of walked branch expressions, captured before arm states join.
-    control_value_facts: std::collections::HashMap<Span, BorrowFact>,
+    control_value_facts: std::collections::HashMap<usize, MoveValueFact>,
     /// Settled facts of walked expressions, captured immediately when that expression falls
     /// through. Parent formation reads these snapshots so a later eager sibling cannot rewrite an
     /// earlier runtime value's provenance in a product, residual aggregate, or call.
     walked_value_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Storage roots captured when each borrow-capable expression completes. Mutable call actions
+    /// consume these alongside `walked_value_facts`; consulting the live local state after a later
+    /// eager argument ran would retarget an already-evaluated slice header.
+    walked_storage_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Mutable backing identities captured at the same completion boundary. This is distinct from
+    /// storage roots because it names every collection whose element facts observe a write.
+    walked_backing_facts: std::collections::HashMap<usize, MutableBackingFact>,
+    /// Post-action completion overrides for calls with mutable destinations. Operand snapshots
+    /// remain pre-call for validation; only the enclosing call result consumes these post-call
+    /// value, storage, and backing facts.
+    pending_call_completions:
+        std::collections::HashMap<usize, MoveExpressionCompletion>,
+    /// Exact argument expressions of calls whose returning action may mutate at least one
+    /// destination. These receive completion-time storage/backing facts even when their value type
+    /// itself cannot carry a borrow (notably numeric owned arrays selected by `ParamStorage`).
+    mutable_call_argument_snapshots: std::collections::HashSet<usize>,
+    /// Stable local/field actuals passed as `borrow mut`. Their expression-completion snapshot also
+    /// reserves the source place, so a later eager argument cannot retarget the pointer that MIR
+    /// will pass when the call action begins.
+    borrow_mut_place_snapshots: std::collections::HashSet<usize>,
     /// Direct borrow-capable children completed while each enclosing expression is evaluated.
     /// Eager operations validate these snapshots at their action boundary; transparent/control
     /// containers defer validation to the operation that consumes their selected result.
-    value_snapshot_frames: Vec<Vec<usize>>,
+    value_snapshot_frames: Vec<MoveTransientFrame>,
     /// Loop refinement may revisit the same action. Emit one invalid-snapshot diagnostic per
     /// checked parent/child identity pair.
     reported_invalid_value_actions: std::collections::HashSet<(usize, usize)>,
@@ -19533,8 +25023,8 @@ struct MoveCheck<'a> {
     return_roots: BorrowRoots,
     /// Symbolic parameter roots observed at worker-transfer sinks, including transitive callees.
     parallel_transfer_roots: BorrowRoots,
-    /// Union of the exact parameter roots stored in every mutable destination at each returning
-    /// function edge. Entries are indexed by this function's parameter positions.
+    /// Union of the exact parameter roots stored in every `borrow mut`/`out` destination at each
+    /// returning function edge. Entries are indexed by this function's parameter positions.
     borrow_mut_retention: BorrowMutRetentionSummary,
     /// Expressions proven not to reach their result edge during this exact source-order walk.
     /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
@@ -19546,7 +25036,7 @@ struct MoveCheck<'a> {
     /// Direct child requests captured from the exhaustive expression match while an eager node is
     /// being lowered onto the explicit Move worklist.
     collecting_move_children: bool,
-    move_children: Vec<(&'a Expr, bool, bool)>,
+    move_children: Vec<(&'a Expr, bool, bool, bool)>,
     /// Locals introduced as read-only projections of a borrowed sum payload. These locals are
     /// initialized per arm but never own an independent value, so any consuming use must be
     /// rejected and no Drop slot may be derived for them.
@@ -19604,11 +25094,12 @@ enum BorrowRoot {
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 
-/// Analysis-local roots that may remain stored in each parameter after a returning `borrow mut`
-/// call. Entries are indexed by destination parameter; every root is relative to a source
+/// Analysis-local roots that may remain stored in each parameter after a returning `borrow mut` or
+/// `out` call. Entries are indexed by destination parameter; every root is relative to a source
 /// parameter of the same function. The fact is deliberately not serialized: a checked-HIR replay
-/// recomputes it from the available same-program bodies, while unavailable bodies use the
-/// conservative all-compatible-input fallback at their call sites.
+/// recomputes it from available same-program bodies, while unavailable bodies use the conservative
+/// all-compatible-input fallback at their call sites. The historical type name remains internal so
+/// the one summary path is extended rather than shadowed by an `out`-only fact.
 type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
@@ -19711,7 +25202,7 @@ impl BorrowRoot {
 
 /// One projection from an aggregate value to a recursively borrow-capable child. This is an
 /// analysis-local fact: public summaries still contain only parameter/capture roots.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum BorrowProjection {
     StructField(u32),
     TupleElement(u32),
@@ -19724,6 +25215,1557 @@ enum BorrowProjection {
     ResultErr,
 }
 
+type StoragePath = Vec<BorrowProjection>;
+
+/// Analysis-local identity of one finite storage-producing occurrence.
+///
+/// Expression-backed origins use the immutable HIR node address, never its [`Span`]. The key is
+/// meaningful only while the checked HIR tree remains alive and is deliberately neither serialized
+/// nor compared between compiler invocations. Result paths keep multi-result producers and nested
+/// owned leaves distinct without allocating an unbounded generation per loop iteration.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum StorageOrigin {
+    Producer {
+        expression: usize,
+        result_path: Box<[BorrowProjection]>,
+    },
+    InlinePlace {
+        local: LocalId,
+        path: Box<[BorrowProjection]>,
+    },
+    CallMutation {
+        call: usize,
+        destination_parameter: u32,
+        path: Box<[BorrowProjection]>,
+    },
+}
+
+impl StorageOrigin {
+    fn path(&self) -> &[BorrowProjection] {
+        match self {
+            Self::Producer { result_path, .. }
+            | Self::InlinePlace {
+                path: result_path,
+                ..
+            }
+            | Self::CallMutation {
+                path: result_path,
+                ..
+            } => result_path,
+        }
+    }
+
+    fn producer(expression: &Expr, result_path: &[BorrowProjection]) -> Self {
+        Self::Producer {
+            expression: storage_expr_key(expression),
+            result_path: result_path.into(),
+        }
+    }
+
+    fn inline_place(local: LocalId, path: &[BorrowProjection]) -> Self {
+        Self::InlinePlace {
+            local,
+            path: path.into(),
+        }
+    }
+
+    #[cfg(test)]
+    fn call_mutation(
+        call: &Expr,
+        destination_parameter: u32,
+        path: &[BorrowProjection],
+    ) -> Self {
+        Self::CallMutation {
+            call: storage_expr_key(call),
+            destination_parameter,
+            path: path.into(),
+        }
+    }
+}
+
+/// Stable generation key shared by EscapeCheck and MoveCheck.
+///
+/// Repeated finite producers have one fresh `Current` and one sticky joined `Prior`. Parameter
+/// values and symbolic caller storage are stable and therefore never participate in recency
+/// renaming.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum StorageGeneration {
+    Current(StorageOrigin),
+    Prior(StorageOrigin),
+    ParameterValue {
+        parameter: u32,
+        path: Box<[BorrowProjection]>,
+    },
+    CallerStorage {
+        parameter: u32,
+        path: Box<[BorrowProjection]>,
+    },
+}
+
+impl StorageGeneration {
+    fn path(&self) -> &[BorrowProjection] {
+        match self {
+            Self::Current(origin) | Self::Prior(origin) => origin.path(),
+            Self::ParameterValue { path, .. } | Self::CallerStorage { path, .. } => path,
+        }
+    }
+
+    fn current(origin: StorageOrigin) -> Self {
+        Self::Current(origin)
+    }
+
+    #[cfg(test)]
+    fn prior(origin: StorageOrigin) -> Self {
+        Self::Prior(origin)
+    }
+
+    fn parameter_value(parameter: u32, path: &[BorrowProjection]) -> Self {
+        Self::ParameterValue {
+            parameter,
+            path: path.into(),
+        }
+    }
+
+    fn caller_storage(parameter: u32, path: &[BorrowProjection]) -> Self {
+        Self::CallerStorage {
+            parameter,
+            path: path.into(),
+        }
+    }
+}
+
+fn storage_expr_key(expression: &Expr) -> usize {
+    std::ptr::from_ref(expression).addr()
+}
+
+/// One atomic Current-to-Prior rename plan. A multi-result producer adds every exact result origin
+/// before any header, directory, or content table applies the plan.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct StorageGenerationRenames {
+    origins: std::collections::BTreeSet<StorageOrigin>,
+}
+
+impl StorageGenerationRenames {
+    fn insert(&mut self, origin: StorageOrigin) {
+        self.origins.insert(origin);
+    }
+
+    fn from_origins(origins: impl IntoIterator<Item = StorageOrigin>) -> Self {
+        Self {
+            origins: origins.into_iter().collect(),
+        }
+    }
+
+    fn apply(&self, generation: &StorageGeneration) -> StorageGeneration {
+        match generation {
+            StorageGeneration::Current(origin) if self.origins.contains(origin) => {
+                StorageGeneration::Prior(origin.clone())
+            }
+            StorageGeneration::Current(_)
+            | StorageGeneration::Prior(_)
+            | StorageGeneration::ParameterValue { .. }
+            | StorageGeneration::CallerStorage { .. } => generation.clone(),
+        }
+    }
+}
+
+/// MoveCheck-only evaluation bookkeeping. Value-completion and control-advance frames nest on one
+/// tagged stack so existing internal `MoveCheck` constructors continue to initialize a single
+/// `Vec::new()`, while neither frame kind leaks into [`BorrowState`] equality or joins.
+enum MoveTransientFrame {
+    Value(Vec<usize>),
+    Storage(StorageGenerationRenames),
+    /// Lexically active allocation region. This is analysis bookkeeping, not semantic flow state:
+    /// arena identity must not be cloned into branch/loop snapshots or participate in joins.
+    Arena(MoveArenaScope),
+    /// Immutable HIR identity of the active loop. Keeping this beside the transient value/storage
+    /// frames, rather than in [`MoveCheck`]'s semantic state, prevents loop-result bookkeeping
+    /// from leaking into snapshots while still giving an accepted `break` its exact destination.
+    Loop(usize),
+}
+
+/// One exact header leaf. `known == false` is sticky and keeps every conservative caller-storage
+/// fallback; it never authorizes minting a generation from those roots.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct StorageGenerationRef {
+    generation: StorageGeneration,
+    /// Projection inside `generation`'s shared content table reached by this value header. The
+    /// value-level projected-header path is intentionally separate: a `SoaColumn` is a root slice
+    /// value that addresses one `StructField` inside the SoA generation, while an ordinary array
+    /// or slice header addresses that generation's empty content path.
+    content_path: StoragePath,
+}
+
+impl StorageGenerationRef {
+    fn root(generation: StorageGeneration) -> Self {
+        Self {
+            generation,
+            content_path: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn selected(generation: StorageGeneration, content_path: StoragePath) -> Self {
+        Self {
+            generation,
+            content_path,
+        }
+    }
+
+    fn rename_generation(&self, renames: &StorageGenerationRenames) -> Self {
+        Self {
+            generation: renames.apply(&self.generation),
+            content_path: self.content_path.clone(),
+        }
+    }
+
+    fn select_content_path(
+        &self,
+        suffix: impl IntoIterator<Item = BorrowProjection>,
+    ) -> StoragePath {
+        let mut path = self.content_path.clone();
+        path.extend(suffix);
+        path
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct StorageHeaderLeaf {
+    generations: std::collections::BTreeSet<StorageGenerationRef>,
+    /// Header shape at this value use-site. The generation directory keeps the underlying storage
+    /// descriptor; forwarders such as `ArrayToSlice` and `SoaColumn` replace only this descriptor.
+    /// An incompatible join clears it so later summary selection fails closed.
+    descriptor: Option<StorageHeaderDescriptor>,
+    known: bool,
+    fallback_roots: BorrowRoots,
+}
+
+impl StorageHeaderLeaf {
+    fn known(generation: StorageGeneration) -> Self {
+        Self {
+            generations: [StorageGenerationRef::root(generation)]
+                .into_iter()
+                .collect(),
+            descriptor: None,
+            known: true,
+            fallback_roots: BorrowRoots::new(),
+        }
+    }
+
+    fn known_typed(
+        generation: StorageGeneration,
+        descriptor: StorageHeaderDescriptor,
+    ) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            ..Self::known(generation)
+        }
+    }
+
+    #[cfg(test)]
+    fn selected(generation: StorageGeneration, content_path: StoragePath) -> Self {
+        Self {
+            generations: [StorageGenerationRef::selected(generation, content_path)]
+                .into_iter()
+                .collect(),
+            descriptor: None,
+            known: true,
+            fallback_roots: BorrowRoots::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn selected_typed(
+        generation: StorageGeneration,
+        content_path: StoragePath,
+        descriptor: StorageHeaderDescriptor,
+    ) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            ..Self::selected(generation, content_path)
+        }
+    }
+
+    fn unknown(fallback_roots: BorrowRoots) -> Self {
+        Self {
+            generations: std::collections::BTreeSet::new(),
+            descriptor: None,
+            known: false,
+            fallback_roots,
+        }
+    }
+
+    fn unknown_typed(
+        fallback_roots: BorrowRoots,
+        descriptor: StorageHeaderDescriptor,
+    ) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            ..Self::unknown(fallback_roots)
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut generations = self.generations.clone();
+        generations.extend(other.generations.iter().cloned());
+        let mut fallback_roots = self.fallback_roots.clone();
+        fallback_roots.extend(&other.fallback_roots);
+        Self {
+            generations,
+            descriptor: (self.descriptor == other.descriptor)
+                .then_some(self.descriptor)
+                .flatten(),
+            known: self.known && other.known,
+            fallback_roots,
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.generations = std::mem::take(&mut self.generations)
+            .into_iter()
+            .map(|generation| generation.rename_generation(renames))
+            .collect();
+    }
+}
+
+/// Finite projected header trie. Unlike [`BorrowFact`], there is deliberately no `direct` field:
+/// a generation stored at the empty path names only that collection header and never implicitly
+/// flows into a nested aggregate/header projection.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct ProjectedHeaderFact {
+    leaves: std::collections::BTreeMap<StoragePath, StorageHeaderLeaf>,
+}
+
+impl ProjectedHeaderFact {
+    fn from_leaf(path: StoragePath, leaf: StorageHeaderLeaf) -> Self {
+        Self {
+            leaves: [(path, leaf)].into_iter().collect(),
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut result = self.clone();
+        for (path, incoming) in &other.leaves {
+            result
+                .leaves
+                .entry(path.clone())
+                .and_modify(|leaf| *leaf = leaf.join(incoming))
+                .or_insert_with(|| incoming.clone());
+        }
+        result
+    }
+
+    fn prefixed(mut self, projection: BorrowProjection) -> Self {
+        self.leaves = self
+            .leaves
+            .into_iter()
+            .map(|(mut path, leaf)| {
+                path.insert(0, projection);
+                (path, leaf)
+            })
+            .collect();
+        self
+    }
+
+    fn prefixed_path(self, path: &[BorrowProjection]) -> Self {
+        path.iter()
+            .rev()
+            .copied()
+            .fold(self, |headers, projection| headers.prefixed(projection))
+    }
+
+    fn project_path(&self, projection: &[BorrowProjection]) -> Self {
+        if projection.is_empty() {
+            return self.clone();
+        }
+        Self {
+            leaves: self
+                .leaves
+                .iter()
+                .filter_map(|(path, leaf)| {
+                    path.strip_prefix(projection)
+                        .map(|suffix| (suffix.to_vec(), leaf.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    fn replace_path(&mut self, path: &[BorrowProjection], incoming: Self) {
+        self.leaves
+            .retain(|candidate, _| !candidate.starts_with(path));
+        for (suffix, leaf) in incoming.leaves {
+            let mut destination = path.to_vec();
+            destination.extend(suffix);
+            self.leaves.insert(destination, leaf);
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        for leaf in self.leaves.values_mut() {
+            leaf.rename_generations(renames);
+        }
+    }
+}
+
+fn rename_storage_generation_map<T>(
+    entries: &mut std::collections::BTreeMap<StorageGeneration, T>,
+    renames: &StorageGenerationRenames,
+    mut join: impl FnMut(&mut T, T),
+) {
+    let mut renamed = std::collections::BTreeMap::new();
+    for (generation, value) in std::mem::take(entries) {
+        let generation = renames.apply(&generation);
+        match renamed.entry(generation) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => join(entry.get_mut(), value),
+        }
+    }
+    *entries = renamed;
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct StorageGenerationDirectory<Entry> {
+    entries: std::collections::BTreeMap<StorageGeneration, Entry>,
+}
+
+impl<Entry> StorageGenerationDirectory<Entry> {
+    fn rename_current_to_prior(
+        &mut self,
+        renames: &StorageGenerationRenames,
+        join: impl FnMut(&mut Entry, Entry),
+    ) {
+        rename_storage_generation_map(&mut self.entries, renames, join);
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct StorageGenerationContents<Fact> {
+    entries: std::collections::BTreeMap<StorageGeneration, Fact>,
+}
+
+impl<Fact> StorageGenerationContents<Fact> {
+    fn rename_current_to_prior(
+        &mut self,
+        renames: &StorageGenerationRenames,
+        join: impl FnMut(&mut Fact, Fact),
+    ) {
+        rename_storage_generation_map(&mut self.entries, renames, join);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageHeaderKind {
+    InlineFixed,
+    OwnedDynamic,
+    View,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageTypedPath {
+    path: StoragePath,
+    kind: StorageHeaderKind,
+    ty: Ty,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct StorageTypePaths {
+    headers: Vec<StorageTypedPath>,
+    carriers: Vec<StoragePath>,
+    valid: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StorageTypeContext<'a> {
+    structs: &'a [StructDef],
+    tuples: &'a [hir::TupleDef],
+    enums: &'a [hir::EnumDef],
+    tagged_types: &'a [hir::TaggedType],
+}
+
+fn storage_type_paths(root: Ty, context: StorageTypeContext<'_>) -> StorageTypePaths {
+    #[derive(Clone, Copy)]
+    enum Work {
+        Enter {
+            ty: Ty,
+            projection: Option<BorrowProjection>,
+        },
+        Exit {
+            ty: Ty,
+            pop_projection: bool,
+        },
+    }
+
+    let mut result = StorageTypePaths {
+        valid: true,
+        ..StorageTypePaths::default()
+    };
+    let mut work = vec![Work::Enter {
+        ty: root,
+        projection: None,
+    }];
+    let mut visiting = HashSet::new();
+    let mut path = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit { ty, pop_projection } => {
+                visiting.remove(&ty);
+                if pop_projection {
+                    path.pop();
+                }
+            }
+            Work::Enter { ty, projection } => {
+                if let Some(projection) = projection {
+                    path.push(projection);
+                }
+                let pop_projection = projection.is_some();
+                let ty = expand_tagged_ty(ty, context.tagged_types);
+                if ty == Ty::Error {
+                    result.valid = false;
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+                // A dynamic struct array is an owning header only in AoS layout.  The SoA
+                // spelling is not a second dynamic-header representation; accepting it here
+                // would let malformed HIR mint an identity that no runtime value can own.
+                if matches!(ty, Ty::DynStructArray(_, Layout::Soa)) {
+                    result.valid = false;
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let aggregate = matches!(
+                    ty,
+                    Ty::Struct(_)
+                        | Ty::Tuple(_)
+                        | Ty::Array(..)
+                        | Ty::StructArray(..)
+                        | Ty::Enum(_)
+                        | Ty::Option(_)
+                        | Ty::Result(..)
+                );
+                if aggregate && !visiting.insert(ty) {
+                    result.valid = false;
+                    if pop_projection {
+                        path.pop();
+                    }
+                    continue;
+                }
+
+                let header = match ty {
+                    Ty::Array(..) | Ty::StructArray(..) => Some(StorageHeaderKind::InlineFixed),
+                    Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos) => {
+                        Some(StorageHeaderKind::OwnedDynamic)
+                    }
+                    Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_) => Some(StorageHeaderKind::View),
+                    _ => None,
+                };
+                if let Some(kind) = header {
+                    result.headers.push(StorageTypedPath {
+                        path: path.clone(),
+                        kind,
+                        ty,
+                    });
+                }
+
+                if matches!(
+                    ty,
+                    Ty::DynSliceArray(_)
+                        | Ty::DynVecArray(..)
+                        | Ty::DynMaskArray(..)
+                        | Ty::DynFixedArray(..)
+                        | Ty::DynFixedStructArray(..)
+                        | Ty::DynResponseArray
+                        | Ty::DictEncoded(..)
+                ) {
+                    result.carriers.push(path.clone());
+                }
+
+                let mut children = Vec::new();
+                match ty {
+                    Ty::Struct(id) => match context.structs.get(id as usize) {
+                        Some(definition) => children.extend(definition.fields.iter().enumerate().map(
+                            |(index, field)| {
+                                (BorrowProjection::StructField(index as u32), field.ty)
+                            },
+                        )),
+                        None => result.valid = false,
+                    },
+                    Ty::Tuple(id) => match context.tuples.get(id as usize) {
+                        Some(definition) => children.extend(definition.elems.iter().enumerate().map(
+                            |(index, element)| {
+                                (
+                                    BorrowProjection::TupleElement(index as u32),
+                                    scalar_to_ty(*element),
+                                )
+                            },
+                        )),
+                        None => result.valid = false,
+                    },
+                    Ty::Array(element, len) => children.extend((0..len).map(|index| {
+                        (BorrowProjection::ArrayElement(index), scalar_to_ty(element))
+                    })),
+                    Ty::StructArray(id, len) => children.extend((0..len).map(|index| {
+                        (BorrowProjection::ArrayElement(index), Ty::Struct(id))
+                    })),
+                    Ty::Enum(id) => match context.enums.get(id as usize) {
+                        Some(definition) => {
+                            for (variant_index, variant) in definition.variants.iter().enumerate() {
+                                children.extend(variant.payload.iter().enumerate().map(
+                                    |(payload_index, payload)| {
+                                        (
+                                            BorrowProjection::EnumPayload {
+                                                variant: variant_index as u32,
+                                                index: payload_index as u32,
+                                            },
+                                            scalar_to_ty(*payload),
+                                        )
+                                    },
+                                ));
+                            }
+                        }
+                        None => result.valid = false,
+                    },
+                    Ty::Option(payload) => {
+                        children.push((BorrowProjection::OptionSome, scalar_to_ty(payload)));
+                    }
+                    Ty::Result(ok, err) => {
+                        children.push((BorrowProjection::ResultOk, scalar_to_ty(ok)));
+                        children.push((BorrowProjection::ResultErr, scalar_to_ty(err)));
+                    }
+                    Ty::DynArray(_)
+                    | Ty::DynStructArray(..)
+                    | Ty::Slice(_)
+                    | Ty::Soa(_)
+                    | Ty::SoaParam(_)
+                    | Ty::DynSliceArray(_)
+                    | Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..)
+                    | Ty::DynResponseArray
+                    | Ty::DictEncoded(..) => {}
+                    _ => {}
+                }
+
+                if aggregate {
+                    work.push(Work::Exit { ty, pop_projection });
+                    for (projection, child) in children.into_iter().rev() {
+                        work.push(Work::Enter {
+                            ty: child,
+                            projection: Some(projection),
+                        });
+                    }
+                } else if pop_projection {
+                    path.pop();
+                }
+            }
+        }
+    }
+    result.headers.sort_by(|left, right| left.path.cmp(&right.path));
+    result.headers.dedup();
+    result.carriers.sort();
+    result.carriers.dedup();
+    result
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageFormationError {
+    MalformedType,
+    NotHeaderPath,
+    DuplicateHeaderPath,
+    DuplicateGeneration,
+    GenerationPathMismatch,
+    MissingInitializer,
+    MalformedInitializer,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageHeaderFormation<DirectoryEntry, ContentFact> {
+    path: StoragePath,
+    generation: StorageGeneration,
+    directory: Option<DirectoryEntry>,
+    content: Option<ContentFact>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageFormationCommit {
+    headers: ProjectedHeaderFact,
+    renames: StorageGenerationRenames,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageGenerationTables<DirectoryEntry, ContentFact> {
+    directory: StorageGenerationDirectory<DirectoryEntry>,
+    contents: StorageGenerationContents<ContentFact>,
+}
+
+impl<DirectoryEntry, ContentFact> Default
+    for StorageGenerationTables<DirectoryEntry, ContentFact>
+{
+    fn default() -> Self {
+        Self {
+            directory: StorageGenerationDirectory {
+                entries: std::collections::BTreeMap::new(),
+            },
+            contents: StorageGenerationContents {
+                entries: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+}
+
+impl<DirectoryEntry: Clone, ContentFact: Clone>
+    StorageGenerationTables<DirectoryEntry, ContentFact>
+{
+    /// Validate every result leaf and initializer before publishing recency or either table.
+    /// Multi-result producers therefore form as one transaction: a bad later ordinal cannot
+    /// leave an earlier directory/content entry visible, and repeated finite producers demote all
+    /// old Current entries before any fresh Current leaf is installed.
+    fn try_form_headers(
+        &mut self,
+        root: Ty,
+        formations: Vec<StorageHeaderFormation<DirectoryEntry, ContentFact>>,
+        context: StorageTypeContext<'_>,
+        mut join_directory: impl FnMut(&mut DirectoryEntry, DirectoryEntry),
+        mut join_content: impl FnMut(&mut ContentFact, ContentFact),
+    ) -> Result<StorageFormationCommit, StorageFormationError> {
+        let paths = storage_type_paths(root, context);
+        if !paths.valid {
+            return Err(StorageFormationError::MalformedType);
+        }
+        if self.directory.entries.keys().ne(self.contents.entries.keys()) {
+            return Err(StorageFormationError::MalformedInitializer);
+        }
+        if formations.is_empty() {
+            return Err(StorageFormationError::MissingInitializer);
+        }
+
+        let valid_paths = paths
+            .headers
+            .into_iter()
+            .map(|header| {
+                (
+                    header.path,
+                    StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut batch_paths = std::collections::BTreeSet::new();
+        let mut batch_generations = std::collections::BTreeSet::new();
+        let mut renames = StorageGenerationRenames::default();
+        for formation in &formations {
+            match (&formation.directory, &formation.content) {
+                (None, None) => return Err(StorageFormationError::MissingInitializer),
+                (Some(_), Some(_)) => {}
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(StorageFormationError::MalformedInitializer);
+                }
+            }
+            if !valid_paths.contains_key(&formation.path) {
+                return Err(StorageFormationError::NotHeaderPath);
+            }
+            if formation.generation.path() != formation.path {
+                return Err(StorageFormationError::GenerationPathMismatch);
+            }
+            if !batch_generations.insert(formation.generation.clone()) {
+                return Err(StorageFormationError::DuplicateGeneration);
+            }
+            if !batch_paths.insert(formation.path.clone()) {
+                return Err(StorageFormationError::DuplicateHeaderPath);
+            }
+            if let StorageGeneration::Current(origin) = &formation.generation {
+                renames.insert(origin.clone());
+            }
+        }
+
+        // Existing Current entries selected by this completion are legal: the transaction first
+        // folds them into Prior. Every other pre-existing key is a genuine duplicate.
+        for generation in &batch_generations {
+            let advances_existing_current = matches!(
+                generation,
+                StorageGeneration::Current(origin) if renames.origins.contains(origin)
+            );
+            if !advances_existing_current
+                && (self.directory.entries.contains_key(generation)
+                    || self.contents.entries.contains_key(generation))
+            {
+                return Err(StorageFormationError::DuplicateGeneration);
+            }
+        }
+
+        let mut next = self.clone();
+        next.directory
+            .rename_current_to_prior(&renames, &mut join_directory);
+        next.contents
+            .rename_current_to_prior(&renames, &mut join_content);
+        let mut headers = ProjectedHeaderFact::default();
+        for formation in formations {
+            if next.directory.entries.contains_key(&formation.generation)
+                || next.contents.entries.contains_key(&formation.generation)
+            {
+                return Err(StorageFormationError::DuplicateGeneration);
+            }
+            let (Some(directory), Some(content)) = (formation.directory, formation.content) else {
+                return Err(StorageFormationError::MalformedInitializer);
+            };
+            next.directory
+                .entries
+                .insert(formation.generation.clone(), directory);
+            next.contents
+                .entries
+                .insert(formation.generation.clone(), content);
+            let descriptor = valid_paths[&formation.path];
+            headers.leaves.insert(
+                formation.path,
+                StorageHeaderLeaf::known_typed(formation.generation, descriptor),
+            );
+        }
+        *self = next;
+        Ok(StorageFormationCommit { headers, renames })
+    }
+
+    /// Single-leaf convenience wrapper over the transactional batch path.
+    #[cfg(test)]
+    fn try_form_header(
+        &mut self,
+        root: Ty,
+        path: &[BorrowProjection],
+        generation: StorageGeneration,
+        directory: DirectoryEntry,
+        content: ContentFact,
+        context: StorageTypeContext<'_>,
+        join_directory: impl FnMut(&mut DirectoryEntry, DirectoryEntry),
+        join_content: impl FnMut(&mut ContentFact, ContentFact),
+    ) -> Result<ProjectedHeaderFact, StorageFormationError> {
+        self.try_form_headers(
+            root,
+            vec![StorageHeaderFormation {
+                path: path.to_vec(),
+                generation,
+                directory: Some(directory),
+                content: Some(content),
+            }],
+            context,
+            join_directory,
+            join_content,
+        )
+        .map(|commit| commit.headers)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum StorageExprRole {
+    HeaderProducer,
+    HeaderForwarder,
+    CarrierProducer,
+    NoStorage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageContentInitializer {
+    None,
+    Forwarded,
+    Aggregate,
+    FixedLiteral,
+    PipelineElement,
+    PartitionElement,
+    SoaColumns,
+    CloneIn,
+    JsonDecoded,
+    JsonDocElements,
+    GroupAggregation,
+    CarrierSource,
+    BuilderElement,
+    CallSummary,
+    UnknownView,
+    FreshEmpty,
+    Missing,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageClassifiedResult {
+    role: StorageExprRole,
+    path: StoragePath,
+    header_kind: Option<StorageHeaderKind>,
+    header_ty: Option<Ty>,
+    initializer: StorageContentInitializer,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StorageExprClassification {
+    policy: StorageVariantPolicy,
+    results: Vec<StorageClassifiedResult>,
+    valid: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageVariantPolicy {
+    Forward,
+    Aggregate,
+    Call,
+    ResultMapErr,
+    UnknownView,
+    ReadOnlyView,
+    Fresh(StorageContentInitializer),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CallSelectedSource {
+    Argument(usize),
+    Capture { target: u32, capture: u32 },
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct CallStorageSelection {
+    sources: std::collections::BTreeSet<CallSelectedSource>,
+    /// Missing/malformed summaries and an erased indirect callee fail closed by selecting every
+    /// compatible argument plus the whole frozen callee environment.
+    fallback_all: bool,
+}
+
+fn call_storage_selection(
+    expression: &Expr,
+    named_return_borrow: &std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    callable_targets: &[CallableTargetSet],
+) -> CallStorageSelection {
+    let mut selection = CallStorageSelection::default();
+    let mut add_summary = |
+        summary: &hir::ReturnBorrowSummary,
+        args_len: usize,
+        target: Option<u32>,
+        captures_admitted: bool,
+    | {
+        let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
+            return;
+        };
+        if params.iter().any(|&index| index as usize >= args_len)
+            || (!captures_admitted && !captures.is_empty())
+        {
+            selection.fallback_all = true;
+            return;
+        }
+        selection.sources.extend(
+            params
+                .iter()
+                .map(|&index| CallSelectedSource::Argument(index as usize)),
+        );
+        if let Some(target) = target {
+            selection.sources.extend(captures.iter().map(|&capture| {
+                CallSelectedSource::Capture { target, capture }
+            }));
+        }
+    };
+    match &expression.kind {
+        ExprKind::Call { func, args, .. } => match named_return_borrow.get(func) {
+            Some(summary) => add_summary(summary, args.len(), None, false),
+            None => selection.fallback_all = true,
+        },
+        ExprKind::RawCall {
+            args,
+            return_borrow,
+            ..
+        } => add_summary(return_borrow, args.len(), None, false),
+        ExprKind::CallFnValue { callee, args } => {
+            let targets = match callee.ty {
+                Ty::Fn(id) => callable_targets.get(id as usize),
+                _ => None,
+            };
+            let Some(targets) = targets.filter(|targets| !targets.is_empty()) else {
+                selection.fallback_all = true;
+                return selection;
+            };
+            for (&target, summary) in targets {
+                add_summary(summary, args.len(), Some(target), true);
+            }
+        }
+        ExprKind::ResultMapErr { f, .. } => {
+            let targets = match f.ty {
+                Ty::Fn(id) => callable_targets.get(id as usize),
+                _ => None,
+            };
+            let Some(targets) = targets.filter(|targets| !targets.is_empty()) else {
+                selection.fallback_all = true;
+                return selection;
+            };
+            for (&target, summary) in targets {
+                add_summary(summary, 1, Some(target), true);
+            }
+        }
+        _ => {}
+    }
+    selection
+}
+
+/// Add target-relative sources proven by the frozen callable environment itself. Structurally
+/// compatible closure literals may have distinct interned `FnTy` ids; after assigning either one
+/// into the same local, the type-level target set can lag the flow-sensitive environment union.
+/// Storage selection must consume every concrete `ClosureTarget` present in that frozen value.
+fn extend_call_storage_selection_from_targets(
+    selection: &mut CallStorageSelection,
+    targets: impl IntoIterator<Item = u32>,
+    args_len: usize,
+    named_return_borrow: &std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    callable_target_ids: &std::collections::HashMap<String, u32>,
+) {
+    for target in targets.into_iter().collect::<std::collections::BTreeSet<_>>() {
+        let Some(name) = callable_target_ids
+            .iter()
+            .find_map(|(name, &candidate)| (candidate == target).then_some(name))
+        else {
+            selection.fallback_all = true;
+            continue;
+        };
+        let Some(summary) = named_return_borrow.get(name) else {
+            selection.fallback_all = true;
+            continue;
+        };
+        let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
+            continue;
+        };
+        if params.iter().any(|&index| index as usize >= args_len) {
+            selection.fallback_all = true;
+            continue;
+        }
+        selection.sources.extend(
+            params
+                .iter()
+                .map(|&index| CallSelectedSource::Argument(index as usize)),
+        );
+        selection.sources.extend(captures.iter().map(|&capture| {
+            CallSelectedSource::Capture { target, capture }
+        }));
+    }
+}
+
+fn storage_header_descriptors_compatible(
+    expected: StorageHeaderDescriptor,
+    candidate: StorageHeaderDescriptor,
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    expected == candidate
+        || (expected.kind == StorageHeaderKind::View
+            && indexed_backing_compatible(expected.ty, candidate.ty, tagged_types))
+}
+
+/// Compile-time-closed storage inventory for every checked-HIR expression variant. This match has
+/// no wildcard by design: adding an [`ExprKind`] cannot silently inherit a producer or forwarding
+/// default. Type-directed header/carrier paths are added by [`classify_storage_expression`].
+#[deny(unreachable_patterns)]
+fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
+    match kind {
+        ExprKind::Closure { .. }
+        | ExprKind::EnumValue { .. }
+        | ExprKind::StructLit { .. }
+        | ExprKind::Tuple { .. }
+        | ExprKind::OptionSome(_)
+        | ExprKind::ResultOk(_)
+        | ExprKind::ResultErr(_) => StorageVariantPolicy::Aggregate,
+
+        ExprKind::Local(_)
+        | ExprKind::TaskGroup(_)
+        | ExprKind::Match { .. }
+        | ExprKind::TaskGet(_)
+        | ExprKind::If { .. }
+        | ExprKind::Field { .. }
+        | ExprKind::SoaColumn { .. }
+        | ExprKind::TupleIndex { .. }
+        | ExprKind::IndexField { .. }
+        | ExprKind::Block(_)
+        | ExprKind::ElseUnwrap { .. }
+        | ExprKind::Try(_)
+        | ExprKind::Loop { .. }
+        | ExprKind::Arena(_)
+        | ExprKind::NamedArena { .. }
+        | ExprKind::Unsafe(_)
+        | ExprKind::BoxGet(_)
+        | ExprKind::ArrayToSlice(_)
+        | ExprKind::Index { .. }
+        | ExprKind::BorrowedIndex { .. }
+        | ExprKind::SliceRange { .. }
+        | ExprKind::ElemField { .. } => StorageVariantPolicy::Forward,
+
+        ExprKind::ResourceViewFromRaw { .. }
+        | ExprKind::BufferBytes { .. }
+        | ExprKind::StrBytes { .. }
+        | ExprKind::RunBytesStdout { .. }
+        | ExprKind::RunBytesStderr { .. }
+        | ExprKind::HttpRespBody { .. }
+        | ExprKind::HttpCtxBody { .. } => StorageVariantPolicy::UnknownView,
+
+        ExprKind::CallFnValue { .. } | ExprKind::Call { .. } | ExprKind::RawCall { .. } => {
+            StorageVariantPolicy::Call
+        }
+        ExprKind::ResultMapErr { .. } => StorageVariantPolicy::ResultMapErr,
+
+        ExprKind::FsReadBytesView { .. } => StorageVariantPolicy::ReadOnlyView,
+
+        ExprKind::ArrayLit { .. } | ExprKind::ConstArray { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::FixedLiteral)
+        }
+        ExprKind::ArrayScan { .. }
+        | ExprKind::ArraySort { .. }
+        | ExprKind::ArraySortBy { .. }
+        | ExprKind::ArrayToArray { .. }
+        | ExprKind::ArrayParMap { .. }
+        | ExprKind::RandSample { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::PipelineElement)
+        }
+        ExprKind::ArrayPartition { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::PartitionElement)
+        }
+        ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::SoaColumns)
+        }
+        ExprKind::CloneIn { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::CloneIn)
+        }
+        ExprKind::JsonDecode { .. }
+        | ExprKind::JsonOwnedDecode { .. }
+        | ExprKind::JsonDecodeArray { .. }
+        | ExprKind::JsonDecodeStructArray { .. }
+        | ExprKind::JsonDecodeUnion { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::JsonDecoded)
+        }
+        ExprKind::JsonDocElems { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::JsonDocElements)
+        }
+        ExprKind::ArrayGroupAgg { .. } | ExprKind::ArrayGroupAggMulti { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::GroupAggregation)
+        }
+        ExprKind::ArrayChunks { .. } | ExprKind::ArrayDictEncode { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::CarrierSource)
+        }
+        ExprKind::ArrayBuilderBuild(_) => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::BuilderElement)
+        }
+
+        ExprKind::Unit
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::SqliteCallbackDescriptor { .. }
+        | ExprKind::Unary { .. }
+        | ExprKind::Cast(_)
+        | ExprKind::Binary { .. }
+        | ExprKind::IntArith { .. }
+        | ExprKind::MathOp { .. }
+        | ExprKind::FnValue(_)
+        | ExprKind::Spawn { .. }
+        | ExprKind::Wait
+        | ExprKind::OptionNone
+        | ExprKind::RawAlloc(_)
+        | ExprKind::RawNull
+        | ExprKind::RawFree(_)
+        | ExprKind::RawLoad { .. }
+        | ExprKind::RawPointerLoad { .. }
+        | ExprKind::StaticDescriptorView { .. }
+        | ExprKind::RawStore { .. }
+        | ExprKind::RawOffset { .. }
+        | ExprKind::RawIsNull(_)
+        | ExprKind::ResourceFromRaw { .. }
+        | ExprKind::ResourceBorrow { .. }
+        | ExprKind::ResourceRaw { .. }
+        | ExprKind::ResourceIntoRaw { .. }
+        | ExprKind::HeapNew(_)
+        | ExprKind::BoxClone(_)
+        | ExprKind::StrClone(_)
+        | ExprKind::StrPredicate { .. }
+        | ExprKind::StrTrim { .. }
+        | ExprKind::StrBorrow(_)
+        | ExprKind::BuilderNew { .. }
+        | ExprKind::BuilderWrite { .. }
+        | ExprKind::BuilderToString(_)
+        | ExprKind::ArrayZip { .. }
+        | ExprKind::Select { .. }
+        | ExprKind::VecSumWhere { .. }
+        | ExprKind::VecDot { .. }
+        | ExprKind::VecMinMax { .. }
+        | ExprKind::VecSum { .. }
+        | ExprKind::VecLoad { .. }
+        | ExprKind::VecStore { .. }
+        | ExprKind::VecLit { .. }
+        | ExprKind::ArraySum { .. }
+        | ExprKind::ArrayCount { .. }
+        | ExprKind::ArrayAnyAll { .. }
+        | ExprKind::ArrayMinMax { .. }
+        | ExprKind::ArrayReduce { .. }
+        | ExprKind::ArrayDot { .. }
+        | ExprKind::ArrayMapInto { .. }
+        | ExprKind::Len(_)
+        | ExprKind::Template(_)
+        | ExprKind::JsonOwnedEncode { .. }
+        | ExprKind::JsonEncodeBounded { .. }
+        | ExprKind::JsonOwnedEncodeBounded { .. }
+        | ExprKind::JsonDecodeScalar { .. }
+        | ExprKind::JsonDoc { .. }
+        | ExprKind::JsonDocKind { .. }
+        | ExprKind::JsonDocGet { .. }
+        | ExprKind::JsonDocAt { .. }
+        | ExprKind::JsonDocAsStr { .. }
+        | ExprKind::JsonDocAsScalar { .. }
+        | ExprKind::JsonDocLen { .. }
+        | ExprKind::JsonDocKey { .. }
+        | ExprKind::JsonScan { .. }
+        | ExprKind::FsReadFile { .. }
+        | ExprKind::ReaderStdin
+        | ExprKind::ReaderOpen { .. }
+        | ExprKind::ReaderOpenBeneath { .. }
+        | ExprKind::WriterStd { .. }
+        | ExprKind::WriterCreate { .. }
+        | ExprKind::CreateExclusive { .. }
+        | ExprKind::CreateExclusiveBeneath { .. }
+        | ExprKind::ReaderRead { .. }
+        | ExprKind::ReaderBuffered { .. }
+        | ExprKind::ReaderReadLine { .. }
+        | ExprKind::BytesAsStr { .. }
+        | ExprKind::WriterWrite { .. }
+        | ExprKind::WriterFlush { .. }
+        | ExprKind::IoCopy { .. }
+        | ExprKind::FileCreateRw { .. }
+        | ExprKind::FileOpenRw { .. }
+        | ExprKind::FilePread { .. }
+        | ExprKind::FilePwrite { .. }
+        | ExprKind::FileLen { .. }
+        | ExprKind::BufferNew { .. }
+        | ExprKind::BufferLen { .. }
+        | ExprKind::BytesRead { .. }
+        | ExprKind::BufferPut { .. }
+        | ExprKind::BufferAppend { .. }
+        | ExprKind::ArrayBuilderNew { .. }
+        | ExprKind::ArrayBuilderPush { .. }
+        | ExprKind::ArrayBuilderAppend { .. }
+        | ExprKind::FsWriteFile { .. }
+        | ExprKind::FsExists { .. }
+        | ExprKind::FsRemove { .. }
+        | ExprKind::RenameNoReplace { .. }
+        | ExprKind::FsReadDir { .. }
+        | ExprKind::DnsResolve { .. }
+        | ExprKind::TcpConnect { .. }
+        | ExprKind::ConnReader { .. }
+        | ExprKind::ConnWriter { .. }
+        | ExprKind::TcpReadTimeout { .. }
+        | ExprKind::TcpWriteTimeout { .. }
+        | ExprKind::TcpListen { .. }
+        | ExprKind::TcpAccept { .. }
+        | ExprKind::UdpBind { .. }
+        | ExprKind::UdpSendTo { .. }
+        | ExprKind::UdpRecvFrom { .. }
+        | ExprKind::FsReadFileView { .. }
+        | ExprKind::PathJoin { .. }
+        | ExprKind::PathComponent { .. }
+        | ExprKind::PathNormalize { .. }
+        | ExprKind::EnvGet { .. }
+        | ExprKind::EnvSet { .. }
+        | ExprKind::TimeNow
+        | ExprKind::TimeInstant
+        | ExprKind::ProcessCpuCount
+        | ExprKind::TimeSleep { .. }
+        | ExprKind::ProcessExit { .. }
+        | ExprKind::ProcessAbort
+        | ExprKind::ProcessSpawn { .. }
+        | ExprKind::ChildWait { .. }
+        | ExprKind::ChildKill { .. }
+        | ExprKind::ProcessExec { .. }
+        | ExprKind::ProcessCommand { .. }
+        | ExprKind::CommandCwd { .. }
+        | ExprKind::CommandTimeout { .. }
+        | ExprKind::CommandMaxCapture { .. }
+        | ExprKind::CommandEnv { .. }
+        | ExprKind::CommandEnvClear { .. }
+        | ExprKind::CommandRun { .. }
+        | ExprKind::CommandRunBytes { .. }
+        | ExprKind::RunOutputCode { .. }
+        | ExprKind::RunOutputStdout { .. }
+        | ExprKind::RunOutputStderr { .. }
+        | ExprKind::RunBytesCode { .. }
+        | ExprKind::EncodingEncode { .. }
+        | ExprKind::EncodingDecode { .. }
+        | ExprKind::Utf8Valid { .. }
+        | ExprKind::Compress { .. }
+        | ExprKind::Decompress { .. }
+        | ExprKind::RandSeed
+        | ExprKind::RandSeedWith { .. }
+        | ExprKind::RandNext { .. }
+        | ExprKind::RandRange { .. }
+        | ExprKind::RandShuffle { .. }
+        | ExprKind::RegexCompile { .. }
+        | ExprKind::RegexIsMatch { .. }
+        | ExprKind::RegexFind { .. }
+        | ExprKind::RegexFindAll { .. }
+        | ExprKind::RegexSplit { .. }
+        | ExprKind::RegexReplace { .. }
+        | ExprKind::RegexCaptures { .. }
+        | ExprKind::RegexGroupCount { .. }
+        | ExprKind::RegexGroupIndex { .. }
+        | ExprKind::CapturesGroup { .. }
+        | ExprKind::CliCommand { .. }
+        | ExprKind::CliFlag { .. }
+        | ExprKind::CliParse { .. }
+        | ExprKind::CliGetBool { .. }
+        | ExprKind::CliGetI64 { .. }
+        | ExprKind::CliGetStr { .. }
+        | ExprKind::CliUsage { .. }
+        | ExprKind::HttpRequest { .. }
+        | ExprKind::HttpHeader { .. }
+        | ExprKind::HttpBody { .. }
+        | ExprKind::HttpRequestTimeout { .. }
+        | ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+        | ExprKind::HttpParse { .. }
+        | ExprKind::HttpRespStatus { .. }
+        | ExprKind::HttpRespHeader { .. }
+        | ExprKind::HttpClient
+        | ExprKind::HttpClientTimeout { .. }
+        | ExprKind::HttpClientMaxResponseBodyBytes { .. }
+        | ExprKind::HttpClientGet { .. }
+        | ExprKind::HttpClientPost { .. }
+        | ExprKind::HttpClientRequest { .. }
+        | ExprKind::HttpGetMany { .. }
+        | ExprKind::HttpServe { .. }
+        | ExprKind::HttpAccept { .. }
+        | ExprKind::HttpCtxMethod { .. }
+        | ExprKind::HttpCtxPath { .. }
+        | ExprKind::HttpCtxHeaders { .. }
+        | ExprKind::HttpCtxHeader { .. }
+        | ExprKind::HttpResponseBuilder { .. }
+        | ExprKind::HttpRbHeader { .. }
+        | ExprKind::HttpRbBody { .. }
+        | ExprKind::HttpRespond { .. }
+        | ExprKind::HttpRespondStream { .. }
+        | ExprKind::HttpStreamSend { .. }
+        | ExprKind::HttpStreamFinish { .. }
+        | ExprKind::HttpStreamReject { .. }
+        | ExprKind::CryptoCtEqual { .. }
+        | ExprKind::CryptoRandom { .. }
+        | ExprKind::CryptoHash { .. }
+        | ExprKind::CryptoHmac { .. }
+        | ExprKind::CryptoHkdf { .. }
+        | ExprKind::CryptoAead { .. }
+        | ExprKind::CryptoArgon2 { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::Missing)
+        }
+    }
+}
+
+fn classify_storage_expression(
+    expression: &Expr,
+    context: StorageTypeContext<'_>,
+    closure_target: Option<u32>,
+) -> StorageExprClassification {
+    let policy = storage_variant_policy(&expression.kind);
+    let mut paths = storage_type_paths(expression.ty, context);
+    if let ExprKind::Closure { captures, .. } = &expression.kind {
+        paths.headers.clear();
+        paths.carriers.clear();
+        for (capture_index, capture) in captures.iter().enumerate() {
+            let capture_paths = storage_type_paths(capture.ty, context);
+            paths.valid &= capture_paths.valid;
+            for mut header in capture_paths.headers {
+                let Some(target) = closure_target else {
+                    paths.valid = false;
+                    continue;
+                };
+                header.path.insert(
+                    0,
+                    BorrowProjection::ClosureCapture(capture_index as u32),
+                );
+                header
+                    .path
+                    .insert(0, BorrowProjection::ClosureTarget(target));
+                paths.headers.push(header);
+            }
+        }
+    }
+
+    // Sum constructors publish only the active payload subtree.  Walking the result type alone
+    // would manufacture headers for `None`, the inactive Result arm, and every inactive enum
+    // variant.  Besides being imprecise, those ghost leaves can later acquire release ownership
+    // and make a value appear to drop storage it never contained.
+    match &expression.kind {
+        ExprKind::OptionNone => {
+            paths.headers.clear();
+            paths.carriers.clear();
+        }
+        ExprKind::OptionSome(_) => {
+            paths.headers.retain(|header| {
+                header.path.starts_with(&[BorrowProjection::OptionSome])
+            });
+            paths.carriers.retain(|path| {
+                path.starts_with(&[BorrowProjection::OptionSome])
+            });
+        }
+        ExprKind::ResultOk(_) => {
+            paths.headers.retain(|header| {
+                header.path.starts_with(&[BorrowProjection::ResultOk])
+            });
+            paths.carriers.retain(|path| {
+                path.starts_with(&[BorrowProjection::ResultOk])
+            });
+        }
+        ExprKind::ResultErr(_) => {
+            paths.headers.retain(|header| {
+                header.path.starts_with(&[BorrowProjection::ResultErr])
+            });
+            paths.carriers.retain(|path| {
+                path.starts_with(&[BorrowProjection::ResultErr])
+            });
+        }
+        ExprKind::EnumValue {
+            enum_id,
+            variant,
+            payload,
+        } => {
+            let valid_payload = context
+                .enums
+                .get(*enum_id as usize)
+                .and_then(|definition| definition.variants.get(*variant as usize))
+                .is_some_and(|definition| definition.payload.len() == payload.len());
+            if !valid_payload {
+                paths.valid = false;
+                paths.headers.clear();
+                paths.carriers.clear();
+            } else {
+                paths.headers.retain(|header| {
+                    matches!(
+                        header.path.first(),
+                        Some(BorrowProjection::EnumPayload { variant: active, index })
+                            if active == variant && (*index as usize) < payload.len()
+                    )
+                });
+                paths.carriers.retain(|path| {
+                    matches!(
+                        path.first(),
+                        Some(BorrowProjection::EnumPayload { variant: active, index })
+                            if active == variant && (*index as usize) < payload.len()
+                    )
+                });
+            }
+        }
+        _ => {}
+    }
+
+    if matches!(
+        &expression.kind,
+        ExprKind::ArrayGroupAggMulti { aggs, source, .. }
+            if aggs.is_empty() || *source != hir::GroupSource::AosStr
+    ) {
+        paths.valid = false;
+        paths.headers.clear();
+        paths.carriers.clear();
+    }
+    let expected_tuple_headers = match &expression.kind {
+        ExprKind::ArrayPartition { .. } | ExprKind::ArrayGroupAgg { .. } => Some(2),
+        ExprKind::ArrayGroupAggMulti { aggs, .. } => Some(aggs.len() + 1),
+        _ => None,
+    };
+    if let Some(expected) = expected_tuple_headers {
+        let exact = paths.headers.len() == expected
+            && paths.headers.iter().enumerate().all(|(ordinal, header)| {
+                header.path == vec![BorrowProjection::TupleElement(ordinal as u32)]
+            });
+        if !exact {
+            paths.valid = false;
+            paths.headers.clear();
+            paths.carriers.clear();
+        }
+    }
+
+    let initializer = match policy {
+        StorageVariantPolicy::Forward => StorageContentInitializer::Forwarded,
+        StorageVariantPolicy::Aggregate => StorageContentInitializer::Aggregate,
+        StorageVariantPolicy::Call => StorageContentInitializer::CallSummary,
+        StorageVariantPolicy::ResultMapErr => StorageContentInitializer::CallSummary,
+        StorageVariantPolicy::UnknownView => StorageContentInitializer::UnknownView,
+        StorageVariantPolicy::ReadOnlyView => StorageContentInitializer::None,
+        StorageVariantPolicy::Fresh(initializer) => initializer,
+    };
+    let header_role = match policy {
+        StorageVariantPolicy::Forward | StorageVariantPolicy::Aggregate => {
+            StorageExprRole::HeaderForwarder
+        }
+        StorageVariantPolicy::Call
+        | StorageVariantPolicy::ResultMapErr
+        | StorageVariantPolicy::UnknownView
+        | StorageVariantPolicy::Fresh(_) => {
+            StorageExprRole::HeaderProducer
+        }
+        StorageVariantPolicy::ReadOnlyView => StorageExprRole::NoStorage,
+    };
+
+    if initializer == StorageContentInitializer::Missing
+        && (!paths.headers.is_empty() || !paths.carriers.is_empty())
+    {
+        paths.valid = false;
+        paths.headers.clear();
+        paths.carriers.clear();
+    }
+
+    let mut results = Vec::new();
+    if !matches!(policy, StorageVariantPolicy::ReadOnlyView) {
+        results.extend(paths.headers.into_iter().map(|header| {
+            let initializer = if header.kind == StorageHeaderKind::View
+                && initializer == StorageContentInitializer::FreshEmpty
+            {
+                // A direct view producer not named by a fresh-known exception cannot invent a
+                // backing generation. Consumers retain its compatible fallback roots instead.
+                StorageContentInitializer::UnknownView
+            } else {
+                initializer
+            };
+            StorageClassifiedResult {
+                role: header_role,
+                path: header.path,
+                header_kind: Some(header.kind),
+                header_ty: Some(header.ty),
+                initializer,
+            }
+        }));
+        if matches!(
+            policy,
+            StorageVariantPolicy::Call
+                | StorageVariantPolicy::ResultMapErr
+                | StorageVariantPolicy::Fresh(_)
+        ) {
+            results.extend(paths.carriers.into_iter().map(|path| StorageClassifiedResult {
+                role: StorageExprRole::CarrierProducer,
+                path,
+                header_kind: None,
+                header_ty: None,
+                initializer,
+            }));
+        }
+    }
+    if results.is_empty() {
+        results.push(StorageClassifiedResult {
+            role: StorageExprRole::NoStorage,
+            path: Vec::new(),
+            header_kind: None,
+            header_ty: None,
+            initializer: StorageContentInitializer::None,
+        });
+    }
+    results.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.role.cmp(&right.role))
+    });
+    StorageExprClassification {
+        policy,
+        results,
+        valid: paths.valid,
+    }
+}
+
 /// Borrow roots carried by a value, separated by aggregate projection. `direct` applies to the
 /// whole current value (and therefore every selected descendant); `projected` stores exact child
 /// facts. The final public summary flattens this finite trie back to parameter roots.
@@ -19734,6 +26776,12 @@ struct BorrowFact {
 }
 
 impl BorrowFact {
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        path.iter()
+            .copied()
+            .fold(self.clone(), |fact, projection| fact.project_exact(projection))
+    }
+
     fn from_direct(roots: BorrowRoots) -> Self {
         Self {
             direct: roots,
@@ -19872,6 +26920,47 @@ impl BorrowFact {
             .collect()
     }
 
+    fn without_root_sources(mut self, excluded: &BorrowRoots) -> Self {
+        let retain = |root: &BorrowRoot| {
+            !excluded.contains(root)
+                && !root
+                    .ended_source()
+                    .is_some_and(|(source, _)| excluded.contains(&source))
+        };
+        self.direct.retain(&retain);
+        for roots in self.projected.values_mut() {
+            roots.retain(&retain);
+        }
+        self.projected.retain(|_, roots| !roots.is_empty());
+        self
+    }
+
+    /// Remove legacy roots only from values carried through one of the selected storage headers.
+    /// A product may contain both a header-mediated view and an ordinary borrowed sibling; moving
+    /// the header generation must not erase the sibling's independent provenance.
+    fn without_root_sources_at_paths(
+        mut self,
+        excluded: &BorrowRoots,
+        header_paths: impl IntoIterator<Item = StoragePath>,
+    ) -> Self {
+        let header_paths = header_paths.into_iter().collect::<Vec<_>>();
+        let retain = |root: &BorrowRoot| {
+            !excluded.contains(root)
+                && !root
+                    .ended_source()
+                    .is_some_and(|(source, _)| excluded.contains(&source))
+        };
+        if header_paths.iter().any(Vec::is_empty) {
+            self.direct.retain(&retain);
+        }
+        for (path, roots) in &mut self.projected {
+            if header_paths.iter().any(|header| path.starts_with(header)) {
+                roots.retain(&retain);
+            }
+        }
+        self.projected.retain(|_, roots| !roots.is_empty());
+        self
+    }
 }
 
 /// Which ended source generations a borrower depends on, and how each ended. `Ord` on
@@ -19879,39 +26968,684 @@ impl BorrowFact {
 /// that was consumed on one path and dropped on another reports the consumption).
 type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 
+/// Storage identities reachable through a mutable collection value. These are deliberately kept
+/// separate from [`BorrowFact`]: a slice may contain views rooted in `Local(x)` while its writable
+/// slots live in an entirely different `Local(y)`. Conflating those two roles makes an element
+/// write update the previous contents instead of every collection that can observe the write.
+///
+/// `unknown` is sticky across control-flow joins. The escape analysis owns the corresponding
+/// lifetime rejection; MoveCheck must nevertheless preserve the distinction so it never pretends
+/// an unresolved slice aliases only its short-lived header local.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct MutableBackingFact {
+    roots: BorrowRoots,
+    unknown: bool,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct MoveValueFact {
+    non_storage: BorrowFact,
+    headers: ProjectedHeaderFact,
+}
+
+impl MoveValueFact {
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            non_storage: self.non_storage.join(&other.non_storage),
+            headers: self.headers.join(&other.headers),
+        }
+    }
+
+    fn prefixed(self, projection: BorrowProjection) -> Self {
+        Self {
+            non_storage: self.non_storage.prefixed(projection),
+            headers: self.headers.prefixed(projection),
+        }
+    }
+
+    fn project_path(&self, path: &[BorrowProjection]) -> Self {
+        Self {
+            non_storage: self.non_storage.project_path(path),
+            headers: self.headers.project_path(path),
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.headers.rename_generations(renames);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum MoveReleasePlace {
+    Local { local: LocalId, path: StoragePath },
+    IterTemp {
+        depth: u32,
+        expression: usize,
+        path: StoragePath,
+    },
+    Staging {
+        action: usize,
+        operand: u32,
+        path: StoragePath,
+    },
+    ArenaScope { arena: MoveArenaScope },
+    LoopResult {
+        loop_expr: usize,
+        path: StoragePath,
+    },
+    Returned { path: StoragePath },
+}
+
+/// Stable identity of one enclosing arena allocation region. A named arena is the handle local
+/// consumed by `clone_in`; an anonymous arena is its unique HIR expression. Producer sites inside
+/// the region deliberately do not become distinct arena owners.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum MoveArenaScope {
+    Anonymous(usize),
+    Named(LocalId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct StorageHeaderDescriptor {
+    ty: Ty,
+    kind: StorageHeaderKind,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct MoveGenerationEntry {
+    /// Exact header shape represented by this generation. `None` is a sticky fail-closed join of
+    /// incompatible descriptors; consumers must then avoid selecting the generation by type.
+    descriptor: Option<StorageHeaderDescriptor>,
+    releases: std::collections::BTreeSet<MoveReleasePlace>,
+    ended: Option<BorrowEnd>,
+}
+
+impl MoveGenerationEntry {
+    fn join(&self, other: &Self) -> Self {
+        let mut releases = self.releases.clone();
+        releases.extend(other.releases.iter().cloned());
+        Self {
+            descriptor: (self.descriptor == other.descriptor)
+                .then_some(self.descriptor)
+                .flatten(),
+            releases,
+            ended: match (self.ended, other.ended) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(ended), None) | (None, Some(ended)) => Some(ended),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MoveExpressionCompletion {
+    value: BorrowFact,
+    storage: BorrowFact,
+    backing: MutableBackingFact,
+}
+
+/// One shared inventory of built-ins whose completed operands are followed by a source-visible
+/// mutation. Snapshot exemption, eager-lane classification, and the post-operand transition all
+/// consume this descriptor so a new mutating HIR variant cannot drift between three parallel
+/// lists.
+enum SourceVisibleMutationAction<'a> {
+    Storage(&'a Expr),
+    Builder {
+        builder: &'a Expr,
+        retained: &'a Expr,
+    },
+    Source(&'a Expr),
+    Shuffle {
+        source: &'a Expr,
+        collection: &'a Expr,
+    },
+    Collection(&'a Expr),
+}
+
+impl SourceVisibleMutationAction<'_> {
+    fn exact_destination_matches(&self, snapshot: usize) -> bool {
+        let matches = |expression: &Expr| MoveCheck::expr_key(expression) == snapshot;
+        match self {
+            Self::Storage(destination)
+            | Self::Builder {
+                builder: destination,
+                ..
+            }
+            | Self::Source(destination)
+            | Self::Collection(destination) => matches(destination),
+            Self::Shuffle { source, collection } => matches(source) || matches(collection),
+        }
+    }
+}
+
+/// One stable source place reserved after an eager `borrow mut` argument completes. This is
+/// deliberately separate from value/storage provenance: rebinding a Copy slice header retargets
+/// the place without ending the old backing owner's generation.
+#[derive(Clone, PartialEq, Eq)]
+struct MutablePlaceSnapshot {
+    root: LocalId,
+    path: Vec<u32>,
+}
+
+impl MutableBackingFact {
+    fn known(roots: BorrowRoots) -> Self {
+        Self {
+            roots,
+            unknown: false,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            roots: BorrowRoots::new(),
+            unknown: true,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut roots = self.roots.clone();
+        roots.extend(&other.roots);
+        Self {
+            roots,
+            unknown: self.unknown || other.unknown,
+        }
+    }
+}
+
 /// Flow-sensitive provenance for locals that borrow storage owned by other locals. `sources`
 /// stores the flattened owner roots of each live borrower. `invalid` records which source
 /// generation ended — moved, replaced, potentially reallocated, or dropped at its scope's end — on
 /// at least one path reaching the current point.
 #[derive(Clone, Default, PartialEq, Eq)]
-struct BorrowState {
+struct BorrowState(Box<BorrowStateData>);
+
+/// Heap-owned so adding another flow fact cannot silently consume the checked-HIR native-stack
+/// depth budget. Cloning this state already clones its map allocations; the one enclosing box
+/// keeps every recursive control walker frame at a stable pointer-sized footprint.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BorrowStateData {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
     facts: std::collections::HashMap<LocalId, BorrowFact>,
+    /// Projected writable headers and read-only carrier dependencies owned by each value. Stable
+    /// generation keys, not the current local name, are the identity authority.
+    headers: std::collections::HashMap<LocalId, ProjectedHeaderFact>,
+    storage: StorageGenerationTables<MoveGenerationEntry, MoveValueFact>,
+    /// Known active top-level sum alternatives. Absence is unknown; a present set is exact and is
+    /// unioned only when both joined paths retain exact knowledge.
+    active_sum: std::collections::HashMap<LocalId, std::collections::BTreeSet<BorrowProjection>>,
+    /// Path-sensitive identities of the writable storage reached by collection locals. An owned
+    /// array names itself; a slice copies the fact of the array/slice expression it views.
+    mutable_backing: std::collections::HashMap<LocalId, MutableBackingFact>,
     invalid: std::collections::HashMap<LocalId, EndedRoots>,
     pipeline_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
     value_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_value_sources: std::collections::HashMap<usize, EndedRoots>,
+    value_headers: std::collections::HashMap<usize, ProjectedHeaderFact>,
+    pipeline_headers: std::collections::HashMap<usize, ProjectedHeaderFact>,
+    mutable_place_sources: std::collections::HashMap<usize, MutablePlaceSnapshot>,
+    invalid_mutable_place_sources: std::collections::HashMap<usize, BorrowEnd>,
+    /// `borrow mut` parameters that still have at least one reaching path with no mutation. A
+    /// mutable-retention summary keeps that parameter's symbolic self roots only on such a path;
+    /// after an actual mutation an empty root set means a proven borrow-free replacement, not a
+    /// no-op call. Control joins union this may-unmodified fact.
+    unmodified_borrow_mut_params: std::collections::BTreeSet<u32>,
 }
 
-#[derive(Clone)]
-struct MoveMatchPrepared {
-    incoming_borrows: BorrowState,
-    evaluated: MovedSet,
-    evaluated_borrows: BorrowState,
-    consumed: Option<MovedSet>,
-    consumed_borrows: Option<BorrowState>,
-    scrutinee_ty: Ty,
-    scrutinee_fact: BorrowFact,
+impl std::ops::Deref for BorrowState {
+    type Target = BorrowStateData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-#[derive(Default)]
-struct MoveMatchJoin {
-    moved: Option<MovedSet>,
-    borrows: Option<BorrowState>,
+impl std::ops::DerefMut for BorrowState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// One reachable control edge. State, completed value, and finite producer-advance frontier stay
+/// together so differential Current-to-Prior renaming cannot update the directory while leaving
+/// the value header pointed at a colliding Current generation.
+#[derive(Clone, PartialEq, Eq)]
+struct MoveControlEdge {
+    moved: MovedSet,
+    borrows: BorrowState,
+    value: MoveValueFact,
+    advances: StorageGenerationRenames,
+}
+
+impl MoveControlEdge {
+    fn join(mut self, mut other: Self) -> Self {
+        let rename_self = StorageGenerationRenames::from_origins(
+            other
+                .advances
+                .origins
+                .difference(&self.advances.origins)
+                .cloned(),
+        );
+        let rename_other = StorageGenerationRenames::from_origins(
+            self.advances
+                .origins
+                .difference(&other.advances.origins)
+                .cloned(),
+        );
+        self.borrows.rename_generations(&rename_self);
+        self.value.rename_generations(&rename_self);
+        other.borrows.rename_generations(&rename_other);
+        other.value.rename_generations(&rename_other);
+        // A generation referenced only by the peer control value can carry an ending or content
+        // transition on this edge. Prune both tables against the union of completed values so that
+        // sticky metadata survives the join instead of being discarded before its peer makes the
+        // generation reachable.
+        let joined_value_headers = self.value.headers.join(&other.value.headers);
+        self.borrows
+            .retain_reachable_storage_with(&joined_value_headers);
+        other
+            .borrows
+            .retain_reachable_storage_with(&joined_value_headers);
+        Self {
+            moved: &self.moved | &other.moved,
+            borrows: BorrowState::join_prepruned(&self.borrows, &other.borrows),
+            value: self.value.join(&other.value),
+            advances: StorageGenerationRenames::from_origins(
+                self.advances
+                    .origins
+                    .union(&other.advances.origins)
+                    .cloned(),
+            ),
+        }
+    }
+
+    fn join_reachable(
+        edges: impl IntoIterator<Item = Option<Self>>,
+    ) -> Option<Self> {
+        edges.into_iter().flatten().reduce(Self::join)
+    }
 }
 
 impl BorrowState {
+    fn begin_value_headers(&mut self, snapshot: usize, headers: ProjectedHeaderFact) {
+        if headers.leaves.is_empty() {
+            self.value_headers.remove(&snapshot);
+        } else {
+            self.value_headers.insert(snapshot, headers);
+        }
+    }
+
+    fn rename_header_state(&mut self, renames: &StorageGenerationRenames) {
+        for headers in self.headers.values_mut() {
+            headers.rename_generations(renames);
+        }
+        for headers in self.value_headers.values_mut() {
+            headers.rename_generations(renames);
+        }
+        for headers in self.pipeline_headers.values_mut() {
+            headers.rename_generations(renames);
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.rename_header_state(renames);
+        for content in self.storage.contents.entries.values_mut() {
+            content.rename_generations(renames);
+        }
+        self.storage
+            .directory
+            .rename_current_to_prior(renames, |existing, incoming| {
+                *existing = existing.join(&incoming);
+            });
+        self.storage
+            .contents
+            .rename_current_to_prior(renames, |existing, incoming| {
+                *existing = existing.join(&incoming);
+            });
+    }
+
+    /// Remove directory/content entries that no live projected header or carried content can
+    /// observe in this path. This is required before control joins: an overwritten generation may
+    /// be ended on one branch and live on another, but if the ending branch retained no alias to
+    /// it, publishing that unreachable sticky end onto the live branch would create a false
+    /// cross-branch invalidation.
+    fn retain_reachable_storage_with(&mut self, extra: &ProjectedHeaderFact) {
+        fn add_headers(
+            reachable: &mut std::collections::BTreeSet<StorageGeneration>,
+            headers: &ProjectedHeaderFact,
+        ) -> bool {
+            let before = reachable.len();
+            reachable.extend(
+                headers
+                    .leaves
+                    .values()
+                    .flat_map(|leaf| leaf.generations.iter())
+                    .map(|reference| reference.generation.clone()),
+            );
+            reachable.len() != before
+        }
+
+        let mut reachable = std::collections::BTreeSet::new();
+        for headers in self
+            .headers
+            .values()
+            .chain(self.value_headers.values())
+            .chain(self.pipeline_headers.values())
+        {
+            add_headers(&mut reachable, headers);
+        }
+        add_headers(&mut reachable, extra);
+        loop {
+            let before = reachable.len();
+            for generation in reachable.clone() {
+                if let Some(content) = self.storage.contents.entries.get(&generation) {
+                    add_headers(&mut reachable, &content.headers);
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+        }
+        self.storage
+            .directory
+            .entries
+            .retain(|generation, _| reachable.contains(generation));
+        self.storage
+            .contents
+            .entries
+            .retain(|generation, _| reachable.contains(generation));
+    }
+
+    fn resolve_headers(&self, headers: &ProjectedHeaderFact) -> MoveValueFact {
+        fn release_root(release: &MoveReleasePlace) -> Option<BorrowRoot> {
+            match release {
+                MoveReleasePlace::Local { local, .. } => Some(BorrowRoot::Local(*local)),
+                MoveReleasePlace::IterTemp { depth, .. } => Some(BorrowRoot::IterTemp(*depth)),
+                MoveReleasePlace::Staging { .. }
+                | MoveReleasePlace::ArenaScope { .. }
+                | MoveReleasePlace::LoopResult { .. }
+                | MoveReleasePlace::Returned { .. } => None,
+            }
+        }
+
+        fn resolve(
+            state: &BorrowState,
+            headers: &ProjectedHeaderFact,
+            visiting: &mut std::collections::BTreeSet<StorageGenerationRef>,
+        ) -> MoveValueFact {
+            let mut result = MoveValueFact {
+                headers: headers.clone(),
+                ..MoveValueFact::default()
+            };
+            for (path, leaf) in &headers.leaves {
+                if !leaf.fallback_roots.is_empty() {
+                    result.non_storage.join_at(
+                        path,
+                        &BorrowFact::from_direct(leaf.fallback_roots.clone()),
+                    );
+                }
+                for reference in &leaf.generations {
+                    let generation = &reference.generation;
+                    if !visiting.insert(reference.clone()) {
+                        continue;
+                    }
+                    if let Some(content) = state.storage.contents.entries.get(generation) {
+                        let selected = content.project_path(&reference.content_path);
+                        let nested = resolve(state, &selected.headers, visiting);
+                        let resolved = selected.join(&nested);
+                        result.non_storage.join_at(path, &resolved.non_storage);
+                    }
+                    let mut owners = match generation {
+                        StorageGeneration::CallerStorage { parameter, .. } => {
+                            [BorrowRoot::ParamStorage(*parameter)].into_iter().collect()
+                        }
+                        StorageGeneration::Current(_)
+                        | StorageGeneration::Prior(_)
+                        | StorageGeneration::ParameterValue { .. } => BorrowRoots::new(),
+                    };
+                    if let Some(entry) = state.storage.directory.entries.get(generation) {
+                        owners.extend(entry.releases.iter().filter_map(release_root));
+                        if let Some(how) = entry.ended {
+                            owners = if owners.is_empty() {
+                                // Staging/arena/loop-result/returned releases have no user-facing
+                                // local root. Preserve their ended state as an anonymous diagnostic
+                                // marker; generation identity remains the directory key.
+                                [BorrowRoot::EndedIterTemp(0, how)].into_iter().collect()
+                            } else {
+                                owners
+                                    .into_iter()
+                                    .map(|owner| owner.ended(how))
+                                    .collect()
+                            };
+                        }
+                    }
+                    if !owners.is_empty() {
+                        result
+                            .non_storage
+                            .join_at(path, &BorrowFact::from_direct(owners));
+                    }
+                    visiting.remove(reference);
+                }
+            }
+            result
+        }
+
+        resolve(self, headers, &mut std::collections::BTreeSet::new())
+    }
+
+    /// Live roots that merely name the current release places of `headers`. These roots are
+    /// resolved at each observation and must never be frozen into a copied local's ordinary
+    /// provenance: a Move changes the release owner without changing the generation seen by
+    /// pre-existing aliases.
+    fn header_release_roots(&self, headers: &ProjectedHeaderFact) -> BorrowRoots {
+        let mut roots = BorrowRoots::new();
+        for reference in headers
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+        {
+            let generation = &reference.generation;
+            if let StorageGeneration::CallerStorage { parameter, .. } = generation {
+                roots.insert(BorrowRoot::ParamStorage(*parameter));
+            }
+            let Some(entry) = self.storage.directory.entries.get(generation) else {
+                continue;
+            };
+            for release in &entry.releases {
+                match release {
+                    MoveReleasePlace::Local { local, .. } => {
+                        roots.insert(BorrowRoot::Local(*local));
+                    }
+                    MoveReleasePlace::IterTemp { depth, .. } => {
+                        roots.insert(BorrowRoot::IterTemp(*depth));
+                    }
+                    MoveReleasePlace::Staging { .. }
+                    | MoveReleasePlace::ArenaScope { .. }
+                    | MoveReleasePlace::LoopResult { .. }
+                    | MoveReleasePlace::Returned { .. } => {}
+                }
+            }
+        }
+        roots
+    }
+
+    fn transfer_owned_releases(
+        &mut self,
+        headers: &ProjectedHeaderFact,
+        typed: &[StorageTypedPath],
+        source: Option<LocalId>,
+        destination: LocalId,
+        destination_prefix: &[BorrowProjection],
+    ) {
+        for header in typed {
+            if header.kind != StorageHeaderKind::OwnedDynamic {
+                continue;
+            }
+            let Some(leaf) = headers.leaves.get(&header.path) else {
+                continue;
+            };
+            for reference in &leaf.generations {
+                let generation = &reference.generation;
+                let Some(entry) = self.storage.directory.entries.get_mut(generation) else {
+                    continue;
+                };
+                let displaced = entry
+                    .releases
+                    .iter()
+                    .filter(|release| {
+                        source.map_or_else(
+                            || matches!(
+                                release,
+                                MoveReleasePlace::Local { .. }
+                                    | MoveReleasePlace::IterTemp { .. }
+                                    | MoveReleasePlace::Staging { .. }
+                                    | MoveReleasePlace::LoopResult { .. }
+                            ),
+                            |source| matches!(
+                                release,
+                                MoveReleasePlace::Local { local, .. } if *local == source
+                            ),
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if displaced.is_empty() {
+                    continue;
+                }
+                for release in displaced {
+                    entry.releases.remove(&release);
+                }
+                let mut path = destination_prefix.to_vec();
+                path.extend(&header.path);
+                entry.releases.insert(MoveReleasePlace::Local {
+                    local: destination,
+                    path,
+                });
+            }
+        }
+    }
+
+    fn end_local_releases(&mut self, local: LocalId, how: BorrowEnd) {
+        for entry in self.storage.directory.entries.values_mut() {
+            if entry.releases.iter().any(
+                |release| matches!(release, MoveReleasePlace::Local { local: owner, .. } if *owner == local),
+            ) {
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+        }
+    }
+
+    fn end_release(&mut self, release: &MoveReleasePlace, how: BorrowEnd) {
+        for entry in self.storage.directory.entries.values_mut() {
+            if entry.releases.contains(release) {
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+        }
+    }
+
+    fn reachable_header_generations(
+        &self,
+        headers: &ProjectedHeaderFact,
+    ) -> std::collections::BTreeSet<StorageGeneration> {
+        let mut pending = headers
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .map(|reference| reference.generation.clone())
+            .collect::<Vec<_>>();
+        let mut reachable = std::collections::BTreeSet::new();
+        while let Some(generation) = pending.pop() {
+            if !reachable.insert(generation.clone()) {
+                continue;
+            }
+            if let Some(content) = self.storage.contents.entries.get(&generation) {
+                pending.extend(
+                    content
+                        .headers
+                        .leaves
+                        .values()
+                        .flat_map(|leaf| leaf.generations.iter())
+                        .map(|reference| reference.generation.clone()),
+                );
+            }
+        }
+        reachable
+    }
+
+    /// End only staging-owned generations reachable from one completed frontier and not retained
+    /// by its result. A staging release belongs to the action that produced that value; walking
+    /// every directory entry here would let a nested discarded expression or loop edge destroy an
+    /// earlier sibling that is still waiting for its enclosing action.
+    fn end_abandoned_staging_releases(
+        &mut self,
+        frontier: &ProjectedHeaderFact,
+        retained: &ProjectedHeaderFact,
+        how: BorrowEnd,
+    ) {
+        let retained = self.reachable_header_generations(retained);
+        let mut pending = frontier
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .map(|reference| reference.generation.clone())
+            .collect::<Vec<_>>();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(generation) = pending.pop() {
+            if !visited.insert(generation.clone()) || retained.contains(&generation) {
+                continue;
+            }
+            if let Some(content) = self.storage.contents.entries.get(&generation) {
+                pending.extend(
+                    content
+                        .headers
+                        .leaves
+                        .values()
+                        .flat_map(|leaf| leaf.generations.iter())
+                        .map(|reference| reference.generation.clone()),
+                );
+            }
+            let Some(entry) = self.storage.directory.entries.get_mut(&generation) else {
+                continue;
+            };
+            if entry
+                .releases
+                .iter()
+                .any(|release| matches!(release, MoveReleasePlace::Staging { .. }))
+            {
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+        }
+    }
+
+    fn end_referenced_staging_releases(&mut self, headers: &ProjectedHeaderFact, how: BorrowEnd) {
+        self.end_abandoned_staging_releases(headers, &ProjectedHeaderFact::default(), how);
+    }
+
+    /// Function-wide cleanup only. Nested actions and loop edges must use
+    /// [`Self::end_referenced_staging_releases`] with their exact completed-value frontier.
+    fn end_all_staging_releases(&mut self, how: BorrowEnd) {
+        for entry in self.storage.directory.entries.values_mut() {
+            if entry
+                .releases
+                .iter()
+                .any(|release| matches!(release, MoveReleasePlace::Staging { .. }))
+            {
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+        }
+    }
+
+    fn end_iteration_releases(&mut self, depth: u32, how: BorrowEnd) {
+        for entry in self.storage.directory.entries.values_mut() {
+            if entry.releases.iter().any(|release| {
+                matches!(release, MoveReleasePlace::IterTemp { depth: owner, .. } if *owner >= depth)
+            }) {
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+        }
+    }
+
     fn assign(&mut self, local: LocalId, fact: BorrowFact) {
         self.invalid.remove(&local);
         self.update_fact(local, fact);
@@ -19971,21 +27705,103 @@ impl BorrowState {
     fn finish_value_source(&mut self, snapshot: usize) {
         self.value_sources.remove(&snapshot);
         self.invalid_value_sources.remove(&snapshot);
+        self.value_headers.remove(&snapshot);
+        self.mutable_place_sources.remove(&snapshot);
+        self.invalid_mutable_place_sources.remove(&snapshot);
+    }
+
+    fn begin_mutable_place_source(&mut self, snapshot: usize, place: MutablePlaceSnapshot) {
+        self.invalid_mutable_place_sources.remove(&snapshot);
+        self.mutable_place_sources.insert(snapshot, place);
+    }
+
+    fn finish_mutable_place_source(&mut self, snapshot: usize) {
+        self.mutable_place_sources.remove(&snapshot);
+        self.invalid_mutable_place_sources.remove(&snapshot);
+    }
+
+    /// End every active reservation whose place overlaps `root.path`. Empty paths denote the
+    /// complete local. A call action retires its own completed argument reservation first, while
+    /// an enclosing call's earlier reservation remains active and is invalidated here.
+    fn invalidate_mutable_places(
+        &mut self,
+        root: LocalId,
+        path: &[u32],
+        how: BorrowEnd,
+    ) {
+        let invalidated = self
+            .mutable_place_sources
+            .iter()
+            .filter_map(|(&snapshot, place)| {
+                (place.root == root
+                    && (place.path.starts_with(path) || path.starts_with(&place.path)))
+                .then_some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        for snapshot in invalidated {
+            let entry = self
+                .invalid_mutable_place_sources
+                .entry(snapshot)
+                .or_insert(how);
+            *entry = (*entry).min(how);
+        }
     }
 
     /// End every source generation matching `ended`. One entry point for both endings: a named
     /// local being consumed, and a whole class of roots (a loop depth's temporaries plus its owned
     /// locals) being dropped at an iteration edge.
+    fn mark_matching_roots_ended(
+        &mut self,
+        how: BorrowEnd,
+        ended: impl std::ops::Fn(BorrowRoot) -> bool,
+    ) {
+        let state = &mut *self.0;
+        let mark_headers = |headers: &mut ProjectedHeaderFact| {
+            for leaf in headers.leaves.values_mut() {
+                leaf.fallback_roots = std::mem::take(&mut leaf.fallback_roots)
+                    .into_iter()
+                    .map(|root| if ended(root) { root.ended(how) } else { root })
+                    .collect();
+            }
+        };
+        for headers in state.headers.values_mut() {
+            mark_headers(headers);
+        }
+        for headers in state.value_headers.values_mut() {
+            mark_headers(headers);
+        }
+        for headers in state.pipeline_headers.values_mut() {
+            mark_headers(headers);
+        }
+        for content in state.storage.contents.entries.values_mut() {
+            mark_headers(&mut content.headers);
+            let invalid = content
+                .non_storage
+                .live_roots()
+                .into_iter()
+                .filter(|root| ended(*root))
+                .map(|root| (root, how))
+                .collect();
+            content.non_storage.mark_ended(&invalid);
+        }
+    }
+
     fn invalidate_matching(&mut self, how: BorrowEnd, ended: impl std::ops::Fn(BorrowRoot) -> bool) {
-        for (&borrower, roots) in &self.sources {
+        let state = &mut *self.0;
+        for (&borrower, roots) in &state.sources {
             for &root in roots.iter().filter(|&&r| ended(r)) {
-                let entry = self.invalid.entry(borrower).or_default().entry(root).or_insert(how);
+                let entry = state
+                    .invalid
+                    .entry(borrower)
+                    .or_default()
+                    .entry(root)
+                    .or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
-        for (&snapshot, roots) in &self.pipeline_sources {
+        for (&snapshot, roots) in &state.pipeline_sources {
             for &root in roots.iter().filter(|&&r| ended(r)) {
-                let entry = self
+                let entry = state
                     .invalid_pipeline_sources
                     .entry(snapshot)
                     .or_default()
@@ -19994,9 +27810,9 @@ impl BorrowState {
                 *entry = (*entry).min(how);
             }
         }
-        for (&snapshot, roots) in &self.value_sources {
+        for (&snapshot, roots) in &state.value_sources {
             for &root in roots.iter().filter(|&&r| ended(r)) {
-                let entry = self
+                let entry = state
                     .invalid_value_sources
                     .entry(snapshot)
                     .or_default()
@@ -20008,6 +27824,7 @@ impl BorrowState {
     }
 
     fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
+        self.mark_matching_roots_ended(how, |r| r == BorrowRoot::Local(owner));
         self.invalidate_matching(how, |r| r == BorrowRoot::Local(owner));
     }
 
@@ -20015,8 +27832,35 @@ impl BorrowState {
         self.invalidate_matching(how, |root| roots.contains(&root));
     }
 
-    fn join(a: &Self, b: &Self) -> Self {
+    fn invalidate_roots_except_local(
+        &mut self,
+        roots: &BorrowRoots,
+        how: BorrowEnd,
+        excluded: LocalId,
+    ) {
+        self.invalidate_roots(roots, how);
+        if let Some(invalid) = self.invalid.get_mut(&excluded) {
+            invalid.retain(|root, _| !roots.contains(root));
+            if invalid.is_empty() {
+                self.invalid.remove(&excluded);
+            }
+        }
+    }
+
+    /// Join states whose storage tables were already pruned against every external control-value
+    /// header that keeps them reachable. Re-pruning here would discard a fresh branch result before
+    /// that result is installed into a local.
+    fn join_prepruned(a: &Self, b: &Self) -> Self {
         let mut out = a.clone();
+        out.unmodified_borrow_mut_params
+            .extend(b.unmodified_borrow_mut_params.iter().copied());
+        out.active_sum.retain(|local, active| {
+            let Some(other) = b.active_sum.get(local) else {
+                return false;
+            };
+            active.extend(other.iter().copied());
+            true
+        });
         for (&local, roots) in &b.sources {
             out.sources.entry(local).or_default().extend(roots);
         }
@@ -20025,6 +27869,34 @@ impl BorrowState {
                 .entry(local)
                 .and_modify(|current| *current = current.join(fact))
                 .or_insert_with(|| fact.clone());
+        }
+        for (&local, headers) in &b.headers {
+            out.headers
+                .entry(local)
+                .and_modify(|current| *current = current.join(headers))
+                .or_insert_with(|| headers.clone());
+        }
+        for (generation, entry) in &b.storage.directory.entries {
+            out.storage
+                .directory
+                .entries
+                .entry(generation.clone())
+                .and_modify(|current| *current = current.join(entry))
+                .or_insert_with(|| entry.clone());
+        }
+        for (generation, content) in &b.storage.contents.entries {
+            out.storage
+                .contents
+                .entries
+                .entry(generation.clone())
+                .and_modify(|current| *current = current.join(content))
+                .or_insert_with(|| content.clone());
+        }
+        for (&local, backing) in &b.mutable_backing {
+            out.mutable_backing
+                .entry(local)
+                .and_modify(|current| *current = current.join(backing))
+                .or_insert_with(|| backing.clone());
         }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
@@ -20064,6 +27936,30 @@ impl BorrowState {
                 let entry = into.entry(owner).or_insert(how);
                 *entry = (*entry).min(how);
             }
+        }
+        for (&snapshot, headers) in &b.value_headers {
+            out.value_headers
+                .entry(snapshot)
+                .and_modify(|current| *current = current.join(headers))
+                .or_insert_with(|| headers.clone());
+        }
+        for (&snapshot, headers) in &b.pipeline_headers {
+            out.pipeline_headers
+                .entry(snapshot)
+                .and_modify(|current| *current = current.join(headers))
+                .or_insert_with(|| headers.clone());
+        }
+        for (&snapshot, place) in &b.mutable_place_sources {
+            out.mutable_place_sources
+                .entry(snapshot)
+                .or_insert_with(|| place.clone());
+        }
+        for (&snapshot, &how) in &b.invalid_mutable_place_sources {
+            let entry = out
+                .invalid_mutable_place_sources
+                .entry(snapshot)
+                .or_insert(how);
+            *entry = (*entry).min(how);
         }
         out
     }
@@ -20127,7 +28023,291 @@ macro_rules! move_expr {
     };
 }
 
+/// Evaluate an operand now but defer its root ownership transfer to the enclosing successful
+/// construction/call action. Statements and nested calls inside the operand still perform their
+/// own actions as they execute; only the value selected at this operand boundary is delayed.
+macro_rules! move_expr_deferred {
+    ($checker:expr, $expression:expr, $moved:expr $(,)?) => {
+        if !$checker.expr_deferred_action($expression, $moved) {
+            return false;
+        }
+    };
+}
+
 impl<'a> MoveCheck<'a> {
+    fn begin_storage_advance_frame(&mut self) {
+        self.value_snapshot_frames.push(MoveTransientFrame::Storage(
+            StorageGenerationRenames::default(),
+        ));
+    }
+
+    fn finish_storage_advance_frame(&mut self) -> StorageGenerationRenames {
+        match self.value_snapshot_frames.pop() {
+            Some(MoveTransientFrame::Storage(advances)) => advances,
+            Some(
+                MoveTransientFrame::Value(_)
+                | MoveTransientFrame::Arena(_)
+                | MoveTransientFrame::Loop(_),
+            )
+            | None => {
+                panic!("storage advance frame balanced")
+            }
+        }
+    }
+
+    fn record_storage_advances(&mut self, renames: &StorageGenerationRenames) {
+        if let Some(MoveTransientFrame::Storage(frame)) = self
+            .value_snapshot_frames
+            .iter_mut()
+            .rev()
+            .find(|frame| matches!(frame, MoveTransientFrame::Storage(_)))
+        {
+            frame.origins.extend(renames.origins.iter().cloned());
+        }
+    }
+
+    fn active_storage_advances(&self) -> StorageGenerationRenames {
+        StorageGenerationRenames::from_origins(self.value_snapshot_frames.iter().flat_map(
+            |frame| match frame {
+                MoveTransientFrame::Storage(advances) => {
+                    advances.origins.iter().cloned().collect::<Vec<_>>()
+                }
+                MoveTransientFrame::Value(_)
+                | MoveTransientFrame::Arena(_)
+                | MoveTransientFrame::Loop(_) => Vec::new(),
+            },
+        ))
+    }
+
+    fn begin_value_snapshot_frame(&mut self) {
+        self.value_snapshot_frames
+            .push(MoveTransientFrame::Value(Vec::new()));
+    }
+
+    fn finish_value_snapshot_frame(&mut self) -> Vec<usize> {
+        match self.value_snapshot_frames.pop() {
+            Some(MoveTransientFrame::Value(snapshots)) => snapshots,
+            Some(
+                MoveTransientFrame::Storage(_)
+                | MoveTransientFrame::Arena(_)
+                | MoveTransientFrame::Loop(_),
+            )
+            | None => {
+                panic!("value snapshot frame balanced")
+            }
+        }
+    }
+
+    fn record_parent_value_snapshot(&mut self, snapshot: usize) {
+        self.record_parent_value_snapshots(&[snapshot]);
+    }
+
+    fn record_parent_value_snapshots(&mut self, snapshots: &[usize]) {
+        if let Some(MoveTransientFrame::Value(parent)) = self
+            .value_snapshot_frames
+            .iter_mut()
+            .rev()
+            .find(|frame| matches!(frame, MoveTransientFrame::Value(_)))
+        {
+            parent.extend(snapshots.iter().copied());
+        }
+    }
+
+    fn arena_scope(expression: &Expr) -> Option<MoveArenaScope> {
+        match &expression.kind {
+            ExprKind::Arena(_) => Some(MoveArenaScope::Anonymous(Self::expr_key(expression))),
+            ExprKind::NamedArena { local, .. } => Some(MoveArenaScope::Named(*local)),
+            _ => None,
+        }
+    }
+
+    fn begin_arena_scope(&mut self, expression: &Expr) {
+        let scope = Self::arena_scope(expression).expect("arena expression");
+        self.value_snapshot_frames
+            .push(MoveTransientFrame::Arena(scope));
+        self.arena_depth += 1;
+    }
+
+    fn active_arena_scope(&self) -> Option<MoveArenaScope> {
+        self.value_snapshot_frames.iter().rev().find_map(|frame| match frame {
+            MoveTransientFrame::Arena(scope) => Some(*scope),
+            MoveTransientFrame::Value(_)
+            | MoveTransientFrame::Storage(_)
+            | MoveTransientFrame::Loop(_) => None,
+        })
+    }
+
+    fn active_named_arena_scope(&self, local: LocalId) -> Option<MoveArenaScope> {
+        self.value_snapshot_frames.iter().rev().find_map(|frame| match frame {
+            MoveTransientFrame::Arena(MoveArenaScope::Named(owner)) if *owner == local => {
+                Some(MoveArenaScope::Named(local))
+            }
+            MoveTransientFrame::Arena(_)
+            | MoveTransientFrame::Value(_)
+            | MoveTransientFrame::Storage(_)
+            | MoveTransientFrame::Loop(_) => None,
+        })
+    }
+
+    fn begin_loop_scope(&mut self, loop_expr: usize) {
+        self.value_snapshot_frames
+            .push(MoveTransientFrame::Loop(loop_expr));
+    }
+
+    fn active_loop_result_key(&self) -> Option<usize> {
+        self.value_snapshot_frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                MoveTransientFrame::Loop(loop_expr) => Some(*loop_expr),
+                MoveTransientFrame::Value(_)
+                | MoveTransientFrame::Storage(_)
+                | MoveTransientFrame::Arena(_) => None,
+            })
+    }
+
+    fn finish_loop_scope(&mut self, loop_expr: usize) {
+        match self.value_snapshot_frames.pop() {
+            Some(MoveTransientFrame::Loop(current)) if current == loop_expr => {}
+            Some(
+                MoveTransientFrame::Loop(_)
+                | MoveTransientFrame::Value(_)
+                | MoveTransientFrame::Storage(_)
+                | MoveTransientFrame::Arena(_),
+            )
+            | None => panic!("loop scope balanced"),
+        }
+    }
+
+    fn snapshot_headers(
+        &self,
+        snapshots: impl IntoIterator<Item = usize>,
+    ) -> ProjectedHeaderFact {
+        snapshots
+            .into_iter()
+            .filter_map(|snapshot| self.borrows.value_headers.get(&snapshot))
+            .fold(ProjectedHeaderFact::default(), |headers, snapshot| {
+                headers.join(snapshot)
+            })
+    }
+
+    fn completed_subtree_headers(&self, expression: &Expr) -> ProjectedHeaderFact {
+        hir_depth::expr_postorder(expression)
+            .into_iter()
+            .filter_map(|node| self.borrows.value_headers.get(&Self::expr_key(node)))
+            .fold(self.completed_headers(expression), |headers, snapshot| {
+                headers.join(snapshot)
+            })
+    }
+
+    fn finish_child_staging_frontier(
+        &mut self,
+        expression: &Expr,
+        child_snapshots: &[usize],
+    ) {
+        if child_snapshots.is_empty() {
+            return;
+        }
+        let frontier = self.snapshot_headers(child_snapshots.iter().copied());
+        let retained = self.completed_headers(expression);
+        self.borrows.end_abandoned_staging_releases(
+            &frontier,
+            &retained,
+            BorrowEnd::Dropped,
+        );
+    }
+
+    fn clear_expression_value_snapshots(&mut self, expression: &Expr) {
+        for node in hir_depth::expr_postorder(expression) {
+            self.clear_value_snapshot(Self::expr_key(node));
+        }
+    }
+
+    fn end_expression_staging_releases(&mut self, expression: &Expr, how: BorrowEnd) {
+        let headers = self.completed_subtree_headers(expression);
+        self.borrows
+            .end_referenced_staging_releases(&headers, how);
+    }
+
+    /// End completed siblings abandoned by a cleanup-carrying control edge. A `return` scans all
+    /// active value frames because it leaves the function; an accepted `break` stops at the
+    /// innermost loop marker so an outer call argument remains live while an inner loop exits.
+    fn end_active_staging_releases(&mut self, stop_at_loop: bool, how: BorrowEnd) {
+        let mut snapshots = Vec::new();
+        for frame in self.value_snapshot_frames.iter().rev() {
+            match frame {
+                MoveTransientFrame::Value(frame) => snapshots.extend(frame.iter().copied()),
+                MoveTransientFrame::Loop(_) if stop_at_loop => break,
+                MoveTransientFrame::Loop(_)
+                | MoveTransientFrame::Storage(_)
+                | MoveTransientFrame::Arena(_) => {}
+            }
+        }
+        let headers = self.snapshot_headers(snapshots);
+        self.borrows
+            .end_referenced_staging_releases(&headers, how);
+    }
+
+    fn finish_arena_scope(&mut self, expression: &Expr, how: Option<BorrowEnd>) {
+        let expected = Self::arena_scope(expression).expect("arena expression");
+        match self.value_snapshot_frames.pop() {
+            Some(MoveTransientFrame::Arena(scope)) if scope == expected => {}
+            Some(MoveTransientFrame::Arena(_)
+                | MoveTransientFrame::Value(_)
+                | MoveTransientFrame::Storage(_)
+                | MoveTransientFrame::Loop(_))
+            | None => panic!("arena scope balanced"),
+        }
+        self.arena_depth -= 1;
+        if let Some(how) = how {
+            self.borrows.end_release(
+                &MoveReleasePlace::ArenaScope { arena: expected },
+                how,
+            );
+        }
+    }
+
+    fn propagate_storage_advances(&mut self, renames: &StorageGenerationRenames) {
+        self.record_storage_advances(renames);
+    }
+
+    fn join_storage_states(
+        left: &BorrowState,
+        left_advances: &StorageGenerationRenames,
+        right: &BorrowState,
+        right_advances: &StorageGenerationRenames,
+    ) -> BorrowState {
+        MoveControlEdge {
+            moved: MovedSet::new(),
+            borrows: left.clone(),
+            value: MoveValueFact::default(),
+            advances: left_advances.clone(),
+        }
+        .join(MoveControlEdge {
+            moved: MovedSet::new(),
+            borrows: right.clone(),
+            value: MoveValueFact::default(),
+            advances: right_advances.clone(),
+        })
+        .borrows
+    }
+
+    fn publish_control_edge(
+        &mut self,
+        key: usize,
+        moved: &mut MovedSet,
+        edge: MoveControlEdge,
+    ) {
+        *moved = edge.moved;
+        self.borrows = edge.borrows;
+        if edge.value.non_storage.is_empty() && edge.value.headers.leaves.is_empty() {
+            self.control_value_facts.remove(&key);
+        } else {
+            self.control_value_facts.insert(key, edge.value);
+        }
+        self.propagate_storage_advances(&edge.advances);
+    }
+
     fn arm_moves_payload(&self, arm: &MatchArm) -> bool {
         arm.bindings.iter().any(|binding| {
             self.is_move(*binding)
@@ -20138,7 +28318,210 @@ impl<'a> MoveCheck<'a> {
         })
     }
 
+    /// Identify the narrow set of expressions whose completion facts a later mutable call action
+    /// consumes. Ordinary borrow-capable expressions already snapshot themselves; this registry
+    /// adds non-borrowing storage arguments and exact `borrow mut` place reservations without
+    /// putting every scalar/local expression on the snapshot path.
+    fn prepare_mutable_call_snapshots(&mut self) {
+        let mut arguments = std::collections::HashSet::new();
+        let mut places = std::collections::HashSet::new();
+        for event in hir_depth::body_events(&self.f.body) {
+            let hir_depth::BodyEvent::ExprEnter(expression) = event else {
+                continue;
+            };
+            let (call_arguments, modes) = match &expression.kind {
+                ExprKind::Call { func, args, .. } => (
+                    args.as_slice(),
+                    self.named_param_modes.get(func).cloned(),
+                ),
+                ExprKind::CallFnValue { callee, args } => (
+                    args.as_slice(),
+                    match callee.ty {
+                        Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                            function
+                                .params
+                                .iter()
+                                .map(|(mode, _)| *mode)
+                                .collect::<Vec<_>>()
+                        }),
+                        _ => None,
+                    },
+                ),
+                _ => continue,
+            };
+            let Some(modes) = modes else {
+                continue;
+            };
+            if !modes.iter().any(|mode| {
+                matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+            }) {
+                continue;
+            }
+            arguments.extend(call_arguments.iter().map(Self::expr_key));
+            places.extend(
+                call_arguments
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, argument)| {
+                        modes.get(*index) == Some(&ast::ParamMode::BorrowMut)
+                            && Self::mutable_actual_root(argument).is_some()
+                    })
+                    .map(|(_, argument)| Self::expr_key(argument)),
+            );
+        }
+        self.mutable_call_argument_snapshots = arguments;
+        self.borrow_mut_place_snapshots = places;
+    }
+
+    fn storage_type_context(&self) -> StorageTypeContext<'_> {
+        StorageTypeContext {
+            structs: self.structs,
+            tuples: self.tuples,
+            enums: self.enums,
+            tagged_types: self.tagged_types,
+        }
+    }
+
+    fn storage_header_content_ty(&self, header_ty: Ty) -> Option<Ty> {
+        match expand_tagged_ty(header_ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                Some(scalar_to_ty(element))
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, Layout::Aos)
+            | Ty::Soa(id) => Some(Ty::Struct(id)),
+            // The id is a symbolic row parameter, not a concrete StructDef index.
+            Ty::SoaParam(_) => None,
+            Ty::DynStructArray(_, Layout::Soa) => None,
+            _ => None,
+        }
+    }
+
+    fn seed_parameter_storage(
+        &mut self,
+        position: u32,
+        local: LocalId,
+        mode: ast::ParamMode,
+    ) {
+        let Some(ty) = self.f.locals.get(local as usize).map(|record| record.ty) else {
+            return;
+        };
+        let paths = storage_type_paths(ty, self.storage_type_context());
+        if !paths.valid {
+            return;
+        }
+        let borrowed = !matches!(mode, ast::ParamMode::ByValue);
+        let generations = paths
+            .headers
+            .iter()
+            .map(|header| {
+                let generation = if borrowed || header.kind == StorageHeaderKind::View {
+                    StorageGeneration::caller_storage(position, &header.path)
+                } else if header.kind == StorageHeaderKind::InlineFixed {
+                    StorageGeneration::current(StorageOrigin::inline_place(local, &header.path))
+                } else {
+                    StorageGeneration::parameter_value(position, &header.path)
+                };
+                (header.path.clone(), (generation, header.clone()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut formations = Vec::new();
+        for (path, (generation, header)) in &generations {
+            let releases = if borrowed || header.kind == StorageHeaderKind::View {
+                std::collections::BTreeSet::new()
+            } else {
+                [MoveReleasePlace::Local {
+                    local,
+                    path: path.clone(),
+                }]
+                .into_iter()
+                .collect()
+            };
+            let content_ty = self.storage_header_content_ty(header.ty);
+            let content_may_borrow = matches!(header.ty, Ty::SoaParam(_))
+                || content_ty.is_some_and(|content_ty| ty_may_borrow(
+                    content_ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ));
+            formations.push(StorageHeaderFormation {
+                path: path.clone(),
+                generation: generation.clone(),
+                directory: Some(MoveGenerationEntry {
+                    descriptor: Some(StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    }),
+                    releases,
+                    ended: None,
+                }),
+                content: Some(MoveValueFact {
+                    non_storage: if content_may_borrow {
+                        BorrowFact::from_direct(
+                            [BorrowRoot::Param(position)].into_iter().collect(),
+                        )
+                    } else {
+                        BorrowFact::default()
+                    },
+                    headers: ProjectedHeaderFact {
+                        leaves: generations
+                            .iter()
+                            .filter_map(|(candidate_path, (candidate_generation, candidate))| {
+                                let suffix = candidate_path.strip_prefix(path.as_slice())?;
+                                (!suffix.is_empty()).then(|| {
+                                    (
+                                        suffix.to_vec(),
+                                        StorageHeaderLeaf::known_typed(
+                                            candidate_generation.clone(),
+                                            StorageHeaderDescriptor {
+                                                ty: candidate.ty,
+                                                kind: candidate.kind,
+                                            },
+                                        ),
+                                    )
+                                })
+                            })
+                            .collect(),
+                    },
+                }),
+            });
+        }
+        if formations.is_empty() {
+            return;
+        }
+        let mut next = self.borrows.storage.clone();
+        if let Ok(commit) = next.try_form_headers(
+            ty,
+            formations,
+            self.storage_type_context(),
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) {
+            self.borrows.rename_header_state(&commit.renames);
+            self.record_storage_advances(&commit.renames);
+            self.borrows.storage = next;
+            self.borrows.headers.insert(local, commit.headers);
+        }
+    }
+
+    fn finish_function_tail(&mut self, falls_through: bool) {
+        if !falls_through {
+            return;
+        }
+        let Some(value) = &self.f.body.value else {
+            return;
+        };
+        let key = Self::expr_key(value);
+        self.validate_value_snapshot(key, key, value.span);
+        self.transfer_completed_value_to_returned(value);
+        self.borrows.end_all_staging_releases(BorrowEnd::Dropped);
+        self.return_roots.extend(self.borrow_sources(value));
+    }
+
     fn check(mut self) -> MoveCheckResult {
+        self.prepare_mutable_call_snapshots();
         for (position, &local) in self.f.params.iter().enumerate() {
             let mode = self
                 .f
@@ -20146,13 +28529,47 @@ impl<'a> MoveCheck<'a> {
                 .get(position)
                 .copied()
                 .unwrap_or(ast::ParamMode::ByValue);
+            if mode == ast::ParamMode::BorrowMut {
+                self.borrows
+                    .unmodified_borrow_mut_params
+                    .insert(position as u32);
+            }
+            self.seed_parameter_storage(position as u32, local, mode);
+            if self
+                .f
+                .locals
+                .get(local as usize)
+                .is_some_and(|local| self.mutable_collection_ty(local.ty))
+            {
+                let backing = self.local_default_mutable_backing(local);
+                self.borrows.mutable_backing.insert(local, backing);
+            }
+            let local_ty = self.f.locals.get(local as usize).map(|local| local.ty);
+            let tracks_dynamic_storage = local_ty.is_some_and(|ty| {
+                ty.is_array_builder()
+                    || matches!(
+                        expand_tagged_ty(ty, self.tagged_types),
+                        Ty::DynArray(..) | Ty::DynStructArray(..)
+                    )
+            });
             if !self.local_may_borrow(local)
-                && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                && !tracks_dynamic_storage
+                && !matches!(
+                    mode,
+                    ast::ParamMode::Borrow
+                        | ast::ParamMode::BorrowMut
+                        | ast::ParamMode::Out
+                )
             {
                 continue;
             }
             let mut roots = BorrowRoots::new();
-            roots.insert(BorrowRoot::Param(position as u32));
+            if self.local_may_borrow(local) || !tracks_dynamic_storage {
+                roots.insert(BorrowRoot::Param(position as u32));
+            }
+            if tracks_dynamic_storage {
+                roots.insert(BorrowRoot::ParamStorage(position as u32));
+            }
             let ty = self.f.locals[local as usize].ty;
             let fact =
                 self.normalize_borrow_fact(ty, BorrowFact::from_direct(roots));
@@ -20164,13 +28581,7 @@ impl<'a> MoveCheck<'a> {
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
         let ret_is_move = self.is_move_ty(self.f.ret);
         let falls_through = self.block(&self.f.body, &mut moved, ret_is_move, true);
-        if falls_through
-            && let Some(value) = &self.f.body.value
-        {
-            let key = Self::expr_key(value);
-            self.validate_value_snapshot(key, key, value.span);
-            self.return_roots.extend(self.borrow_sources(value));
-        }
+        self.finish_function_tail(falls_through);
         if falls_through {
             self.collect_borrow_mut_exit_roots();
         }
@@ -20183,6 +28594,8 @@ impl<'a> MoveCheck<'a> {
 
     /// Join the mutable destinations visible at one returning edge. Projection precision remains
     /// inside `BorrowState`; the interprocedural fact needs only exact source-parameter roots.
+    /// `borrow mut` and `out` share this one summary: their caller transitions differ, not the
+    /// callee-side question of which roots may remain stored in a destination.
     fn collect_borrow_mut_exit_roots(&mut self) {
         for (destination, (&local, mode)) in self
             .f
@@ -20191,18 +28604,30 @@ impl<'a> MoveCheck<'a> {
             .zip(self.f.param_modes.iter().copied())
             .enumerate()
         {
-            if mode != ast::ParamMode::BorrowMut {
+            if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                 continue;
+            }
+            // The storage directory is authoritative after a mutable transition. Reading the
+            // legacy projected fact here would preserve the destination's pre-call roots after a
+            // strong content clear, and would miss a Copy view rebound to another parameter.
+            let mut roots = self.local_borrow_fact(local).flatten();
+            if mode == ast::ParamMode::BorrowMut
+                && !self
+                    .borrows
+                    .unmodified_borrow_mut_params
+                    .contains(&(destination as u32))
+            {
+                roots.retain(|root| {
+                    !matches!(
+                        root,
+                        BorrowRoot::Param(source) | BorrowRoot::ParamStorage(source)
+                            if *source == destination as u32
+                    )
+                });
             }
             let Some(summary) = self.borrow_mut_retention.get_mut(destination) else {
                 continue;
             };
-            let roots = self
-                .borrows
-                .facts
-                .get(&local)
-                .map(BorrowFact::flatten)
-                .unwrap_or_default();
             summary.extend(roots.into_iter().filter(|root| {
                 matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_))
             }));
@@ -20248,6 +28673,444 @@ impl<'a> MoveCheck<'a> {
         })
     }
 
+    fn parameter_position(&self, id: LocalId) -> Option<u32> {
+        self.f
+            .params
+            .iter()
+            .position(|&param| param == id)
+            .map(|position| position as u32)
+    }
+
+    fn mutable_collection_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..)
+        )
+    }
+
+    fn mutable_collection_contents_may_borrow(&self, ty: Ty) -> bool {
+        let content = match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                scalar_to_ty(element)
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::Soa(id) => Ty::Struct(id),
+            // Concrete emitted HIR substitutes this symbolic form. Keeping an unresolved template
+            // conservative avoids silently skipping a future borrow-capable instantiation.
+            Ty::SoaParam(_) => return true,
+            _ => return false,
+        };
+        ty_may_borrow(
+            content,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+    }
+
+    /// Whether a value can contain a collection header whose slots may be observed through an
+    /// alias. This is intentionally broader than a top-level collection test: a struct/sum/tuple
+    /// can retain a slice or SoA header. Plain scalar borrowers such as `str` are not observers of
+    /// every later write to the collection from which one element was read.
+    fn ty_contains_mutable_collection_header(&self, ty: Ty) -> bool {
+        #[allow(clippy::too_many_arguments)]
+        fn visit(
+            ty: Ty,
+            structs: &[StructDef],
+            tuples: &[hir::TupleDef],
+            enums: &[hir::EnumDef],
+            tagged_types: &[hir::TaggedType],
+            active_structs: &mut std::collections::HashSet<u32>,
+            active_tuples: &mut std::collections::HashSet<u32>,
+            active_enums: &mut std::collections::HashSet<u32>,
+            active_tagged: &mut std::collections::HashSet<u32>,
+        ) -> bool {
+            match ty {
+                Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..) => true,
+                Ty::Struct(id) => {
+                    if !active_structs.insert(id) {
+                        return true;
+                    }
+                    let result = structs.get(id as usize).is_none_or(|definition| {
+                        definition.fields.iter().any(|field| {
+                            visit(
+                                field.ty,
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            )
+                        })
+                    });
+                    active_structs.remove(&id);
+                    result
+                }
+                Ty::Tuple(id) => {
+                    if !active_tuples.insert(id) {
+                        return true;
+                    }
+                    let result = tuples.get(id as usize).is_none_or(|definition| {
+                        definition.elems.iter().copied().any(|element| {
+                            visit(
+                                scalar_to_ty(element),
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            )
+                        })
+                    });
+                    active_tuples.remove(&id);
+                    result
+                }
+                Ty::Enum(id) => {
+                    if !active_enums.insert(id) {
+                        return true;
+                    }
+                    let result = enums.get(id as usize).is_none_or(|definition| {
+                        definition.variants.iter().any(|variant| {
+                            variant.payload.iter().copied().any(|payload| {
+                                visit(
+                                    scalar_to_ty(payload),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                )
+                            })
+                        })
+                    });
+                    active_enums.remove(&id);
+                    result
+                }
+                Ty::Option(payload) | Ty::Box(payload) => visit(
+                    scalar_to_ty(payload),
+                    structs,
+                    tuples,
+                    enums,
+                    tagged_types,
+                    active_structs,
+                    active_tuples,
+                    active_enums,
+                    active_tagged,
+                ),
+                Ty::Result(ok, err) => {
+                    visit(
+                        scalar_to_ty(ok),
+                        structs,
+                        tuples,
+                        enums,
+                        tagged_types,
+                        active_structs,
+                        active_tuples,
+                        active_enums,
+                        active_tagged,
+                    ) || visit(
+                        scalar_to_ty(err),
+                        structs,
+                        tuples,
+                        enums,
+                        tagged_types,
+                        active_structs,
+                        active_tuples,
+                        active_enums,
+                        active_tagged,
+                    )
+                }
+                Ty::Tagged(id) => {
+                    if !active_tagged.insert(id) {
+                        return true;
+                    }
+                    let result = tagged_types.get(id as usize).is_none_or(|definition| {
+                        match definition {
+                            hir::TaggedType::Option(payload) => visit(
+                                scalar_to_ty(*payload),
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            ),
+                            hir::TaggedType::Result(ok, err) => {
+                                visit(
+                                    scalar_to_ty(*ok),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                ) || visit(
+                                    scalar_to_ty(*err),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                )
+                            }
+                        }
+                    });
+                    active_tagged.remove(&id);
+                    result
+                }
+                _ => false,
+            }
+        }
+
+        visit(
+            ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+        )
+    }
+
+    fn mutable_view_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..)
+        )
+    }
+
+    fn caller_backed_view_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+        )
+    }
+
+    fn local_default_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        let Some(local_ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return MutableBackingFact::unknown();
+        };
+        if !self.mutable_collection_ty(local_ty) {
+            return MutableBackingFact::unknown();
+        }
+        if let Some(position) = self.parameter_position(local) {
+            let mode = self
+                .f
+                .param_modes
+                .get(position as usize)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            if self.caller_backed_view_ty(local_ty)
+                || matches!(
+                    mode,
+                    ast::ParamMode::Borrow
+                        | ast::ParamMode::BorrowMut
+                        | ast::ParamMode::Out
+                )
+            {
+                return MutableBackingFact::known(
+                    [BorrowRoot::ParamStorage(position)]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+        }
+        if self.mutable_view_ty(local_ty) {
+            MutableBackingFact::unknown()
+        } else {
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        }
+    }
+
+    /// A destructured owned collection transfers/copies its slots into the new binding. Slice and
+    /// SoA payloads remain views whose projection identity is not represented here, but fixed and
+    /// dynamic arrays have a definite new intra-function content-fact target.
+    fn destructured_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        let Some(ty) = self.f.locals.get(local as usize).map(|record| record.ty) else {
+            return MutableBackingFact::unknown();
+        };
+        if matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+        ) {
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        } else {
+            MutableBackingFact::unknown()
+        }
+    }
+
+    fn local_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        self.borrows
+            .mutable_backing
+            .get(&local)
+            .cloned()
+            .unwrap_or_else(|| self.local_default_mutable_backing(local))
+    }
+
+    fn block_mutable_backing(&self, block: &Block) -> MutableBackingFact {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block.value.as_deref().map_or_else(
+                MutableBackingFact::unknown,
+                |value| self.mutable_backing(value),
+            )
+        } else {
+            MutableBackingFact::unknown()
+        }
+    }
+
+    /// Resolve the storage identities reached by a mutable collection expression. Unlike
+    /// `storage_roots`, this never includes owners of views merely contained in the collection.
+    fn mutable_backing(&self, expression: &Expr) -> MutableBackingFact {
+        if let Some(backing) = self
+            .walked_backing_facts
+            .get(&Self::expr_key(expression))
+        {
+            return backing.clone();
+        }
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return self.mutable_backing(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(local) => self.local_mutable_backing(*local),
+            ExprKind::ArrayToSlice(inner)
+            | ExprKind::SliceRange { recv: inner, .. } => {
+                self.mutable_backing(inner)
+            }
+            ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block) => self.block_mutable_backing(block),
+            ExprKind::If { then, els, .. } => self
+                .block_mutable_backing(then)
+                .join(&self.block_mutable_backing(els)),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .filter(|arm| !self.non_fallthrough.contains(&arm.body.span))
+                .map(|arm| self.mutable_backing(&arm.body))
+                .reduce(|left, right| left.join(&right))
+                .unwrap_or_else(MutableBackingFact::unknown),
+            // The success carrier of an Option/Result and a loop break need projection-aware
+            // backing facts. Until that representation exists they remain explicitly unknown;
+            // EscapeCheck rejects a non-static retained value through the unresolved view.
+            ExprKind::ElseUnwrap { .. } | ExprKind::Try(_) | ExprKind::Loop { .. } => {
+                MutableBackingFact::unknown()
+            }
+            _ => MutableBackingFact::unknown(),
+        }
+    }
+
+    fn forwards_mutable_backing(expression: &Expr) -> bool {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return Self::forwards_mutable_backing(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(_)
+            | ExprKind::ArrayToSlice(_)
+            | ExprKind::SliceRange { .. } => true,
+            ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Block(block)
+            | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .is_some_and(Self::forwards_mutable_backing),
+            ExprKind::If { then, els, .. } => then
+                .value
+                .as_deref()
+                .is_some_and(Self::forwards_mutable_backing)
+                && els
+                    .value
+                    .as_deref()
+                    .is_some_and(Self::forwards_mutable_backing),
+            ExprKind::Match { arms, .. } => !arms.is_empty()
+                && arms
+                    .iter()
+                    .all(|arm| Self::forwards_mutable_backing(&arm.body)),
+            _ => false,
+        }
+    }
+
+    fn assign_mutable_backing(&mut self, local: LocalId, value: &Expr) {
+        let Some(local_ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return;
+        };
+        if !self.mutable_collection_ty(local_ty) {
+            self.borrows.mutable_backing.remove(&local);
+            return;
+        }
+        let expanded = expand_tagged_ty(local_ty, self.tagged_types);
+        let backing = if self.mutable_view_ty(local_ty) {
+            self.mutable_backing(value)
+        } else if matches!(expanded, Ty::Soa(..) | Ty::SoaParam(..)) {
+            if Self::forwards_mutable_backing(value) {
+                self.mutable_backing(value)
+            } else if materializes_fresh_soa_storage(value) {
+                MutableBackingFact::known(
+                    [BorrowRoot::Local(local)].into_iter().collect(),
+                )
+            } else {
+                // A call or mixed control result may forward an existing header. Unknown must
+                // overwrite any stale known identity instead of being mislabeled as fresh.
+                self.mutable_backing(value)
+            }
+        } else {
+            // Fixed and dynamic arrays own the visible slot storage after a bind/move/copy. The
+            // escape pass separately tracks whether that allocation is frame-, arena-, or
+            // caller-owned; MoveCheck needs only the collection identity whose content fact
+            // changes after an indexed write.
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        };
+        self.borrows.mutable_backing.insert(local, backing);
+    }
+
     fn borrowed_param_position(&self, id: LocalId) -> Option<u32> {
         self.f
             .params
@@ -20267,6 +29130,319 @@ impl<'a> MoveCheck<'a> {
             .and_then(|position| self.f.param_modes.get(position as usize).copied())
     }
 
+    /// Record an actual mutation through every symbolic caller-storage header reachable from a
+    /// place. This follows aliases as well as the parameter local itself; exact self-assignment
+    /// callers deliberately do not invoke it.
+    fn mark_borrow_mut_modified(&mut self, local: LocalId) {
+        let mut parameters = self
+            .local_headers(local)
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .filter_map(|reference| match reference.generation {
+                StorageGeneration::CallerStorage { parameter, .. }
+                    if self.f.param_modes.get(parameter as usize)
+                        == Some(&ast::ParamMode::BorrowMut) =>
+                {
+                    Some(parameter)
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        // A header-free aggregate such as `{ text: str }` still denotes the borrowed parameter
+        // place itself. Its projected value provenance describes the old contents, not whether the
+        // caller place was mutated, so seed the exact syntactic parameter independently.
+        if let Some(parameter) = self
+            .f
+            .params
+            .iter()
+            .position(|candidate| *candidate == local)
+            .filter(|parameter| {
+                self.f.param_modes.get(*parameter) == Some(&ast::ParamMode::BorrowMut)
+            })
+        {
+            parameters.insert(parameter as u32);
+        }
+        for parameter in parameters {
+            self.borrows
+                .unmodified_borrow_mut_params
+                .remove(&parameter);
+        }
+    }
+
+    fn borrow_mut_replacement_backing(
+        &self,
+        destination: &Expr,
+        sources: &[BorrowMutRetentionSource],
+        args: &[Expr],
+        completed: &[MutableBackingFact],
+    ) -> MutableBackingFact {
+        if matches!(
+            expand_tagged_ty(destination.ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+        ) {
+            return match destination.kind {
+                ExprKind::Local(local) => MutableBackingFact::known(
+                    [BorrowRoot::Local(local)].into_iter().collect(),
+                ),
+                _ => self.mutable_backing(destination),
+            };
+        }
+
+        let selected = sources
+            .iter()
+            .filter_map(|source| {
+                let index = source.index();
+                args.get(index)
+                    .is_some_and(|argument| {
+                        mutable_replacement_backing_compatible(
+                            destination.ty,
+                            argument.ty,
+                            self.tagged_types,
+                        )
+                    })
+                    .then_some(index)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        selected
+            .into_iter()
+            .filter_map(|index| completed.get(index))
+            .cloned()
+            .reduce(|left, right| left.join(&right))
+            .unwrap_or_else(MutableBackingFact::unknown)
+    }
+
+    fn borrow_mut_replacement_storage_fact(
+        &self,
+        destination: &Expr,
+        sources: &[BorrowMutRetentionSource],
+        args: &[Expr],
+        completed: &[MoveExpressionCompletion],
+        replacement: Option<&MutableBackingFact>,
+    ) -> BorrowFact {
+        if matches!(
+            expand_tagged_ty(destination.ty, self.tagged_types),
+            Ty::Array(..) | Ty::StructArray(..)
+        ) {
+            return completed
+                .get(
+                    args.iter()
+                        .position(|argument| std::ptr::eq(argument, destination))
+                        .unwrap_or(args.len()),
+                )
+                .map(|completion| completion.storage.clone())
+                .unwrap_or_default();
+        }
+
+        let mut storage = BorrowFact::default();
+        let mut selected = false;
+        for source in sources {
+            let index = source.index();
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            if argument.ty != Ty::ArenaHandle
+                && !mutable_replacement_backing_compatible(
+                    destination.ty,
+                    argument.ty,
+                    self.tagged_types,
+                )
+            {
+                continue;
+            }
+            let Some(completion) = completed.get(index) else {
+                continue;
+            };
+            storage = storage.join(&completion.storage);
+            storage
+                .direct
+                .extend(completion.backing.roots.iter().filter_map(|root| root.live()));
+            selected = true;
+        }
+        if !selected {
+            // An exact empty source set represents a fresh replacement. Its new caller-visible
+            // generation is still named by the replacement backing when one exists.
+            storage = BorrowFact::default();
+        }
+        if let Some(replacement) = replacement {
+            storage
+                .direct
+                .extend(replacement.roots.iter().filter_map(|root| root.live()));
+        }
+        storage
+    }
+
+    fn call_result_backing_from_indices(
+        &self,
+        result: Ty,
+        args: &[Expr],
+        completed: &[MoveExpressionCompletion],
+        indices: impl IntoIterator<Item = usize>,
+    ) -> MutableBackingFact {
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            return MutableBackingFact::unknown();
+        }
+        let mut roots = BorrowRoots::new();
+        for index in indices {
+            let Some((argument, completion)) = args.get(index).zip(completed.get(index)) else {
+                continue;
+            };
+            if matches!(
+                expand_tagged_ty(result, self.tagged_types),
+                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            ) && indexed_backing_compatible(result, argument.ty, self.tagged_types)
+            {
+                roots.extend(&completion.backing.roots);
+            }
+        }
+        MutableBackingFact {
+            roots,
+            // A return summary proves dependency, not exact writable-header identity.
+            unknown: true,
+        }
+    }
+
+    fn call_result_storage_compatible(&self, result: Ty, source: Ty) -> bool {
+        let result = expand_tagged_ty(result, self.tagged_types);
+        let source = expand_tagged_ty(source, self.tagged_types);
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            // A return summary can select one argument for element provenance without making an
+            // owned or inline result reuse that argument's allocation.
+            return false;
+        }
+        result == source
+            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+                && indexed_backing_compatible(result, source, self.tagged_types))
+    }
+
+    fn conservative_call_value(completed: &[MoveExpressionCompletion]) -> BorrowFact {
+        completed.iter().fold(BorrowFact::default(), |fact, completion| {
+            fact.join(&completion.value)
+        })
+    }
+
+    fn mutable_call_result_completion(
+        &self,
+        action: &Expr,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+        completed: &[MoveExpressionCompletion],
+    ) -> MoveExpressionCompletion {
+        let select_fact = |index: usize| {
+            completed.get(index).map(|completion| {
+                if matches!(
+                    modes.get(index),
+                    Some(
+                        ast::ParamMode::Borrow
+                            | ast::ParamMode::BorrowMut
+                            | ast::ParamMode::Out
+                    )
+                ) {
+                    completion.storage.clone()
+                } else {
+                    completion.value.clone()
+                }
+            })
+        };
+
+        let (value, selected) = match &action.kind {
+            ExprKind::Call { func, .. } => match self.named_return_borrow.get(func) {
+                Some(hir::ReturnBorrowSummary::None) => {
+                    (BorrowFact::default(), std::collections::BTreeSet::new())
+                }
+                Some(hir::ReturnBorrowSummary::Roots { params, captures })
+                    if captures.is_empty()
+                        && params.iter().all(|index| (*index as usize) < args.len()) =>
+                {
+                    let value = params.iter().fold(BorrowFact::default(), |fact, &index| {
+                        select_fact(index as usize)
+                            .map_or(fact.clone(), |selected| fact.join(&selected))
+                    });
+                    (
+                        value,
+                        params
+                            .iter()
+                            .map(|index| *index as usize)
+                            .collect::<std::collections::BTreeSet<_>>(),
+                    )
+                }
+                Some(hir::ReturnBorrowSummary::Roots { .. }) | None => (
+                    Self::conservative_call_value(completed),
+                    (0..args.len()).collect(),
+                ),
+            },
+            ExprKind::CallFnValue { callee, .. } => {
+                let arguments = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, argument)| {
+                        (
+                            argument.ty,
+                            select_fact(index).unwrap_or_else(|| {
+                                Self::conservative_call_value(completed)
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let value = self.callable_return_fact_from_facts(callee, &arguments);
+                let mut selected = std::collections::BTreeSet::new();
+                let targets = match callee.ty {
+                    Ty::Fn(id) => self.callable_targets.get(id as usize),
+                    _ => None,
+                };
+                let well_formed = targets.is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets.values().all(|summary| match summary {
+                            hir::ReturnBorrowSummary::None => true,
+                            hir::ReturnBorrowSummary::Roots { params, .. } => params
+                                .iter()
+                                .all(|index| (*index as usize) < args.len()),
+                        })
+                });
+                if well_formed {
+                    for summary in targets.into_iter().flat_map(|targets| targets.values()) {
+                        if let hir::ReturnBorrowSummary::Roots { params, .. } = summary {
+                            selected.extend(params.iter().map(|index| *index as usize));
+                        }
+                    }
+                } else {
+                    selected.extend(0..args.len());
+                }
+                (value, selected)
+            }
+            _ => (
+                Self::conservative_call_value(completed),
+                (0..args.len()).collect(),
+            ),
+        };
+        let backing = self.call_result_backing_from_indices(
+            action.ty,
+            args,
+            completed,
+            selected.iter().copied(),
+        );
+        let mut storage = selected
+            .iter()
+            .filter_map(|index| args.get(*index).zip(completed.get(*index)))
+            .filter(|(argument, _)| {
+                self.call_result_storage_compatible(action.ty, argument.ty)
+            })
+            .fold(BorrowFact::default(), |fact, (_, completion)| {
+                fact.join(&completion.storage)
+            });
+        if let Some(root) = self.temp_owner_root(action) {
+            storage.direct.insert(root);
+        }
+        MoveExpressionCompletion {
+            value,
+            storage,
+            backing,
+        }
+    }
+
     fn refresh_borrow_mut_place(&mut self, argument: &Expr) {
         let root = match argument.kind {
             ExprKind::Local(local) => Some(local),
@@ -20278,8 +29454,9 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn apply_direct_borrow_mut_call_effects(
+    fn apply_direct_mutable_call_effects(
         &mut self,
+        action: &Expr,
         function: &str,
         args: &[Expr],
         moved: &MovedSet,
@@ -20288,79 +29465,648 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let summary = self.named_borrow_mut_retention.get(function).cloned();
-        self.apply_borrow_mut_call_effects(args, &modes, summary.as_ref(), moved);
+        self.apply_mutable_call_effects(action, args, &modes, summary.as_ref(), moved);
     }
 
     /// Apply one returning call as an atomic mutable-place transition. Argument evaluation has
-    /// completed, but no destination generation has changed yet. Snapshot every contained fact and
-    /// invalidation root first so multiple mutable destinations (including swaps) all observe the
-    /// same pre-call values.
-    fn apply_borrow_mut_call_effects(
+    /// completed, but no destination generation or element fact has changed yet. Snapshot every
+    /// whole-value/element fact, backing identity, and invalidation root first so multiple mutable
+    /// destinations (including swaps) all observe the same pre-call values. `borrow mut` advances a
+    /// generation; `out` only joins borrow-capable element contents into existing backing storage.
+    fn apply_mutable_call_effects(
         &mut self,
+        action: &Expr,
         args: &[Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
         moved: &MovedSet,
     ) {
-        let contained_argument_facts = args
+        let action_key = Self::expr_key(action);
+        if !modes.iter().any(|mode| {
+            matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+        }) {
+            return;
+        }
+        for (index, argument) in args.iter().enumerate() {
+            let snapshot = Self::expr_key(argument);
+            if self.mutable_call_argument_snapshots.contains(&snapshot)
+                && (!self.walked_value_facts.contains_key(&snapshot)
+                    || !self.walked_storage_facts.contains_key(&snapshot)
+                    || !self.walked_backing_facts.contains_key(&snapshot))
+            {
+                self.diags.error(
+                    "mutable call argument did not produce a completion snapshot".to_string(),
+                    argument.span,
+                );
+            }
+            self.validate_value_snapshot(action_key, snapshot, action.span);
+            if modes.get(index) == Some(&ast::ParamMode::BorrowMut) {
+                self.validate_mutable_place_snapshot(action_key, snapshot, action.span);
+            }
+        }
+        let value_argument_facts = args
             .iter()
-            .map(|argument| {
-                let fallback = self.borrow_fact(argument);
-                self.stored_argument_fact(argument, &fallback)
+            .map(|argument| self.completed_value_fact(argument))
+            .collect::<Vec<_>>();
+        let whole_argument_facts = args
+            .iter()
+            .zip(&value_argument_facts)
+            .map(|(argument, completed)| {
+                let backing = self.completed_backing_fact(argument);
+                self.retained_argument_fact(argument, completed.clone(), &backing)
+            })
+            .collect::<Vec<_>>();
+        let element_argument_facts = args
+            .iter()
+            .zip(&whole_argument_facts)
+            .map(|(argument, whole)| {
+                let backing = self.completed_backing_fact(argument);
+                self.element_argument_fact(whole.clone(), &backing)
             })
             .collect::<Vec<_>>();
         let storage_argument_facts = args
             .iter()
-            .map(|argument| BorrowFact::from_direct(self.storage_roots(argument)))
+            .map(|argument| self.completed_storage_fact(argument))
             .collect::<Vec<_>>();
+        // Snapshot every root observed by an exclusive argument. The call action ends that
+        // observed generation even when the callee's retention summary proves no replacement;
+        // the distinction only controls whether a live Drop-bearing child must block beforehand.
+        let exclusive_roots = modes
+            .iter()
+            .enumerate()
+            .filter(|(_, mode)| **mode == ast::ParamMode::BorrowMut)
+            .filter_map(|(index, _)| {
+                args.get(index).map(|argument| {
+                    (
+                        index,
+                        argument.span,
+                        self.completed_borrow_mut_invalidation_roots(
+                            argument,
+                            &storage_argument_facts[index],
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut header_argument_facts = args
+            .iter()
+            .map(|argument| self.completed_headers(argument))
+            .collect::<Vec<_>>();
+        let backing_argument_facts = args
+            .iter()
+            .map(|argument| self.completed_backing_fact(argument))
+            .collect::<Vec<_>>();
+        let pre_argument_completions = value_argument_facts
+            .iter()
+            .cloned()
+            .zip(storage_argument_facts.iter().cloned())
+            .zip(backing_argument_facts.iter().cloned())
+            .map(|((value, storage), backing)| MoveExpressionCompletion {
+                value,
+                storage,
+                backing,
+            })
+            .collect::<Vec<_>>();
+
+        let mut post_argument_completions = pre_argument_completions.clone();
         let destinations = modes
             .iter()
             .copied()
             .enumerate()
             .filter_map(|(index, mode)| {
-                if mode != ast::ParamMode::BorrowMut {
+                if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                     return None;
                 }
                 let argument = args.get(index)?;
+                let old_backing = backing_argument_facts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(MutableBackingFact::unknown);
+                let storage = storage_argument_facts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default();
+                let exact_sources =
+                    exact_borrow_mut_source_indices(summary, index, args.len());
+                let sources = borrow_mut_source_indices(summary, index, args.len());
+                // An exact summary containing only the destination's own contained/storage roots
+                // is the callee's no-mutation sentinel. Do not advance a caller generation for a
+                // helper that merely accepted `borrow mut` and returned.
+                if mode == ast::ParamMode::BorrowMut
+                    && exact_sources.as_ref().is_some_and(|exact| {
+                        !exact.is_empty()
+                            && exact.iter().all(|source| source.index() == index)
+                    })
+                {
+                    return None;
+                }
+                let replacement_backing = (mode == ast::ParamMode::BorrowMut
+                    && self.mutable_collection_ty(argument.ty))
+                    .then(|| {
+                        self.borrow_mut_replacement_backing(
+                            argument,
+                            &sources,
+                            args,
+                            &backing_argument_facts,
+                        )
+                    });
+                let possible_backing = replacement_backing.as_ref().map_or_else(
+                    || old_backing.clone(),
+                    |replacement| old_backing.join(replacement),
+                );
+                let retains_contents =
+                    self.mutable_collection_contents_may_borrow(argument.ty);
+                let mut observers =
+                    self.mutable_observer_locals(&possible_backing, &storage);
+                if retains_contents
+                    && self.mutable_actual_observes_completion(
+                        argument,
+                        &possible_backing,
+                        &storage,
+                    )
+                    && let Some(actual) = Self::mutable_actual_root(argument)
+                {
+                    observers.insert(actual);
+                }
                 Some((
                     index,
-                    self.borrow_mut_invalidation_roots(argument),
-                    borrow_mut_source_indices(summary, index, args.len()),
+                    mode,
+                    self.completed_borrow_mut_invalidation_roots(argument, &storage),
+                    possible_backing,
+                    replacement_backing,
+                    observers,
+                    retains_contents,
+                    sources,
                 ))
             })
             .collect::<Vec<_>>();
 
-        for (index, roots, _) in &destinations {
-            if let Some(argument) = args.get(*index) {
-                self.reject_live_resource_dependents_of_roots(roots, moved, argument.span);
+        // Every exclusive call ends the generation observed by values completed before its
+        // action, including a callee whose exact retention summary proves that it leaves the
+        // destination unchanged. This makes a later use diagnose against the old generation
+        // without rejecting a Copy dependent whose last source use already occurred. A live
+        // Drop-bearing child still blocks every exclusive action because its eventual Drop needs
+        // the parent throughout the borrow, even when the callee preserves the whole value.
+        for (_, span, roots) in &exclusive_roots {
+            self.reject_live_resource_dependents_of_roots(roots, moved, *span);
+        }
+
+        for (index, mode, ..) in &destinations {
+            if *mode != ast::ParamMode::BorrowMut {
+                continue;
+            }
+            if let Some(place) = args
+                .get(*index)
+                .and_then(Self::mutable_actual_place)
+            {
+                self.mark_borrow_mut_modified(place.root);
             }
         }
-        for (_, roots, _) in &destinations {
-            self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
-        }
-        for (index, _, sources) in destinations {
-            if let Some(argument) = args.get(index) {
-                self.refresh_borrow_mut_call(
-                    argument,
-                    &contained_argument_facts,
+
+        // Publish every whole-place mutation into the generation authority before legacy root
+        // invalidation runs. Fixed places keep their generation and change contents; Copy views
+        // retarget only the destination header; Move owners end the old release and form one
+        // finite CallMutation Current generation (demoting a prior loop iteration first).
+        for (index, mode, _, _, _, _, _, sources) in &destinations {
+            let Some(argument) = args.get(*index) else {
+                continue;
+            };
+            if *mode == ast::ParamMode::Out {
+                // `out` preserves the completed destination header and joins only its possible
+                // element contents. Publish that join in the generation table as well as in the
+                // legacy BorrowFact lane below; otherwise a forwarding wrapper's exit summary
+                // reads the unchanged parameter seed and drops the callee-selected source.
+                let incoming = self.mutable_retention_fact(
+                    &whole_argument_facts,
+                    &element_argument_facts,
                     &storage_argument_facts,
-                    &sources,
+                    *index,
+                    *mode,
+                    sources,
+                );
+                if let Some(headers) = header_argument_facts.get(*index) {
+                    for leaf in headers.leaves.values() {
+                        for reference in &leaf.generations {
+                            if let Some(content) = self
+                                .borrows
+                                .storage
+                                .contents
+                                .entries
+                                .get_mut(&reference.generation)
+                            {
+                                let selected = reference.content_path.iter().rev().copied().fold(
+                                    MoveValueFact {
+                                        non_storage: incoming.clone(),
+                                        headers: ProjectedHeaderFact::default(),
+                                    },
+                                    |fact, projection| fact.prefixed(projection),
+                                );
+                                *content = content.join(&selected);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if *mode != ast::ParamMode::BorrowMut {
+                continue;
+            }
+            let Some(place) = Self::mutable_actual_place(argument) else {
+                continue;
+            };
+            let place_path = place
+                .path
+                .iter()
+                .copied()
+                .map(BorrowProjection::StructField)
+                .collect::<Vec<_>>();
+            let declared_ty = self
+                .projected_local_ty(place.root, &place_path)
+                .unwrap_or(argument.ty);
+            let typed = storage_type_paths(declared_ty, self.storage_type_context());
+            if !typed.valid {
+                continue;
+            }
+            let incoming = self.mutable_retention_fact(
+                &whole_argument_facts,
+                &element_argument_facts,
+                &storage_argument_facts,
+                *index,
+                *mode,
+                sources,
+            );
+            let mut incoming_headers = ProjectedHeaderFact::default();
+            for source in sources {
+                if let Some(headers) = header_argument_facts.get(source.index()) {
+                    incoming_headers = incoming_headers.join(headers);
+                }
+            }
+            let mut incoming_content = MoveValueFact {
+                non_storage: incoming.clone(),
+                headers: incoming_headers,
+            };
+
+            let fixed_place = matches!(
+                expand_tagged_ty(declared_ty, self.tagged_types),
+                Ty::Array(..) | Ty::StructArray(..)
+            );
+            if fixed_place {
+                let current_headers = self.local_headers(place.root).project_path(&place_path);
+                for leaf in current_headers.leaves.values() {
+                    for reference in &leaf.generations {
+                        if let Some(content) = self
+                            .borrows
+                            .storage
+                            .contents
+                            .entries
+                            .get_mut(&reference.generation)
+                        {
+                            let selected = reference.content_path.iter().rev().copied().fold(
+                                incoming_content.clone(),
+                                |fact, projection| fact.prefixed(projection),
+                            );
+                            *content = if sources.is_empty() {
+                                selected
+                            } else {
+                                content.join(&selected)
+                            };
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let view_only = typed
+                .headers
+                .iter()
+                .all(|header| header.kind == StorageHeaderKind::View);
+            if view_only {
+                if sources.is_empty() {
+                    // With no retained root the callee proved that the post-call elements are
+                    // borrow-free. The passed view still names its captured backing, so clear that
+                    // generation in place and let every pre-existing alias observe the mutation.
+                    if let Some(headers) = header_argument_facts.get(*index) {
+                        for leaf in headers.leaves.values() {
+                            for reference in &leaf.generations {
+                                if let Some(content) = self
+                                    .borrows
+                                    .storage
+                                    .contents
+                                    .entries
+                                    .get_mut(&reference.generation)
+                                {
+                                    *content = MoveValueFact::default();
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let mut replacement = ProjectedHeaderFact::default();
+                for header in &typed.headers {
+                    let descriptor = StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    };
+                    let mut candidates = ProjectedHeaderFact::default();
+                    for source in sources {
+                        let source_index = source.index();
+                        if let Some(headers) = header_argument_facts.get(source_index) {
+                            candidates = candidates.join(headers);
+                        }
+                    }
+                    if let Some(leaf) = self.compatible_header_union(&candidates, descriptor) {
+                        replacement.leaves.insert(header.path.clone(), leaf);
+                    }
+                }
+                let mut destination = self.local_headers(place.root);
+                destination.replace_path(&place_path, replacement);
+                self.borrows.headers.insert(place.root, destination);
+                continue;
+            }
+
+            let origins = typed
+                .headers
+                .iter()
+                .filter(|header| header.kind != StorageHeaderKind::View)
+                .map(|header| {
+                    let mut path = place_path.clone();
+                    path.extend(&header.path);
+                    StorageOrigin::CallMutation {
+                        call: action_key,
+                        destination_parameter: *index as u32,
+                        path: path.into(),
+                    }
+                });
+            let renames = StorageGenerationRenames::from_origins(origins);
+            self.apply_generation_renames(&renames);
+            for headers in &mut header_argument_facts {
+                headers.rename_generations(&renames);
+            }
+            incoming_content.rename_generations(&renames);
+
+            let mut replacement = ProjectedHeaderFact::default();
+            for header in &typed.headers {
+                let mut destination_path = place_path.clone();
+                destination_path.extend(&header.path);
+                if header.kind == StorageHeaderKind::View {
+                    continue;
+                }
+                for entry in self.borrows.storage.directory.entries.values_mut() {
+                    if entry.releases.contains(&MoveReleasePlace::Local {
+                        local: place.root,
+                        path: destination_path.clone(),
+                    }) {
+                        entry.ended = Some(
+                            entry
+                                .ended
+                                .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
+                        );
+                    }
+                }
+                let generation = StorageGeneration::current(StorageOrigin::CallMutation {
+                    call: action_key,
+                    destination_parameter: *index as u32,
+                    path: destination_path.clone().into(),
+                });
+                self.borrows.storage.directory.entries.insert(
+                    generation.clone(),
+                    MoveGenerationEntry {
+                        descriptor: Some(StorageHeaderDescriptor {
+                            ty: header.ty,
+                            kind: header.kind,
+                        }),
+                        releases: [MoveReleasePlace::Local {
+                            local: place.root,
+                            path: destination_path,
+                        }]
+                        .into_iter()
+                        .collect(),
+                        ended: None,
+                    },
+                );
+                self.borrows
+                    .storage
+                    .contents
+                    .entries
+                    .insert(generation.clone(), incoming_content.clone());
+                replacement.leaves.insert(
+                    header.path.clone(),
+                    StorageHeaderLeaf::known_typed(
+                        generation,
+                        StorageHeaderDescriptor {
+                            ty: header.ty,
+                            kind: header.kind,
+                        },
+                    ),
+                );
+            }
+            let mut destination = self.local_headers(place.root);
+            destination.replace_path(&place_path, replacement);
+            self.borrows.headers.insert(place.root, destination);
+        }
+
+        for (index, mode, _, _, _, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut
+                && let Some(argument) = args.get(*index)
+            {
+                self.borrows
+                    .finish_mutable_place_source(Self::expr_key(argument));
+            }
+        }
+        let mutated_backing_places = destinations
+            .iter()
+            .flat_map(|(_, _, _, backing, _, observers, _, _)| {
+                self.resolved_mutable_destinations(backing, observers)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for local in mutated_backing_places {
+            self.invalidate_mutable_place(local, &[]);
+        }
+        for (index, _, _, _, _, _, _, _) in &destinations {
+            if let Some(argument) = args.get(*index)
+                && let Some(place) = Self::mutable_actual_place(argument)
+            {
+                self.borrows.invalidate_mutable_places(
+                    place.root,
+                    &place.path,
+                    BorrowEnd::Consumed,
                 );
             }
         }
+        for (index, _, roots) in &exclusive_roots {
+            if args.get(*index).is_some_and(|argument| {
+                matches!(
+                    expand_tagged_ty(argument.ty, self.tagged_types),
+                    Ty::Resource(_)
+                )
+            }) {
+                // A resource mutation advances the generation observed by values returned from
+                // an earlier action (`rows.next` is the canonical case). Rewrite those roots in
+                // generation content before installing this call's result, while the exclusion
+                // below keeps the receiver local itself available for its post-call generation.
+                // Copy views do not take this path: rebinding one header must not end its backing.
+                self.borrows.mark_matching_roots_ended(
+                    BorrowEnd::Consumed,
+                    |root| roots.contains(&root),
+                );
+            }
+            if let Some(owner) = args
+                .get(*index)
+                .and_then(Self::mutable_actual_place)
+                .map(|place| place.root)
+            {
+                self.borrows.invalidate_roots_except_local(
+                    roots,
+                    BorrowEnd::Consumed,
+                    owner,
+                );
+            } else {
+                self.borrows
+                    .invalidate_roots(roots, BorrowEnd::Consumed);
+            }
+        }
+        let mut backing_updates = std::collections::HashMap::new();
+        for (index, mode, _, _, replacement, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut
+                && let Some(replacement) = replacement
+                && let Some(Expr {
+                    kind: ExprKind::Local(local),
+                    ..
+                }) = args.get(*index)
+            {
+                backing_updates
+                    .entry(*local)
+                    .and_modify(|current: &mut MutableBackingFact| {
+                        *current = current.join(replacement)
+                    })
+                    .or_insert_with(|| replacement.clone());
+            }
+        }
+        self.borrows.mutable_backing.extend(backing_updates);
+
+        for (index, mode, _, backing, replacement, observers, retains_contents, sources) in destinations {
+            if let Some(argument) = args.get(index) {
+                let incoming = self.mutable_retention_fact(
+                    &whole_argument_facts,
+                    &element_argument_facts,
+                    &storage_argument_facts,
+                    index,
+                    mode,
+                    &sources,
+                );
+                match mode {
+                    ast::ParamMode::BorrowMut => {
+                        // Preserve the historical strong header/place replacement, then publish
+                        // the summary's possible indexed contents to every other backing observer.
+                        self.refresh_borrow_mut_call(argument, incoming.clone());
+                        if retains_contents {
+                            self.join_borrow_mut_backing_contents(
+                                argument,
+                                &backing,
+                                &observers,
+                                &incoming,
+                            );
+                        }
+                        if let Some(post) = post_argument_completions.get_mut(index) {
+                            let replacement_storage = self.borrow_mut_replacement_storage_fact(
+                                argument,
+                                &sources,
+                                args,
+                                &pre_argument_completions,
+                                replacement.as_ref(),
+                            );
+                            post.value = self.normalize_borrow_fact(argument.ty, incoming.clone());
+                            post.storage = replacement_storage.join(&post.value);
+                            post.backing = replacement
+                                .clone()
+                                .unwrap_or_else(MutableBackingFact::unknown);
+                        }
+                    }
+                    ast::ParamMode::Out => {
+                        if retains_contents {
+                            self.join_out_call_contents(
+                                argument,
+                                &backing,
+                                &observers,
+                                incoming.clone(),
+                            );
+                        }
+                        if let Some(post) = post_argument_completions.get_mut(index) {
+                            post.value = post.value.join(&incoming);
+                            post.storage = post.storage.join(&incoming);
+                        }
+                    }
+                    ast::ParamMode::ByValue | ast::ParamMode::Borrow => {}
+                }
+            }
+        }
+        if self.completion_snapshot_needed(action) {
+            let completion = self.mutable_call_result_completion(
+                action,
+                args,
+                modes,
+                &post_argument_completions,
+            );
+            self.pending_call_completions.insert(action_key, completion);
+        }
     }
 
-    /// Refresh one caller place with the roots a returning mutable callee may have installed.
-    /// `argument_facts` are captured before any destination generation is invalidated, so a
-    /// summary that retains its destination preserves the old embedded fields without retaining
-    /// the destination place's own generation as though it were backing storage.
-    fn refresh_borrow_mut_call(
-        &mut self,
-        argument: &Expr,
-        contained_argument_facts: &[BorrowFact],
+    /// Select the roots one returning mutable callee may have installed. An `out` destination's
+    /// self-source denotes old elements; every other contained source denotes a copied whole value,
+    /// including its backing. Facts are captured before any destination generation is invalidated.
+    fn mutable_retention_fact(
+        &self,
+        whole_argument_facts: &[BorrowFact],
+        element_argument_facts: &[BorrowFact],
         storage_argument_facts: &[BorrowFact],
+        destination: usize,
+        mode: ast::ParamMode,
         sources: &[BorrowMutRetentionSource],
-    ) {
+    ) -> BorrowFact {
+        let mut incoming = BorrowFact::default();
+        let mut join_source = |source: BorrowMutRetentionSource| {
+            let source_fact = match source {
+                BorrowMutRetentionSource::Contained(index)
+                    if mode == ast::ParamMode::Out && index == destination =>
+                {
+                    element_argument_facts.get(index)
+                }
+                BorrowMutRetentionSource::Contained(index) => whole_argument_facts.get(index),
+                BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
+            };
+            let Some(source_fact) = source_fact else {
+                // A malformed exact fact must not become an empty, fail-open update.
+                incoming = BorrowFact::default();
+                for index in 0..whole_argument_facts.len() {
+                    let contained = if mode == ast::ParamMode::Out && index == destination {
+                        element_argument_facts.get(index)
+                    } else {
+                        whole_argument_facts.get(index)
+                    };
+                    if let Some(contained) = contained {
+                        incoming = incoming.join(contained);
+                    }
+                    if let Some(storage) = storage_argument_facts.get(index) {
+                        incoming = incoming.join(storage);
+                    }
+                }
+                return false;
+            };
+            incoming = incoming.join(source_fact);
+            true
+        };
+        for &source in sources {
+            if !join_source(source) {
+                break;
+            }
+        }
+        incoming
+    }
+
+    /// Refresh one caller place after an exclusive `borrow mut` call. This is replacement, not an
+    /// element join: the call advanced the old generation and may have replaced the whole value.
+    fn refresh_borrow_mut_call(&mut self, argument: &Expr, incoming: BorrowFact) {
         self.refresh_borrow_mut_place(argument);
         if !ty_may_borrow(
             argument.ty,
@@ -20382,33 +30128,6 @@ impl<'a> MoveCheck<'a> {
             ),
             _ => return,
         };
-        let mut incoming = BorrowFact::default();
-        let mut join_source = |source: BorrowMutRetentionSource| {
-            let source_fact = match source {
-                BorrowMutRetentionSource::Contained(index) => {
-                    contained_argument_facts.get(index)
-                }
-                BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
-            };
-            let Some(source_fact) = source_fact else {
-                // A malformed exact fact must not become an empty, fail-open update.
-                incoming = BorrowFact::default();
-                for (contained, storage) in contained_argument_facts
-                    .iter()
-                    .zip(storage_argument_facts)
-                {
-                    incoming = incoming.join(contained).join(storage);
-                }
-                return false;
-            };
-            incoming = incoming.join(source_fact);
-            true
-        };
-        for &source in sources {
-            if !join_source(source) {
-                break;
-            }
-        }
         if path.is_empty() {
             let ty = self.f.locals.get(local as usize).map(|local| local.ty);
             let Some(ty) = ty else {
@@ -20425,41 +30144,243 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    /// Provenance of the value contained in an argument place, excluding the place's own storage
-    /// generation. Retaining a `str` field copies its pointer/length and depends on the field's
-    /// backing owner, not on the aggregate header local from which those two scalars were read.
-    fn stored_argument_fact(&self, argument: &Expr, fallback: &BorrowFact) -> BorrowFact {
-        match &argument.kind {
-            ExprKind::Local(local) => self
-                .borrows
-                .facts
-                .get(local)
-                .cloned()
-                .unwrap_or_default(),
-            ExprKind::Field { root, path } => {
-                let Some(root_ty) = self.f.locals.get(*root as usize).map(|local| local.ty) else {
-                    return fallback.clone();
-                };
-                let root_fact = self
-                    .borrows
-                    .facts
-                    .get(root)
-                    .cloned()
-                    .unwrap_or_default();
-                let projections = path
-                    .iter()
-                    .copied()
-                    .map(BorrowProjection::StructField)
-                    .collect::<Vec<_>>();
-                self.project_fact_or_flatten(
-                    root_ty,
-                    root_fact,
-                    &projections,
-                    argument.ty,
-                )
-            }
-            _ => fallback.clone(),
+    fn join_local_mutable_contents(&mut self, local: LocalId, incoming: &BorrowFact) {
+        if !self.local_may_borrow(local) {
+            return;
         }
+        let Some(ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return;
+        };
+        let current = self
+            .borrows
+            .facts
+            .get(&local)
+            .cloned()
+            .unwrap_or_default();
+        let incoming = self.normalize_borrow_fact(ty, incoming.clone());
+        self.borrows.update_fact(local, current.join(&incoming));
+    }
+
+    fn backing_root_local(&self, root: BorrowRoot) -> Option<LocalId> {
+        match root {
+            BorrowRoot::Local(local) => Some(local),
+            BorrowRoot::ParamStorage(position) => {
+                self.f.params.get(position as usize).copied()
+            }
+            BorrowRoot::IterTemp(_)
+            | BorrowRoot::Param(_)
+            | BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => None,
+        }
+    }
+
+    fn roots_intersect(left: &BorrowRoots, right: &BorrowRoots) -> bool {
+        left.iter().any(|root| right.contains(root))
+    }
+
+    fn mutable_backing_evidence(
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> BorrowRoots {
+        if backing.roots.is_empty() {
+            // A rootless unresolved view has no projection-aware backing identity. Its captured
+            // storage roots are the only conservative reverse-alias evidence available.
+            storage.live_roots()
+        } else {
+            // Do not mix contained owners from `storage` into an already-resolved backing set:
+            // two independent arrays may legitimately hold views of the same string owner.
+            backing.roots.clone()
+        }
+    }
+
+    /// Snapshot every already-created mutable collection that can observe a destination's slots.
+    /// Exact backing roots cover ordinary aliases; flattened storage-borrow roots retain the
+    /// conservative reverse edge for a view returned through an unresolved helper.
+    fn mutable_observer_locals(
+        &self,
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> std::collections::BTreeSet<LocalId> {
+        let evidence = Self::mutable_backing_evidence(backing, storage);
+        if evidence.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+
+        let mut candidates = self
+            .borrows
+            .mutable_backing
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        candidates.extend(self.borrows.sources.keys().copied());
+        candidates.retain(|local| {
+            self.f
+                .locals
+                .get(*local as usize)
+                .is_some_and(|local| {
+                    self.ty_contains_mutable_collection_header(local.ty)
+                })
+                && (self.borrows
+                    .mutable_backing
+                    .get(local)
+                    .is_some_and(|candidate| {
+                        Self::roots_intersect(&candidate.roots, &evidence)
+                    })
+                    || self
+                        .borrows
+                        .sources
+                        .get(local)
+                        .is_some_and(|roots| Self::roots_intersect(roots, &evidence)))
+        });
+        candidates
+    }
+
+    fn mutable_actual_root(argument: &Expr) -> Option<LocalId> {
+        match argument.kind {
+            ExprKind::Local(local) => Some(local),
+            ExprKind::Field { root, .. } => Some(root),
+            _ => None,
+        }
+    }
+
+    fn mutable_actual_place(argument: &Expr) -> Option<MutablePlaceSnapshot> {
+        match &argument.kind {
+            ExprKind::Local(local) => Some(MutablePlaceSnapshot {
+                root: *local,
+                path: Vec::new(),
+            }),
+            ExprKind::Field { root, path } => Some(MutablePlaceSnapshot {
+                root: *root,
+                path: path.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the syntactic actual still denotes the header/storage captured when its argument
+    /// completed. `out` passes a slice descriptor by value, so a later eager rebind must update the
+    /// old backing without attaching the installed owner to the now-unrelated local.
+    fn mutable_actual_observes_completion(
+        &self,
+        argument: &Expr,
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> bool {
+        let Some(actual) = Self::mutable_actual_root(argument) else {
+            return false;
+        };
+        let evidence = Self::mutable_backing_evidence(backing, storage);
+        self.borrows
+            .mutable_backing
+            .get(&actual)
+            .is_some_and(|current| Self::roots_intersect(&current.roots, &evidence))
+            || self
+                .borrows
+                .sources
+                .get(&actual)
+                .is_some_and(|roots| Self::roots_intersect(roots, &evidence))
+    }
+
+    fn resolved_mutable_destinations(
+        &self,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+    ) -> std::collections::BTreeSet<LocalId> {
+        let mut destinations = observers.clone();
+        for &root in &backing.roots {
+            if let Some(local) = self.backing_root_local(root)
+                && self
+                    .f
+                    .locals
+                    .get(local as usize)
+                    .is_some_and(|record| self.mutable_collection_ty(record.ty))
+                && self
+                    .borrows
+                    .mutable_backing
+                    .get(&local)
+                    .is_some_and(|current| {
+                        Self::roots_intersect(&current.roots, &backing.roots)
+                    })
+            {
+                destinations.insert(local);
+            }
+        }
+        destinations
+    }
+
+    /// A `borrow mut` call may be either a whole-place replacement or an indexed mutation. The
+    /// actual keeps the strong replacement above; every *other* possible backing/observer receives
+    /// a conservative content join because the analysis-local summary has no discriminator.
+    fn join_borrow_mut_backing_contents(
+        &mut self,
+        argument: &Expr,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+        incoming: &BorrowFact,
+    ) {
+        let actual = Self::mutable_actual_root(argument);
+        for local in self.resolved_mutable_destinations(backing, observers) {
+            if Some(local) != actual {
+                self.join_local_mutable_contents(local, incoming);
+            }
+        }
+    }
+
+    /// `out` mutates elements without replacing the slice header or ending a backing allocation
+    /// generation. Join the callee result into the visible actual and every resolved collection
+    /// identity so reads through a sibling alias observe the installed owner dependency.
+    fn join_out_call_contents(
+        &mut self,
+        _argument: &Expr,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+        incoming: BorrowFact,
+    ) {
+        for local in self.resolved_mutable_destinations(backing, observers) {
+            self.join_local_mutable_contents(local, &incoming);
+        }
+    }
+
+    /// Provenance retained by copying the completed argument value. Strip only a distinct
+    /// syntactic header local; the backing roots are part of a slice/collection value and must
+    /// survive a whole-place or field replacement through `borrow mut`.
+    fn retained_argument_fact(
+        &self,
+        argument: &Expr,
+        mut completed: BorrowFact,
+        backing: &MutableBackingFact,
+    ) -> BorrowFact {
+        let invalid = self
+            .borrows
+            .invalid_value_sources
+            .get(&Self::expr_key(argument));
+        completed.direct.extend(backing.roots.iter().copied().map(|root| {
+            invalid
+                .and_then(|ended| ended.get(&root))
+                .map_or(root, |&how| root.ended(how))
+        }));
+        let mut excluded = BorrowRoots::new();
+        if let Some(local) = Self::mutable_actual_root(argument) {
+            let header = BorrowRoot::Local(local);
+            if !backing.roots.contains(&header) {
+                excluded.insert(header);
+            }
+        }
+        completed.without_root_sources(&excluded)
+    }
+
+    /// Provenance of values already stored in a collection, excluding the collection/header
+    /// storage itself. An `out` destination's self-source denotes these old elements rather than a
+    /// copied slice header, so retaining it must not install a backing self-root.
+    fn element_argument_fact(
+        &self,
+        whole: BorrowFact,
+        backing: &MutableBackingFact,
+    ) -> BorrowFact {
+        whole.without_root_sources(&backing.roots)
     }
 
     fn mutable_place_roots(&self, argument: &Expr) -> Option<BorrowRoots> {
@@ -20613,6 +30534,9 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
+        if let Some(headers) = self.borrows.headers.get(&id) {
+            return self.borrows.resolve_headers(headers).non_storage.live_roots();
+        }
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
         let region_param = self
             .f
@@ -20650,6 +30574,18 @@ impl<'a> MoveCheck<'a> {
 
     fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
         let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
+        if let Some(headers) = self.borrows.headers.get(&id) {
+            let resolved = self.borrows.resolve_headers(headers).non_storage;
+            // A root header (str/string/collection/view) owns all borrow-bearing content of the
+            // value. Once that generation exists, copied legacy roots are stale snapshots: element
+            // stores, whole-header replacement, and CallMutation must be observed through the
+            // directory/content tables. Aggregates whose headers live only below projected fields
+            // still retain their separate non-storage legacy leaves during the E2 transition.
+            if headers.leaves.contains_key(&Vec::new()) {
+                return resolved;
+            }
+            return fact.join(&resolved);
+        }
         let region_param = self
             .f
             .params
@@ -20864,6 +30800,25 @@ impl<'a> MoveCheck<'a> {
         self.borrow_mut_alias_roots(argument)
     }
 
+    fn completed_borrow_mut_invalidation_roots(
+        &self,
+        argument: &Expr,
+        storage: &BorrowFact,
+    ) -> BorrowRoots {
+        if argument.ty.is_array_builder()
+            || matches!(
+                expand_tagged_ty(argument.ty, self.tagged_types),
+                Ty::Resource(_)
+            )
+            || !self.borrow_mut_uses_reachable_storage(argument)
+        {
+            self.mutable_place_roots(argument)
+                .unwrap_or_else(|| storage.live_roots())
+        } else {
+            storage.live_roots()
+        }
+    }
+
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
     /// The classification in [`Self::borrow_sources_inner`] is **exhaustive** — no `_` tail —
@@ -20943,7 +30898,15 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn value_snapshot_needed(&self, e: &Expr) -> bool {
+        let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
+            || e.ty.is_array_builder()
+            || !storage_paths.headers.is_empty()
+            || !storage_paths.carriers.is_empty()
+            || matches!(
+                expand_tagged_ty(e.ty, self.tagged_types),
+                Ty::DynArray(..) | Ty::DynStructArray(..)
+            )
             || ty_may_borrow(
                 e.ty,
                 self.structs,
@@ -20953,14 +30916,1068 @@ impl<'a> MoveCheck<'a> {
             )
     }
 
+    fn completion_snapshot_needed(&self, e: &Expr) -> bool {
+        self.value_snapshot_needed(e)
+            || self
+                .mutable_call_argument_snapshots
+                .contains(&Self::expr_key(e))
+    }
+
     fn clear_value_snapshot(&mut self, key: usize) {
         self.walked_value_facts.remove(&key);
+        self.walked_storage_facts.remove(&key);
+        self.walked_backing_facts.remove(&key);
+        self.pending_call_completions.remove(&key);
         self.borrows.finish_value_source(key);
-        for frame in &mut self.loop_borrow_breaks {
-            for state in frame {
-                state.finish_value_source(key);
+        for frame in &mut self.loop_breaks {
+            for edge in frame {
+                edge.borrows.finish_value_source(key);
             }
         }
+    }
+
+    fn completed_headers(&self, expression: &Expr) -> ProjectedHeaderFact {
+        self.borrows
+            .value_headers
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .unwrap_or_else(|| self.forwarded_headers(expression))
+    }
+
+    fn local_headers(&self, local: LocalId) -> ProjectedHeaderFact {
+        self.borrows.headers.get(&local).cloned().unwrap_or_default()
+    }
+
+    fn block_headers(&self, block: &Block) -> ProjectedHeaderFact {
+        block
+            .value
+            .as_deref()
+            .map_or_else(ProjectedHeaderFact::default, |value| {
+                self.completed_headers(value)
+            })
+    }
+
+    fn retarget_root_header(
+        &self,
+        headers: ProjectedHeaderFact,
+        result_ty: Ty,
+        content_suffix: &[BorrowProjection],
+    ) -> ProjectedHeaderFact {
+        let paths = storage_type_paths(result_ty, self.storage_type_context());
+        let Some(header) = paths
+            .valid
+            .then_some(paths.headers)
+            .into_iter()
+            .flatten()
+            .find(|header| header.path.is_empty())
+        else {
+            return ProjectedHeaderFact::default();
+        };
+        let Some(mut leaf) = headers.leaves.get(&Vec::new()).cloned() else {
+            return ProjectedHeaderFact::default();
+        };
+        leaf.generations = std::mem::take(&mut leaf.generations)
+            .into_iter()
+            .map(|mut reference| {
+                reference.content_path =
+                    reference.select_content_path(content_suffix.iter().copied());
+                reference
+            })
+            .collect();
+        leaf.descriptor = Some(StorageHeaderDescriptor {
+            ty: header.ty,
+            kind: header.kind,
+        });
+        ProjectedHeaderFact::from_leaf(Vec::new(), leaf)
+    }
+
+    fn forwarded_headers(&self, expression: &Expr) -> ProjectedHeaderFact {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return self.completed_headers(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(local) => self.local_headers(*local),
+            ExprKind::ArrayToSlice(inner) => self.retarget_root_header(
+                self.completed_headers(inner),
+                expression.ty,
+                &[],
+            ),
+            ExprKind::SliceRange { recv, .. } => self.retarget_root_header(
+                self.completed_headers(recv),
+                expression.ty,
+                &[],
+            ),
+            ExprKind::Field { root, path } => {
+                let projections = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                self.local_headers(*root).project_path(&projections)
+            }
+            ExprKind::TupleIndex { recv, index } => self
+                .completed_headers(recv)
+                .project_path(&[BorrowProjection::TupleElement(*index)]),
+            ExprKind::SoaColumn { base, field, .. } => {
+                self.retarget_root_header(
+                    self.local_headers(*base),
+                    expression.ty,
+                    &[BorrowProjection::StructField(*field)],
+                )
+            }
+            ExprKind::Index { .. } | ExprKind::ElemField { .. }
+                if !storage_type_paths(expression.ty, self.storage_type_context())
+                    .headers
+                    .is_empty() =>
+            {
+                self.indexed_generation_content(expression).headers
+            }
+            ExprKind::Index { .. } | ExprKind::ElemField { .. } => {
+                ProjectedHeaderFact::default()
+            }
+            ExprKind::StructLit { fields, .. } => fields.iter().enumerate().fold(
+                ProjectedHeaderFact::default(),
+                |headers, (index, field)| {
+                    headers.join(
+                        &self
+                            .completed_headers(field)
+                            .prefixed(BorrowProjection::StructField(index as u32)),
+                    )
+                },
+            ),
+            ExprKind::Tuple { elems, .. } => elems.iter().enumerate().fold(
+                ProjectedHeaderFact::default(),
+                |headers, (index, element)| {
+                    headers.join(
+                        &self
+                            .completed_headers(element)
+                            .prefixed(BorrowProjection::TupleElement(index as u32)),
+                    )
+                },
+            ),
+            ExprKind::OptionSome(value) => self
+                .completed_headers(value)
+                .prefixed(BorrowProjection::OptionSome),
+            ExprKind::ResultOk(value) => self
+                .completed_headers(value)
+                .prefixed(BorrowProjection::ResultOk),
+            ExprKind::ResultErr(value) => self
+                .completed_headers(value)
+                .prefixed(BorrowProjection::ResultErr),
+            ExprKind::EnumValue {
+                variant, payload, ..
+            } => payload.iter().enumerate().fold(
+                ProjectedHeaderFact::default(),
+                |headers, (index, value)| {
+                    headers.join(&self.completed_headers(value).prefixed(
+                        BorrowProjection::EnumPayload {
+                            variant: *variant,
+                            index: index as u32,
+                        },
+                    ))
+                },
+            ),
+            ExprKind::Closure { lifted, captures } => {
+                let Some(target) = self.callable_target_ids.get(lifted).copied() else {
+                    return ProjectedHeaderFact::default();
+                };
+                captures.iter().enumerate().fold(
+                    ProjectedHeaderFact::default(),
+                    |headers, (index, capture)| {
+                        headers.join(
+                            &self
+                                .completed_headers(capture)
+                                .prefixed(BorrowProjection::ClosureCapture(index as u32))
+                                .prefixed(BorrowProjection::ClosureTarget(target)),
+                        )
+                    },
+                )
+            }
+            ExprKind::Try(result) => self
+                .completed_headers(result)
+                .project_path(&[BorrowProjection::ResultOk]),
+            ExprKind::ResultMapErr { result, .. } => {
+                let active = self.active_sum_paths(result);
+                if active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(&BorrowProjection::ResultOk))
+                {
+                    self.completed_headers(result)
+                        .project_path(&[BorrowProjection::ResultOk])
+                        .prefixed(BorrowProjection::ResultOk)
+                } else {
+                    ProjectedHeaderFact::default()
+                }
+            }
+            ExprKind::ElseUnwrap { .. }
+            | ExprKind::If { .. }
+            | ExprKind::Match { .. } => self
+                .control_value_facts
+                .get(&Self::expr_key(expression))
+                .map(|fact| fact.headers.clone())
+                .unwrap_or_default(),
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => self.block_headers(block),
+            ExprKind::Loop { .. } => self
+                .loop_value_facts
+                .get(&Self::expr_key(expression))
+                .map(|fact| fact.headers.clone())
+                .unwrap_or_default(),
+            ExprKind::ArrayChunks { source, .. } => self.completed_headers(source),
+            ExprKind::ArrayDictEncode { base, .. } => self.local_headers(*base),
+            _ => ProjectedHeaderFact::default(),
+        }
+    }
+
+    fn initializer_headers(&self, expression: &Expr) -> ProjectedHeaderFact {
+        match &expression.kind {
+            ExprKind::ArrayLit { elems, .. } | ExprKind::ConstArray { elems, .. } => elems
+                .iter()
+                .enumerate()
+                .fold(ProjectedHeaderFact::default(), |headers, (index, value)| {
+                    headers.join(
+                        &self
+                            .completed_headers(value)
+                            .prefixed(BorrowProjection::ArrayElement(index as u32)),
+                    )
+                }),
+            _ => ProjectedHeaderFact::default(),
+        }
+    }
+
+    fn generation_content_headers(
+        &self,
+        headers: &ProjectedHeaderFact,
+    ) -> ProjectedHeaderFact {
+        headers
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .filter_map(|reference| {
+                self.borrows
+                    .storage
+                    .contents
+                    .entries
+                    .get(&reference.generation)
+                    .map(|content| content.project_path(&reference.content_path).headers)
+            })
+            .fold(ProjectedHeaderFact::default(), |current, selected| {
+                current.join(&selected)
+            })
+    }
+
+    fn compatible_header_union(
+        &self,
+        headers: &ProjectedHeaderFact,
+        expected: StorageHeaderDescriptor,
+    ) -> Option<StorageHeaderLeaf> {
+        headers
+            .leaves
+            .values()
+            .filter(|leaf| {
+                leaf.descriptor.is_some_and(|candidate| {
+                    storage_header_descriptors_compatible(
+                        expected,
+                        candidate,
+                        self.tagged_types,
+                    )
+                })
+            })
+            .cloned()
+            .reduce(|current, incoming| current.join(&incoming))
+    }
+
+    fn projected_storage_result_ty(
+        &self,
+        mut ty: Ty,
+        path: &[BorrowProjection],
+    ) -> Option<Ty> {
+        for &projection in path {
+            ty = self.projection_ty(ty, projection)?;
+        }
+        Some(expand_tagged_ty(ty, self.tagged_types))
+    }
+
+    /// Normalize selected call/source headers to the carrier's closed element inventory. A
+    /// dynamic slice carrier keeps one compatible backing dependency; fixed aggregate carriers
+    /// retain exact slot/field paths; SIMD and response carriers borrow no storage at all.
+    fn normalize_carrier_dependencies(
+        &self,
+        carrier_ty: Ty,
+        headers: &ProjectedHeaderFact,
+    ) -> ProjectedHeaderFact {
+        match expand_tagged_ty(carrier_ty, self.tagged_types) {
+            Ty::DynSliceArray(element) => {
+                let expected = StorageHeaderDescriptor {
+                    ty: Ty::Slice(prim_to_scalar(element)),
+                    kind: StorageHeaderKind::View,
+                };
+                self.compatible_header_union(headers, expected)
+                    .map_or_else(ProjectedHeaderFact::default, |leaf| {
+                        ProjectedHeaderFact::from_leaf(Vec::new(), leaf)
+                    })
+            }
+            Ty::DynFixedArray(element, length) => self
+                .normalize_fixed_carrier_dependencies(
+                    Ty::Array(element, length),
+                    headers,
+                ),
+            Ty::DynFixedStructArray(id, length) => self
+                .normalize_fixed_carrier_dependencies(
+                    Ty::StructArray(id, length),
+                    headers,
+                ),
+            Ty::DictEncoded(id, _) => {
+                let leaf = headers
+                    .leaves
+                    .values()
+                    .filter(|leaf| {
+                        leaf.descriptor.is_some_and(|descriptor| {
+                            matches!(
+                                expand_tagged_ty(descriptor.ty, self.tagged_types),
+                                Ty::StructArray(candidate, _)
+                                    | Ty::DynStructArray(candidate, Layout::Aos)
+                                    | Ty::Soa(candidate)
+                                    if candidate == id
+                            )
+                        })
+                    })
+                    .cloned()
+                    .reduce(|current, incoming| current.join(&incoming));
+                leaf.map_or_else(ProjectedHeaderFact::default, |leaf| {
+                    ProjectedHeaderFact::from_leaf(Vec::new(), leaf)
+                })
+            }
+            Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynResponseArray => {
+                ProjectedHeaderFact::default()
+            }
+            _ => ProjectedHeaderFact::default(),
+        }
+    }
+
+    fn normalize_fixed_carrier_dependencies(
+        &self,
+        fixed_ty: Ty,
+        headers: &ProjectedHeaderFact,
+    ) -> ProjectedHeaderFact {
+        let expanded = headers.join(&self.generation_content_headers(headers));
+        let expected = storage_type_paths(fixed_ty, self.storage_type_context())
+            .headers
+            .into_iter()
+            .filter(|header| !header.path.is_empty())
+            .collect::<Vec<_>>();
+        self.normalize_expected_dependencies(&expected, &expanded)
+    }
+
+    fn normalize_expected_dependencies(
+        &self,
+        expected: &[StorageTypedPath],
+        expanded: &ProjectedHeaderFact,
+    ) -> ProjectedHeaderFact {
+        expected
+            .iter()
+            .fold(ProjectedHeaderFact::default(), |normalized, expected| {
+                let descriptor = StorageHeaderDescriptor {
+                    ty: expected.ty,
+                    kind: expected.kind,
+                };
+                let exact = expanded.project_path(&expected.path);
+                let leaf = self
+                    .compatible_header_union(&exact, descriptor)
+                    .or_else(|| self.compatible_header_union(expanded, descriptor));
+                leaf.map_or(normalized.clone(), |leaf| {
+                    normalized.join(&ProjectedHeaderFact::from_leaf(
+                        expected.path.clone(),
+                        leaf,
+                    ))
+                })
+            })
+    }
+
+    fn call_generation_content_headers(
+        &self,
+        expression: &Expr,
+        descriptor: StorageHeaderDescriptor,
+    ) -> ProjectedHeaderFact {
+        let (selected, _) = self.selected_move_call_headers(expression);
+        let expanded = selected.join(&self.generation_content_headers(&selected));
+        let expected = match expand_tagged_ty(descriptor.ty, self.tagged_types) {
+            Ty::Array(..) | Ty::StructArray(..) => storage_type_paths(
+                descriptor.ty,
+                self.storage_type_context(),
+            )
+            .headers
+            .into_iter()
+            .filter(|header| !header.path.is_empty())
+            .collect::<Vec<_>>(),
+            Ty::DynArray(element) => storage_type_paths(
+                scalar_to_ty(element),
+                self.storage_type_context(),
+            )
+            .headers,
+            Ty::DynStructArray(id, Layout::Aos) => storage_type_paths(
+                Ty::Struct(id),
+                self.storage_type_context(),
+            )
+            .headers,
+            Ty::DynStructArray(_, Layout::Soa)
+            | Ty::Slice(_)
+            | Ty::Soa(_)
+            | Ty::SoaParam(_)
+            | Ty::Error => Vec::new(),
+            _ => Vec::new(),
+        };
+        self.normalize_expected_dependencies(&expected, &expanded)
+    }
+
+    /// Resolve an indexed observation through the stable generation content table. Scalar reads
+    /// freeze only ordinary content into their completion; a nested header-bearing element/field
+    /// forwards the selected content header and never the outer collection header itself.
+    fn indexed_generation_content(&self, expression: &Expr) -> MoveValueFact {
+        let (recv, index, field_path) = match &expression.kind {
+            ExprKind::Index { recv, index } => (recv.as_ref(), index.as_ref(), &[][..]),
+            ExprKind::ElemField {
+                recv,
+                index,
+                path,
+                ..
+            } => (recv.as_ref(), index.as_ref(), path.as_slice()),
+            _ => return MoveValueFact::default(),
+        };
+        let headers = self.completed_headers(recv);
+        let fixed = self.fixed_array_shape(recv.ty);
+        let element_paths = if let Some((_, len)) = fixed {
+            self.exact_fixed_index(index, len).map_or_else(
+                || {
+                    (0..len)
+                        .map(|candidate| vec![BorrowProjection::ArrayElement(candidate)])
+                        .collect::<Vec<_>>()
+                },
+                |exact| vec![vec![BorrowProjection::ArrayElement(exact)]],
+            )
+        } else {
+            vec![Vec::new()]
+        };
+        let suffix = field_path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        headers
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .filter_map(|reference| {
+                self.borrows
+                    .storage
+                    .contents
+                    .entries
+                    .get(&reference.generation)
+                    .map(|content| (reference, content))
+            })
+            .fold(MoveValueFact::default(), |selected, (reference, content)| {
+                element_paths.iter().fold(selected, |selected, element_path| {
+                    let path = reference.select_content_path(
+                        element_path.iter().chain(&suffix).copied(),
+                    );
+                    selected.join(&content.project_path(&path))
+                })
+            })
+    }
+
+    fn selected_move_call_headers(
+        &self,
+        expression: &Expr,
+    ) -> (ProjectedHeaderFact, bool) {
+        let mut selection = call_storage_selection(
+            expression,
+            self.named_return_borrow,
+            self.callable_targets,
+        );
+        let (argument_headers, callee) = match &expression.kind {
+            ExprKind::Call { args, .. } | ExprKind::RawCall { args, .. } => (
+                args.iter()
+                    .map(|argument| self.completed_headers(argument))
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            ExprKind::CallFnValue { callee, args } => (
+                args.iter()
+                    .map(|argument| self.completed_headers(argument))
+                    .collect::<Vec<_>>(),
+                Some(callee.as_ref()),
+            ),
+            ExprKind::ResultMapErr { result, f } => (
+                vec![self
+                    .completed_headers(result)
+                    .project_path(&[BorrowProjection::ResultErr])],
+                Some(f.as_ref()),
+            ),
+            _ => (Vec::new(), None),
+        };
+        let callable_headers = callee.map(|callee| self.completed_headers(callee));
+        if let Some(callable) = &callable_headers {
+            extend_call_storage_selection_from_targets(
+                &mut selection,
+                callable.leaves.keys().filter_map(|path| match path.first() {
+                    Some(BorrowProjection::ClosureTarget(target)) => Some(*target),
+                    _ => None,
+                }),
+                argument_headers.len(),
+                self.named_return_borrow,
+                self.callable_target_ids,
+            );
+        }
+        if !selection.fallback_all
+            && selection.sources.iter().any(|source| match source {
+                CallSelectedSource::Capture { target, capture } => callable_headers
+                    .as_ref()
+                    .is_none_or(|headers| {
+                        let path = [
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ];
+                        !headers
+                            .leaves
+                            .keys()
+                            .any(|candidate| candidate.starts_with(&path))
+                    }),
+                CallSelectedSource::Argument(_) => false,
+            })
+        {
+            selection.fallback_all = true;
+        }
+        let mut headers = ProjectedHeaderFact::default();
+        if selection.fallback_all {
+            for argument in &argument_headers {
+                headers = headers.join(argument);
+            }
+            if let Some(callable) = callable_headers {
+                headers = headers.join(&callable);
+            }
+            return (headers, true);
+        }
+        for source in &selection.sources {
+            let selected = match source {
+                CallSelectedSource::Argument(index) => argument_headers
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or_default(),
+                CallSelectedSource::Capture { target, capture } => callable_headers
+                    .as_ref()
+                    .map(|headers| {
+                        headers.project_path(&[
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ])
+                    })
+                    .unwrap_or_default(),
+            };
+            headers = headers.join(&selected);
+        }
+        (headers, false)
+    }
+
+    /// Return the exact dependency header source for one carrier result. Calls consume the shared
+    /// return-summary selector rather than unioning every eager argument; that keeps unrelated
+    /// response/vector/mask inputs out of the carried content while malformed summaries remain
+    /// explicitly fail-closed.
+    fn carrier_dependency_headers(
+        &self,
+        expression: &Expr,
+    ) -> (ProjectedHeaderFact, bool) {
+        match &expression.kind {
+            ExprKind::ArrayChunks { source, .. } => {
+                let headers = self.completed_headers(source);
+                let missing = headers.leaves.is_empty();
+                (headers, missing)
+            }
+            ExprKind::ArrayDictEncode { base, .. } => {
+                let headers = self.local_headers(*base);
+                let missing = headers.leaves.is_empty();
+                (headers, missing)
+            }
+            ExprKind::ArrayToArray { source, .. }
+            | ExprKind::ArraySort { source, .. }
+            | ExprKind::ArraySortBy { source, .. }
+            | ExprKind::ArrayParMap { source, .. }
+            | ExprKind::ArrayPartition { source, .. }
+            | ExprKind::ArrayToSoa { source, .. } => {
+                let headers = self.completed_headers(source);
+                let dependencies = self.generation_content_headers(&headers);
+                let missing = dependencies.leaves.is_empty()
+                    && ty_may_borrow(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    );
+                (dependencies, missing)
+            }
+            ExprKind::ArrayBuilderBuild(builder) => {
+                let headers = self.completed_headers(builder);
+                let missing = headers.leaves.is_empty()
+                    && ty_may_borrow(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    );
+                (headers, missing)
+            }
+            ExprKind::Call { .. }
+            | ExprKind::RawCall { .. }
+            | ExprKind::CallFnValue { .. } => self.selected_move_call_headers(expression),
+            _ => (ProjectedHeaderFact::default(), true),
+        }
+    }
+
+    fn form_result_map_err_completion(
+        &mut self,
+        expression: &Expr,
+        fact: &BorrowFact,
+    ) -> ProjectedHeaderFact {
+        let ExprKind::ResultMapErr { result, .. } = &expression.kind else {
+            return ProjectedHeaderFact::default();
+        };
+        let mut headers = self.forwarded_headers(expression);
+        let active = self.active_sum_paths(result);
+        if active
+            .as_ref()
+            .is_some_and(|active| !active.contains(&BorrowProjection::ResultErr))
+        {
+            return headers;
+        }
+        let paths = storage_type_paths(expression.ty, self.storage_type_context());
+        if !paths.valid {
+            return ProjectedHeaderFact::default();
+        }
+        let (selected, source_unknown) = self.selected_move_call_headers(expression);
+        let mut carried = ProjectedHeaderFact::default();
+        for path in paths
+            .carriers
+            .iter()
+            .filter(|path| path.starts_with(&[BorrowProjection::ResultErr]))
+        {
+            let normalized = self
+                .projected_storage_result_ty(expression.ty, path)
+                .map_or_else(ProjectedHeaderFact::default, |carrier_ty| {
+                    self.normalize_carrier_dependencies(carrier_ty, &selected)
+                });
+            if normalized.leaves.is_empty() && source_unknown {
+                carried.leaves.insert(
+                    path.clone(),
+                    StorageHeaderLeaf::unknown(fact.live_roots()),
+                );
+            } else {
+                carried = carried.join(&normalized.prefixed_path(path));
+            }
+        }
+        let mut unknown = ProjectedHeaderFact::default();
+        let formations = paths
+            .headers
+            .into_iter()
+            .filter(|header| header.path.starts_with(&[BorrowProjection::ResultErr]))
+            .filter_map(|header| {
+                let descriptor = StorageHeaderDescriptor {
+                    ty: header.ty,
+                    kind: header.kind,
+                };
+                if header.kind == StorageHeaderKind::View {
+                    let mut leaf = StorageHeaderLeaf::unknown_typed(
+                        fact.live_roots(),
+                        descriptor,
+                    );
+                    let mut matched = false;
+                    let mut matched_exactly = true;
+                    for candidate in selected.leaves.values() {
+                        if candidate.descriptor.is_some_and(|candidate_descriptor| {
+                            storage_header_descriptors_compatible(
+                                descriptor,
+                                candidate_descriptor,
+                                self.tagged_types,
+                            )
+                        }) {
+                            matched = true;
+                            matched_exactly &= candidate.known
+                                && !candidate.generations.is_empty();
+                            leaf.generations
+                                .extend(candidate.generations.iter().cloned());
+                            leaf.fallback_roots
+                                .extend(candidate.fallback_roots.iter().copied());
+                        }
+                    }
+                    if matched && matched_exactly && !leaf.generations.is_empty() {
+                        leaf.known = true;
+                        leaf.fallback_roots.clear();
+                    }
+                    unknown.leaves.insert(header.path, leaf);
+                    return None;
+                }
+                Some((header, descriptor))
+            })
+            .enumerate()
+            .map(|(operand, (header, descriptor))| {
+                let generation = StorageGeneration::current(StorageOrigin::producer(
+                    expression,
+                    &header.path,
+                ));
+                StorageHeaderFormation {
+                    path: header.path.clone(),
+                    generation,
+                    directory: Some(MoveGenerationEntry {
+                        descriptor: Some(descriptor),
+                        releases: [MoveReleasePlace::Staging {
+                            action: Self::expr_key(expression),
+                            operand: operand as u32,
+                            path: header.path.clone(),
+                        }]
+                        .into_iter()
+                        .collect(),
+                        ended: None,
+                    }),
+                    content: Some(MoveValueFact {
+                        non_storage: fact.project_path(&header.path),
+                        headers: self.call_generation_content_headers(
+                            expression,
+                            descriptor,
+                        ),
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        if formations.is_empty() {
+            return headers.join(&carried).join(&unknown);
+        }
+        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
+            |formation| match &formation.generation {
+                StorageGeneration::Current(origin) => Some(origin.clone()),
+                StorageGeneration::Prior(_)
+                | StorageGeneration::ParameterValue { .. }
+                | StorageGeneration::CallerStorage { .. } => None,
+            },
+        ));
+        let mut next = self.borrows.storage.clone();
+        for content in next.contents.entries.values_mut() {
+            content.rename_generations(&renames);
+        }
+        let Ok(commit) = next.try_form_headers(
+            expression.ty,
+            formations,
+            self.storage_type_context(),
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) else {
+            return headers.join(&carried).join(&unknown);
+        };
+        self.borrows.rename_header_state(&commit.renames);
+        self.rename_external_storage_snapshots(&commit.renames);
+        self.record_storage_advances(&commit.renames);
+        self.borrows.storage = next;
+        headers = headers
+            .join(&commit.headers)
+            .join(&carried)
+            .join(&unknown);
+        headers
+    }
+
+    fn form_storage_completion(
+        &mut self,
+        expression: &Expr,
+        fact: &BorrowFact,
+    ) -> ProjectedHeaderFact {
+        if matches!(expression.kind, ExprKind::ResultMapErr { .. }) {
+            return self.form_result_map_err_completion(expression, fact);
+        }
+        let classification = classify_storage_expression(
+            expression,
+            self.storage_type_context(),
+            match &expression.kind {
+                ExprKind::Closure { lifted, .. } => {
+                    self.callable_target_ids.get(lifted).copied()
+                }
+                _ => None,
+            },
+        );
+        if !classification.valid {
+            return ProjectedHeaderFact::default();
+        }
+        // The expression-level action remains authoritative even when the result type has no
+        // header leaves. Scalar `Index`/`ElemField` reads still freeze generation content into
+        // their ordinary completion fact; collapsing an empty result list to NoStorage would lose
+        // that closed action discriminator.
+        if matches!(
+            classification.policy,
+            StorageVariantPolicy::Forward | StorageVariantPolicy::Aggregate
+        ) {
+            return self.forwarded_headers(expression);
+        }
+        let mut unknown = ProjectedHeaderFact::default();
+        let mut carriers = ProjectedHeaderFact::default();
+        let mut formations = Vec::new();
+        let initialized_headers = self.initializer_headers(expression);
+        for (ordinal, result) in classification.results.into_iter().enumerate() {
+            if result.role == StorageExprRole::CarrierProducer {
+                let (dependencies, source_unknown) =
+                    self.carrier_dependency_headers(expression);
+                let normalized = self
+                    .projected_storage_result_ty(expression.ty, &result.path)
+                    .map_or_else(ProjectedHeaderFact::default, |carrier_ty| {
+                        self.normalize_carrier_dependencies(carrier_ty, &dependencies)
+                    });
+                if normalized.leaves.is_empty() && source_unknown {
+                    unknown.leaves.insert(
+                        result.path,
+                        StorageHeaderLeaf::unknown(fact.live_roots()),
+                    );
+                } else {
+                    carriers = carriers.join(&normalized.prefixed_path(&result.path));
+                }
+                continue;
+            }
+            if result.role != StorageExprRole::HeaderProducer {
+                continue;
+            }
+            let unknown_identity = result.initializer == StorageContentInitializer::UnknownView
+                || (result.header_kind == Some(StorageHeaderKind::View)
+                    && result.initializer == StorageContentInitializer::CallSummary);
+            if unknown_identity {
+                let descriptor = result
+                    .header_ty
+                    .zip(result.header_kind)
+                    .map(|(ty, kind)| StorageHeaderDescriptor { ty, kind });
+                let mut leaf = descriptor.map_or_else(
+                    || StorageHeaderLeaf::unknown(fact.live_roots()),
+                    |descriptor| {
+                        StorageHeaderLeaf::unknown_typed(fact.live_roots(), descriptor)
+                    },
+                );
+                if let Some(descriptor) = descriptor
+                    && matches!(
+                        expression.kind,
+                        ExprKind::Call { .. }
+                            | ExprKind::CallFnValue { .. }
+                            | ExprKind::RawCall { .. }
+                    )
+                {
+                    let (sources, _) = self.selected_move_call_headers(expression);
+                    let mut matched = false;
+                    let mut matched_exactly = true;
+                    for candidate in sources.leaves.values() {
+                        if candidate.descriptor.is_some_and(|candidate_descriptor| {
+                            storage_header_descriptors_compatible(
+                                descriptor,
+                                candidate_descriptor,
+                                self.tagged_types,
+                            )
+                        }) {
+                            matched = true;
+                            matched_exactly &=
+                                candidate.known && !candidate.generations.is_empty();
+                            leaf.generations
+                                .extend(candidate.generations.iter().cloned());
+                            leaf.fallback_roots
+                                .extend(candidate.fallback_roots.iter().copied());
+                        }
+                    }
+                    if matched && matched_exactly && !leaf.generations.is_empty() {
+                        leaf.known = true;
+                        leaf.fallback_roots.clear();
+                    }
+                }
+                unknown.leaves.insert(
+                    result.path,
+                    leaf,
+                );
+                continue;
+            }
+            let origin = StorageOrigin::producer(expression, &result.path);
+            let generation = StorageGeneration::current(origin);
+            let staging = MoveReleasePlace::Staging {
+                action: Self::expr_key(expression),
+                operand: ordinal as u32,
+                path: result.path.clone(),
+            };
+            let individual = self.loop_iter_drops.last().map_or(staging.clone(), |_| {
+                MoveReleasePlace::IterTemp {
+                    depth: self.loop_iter_drops.len() as u32,
+                    expression: Self::expr_key(expression),
+                    path: result.path.clone(),
+                }
+            });
+            let active_arena = self.active_arena_scope();
+            let explicit_clone_region = match &expression.kind {
+                ExprKind::CloneIn { region, .. } => match region.kind {
+                    ExprKind::Local(local) => self.active_named_arena_scope(local),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let releases = if result.header_kind == Some(StorageHeaderKind::InlineFixed) {
+                [individual].into_iter().collect()
+            } else if result.header_kind == Some(StorageHeaderKind::View)
+                && result.initializer == StorageContentInitializer::FixedLiteral
+            {
+                // A fixed literal copies each nested view header; it does not own the storage
+                // that header observes. The initializer's projected content carries the child's
+                // actual owner roots/generations, so attaching the literal's staging release to
+                // this Copy view would spuriously end static and caller-backed elements at the
+                // end of the construction statement.
+                std::collections::BTreeSet::new()
+            } else if result.initializer == StorageContentInitializer::CloneIn {
+                // `clone_in` allocates in its explicit region. Only an exact active named arena is
+                // locally released; a parameter/caller region has no release in this frame.
+                explicit_clone_region
+                    .map(|arena| MoveReleasePlace::ArenaScope { arena })
+                    .into_iter()
+                    .collect()
+            } else if result.initializer != StorageContentInitializer::CallSummary
+                && let Some(arena) = active_arena
+            {
+                // Language materializers inside an arena allocate in that enclosing region. Call
+                // results remain callee/caller heap allocations: lexical presence of an arena is
+                // not authority to retag an opaque returned allocation.
+                [MoveReleasePlace::ArenaScope { arena }]
+                    .into_iter()
+                    .collect()
+            } else {
+                [individual].into_iter().collect()
+            };
+            formations.push(StorageHeaderFormation {
+                path: result.path.clone(),
+                generation,
+                directory: Some(MoveGenerationEntry {
+                    descriptor: result.header_ty.zip(result.header_kind).map(|(ty, kind)| {
+                        StorageHeaderDescriptor { ty, kind }
+                    }),
+                    releases,
+                    ended: None,
+                }),
+                content: Some(MoveValueFact {
+                    non_storage: fact.project_path(&result.path),
+                    headers: if result.initializer
+                        == StorageContentInitializer::CallSummary
+                    {
+                        result
+                            .header_ty
+                            .zip(result.header_kind)
+                            .map_or_else(ProjectedHeaderFact::default, |(ty, kind)| {
+                                self.call_generation_content_headers(
+                                    expression,
+                                    StorageHeaderDescriptor { ty, kind },
+                                )
+                            })
+                    } else {
+                        initialized_headers.project_path(&result.path)
+                    },
+                }),
+            });
+        }
+        if formations.is_empty() {
+            return carriers.join(&unknown);
+        }
+
+        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
+            |formation| match &formation.generation {
+                StorageGeneration::Current(origin) => Some(origin.clone()),
+                StorageGeneration::Prior(_)
+                | StorageGeneration::ParameterValue { .. }
+                | StorageGeneration::CallerStorage { .. } => None,
+            },
+        ));
+        let mut next = self.borrows.storage.clone();
+        for content in next.contents.entries.values_mut() {
+            content.rename_generations(&renames);
+        }
+        let Ok(commit) = next.try_form_headers(
+            expression.ty,
+            formations,
+            self.storage_type_context(),
+            |existing, incoming| *existing = existing.join(&incoming),
+            |existing, incoming| *existing = existing.join(&incoming),
+        ) else {
+            return unknown;
+        };
+        self.borrows.rename_header_state(&commit.renames);
+        self.rename_external_storage_snapshots(&commit.renames);
+        self.record_storage_advances(&commit.renames);
+        self.borrows.storage = next;
+        commit.headers.join(&carriers).join(&unknown)
+    }
+
+    fn record_value_completion(&mut self, expression: &Expr, fact: BorrowFact) {
+        let key = Self::expr_key(expression);
+        let (fact, mut storage, backing) = self
+            .pending_call_completions
+            .remove(&key)
+            .map_or_else(
+                || {
+                    let backing = self.mutable_backing(expression);
+                    let storage = BorrowFact::from_direct(self.storage_roots(expression));
+                    (fact, storage, backing)
+                },
+                |completion| {
+                    (
+                        completion.value,
+                        completion.storage,
+                        completion.backing,
+                    )
+                },
+            );
+        let fact = fact.join(&self.indexed_generation_content(expression).non_storage);
+        if self.mutable_collection_ty(expression.ty) {
+            storage
+                .direct
+                .extend(backing.roots.iter().filter_map(|root| root.live()));
+        }
+        let headers = self.form_storage_completion(expression, &fact);
+        let mut completion_roots = fact.live_roots();
+        completion_roots.extend(storage.live_roots());
+        completion_roots.extend(backing.roots.iter().filter_map(|root| root.live()));
+        self.borrows.begin_value_source(key, completion_roots);
+        self.borrows.begin_value_headers(key, headers);
+        if self.borrow_mut_place_snapshots.contains(&key)
+            && let Some(place) = Self::mutable_actual_place(expression)
+        {
+            self.borrows.begin_mutable_place_source(key, place);
+        }
+        self.walked_value_facts.insert(key, fact);
+        self.walked_storage_facts.insert(key, storage);
+        self.walked_backing_facts.insert(key, backing);
+    }
+
+    fn completed_value_fact(&self, expression: &Expr) -> BorrowFact {
+        let key = Self::expr_key(expression);
+        let Some(mut fact) = self.walked_value_facts.get(&key).cloned() else {
+            return self.borrow_fact(expression);
+        };
+        if let Some(invalid) = self.borrows.invalid_value_sources.get(&key) {
+            fact.mark_ended(invalid);
+        }
+        fact
+    }
+
+    fn completed_storage_fact(&self, expression: &Expr) -> BorrowFact {
+        let key = Self::expr_key(expression);
+        let Some(mut fact) = self.walked_storage_facts.get(&key).cloned() else {
+            return BorrowFact::from_direct(self.storage_roots(expression));
+        };
+        if let Some(invalid) = self.borrows.invalid_value_sources.get(&key) {
+            fact.mark_ended(invalid);
+        }
+        fact
+    }
+
+    fn completed_backing_fact(&self, expression: &Expr) -> MutableBackingFact {
+        self.walked_backing_facts
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .unwrap_or_else(|| self.mutable_backing(expression))
     }
 
     fn ended_value_snapshot(&self, key: usize) -> Option<(BorrowRoot, BorrowEnd)> {
@@ -21019,6 +32036,43 @@ impl<'a> MoveCheck<'a> {
         self.diags.error(message, span);
     }
 
+    fn validate_mutable_place_snapshot(
+        &mut self,
+        action: usize,
+        snapshot: usize,
+        span: Span,
+    ) {
+        let Some(&how) = self
+            .borrows
+            .invalid_mutable_place_sources
+            .get(&snapshot)
+        else {
+            return;
+        };
+        if !self
+            .reported_invalid_value_actions
+            .insert((action, snapshot))
+        {
+            return;
+        }
+        let owner = self
+            .borrows
+            .mutable_place_sources
+            .get(&snapshot)
+            .and_then(|place| self.f.locals.get(place.root as usize))
+            .map_or("<place>", |local| local.name.as_str());
+        let why = match how {
+            BorrowEnd::Consumed => "was reassigned or mutated by a later eager operand",
+            BorrowEnd::Dropped => "was dropped before the call action",
+        };
+        self.diags.error(
+            format!(
+                "borrow mut argument place was invalidated before the call action: '{owner}' {why}"
+            ),
+            span,
+        );
+    }
+
     fn defers_child_snapshot_validation(kind: &ExprKind) -> bool {
         matches!(
             kind,
@@ -21038,12 +32092,11 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
-    /// A `borrow mut` argument is deliberately advanced by the call itself. When that call returns
-    /// a value rooted in the fresh post-call generation (for example `db.next(rows)`), validating
-    /// the argument's pre-call snapshot after the mutation would reject the intended generation
-    /// transition. Only the exact mutable argument snapshot is exempt: a callee or another eager
-    /// value may retain the same pre-call roots and must still be rejected after the advancement.
-    fn intentional_borrow_mut_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
+    /// A mutable operand is deliberately advanced by its own enclosing action. Validating that
+    /// exact pre-action operand snapshot after the mutation would reject the intended generation
+    /// transition. Only the exact destination snapshot is exempt: a callee, source value, or
+    /// another eager operand may retain the same pre-action roots and must still be rejected.
+    fn intentional_action_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
         let is_exact_snapshot = |argument: &Expr| Self::expr_key(argument) == snapshot;
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
@@ -21064,7 +32117,8 @@ impl<'a> MoveCheck<'a> {
                 }),
                 _ => false,
             },
-            _ => false,
+            _ => Self::source_visible_mutation_action(&expression.kind)
+                .is_some_and(|action| action.exact_destination_matches(snapshot)),
         }
     }
 
@@ -21180,12 +32234,18 @@ impl<'a> MoveCheck<'a> {
 
     fn pipeline_element_fact(&self, source: &Expr, stages: &[Stage]) -> (Ty, BorrowFact) {
         let mut element_ty = self.collection_element_ty(source.ty).unwrap_or(source.ty);
-        let mut fact = if self.fixed_array_shape(source.ty).is_some() {
+        let fact = if self.fixed_array_shape(source.ty).is_some() {
             self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
                 .project_array_elements()
         } else {
             BorrowFact::from_direct(self.borrow_sources(source))
         };
+        // A materializing pipeline copies element values into fresh storage. Retain owners used by
+        // those values, but not the source collection/header generation itself. Completed value
+        // facts deliberately include that generation even for a primitive dynamic collection so
+        // an eager mutable call can reserve it; leaking the same root into a materialized result
+        // would make a later source reassignment invalidate independent ArrayToSoa/ToArray output.
+        let mut fact = self.element_argument_fact(fact, &self.mutable_backing(source));
         for stage in stages {
             match &stage.kind {
                 StageKind::Project { field } => {
@@ -21258,16 +32318,44 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .enumerate()
             .map(|(index, argument)| {
-                let fact = if signature.is_some_and(|signature| {
+                let borrowed = signature.is_some_and(|signature| {
                     matches!(
                         signature.params.get(index).map(|(mode, _)| mode),
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     )
-                }) {
-                    BorrowFact::from_direct(self.storage_roots(argument))
+                });
+                let mut fact = if borrowed {
+                    self.completed_storage_fact(argument)
                 } else {
-                    self.borrow_fact(argument)
+                    self.completed_value_fact(argument)
                 };
+                if !borrowed
+                    && self.is_move_ty(argument.ty)
+                    && signature.is_some_and(|signature| {
+                        ty_is_move(
+                            signature.ret,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        ) && ty_mentions_resource(
+                            signature.ret,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                    })
+                    && let Some(source) = self.direct_storage_move_source(argument)
+                {
+                    fact = fact.without_root_sources(
+                        &[BorrowRoot::Local(source)].into_iter().collect(),
+                    );
+                }
                 (argument.ty, fact)
             })
             .collect::<Vec<_>>();
@@ -21315,7 +32403,9 @@ impl<'a> MoveCheck<'a> {
             return BorrowFact::from_direct(unresolved().flatten());
         }
         let mut fact = BorrowFact::default();
-        let environment = self.borrow_fact(callee);
+        // The callable expression completed before argument zero. A later eager argument may
+        // rebind its source local, but the runtime invokes the already-evaluated environment.
+        let environment = self.completed_value_fact(callee);
         for (&target, summary) in targets {
             let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
                 continue;
@@ -21340,11 +32430,15 @@ impl<'a> MoveCheck<'a> {
     fn parallel_argument_fact(&self, argument: &Expr, mode: Option<ast::ParamMode>) -> BorrowFact {
         if matches!(
             mode,
-            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            Some(
+                ast::ParamMode::Borrow
+                    | ast::ParamMode::BorrowMut
+                    | ast::ParamMode::Out
+            )
         ) {
-            BorrowFact::from_direct(self.storage_roots(argument))
+            self.completed_storage_fact(argument)
         } else {
-            self.borrow_fact(argument)
+            self.completed_value_fact(argument)
         }
     }
 
@@ -21415,7 +32509,7 @@ impl<'a> MoveCheck<'a> {
         if targets.is_empty() {
             return unresolved();
         }
-        let environment = self.borrow_fact(callee);
+        let environment = self.completed_value_fact(callee);
         let mut fact = BorrowFact::default();
         for target in targets.keys().copied() {
             let Some(summary) = self.callable_parallel_targets.get(&target) else {
@@ -21684,7 +32778,23 @@ impl<'a> MoveCheck<'a> {
                 e.ty,
             ),
             ExprKind::ResultMapErr { result, f } => {
+                if !ty_may_borrow(
+                    e.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    return BorrowFact::default();
+                }
                 let result_fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
+                let active = self.active_sum_paths(result);
+                let selects_ok = active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(&BorrowProjection::ResultOk));
+                let selects_err = active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(&BorrowProjection::ResultErr));
                 let (input_error_ty, output_error_ty) = match (
                     expand_tagged_ty(result.ty, self.tagged_types),
                     expand_tagged_ty(e.ty, self.tagged_types),
@@ -21698,14 +32808,40 @@ impl<'a> MoveCheck<'a> {
                         return BorrowFact::from_direct(roots);
                     }
                 };
-                let ok = result_fact
-                    .project_exact(BorrowProjection::ResultOk)
-                    .prefixed(BorrowProjection::ResultOk);
-                let input_error = result_fact.project_exact(BorrowProjection::ResultErr);
-                let mapped_error = self.callable_return_fact_from_facts(
-                    f,
-                    &[(input_error_ty, input_error)],
-                );
+                let ok = if selects_ok {
+                    result_fact
+                        .project_exact(BorrowProjection::ResultOk)
+                        .prefixed(BorrowProjection::ResultOk)
+                } else {
+                    BorrowFact::default()
+                };
+                let mut input_error = result_fact.project_exact(BorrowProjection::ResultErr);
+                if ty_is_move(
+                    output_error_ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) && ty_mentions_resource(
+                    output_error_ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) && let Some(source) = self.direct_storage_move_source(result)
+                {
+                    input_error = input_error.without_root_sources(
+                        &[BorrowRoot::Local(source)].into_iter().collect(),
+                    );
+                }
+                let mapped_error = if selects_err {
+                    self.callable_return_fact_from_facts(
+                        f,
+                        &[(input_error_ty, input_error)],
+                    )
+                } else {
+                    BorrowFact::default()
+                };
                 if self.projection_ty(e.ty, BorrowProjection::ResultErr)
                     != Some(output_error_ty)
                 {
@@ -21715,35 +32851,11 @@ impl<'a> MoveCheck<'a> {
                 }
                 ok.join(&mapped_error.prefixed(BorrowProjection::ResultErr))
             }
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                let projection = match expand_tagged_ty(opt.ty, self.tagged_types) {
-                    Ty::Option(_) => Some(BorrowProjection::OptionSome),
-                    Ty::Result(..) => Some(BorrowProjection::ResultOk),
-                    _ => None,
-                };
-                let success = projection.map_or_else(
-                    || BorrowFact::from_direct(self.borrow_sources(opt)),
-                    |projection| {
-                        self.project_fact_or_flatten(
-                            opt.ty,
-                            self.borrow_fact(opt),
-                            &[projection],
-                            e.ty,
-                        )
-                    },
-                );
-                if self.non_fallthrough.contains(&fallback.span) {
-                    success
-                } else {
-                    success.join(&self.borrow_fact(fallback))
-                }
-            }
-            ExprKind::Match { arms, .. } => arms
-                .iter()
-                .filter(|arm| !self.non_fallthrough.contains(&arm.body.span))
-                .fold(BorrowFact::default(), |fact, arm| {
-                    fact.join(&self.borrow_fact(&arm.body))
-                }),
+            ExprKind::ElseUnwrap { .. } | ExprKind::Match { .. } => self
+                .control_value_facts
+                .get(&Self::expr_key(e))
+                .map(|fact| fact.non_storage.clone())
+                .unwrap_or_default(),
             ExprKind::ArrayToArray { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArraySortBy { source, stages, .. }
@@ -21766,7 +32878,19 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayChunks { source, .. } => {
                 BorrowFact::from_direct(self.storage_roots(source))
             }
-            ExprKind::CallFnValue { callee, args } => self.callable_return_fact(callee, args),
+            ExprKind::CallFnValue { callee, args } => {
+                if ty_may_borrow(
+                    e.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    self.callable_return_fact(callee, args)
+                } else {
+                    BorrowFact::default()
+                }
+            }
             ExprKind::Closure { lifted, captures } => {
                 let fact = captures.iter().enumerate().fold(
                     BorrowFact::default(),
@@ -21791,13 +32915,13 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Unsafe(block) => self.block_value_fact(block),
             ExprKind::If { .. } => self
                 .control_value_facts
-                .get(&e.span)
-                .cloned()
+                .get(&Self::expr_key(e))
+                .map(|fact| fact.non_storage.clone())
                 .unwrap_or_default(),
             ExprKind::Loop { .. } => self
                 .loop_value_facts
-                .get(&e.span)
-                .cloned()
+                .get(&Self::expr_key(e))
+                .map(|fact| fact.non_storage.clone())
                 .unwrap_or_default(),
             // Remaining non-fixed collection and pipeline forms retain
             // the conservative flattened fact until their dedicated C-B cells below.
@@ -21847,6 +32971,7 @@ impl<'a> MoveCheck<'a> {
         &self,
         summary: &hir::ReturnBorrowSummary,
         modes: Option<&[ast::ParamMode]>,
+        result_ty: Ty,
         args: impl std::ops::Fn(u32) -> Option<&'b Expr>,
     ) -> BorrowRoots {
         let hir::ReturnBorrowSummary::Roots {
@@ -21859,15 +32984,46 @@ impl<'a> MoveCheck<'a> {
         let mut roots = BorrowRoots::new();
         for &index in params {
             if let Some(value) = args(index) {
-                if modes.is_some_and(|modes| {
+                let borrowed = modes.is_some_and(|modes| {
                     matches!(
                         modes.get(index as usize),
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     )
-                }) {
-                    roots.extend(self.storage_roots(value));
+                });
+                if borrowed {
+                    roots.extend(self.completed_storage_fact(value).flatten());
                 } else {
-                    roots.extend(self.borrow_sources(value));
+                    let mut fact = self.completed_value_fact(value);
+                    // Only an owned argument transfers its local storage away. A Copy
+                    // `resource_ref` names a resource owner without consuming it, so stripping
+                    // that local here would lose the dependent result's lifetime and Drop
+                    // ordering provenance.
+                    if self.is_move_ty(value.ty)
+                        && ty_is_move(
+                            result_ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        && ty_mentions_resource(
+                            result_ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        && let Some(source) = self.direct_storage_move_source(value)
+                    {
+                        fact = fact.without_root_sources(
+                            &[BorrowRoot::Local(source)].into_iter().collect(),
+                        );
+                    }
+                    roots.extend(fact.flatten());
                 }
             }
         }
@@ -22016,10 +33172,17 @@ impl<'a> MoveCheck<'a> {
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
             // past the input's liveness is caught.
             ExprKind::JsonScan { input, .. } => self.storage_roots(input),
-            ExprKind::Call { func, args, .. } => self
-                .named_return_borrow
-                .get(func)
-                .map_or_else(
+            ExprKind::Call { func, args, .. } => {
+                if !ty_may_borrow(
+                    e.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    return BorrowRoots::new();
+                }
+                self.named_return_borrow.get(func).map_or_else(
                     || {
                         let mut roots = BorrowRoots::new();
                         for arg in args {
@@ -22031,10 +33194,12 @@ impl<'a> MoveCheck<'a> {
                         self.map_summary_roots(
                             summary,
                             self.named_param_modes.get(func).map(Vec::as_slice),
+                            e.ty,
                             |index| args.get(index as usize),
                         )
                     },
-                ),
+                )
+            }
             ExprKind::CallFnValue { callee, args } => {
                 let mut roots = self.borrow_sources(callee);
                 for arg in args {
@@ -22047,11 +33212,24 @@ impl<'a> MoveCheck<'a> {
                 param_modes,
                 return_borrow,
                 ..
-            } => self.map_summary_roots(
-                return_borrow,
-                Some(param_modes.as_slice()),
-                |index| args.get(index as usize),
-            ),
+            } => {
+                if ty_may_borrow(
+                    e.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    self.map_summary_roots(
+                        return_borrow,
+                        Some(param_modes.as_slice()),
+                        e.ty,
+                        |index| args.get(index as usize),
+                    )
+                } else {
+                    BorrowRoots::new()
+                }
+            }
             ExprKind::RawPointerLoad { .. } => BorrowRoots::new(),
             ExprKind::StaticDescriptorView { ptr, .. } => self.borrow_sources(ptr),
             ExprKind::Spawn { closure, .. } => self.borrow_sources(closure),
@@ -22134,8 +33312,8 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Loop { .. } => self
                 .loop_value_facts
-                .get(&e.span)
-                .map(BorrowFact::flatten)
+                .get(&Self::expr_key(e))
+                .map(|fact| fact.non_storage.flatten())
                 .unwrap_or_default(),
             // ── The remaining forms record NO provenance, and the list is EXHAUSTIVE: there is no
             // `_` tail, so a new `ExprKind` cannot silently inherit "borrows nothing" — which is
@@ -22254,14 +33432,454 @@ impl<'a> MoveCheck<'a> {
         }
     }
     fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
-        let fact = if self.local_may_borrow(local) {
+        let tracks_dynamic_storage = self.f.locals.get(local as usize).is_some_and(|local| {
+            local.ty.is_array_builder()
+                || matches!(
+                    expand_tagged_ty(local.ty, self.tagged_types),
+                    Ty::DynArray(..) | Ty::DynStructArray(..)
+                )
+        });
+        let fact = if self.local_may_borrow(local) || tracks_dynamic_storage {
             let fact = self.borrow_fact(value);
             let ty = self.f.locals[local as usize].ty;
             self.normalize_borrow_fact(ty, fact)
         } else {
             BorrowFact::default()
         };
+        self.assign_completed_borrow_fact(
+            local,
+            fact,
+            self.completed_storage_fact(value).live_roots(),
+        );
+    }
+
+    fn assign_completed_borrow_fact(
+        &mut self,
+        local: LocalId,
+        mut fact: BorrowFact,
+        completed_storage_roots: BorrowRoots,
+    ) {
+        // Projected storage identity is resolved through the stable generation directory at each
+        // use. Freezing the current release local here would make an alias keep pointing at a
+        // moved-from name after ownership transfers to another local.
+        if let Some(headers) = self.borrows.headers.get(&local) {
+            let mut releases = self.borrows.header_release_roots(headers);
+            // The completed RHS snapshot was frozen before a consuming install transferred the
+            // release place. Remove that completion-time storage identity as well; nested value
+            // provenance remains in the generation content table and is resolved lazily.
+            releases.extend(completed_storage_roots);
+            fact = fact.without_root_sources_at_paths(
+                &releases,
+                headers.leaves.keys().cloned(),
+            );
+        }
         self.borrows.assign(local, fact);
+    }
+
+    fn active_sum_paths(
+        &self,
+        expression: &Expr,
+    ) -> Option<std::collections::BTreeSet<BorrowProjection>> {
+        resolve_active_sum_paths(expression, &self.borrows.active_sum, |body| {
+            !self.non_fallthrough.contains(&body.span)
+        })
+    }
+
+    fn assign_active_sum(&mut self, local: LocalId, value: &Expr) {
+        if let Some(active) = self.active_sum_paths(value) {
+            self.borrows.active_sum.insert(local, active);
+        } else {
+            self.borrows.active_sum.remove(&local);
+        }
+    }
+
+    fn direct_storage_move_source(&self, value: &Expr) -> Option<LocalId> {
+        if let Some(inner) = borrow_transparent_value(value) {
+            return self.direct_storage_move_source(inner);
+        }
+        match &value.kind {
+            ExprKind::Local(local) => Some(*local),
+            ExprKind::Block(block)
+            | ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .and_then(|tail| self.direct_storage_move_source(tail)),
+            _ => None,
+        }
+    }
+
+    fn detach_legacy_storage_root(
+        &mut self,
+        source: LocalId,
+        headers: &ProjectedHeaderFact,
+    ) {
+        let generations = headers
+            .leaves
+            .values()
+            .flat_map(|leaf| {
+                leaf.generations
+                    .iter()
+                    .map(|reference| reference.generation.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if generations.is_empty() {
+            return;
+        }
+        let affected = self
+            .borrows
+            .headers
+            .iter()
+            .filter_map(|(&local, candidate)| {
+                let paths = candidate
+                    .leaves
+                    .iter()
+                    .filter_map(|(path, leaf)| {
+                        leaf.generations
+                            .iter()
+                            .any(|reference| generations.contains(&reference.generation))
+                            .then_some(path.clone())
+                    })
+                    .collect::<Vec<_>>();
+                (!paths.is_empty()).then_some((local, paths))
+            })
+            .collect::<Vec<_>>();
+        let excluded = [BorrowRoot::Local(source)].into_iter().collect();
+        for (local, paths) in affected {
+            let mut retains_source = false;
+            if let Some(fact) = self.borrows.facts.get(&local).cloned() {
+                let fact = fact.without_root_sources_at_paths(&excluded, paths);
+                retains_source = fact.flatten().iter().any(|root| {
+                    *root == BorrowRoot::Local(source)
+                        || root
+                            .ended_source()
+                            .is_some_and(|(root, _)| root == BorrowRoot::Local(source))
+                });
+                self.borrows.update_fact(local, fact);
+            } else if let Some(roots) = self.borrows.sources.get_mut(&local) {
+                roots.remove(&BorrowRoot::Local(source));
+            }
+            if !retains_source
+                && let Some(invalid) = self.borrows.invalid.get_mut(&local)
+            {
+                invalid.remove(&BorrowRoot::Local(source));
+            }
+        }
+    }
+
+    fn rename_external_storage_snapshots(&mut self, renames: &StorageGenerationRenames) {
+        for fact in self.control_value_facts.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for fact in self.loop_value_facts.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for edges in &mut self.loop_breaks {
+            for edge in edges {
+                edge.value.rename_generations(renames);
+                edge.borrows.rename_generations(renames);
+            }
+        }
+    }
+
+    fn apply_generation_renames(&mut self, renames: &StorageGenerationRenames) {
+        if renames.origins.is_empty() {
+            return;
+        }
+        self.borrows.rename_generations(renames);
+        self.rename_external_storage_snapshots(renames);
+        self.record_storage_advances(renames);
+    }
+
+    fn projected_local_ty(
+        &self,
+        local: LocalId,
+        path: &[BorrowProjection],
+    ) -> Option<Ty> {
+        let mut ty = self.f.locals.get(local as usize)?.ty;
+        for &projection in path {
+            ty = self.projection_ty(ty, projection)?;
+        }
+        Some(ty)
+    }
+
+    /// Install one already-completed projected value into a canonical local place. Every binding
+    /// form supplies only its selector and whether it owns the selected payload; fixed rebasing,
+    /// dynamic release transfer, replacement ending, and projected-trie replacement then share
+    /// this one action.
+    fn install_projected_storage(
+        &mut self,
+        local: LocalId,
+        destination_prefix: &[BorrowProjection],
+        incoming: ProjectedHeaderFact,
+        source: Option<LocalId>,
+        replacing: bool,
+        owns_selected_value: bool,
+    ) {
+        let Some(destination_ty) = self.projected_local_ty(local, destination_prefix) else {
+            return;
+        };
+        let typed = storage_type_paths(destination_ty, self.storage_type_context());
+        if !typed.valid {
+            let mut headers = self.local_headers(local);
+            headers.replace_path(destination_prefix, ProjectedHeaderFact::default());
+            if headers.leaves.is_empty() {
+                self.borrows.headers.remove(&local);
+            } else {
+                self.borrows.headers.insert(local, headers);
+            }
+            return;
+        }
+
+        let mut installed = incoming.clone();
+        let mut transferable = installed.clone();
+
+        if replacing {
+            let owned_paths = typed
+                .headers
+                .iter()
+                .filter(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+                .map(|header| {
+                    let mut path = destination_prefix.to_vec();
+                    path.extend(&header.path);
+                    path
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            for entry in self.borrows.storage.directory.entries.values_mut() {
+                if entry.releases.iter().any(|release| {
+                    matches!(release, MoveReleasePlace::Local { local: owner, path }
+                        if *owner == local && owned_paths.contains(path))
+                }) {
+                    entry.ended = Some(
+                        entry
+                            .ended
+                            .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
+                    );
+                }
+            }
+        }
+
+        for header in &typed.headers {
+            if header.kind != StorageHeaderKind::InlineFixed {
+                continue;
+            }
+            transferable.leaves.remove(&header.path);
+            let source_leaf = installed.leaves.get(&header.path).cloned();
+            let mut content = source_leaf
+                .iter()
+                .flat_map(|leaf| leaf.generations.iter())
+                .filter_map(|reference| {
+                    self.borrows
+                        .storage
+                        .contents
+                        .entries
+                        .get(&reference.generation)
+                        .map(|content| content.project_path(&reference.content_path))
+                })
+                .reduce(|left, right| left.join(&right))
+                .unwrap_or_default();
+            let mut destination_path = destination_prefix.to_vec();
+            destination_path.extend(&header.path);
+            let origin = StorageOrigin::inline_place(local, &destination_path);
+            let mut generation = StorageGeneration::current(origin.clone());
+            let preserves_live_destination = replacing
+                && self
+                    .borrows
+                    .storage
+                    .directory
+                    .entries
+                    .get(&generation)
+                    .is_some_and(|entry| {
+                        entry.ended.is_none()
+                            && entry.releases.contains(&MoveReleasePlace::Local {
+                                local,
+                                path: destination_path.clone(),
+                            })
+                    });
+            if !preserves_live_destination
+                && (self
+                    .borrows
+                    .storage
+                    .directory
+                    .entries
+                    .contains_key(&generation)
+                    || self
+                        .borrows
+                        .storage
+                        .contents
+                        .entries
+                        .contains_key(&generation))
+            {
+                let renames = StorageGenerationRenames::from_origins([origin.clone()]);
+                self.apply_generation_renames(&renames);
+                content.rename_generations(&renames);
+                generation = StorageGeneration::current(origin);
+            }
+            self.borrows.storage.directory.entries.insert(
+                generation.clone(),
+                MoveGenerationEntry {
+                    descriptor: Some(StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    }),
+                    releases: [MoveReleasePlace::Local {
+                        local,
+                        path: destination_path,
+                    }]
+                    .into_iter()
+                    .collect(),
+                    ended: None,
+                },
+            );
+            self.borrows
+                .storage
+                .contents
+                .entries
+                .insert(generation.clone(), content);
+            installed.leaves.insert(
+                header.path.clone(),
+                StorageHeaderLeaf::known_typed(
+                    generation.clone(),
+                    StorageHeaderDescriptor {
+                        ty: header.ty,
+                        kind: header.kind,
+                    },
+                ),
+            );
+
+            // Copying an inline header materializes another addressable place but leaves the source
+            // live. Only an owned/Move selected payload consumes a distinct source generation.
+            if owns_selected_value {
+                for source_generation in source_leaf
+                    .iter()
+                    .flat_map(|leaf| leaf.generations.iter())
+                    .map(|reference| &reference.generation)
+                    .filter(|source_generation| **source_generation != generation)
+                {
+                    if let Some(entry) = self
+                        .borrows
+                        .storage
+                        .directory
+                        .entries
+                        .get_mut(source_generation)
+                    {
+                        entry.ended = Some(entry.ended.map_or(BorrowEnd::Consumed, |ended| {
+                            ended.min(BorrowEnd::Consumed)
+                        }));
+                    }
+                }
+            }
+        }
+
+        if owns_selected_value {
+            self.borrows.transfer_owned_releases(
+                &transferable,
+                &typed.headers,
+                source,
+                local,
+                destination_prefix,
+            );
+            if let Some(source) = source {
+                let owned = ProjectedHeaderFact {
+                    leaves: typed
+                        .headers
+                        .iter()
+                        .filter(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+                        .filter_map(|header| {
+                            transferable
+                                .leaves
+                                .get(&header.path)
+                                .cloned()
+                                .map(|leaf| (header.path.clone(), leaf))
+                        })
+                        .collect(),
+                };
+                self.detach_legacy_storage_root(source, &owned);
+            }
+        }
+
+        let mut destination = self.local_headers(local);
+        destination.replace_path(destination_prefix, installed);
+        if destination.leaves.is_empty() {
+            self.borrows.headers.remove(&local);
+        } else {
+            self.borrows.headers.insert(local, destination);
+        }
+    }
+
+    fn install_storage(&mut self, local: LocalId, value: &Expr, replacing: bool) {
+        if matches!(value.kind, ExprKind::Local(source) if source == local) {
+            return;
+        }
+        let owns_value = self
+            .f
+            .locals
+            .get(local as usize)
+            .is_some_and(|record| self.is_move_ty(record.ty));
+        self.install_projected_storage(
+            local,
+            &[],
+            self.completed_headers(value),
+            self.direct_storage_move_source(value),
+            replacing,
+            owns_value,
+        );
+    }
+
+    fn install_tuple_bindings(
+        &mut self,
+        locals: &[Option<LocalId>],
+        init: &Expr,
+        moved: &mut MovedSet,
+    ) {
+        let fact = self.borrow_fact(init);
+        let headers = self.completed_headers(init);
+        let completed_storage_roots = self.completed_storage_fact(init).live_roots();
+        let source = self.direct_storage_move_source(init);
+        for (index, local) in locals.iter().enumerate() {
+            let Some(local) = local else { continue };
+            let selector = [BorrowProjection::TupleElement(index as u32)];
+            // Destructuring a Move aggregate consumes its inline source slots even when one
+            // selected fixed leaf is Copy. A wholly Copy tuple merely copies/rematerializes and
+            // leaves every source generation live.
+            let owns_selected = self.is_move_ty(init.ty);
+            self.install_projected_storage(
+                *local,
+                &[],
+                headers.project_path(&selector),
+                source,
+                false,
+                owns_selected,
+            );
+            let local_fact = if self.local_may_borrow(*local) {
+                let selected = self.project_fact_or_flatten(
+                    init.ty,
+                    fact.clone(),
+                    &selector,
+                    self.f.locals[*local as usize].ty,
+                );
+                self.normalize_borrow_fact(self.f.locals[*local as usize].ty, selected)
+            } else {
+                BorrowFact::default()
+            };
+            self.assign_completed_borrow_fact(
+                *local,
+                local_fact,
+                completed_storage_roots.clone(),
+            );
+            if self
+                .f
+                .locals
+                .get(*local as usize)
+                .is_some_and(|local| self.mutable_collection_ty(local.ty))
+            {
+                let backing = self.destructured_mutable_backing(*local);
+                self.borrows.mutable_backing.insert(*local, backing);
+            }
+            clear_moved(moved, *local);
+        }
     }
 
     fn replace_local_borrow_projection(
@@ -22270,7 +33888,16 @@ impl<'a> MoveCheck<'a> {
         path: &[BorrowProjection],
         value: &Expr,
     ) {
-        let incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
+        let mut incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
+        let headers = self.local_headers(local).project_path(path);
+        if !headers.leaves.is_empty() {
+            let mut releases = self.borrows.header_release_roots(&headers);
+            releases.extend(self.completed_storage_fact(value).live_roots());
+            incoming = incoming.without_root_sources_at_paths(
+                &releases,
+                headers.leaves.keys().cloned(),
+            );
+        }
         self.replace_local_borrow_fact_projection(local, path, value.ty, incoming);
     }
 
@@ -22362,6 +33989,113 @@ impl<'a> MoveCheck<'a> {
         self.borrows.update_fact(local, current);
     }
 
+    /// Apply one indexed content transition to the syntactic base and every storage identity that
+    /// can be observed through another alias. The backing snapshot is taken before any fact update;
+    /// a computed fixed index and dynamic/slice storage retain the existing conservative join.
+    fn update_mutable_collection_contents(
+        &mut self,
+        base: LocalId,
+        index: &Expr,
+        field_path: &[u32],
+        value: &Expr,
+    ) {
+        self.mark_borrow_mut_modified(base);
+        self.update_generation_collection_contents(base, index, field_path, value);
+        let backing = self.local_mutable_backing(base);
+        let storage = BorrowFact::from_direct(self.local_storage_roots(base));
+        let observers = self.mutable_observer_locals(&backing, &storage);
+        for local in self.resolved_mutable_destinations(&backing, &observers) {
+            self.invalidate_mutable_place(local, &[]);
+        }
+        // Only the syntactic fixed-array base has an index in its own coordinate space. A slice or
+        // range may carry an offset that the analysis-local backing fact deliberately does not
+        // encode, so reusing `index` for an underlying fixed array could replace the wrong element
+        // fact (`values[1..2][0]` is `values[1]`, not `values[0]`). Keep the visible base precise and
+        // conservatively join the incoming owner into every distinct backing collection and
+        // pre-existing observer captured before the visible fact changes.
+        self.update_local_array_projection(base, index, field_path, value);
+        let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
+        destinations.remove(&base);
+        for local in destinations {
+            self.join_local_borrow_fallback(local, value);
+        }
+    }
+
+    fn update_generation_collection_contents(
+        &mut self,
+        base: LocalId,
+        index: &Expr,
+        field_path: &[u32],
+        value: &Expr,
+    ) {
+        let Some(headers) = self.borrows.headers.get(&base).cloned() else {
+            return;
+        };
+        let Some(base_ty) = self.f.locals.get(base as usize).map(|record| record.ty) else {
+            return;
+        };
+        let incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
+        let incoming_headers = self.completed_headers(value);
+        let fixed = self.fixed_array_shape(base_ty);
+        let exact = fixed.and_then(|(_, len)| self.exact_fixed_index(index, len));
+        let field_suffix = field_path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let references = headers
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        for reference in references {
+            let Some(content) = self
+                .borrows
+                .storage
+                .contents
+                .entries
+                .get_mut(&reference.generation)
+            else {
+                continue;
+            };
+            if let Some(exact) = exact {
+                let path = reference.select_content_path(
+                    std::iter::once(BorrowProjection::ArrayElement(exact))
+                        .chain(field_suffix.iter().copied()),
+                );
+                content.non_storage.replace_exact(&path, incoming.clone());
+                content
+                    .headers
+                    .replace_path(&path, incoming_headers.clone());
+            } else if let Some((_, len)) = fixed {
+                for candidate in 0..len {
+                    let path = reference.select_content_path(
+                        std::iter::once(BorrowProjection::ArrayElement(candidate))
+                            .chain(field_suffix.iter().copied()),
+                    );
+                    content.non_storage.join_at(&path, &incoming);
+                    let mut prefixed = incoming_headers.clone();
+                    for projection in path.iter().rev() {
+                        prefixed = prefixed.prefixed(*projection);
+                    }
+                    content.headers = content.headers.join(&prefixed);
+                }
+            } else {
+                let path = reference.select_content_path(field_suffix.iter().copied());
+                if path.is_empty() {
+                    content.non_storage.direct.extend(incoming.flatten());
+                } else {
+                    content.non_storage.join_at(&path, &incoming);
+                }
+                let mut prefixed = incoming_headers.clone();
+                for projection in path.iter().rev() {
+                    prefixed = prefixed.prefixed(*projection);
+                }
+                content.headers = content.headers.join(&prefixed);
+            }
+        }
+    }
+
     fn join_local_borrow_fallback(&mut self, local: LocalId, value: &Expr) {
         if !self.local_may_borrow(local) {
             return;
@@ -22380,27 +34114,99 @@ impl<'a> MoveCheck<'a> {
         self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
     }
 
-    /// A resource/reference borrower is itself live native state, not merely a view whose later use
-    /// can diagnose lazily. End the owner generation only after every such dependent value has been
-    /// consumed, so a child resource's eventual Drop can never run against a moved/replaced parent.
+    fn move_transfers_storage(&self, local: LocalId) -> bool {
+        self.borrows
+            .headers
+            .get(&local)
+            .is_some_and(|headers| !headers.leaves.is_empty())
+            && self.f.locals.get(local as usize).is_some_and(|record| {
+                storage_type_paths(record.ty, self.storage_type_context())
+                    .headers
+                    .iter()
+                    .any(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+            })
+    }
+
+    fn invalidate_mutable_place(&mut self, root: LocalId, path: &[u32]) {
+        self.borrows
+            .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
+    }
+
+    fn invalidate_source_mutation_target(&mut self, target: &Expr) {
+        if let Some(place) = Self::mutable_actual_place(target) {
+            self.invalidate_mutable_place(place.root, &place.path);
+        }
+    }
+
+    /// Invalidate exact-place reservations for every collection header that can observe a write to
+    /// the completed target. Backing/storage facts come from operand completion, so a later eager
+    /// sibling cannot retarget an already-evaluated slice alias before the action runs.
+    fn invalidate_collection_mutation_target(&mut self, target: &Expr) {
+        let backing = self.completed_backing_fact(target);
+        let storage = self.completed_storage_fact(target);
+        let observers = self.mutable_observer_locals(&backing, &storage);
+        let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
+        if self.mutable_actual_observes_completion(target, &backing, &storage)
+            && let Some(actual) = Self::mutable_actual_root(target)
+        {
+            destinations.insert(actual);
+        }
+        for local in destinations {
+            self.invalidate_mutable_place(local, &[]);
+        }
+    }
+
+    /// A Drop-bearing resource borrower is itself live native state, not merely a view whose later
+    /// use can diagnose lazily. End the owner generation only after every such dependent value has
+    /// been consumed, so a child resource's eventual Drop can never run against a moved/replaced
+    /// parent. A Copy reference rooted in a borrowed parameter may instead end at its last use.
     fn reject_live_resource_dependents(
         &mut self,
         owner: LocalId,
         moved: &MovedSet,
         span: Span,
     ) {
+        self.reject_live_resource_dependents_of_root(
+            BorrowRoot::Local(owner),
+            owner,
+            moved,
+            span,
+        );
+    }
+
+    fn reject_live_resource_dependents_of_root(
+        &mut self,
+        root: BorrowRoot,
+        owner: LocalId,
+        moved: &MovedSet,
+        span: Span,
+    ) -> bool {
+        let parameter_root = matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_));
         let dependent = self.borrows.sources.iter().find_map(|(&borrower, roots)| {
             (borrower != owner
                 && !whole_moved(moved, borrower)
-                && roots.contains(&BorrowRoot::Local(owner))
+                && roots.contains(&root)
                 && self.f.locals.get(borrower as usize).is_some_and(|local| {
-                    ty_mentions_resource(
+                    let mentions_resource = ty_mentions_resource(
                         local.ty,
                         self.structs,
                         self.tuples,
                         self.enums,
                         self.tagged_types,
-                    )
+                    );
+                    // A Copy reference rooted in a borrowed parameter can end at its last use;
+                    // any later use observes the ended generation through the ordinary borrow
+                    // check. A Drop-bearing child cannot be deferred that way: its implicit Drop
+                    // still needs the parent alive, so it must block the exclusive operation.
+                    mentions_resource
+                        && (!parameter_root
+                            || needs_drop_flag(
+                                local.ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            ))
                 }))
             .then_some(borrower)
         });
@@ -22421,6 +34227,9 @@ impl<'a> MoveCheck<'a> {
                 ),
                 span,
             );
+            true
+        } else {
+            false
         }
     }
 
@@ -22430,9 +34239,22 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) {
-        for root in roots {
-            if let BorrowRoot::Local(owner) = root {
-                self.reject_live_resource_dependents(*owner, moved, span);
+        for &root in roots {
+            let owner = match root {
+                BorrowRoot::Local(owner) => Some(owner),
+                BorrowRoot::Param(position) | BorrowRoot::ParamStorage(position) => {
+                    self.f.params.get(position as usize).copied()
+                }
+                BorrowRoot::IterTemp(_)
+                | BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedIterTemp(..)
+                | BorrowRoot::EndedParam(..)
+                | BorrowRoot::EndedParamStorage(..) => None,
+            };
+            if let Some(owner) = owner
+                && self.reject_live_resource_dependents_of_root(root, owner, moved, span)
+            {
+                break;
             }
         }
     }
@@ -22441,10 +34263,22 @@ impl<'a> MoveCheck<'a> {
     /// buffer whatever names it. A temporary root reaching here is left alone: the operation
     /// replaces the *named* storage, not the hidden owner, which only its loop edge frees.
     fn invalidate_storage(&mut self, storage: &Expr) {
-        for root in self.storage_roots(storage) {
+        self.invalidate_source_mutation_target(storage);
+        for root in self.completed_storage_fact(storage).live_roots() {
             if let BorrowRoot::Local(owner) = root {
+                self.invalidate_mutable_place(owner, &[]);
                 self.invalidate_owner(owner);
             }
+        }
+    }
+
+    /// A builder reallocation advances the builder slot, not the owners of borrowed views already
+    /// copied into its elements. `completed_storage_fact(builder)` deliberately contains both, so
+    /// the generic storage invalidator would end valid element provenance on the next push.
+    fn invalidate_builder_storage(&mut self, builder: &Expr) {
+        self.invalidate_source_mutation_target(builder);
+        if let Some(place) = Self::mutable_actual_place(builder) {
+            self.invalidate_owner(place.root);
         }
     }
 
@@ -22471,17 +34305,24 @@ impl<'a> MoveCheck<'a> {
     /// points at freed storage past this edge. Declaration order within `drops` is irrelevant: a
     /// local not yet bound on this path has no live borrower to invalidate.
     fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
-        state.invalidate_matching(BorrowEnd::Dropped, |root| match root {
+        let ended = |root| match root {
             BorrowRoot::Local(id) => drops.contains(&id),
-            // Deeper temporaries are already dead — an inner loop's own edges ended them — but
-            // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
             BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => false,
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => false,
-        });
+        };
+        state.mark_matching_roots_ended(BorrowEnd::Dropped, ended);
+        for &local in drops {
+            state.end_local_releases(local, BorrowEnd::Dropped);
+        }
+        state.end_iteration_releases(depth, BorrowEnd::Dropped);
+        // Deeper temporaries are already dead — an inner loop's own edges ended them — but the
+        // shared predicate keeps both the generation-content and legacy lanes independent of that
+        // ordering.
+        state.invalidate_matching(BorrowEnd::Dropped, ended);
     }
 
     /// The owned locals a `loop` body drops per iteration, in `body_locals` order.
@@ -22490,10 +34331,69 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn check_borrow_use(&mut self, local: LocalId, span: Span) {
+        if let Some(headers) = self.borrows.headers.get(&local).cloned() {
+            let resolved = self.borrows.resolve_headers(&headers).non_storage;
+            // Contents and release owners are generation-relative and may change after a move or
+            // store. Only materialize ended markers into the legacy diagnostic index; keeping
+            // live resolved roots in the local fact would turn the old owner name back into an
+            // identity authority.
+            for root in resolved.flatten() {
+                if let Some((source, how)) = root.ended_source() {
+                    let entry = self
+                        .borrows
+                        .invalid
+                        .entry(local)
+                        .or_default()
+                        .entry(source)
+                        .or_insert(how);
+                    *entry = (*entry).min(how);
+                }
+            }
+        }
         let Some(owners) = self.borrows.invalid.get(&local) else { return };
         // `BorrowRoot::Local` sorts first, so a named source is reported in preference to an
         // anonymous temporary when a borrower depends on both.
         let Some((root, how)) = owners.iter().next().map(|(&r, &h)| (r, h)) else { return };
+        self.emit_invalid_borrow(local, root, how, span);
+    }
+
+    /// Validate one exact aggregate projection without letting an ended sibling poison it. The
+    /// whole local remains invalid for whole-value reads, while `value.owned` can stay live when a
+    /// separate `value.view` leaf conservatively refers to an ended input generation.
+    fn check_borrow_projection_use(
+        &mut self,
+        local: LocalId,
+        path: &[BorrowProjection],
+        span: Span,
+    ) {
+        let selected_headers = self.local_headers(local).project_path(path);
+        let header_ended = self
+            .borrows
+            .resolve_headers(&selected_headers)
+            .non_storage
+            .flatten()
+            .into_iter()
+            .find_map(|root| root.ended_source());
+        let selected = self.local_borrow_fact(local).project_path(path).flatten();
+        let ended = selected.iter().find_map(|root| root.ended_source());
+        let invalid = self.borrows.invalid.get(&local).and_then(|owners| {
+            owners
+                .iter()
+                .find(|(root, _)| selected.contains(root))
+                .map(|(&root, &how)| (root, how))
+        });
+        if let Some((root, how)) = header_ended.or(ended).or(invalid) {
+            self.emit_invalid_borrow(local, root, how, span);
+        }
+    }
+
+    fn emit_invalid_borrow(
+        &mut self,
+        local: LocalId,
+        root: BorrowRoot,
+        how: BorrowEnd,
+        span: Span,
+    ) {
         let borrower = self
             .f
             .locals
@@ -22643,9 +34543,9 @@ impl<'a> MoveCheck<'a> {
         // An accepted `break` in a terminal operand has already copied the current borrow state
         // into its enclosing loop frame. That edge never reaches the terminal action, so erase the
         // analysis-only snapshot there as well; otherwise loop joins/fixpoints can resurrect it.
-        for frame in &mut self.loop_borrow_breaks {
-            for state in frame {
-                state.finish_pipeline_source(snapshot);
+        for frame in &mut self.loop_breaks {
+            for edge in frame {
+                edge.borrows.finish_pipeline_source(snapshot);
             }
         }
         if !validate {
@@ -22697,7 +34597,7 @@ impl<'a> MoveCheck<'a> {
         &mut self,
         body: &'a Block,
         body_locals: &std::ops::Range<LocalId>,
-        span: Span,
+        loop_key: usize,
         moved: &mut MovedSet,
     ) -> bool {
         let entry = moved.clone();
@@ -22708,6 +34608,7 @@ impl<'a> MoveCheck<'a> {
         // rooted in one of them as dead.
         let drops = self.iteration_drops(body_locals);
         self.loop_iter_drops.push(drops.clone());
+        self.begin_loop_scope(loop_key);
         // Depth AFTER the push: the loop being walked is the one whose edges free these.
         let depth = self.loop_iter_drops.len() as u32;
         // Probe pass: discover which locals a fall-through iteration moves, with diagnostics
@@ -22718,13 +34619,19 @@ impl<'a> MoveCheck<'a> {
             self.reported_invalid_value_actions.clone();
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
-        self.loop_borrow_breaks.push(Vec::new());
-        self.loop_value_breaks.push(BorrowFact::default());
         self.borrows = entry_borrows.clone();
+        self.begin_storage_advance_frame();
+        self.begin_value_snapshot_frame();
         let probe_falls_through = self.block(body, &mut probe, false, false);
+        if probe_falls_through {
+            self.end_active_staging_releases(true, BorrowEnd::Dropped);
+        }
+        let probe_snapshots = self.finish_value_snapshot_frame();
+        for snapshot in probe_snapshots {
+            self.clear_value_snapshot(snapshot);
+        }
+        let probe_advances = self.finish_storage_advance_frame();
         self.loop_breaks.pop();
-        self.loop_borrow_breaks.pop();
-        self.loop_value_breaks.pop();
         let mut probe_borrows = self.borrows.clone();
         Self::invalidate_iteration_drops(&mut probe_borrows, &drops, depth);
         // The back-edge is reached only on a fall-through path (one that neither `break`s nor
@@ -22744,20 +34651,43 @@ impl<'a> MoveCheck<'a> {
         // Compute the finite may-state fixpoint with diagnostics still suppressed. Keeping the old
         // head in the join represents every possible iteration count, including the first.
         let fixed_borrows = if probe_falls_through {
-            let mut head = BorrowState::join(&entry_borrows, &probe_borrows);
+            let mut head = Self::join_storage_states(
+                &entry_borrows,
+                &StorageGenerationRenames::default(),
+                &probe_borrows,
+                &probe_advances,
+            );
             loop {
                 self.borrows = head.clone();
                 let mut probe_state = &entry | &back_edge;
                 self.loop_breaks.push(Vec::new());
-                self.loop_borrow_breaks.push(Vec::new());
-                self.loop_value_breaks.push(BorrowFact::default());
-                self.block(body, &mut probe_state, false, false);
+                self.begin_storage_advance_frame();
+                self.begin_value_snapshot_frame();
+                let iteration_falls_through =
+                    self.block(body, &mut probe_state, false, false);
+                if iteration_falls_through {
+                    self.end_active_staging_releases(true, BorrowEnd::Dropped);
+                }
+                let iteration_snapshots = self.finish_value_snapshot_frame();
+                for snapshot in iteration_snapshots {
+                    self.clear_value_snapshot(snapshot);
+                }
+                let iteration_advances = self.finish_storage_advance_frame();
                 self.loop_breaks.pop();
-                self.loop_borrow_breaks.pop();
-                self.loop_value_breaks.pop();
                 let mut end = self.borrows.clone();
                 Self::invalidate_iteration_drops(&mut end, &drops, depth);
-                let next = BorrowState::join(&head, &BorrowState::join(&entry_borrows, &end));
+                let iteration = Self::join_storage_states(
+                    &entry_borrows,
+                    &StorageGenerationRenames::default(),
+                    &end,
+                    &iteration_advances,
+                );
+                let next = Self::join_storage_states(
+                    &head,
+                    &StorageGenerationRenames::default(),
+                    &iteration,
+                    &iteration_advances,
+                );
                 if next == head {
                     break head;
                 }
@@ -22775,44 +34705,51 @@ impl<'a> MoveCheck<'a> {
         let mut body_state = &entry | &back_edge;
         self.borrows = fixed_borrows;
         self.loop_breaks.push(Vec::new());
-        self.loop_borrow_breaks.push(Vec::new());
-        self.loop_value_breaks.push(BorrowFact::default());
-        self.block(body, &mut body_state, false, false);
-        let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
-        let falls_through = !breaks.is_empty();
-        let borrow_breaks = self
-            .loop_borrow_breaks
-            .pop()
-            .expect("loop borrow-break frame balanced");
-        let value_fact = self
-            .loop_value_breaks
-            .pop()
-            .expect("loop value-break frame balanced");
-        if value_fact.is_empty() {
-            self.loop_value_facts.remove(&span);
-        } else {
-            self.loop_value_facts.insert(span, value_fact);
+        self.begin_storage_advance_frame();
+        self.begin_value_snapshot_frame();
+        let body_falls_through = self.block(body, &mut body_state, false, false);
+        if body_falls_through {
+            self.end_active_staging_releases(true, BorrowEnd::Dropped);
         }
-        self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
+        let body_snapshots = self.finish_value_snapshot_frame();
+        let body_advances = self.finish_storage_advance_frame();
+        let breaks = self
+            .loop_breaks
+            .pop()
+            .expect("loop control-break frame balanced");
+        let falls_through = !breaks.is_empty();
         // Code after the loop runs only after a `break`; a local moved on *any* break path is
         // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
         // leave `moved` unchanged.
         if let Some((first, rest)) = breaks.split_first() {
-            let mut post = first.clone();
-            for b in rest {
-                post = &post | b;
+            let post = rest
+                .iter()
+                .cloned()
+                .fold(first.clone(), MoveControlEdge::join);
+            let loop_headers = post.value.headers.clone();
+            if post.value.non_storage.is_empty() && post.value.headers.leaves.is_empty() {
+                self.loop_value_facts.remove(&loop_key);
+            } else {
+                self.loop_value_facts.insert(loop_key, post.value.clone());
             }
-            *moved = post;
-        }
-        if let Some((first, rest)) = borrow_breaks.split_first() {
-            let mut post = first.clone();
-            for b in rest {
-                post = BorrowState::join(&post, b);
-            }
-            self.borrows = post;
+            *moved = post.moved;
+            self.borrows = post.borrows;
+            self.propagate_storage_advances(&post.advances);
+            self.borrows.begin_value_headers(loop_key, loop_headers);
         } else {
             self.borrows = entry_borrows;
+            self.loop_value_facts.remove(&loop_key);
+            self.borrows
+                .begin_value_headers(loop_key, ProjectedHeaderFact::default());
         }
+        for snapshot in body_snapshots {
+            if snapshot != loop_key {
+                self.clear_value_snapshot(snapshot);
+            }
+        }
+        self.loop_iter_drops.pop().expect("loop iteration-drop frame balanced");
+        self.finish_loop_scope(loop_key);
+        let _ = body_advances;
         falls_through
     }
 
@@ -22836,8 +34773,12 @@ impl<'a> MoveCheck<'a> {
             match s {
                 Stmt::Let { local, init } => {
                     move_expr!(self, init, moved, true, true);
+                    self.install_storage(*local, init, false);
                     self.assign_borrow(*local, init);
+                    self.assign_active_sum(*local, init);
+                    self.assign_mutable_backing(*local, init);
                     clear_moved(moved, *local);
+                    self.clear_value_snapshot(Self::expr_key(init));
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
                     let was_moved = whole_moved(moved, *local);
@@ -22850,12 +34791,22 @@ impl<'a> MoveCheck<'a> {
                     // locals never drop. (`s = make(s.len())` borrows, not moves → still drops.)
                     let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
                     drop_old.set(self.is_move(*local) && !consumed_by_rhs);
-                    if self.local_owns_view_storage(*local) {
+                    if !matches!(value.kind, ExprKind::Local(source) if source == *local) {
+                        self.mark_borrow_mut_modified(*local);
+                        self.invalidate_mutable_place(*local, &[]);
+                    }
+                    if self.local_owns_view_storage(*local)
+                        && !matches!(value.kind, ExprKind::Local(source) if source == *local)
+                    {
                         self.reject_live_resource_dependents(*local, moved, value.span);
                         self.invalidate_owner(*local);
                     }
+                    self.install_storage(*local, value, true);
                     self.assign_borrow(*local, value);
+                    self.assign_active_sum(*local, value);
+                    self.assign_mutable_backing(*local, value);
                     clear_moved(moved, *local);
+                    self.clear_value_snapshot(Self::expr_key(value));
                 }
                 // `root.field = value` — writing a field is a use of `root` (an owned struct could
                 // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
@@ -22894,11 +34845,21 @@ impl<'a> MoveCheck<'a> {
                         self.invalidate_owner(*root);
                     }
                     if !self_assign {
+                        self.mark_borrow_mut_modified(*root);
+                        self.invalidate_mutable_place(*root, path);
                         let projections = path
                             .iter()
                             .copied()
                             .map(BorrowProjection::StructField)
                             .collect::<Vec<_>>();
+                        self.install_projected_storage(
+                            *root,
+                            &projections,
+                            self.completed_headers(value),
+                            self.direct_storage_move_source(value),
+                            true,
+                            self.is_move_ty(value.ty),
+                        );
                         self.replace_local_borrow_projection(
                             *root,
                             &projections,
@@ -22906,8 +34867,8 @@ impl<'a> MoveCheck<'a> {
                         );
                     }
                 }
-                // `base[index] = value` — primitive array elements are Copy, so the index and value
-                // are read without consuming either.
+                // `base[index] = value` — AssignIndex admits only Copy scalars and borrowed `str`,
+                // so the index and value are read without consuming either.
                 Stmt::AssignIndex { base, index, value } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
@@ -22916,7 +34877,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
-                    self.update_local_array_projection(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, index, &[], value);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
@@ -22939,7 +34900,7 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
-                    self.update_local_array_projection(*base, index, path, value);
+                    self.update_mutable_collection_contents(*base, index, path, value);
                 }
                 Stmt::AssignElem { base, index, value, .. } => {
                     self.check_borrow_use(*base, index.span);
@@ -22952,41 +34913,49 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
-                    self.update_local_array_projection(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, index, &[], value);
                 }
-                Stmt::AssignVecLane { value, .. } => {
+                Stmt::AssignVecLane { local, value, .. } => {
                     move_expr!(self, value, moved, false, false);
+                    self.invalidate_mutable_place(*local, &[]);
                 }
                 Stmt::Return(Some(e)) => {
                     move_expr!(self, e, moved, true, true);
                     let key = Self::expr_key(e);
                     self.validate_value_snapshot(key, key, e.span);
+                    self.transfer_completed_value_to_returned(e);
+                    self.end_active_staging_releases(false, BorrowEnd::Dropped);
                     // Control expressions establish match-arm payload bindings while they are
                     // walked. Query after that walk so an explicit `return match ...` observes the
                     // same binding provenance as a trailing match expression.
                     self.return_roots.extend(self.borrow_sources(e));
                     self.collect_borrow_mut_exit_roots();
                 }
-                Stmt::Return(None) => self.collect_borrow_mut_exit_roots(),
+                Stmt::Return(None) => {
+                    self.end_active_staging_releases(false, BorrowEnd::Dropped);
+                    self.collect_borrow_mut_exit_roots();
+                }
                 // `break e` moves `e` out of the loop, exactly like `return` moves a value out of the
                 // function (a direct, consuming move site). Then snapshot the move state for the
                 // loop's post-state union (`break` is the only way control reaches past the loop).
                 Stmt::Break { value, accepted } => {
+                    let mut value_fact = MoveValueFact::default();
                     if let Some(e) = value {
                         move_expr!(self, e, moved, true, true);
                         if *accepted {
                             let key = Self::expr_key(e);
                             self.validate_value_snapshot(key, key, e.span);
-                            let fact = self.borrow_fact(e);
-                            if let Some(frame) = self.loop_value_breaks.last_mut() {
-                                *frame = frame.join(&fact);
+                            if let Some(loop_expr) = self.active_loop_result_key() {
+                                self.transfer_completed_value_to_loop_result(e, loop_expr);
                             }
+                            value_fact = MoveValueFact {
+                                non_storage: self.borrow_fact(e),
+                                headers: self.completed_headers(e),
+                            };
                         }
                     }
                     if *accepted {
-                        if let Some(frame) = self.loop_breaks.last_mut() {
-                            frame.push(moved.clone());
-                        }
+                        self.end_active_staging_releases(true, BorrowEnd::Dropped);
                         // This edge leaves the innermost loop, which drops its per-iteration owned
                         // locals here (MIR `loop_iter_drops`) — so every view rooted in one of them
                         // is dead in the code that follows the loop. The invalidation applies to the
@@ -22997,37 +34966,27 @@ impl<'a> MoveCheck<'a> {
                             let depth = self.loop_iter_drops.len() as u32;
                             Self::invalidate_iteration_drops(&mut at_break, drops, depth);
                         }
-                        if let Some(frame) = self.loop_borrow_breaks.last_mut() {
-                            frame.push(at_break);
+                        let advances = self.active_storage_advances();
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(MoveControlEdge {
+                                moved: moved.clone(),
+                                borrows: at_break,
+                                value: value_fact,
+                                advances,
+                            });
                         }
                     }
                 }
                 Stmt::Expr(e) => {
                     move_expr!(self, e, moved, false, false);
+                    self.end_expression_staging_releases(e, BorrowEnd::Dropped);
+                    self.clear_expression_value_snapshots(e);
                 }
                 // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
                     move_expr!(self, init, moved, true, true);
-                    let fact = self.borrow_fact(init);
-                    for (index, local) in locals.iter().enumerate() {
-                        let Some(local) = local else { continue };
-                        let local_fact = if self.local_may_borrow(*local) {
-                            let selected = self.project_fact_or_flatten(
-                                init.ty,
-                                fact.clone(),
-                                &[BorrowProjection::TupleElement(index as u32)],
-                                self.f.locals[*local as usize].ty,
-                            );
-                            self.normalize_borrow_fact(
-                                self.f.locals[*local as usize].ty,
-                                selected,
-                            )
-                        } else {
-                            BorrowFact::default()
-                        };
-                        self.borrows.assign(*local, local_fact);
-                        clear_moved(moved, *local);
-                    }
+                    self.install_tuple_bindings(locals, init, moved);
+                    self.clear_value_snapshot(Self::expr_key(init));
                 }
             }
             falls_through =
@@ -23081,16 +35040,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, value, moved, true, true);
-                if let ExprKind::Local(local) = builder.kind {
-                    self.join_local_borrow_fallback(local, value);
-                }
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, data, moved, false, false);
-                if let ExprKind::Local(local) = builder.kind {
-                    self.join_local_borrow_fallback(local, data);
-                }
             }
             ExprKind::ArrayBuilderBuild(i) => {
                 move_expr!(self, i, moved, true, true);
@@ -23138,7 +35091,10 @@ impl<'a> MoveCheck<'a> {
                         );
                     }
                     self.reject_live_resource_dependents(*id, moved, expression.span);
-                    self.invalidate_owner(*id);
+                    self.invalidate_mutable_place(*id, &[]);
+                    if !self.move_transfers_storage(*id) {
+                        self.invalidate_owner(*id);
+                    }
                     moved.insert(MovedKey::Whole(*id));
                     return;
                 }
@@ -23184,6 +35140,7 @@ impl<'a> MoveCheck<'a> {
                             return;
                         }
                         self.reject_live_resource_dependents(*root, moved, expression.span);
+                        self.invalidate_mutable_place(*root, &[field]);
                         self.invalidate_owner(*root);
                         moved.insert(MovedKey::Field(*root, field));
                     } else if self.is_move_ty(expression.ty) {
@@ -23219,12 +35176,28 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) -> bool {
+        self.expr_with_action_mode(e, moved, consuming, direct, false)
+    }
+
+    fn expr_deferred_action(&mut self, e: &'a Expr, moved: &mut MovedSet) -> bool {
+        self.expr_with_action_mode(e, moved, false, false, true)
+    }
+
+    fn expr_with_action_mode(
+        &mut self,
+        e: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+        deferred_action: bool,
+    ) -> bool {
         if self.collecting_move_children {
-            self.move_children.push((e, consuming, direct));
+            self.move_children
+                .push((e, consuming, direct, deferred_action));
             return true;
         }
         if let Some(falls_through) =
-            self.expr_transparent_spine(e, moved, consuming, direct)
+            self.expr_transparent_spine(e, moved, consuming, direct, deferred_action)
         {
             return falls_through;
         }
@@ -23235,8 +35208,34 @@ impl<'a> MoveCheck<'a> {
             }
             return falls_through;
         }
+        if let Some(falls_through) =
+            self.expr_if_value_worklist(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
+        if let Some(falls_through) =
+            self.expr_else_unwrap_worklist(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
+        if let Some(falls_through) =
+            self.expr_short_circuit_worklist(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
+        if let Some(falls_through) =
+            self.expr_binding_free_match_worklist(e, moved, consuming, direct)
+        {
+            return falls_through;
+        }
         if self.expr_uses_eager_worklist(e) {
-            return self.expr_eager_worklist(e, moved, consuming, direct);
+            return self.expr_eager_worklist(
+                e,
+                moved,
+                consuming,
+                direct,
+                deferred_action,
+            );
         }
         if matches!(
             e.kind,
@@ -23263,43 +35262,780 @@ impl<'a> MoveCheck<'a> {
         {
             return self.expr_non_borrowing_binary_tree(e, moved);
         }
-        let may_borrow = self.value_snapshot_needed(e);
+        let value_snapshot = self.value_snapshot_needed(e);
+        let completion_snapshot = self.completion_snapshot_needed(e);
         let key = Self::expr_key(e);
         // A loop refinement or another repeated structural walk may revisit the same source node
         // under a stronger state. Never let that prior pass answer this evaluation's fact query.
-        if may_borrow {
+        if completion_snapshot {
             self.clear_value_snapshot(key);
         }
-        self.value_snapshot_frames.push(Vec::new());
-        let falls_through =
-            self.expr_inner(e, moved, consuming, direct);
-        let child_snapshots = self
-            .value_snapshot_frames
-            .pop()
-            .expect("value snapshot frame for walked expression");
+        self.begin_value_snapshot_frame();
+        let falls_through = self.expr_inner(e, moved, consuming, direct);
+        let child_snapshots = self.finish_value_snapshot_frame();
         if falls_through
             && !Self::defers_child_snapshot_validation(&e.kind)
         {
-            for snapshot in child_snapshots {
-                if !self.intentional_borrow_mut_snapshot(e, snapshot) {
-                self.validate_value_snapshot(key, snapshot, e.span);
+            for &snapshot in &child_snapshots {
+                if !self.intentional_action_snapshot(e, snapshot) {
+                    self.validate_value_snapshot(key, snapshot, e.span);
+                }
             }
-        }
         }
         if !falls_through {
             self.non_fallthrough.insert(e.span);
-        } else if may_borrow {
-            // Every eager child has already stored its own completion-time fact. Forming this
-            // parent from those child snapshots preserves runtime source order even if a later
-            // sibling reassigned a local mentioned by an earlier child.
-            let fact = self.borrow_fact(e);
-            self.borrows.begin_value_source(key, fact.live_roots());
-            self.walked_value_facts.insert(key, fact);
-            if let Some(parent) = self.value_snapshot_frames.last_mut() {
-                parent.push(key);
+        } else {
+            if completion_snapshot {
+                // Every eager child has already stored its own completion-time fact. Forming this
+                // parent from those child snapshots preserves runtime source order even if a later
+                // sibling reassigned a local mentioned by an earlier child.
+                let fact = if value_snapshot {
+                    self.borrow_fact(e)
+                } else {
+                    BorrowFact::default()
+                };
+                self.record_value_completion(e, fact);
+                if value_snapshot {
+                    self.record_parent_value_snapshot(key);
+                }
             }
+            self.finish_child_staging_frontier(e, &child_snapshots);
+            self.record_parent_value_snapshots(&child_snapshots);
         }
         falls_through
+    }
+
+    fn finish_control_worklist_expression(
+        &mut self,
+        expression: &Expr,
+        key: usize,
+        value_snapshot: bool,
+        completion_snapshot: bool,
+        falls_through: bool,
+    ) -> bool {
+        let child_snapshots = self.finish_value_snapshot_frame();
+        if !falls_through {
+            self.non_fallthrough.insert(expression.span);
+            return false;
+        }
+        if completion_snapshot {
+            let fact = if value_snapshot {
+                self.borrow_fact(expression)
+            } else {
+                BorrowFact::default()
+            };
+            self.record_value_completion(expression, fact);
+            if value_snapshot {
+                self.record_parent_value_snapshot(key);
+            }
+        }
+        self.finish_child_staging_frontier(expression, &child_snapshots);
+        self.record_parent_value_snapshots(&child_snapshots);
+        true
+    }
+
+    /// Keep the common expression-only `if` shape on an explicit worklist. Statement-bearing
+    /// branches retain the ordinary block walker; the accepted-depth owner composes deep value
+    /// branches and conditions without growing the native stack.
+    fn expr_if_value_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        let ExprKind::If { then, els, .. } = &root.kind else {
+            return None;
+        };
+        if !then.stmts.is_empty()
+            || !els.stmts.is_empty()
+            || then.value.is_none()
+            || els.value.is_none()
+        {
+            return None;
+        }
+
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            AfterCond {
+                expression: &'e Expr,
+                then_value: &'e Expr,
+                else_value: &'e Expr,
+                consuming: bool,
+            },
+            AfterThen {
+                expression: &'e Expr,
+                then_value: &'e Expr,
+                else_value: &'e Expr,
+                consuming: bool,
+                incoming_moved: MovedSet,
+                incoming_borrows: BorrowState,
+            },
+            AfterElse {
+                expression: &'e Expr,
+                else_value: &'e Expr,
+                then_edge: Option<MoveControlEdge>,
+                incoming_borrows: BorrowState,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                value_snapshot: bool,
+                completion_snapshot: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    let parts = match &expression.kind {
+                        ExprKind::If { cond, then, els }
+                            if then.stmts.is_empty()
+                                && els.stmts.is_empty()
+                                && then.value.is_some()
+                                && els.value.is_some() =>
+                        {
+                            Some((
+                                cond.as_ref(),
+                                then.value.as_deref().expect("checked then value"),
+                                els.value.as_deref().expect("checked else value"),
+                            ))
+                        }
+                        _ => None,
+                    };
+                    let Some((cond, then_value, else_value)) = parts else {
+                        values.push(self.expr_with_action_mode(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                            false,
+                        ));
+                        continue;
+                    };
+
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
+                    let key = Self::expr_key(expression);
+                    if completion_snapshot {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.begin_value_snapshot_frame();
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                    });
+                    work.push(Work::AfterCond {
+                        expression,
+                        then_value,
+                        else_value,
+                        consuming,
+                    });
+                    work.push(Work::Eval(cond, false, false));
+                }
+                Work::AfterCond {
+                    expression,
+                    then_value,
+                    else_value,
+                    consuming,
+                } => {
+                    if !values.pop().expect("if condition result") {
+                        values.push(false);
+                        continue;
+                    }
+                    let incoming_moved = moved.clone();
+                    let incoming_borrows = self.borrows.clone();
+                    self.begin_storage_advance_frame();
+                    work.push(Work::AfterThen {
+                        expression,
+                        then_value,
+                        else_value,
+                        consuming,
+                        incoming_moved,
+                        incoming_borrows,
+                    });
+                    work.push(Work::Eval(then_value, consuming, false));
+                }
+                Work::AfterThen {
+                    expression,
+                    then_value,
+                    else_value,
+                    consuming,
+                    incoming_moved,
+                    incoming_borrows,
+                } => {
+                    let then_falls_through = values.pop().expect("if then result");
+                    let then_advances = self.finish_storage_advance_frame();
+                    let then_edge = then_falls_through.then(|| MoveControlEdge {
+                        moved: moved.clone(),
+                        borrows: self.borrows.clone(),
+                        value: MoveValueFact {
+                            non_storage: self.borrow_fact(then_value),
+                            headers: self.completed_headers(then_value),
+                        },
+                        advances: then_advances,
+                    });
+                    *moved = incoming_moved;
+                    self.borrows = incoming_borrows.clone();
+                    self.begin_storage_advance_frame();
+                    work.push(Work::AfterElse {
+                        expression,
+                        else_value,
+                        then_edge,
+                        incoming_borrows,
+                    });
+                    work.push(Work::Eval(else_value, consuming, false));
+                }
+                Work::AfterElse {
+                    expression,
+                    else_value,
+                    then_edge,
+                    incoming_borrows,
+                } => {
+                    let else_falls_through = values.pop().expect("if else result");
+                    let else_advances = self.finish_storage_advance_frame();
+                    let else_edge = else_falls_through.then(|| MoveControlEdge {
+                        moved: moved.clone(),
+                        borrows: self.borrows.clone(),
+                        value: MoveValueFact {
+                            non_storage: self.borrow_fact(else_value),
+                            headers: self.completed_headers(else_value),
+                        },
+                        advances: else_advances,
+                    });
+                    let Some(edge) =
+                        MoveControlEdge::join_reachable([then_edge, else_edge])
+                    else {
+                        self.borrows = incoming_borrows;
+                        self.control_value_facts
+                            .remove(&Self::expr_key(expression));
+                        values.push(false);
+                        continue;
+                    };
+                    self.publish_control_edge(Self::expr_key(expression), moved, edge);
+                    values.push(true);
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    value_snapshot,
+                    completion_snapshot,
+                } => {
+                    let falls_through = values.pop().expect("if result");
+                    values.push(self.finish_control_worklist_expression(
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                        falls_through,
+                    ));
+                }
+            }
+        }
+        Some(values.pop().expect("if root result"))
+    }
+
+    fn expr_else_unwrap_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        if !matches!(root.kind, ExprKind::ElseUnwrap { .. }) {
+            return None;
+        }
+
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            AfterOpt {
+                expression: &'e Expr,
+                opt: &'e Expr,
+                fallback: &'e Expr,
+                consuming: bool,
+            },
+            AfterFallback {
+                expression: &'e Expr,
+                fallback: &'e Expr,
+                success: MoveControlEdge,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                value_snapshot: bool,
+                completion_snapshot: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    let operands = match &expression.kind {
+                        ExprKind::ElseUnwrap { opt, fallback } => {
+                            Some((opt.as_ref(), fallback.as_ref()))
+                        }
+                        _ => None,
+                    };
+                    let Some((opt, fallback)) = operands else {
+                        values.push(self.expr_with_action_mode(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                            false,
+                        ));
+                        continue;
+                    };
+
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
+                    let key = Self::expr_key(expression);
+                    if completion_snapshot {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.begin_value_snapshot_frame();
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                    });
+                    work.push(Work::AfterOpt {
+                        expression,
+                        opt,
+                        fallback,
+                        consuming,
+                    });
+                    work.push(Work::Eval(opt, true, true));
+                }
+                Work::AfterOpt {
+                    expression,
+                    opt,
+                    fallback,
+                    consuming,
+                } => {
+                    if !values.pop().expect("else-unwrap option result") {
+                        values.push(false);
+                        continue;
+                    }
+                    let success_projection = match expand_tagged_ty(opt.ty, self.tagged_types) {
+                        Ty::Option(_) => Some(BorrowProjection::OptionSome),
+                        Ty::Result(..) => Some(BorrowProjection::ResultOk),
+                        _ => None,
+                    };
+                    let success_fact = success_projection.map_or_else(
+                        || BorrowFact::from_direct(self.borrow_sources(opt)),
+                        |projection| {
+                            self.project_fact_or_flatten(
+                                opt.ty,
+                                self.borrow_fact(opt),
+                                &[projection],
+                                expression.ty,
+                            )
+                        },
+                    );
+                    let success_headers = success_projection.map_or_else(
+                        ProjectedHeaderFact::default,
+                        |projection| self.completed_headers(opt).project_path(&[projection]),
+                    );
+                    let success = MoveControlEdge {
+                        moved: moved.clone(),
+                        borrows: self.borrows.clone(),
+                        value: MoveValueFact {
+                            non_storage: success_fact,
+                            headers: success_headers,
+                        },
+                        advances: StorageGenerationRenames::default(),
+                    };
+                    self.begin_storage_advance_frame();
+                    work.push(Work::AfterFallback {
+                        expression,
+                        fallback,
+                        success,
+                    });
+                    work.push(Work::Eval(fallback, consuming, false));
+                }
+                Work::AfterFallback {
+                    expression,
+                    fallback,
+                    success,
+                } => {
+                    let fallback_falls_through =
+                        values.pop().expect("else-unwrap fallback result");
+                    let fallback_advances = self.finish_storage_advance_frame();
+                    let edge = if fallback_falls_through {
+                        success.join(MoveControlEdge {
+                            moved: moved.clone(),
+                            borrows: self.borrows.clone(),
+                            value: MoveValueFact {
+                                non_storage: self.borrow_fact(fallback),
+                                headers: self.completed_headers(fallback),
+                            },
+                            advances: fallback_advances,
+                        })
+                    } else {
+                        success
+                    };
+                    self.publish_control_edge(Self::expr_key(expression), moved, edge);
+                    values.push(true);
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    value_snapshot,
+                    completion_snapshot,
+                } => {
+                    let falls_through = values.pop().expect("else-unwrap result");
+                    values.push(self.finish_control_worklist_expression(
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                        falls_through,
+                    ));
+                }
+            }
+        }
+        Some(values.pop().expect("else-unwrap root result"))
+    }
+
+    fn expr_short_circuit_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        if !matches!(
+            root.kind,
+            ExprKind::Binary {
+                op: BinOp::And | BinOp::Or,
+                ..
+            }
+        ) {
+            return None;
+        }
+
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            AfterLhs {
+                rhs: &'e Expr,
+            },
+            AfterRhs {
+                lhs_moved: MovedSet,
+                lhs_borrows: BorrowState,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                value_snapshot: bool,
+                completion_snapshot: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    let operands = match &expression.kind {
+                        ExprKind::Binary {
+                            op: BinOp::And | BinOp::Or,
+                            lhs,
+                            rhs,
+                        } => Some((lhs.as_ref(), rhs.as_ref())),
+                        _ => None,
+                    };
+                    let Some((lhs, rhs)) = operands else {
+                        values.push(self.expr_with_action_mode(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                            false,
+                        ));
+                        continue;
+                    };
+
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
+                    let key = Self::expr_key(expression);
+                    if completion_snapshot {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.begin_value_snapshot_frame();
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                    });
+                    work.push(Work::AfterLhs { rhs });
+                    work.push(Work::Eval(lhs, false, false));
+                }
+                Work::AfterLhs { rhs } => {
+                    if !values.pop().expect("short-circuit lhs result") {
+                        values.push(false);
+                        continue;
+                    }
+                    let lhs_moved = moved.clone();
+                    let lhs_borrows = self.borrows.clone();
+                    self.begin_storage_advance_frame();
+                    work.push(Work::AfterRhs {
+                        lhs_moved,
+                        lhs_borrows,
+                    });
+                    work.push(Work::Eval(rhs, false, false));
+                }
+                Work::AfterRhs {
+                    lhs_moved,
+                    lhs_borrows,
+                } => {
+                    let rhs_falls_through =
+                        values.pop().expect("short-circuit rhs result");
+                    let rhs_advances = self.finish_storage_advance_frame();
+                    if rhs_falls_through {
+                        *moved = &lhs_moved | &*moved;
+                        self.borrows = Self::join_storage_states(
+                            &lhs_borrows,
+                            &StorageGenerationRenames::default(),
+                            &self.borrows,
+                            &rhs_advances,
+                        );
+                        self.propagate_storage_advances(&rhs_advances);
+                    } else {
+                        *moved = lhs_moved;
+                        self.borrows = lhs_borrows;
+                    }
+                    values.push(true);
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    value_snapshot,
+                    completion_snapshot,
+                } => {
+                    let falls_through = values.pop().expect("short-circuit result");
+                    values.push(self.finish_control_worklist_expression(
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                        falls_through,
+                    ));
+                }
+            }
+        }
+        Some(values.pop().expect("short-circuit root result"))
+    }
+
+    /// Evaluate binding-free matches without one native call frame per nesting level. Each arm
+    /// still starts from the common post-scrutinee state and contributes its own storage advances.
+    fn expr_binding_free_match_worklist(
+        &mut self,
+        root: &'a Expr,
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> Option<bool> {
+        let ExprKind::Match { arms, .. } = &root.kind else {
+            return None;
+        };
+        if arms.is_empty()
+            || arms.iter().any(|arm| {
+                !arm.bindings.is_empty() || !arm.borrowed_bindings.is_empty()
+            })
+        {
+            return None;
+        }
+
+        enum Work<'e> {
+            Eval(&'e Expr, bool, bool),
+            AfterScrutinee {
+                expression: &'e Expr,
+                arms: &'e [MatchArm],
+                incoming_borrows: BorrowState,
+                consuming: bool,
+                direct: bool,
+            },
+            Arms {
+                expression: &'e Expr,
+                arms: &'e [MatchArm],
+                index: usize,
+                incoming_borrows: BorrowState,
+                evaluated_moved: MovedSet,
+                evaluated_borrows: BorrowState,
+                joined: Option<Box<MoveControlEdge>>,
+                consuming: bool,
+                direct: bool,
+            },
+            Finish {
+                expression: &'e Expr,
+                key: usize,
+                value_snapshot: bool,
+                completion_snapshot: bool,
+            },
+        }
+
+        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, consuming, direct) => {
+                    let binding_free = match &expression.kind {
+                        ExprKind::Match {
+                            scrutinee, arms, ..
+                        } if !arms.is_empty()
+                            && arms.iter().all(|arm| {
+                                arm.bindings.is_empty()
+                                    && arm.borrowed_bindings.is_empty()
+                            }) => Some((scrutinee.as_ref(), arms.as_slice())),
+                        _ => None,
+                    };
+                    let Some((scrutinee, arms)) = binding_free else {
+                        values.push(self.expr_with_action_mode(
+                            expression,
+                            moved,
+                            consuming,
+                            direct,
+                            false,
+                        ));
+                        continue;
+                    };
+
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
+                    let key = Self::expr_key(expression);
+                    if completion_snapshot {
+                        self.clear_value_snapshot(key);
+                    }
+                    self.begin_value_snapshot_frame();
+                    let incoming_borrows = self.borrows.clone();
+                    work.push(Work::Finish {
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                    });
+                    work.push(Work::AfterScrutinee {
+                        expression,
+                        arms,
+                        incoming_borrows,
+                        consuming,
+                        direct,
+                    });
+                    work.push(Work::Eval(scrutinee, false, false));
+                }
+                Work::AfterScrutinee {
+                    expression,
+                    arms,
+                    incoming_borrows,
+                    consuming,
+                    direct,
+                } => {
+                    if !values.pop().expect("single-match scrutinee result") {
+                        values.push(false);
+                        continue;
+                    }
+                    let evaluated_moved = moved.clone();
+                    let evaluated_borrows = self.borrows.clone();
+                    work.push(Work::Arms {
+                        expression,
+                        arms,
+                        index: 0,
+                        incoming_borrows,
+                        evaluated_moved,
+                        evaluated_borrows,
+                        joined: None,
+                        consuming,
+                        direct,
+                    });
+                }
+                Work::Arms {
+                    expression,
+                    arms,
+                    index,
+                    incoming_borrows,
+                    evaluated_moved,
+                    evaluated_borrows,
+                    mut joined,
+                    consuming,
+                    direct,
+                } => {
+                    if index > 0 {
+                        let body = &arms[index - 1].body;
+                        let falls_through =
+                            values.pop().expect("binding-free match arm result");
+                        let advances = self.finish_storage_advance_frame();
+                        if falls_through {
+                        let value = MoveValueFact {
+                            non_storage: self.borrow_fact(body),
+                            headers: self.completed_headers(body),
+                        };
+                            let edge = MoveControlEdge {
+                                moved: moved.clone(),
+                                borrows: self.borrows.clone(),
+                                value,
+                                advances,
+                            };
+                            joined = Some(Box::new(match joined {
+                                None => edge,
+                                Some(previous) => (*previous).join(edge),
+                            }));
+                        }
+                    }
+                    let Some(arm) = arms.get(index) else {
+                        let Some(edge) = joined else {
+                        self.borrows = incoming_borrows;
+                        self.control_value_facts
+                            .remove(&Self::expr_key(expression));
+                            values.push(false);
+                            continue;
+                        };
+                        self.publish_control_edge(Self::expr_key(expression), moved, *edge);
+                        values.push(true);
+                        continue;
+                    };
+                    *moved = evaluated_moved.clone();
+                    self.borrows = evaluated_borrows.clone();
+                    self.begin_storage_advance_frame();
+                    work.push(Work::Arms {
+                        expression,
+                        arms,
+                        index: index + 1,
+                        incoming_borrows,
+                        evaluated_moved,
+                        evaluated_borrows,
+                        joined,
+                        consuming,
+                        direct,
+                    });
+                    work.push(Work::Eval(&arm.body, consuming, direct));
+                }
+                Work::Finish {
+                    expression,
+                    key,
+                    value_snapshot,
+                    completion_snapshot,
+                } => {
+                    let falls_through = values.pop().expect("binding-free match result");
+                    values.push(self.finish_control_worklist_expression(
+                        expression,
+                        key,
+                        value_snapshot,
+                        completion_snapshot,
+                        falls_through,
+                    ));
+                }
+            }
+        }
+        Some(values.pop().expect("binding-free match root result"))
     }
 
     fn expr_uses_eager_worklist(&self, expression: &Expr) -> bool {
@@ -23337,41 +36073,51 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
+        deferred_action: bool,
     ) -> bool {
         enum Work<'e> {
-            Eval(&'e Expr, bool, bool),
+            Eval(&'e Expr, bool, bool, bool),
             Children {
-                children: Vec<(&'e Expr, bool, bool)>,
+                children: Vec<(&'e Expr, bool, bool, bool)>,
                 index: usize,
                 own_falls_through: bool,
             },
             Finish {
                 expression: &'e Expr,
                 key: usize,
-                may_borrow: bool,
+                value_snapshot: bool,
+                completion_snapshot: bool,
+                deferred_action: bool,
             },
         }
 
-        let mut work = vec![Work::Eval(root, consuming, direct)];
+        let mut work = vec![Work::Eval(
+            root,
+            consuming,
+            direct,
+            deferred_action,
+        )];
         let mut values = Vec::new();
         while let Some(item) = work.pop() {
             match item {
-                Work::Eval(expression, consuming, direct) => {
+                Work::Eval(expression, consuming, direct, deferred_action) => {
                     if !self.expr_uses_eager_worklist(expression) {
-                        values.push(self.expr(
+                        values.push(self.expr_with_action_mode(
                             expression,
                             moved,
                             consuming,
                             direct,
+                            deferred_action,
                         ));
                         continue;
                     }
-                    let may_borrow = self.value_snapshot_needed(expression);
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
                     let key = Self::expr_key(expression);
-                    if may_borrow {
+                    if completion_snapshot {
                         self.clear_value_snapshot(key);
                     }
-                    self.value_snapshot_frames.push(Vec::new());
+                    self.begin_value_snapshot_frame();
                     debug_assert!(!self.collecting_move_children);
                     debug_assert!(self.move_children.is_empty());
                     self.collecting_move_children = true;
@@ -23386,7 +36132,9 @@ impl<'a> MoveCheck<'a> {
                     work.push(Work::Finish {
                         expression,
                         key,
-                        may_borrow,
+                        value_snapshot,
+                        completion_snapshot,
+                        deferred_action,
                     });
                     work.push(Work::Children {
                         children,
@@ -23403,7 +36151,7 @@ impl<'a> MoveCheck<'a> {
                         && !values.pop().expect("Move child result")
                     {
                         values.push(false);
-                    } else if let Some(&(child, consuming, direct)) =
+                    } else if let Some(&(child, consuming, direct, deferred_action)) =
                         children.get(index)
                     {
                         work.push(Work::Children {
@@ -23411,7 +36159,12 @@ impl<'a> MoveCheck<'a> {
                             index: index + 1,
                             own_falls_through,
                         });
-                        work.push(Work::Eval(child, consuming, direct));
+                        work.push(Work::Eval(
+                            child,
+                            consuming,
+                            direct,
+                            deferred_action,
+                        ));
                     } else {
                         values.push(own_falls_through);
                     }
@@ -23419,39 +36172,60 @@ impl<'a> MoveCheck<'a> {
                 Work::Finish {
                     expression,
                     key,
-                    may_borrow,
+                    value_snapshot,
+                    completion_snapshot,
+                    deferred_action,
                 } => {
                     let falls_through =
                         values.pop().expect("Move expression result");
-                    if falls_through {
-                        self.finish_eager_move_action(expression, moved);
-                    }
-                    let child_snapshots = self
-                        .value_snapshot_frames
-                        .pop()
-                        .expect("value snapshot frame for eager expression");
+                    let child_snapshots = self.finish_value_snapshot_frame();
                     if falls_through
                         && !Self::defers_child_snapshot_validation(
                             &expression.kind,
                         )
                     {
-                        for snapshot in child_snapshots {
-                            if !self.intentional_borrow_mut_snapshot(expression, snapshot) {
+                        for &snapshot in &child_snapshots {
+                            if !self.intentional_action_snapshot(expression, snapshot) {
                                 self.validate_value_snapshot(key, snapshot, expression.span);
                             }
                         }
                     }
+                    // Freeze the result before its own ownership action consumes or transfers an
+                    // exact child. A later sibling must still invalidate this completion, but the
+                    // constructor itself is not a later eager operand. Mutable-call completions
+                    // are published after their action from `pending_call_completions`, so this
+                    // pre-action fallback does not erase a callee-installed replacement.
+                    let completion_fact = (falls_through && completion_snapshot).then(|| {
+                        if value_snapshot {
+                            self.borrow_fact(expression)
+                        } else {
+                            BorrowFact::default()
+                        }
+                    });
+                    if falls_through {
+                        self.finish_eager_move_action(
+                            expression,
+                            moved,
+                            deferred_action,
+                        );
+                    }
                     if !falls_through {
                         self.non_fallthrough.insert(expression.span);
-                    } else if may_borrow {
-                        let fact = self.borrow_fact(expression);
-                        self.borrows
-                            .begin_value_source(key, fact.live_roots());
-                        self.walked_value_facts.insert(key, fact);
-                        if let Some(parent) =
-                            self.value_snapshot_frames.last_mut()
-                        {
-                            parent.push(key);
+                    } else if completion_snapshot {
+                        let fact = completion_fact.expect("fallthrough completion fact");
+                        self.record_value_completion(expression, fact);
+                        if value_snapshot {
+                            self.record_parent_value_snapshot(key);
+                        }
+                    }
+                    let ownership_action = Self::kind_has_ownership_action(&expression.kind);
+                    if falls_through && !ownership_action {
+                        self.finish_child_staging_frontier(expression, &child_snapshots);
+                        self.record_parent_value_snapshots(&child_snapshots);
+                    }
+                    if falls_through && ownership_action {
+                        for snapshot in child_snapshots {
+                            self.clear_value_snapshot(snapshot);
                         }
                     }
                     values.push(falls_through);
@@ -23461,13 +36235,343 @@ impl<'a> MoveCheck<'a> {
         values.pop().expect("Move root result")
     }
 
-    fn finish_eager_move_action(&mut self, expression: &Expr, moved: &MovedSet) {
+    fn action_values(expression: &Expr) -> Vec<&Expr> {
+        match &expression.kind {
+            ExprKind::StructLit { fields, .. } => fields.iter().collect(),
+            ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                elems.iter().collect()
+            }
+            ExprKind::OptionSome(value)
+            | ExprKind::ResultOk(value)
+            | ExprKind::ResultErr(value) => vec![value],
+            ExprKind::EnumValue { payload, .. } => payload.iter().collect(),
+            // Closure captures are Copy aliases. They participate in completion/header staging but
+            // never null their source binding.
+            ExprKind::Closure { .. } => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Null only the already-evaluated value selected at an action boundary. This deliberately
+    /// never re-walks statements or nested calls: those ran while forming the completion. Nested
+    /// aggregates are structural and are fused into this action, so descend through their payload
+    /// expressions until stable local/field sources are reached.
+    fn consume_completed_action_value(&mut self, value: &Expr, moved: &mut MovedSet) {
+        if !self.is_move_ty(value.ty) {
+            return;
+        }
+        let mut work = vec![value];
+        while let Some(value) = work.pop() {
+            if !self.is_move_ty(value.ty) {
+                continue;
+            }
+            match &value.kind {
+                ExprKind::StructLit { fields, .. } => work.extend(fields.iter().rev()),
+                ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
+                    work.extend(elems.iter().rev())
+                }
+                ExprKind::OptionSome(inner)
+                | ExprKind::ResultOk(inner)
+                | ExprKind::ResultErr(inner) => work.push(inner),
+                ExprKind::EnumValue { payload, .. } => work.extend(payload.iter().rev()),
+                ExprKind::Block(block)
+                | ExprKind::Arena(block)
+                | ExprKind::NamedArena { block, .. }
+                | ExprKind::TaskGroup(block)
+                | ExprKind::Unsafe(block) => {
+                    if let Some(tail) = block.value.as_deref() {
+                        work.push(tail);
+                    }
+                }
+                ExprKind::If { then, els, .. } => {
+                    if let Some(value) = els.value.as_deref() {
+                        work.push(value);
+                    }
+                    if let Some(value) = then.value.as_deref() {
+                        work.push(value);
+                    }
+                }
+                ExprKind::Match { arms, .. } => {
+                    work.extend(arms.iter().rev().map(|arm| &arm.body));
+                }
+                _ => self.consume_match_result(value, moved, true),
+            }
+        }
+    }
+
+    fn end_completed_owned_headers(&mut self, value: &Expr, how: BorrowEnd) {
+        if !self.is_move_ty(value.ty) {
+            return;
+        }
+        let typed = storage_type_paths(value.ty, self.storage_type_context());
+        if !typed.valid {
+            return;
+        }
+        let headers = self.completed_headers(value);
+        for header in typed.headers {
+            if header.kind == StorageHeaderKind::View {
+                continue;
+            }
+            let Some(leaf) = headers.leaves.get(&header.path) else {
+                continue;
+            };
+            for reference in &leaf.generations {
+                if let Some(entry) = self
+                    .borrows
+                    .storage
+                    .directory
+                    .entries
+                    .get_mut(&reference.generation)
+                {
+                    entry.ended = Some(entry.ended.map_or(how, |ended| ended.min(how)));
+                }
+            }
+        }
+    }
+
+    /// Move individually-owned dynamic leaves into one aggregate temporary. Arena-owned leaves
+    /// retain their arena release; caller-region leaves retain no local release. A later binding
+    /// transfers this staging place to its canonical destination, while a later consuming call
+    /// ends it at that call action.
+    fn stage_completed_aggregate(&mut self, expression: &Expr) {
+        let typed = storage_type_paths(expression.ty, self.storage_type_context());
+        if !typed.valid {
+            return;
+        }
+        let headers = self.forwarded_headers(expression);
+        for (operand, header) in typed.headers.into_iter().enumerate() {
+            if header.kind != StorageHeaderKind::OwnedDynamic {
+                continue;
+            }
+            let Some(leaf) = headers.leaves.get(&header.path) else {
+                continue;
+            };
+            for reference in &leaf.generations {
+                let Some(entry) = self
+                    .borrows
+                    .storage
+                    .directory
+                    .entries
+                    .get_mut(&reference.generation)
+                else {
+                    continue;
+                };
+                let displaced = entry
+                    .releases
+                    .iter()
+                    .filter(|release| {
+                        matches!(
+                            release,
+                            MoveReleasePlace::Local { .. }
+                                | MoveReleasePlace::IterTemp { .. }
+                                | MoveReleasePlace::Staging { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if displaced.is_empty() {
+                    continue;
+                }
+                for release in displaced {
+                    entry.releases.remove(&release);
+                }
+                entry.releases.insert(MoveReleasePlace::Staging {
+                    action: Self::expr_key(expression),
+                    operand: operand as u32,
+                    path: header.path.clone(),
+                });
+            }
+        }
+    }
+
+    fn transfer_completed_value_to_loop_result(&mut self, value: &Expr, loop_expr: usize) {
+        if !self.is_move_ty(value.ty) {
+            return;
+        }
+        let typed = storage_type_paths(value.ty, self.storage_type_context());
+        if !typed.valid {
+            return;
+        }
+        let headers = self.completed_headers(value);
+        let mut transferred = ProjectedHeaderFact::default();
+        for header in typed.headers {
+            let Some(leaf) = headers.leaves.get(&header.path) else {
+                continue;
+            };
+            match header.kind {
+                StorageHeaderKind::OwnedDynamic => {
+                    for reference in &leaf.generations {
+                        let Some(entry) = self
+                            .borrows
+                            .storage
+                            .directory
+                            .entries
+                            .get_mut(&reference.generation)
+                        else {
+                            continue;
+                        };
+                        let displaced = entry
+                            .releases
+                            .iter()
+                            .filter(|release| {
+                                matches!(
+                                    release,
+                                    MoveReleasePlace::Local { .. }
+                                        | MoveReleasePlace::IterTemp { .. }
+                                        | MoveReleasePlace::Staging { .. }
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if displaced.is_empty() {
+                            continue;
+                        }
+                        for release in displaced {
+                            entry.releases.remove(&release);
+                        }
+                        entry.releases.insert(MoveReleasePlace::LoopResult {
+                            loop_expr,
+                            path: header.path.clone(),
+                        });
+                    }
+                    transferred.leaves.insert(header.path, leaf.clone());
+                }
+                StorageHeaderKind::InlineFixed => {
+                    for reference in &leaf.generations {
+                        if let Some(entry) = self
+                            .borrows
+                            .storage
+                            .directory
+                            .entries
+                            .get_mut(&reference.generation)
+                        {
+                            entry.ended = Some(entry.ended.map_or(
+                                BorrowEnd::Consumed,
+                                |ended| ended.min(BorrowEnd::Consumed),
+                            ));
+                        }
+                    }
+                }
+                StorageHeaderKind::View => {}
+            }
+        }
+        if let Some(source) = self.direct_storage_move_source(value) {
+            self.detach_legacy_storage_root(source, &transferred);
+        }
+    }
+
+    fn transfer_completed_value_to_returned(&mut self, value: &Expr) {
+        if !self.is_move_ty(value.ty) {
+            return;
+        }
+        let typed = storage_type_paths(value.ty, self.storage_type_context());
+        if !typed.valid {
+            return;
+        }
+        let headers = self.completed_headers(value);
+        let mut transferred = ProjectedHeaderFact::default();
+        for header in typed.headers {
+            let Some(leaf) = headers.leaves.get(&header.path) else {
+                continue;
+            };
+            match header.kind {
+                StorageHeaderKind::OwnedDynamic => {
+                    for reference in &leaf.generations {
+                        let Some(entry) = self
+                            .borrows
+                            .storage
+                            .directory
+                            .entries
+                            .get_mut(&reference.generation)
+                        else {
+                            continue;
+                        };
+                        let displaced = entry
+                            .releases
+                            .iter()
+                            .filter(|release| {
+                                matches!(
+                                    release,
+                                    MoveReleasePlace::Local { .. }
+                                        | MoveReleasePlace::IterTemp { .. }
+                                        | MoveReleasePlace::Staging { .. }
+                                        | MoveReleasePlace::LoopResult { .. }
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if displaced.is_empty() {
+                            continue;
+                        }
+                        for release in displaced {
+                            entry.releases.remove(&release);
+                        }
+                        entry.releases.insert(MoveReleasePlace::Returned {
+                            path: header.path.clone(),
+                        });
+                    }
+                    transferred.leaves.insert(header.path, leaf.clone());
+                }
+                StorageHeaderKind::InlineFixed => {
+                    for reference in &leaf.generations {
+                        if let Some(entry) = self
+                            .borrows
+                            .storage
+                            .directory
+                            .entries
+                            .get_mut(&reference.generation)
+                        {
+                            entry.ended = Some(entry.ended.map_or(
+                                BorrowEnd::Consumed,
+                                |ended| ended.min(BorrowEnd::Consumed),
+                            ));
+                        }
+                    }
+                }
+                StorageHeaderKind::View => {}
+            }
+        }
+        if let Some(source) = self.direct_storage_move_source(value) {
+            self.detach_legacy_storage_root(source, &transferred);
+        }
+    }
+
+    fn finish_successful_aggregate_action(
+        &mut self,
+        expression: &Expr,
+        moved: &mut MovedSet,
+    ) {
+        for value in Self::action_values(expression) {
+            // A later eager operand may have rebound the source after this value completed. The
+            // snapshot diagnostic has already been emitted before this action; do not now mark the
+            // rebound binding moved or silently retarget the frozen aggregate.
+            if self.ended_value_snapshot(Self::expr_key(value)).is_none() {
+                self.consume_completed_action_value(value, moved);
+            }
+        }
+        self.stage_completed_aggregate(expression);
+    }
+
+    fn finish_eager_move_action(
+        &mut self,
+        expression: &Expr,
+        moved: &mut MovedSet,
+        deferred_action: bool,
+    ) {
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
-                self.apply_direct_borrow_mut_call_effects(func, args, moved);
                 self.add_direct_parallel_transfer(func, args);
+                self.apply_direct_mutable_call_effects(expression, func, args, moved);
+                let modes = self.named_param_modes.get(func).cloned();
+                self.finish_successful_call_arguments(
+                    args,
+                    modes.as_deref(),
+                    func == "print",
+                    moved,
+                );
             }
             ExprKind::CallFnValue { callee, args } => {
+                self.add_indirect_parallel_transfer(callee, args);
                 let modes = match callee.ty {
                     Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
                         function
@@ -23479,15 +36583,72 @@ impl<'a> MoveCheck<'a> {
                     _ => None,
                 };
                 if let Some(modes) = modes {
-                    self.apply_borrow_mut_call_effects(args, &modes, None, moved);
+                    self.apply_mutable_call_effects(expression, args, &modes, None, moved);
                 }
-                self.add_indirect_parallel_transfer(callee, args);
+                let modes = match callee.ty {
+                    Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                        function
+                            .params
+                            .iter()
+                            .map(|(mode, _)| *mode)
+                            .collect::<Vec<_>>()
+                    }),
+                    _ => None,
+                };
+                self.finish_successful_call_arguments(args, modes.as_deref(), false, moved);
+            }
+            ExprKind::RawCall {
+                args, param_modes, ..
+            } => self.finish_successful_call_arguments(
+                args,
+                Some(param_modes),
+                false,
+                moved,
+            ),
+            ExprKind::StructLit { .. }
+            | ExprKind::Tuple { .. }
+            | ExprKind::ArrayLit { .. }
+            | ExprKind::OptionSome(_)
+            | ExprKind::ResultOk(_)
+            | ExprKind::ResultErr(_)
+            | ExprKind::EnumValue { .. }
+            | ExprKind::Closure { .. }
+                if !deferred_action =>
+            {
+                self.finish_successful_aggregate_action(expression, moved);
             }
             ExprKind::Spawn { closure, .. } => {
                 self.parallel_transfer_roots
                     .extend(self.borrow_sources(closure));
             }
             ExprKind::ResultMapErr { result, f } => {
+                let active = self.active_sum_paths(result);
+                if active
+                    .as_ref()
+                    .is_none_or(|active| active.contains(&BorrowProjection::ResultErr))
+                {
+                    let error_headers = self
+                        .completed_headers(result)
+                        .project_path(&[BorrowProjection::ResultErr]);
+                    for reference in error_headers
+                        .leaves
+                        .values()
+                        .flat_map(|leaf| leaf.generations.iter())
+                    {
+                        if let Some(entry) = self
+                            .borrows
+                            .storage
+                            .directory
+                            .entries
+                            .get_mut(&reference.generation)
+                        {
+                            entry.ended = Some(entry.ended.map_or(
+                                BorrowEnd::Consumed,
+                                |ended| ended.min(BorrowEnd::Consumed),
+                            ));
+                        }
+                    }
+                }
                 let result_fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
                 let error_ty = match expand_tagged_ty(result.ty, self.tagged_types) {
                     Ty::Result(_, error) => scalar_to_ty(error),
@@ -23502,14 +36663,138 @@ impl<'a> MoveCheck<'a> {
                     .flatten();
                 self.parallel_transfer_roots.extend(roots);
             }
-            ExprKind::ReaderReadLine { buffer, .. } => {
-                self.invalidate_storage(buffer);
-            }
-            ExprKind::BufferPut { buffer, .. }
-            | ExprKind::BufferAppend { buffer, .. } => {
-                self.invalidate_storage(buffer);
-            }
             _ => {}
+        }
+        self.apply_builtin_mutation_action(expression);
+    }
+
+    fn finish_successful_call_arguments(
+        &mut self,
+        args: &[Expr],
+        modes: Option<&[ast::ParamMode]>,
+        print_borrows: bool,
+        moved: &mut MovedSet,
+    ) {
+        for (index, argument) in args.iter().enumerate() {
+            let mode = modes
+                .and_then(|modes| modes.get(index))
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            if print_borrows
+                || matches!(
+                    mode,
+                    ast::ParamMode::Borrow
+                        | ast::ParamMode::BorrowMut
+                        | ast::ParamMode::Out
+                )
+            {
+                continue;
+            }
+            if self
+                .ended_value_snapshot(Self::expr_key(argument))
+                .is_some()
+            {
+                continue;
+            }
+            self.consume_completed_action_value(argument, moved);
+            self.end_completed_owned_headers(argument, BorrowEnd::Consumed);
+        }
+    }
+
+    fn source_visible_mutation_action(
+        kind: &ExprKind,
+    ) -> Option<SourceVisibleMutationAction<'_>> {
+        match kind {
+            ExprKind::ReaderRead { buffer, .. }
+            | ExprKind::ReaderReadLine { buffer, .. }
+            | ExprKind::FilePread { buffer, .. }
+            | ExprKind::UdpRecvFrom { buffer, .. }
+            | ExprKind::CryptoRandom { out: buffer }
+            | ExprKind::BufferPut { buffer, .. }
+            | ExprKind::BufferAppend { buffer, .. } => {
+                Some(SourceVisibleMutationAction::Storage(buffer))
+            }
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                Some(SourceVisibleMutationAction::Builder {
+                    builder,
+                    retained: value,
+                })
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                Some(SourceVisibleMutationAction::Builder {
+                    builder,
+                    retained: data,
+                })
+            }
+            ExprKind::RandNext { rng }
+            | ExprKind::RandRange { rng, .. }
+            | ExprKind::RandSample { rng, .. } => {
+                Some(SourceVisibleMutationAction::Source(rng))
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                Some(SourceVisibleMutationAction::Shuffle {
+                    source: rng,
+                    collection: xs,
+                })
+            }
+            ExprKind::VecStore { dst, .. } | ExprKind::ArrayMapInto { dst, .. } => {
+                Some(SourceVisibleMutationAction::Collection(dst))
+            }
+            _ => None,
+        }
+    }
+
+    fn kind_has_source_visible_mutation(kind: &ExprKind) -> bool {
+        Self::source_visible_mutation_action(kind).is_some()
+    }
+
+    /// Expressions whose operands are transferred only by the expression's successful runtime
+    /// action. Keep even one-child instances off the transparent-spine fast path so the eager
+    /// worklist has one explicit Finish boundary at which it can commit or discard that transfer.
+    fn kind_has_ownership_action(kind: &ExprKind) -> bool {
+        matches!(
+            kind,
+            ExprKind::Call { .. }
+                | ExprKind::CallFnValue { .. }
+                | ExprKind::RawCall { .. }
+                | ExprKind::StructLit { .. }
+                | ExprKind::Tuple { .. }
+                | ExprKind::ArrayLit { .. }
+                | ExprKind::OptionSome(_)
+                | ExprKind::ResultOk(_)
+                | ExprKind::ResultErr(_)
+                | ExprKind::EnumValue { .. }
+                | ExprKind::Closure { .. }
+        )
+    }
+
+    /// Apply the source-binding mutations emitted by built-ins after all eager operands complete.
+    /// Opaque handle interiors are deliberately absent: only operations that replace a visible
+    /// source place or write a caller-visible collection backing end a place reservation.
+    fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        let Some(action) = Self::source_visible_mutation_action(&expression.kind) else {
+            return;
+        };
+        match action {
+            SourceVisibleMutationAction::Storage(destination) => {
+                self.invalidate_storage(destination);
+            }
+            SourceVisibleMutationAction::Builder { builder, retained } => {
+                self.invalidate_builder_storage(builder);
+                if let ExprKind::Local(local) = builder.kind {
+                    self.join_local_borrow_fallback(local, retained);
+                }
+            }
+            SourceVisibleMutationAction::Source(destination) => {
+                self.invalidate_source_mutation_target(destination);
+            }
+            SourceVisibleMutationAction::Shuffle { source, collection } => {
+                self.invalidate_source_mutation_target(source);
+                self.invalidate_collection_mutation_target(collection);
+            }
+            SourceVisibleMutationAction::Collection(destination) => {
+                self.invalidate_collection_mutation_target(destination);
+            }
         }
     }
 
@@ -23522,7 +36807,32 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
+        deferred_action: bool,
     ) -> Option<bool> {
+        // A deferred operand may contain arbitrary statements before its selected result. The
+        // ordinary recursive block/control walker keeps those statement actions immediate while
+        // evaluating only the result position non-consuming; peeling a largest child here could
+        // incorrectly defer a statement-local Move along with the parent operand root.
+        if deferred_action {
+            return None;
+        }
+        // Control alternatives own transient storage-advance frames. Keep them on the recursive
+        // control path so each arm's frame begins at the common post-condition baseline and is
+        // joined exactly once; the transparent-spine size heuristic may otherwise start in an arm
+        // before that baseline has been captured.
+        if Self::kind_has_ownership_action(&root.kind)
+            || matches!(
+            root.kind,
+            ExprKind::If { .. }
+                | ExprKind::Match { .. }
+                | ExprKind::ElseUnwrap { .. }
+                | ExprKind::Binary {
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                }
+        ) {
+            return None;
+        }
         enum Post<'e> {
             None,
             Try(BorrowRoots),
@@ -23536,47 +36846,7 @@ impl<'a> MoveCheck<'a> {
             DirectCall {
                 function: &'e str,
                 args: &'e [Expr],
-                borrow_mut: bool,
-            },
-            IfAfterCondition {
-                then: &'e Block,
-                els: &'e Block,
-                consuming: bool,
-            },
-            IfAfterThen {
-                condition: &'e Expr,
-                then: &'e Block,
-                els: &'e Block,
-                consuming: bool,
-                incoming: Option<(MovedSet, BorrowState)>,
-            },
-            IfAfterElse {
-                condition: &'e Expr,
-                then: &'e Block,
-                els: &'e Block,
-                consuming: bool,
-                incoming: Option<(MovedSet, BorrowState)>,
-                then_result:
-                    Box<Option<(bool, MovedSet, BorrowState, BorrowFact)>>,
-            },
-            MatchAfterScrutinee {
-                scrutinee: &'e Expr,
-                arms: &'e [MatchArm],
-                consuming: bool,
-                direct: bool,
-                incoming_borrows: BorrowState,
-                consuming_control: bool,
-            },
-            MatchAfterArm {
-                scrutinee: &'e Expr,
-                arms: &'e [MatchArm],
-                selected: usize,
-                consuming: bool,
-                direct: bool,
-                incoming_borrows: BorrowState,
-                consuming_control: bool,
-                prepared: Option<Box<MoveMatchPrepared>>,
-                join: Box<MoveMatchJoin>,
+                mutable: bool,
             },
             BlockLet {
                 local: LocalId,
@@ -23603,6 +36873,9 @@ impl<'a> MoveCheck<'a> {
                 value: &'e Expr,
                 self_assign: bool,
             },
+            BlockAssignVecLane {
+                local: LocalId,
+            },
             BlockPairAfterIndex {
                 base: LocalId,
                 value: &'e Expr,
@@ -23626,17 +36899,6 @@ impl<'a> MoveCheck<'a> {
                 tail_direct: bool,
                 prefix_complete: bool,
             },
-            OptionalAfterFirst {
-                second: &'e Expr,
-                consuming: bool,
-                direct: bool,
-            },
-            OptionalAfterSecond {
-                first: &'e Expr,
-                first_consuming: bool,
-                first_direct: bool,
-                incoming: Option<(MovedSet, BorrowState)>,
-            },
         }
 
         let mut wrappers = Vec::new();
@@ -23645,6 +36907,23 @@ impl<'a> MoveCheck<'a> {
         let mut current_direct = direct;
         let mut prefix_falls_through = None;
         loop {
+            // A transparent constructor or block may expose a control node after the root guard
+            // above. Stop peeling at every such node, not only when it was the original root, so
+            // the recursive control walker owns the branch advance frames for `Some(if ...)`,
+            // wrapped matches/else-unwrapping, and nested short-circuit expressions too.
+            if Self::kind_has_ownership_action(&current.kind)
+                || matches!(
+                current.kind,
+                ExprKind::If { .. }
+                    | ExprKind::Match { .. }
+                    | ExprKind::ElseUnwrap { .. }
+                    | ExprKind::Binary {
+                        op: BinOp::And | BinOp::Or,
+                        ..
+                    }
+            ) {
+                break;
+            }
             let (child, opens_arena, child_consuming, child_direct, post) =
                 if let Some((source, child, snapshots_source)) =
                     self.transparent_pipeline_child(current)
@@ -23941,7 +37220,7 @@ impl<'a> MoveCheck<'a> {
                                 [Stmt::AssignVecLane { .. }]
                             ) =>
                     {
-                        let [Stmt::AssignVecLane { value, .. }] =
+                        let [Stmt::AssignVecLane { local, value, .. }] =
                             block.stmts.as_slice()
                         else {
                             unreachable!("single vector lane assign guard")
@@ -23954,7 +37233,7 @@ impl<'a> MoveCheck<'a> {
                             ),
                             false,
                             false,
-                            Post::None,
+                            Post::BlockAssignVecLane { local: *local },
                         )
                     }
                     ExprKind::Block(block)
@@ -24167,195 +37446,6 @@ impl<'a> MoveCheck<'a> {
                         };
                         (child, true, false, false, Post::None)
                     }
-                    ExprKind::Match { scrutinee, arms, .. }
-                        if !arms.is_empty() =>
-                    {
-                        let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
-                        let consuming_control = has_move_binding
-                            && match_scrutinee_materializes_result(
-                                scrutinee,
-                            );
-                        let scrutinee_size =
-                            hir_depth::expr_postorder(scrutinee).len();
-                        let (selected, selected_size) = arms
-                            .iter()
-                            .enumerate()
-                            .map(|(index, arm)| {
-                                (
-                                    index,
-                                    hir_depth::expr_postorder(&arm.body)
-                                        .len(),
-                                )
-                            })
-                            .max_by_key(|&(_, size)| size)
-                            .expect("non-empty match arms");
-                        let incoming_borrows = self.borrows.clone();
-                        if scrutinee_size >= selected_size {
-                            (
-                                scrutinee.as_ref(),
-                                false,
-                                consuming_control,
-                                consuming_control,
-                                Post::MatchAfterScrutinee {
-                                    scrutinee,
-                                    arms,
-                                    consuming: current_consuming,
-                                    direct: current_direct,
-                                    incoming_borrows,
-                                    consuming_control,
-                                },
-                            )
-                        } else {
-                            (
-                                &arms[selected].body,
-                                false,
-                                current_consuming,
-                                current_direct,
-                                Post::MatchAfterArm {
-                                    scrutinee,
-                                    arms,
-                                    selected,
-                                    consuming: current_consuming,
-                                    direct: current_direct,
-                                    incoming_borrows,
-                                    consuming_control,
-                                    prepared: None,
-                                    join: Box::default(),
-                                },
-                            )
-                        }
-                    }
-                    ExprKind::Binary {
-                        op: BinOp::And | BinOp::Or,
-                        lhs,
-                        rhs,
-                    } =>
-                    {
-                        if hir_depth::expr_postorder(lhs).len()
-                            >= hir_depth::expr_postorder(rhs).len()
-                        {
-                            (
-                                lhs.as_ref(),
-                                false,
-                                false,
-                                false,
-                                Post::OptionalAfterFirst {
-                                    second: rhs,
-                                    consuming: false,
-                                    direct: false,
-                                },
-                            )
-                        } else {
-                            (
-                                rhs.as_ref(),
-                                false,
-                                false,
-                                false,
-                                Post::OptionalAfterSecond {
-                                    first: lhs,
-                                    first_consuming: false,
-                                    first_direct: false,
-                                    incoming: None,
-                                },
-                            )
-                        }
-                    }
-                    ExprKind::ElseUnwrap { opt, fallback } =>
-                    {
-                        if hir_depth::expr_postorder(opt).len()
-                            >= hir_depth::expr_postorder(fallback).len()
-                        {
-                            (
-                                opt.as_ref(),
-                                false,
-                                true,
-                                true,
-                                Post::OptionalAfterFirst {
-                                    second: fallback,
-                                    consuming: current_consuming,
-                                    direct: false,
-                                },
-                            )
-                        } else {
-                            (
-                                fallback.as_ref(),
-                                false,
-                                current_consuming,
-                                false,
-                                Post::OptionalAfterSecond {
-                                    first: opt,
-                                    first_consuming: true,
-                                    first_direct: true,
-                                    incoming: None,
-                                },
-                            )
-                        }
-                    }
-                    ExprKind::If { cond, then, els }
-                        if then.stmts.is_empty()
-                            && els.stmts.is_empty()
-                            && then.value.is_some()
-                            && els.value.is_some() =>
-                    {
-                        let then_value = then
-                            .value
-                            .as_deref()
-                            .expect("guarded then value");
-                        let else_value = els
-                            .value
-                            .as_deref()
-                            .expect("guarded else value");
-                        let condition_size =
-                            hir_depth::expr_postorder(cond).len();
-                        let then_size =
-                            hir_depth::expr_postorder(then_value).len();
-                        let else_size =
-                            hir_depth::expr_postorder(else_value).len();
-                        if condition_size >= then_size
-                            && condition_size >= else_size
-                        {
-                            (
-                                cond.as_ref(),
-                                false,
-                                false,
-                                false,
-                                Post::IfAfterCondition {
-                                    then,
-                                    els,
-                                    consuming: current_consuming,
-                                },
-                            )
-                        } else if then_size >= else_size {
-                            (
-                                then_value,
-                                false,
-                                current_consuming,
-                                false,
-                                Post::IfAfterThen {
-                                    condition: cond,
-                                    then,
-                                    els,
-                                    consuming: current_consuming,
-                                    incoming: None,
-                                },
-                            )
-                        } else {
-                            (
-                                else_value,
-                                false,
-                                current_consuming,
-                                false,
-                                Post::IfAfterElse {
-                                    condition: cond,
-                                    then,
-                                    els,
-                                    consuming: current_consuming,
-                                    incoming: None,
-                                    then_result: Box::default(),
-                                },
-                            )
-                        }
-                    }
                     ExprKind::Loop {
                         body,
                         body_locals,
@@ -24473,11 +37563,24 @@ impl<'a> MoveCheck<'a> {
                             self.check_call_borrow_aliases(func, args, &modes);
                         }
                         let consumes = func != "print"
-                            && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut);
+                            && !matches!(
+                                mode,
+                                ast::ParamMode::Borrow
+                                    | ast::ParamMode::BorrowMut
+                                    | ast::ParamMode::Out
+                            );
+                        let mutable = self.named_param_modes.get(func).is_some_and(|modes| {
+                            modes.iter().any(|mode| {
+                                matches!(
+                                    mode,
+                                    ast::ParamMode::BorrowMut | ast::ParamMode::Out
+                                )
+                            })
+                        });
                         let post = Post::DirectCall {
                             function: func,
                             args,
-                            borrow_mut: mode == ast::ParamMode::BorrowMut,
+                            mutable,
                         };
                         (&args[0], false, consumes, consumes, post)
                     }
@@ -24532,19 +37635,12 @@ impl<'a> MoveCheck<'a> {
                     _ => break,
                     }
                 };
-            let may_borrow = ty_may_borrow(
-                current.ty,
-                self.structs,
-                self.tuples,
-                self.enums,
-                self.tagged_types,
-            );
-            if may_borrow {
+            if self.completion_snapshot_needed(current) {
                 self.clear_value_snapshot(Self::expr_key(current));
             }
-            self.value_snapshot_frames.push(Vec::new());
+            self.begin_value_snapshot_frame();
             if opens_arena {
-                self.arena_depth += 1;
+                self.begin_arena_scope(current);
             };
             wrappers.push((current, opens_arena, post));
             if let Some((_, _, post)) = wrappers.last_mut() {
@@ -24565,82 +37661,6 @@ impl<'a> MoveCheck<'a> {
                                 ),
                             );
                         }
-                    }
-                    Post::OptionalAfterSecond {
-                        first,
-                        first_consuming,
-                        first_direct,
-                        incoming,
-                    } => {
-                        if !self.expr(
-                            first,
-                            moved,
-                            *first_consuming,
-                            *first_direct,
-                        ) {
-                            prefix_falls_through = Some(false);
-                            break;
-                        }
-                        *incoming = Some((
-                            moved.clone(),
-                            self.borrows.clone(),
-                        ));
-                    }
-                    Post::MatchAfterArm {
-                        scrutinee,
-                        arms,
-                        selected,
-                        consuming,
-                        direct,
-                        incoming_borrows,
-                        consuming_control,
-                        prepared,
-                        join,
-                    } => {
-                        if !self.expr(
-                            scrutinee,
-                            moved,
-                            *consuming_control,
-                            *consuming_control,
-                        ) {
-                            prefix_falls_through = Some(false);
-                            break;
-                        }
-                        let match_state =
-                            self.prepare_match_after_scrutinee(
-                                scrutinee,
-                                arms,
-                                moved,
-                                incoming_borrows.clone(),
-                                *consuming_control,
-                            );
-                        for arm in &arms[..*selected] {
-                            self.begin_match_arm(
-                                &match_state,
-                                arm,
-                                moved,
-                            );
-                            let arm_falls = self.expr(
-                                &arm.body,
-                                moved,
-                                *consuming,
-                                *direct,
-                            );
-                            if arm_falls {
-                                let arm_borrows = self.borrows.clone();
-                                self.join_match_arm(
-                                    join,
-                                    moved,
-                                    &arm_borrows,
-                                );
-                            }
-                        }
-                        self.begin_match_arm(
-                            &match_state,
-                            &arms[*selected],
-                            moved,
-                        );
-                        *prepared = Some(Box::new(match_state));
                     }
                     Post::BlockPairAfterValue {
                         index,
@@ -24671,65 +37691,16 @@ impl<'a> MoveCheck<'a> {
                                 prefix_falls_through = Some(false);
                                 break;
                             }
+                            self.end_expression_staging_releases(
+                                expression,
+                                BorrowEnd::Dropped,
+                            );
+                            self.clear_expression_value_snapshots(expression);
                         }
                         if prefix_falls_through.is_some() {
                             break;
                         }
                         *prefix_complete = true;
-                    }
-                    Post::IfAfterThen {
-                        condition,
-                        incoming,
-                        ..
-                    } => {
-                        if !self.expr(condition, moved, false, false) {
-                            prefix_falls_through = Some(false);
-                            break;
-                        }
-                        *incoming = Some((
-                            moved.clone(),
-                            self.borrows.clone(),
-                        ));
-                    }
-                    Post::IfAfterElse {
-                        condition,
-                        then,
-                        consuming,
-                        incoming,
-                        then_result,
-                        ..
-                    } => {
-                        if !self.expr(condition, moved, false, false) {
-                            prefix_falls_through = Some(false);
-                            break;
-                        }
-                        let incoming_moved = moved.clone();
-                        let incoming_borrows = self.borrows.clone();
-                        let mut then_moved = incoming_moved.clone();
-                        self.borrows = incoming_borrows.clone();
-                        let then_falls = self.block(
-                            then,
-                            &mut then_moved,
-                            *consuming,
-                            false,
-                        );
-                        let then_fact = if then_falls {
-                            self.block_value_fact(then)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        **then_result = Some((
-                            then_falls,
-                            then_moved,
-                            self.borrows.clone(),
-                            then_fact,
-                        ));
-                        *incoming = Some((
-                            incoming_moved.clone(),
-                            incoming_borrows.clone(),
-                        ));
-                        *moved = incoming_moved;
-                        self.borrows = incoming_borrows;
                     }
                     _ => {}
                 }
@@ -24743,11 +37714,12 @@ impl<'a> MoveCheck<'a> {
         }
 
         let mut falls_through = prefix_falls_through.unwrap_or_else(|| {
-            self.expr(
+            self.expr_with_action_mode(
                 current,
                 moved,
                 current_consuming,
                 current_direct,
+                deferred_action,
             )
         });
         for (wrapper, opens_arena, post) in
@@ -24755,54 +37727,6 @@ impl<'a> MoveCheck<'a> {
         {
             let key = Self::expr_key(wrapper);
             let try_result = match post {
-                Post::OptionalAfterFirst {
-                    second,
-                    consuming,
-                    direct,
-                } => {
-                    if falls_through {
-                        let incoming_moved = moved.clone();
-                        let incoming_borrows = self.borrows.clone();
-                        let mut second_moved = incoming_moved.clone();
-                        self.borrows = incoming_borrows.clone();
-                        let second_falls = self.expr(
-                            second,
-                            &mut second_moved,
-                            consuming,
-                            direct,
-                        );
-                        if second_falls {
-                            *moved = &incoming_moved | &second_moved;
-                            self.borrows = BorrowState::join(
-                                &incoming_borrows,
-                                &self.borrows,
-                            );
-                        } else {
-                            *moved = incoming_moved;
-                            self.borrows = incoming_borrows;
-                        }
-                        falls_through = true;
-                    }
-                    None
-                }
-                Post::OptionalAfterSecond { incoming, .. } => {
-                    if let Some((incoming_moved, incoming_borrows)) =
-                        incoming
-                    {
-                        if falls_through {
-                            *moved = &incoming_moved | &*moved;
-                            self.borrows = BorrowState::join(
-                                &incoming_borrows,
-                                &self.borrows,
-                            );
-                        } else {
-                            *moved = incoming_moved;
-                            self.borrows = incoming_borrows;
-                        }
-                        falls_through = true;
-                    }
-                    None
-                }
                 Post::Try(error_roots) => {
                     if falls_through {
                         self.collect_borrow_mut_exit_roots();
@@ -24812,7 +37736,7 @@ impl<'a> MoveCheck<'a> {
                 Post::LoopBreak(value) => {
                     if falls_through {
                         let fact = value.map_or_else(
-                            BorrowFact::default,
+                            MoveValueFact::default,
                             |value| {
                                 let key = Self::expr_key(value);
                                 self.validate_value_snapshot(
@@ -24820,21 +37744,28 @@ impl<'a> MoveCheck<'a> {
                                     key,
                                     value.span,
                                 );
-                                self.borrow_fact(value)
+                                self.transfer_completed_value_to_loop_result(
+                                    value,
+                                    Self::expr_key(wrapper),
+                                );
+                                MoveValueFact {
+                                    non_storage: self.borrow_fact(value),
+                                    headers: self.completed_headers(value),
+                                }
                             },
                         );
-                        if fact.is_empty() {
-                            self.loop_value_facts.remove(&wrapper.span);
+                        if fact.non_storage.is_empty() && fact.headers.leaves.is_empty() {
+                            self.loop_value_facts.remove(&key);
                         } else {
-                            self.loop_value_facts.insert(wrapper.span, fact);
+                            self.loop_value_facts.insert(key, fact);
                         }
                     } else {
-                        self.loop_value_facts.remove(&wrapper.span);
+                        self.loop_value_facts.remove(&key);
                     }
                     None
                 }
                 Post::LoopDiverge => {
-                    self.loop_value_facts.remove(&wrapper.span);
+                    self.loop_value_facts.remove(&key);
                     None
                 }
                 Post::Pipeline { source, snapshot, .. } => {
@@ -24854,258 +37785,40 @@ impl<'a> MoveCheck<'a> {
                             self.parallel_transfer_roots.extend(self.borrow_sources(capture));
                         }
                     }
+                    if falls_through && matches!(wrapper.kind, ExprKind::ArrayMapInto { .. }) {
+                        self.apply_builtin_mutation_action(wrapper);
+                    }
                     None
                 }
-                Post::DirectCall { function, args, borrow_mut } => {
+                Post::DirectCall { function, args, mutable } => {
                     if falls_through {
-                        if borrow_mut {
-                            self.apply_direct_borrow_mut_call_effects(function, args, moved);
-                        }
                         self.add_direct_parallel_transfer(function, args);
-                    }
-                    None
-                }
-                Post::MatchAfterScrutinee {
-                    scrutinee,
-                    arms,
-                    consuming,
-                    direct,
-                    incoming_borrows,
-                    consuming_control,
-                } => {
-                    if falls_through {
-                        let prepared =
-                            self.prepare_match_after_scrutinee(
-                                scrutinee,
-                                arms,
+                        if mutable {
+                            self.apply_direct_mutable_call_effects(
+                                wrapper,
+                                function,
+                                args,
                                 moved,
-                                incoming_borrows,
-                                consuming_control,
-                            );
-                        let mut join = MoveMatchJoin::default();
-                        for arm in arms {
-                            self.begin_match_arm(
-                                &prepared,
-                                arm,
-                                moved,
-                            );
-                            let arm_falls = self.expr(
-                                &arm.body,
-                                moved,
-                                consuming,
-                                direct,
-                            );
-                            if arm_falls {
-                                let arm_borrows = self.borrows.clone();
-                                self.join_match_arm(
-                                    &mut join,
-                                    moved,
-                                    &arm_borrows,
-                                );
-                            }
-                        }
-                        falls_through = self.finish_match_join(
-                            &prepared,
-                            join,
-                            moved,
-                        );
-                    }
-                    None
-                }
-                Post::MatchAfterArm {
-                    arms,
-                    selected,
-                    consuming,
-                    direct,
-                    prepared,
-                    mut join,
-                    ..
-                } => {
-                    if let Some(prepared) = prepared {
-                        if falls_through {
-                            let arm_borrows = self.borrows.clone();
-                            self.join_match_arm(
-                                &mut join,
-                                moved,
-                                &arm_borrows,
                             );
                         }
-                        for arm in &arms[selected + 1..] {
-                            self.begin_match_arm(
-                                &prepared,
-                                arm,
-                                moved,
-                            );
-                            let arm_falls = self.expr(
-                                &arm.body,
-                                moved,
-                                consuming,
-                                direct,
-                            );
-                            if arm_falls {
-                                let arm_borrows = self.borrows.clone();
-                                self.join_match_arm(
-                                    &mut join,
-                                    moved,
-                                    &arm_borrows,
-                                );
-                            }
-                        }
-                        falls_through = self.finish_match_join(
-                            &prepared,
-                            *join,
+                        let modes = self.named_param_modes.get(function).cloned();
+                        self.finish_successful_call_arguments(
+                            args,
+                            modes.as_deref(),
+                            function == "print",
                             moved,
-                        );
-                    }
-                    None
-                }
-                Post::IfAfterCondition {
-                    then,
-                    els,
-                    consuming,
-                } => {
-                    if falls_through {
-                        let incoming_moved = moved.clone();
-                        let incoming_borrows = self.borrows.clone();
-                        let mut then_moved = incoming_moved.clone();
-                        self.borrows = incoming_borrows.clone();
-                        let then_falls = self.block(
-                            then,
-                            &mut then_moved,
-                            consuming,
-                            false,
-                        );
-                        let then_fact = if then_falls {
-                            self.block_value_fact(then)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        let then_borrows = self.borrows.clone();
-                        let mut else_moved = incoming_moved.clone();
-                        self.borrows = incoming_borrows.clone();
-                        let else_falls = self.block(
-                            els,
-                            &mut else_moved,
-                            consuming,
-                            false,
-                        );
-                        let else_fact = if else_falls {
-                            self.block_value_fact(els)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        let else_borrows = self.borrows.clone();
-                        falls_through = self.finish_if_move_join(
-                            wrapper.span,
-                            moved,
-                            incoming_moved,
-                            incoming_borrows,
-                            then_falls,
-                            then_moved,
-                            then_borrows,
-                            then_fact,
-                            else_falls,
-                            else_moved,
-                            else_borrows,
-                            else_fact,
-                        );
-                    }
-                    None
-                }
-                Post::IfAfterThen {
-                    then,
-                    els,
-                    consuming,
-                    incoming,
-                    ..
-                } => {
-                    if let Some((incoming_moved, incoming_borrows)) =
-                        incoming
-                    {
-                        let then_falls = falls_through;
-                        let then_moved = moved.clone();
-                        let then_borrows = self.borrows.clone();
-                        let then_fact = if then_falls {
-                            self.block_value_fact(then)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        let mut else_moved = incoming_moved.clone();
-                        self.borrows = incoming_borrows.clone();
-                        let else_falls = self.block(
-                            els,
-                            &mut else_moved,
-                            consuming,
-                            false,
-                        );
-                        let else_fact = if else_falls {
-                            self.block_value_fact(els)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        let else_borrows = self.borrows.clone();
-                        falls_through = self.finish_if_move_join(
-                            wrapper.span,
-                            moved,
-                            incoming_moved,
-                            incoming_borrows,
-                            then_falls,
-                            then_moved,
-                            then_borrows,
-                            then_fact,
-                            else_falls,
-                            else_moved,
-                            else_borrows,
-                            else_fact,
-                        );
-                    }
-                    None
-                }
-                Post::IfAfterElse {
-                    els,
-                    incoming,
-                    then_result,
-                    ..
-                } => {
-                    if let (
-                        Some((incoming_moved, incoming_borrows)),
-                        Some((
-                            then_falls,
-                            then_moved,
-                            then_borrows,
-                            then_fact,
-                        )),
-                    ) = (incoming, *then_result)
-                    {
-                        let else_falls = falls_through;
-                        let else_moved = moved.clone();
-                        let else_borrows = self.borrows.clone();
-                        let else_fact = if else_falls {
-                            self.block_value_fact(els)
-                        } else {
-                            BorrowFact::default()
-                        };
-                        falls_through = self.finish_if_move_join(
-                            wrapper.span,
-                            moved,
-                            incoming_moved,
-                            incoming_borrows,
-                            then_falls,
-                            then_moved,
-                            then_borrows,
-                            then_fact,
-                            else_falls,
-                            else_moved,
-                            else_borrows,
-                            else_fact,
                         );
                     }
                     None
                 }
                 Post::BlockLet { local, init } => {
                     if falls_through {
+                        self.install_storage(local, init, false);
                         self.assign_borrow(local, init);
+                        self.assign_active_sum(local, init);
+                        self.assign_mutable_backing(local, init);
                         clear_moved(moved, local);
+                        self.clear_value_snapshot(Self::expr_key(init));
                     }
                     None
                 }
@@ -25121,12 +37834,22 @@ impl<'a> MoveCheck<'a> {
                         drop_old.set(
                             self.is_move(local) && !consumed_by_rhs,
                         );
-                        if self.local_owns_view_storage(local) {
+                        if !matches!(value.kind, ExprKind::Local(source) if source == local) {
+                            self.mark_borrow_mut_modified(local);
+                            self.invalidate_mutable_place(local, &[]);
+                        }
+                        if self.local_owns_view_storage(local)
+                            && !matches!(value.kind, ExprKind::Local(source) if source == local)
+                        {
                             self.reject_live_resource_dependents(local, moved, wrapper.span);
                             self.invalidate_owner(local);
                         }
+                        self.install_storage(local, value, true);
                         self.assign_borrow(local, value);
+                        self.assign_active_sum(local, value);
+                        self.assign_mutable_backing(local, value);
                         clear_moved(moved, local);
+                        self.clear_value_snapshot(Self::expr_key(value));
                     }
                     None
                 }
@@ -25138,6 +37861,8 @@ impl<'a> MoveCheck<'a> {
                             value_key,
                             value.span,
                         );
+                        self.transfer_completed_value_to_returned(value);
+                        self.end_active_staging_releases(false, BorrowEnd::Dropped);
                         self.return_roots
                             .extend(self.borrow_sources(value));
                         self.collect_borrow_mut_exit_roots();
@@ -25147,32 +37872,8 @@ impl<'a> MoveCheck<'a> {
                 }
                 Post::BlockLetTuple { locals, init } => {
                     if falls_through {
-                        let fact = self.borrow_fact(init);
-                        for (index, local) in
-                            locals.iter().enumerate()
-                        {
-                            let Some(local) = local else { continue };
-                            let local_fact = if self
-                                .local_may_borrow(*local)
-                            {
-                                let selected = self.project_fact_or_flatten(
-                                    init.ty,
-                                    fact.clone(),
-                                    &[BorrowProjection::TupleElement(
-                                        index as u32,
-                                    )],
-                                    self.f.locals[*local as usize].ty,
-                                );
-                                self.normalize_borrow_fact(
-                                    self.f.locals[*local as usize].ty,
-                                    selected,
-                                )
-                            } else {
-                                BorrowFact::default()
-                            };
-                            self.borrows.assign(*local, local_fact);
-                            clear_moved(moved, *local);
-                        }
+                        self.install_tuple_bindings(locals, init, moved);
+                        self.clear_value_snapshot(Self::expr_key(init));
                     }
                     None
                 }
@@ -25184,15 +37885,15 @@ impl<'a> MoveCheck<'a> {
                             value_key,
                             value.span,
                         );
+                        if let Some(loop_expr) = self.active_loop_result_key() {
+                            self.transfer_completed_value_to_loop_result(value, loop_expr);
+                        }
                         let fact = self.borrow_fact(value);
-                        if let Some(frame) =
-                            self.loop_value_breaks.last_mut()
-                        {
-                            *frame = frame.join(&fact);
-                        }
-                        if let Some(frame) = self.loop_breaks.last_mut() {
-                            frame.push(moved.clone());
-                        }
+                        let value_fact = MoveValueFact {
+                            non_storage: fact,
+                            headers: self.completed_headers(value),
+                        };
+                        self.end_active_staging_releases(true, BorrowEnd::Dropped);
                         let mut at_break = self.borrows.clone();
                         if let Some(drops) = self.loop_iter_drops.last() {
                             let depth = self.loop_iter_drops.len() as u32;
@@ -25202,10 +37903,14 @@ impl<'a> MoveCheck<'a> {
                                 depth,
                             );
                         }
-                        if let Some(frame) =
-                            self.loop_borrow_breaks.last_mut()
-                        {
-                            frame.push(at_break);
+                        let advances = self.active_storage_advances();
+                        if let Some(frame) = self.loop_breaks.last_mut() {
+                            frame.push(MoveControlEdge {
+                                moved: moved.clone(),
+                                borrows: at_break,
+                                value: value_fact,
+                                advances,
+                            });
                         }
                     }
                     falls_through = false;
@@ -25226,17 +37931,33 @@ impl<'a> MoveCheck<'a> {
                             self.invalidate_owner(root);
                         }
                         if !self_assign {
+                            self.mark_borrow_mut_modified(root);
+                            self.invalidate_mutable_place(root, path);
                             let projections = path
                                 .iter()
                                 .copied()
                                 .map(BorrowProjection::StructField)
                                 .collect::<Vec<_>>();
+                            self.install_projected_storage(
+                                root,
+                                &projections,
+                                self.completed_headers(value),
+                                self.direct_storage_move_source(value),
+                                true,
+                                self.is_move_ty(value.ty),
+                            );
                             self.replace_local_borrow_projection(
                                 root,
                                 &projections,
                                 value,
                             );
                         }
+                    }
+                    None
+                }
+                Post::BlockAssignVecLane { local } => {
+                    if falls_through {
+                        self.invalidate_mutable_place(local, &[]);
                     }
                     None
                 }
@@ -25260,7 +37981,7 @@ impl<'a> MoveCheck<'a> {
                             {
                                 self.invalidate_owner(base);
                             }
-                            self.update_local_array_projection(
+                            self.update_mutable_collection_contents(
                                 base,
                                 match &wrapper.kind {
                                     ExprKind::Block(block)
@@ -25297,7 +38018,7 @@ impl<'a> MoveCheck<'a> {
                         {
                             self.invalidate_owner(base);
                         }
-                        self.update_local_array_projection(base, index, field_path, value);
+                        self.update_mutable_collection_contents(base, index, field_path, value);
                     }
                     None
                 }
@@ -25323,6 +38044,11 @@ impl<'a> MoveCheck<'a> {
                             if !falls_through {
                                 break;
                             }
+                            self.end_expression_staging_releases(
+                                expression,
+                                BorrowEnd::Dropped,
+                            );
+                            self.clear_expression_value_snapshots(expression);
                         }
                         if falls_through
                             && let Some(tail) = tail
@@ -25340,12 +38066,16 @@ impl<'a> MoveCheck<'a> {
                 Post::None => None,
             };
             if opens_arena {
-                self.arena_depth -= 1;
+                // Pop the transient scope on every edge so the enclosing value frame remains
+                // balanced. Only a normal lexical successor publishes the arena Drop here;
+                // returning/breaking cleanup edges publish into their own snapshots, while
+                // abort/trap/permanent-loop sinks have no successor state to mutate.
+                self.finish_arena_scope(
+                    wrapper,
+                    falls_through.then_some(BorrowEnd::Dropped),
+                );
             }
-            let child_snapshots = self
-                .value_snapshot_frames
-                .pop()
-                .expect("value snapshot frame for transparent expression");
+            let child_snapshots = self.finish_value_snapshot_frame();
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
             } else {
@@ -25361,111 +38091,57 @@ impl<'a> MoveCheck<'a> {
                     self.return_roots.extend(error_roots);
                 }
                 if !Self::defers_child_snapshot_validation(&wrapper.kind) {
-                    for snapshot in child_snapshots {
-                        if !self.intentional_borrow_mut_snapshot(wrapper, snapshot) {
+                    for &snapshot in &child_snapshots {
+                        if !self.intentional_action_snapshot(wrapper, snapshot) {
                             self.validate_value_snapshot(key, snapshot, wrapper.span);
                         }
                     }
                 }
-                if ty_may_borrow(
-                    wrapper.ty,
-                    self.structs,
-                    self.tuples,
-                    self.enums,
-                    self.tagged_types,
-                ) {
-                    let fact = self.borrow_fact(wrapper);
-                    self.borrows.begin_value_source(key, fact.live_roots());
-                    self.walked_value_facts.insert(key, fact);
-                    if let Some(parent) = self.value_snapshot_frames.last_mut() {
-                        parent.push(key);
+                let value_snapshot = self.value_snapshot_needed(wrapper);
+                if self.completion_snapshot_needed(wrapper) {
+                    let fact = if value_snapshot {
+                        self.borrow_fact(wrapper)
+                    } else {
+                        BorrowFact::default()
+                    };
+                    self.record_value_completion(wrapper, fact);
+                    if value_snapshot {
+                        self.record_parent_value_snapshot(key);
                     }
                 }
+                self.finish_child_staging_frontier(wrapper, &child_snapshots);
+                self.record_parent_value_snapshots(&child_snapshots);
             }
         }
         Some(falls_through)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn finish_if_move_join(
-        &mut self,
-        span: Span,
-        moved: &mut MovedSet,
-        incoming_moved: MovedSet,
-        incoming_borrows: BorrowState,
-        then_falls: bool,
-        then_moved: MovedSet,
-        then_borrows: BorrowState,
-        then_fact: BorrowFact,
-        else_falls: bool,
-        else_moved: MovedSet,
-        else_borrows: BorrowState,
-        else_fact: BorrowFact,
-    ) -> bool {
-        let value_fact = match (then_falls, else_falls) {
-            (true, true) => then_fact.join(&else_fact),
-            (true, false) => then_fact,
-            (false, true) => else_fact,
-            (false, false) => BorrowFact::default(),
-        };
-        if value_fact.is_empty() {
-            self.control_value_facts.remove(&span);
-        } else {
-            self.control_value_facts.insert(span, value_fact);
-        }
-        *moved = match (then_falls, else_falls) {
-            (true, true) => &then_moved | &else_moved,
-            (true, false) => then_moved,
-            (false, true) => else_moved,
-            (false, false) => incoming_moved,
-        };
-        self.borrows = match (then_falls, else_falls) {
-            (true, true) => {
-                BorrowState::join(&then_borrows, &else_borrows)
+    fn match_binding_projection(
+        &self,
+        scrutinee_ty: Ty,
+        arm: &MatchArm,
+        binding_index: usize,
+    ) -> Option<BorrowProjection> {
+        let &variant = arm
+            .variants
+            .as_slice()
+            .first()
+            .filter(|_| arm.variants.len() == 1)?;
+        match expand_tagged_ty(scrutinee_ty, self.tagged_types) {
+            Ty::Enum(_) => Some(BorrowProjection::EnumPayload {
+                variant,
+                index: binding_index as u32,
+            }),
+            Ty::Option(_) if variant == 0 && binding_index == 0 => {
+                Some(BorrowProjection::OptionSome)
             }
-            (true, false) => then_borrows,
-            (false, true) => else_borrows,
-            (false, false) => incoming_borrows,
-        };
-        then_falls || else_falls
-    }
-
-    fn prepare_match_after_scrutinee(
-        &mut self,
-        scrutinee: &Expr,
-        arms: &[MatchArm],
-        moved: &MovedSet,
-        incoming_borrows: BorrowState,
-        consuming_control: bool,
-    ) -> MoveMatchPrepared {
-        let evaluated = moved.clone();
-        let evaluated_borrows = self.borrows.clone();
-        let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
-        let (consumed, consumed_borrows) = if has_move_binding {
-            if consuming_control {
-                (
-                    Some(evaluated.clone()),
-                    Some(evaluated_borrows.clone()),
-                )
-            } else {
-                let mut state = evaluated.clone();
-                self.borrows = evaluated_borrows.clone();
-                self.consume_match_result(scrutinee, &mut state, true);
-                (Some(state), Some(self.borrows.clone()))
+            Ty::Result(..) if variant == 0 && binding_index == 0 => {
+                Some(BorrowProjection::ResultOk)
             }
-        } else {
-            (None, None)
-        };
-        self.borrows = evaluated_borrows.clone();
-        let scrutinee_fact = self.borrow_fact(scrutinee);
-        MoveMatchPrepared {
-            incoming_borrows,
-            evaluated,
-            evaluated_borrows,
-            consumed,
-            consumed_borrows,
-            scrutinee_ty: scrutinee.ty,
-            scrutinee_fact,
+            Ty::Result(..) if variant == 1 && binding_index == 0 => {
+                Some(BorrowProjection::ResultErr)
+            }
+            _ => None,
         }
     }
 
@@ -25480,23 +38156,10 @@ impl<'a> MoveCheck<'a> {
         if !self.local_may_borrow(binding) {
             return BorrowFact::default();
         }
-        let Some(&variant) = arm
-            .variants
-            .as_slice()
-            .first()
-            .filter(|_| arm.variants.len() == 1)
+        let Some(projection) =
+            self.match_binding_projection(scrutinee_ty, arm, binding_index)
         else {
             return BorrowFact::from_direct(scrutinee_fact.flatten());
-        };
-        let projection = match expand_tagged_ty(scrutinee_ty, self.tagged_types) {
-            Ty::Enum(_) => BorrowProjection::EnumPayload {
-                variant,
-                index: binding_index as u32,
-            },
-            Ty::Option(_) if variant == 0 && binding_index == 0 => BorrowProjection::OptionSome,
-            Ty::Result(..) if variant == 0 && binding_index == 0 => BorrowProjection::ResultOk,
-            Ty::Result(..) if variant == 1 && binding_index == 0 => BorrowProjection::ResultErr,
-            _ => return BorrowFact::from_direct(scrutinee_fact.flatten()),
         };
         self.project_fact_or_flatten(
             scrutinee_ty,
@@ -25504,79 +38167,6 @@ impl<'a> MoveCheck<'a> {
             &[projection],
             self.f.locals[binding as usize].ty,
         )
-    }
-
-    fn begin_match_arm(
-        &mut self,
-        prepared: &MoveMatchPrepared,
-        arm: &MatchArm,
-        moved: &mut MovedSet,
-    ) {
-        let arm_moves_payload = self.arm_moves_payload(arm);
-        *moved = if arm_moves_payload {
-            prepared
-                .consumed
-                .as_ref()
-                .expect("Move binding has consumed state")
-                .clone()
-        } else {
-            prepared.evaluated.clone()
-        };
-        self.borrows = if arm_moves_payload {
-            prepared
-                .consumed_borrows
-                .as_ref()
-                .expect("Move binding has consumed borrow state")
-                .clone()
-        } else {
-            prepared.evaluated_borrows.clone()
-        };
-        for (binding_index, binding) in arm.bindings.iter().enumerate() {
-            let fact = self.match_binding_fact(
-                prepared.scrutinee_ty,
-                &prepared.scrutinee_fact,
-                arm,
-                binding_index,
-                *binding,
-            );
-            self.borrows.assign(*binding, fact);
-            clear_moved(moved, *binding);
-        }
-    }
-
-    fn join_match_arm(
-        &self,
-        join: &mut MoveMatchJoin,
-        moved: &MovedSet,
-        borrows: &BorrowState,
-    ) {
-        join.moved = Some(match join.moved.take() {
-            None => moved.clone(),
-            Some(previous) => &previous | moved,
-        });
-        join.borrows = Some(match join.borrows.take() {
-            None => borrows.clone(),
-            Some(previous) => BorrowState::join(&previous, borrows),
-        });
-    }
-
-    fn finish_match_join(
-        &mut self,
-        prepared: &MoveMatchPrepared,
-        join: MoveMatchJoin,
-        moved: &mut MovedSet,
-    ) -> bool {
-        if let Some(joined) = join.moved {
-            *moved = joined;
-            self.borrows = join
-                .borrows
-                .expect("fallthrough match arm has borrow state");
-            true
-        } else {
-            *moved = prepared.evaluated.clone();
-            self.borrows = prepared.incoming_borrows.clone();
-            false
-        }
     }
 
     fn transparent_pipeline_child(
@@ -25646,7 +38236,9 @@ impl<'a> MoveCheck<'a> {
     /// shared iterative divergence result.
     fn expr_is_move_neutral(&self, root: &Expr) -> bool {
         for expression in hir_depth::expr_postorder(root) {
-            if self.is_move_ty(expression.ty)
+            if self.completion_snapshot_needed(expression)
+                || Self::kind_has_source_visible_mutation(&expression.kind)
+                || self.is_move_ty(expression.ty)
                 || ty_may_borrow(
                     expression.ty,
                     self.structs,
@@ -25698,7 +38290,8 @@ impl<'a> MoveCheck<'a> {
     fn eager_binary_tree_is_non_borrowing(&self, root: &Expr) -> bool {
         let mut work = vec![root];
         while let Some(node) = work.pop() {
-            if ty_may_borrow(
+            if self.completion_snapshot_needed(node)
+                || ty_may_borrow(
                 node.ty,
                 self.structs,
                 self.tuples,
@@ -25747,6 +38340,184 @@ impl<'a> MoveCheck<'a> {
         true
     }
 
+    #[inline(never)]
+    fn move_if(
+        &mut self,
+        expression: &'a Expr,
+        cond: &'a Expr,
+        then: &'a Block,
+        els: &'a Block,
+        moved: &mut MovedSet,
+        consuming: bool,
+    ) -> bool {
+        if !self.expr(cond, moved, false, false) {
+            return false;
+        }
+        let incoming_borrows = self.borrows.clone();
+        let mut then_moved = moved.clone();
+        self.borrows = incoming_borrows.clone();
+        self.begin_storage_advance_frame();
+        let then_falls_through = self.block(then, &mut then_moved, consuming, false);
+        let then_advances = self.finish_storage_advance_frame();
+        let then_edge = then_falls_through.then(|| MoveControlEdge {
+            moved: then_moved,
+            borrows: self.borrows.clone(),
+            value: MoveValueFact {
+                non_storage: self.block_value_fact(then),
+                headers: self.block_headers(then),
+            },
+            advances: then_advances,
+        });
+        let mut else_moved = moved.clone();
+        self.borrows = incoming_borrows.clone();
+        self.begin_storage_advance_frame();
+        let else_falls_through = self.block(els, &mut else_moved, consuming, false);
+        let else_advances = self.finish_storage_advance_frame();
+        let else_edge = else_falls_through.then(|| MoveControlEdge {
+            moved: else_moved,
+            borrows: self.borrows.clone(),
+            value: MoveValueFact {
+                non_storage: self.block_value_fact(els),
+                headers: self.block_headers(els),
+            },
+            advances: else_advances,
+        });
+        let Some(edge) = MoveControlEdge::join_reachable([then_edge, else_edge]) else {
+            self.borrows = incoming_borrows;
+            self.control_value_facts
+                .remove(&Self::expr_key(expression));
+            return false;
+        };
+        self.publish_control_edge(Self::expr_key(expression), moved, edge);
+        true
+    }
+
+    #[inline(never)]
+    fn move_match(
+        &mut self,
+        expression: &'a Expr,
+        scrutinee: &'a Expr,
+        arms: &'a [MatchArm],
+        moved: &mut MovedSet,
+        consuming: bool,
+        direct: bool,
+    ) -> bool {
+        let incoming_borrows = self.borrows.clone();
+        let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
+        self.borrows = incoming_borrows.clone();
+        let consuming_control =
+            has_move_binding && match_scrutinee_materializes_result(scrutinee);
+        if !self.expr(
+            scrutinee,
+            moved,
+            consuming_control,
+            consuming_control,
+        ) {
+            return false;
+        }
+        let evaluated = moved.clone();
+        let evaluated_borrows = self.borrows.clone();
+        let (consumed, consumed_borrows) = if has_move_binding {
+            if consuming_control {
+                (Some(evaluated.clone()), Some(evaluated_borrows.clone()))
+            } else {
+                let mut state = evaluated.clone();
+                self.borrows = evaluated_borrows.clone();
+                self.consume_match_result(scrutinee, &mut state, true);
+                (Some(state), Some(self.borrows.clone()))
+            }
+        } else {
+            (None, None)
+        };
+        self.borrows = evaluated_borrows.clone();
+        let scrutinee_fact = self.borrow_fact(scrutinee);
+        let scrutinee_headers = self.completed_headers(scrutinee);
+        let scrutinee_storage_roots = self.completed_storage_fact(scrutinee).live_roots();
+        let scrutinee_source = self.direct_storage_move_source(scrutinee);
+        let mut joined: Option<MoveControlEdge> = None;
+        for arm in arms {
+            let arm_moves_payload = self.arm_moves_payload(arm);
+            let mut arm_moved = if arm_moves_payload {
+                consumed
+                    .as_ref()
+                    .expect("Move binding has consumed state")
+                    .clone()
+            } else {
+                evaluated.clone()
+            };
+            self.borrows = if arm_moves_payload {
+                consumed_borrows
+                    .as_ref()
+                    .expect("Move binding has consumed borrow state")
+                    .clone()
+            } else {
+                evaluated_borrows.clone()
+            };
+            for (binding_index, binding) in arm.bindings.iter().enumerate() {
+                let borrowed = arm
+                    .borrowed_bindings
+                    .iter()
+                    .any(|projection| projection.binding_local == *binding);
+                let projection =
+                    self.match_binding_projection(scrutinee.ty, arm, binding_index);
+                let selected_headers = projection.map_or_else(
+                    ProjectedHeaderFact::default,
+                    |projection| scrutinee_headers.project_path(&[projection]),
+                );
+                self.install_projected_storage(
+                    *binding,
+                    &[],
+                    selected_headers,
+                    scrutinee_source,
+                    false,
+                    arm_moves_payload && !borrowed,
+                );
+                let fact = self.match_binding_fact(
+                    scrutinee.ty,
+                    &scrutinee_fact,
+                    arm,
+                    binding_index,
+                    *binding,
+                );
+                self.assign_completed_borrow_fact(
+                    *binding,
+                    fact,
+                    scrutinee_storage_roots.clone(),
+                );
+                clear_moved(&mut arm_moved, *binding);
+            }
+            self.begin_storage_advance_frame();
+            let arm_falls_through =
+                self.expr(&arm.body, &mut arm_moved, consuming, direct);
+            let arm_advances = self.finish_storage_advance_frame();
+            if !arm_falls_through {
+                continue;
+            }
+            let arm_value = MoveValueFact {
+                non_storage: self.borrow_fact(&arm.body),
+                headers: self.completed_headers(&arm.body),
+            };
+            let edge = MoveControlEdge {
+                moved: arm_moved,
+                borrows: self.borrows.clone(),
+                value: arm_value,
+                advances: arm_advances,
+            };
+            joined = Some(match joined {
+                None => edge,
+                Some(previous) => previous.join(edge),
+            });
+        }
+        let Some(joined) = joined else {
+            self.borrows = incoming_borrows;
+            self.control_value_facts
+                .remove(&Self::expr_key(expression));
+            return false;
+        };
+        self.publish_control_edge(Self::expr_key(expression), moved, joined);
+        true
+    }
+
     fn expr_inner(
         &mut self,
         e: &'a Expr,
@@ -25788,13 +38559,21 @@ impl<'a> MoveCheck<'a> {
                             );
                         }
                         self.reject_live_resource_dependents(*id, moved, e.span);
-                        self.invalidate_owner(*id);
+                        self.invalidate_mutable_place(*id, &[]);
+                        if !self.move_transfers_storage(*id) {
+                            self.invalidate_owner(*id);
+                        }
                         moved.insert(MovedKey::Whole(*id));
                     }
                 }
             }
             ExprKind::Field { root: base, path } => {
-                self.check_borrow_use(*base, e.span);
+                let borrow_path = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                self.check_borrow_projection_use(*base, &borrow_path, e.span);
                 if path.len() == 1 {
                     let fld = path[0];
                     if field_moved(moved, *base, fld) {
@@ -25846,6 +38625,7 @@ impl<'a> MoveCheck<'a> {
                         // argument) reaches here non-consuming (wrapped in `StrBorrow`/`Len`), so it
                         // is allowed and moves nothing.
                         self.reject_live_resource_dependents(*base, moved, e.span);
+                        self.invalidate_mutable_place(*base, &[fld]);
                         self.invalidate_owner(*base);
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
@@ -25890,25 +38670,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => move_expr!(self, expr, moved, false, false),
             ExprKind::Binary {
                 op: BinOp::And | BinOp::Or,
-                lhs,
-                rhs,
-            } => {
-                move_expr!(self, lhs, moved, false, false);
-                let lhs_moved = moved.clone();
-                let lhs_borrows = self.borrows.clone();
-                let mut rhs_moved = lhs_moved.clone();
-                self.borrows = lhs_borrows.clone();
-                let rhs_falls_through =
-                    self.expr(rhs, &mut rhs_moved, false, false);
-                if rhs_falls_through {
-                    *moved = &lhs_moved | &rhs_moved;
-                    self.borrows =
-                        BorrowState::join(&lhs_borrows, &self.borrows);
-                } else {
-                    *moved = lhs_moved;
-                    self.borrows = lhs_borrows;
-                }
-            }
+                ..
+            } => unreachable!("short-circuit expressions use the control worklist"),
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::IntArith { lhs, rhs, .. } => {
                 move_expr!(self, lhs, moved, false, false);
@@ -25930,9 +38693,17 @@ impl<'a> MoveCheck<'a> {
                             self.named_param_modes
                                 .get(func)
                                 .and_then(|modes| modes.get(index)),
-                            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                            Some(
+                                ast::ParamMode::Borrow
+                                    | ast::ParamMode::BorrowMut
+                                    | ast::ParamMode::Out
+                            )
                         );
-                    move_expr!(self, a, moved, consuming, consuming);
+                    if consuming {
+                        move_expr_deferred!(self, a, moved);
+                    } else {
+                        move_expr!(self, a, moved, false, false);
+                    }
                 }
                 if !self.collecting_move_children {
                     self.add_direct_parallel_transfer(func, args);
@@ -25969,9 +38740,17 @@ impl<'a> MoveCheck<'a> {
                     };
                     let consuming = !matches!(
                         mode,
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     );
-                    move_expr!(self, a, moved, consuming, consuming);
+                    if consuming {
+                        move_expr_deferred!(self, a, moved);
+                    } else {
+                        move_expr!(self, a, moved, false, false);
+                    }
                 }
                 if !self.collecting_move_children {
                     self.add_indirect_parallel_transfer(callee, args);
@@ -25979,13 +38758,13 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::StructLit { fields, .. } => {
                 for field in fields {
-                    move_expr!(self, field, moved, true, true);
+                    move_expr_deferred!(self, field, moved);
                 }
             }
             ExprKind::OptionSome(i)
             | ExprKind::ResultOk(i)
-            | ExprKind::ResultErr(i)
-            | ExprKind::HeapNew(i) => move_expr!(self, i, moved, true, true),
+            | ExprKind::ResultErr(i) => move_expr_deferred!(self, i, moved),
+            ExprKind::HeapNew(i) => move_expr!(self, i, moved, true, true),
             ExprKind::Try(i) => {
                 // Keep the same guard as the final return summary so a borrowing Ok payload cannot
                 // taint an enclosing Result whose returned paths carry no borrow.
@@ -26251,6 +39030,10 @@ impl<'a> MoveCheck<'a> {
                     e.span,
                     true,
                 );
+                // A pipeline used as a deferred call argument takes the recursive lane rather
+                // than `Post::Pipeline`; its successful map-into write must still invalidate all
+                // reservations that observe the completed destination backing.
+                self.apply_builtin_mutation_action(e);
             }
             ExprKind::ArrayDot { a, b, .. } => {
                 move_expr!(self, a, moved, false, false);
@@ -26260,7 +39043,12 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, source, moved, false, false);
                 move_expr!(self, n, moved, false, false);
             }
-            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
+            ExprKind::ArrayLit { elems, .. } => {
+                for e in elems {
+                    move_expr_deferred!(self, e, moved);
+                }
+            }
+            ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     move_expr!(self, e, moved, true, true);
                 }
@@ -26294,26 +39082,8 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, index, moved, true, true);
                 move_expr!(self, value, moved, true, true);
             }
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                move_expr!(self, opt, moved, true, true);
-                let success_moved = moved.clone();
-                let success_borrows = self.borrows.clone();
-                let mut fallback_moved = success_moved.clone();
-                self.borrows = success_borrows.clone();
-                // The fallback is an arm value: it inherits this position's `consuming` but is
-                // not a direct move site (like an `if`/`else` arm). A `Result<string, Error> else`
-                // yields a Move (`string`) result, moved at its binding site — treating the fallback
-                // consistently (arm value, not a direct move) keeps that sound.
-                let fallback_falls_through =
-                    self.expr(fallback, &mut fallback_moved, consuming, false);
-                if fallback_falls_through {
-                    *moved = &success_moved | &fallback_moved;
-                    self.borrows =
-                        BorrowState::join(&success_borrows, &self.borrows);
-                } else {
-                    *moved = success_moved;
-                    self.borrows = success_borrows;
-                }
+            ExprKind::ElseUnwrap { .. } => {
+                unreachable!("else-unwrap expressions use the control worklist")
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => {
@@ -26325,17 +39095,17 @@ impl<'a> MoveCheck<'a> {
             // MIR mints no hidden `string` owner for a `template` there, so no per-iteration borrow
             // root is recorded (see [`owns_hidden_string`] and `Self::template_owner_root`).
             ExprKind::Arena(b) => {
-                self.arena_depth += 1;
+                self.begin_arena_scope(e);
                 let falls_through = self.block(b, moved, consuming, direct);
-                self.arena_depth -= 1;
+                self.finish_arena_scope(e, falls_through.then_some(BorrowEnd::Dropped));
                 if !falls_through {
                     return false;
                 }
             }
             ExprKind::NamedArena { block, .. } => {
-                self.arena_depth += 1;
+                self.begin_arena_scope(e);
                 let falls_through = self.block(block, moved, consuming, direct);
-                self.arena_depth -= 1;
+                self.finish_arena_scope(e, falls_through.then_some(BorrowEnd::Dropped));
                 if !falls_through {
                     return false;
                 }
@@ -26356,7 +39126,7 @@ impl<'a> MoveCheck<'a> {
             // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
             // chain would otherwise overflow the stack; see `expr_depth` test).
             ExprKind::Loop { body, body_locals, .. } => {
-                if !self.loop_moves(body, body_locals, e.span, moved) {
+                if !self.loop_moves(body, body_locals, Self::expr_key(e), moved) {
                     return false;
                 }
             }
@@ -26392,7 +39162,11 @@ impl<'a> MoveCheck<'a> {
                         param_modes.get(index),
                         Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
                     );
-                    move_expr!(self, argument, moved, consuming, true);
+                    if consuming {
+                        move_expr_deferred!(self, argument, moved);
+                    } else {
+                        move_expr!(self, argument, moved, false, false);
+                    }
                 }
             }
             ExprKind::RawStore { ptr, offset, value } => {
@@ -26433,112 +39207,13 @@ impl<'a> MoveCheck<'a> {
             // "consuming" it is a no-op.
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
-                    move_expr!(self, p, moved, true, true);
+                    move_expr_deferred!(self, p, moved);
                 }
             }
             ExprKind::Match { scrutinee, arms, .. } => {
-                // Arms are mutually exclusive, so each is checked in the *same* incoming state:
-                // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
-                // Without this the arms share one set, so a value consumed in arm A is wrongly seen
-                // as already-moved in arm B (a false "use of moved value"). A diverging arm
-                // (`=> { return … }`) contributes nothing to the fall-through, so its moves must not
-                // poison the post-state; if every arm diverges the code after is unreachable.
-                let incoming_borrows = self.borrows.clone();
-                // Extracting a Move payload consumes the scrutinee on precisely those arms that
-                // bind one. Walk that consuming form once through the ordinary expression
-                // dataflow, so blocks and control-flow values cannot drift from MIR's recursive,
-                // path-local `null_moved_source`. Non-binding/Copy arms retain the incoming state.
-                // This single walk also emits any use-after-move or unsupported conditional-move
-                // diagnostic once rather than once per arm.
-                let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
-                // Evaluate once for every arm. If a Move payload can be extracted, derive its
-                // transfer state in that same walk for a control-joined scrutinee; a direct place
-                // stays borrowed until the selected Move-binding arm extracts it.
-                self.borrows = incoming_borrows.clone();
-                let consuming_control = has_move_binding
-                    && match_scrutinee_materializes_result(scrutinee);
-                move_expr!(self,
-                    scrutinee,
-                    moved,
-                    consuming_control,
-                    consuming_control,
-                );
-                let evaluated = moved.clone();
-                let evaluated_borrows = self.borrows.clone();
-                let (consumed, consumed_borrows) = if has_move_binding {
-                    if consuming_control {
-                        (
-                            Some(evaluated.clone()),
-                            Some(evaluated_borrows.clone()),
-                        )
-                    } else {
-                        let mut state = evaluated.clone();
-                        self.borrows = evaluated_borrows.clone();
-                        self.consume_match_result(scrutinee, &mut state, true);
-                        (Some(state), Some(self.borrows.clone()))
-                    }
-                } else {
-                    (None, None)
-                };
-                // An evaluated block/control value may have reassigned a view before yielding it.
-                // Derive payload-binding provenance from that post-evaluation state, not the
-                // incoming state, or the binding can retain stale roots and outlive its real owner.
-                self.borrows = evaluated_borrows.clone();
-                let scrutinee_roots = self.borrow_sources(scrutinee);
-                let mut joined: Option<MovedSet> = None;
-                let mut joined_borrows: Option<BorrowState> = None;
-                for a in arms {
-                    let arm_moves_payload = self.arm_moves_payload(a);
-                    let mut m = if arm_moves_payload {
-                        consumed.as_ref().expect("Move binding has consumed state").clone()
-                    } else {
-                        evaluated.clone()
-                    };
-                    self.borrows = if arm_moves_payload {
-                        consumed_borrows
-                            .as_ref()
-                            .expect("Move binding has consumed borrow state")
-                            .clone()
-                    } else {
-                        evaluated_borrows.clone()
-                    };
-                    for binding in &a.bindings {
-                        let roots = if self.local_may_borrow(*binding) {
-                            scrutinee_roots.clone()
-                        } else {
-                            BorrowRoots::new()
-                        };
-                        self.borrows
-                            .assign(*binding, BorrowFact::from_direct(roots));
-                        // An arm binding is INITIALIZED here from the scrutinee's payload, exactly
-                        // like a `Let` — clear any stale moved bit. Without this, an arm that
-                        // consumes its own binding inside a `loop` body poisons the back-edge
-                        // fixpoint, and the next iteration's freshly bound value is rejected as
-                        // "use of moved value" (hit by pkg.web's serve: `Ok(s) => pump(c, s)`).
-                        clear_moved(&mut m, *binding);
-                    }
-                    let arm_falls_through =
-                        self.expr(&a.body, &mut m, consuming, direct);
-                    if !arm_falls_through {
-                        continue;
-                    }
-                    joined = Some(match joined {
-                        None => m,
-                        Some(j) => &j | &m,
-                    });
-                    joined_borrows = Some(match joined_borrows {
-                        None => self.borrows.clone(),
-                        Some(j) => BorrowState::join(&j, &self.borrows),
-                    });
-                }
-                if let Some(j) = joined {
-                    *moved = j;
-                } else {
-                    self.borrows = incoming_borrows;
+                if !self.move_match(e, scrutinee, arms, moved, consuming, direct) {
                     return false;
                 }
-                self.borrows =
-                    joined_borrows.expect("fallthrough match arm has borrow state");
             }
             ExprKind::ResultMapErr { result, f } => {
                 // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
@@ -26570,51 +39245,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
-                move_expr!(self, cond, moved, false, false);
-                // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
-                // bound owned local out through it is rejected (the `direct = false`).
-                let incoming_borrows = self.borrows.clone();
-                let mut m1 = moved.clone();
-                self.borrows = incoming_borrows.clone();
-                let then_falls_through =
-                    self.block(then, &mut m1, consuming, false);
-                let then_fact = then_falls_through
-                    .then(|| self.block_value_fact(then));
-                let b1 = self.borrows.clone();
-                let mut m2 = moved.clone();
-                self.borrows = incoming_borrows.clone();
-                let else_falls_through =
-                    self.block(els, &mut m2, consuming, false);
-                let else_fact = else_falls_through
-                    .then(|| self.block_value_fact(els));
-                let b2 = self.borrows.clone();
-                let value_fact = match (then_fact, else_fact) {
-                    (Some(then), Some(els)) => then.join(&els),
-                    (Some(fact), None) | (None, Some(fact)) => fact,
-                    (None, None) => BorrowFact::default(),
-                };
-                if value_fact.is_empty() {
-                    self.control_value_facts.remove(&e.span);
-                } else {
-                    self.control_value_facts.insert(e.span, value_fact);
-                }
-                // Join the branch states — but a branch that always diverges (`return`) contributes
-                // nothing past the `if`, so its moves must not poison the fall-through. (Without this,
-                // `if c { return x }; use(x)` wrongly reports `x` moved.) When both diverge the code
-                // after is unreachable, so the post-state is immaterial.
-                *moved = match (then_falls_through, else_falls_through) {
-                    (true, true) => &m1 | &m2,
-                    (false, true) => m2,
-                    (true, false) => m1,
-                    (false, false) => moved.clone(),
-                };
-                self.borrows = match (then_falls_through, else_falls_through) {
-                    (true, true) => BorrowState::join(&b1, &b2),
-                    (false, true) => b2,
-                    (true, false) => b1,
-                    (false, false) => incoming_borrows,
-                };
-                if !then_falls_through && !else_falls_through {
+                if !self.move_if(e, cond, then, els, moved, consuming) {
                     return false;
                 }
             }
@@ -26759,6 +39390,10 @@ impl<'a> MoveCheck<'a> {
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => {
                 move_expr!(self, code, moved, false, false);
+                // `exit` runs language cleanup after its operand completes. Retire only completed
+                // values abandoned by the active action stack; `abort` below intentionally has no
+                // cleanup edge and therefore must not publish invented Drops.
+                self.end_active_staging_releases(false, BorrowEnd::Dropped);
                 return false;
             }
             ExprKind::ProcessAbort => return false,
@@ -27057,7 +39692,7 @@ impl<'a> MoveCheck<'a> {
             // borrow analyses.
             ExprKind::Tuple { elems, .. } => {
                 for element in elems {
-                    move_expr!(self, element, moved, true, true);
+                    move_expr_deferred!(self, element, moved);
                 }
             }
             ExprKind::MathOp { operands, .. } => {
@@ -27082,6 +39717,7 @@ impl<'a> MoveCheck<'a> {
                                 if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
                             if owned && consuming {
                                 self.reject_live_resource_dependents(*t, moved, e.span);
+                                self.invalidate_mutable_place(*t, &[]);
                                 self.invalidate_owner(*t);
                                 moved.insert(MovedKey::Field(*t, *index));
                             }
@@ -28232,7 +40868,17 @@ impl<'a, 't> Checker<'a, 't> {
                         // array values aren't materialized (only a `let` initializes one), and copying
                         // a Move-struct array would double-own its elements. Reject cleanly — else an
                         // array-literal RHS panics MIR lowering — and point at element assignment.
-                        if matches!(ty, Ty::Array(..) | Ty::StructArray(..)) {
+                        let exact_self_assignment = self
+                            .place_local(value)
+                            .is_some_and(|(source, source_ty)| source == id && source_ty == ty);
+                        if matches!(ty, Ty::Array(..) | Ty::StructArray(..))
+                            && exact_self_assignment
+                        {
+                            // Fixed arrays are not materialized as whole values, but an exact
+                            // place self-assignment has no runtime action to materialize. Accept it
+                            // as a checked no-op so it also cannot advance storage generations.
+                            let _ = self.check_expr(value, Some(ty));
+                        } else if matches!(ty, Ty::Array(..) | Ty::StructArray(..)) {
                             self.diags.error(
                                 format!("whole-array reassignment of {} is not supported yet (array values aren't materialized); assign elements individually, `a[i] = …`", ty_name(ty)),
                                 place.span,
@@ -28834,12 +41480,12 @@ impl<'a, 't> Checker<'a, 't> {
                     return Place::Err;
                 }
             };
-            // First cut: element stores are primitive-scalar only (int/float/bool/char). A `str`
-            // element store would need a region check (storing a borrowed view into the buffer);
-            // struct / Move elements need whole-struct / ownership handling. Both deferred.
-            if ty_to_scalar(elem).and_then(scalar_to_prim).is_none() {
+            // Plain element stores support Copy scalars and borrowed `str`; EscapeCheck owns the
+            // view-region constraint. Move elements need drop-old and source-nulling operations,
+            // while structs use the dedicated whole-element path above.
+            if !indexed_element_store_ok(elem) {
                 self.diags.error(
-                    format!("element assignment of {} is not supported yet (primitive elements only for now)", ty_name(elem)),
+                    format!("element assignment of {} is not supported yet (Copy scalar or borrowed `str` elements only for now)", ty_name(elem)),
                     place.span,
                 );
                 return Place::Err;
@@ -50066,6 +62712,3119 @@ mod tests {
     use align_parser::parse_file;
 
     #[test]
+    fn storage_generation_formation_and_malformed_matrix() {
+        let u8_ = IntTy {
+            bits: 8,
+            signed: false,
+        };
+        let structures = vec![StructDef {
+            name: "StorageShape".to_string(),
+            source_name: "StorageShape".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "fixed_views".to_string(),
+                    ty: Ty::Array(Scalar::Slice(PrimScalar::Int(u8_)), 2),
+                },
+                FieldDef {
+                    name: "owned".to_string(),
+                    ty: Ty::DynArray(Scalar::Str),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        }];
+        let tuples = vec![
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynArray(PrimScalar::Str),
+                    Scalar::DynArray(PrimScalar::Int(u8_)),
+                ],
+            },
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynArray(PrimScalar::Str),
+                    Scalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    Scalar::Slice(PrimScalar::Int(u8_)),
+                ],
+            },
+        ];
+        let enums = vec![hir::EnumDef {
+            name: "StorageChoice".to_string(),
+            source_name: "StorageChoice".to_string(),
+            variants: vec![
+                hir::EnumVariant {
+                    name: "Empty".to_string(),
+                    payload: Vec::new(),
+                    field_base: 1,
+                },
+                hir::EnumVariant {
+                    name: "Pair".to_string(),
+                    payload: vec![
+                        Scalar::Slice(PrimScalar::Int(u8_)),
+                        Scalar::DynArray(PrimScalar::Str),
+                    ],
+                    field_base: 1,
+                },
+            ],
+        }];
+        let context = StorageTypeContext {
+            structs: &structures,
+            tuples: &tuples,
+            enums: &enums,
+            tagged_types: &[],
+        };
+
+        let paths = storage_type_paths(Ty::Struct(0), context);
+        assert!(paths.valid);
+        assert_eq!(
+            paths
+                .headers
+                .iter()
+                .map(|entry| (entry.path.clone(), entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    vec![BorrowProjection::StructField(0)],
+                    StorageHeaderKind::InlineFixed,
+                ),
+                (
+                    vec![
+                        BorrowProjection::StructField(0),
+                        BorrowProjection::ArrayElement(0),
+                    ],
+                    StorageHeaderKind::View,
+                ),
+                (
+                    vec![
+                        BorrowProjection::StructField(0),
+                        BorrowProjection::ArrayElement(1),
+                    ],
+                    StorageHeaderKind::View,
+                ),
+                (
+                    vec![BorrowProjection::StructField(1)],
+                    StorageHeaderKind::OwnedDynamic,
+                ),
+            ],
+            "header paths and fixed-element cardinality must stay in canonical type order",
+        );
+        assert_eq!(
+            storage_type_paths(Ty::Tuple(1), context)
+                .headers
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec![
+                vec![BorrowProjection::TupleElement(0)],
+                vec![BorrowProjection::TupleElement(2)],
+            ],
+            "tuple ordinals retain scalar holes instead of being densely renumbered",
+        );
+        assert_eq!(
+            storage_type_paths(
+                Ty::Option(Scalar::Slice(PrimScalar::Int(u8_))),
+                context,
+            )
+            .headers[0]
+                .path,
+            vec![BorrowProjection::OptionSome],
+        );
+        assert_eq!(
+            storage_type_paths(
+                Ty::Result(
+                    Scalar::Slice(PrimScalar::Int(u8_)),
+                    Scalar::DynArray(PrimScalar::Str),
+                ),
+                context,
+            )
+            .headers
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+            vec![
+                vec![BorrowProjection::ResultOk],
+                vec![BorrowProjection::ResultErr],
+            ],
+        );
+        assert_eq!(
+            storage_type_paths(Ty::Enum(0), context)
+                .headers
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec![
+                vec![BorrowProjection::EnumPayload {
+                    variant: 1,
+                    index: 0,
+                }],
+                vec![BorrowProjection::EnumPayload {
+                    variant: 1,
+                    index: 1,
+                }],
+            ],
+        );
+
+        let span = Span::new(7, 11, 19);
+        let first = Expr {
+            kind: ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        };
+        let second = Expr {
+            kind: ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        };
+        let first_origin = StorageOrigin::producer(&first, &[]);
+        let second_origin = StorageOrigin::producer(&second, &[]);
+        assert_ne!(
+            first_origin, second_origin,
+            "distinct immutable HIR nodes sharing a Span must retain distinct identities",
+        );
+        assert_ne!(
+            StorageOrigin::producer(&first, &[]),
+            StorageOrigin::producer(&first, &[BorrowProjection::TupleElement(0)]),
+            "one producer's exact result paths must remain distinct",
+        );
+        assert_ne!(
+            StorageOrigin::inline_place(0, &[]),
+            StorageOrigin::call_mutation(&first, 0, &[]),
+        );
+        assert_eq!(
+            first_origin,
+            StorageOrigin::producer(&first, &[]),
+            "repeating the same immutable node/path lookup must be stable",
+        );
+        assert_ne!(
+            StorageOrigin::call_mutation(&first, 0, &[]),
+            StorageOrigin::call_mutation(&first, 1, &[]),
+            "mutable destinations use their parameter ordinal",
+        );
+        assert_ne!(
+            StorageOrigin::call_mutation(&first, 0, &[]),
+            StorageOrigin::call_mutation(
+                &first,
+                0,
+                &[BorrowProjection::StructField(0)],
+            ),
+            "projected mutable destinations remain distinct",
+        );
+
+        let tuple_zero = vec![BorrowProjection::TupleElement(0)];
+        let tuple_one = vec![BorrowProjection::TupleElement(1)];
+        let zero_generation = StorageGeneration::current(StorageOrigin::producer(
+            &first,
+            &tuple_zero,
+        ));
+        let one_generation = StorageGeneration::current(StorageOrigin::producer(
+            &second,
+            &tuple_one,
+        ));
+        let zero_formation = StorageHeaderFormation {
+            path: tuple_zero.clone(),
+            generation: zero_generation.clone(),
+            directory: Some(10_u32),
+            content: Some([BorrowRoot::Param(0)].into_iter().collect::<BorrowRoots>()),
+        };
+        let one_formation = StorageHeaderFormation {
+            path: tuple_one.clone(),
+            generation: one_generation.clone(),
+            directory: Some(20_u32),
+            content: Some([BorrowRoot::Param(1)].into_iter().collect::<BorrowRoots>()),
+        };
+        let mut forward_tables = StorageGenerationTables::<u32, BorrowRoots>::default();
+        let forward_commit = forward_tables
+            .try_form_headers(
+                Ty::Tuple(0),
+                vec![zero_formation.clone(), one_formation.clone()],
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("forward batch formation");
+        let mut reverse_tables = StorageGenerationTables::<u32, BorrowRoots>::default();
+        let reverse_commit = reverse_tables
+            .try_form_headers(
+                Ty::Tuple(0),
+                vec![one_formation.clone(), zero_formation.clone()],
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("reverse batch formation");
+        assert_eq!(forward_tables, reverse_tables);
+        assert_eq!(forward_commit, reverse_commit);
+
+        let transaction_before = forward_tables.clone();
+        assert_eq!(
+            forward_tables.try_form_headers(
+                Ty::Tuple(0),
+                vec![
+                    zero_formation.clone(),
+                    StorageHeaderFormation {
+                        path: vec![BorrowProjection::TupleElement(u32::MAX)],
+                        generation: one_generation.clone(),
+                        directory: Some(30),
+                        content: Some(BorrowRoots::new()),
+                    },
+                ],
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            ),
+            Err(StorageFormationError::NotHeaderPath),
+            "a bad second result must publish neither headers nor a rename plan",
+        );
+        assert_eq!(forward_tables, transaction_before);
+        assert!(forward_tables
+            .directory
+            .entries
+            .contains_key(&zero_generation));
+        assert!(!forward_tables.directory.entries.contains_key(
+            &StorageGeneration::prior(StorageOrigin::producer(&first, &tuple_zero)),
+        ));
+
+        for (formations, expected) in [
+            (
+                vec![
+                    zero_formation.clone(),
+                    StorageHeaderFormation {
+                        path: tuple_zero.clone(),
+                        generation: zero_generation.clone(),
+                        directory: Some(20),
+                        content: Some(BorrowRoots::new()),
+                    },
+                ],
+                StorageFormationError::DuplicateGeneration,
+            ),
+            (
+                vec![
+                    zero_formation.clone(),
+                    StorageHeaderFormation {
+                        path: tuple_zero.clone(),
+                        generation: StorageGeneration::current(StorageOrigin::producer(
+                            &second,
+                            &tuple_zero,
+                        )),
+                        directory: Some(20),
+                        content: Some(BorrowRoots::new()),
+                    },
+                ],
+                StorageFormationError::DuplicateHeaderPath,
+            ),
+            (
+                vec![StorageHeaderFormation {
+                    path: tuple_zero.clone(),
+                    generation: zero_generation.clone(),
+                    directory: None,
+                    content: None,
+                }],
+                StorageFormationError::MissingInitializer,
+            ),
+            (
+                vec![StorageHeaderFormation {
+                    path: tuple_zero.clone(),
+                    generation: zero_generation.clone(),
+                    directory: Some(10),
+                    content: None,
+                }],
+                StorageFormationError::MalformedInitializer,
+            ),
+            (
+                vec![StorageHeaderFormation {
+                    path: tuple_zero.clone(),
+                    generation: one_generation.clone(),
+                    directory: Some(10),
+                    content: Some(BorrowRoots::new()),
+                }],
+                StorageFormationError::GenerationPathMismatch,
+            ),
+        ] {
+            let before = forward_tables.clone();
+            assert_eq!(
+                forward_tables.try_form_headers(
+                    Ty::Tuple(0),
+                    formations,
+                    context,
+                    |existing, incoming| *existing += incoming,
+                    |existing, incoming| existing.extend(incoming),
+                ),
+                Err(expected),
+            );
+            assert_eq!(forward_tables, before);
+        }
+        let mut projection_tables = StorageGenerationTables::<u32, BorrowRoots>::default();
+        for (parameter, root_ty, path) in [
+            (
+                20,
+                Ty::Tuple(1),
+                vec![BorrowProjection::TupleElement(1)],
+            ),
+            (
+                21,
+                Ty::Option(Scalar::Slice(PrimScalar::Int(u8_))),
+                vec![BorrowProjection::ResultOk],
+            ),
+            (
+                22,
+                Ty::Result(
+                    Scalar::Slice(PrimScalar::Int(u8_)),
+                    Scalar::DynArray(PrimScalar::Str),
+                ),
+                vec![BorrowProjection::OptionSome],
+            ),
+            (
+                23,
+                Ty::Enum(0),
+                vec![BorrowProjection::EnumPayload {
+                    variant: 0,
+                    index: 0,
+                }],
+            ),
+            (
+                24,
+                Ty::Enum(0),
+                vec![BorrowProjection::EnumPayload {
+                    variant: 1,
+                    index: 2,
+                }],
+            ),
+        ] {
+            let before = projection_tables.clone();
+            assert_eq!(
+                projection_tables.try_form_header(
+                    root_ty,
+                    &path,
+                    StorageGeneration::parameter_value(parameter, &path),
+                    parameter,
+                    BorrowRoots::new(),
+                    context,
+                    |existing, incoming| *existing += incoming,
+                    |existing, incoming| existing.extend(incoming),
+                ),
+                Err(StorageFormationError::NotHeaderPath),
+            );
+            assert_eq!(projection_tables, before);
+        }
+
+        let field_path = vec![BorrowProjection::StructField(1)];
+        let field_origin = StorageOrigin::producer(&first, &field_path);
+        let generation = StorageGeneration::current(field_origin.clone());
+        let mut tables = StorageGenerationTables::<u32, BorrowRoots>::default();
+        let formed = tables
+            .try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(1)],
+                generation.clone(),
+                1,
+                [BorrowRoot::Param(0)].into_iter().collect(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("the exact owned field is a writable header");
+        assert_eq!(tables.directory.entries.len(), 1);
+        assert_eq!(tables.contents.entries.len(), 1);
+        assert_eq!(
+            formed
+                .leaves
+                .get(&vec![BorrowProjection::StructField(1)])
+                .expect("formed field leaf")
+                .generations,
+            [StorageGenerationRef::root(generation.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            formed.leaves[&vec![BorrowProjection::StructField(1)]].descriptor,
+            Some(StorageHeaderDescriptor {
+                ty: Ty::DynArray(Scalar::Str),
+                kind: StorageHeaderKind::OwnedDynamic,
+            }),
+            "formed known leaves retain the same exact descriptor as their type path",
+        );
+
+        let before = tables.clone();
+        assert_eq!(
+            tables.try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(u32::MAX)],
+                StorageGeneration::current(second_origin.clone()),
+                2,
+                BorrowRoots::new(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            ),
+            Err(StorageFormationError::NotHeaderPath),
+        );
+        assert_eq!(
+            tables, before,
+            "an impossible projection must mutate neither directory nor content",
+        );
+        assert_eq!(
+            tables.try_form_header(
+                Ty::Struct(99),
+                &[],
+                StorageGeneration::current(second_origin),
+                2,
+                BorrowRoots::new(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            ),
+            Err(StorageFormationError::MalformedType),
+        );
+        assert_eq!(tables, before);
+        let recurring = tables
+            .try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(1)],
+                generation.clone(),
+                2,
+                BorrowRoots::new(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("a repeated finite producer advances Current to Prior");
+        assert_eq!(
+            recurring.leaves[&vec![BorrowProjection::StructField(1)]].generations,
+            [StorageGenerationRef::root(generation.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(tables
+            .directory
+            .entries
+            .contains_key(&StorageGeneration::prior(field_origin.clone())));
+        tables
+            .try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(1)],
+                generation.clone(),
+                4,
+                [BorrowRoot::Param(2)].into_iter().collect(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("Prior remains sticky across another completion");
+        assert_eq!(
+            tables.directory.entries
+                [&StorageGeneration::prior(field_origin.clone())],
+            3,
+        );
+        assert_eq!(tables.directory.entries[&generation], 4);
+        let stable_generation = StorageGeneration::parameter_value(
+            9,
+            &[BorrowProjection::StructField(1)],
+        );
+        tables
+            .try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(1)],
+                stable_generation.clone(),
+                3,
+                BorrowRoots::new(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            )
+            .expect("first stable parameter formation");
+        let stable_before = tables.clone();
+        assert_eq!(
+            tables.try_form_header(
+                Ty::Struct(0),
+                &[BorrowProjection::StructField(1)],
+                stable_generation,
+                4,
+                BorrowRoots::new(),
+                context,
+                |existing, incoming| *existing += incoming,
+                |existing, incoming| existing.extend(incoming),
+            ),
+            Err(StorageFormationError::DuplicateGeneration),
+        );
+        assert_eq!(tables, stable_before);
+
+        let root = ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::known(StorageGeneration::parameter_value(0, &[])),
+        );
+        let nested = ProjectedHeaderFact::from_leaf(
+            vec![BorrowProjection::StructField(0)],
+            StorageHeaderLeaf::unknown(
+                [BorrowRoot::ParamStorage(1)].into_iter().collect(),
+            ),
+        );
+        let headers = root.join(&nested);
+        assert!(
+            root.clone()
+                .prefixed(BorrowProjection::TupleElement(0))
+                .leaves
+                .contains_key(&vec![BorrowProjection::TupleElement(0)]),
+        );
+        let selected = headers.project_path(&[BorrowProjection::StructField(0)]);
+        assert_eq!(selected.leaves.len(), 1);
+        assert!(selected.leaves.contains_key(&Vec::new()));
+        assert!(
+            !selected.leaves[&Vec::new()].known,
+            "an empty-path parent header must not inherit into a nested header projection",
+        );
+        let unrelated = headers.project_path(&[BorrowProjection::StructField(1)]);
+        assert!(unrelated.leaves.is_empty());
+        let closure_headers = ProjectedHeaderFact::from_leaf(
+            vec![
+                BorrowProjection::ClosureTarget(7),
+                BorrowProjection::ClosureCapture(3),
+            ],
+            StorageHeaderLeaf::known(StorageGeneration::caller_storage(2, &[])),
+        );
+        assert!(closure_headers
+            .project_path(&[
+                BorrowProjection::ClosureTarget(7),
+                BorrowProjection::ClosureCapture(3),
+            ])
+            .leaves
+            .contains_key(&Vec::new()));
+        assert!(closure_headers
+            .project_path(&[
+                BorrowProjection::ClosureTarget(7),
+                BorrowProjection::ClosureCapture(4),
+            ])
+            .leaves
+            .is_empty());
+        let mut replaced = headers.clone();
+        replaced.replace_path(
+            &[BorrowProjection::StructField(0)],
+            ProjectedHeaderFact::from_leaf(
+                Vec::new(),
+                StorageHeaderLeaf::known(StorageGeneration::parameter_value(2, &[])),
+            ),
+        );
+        assert!(replaced.leaves[&vec![BorrowProjection::StructField(0)]].known);
+
+        // A value header may expose one exact content projection of a shared generation. SoA
+        // column views are the canonical case: `rows.name` and `rows.score` have root value paths
+        // but distinct field selectors, and aggregate/closure prefixes must not flatten those
+        // selectors back into the value path.
+        let selector_origin = StorageOrigin::producer(&second, &[]);
+        let selector_generation = StorageGeneration::current(selector_origin.clone());
+        let underlying_descriptor = StorageHeaderDescriptor {
+            ty: Ty::Soa(0),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let view_descriptor = StorageHeaderDescriptor {
+            ty: Ty::Slice(Scalar::Int(u8_)),
+            kind: StorageHeaderKind::View,
+        };
+        let mut selector_content = MoveValueFact::default();
+        selector_content.non_storage.join_at(
+            &[BorrowProjection::StructField(0)],
+            &BorrowFact::from_direct([BorrowRoot::Param(0)].into_iter().collect()),
+        );
+        selector_content.non_storage.join_at(
+            &[BorrowProjection::StructField(1)],
+            &BorrowFact::from_direct([BorrowRoot::Param(1)].into_iter().collect()),
+        );
+        let mut selector_state = BorrowState::default();
+        selector_state.storage.directory.entries.insert(
+            selector_generation.clone(),
+            MoveGenerationEntry {
+                descriptor: Some(underlying_descriptor),
+                releases: [MoveReleasePlace::Local {
+                    local: 7,
+                    path: Vec::new(),
+                }]
+                .into_iter()
+                .collect(),
+                ended: None,
+            },
+        );
+        selector_state
+            .storage
+            .contents
+            .entries
+            .insert(selector_generation.clone(), selector_content);
+        let column = ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::selected_typed(
+                selector_generation.clone(),
+                vec![BorrowProjection::StructField(0)],
+                view_descriptor,
+            ),
+        );
+        let resolved_column = selector_state.resolve_headers(&column).non_storage.flatten();
+        assert!(resolved_column.contains(&BorrowRoot::Param(0)));
+        assert!(!resolved_column.contains(&BorrowRoot::Param(1)));
+        assert!(resolved_column.contains(&BorrowRoot::Local(7)));
+        let sibling = ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::selected_typed(
+                selector_generation.clone(),
+                vec![BorrowProjection::StructField(1)],
+                view_descriptor,
+            ),
+        );
+        let resolved_sibling = selector_state.resolve_headers(&sibling).non_storage.flatten();
+        assert!(resolved_sibling.contains(&BorrowRoot::Param(1)));
+        assert!(!resolved_sibling.contains(&BorrowRoot::Param(0)));
+
+        let saved_column = column
+            .clone()
+            .prefixed(BorrowProjection::StructField(2))
+            .prefixed(BorrowProjection::ClosureCapture(1))
+            .prefixed(BorrowProjection::ClosureTarget(5));
+        let restored_column = saved_column.project_path(&[
+            BorrowProjection::ClosureTarget(5),
+            BorrowProjection::ClosureCapture(1),
+            BorrowProjection::StructField(2),
+        ]);
+        let restored_reference = restored_column.leaves[&Vec::new()]
+            .generations
+            .iter()
+            .next()
+            .expect("saved column reference");
+        assert_eq!(
+            restored_reference.content_path,
+            vec![BorrowProjection::StructField(0)],
+        );
+        assert_eq!(restored_column.leaves[&Vec::new()].descriptor, Some(view_descriptor));
+        assert_eq!(
+            restored_reference.select_content_path([
+                BorrowProjection::ArrayElement(3),
+                BorrowProjection::StructField(4),
+            ]),
+            vec![
+                BorrowProjection::StructField(0),
+                BorrowProjection::ArrayElement(3),
+                BorrowProjection::StructField(4),
+            ],
+            "scalar reads and stores must prefix the column selector before their element path",
+        );
+
+        let root_control = StorageHeaderLeaf::known_typed(
+            selector_generation.clone(),
+            underlying_descriptor,
+        );
+        assert!(root_control
+            .generations
+            .iter()
+            .all(|reference| reference.content_path.is_empty()));
+        let unknown_same_type = StorageHeaderLeaf::unknown_typed(
+            [BorrowRoot::ParamStorage(9)].into_iter().collect(),
+            view_descriptor,
+        );
+        let conservative_column = column.leaves[&Vec::new()].join(&unknown_same_type);
+        assert_eq!(conservative_column.descriptor, Some(view_descriptor));
+        assert!(!conservative_column.known);
+        let incompatible = StorageHeaderLeaf::unknown_typed(
+            BorrowRoots::new(),
+            StorageHeaderDescriptor {
+                ty: Ty::Slice(Scalar::Bool),
+                kind: StorageHeaderKind::View,
+            },
+        );
+        assert_eq!(conservative_column.join(&incompatible).descriptor, None);
+
+        let selector_renames = StorageGenerationRenames::from_origins([
+            selector_origin.clone(),
+        ]);
+        let mut renamed_column = column.clone();
+        renamed_column.rename_generations(&selector_renames);
+        let renamed_reference = renamed_column.leaves[&Vec::new()]
+            .generations
+            .iter()
+            .next()
+            .expect("renamed column reference");
+        assert_eq!(
+            renamed_reference.generation,
+            StorageGeneration::prior(selector_origin),
+        );
+        assert_eq!(
+            renamed_reference.content_path,
+            vec![BorrowProjection::StructField(0)],
+        );
+
+        let current = StorageGeneration::current(first_origin.clone());
+        let prior = StorageGeneration::prior(first_origin.clone());
+        let stable = StorageGeneration::caller_storage(0, &[]);
+        let mut renames = StorageGenerationRenames::default();
+        renames.insert(first_origin.clone());
+        assert_eq!(
+            renames,
+            StorageGenerationRenames::from_origins([first_origin]),
+        );
+        let mut rename_headers = ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf {
+                generations: [current.clone(), stable.clone()]
+                    .into_iter()
+                    .map(StorageGenerationRef::root)
+                    .collect(),
+                descriptor: None,
+                known: true,
+                fallback_roots: BorrowRoots::new(),
+            },
+        );
+        rename_headers.rename_generations(&renames);
+        assert_eq!(
+            rename_headers.leaves[&Vec::new()].generations,
+            [prior.clone(), stable]
+                .into_iter()
+                .map(StorageGenerationRef::root)
+                .collect(),
+        );
+
+        let mut directory = StorageGenerationDirectory {
+            entries: [(current.clone(), 2_u32), (prior.clone(), 3_u32)]
+                .into_iter()
+                .collect(),
+        };
+        directory.rename_current_to_prior(&renames, |existing, incoming| {
+            *existing += incoming;
+        });
+        assert_eq!(directory.entries, [(prior.clone(), 5)].into_iter().collect());
+        let mut contents = StorageGenerationContents {
+            entries: [
+                (
+                    current,
+                    [BorrowRoot::Param(0)].into_iter().collect::<BorrowRoots>(),
+                ),
+                (
+                    prior.clone(),
+                    [BorrowRoot::Param(1)].into_iter().collect::<BorrowRoots>(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        contents.rename_current_to_prior(&renames, |existing, incoming| {
+            existing.extend(incoming);
+        });
+        assert_eq!(
+            contents.entries[&prior],
+            [BorrowRoot::Param(0), BorrowRoot::Param(1)]
+                .into_iter()
+                .collect(),
+            "Current content must merge into the sticky Prior entry",
+        );
+    }
+
+    #[test]
+    fn storage_generation_expr_variant_sweep() {
+        let source = include_str!("hir.rs");
+        let marker = "pub enum ExprKind {";
+        let definition = source.find(marker).expect("ExprKind definition");
+        let mut variants = 0usize;
+        for line in source[definition + marker.len()..].lines() {
+            if line == "}" {
+                break;
+            }
+            if let Some(top_level) = line.strip_prefix("    ")
+                && !top_level.starts_with(' ')
+                && top_level
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic)
+                && (top_level.ends_with(',') || top_level.ends_with('{'))
+            {
+                variants += 1;
+            }
+        }
+        assert_eq!(
+            variants, 268,
+            "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
+        );
+
+        let u8_ = IntTy {
+            bits: 8,
+            signed: false,
+        };
+        let i64_ = IntTy {
+            bits: 64,
+            signed: true,
+        };
+        let tuples = vec![
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynArray(PrimScalar::Str),
+                    Scalar::DynArray(PrimScalar::Str),
+                ],
+            },
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::DynArray(PrimScalar::Str),
+                    Scalar::DynArray(PrimScalar::Int(i64_)),
+                    Scalar::DynArray(PrimScalar::Int(i64_)),
+                ],
+            },
+        ];
+        let context = StorageTypeContext {
+            structs: &[],
+            tuples: &tuples,
+            enums: &[],
+            tagged_types: &[],
+        };
+        let span = Span::new(0, 0, 0);
+        let leaf = || Expr {
+            kind: ExprKind::Int(0),
+            ty: Ty::Int(i64_),
+            span,
+        };
+
+        let literal = Expr {
+            kind: ExprKind::ArrayLit {
+                elems: vec![leaf(), leaf()],
+                elem: Ty::Int(i64_),
+                pooled: false,
+            },
+            ty: Ty::Array(Scalar::Int(i64_), 2),
+            span,
+        };
+        assert_eq!(
+            classify_storage_expression(&literal, context, None),
+            StorageExprClassification {
+                policy: StorageVariantPolicy::Fresh(StorageContentInitializer::FixedLiteral),
+                results: vec![StorageClassifiedResult {
+                    role: StorageExprRole::HeaderProducer,
+                    path: Vec::new(),
+                    header_kind: Some(StorageHeaderKind::InlineFixed),
+                    header_ty: Some(Ty::Array(Scalar::Int(i64_), 2)),
+                    initializer: StorageContentInitializer::FixedLiteral,
+                }],
+                valid: true,
+            },
+        );
+
+        let partition = Expr {
+            kind: ExprKind::ArrayPartition {
+                source: Box::new(leaf()),
+                stages: Vec::new(),
+                func: "predicate".to_string(),
+                captures: Vec::new(),
+                elem: Ty::Str,
+            },
+            ty: Ty::Tuple(0),
+            span,
+        };
+        let partition_class = classify_storage_expression(&partition, context, None);
+        assert!(partition_class.valid);
+        assert_eq!(
+            partition_class
+                .results
+                .iter()
+                .map(|result| (result.path.clone(), result.initializer))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    vec![BorrowProjection::TupleElement(0)],
+                    StorageContentInitializer::PartitionElement,
+                ),
+                (
+                    vec![BorrowProjection::TupleElement(1)],
+                    StorageContentInitializer::PartitionElement,
+                ),
+            ],
+            "multi-result ordinals must be exact and source ordered",
+        );
+
+        let group = Expr {
+            kind: ExprKind::ArrayGroupAgg {
+                base: 0,
+                struct_id: 0,
+                key_field: 0,
+                value_field: Some(1),
+                op: hir::GroupOp::Sum,
+                source: hir::GroupSource::AosStr,
+            },
+            ty: Ty::Tuple(0),
+            span,
+        };
+        assert_eq!(
+            classify_storage_expression(&group, context, None)
+                .results
+                .into_iter()
+                .map(|result| result.path)
+                .collect::<Vec<_>>(),
+            vec![
+                vec![BorrowProjection::TupleElement(0)],
+                vec![BorrowProjection::TupleElement(1)],
+            ],
+        );
+        let group_multi = Expr {
+            kind: ExprKind::ArrayGroupAggMulti {
+                base: 0,
+                struct_id: 0,
+                key_field: 0,
+                aggs: vec![
+                    hir::GroupAgg1 {
+                        op: hir::GroupOp::Sum,
+                        value_field: Some(1),
+                    },
+                    hir::GroupAgg1 {
+                        op: hir::GroupOp::Count,
+                        value_field: None,
+                    },
+                ],
+                source: hir::GroupSource::AosStr,
+            },
+            ty: Ty::Tuple(1),
+            span,
+        };
+        let group_multi_class = classify_storage_expression(&group_multi, context, None);
+        assert_eq!(group_multi_class.results.len(), 3);
+        assert!(group_multi_class.results.iter().enumerate().all(|(index, result)| {
+            result.path == vec![BorrowProjection::TupleElement(index as u32)]
+                && result.initializer == StorageContentInitializer::GroupAggregation
+        }));
+        let malformed_group_multi = Expr {
+            kind: ExprKind::ArrayGroupAggMulti {
+                base: 0,
+                struct_id: 0,
+                key_field: 0,
+                aggs: vec![hir::GroupAgg1 {
+                    op: hir::GroupOp::Sum,
+                    value_field: Some(1),
+                }],
+                source: hir::GroupSource::SoaI64,
+            },
+            ty: Ty::Tuple(0),
+            span,
+        };
+        let malformed_group_class =
+            classify_storage_expression(&malformed_group_multi, context, None);
+        assert!(!malformed_group_class.valid);
+        assert_eq!(malformed_group_class.results[0].role, StorageExprRole::NoStorage);
+        let malformed_group_cardinality = Expr {
+            kind: ExprKind::ArrayGroupAggMulti {
+                base: 0,
+                struct_id: 0,
+                key_field: 0,
+                aggs: vec![
+                    hir::GroupAgg1 {
+                        op: hir::GroupOp::Sum,
+                        value_field: Some(1),
+                    },
+                    hir::GroupAgg1 {
+                        op: hir::GroupOp::Count,
+                        value_field: None,
+                    },
+                ],
+                source: hir::GroupSource::AosStr,
+            },
+            ty: Ty::Tuple(0),
+            span,
+        };
+        assert!(!classify_storage_expression(
+            &malformed_group_cardinality,
+            context,
+            None,
+        )
+        .valid);
+
+        let captured_slice = Expr {
+            kind: ExprKind::Local(0),
+            ty: Ty::Slice(Scalar::Int(i64_)),
+            span,
+        };
+        let closure = Expr {
+            kind: ExprKind::Closure {
+                lifted: "lifted".to_string(),
+                captures: vec![captured_slice],
+            },
+            ty: Ty::Fn(0),
+            span,
+        };
+        let closure_class = classify_storage_expression(&closure, context, Some(3));
+        assert_eq!(
+            closure_class.results[0].path,
+            vec![
+                BorrowProjection::ClosureTarget(3),
+                BorrowProjection::ClosureCapture(0),
+            ],
+        );
+        assert_eq!(
+            closure_class.results[0].role,
+            StorageExprRole::HeaderForwarder,
+        );
+        assert!(!classify_storage_expression(&closure, context, None).valid);
+
+        let chunks = Expr {
+            kind: ExprKind::ArrayChunks {
+                source: Box::new(leaf()),
+                n: Box::new(leaf()),
+                elem: Ty::Int(i64_),
+            },
+            ty: Ty::DynSliceArray(PrimScalar::Int(i64_)),
+            span,
+        };
+        let chunks_class = classify_storage_expression(&chunks, context, None);
+        assert_eq!(chunks_class.results[0].role, StorageExprRole::CarrierProducer);
+        assert_eq!(
+            chunks_class.results[0].initializer,
+            StorageContentInitializer::CarrierSource,
+        );
+        for carrier_ty in [
+            Ty::DynSliceArray(PrimScalar::Int(i64_)),
+            Ty::DynVecArray(Scalar::Int(i64_), 4),
+            Ty::DynMaskArray(Scalar::Int(i64_), 4),
+            Ty::DynFixedArray(Scalar::Slice(PrimScalar::Int(u8_)), 2),
+            Ty::DynFixedStructArray(0, 2),
+            Ty::DynResponseArray,
+            Ty::DictEncoded(0, 0),
+        ] {
+            let carrier_call = Expr {
+                kind: ExprKind::Call {
+                    func: "carrier".to_string(),
+                    args: Vec::new(),
+                    type_args: Vec::new(),
+                },
+                ty: carrier_ty,
+                span,
+            };
+            let class = classify_storage_expression(&carrier_call, context, None);
+            assert!(class.valid, "carrier type {carrier_ty:?}");
+            assert_eq!(class.results.len(), 1, "carrier type {carrier_ty:?}");
+            assert_eq!(
+                class.results[0].role,
+                StorageExprRole::CarrierProducer,
+                "carrier type {carrier_ty:?}",
+            );
+            assert_eq!(
+                class.results[0].initializer,
+                StorageContentInitializer::CallSummary,
+            );
+        }
+
+        let call = Expr {
+            kind: ExprKind::Call {
+                func: "produce".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            ty: Ty::DynArray(Scalar::Str),
+            span,
+        };
+        let call_class = classify_storage_expression(&call, context, None);
+        assert_eq!(call_class.results[0].role, StorageExprRole::HeaderProducer);
+        assert_eq!(
+            call_class.results[0].initializer,
+            StorageContentInitializer::CallSummary,
+        );
+        let call_fn_value = Expr {
+            kind: ExprKind::CallFnValue {
+                callee: Box::new(Expr {
+                    kind: ExprKind::FnValue("produce".to_string()),
+                    ty: Ty::Fn(0),
+                    span,
+                }),
+                args: Vec::new(),
+            },
+            ty: Ty::DynArray(Scalar::Str),
+            span,
+        };
+        let raw_call = Expr {
+            kind: ExprKind::RawCall {
+                guard: None,
+                callee: Box::new(leaf()),
+                args: Vec::new(),
+                param_tys: Vec::new(),
+                param_modes: Vec::new(),
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
+            },
+            ty: Ty::DynArray(Scalar::Str),
+            span,
+        };
+        for call in [&call, &call_fn_value, &raw_call] {
+            let class = classify_storage_expression(call, context, None);
+            assert_eq!(class.results.len(), 1);
+            assert_eq!(class.results[0].role, StorageExprRole::HeaderProducer);
+            assert_eq!(
+                class.results[0].initializer,
+                StorageContentInitializer::CallSummary,
+            );
+        }
+        let view_call = Expr {
+            kind: ExprKind::Call {
+                func: "view".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            ty: Ty::Slice(Scalar::Int(u8_)),
+            span,
+        };
+        let view_call_class = classify_storage_expression(&view_call, context, None);
+        assert_eq!(
+            view_call_class.results[0].header_kind,
+            Some(StorageHeaderKind::View),
+        );
+        assert_eq!(
+            view_call_class.results[0].initializer,
+            StorageContentInitializer::CallSummary,
+            "call-produced views retain the summary initializer and are consumed as unknown identities",
+        );
+
+        let initializer_cases = [
+            (
+                Expr {
+                    kind: ExprKind::CloneIn {
+                        value: Box::new(leaf()),
+                        region: Box::new(leaf()),
+                    },
+                    ty: Ty::Slice(Scalar::Int(u8_)),
+                    span,
+                },
+                StorageContentInitializer::CloneIn,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::JsonDocElems {
+                        doc: Box::new(leaf()),
+                    },
+                    ty: Ty::Slice(Scalar::JsonDoc),
+                    span,
+                },
+                StorageContentInitializer::JsonDocElements,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::ArrayToSoa {
+                        source: Box::new(leaf()),
+                        struct_id: 0,
+                    },
+                    ty: Ty::Soa(0),
+                    span,
+                },
+                StorageContentInitializer::SoaColumns,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::JsonDecodeSoa {
+                        struct_id: 0,
+                        input: Box::new(leaf()),
+                    },
+                    ty: Ty::Result(Scalar::Soa(0), Scalar::Unit),
+                    span,
+                },
+                StorageContentInitializer::SoaColumns,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::JsonDecodeArray {
+                        elem: Ty::Int(i64_),
+                        input: Box::new(leaf()),
+                    },
+                    ty: Ty::Result(
+                        Scalar::DynArray(PrimScalar::Int(i64_)),
+                        Scalar::Unit,
+                    ),
+                    span,
+                },
+                StorageContentInitializer::JsonDecoded,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::JsonDecodeStructArray {
+                        struct_id: 0,
+                        input: Box::new(leaf()),
+                    },
+                    ty: Ty::Result(Scalar::DynStructArray(0), Scalar::Unit),
+                    span,
+                },
+                StorageContentInitializer::JsonDecoded,
+            ),
+        ];
+        for (expression, expected) in initializer_cases {
+            let class = classify_storage_expression(&expression, context, None);
+            assert!(class.valid, "initializer case {:?}", expression.kind);
+            assert!(class.results.iter().all(|result| {
+                result.role == StorageExprRole::HeaderProducer
+                    && result.initializer == expected
+            }));
+        }
+        let missing_initializer = Expr {
+            kind: ExprKind::Int(0),
+            ty: Ty::DynArray(Scalar::Int(i64_)),
+            span,
+        };
+        let missing_class = classify_storage_expression(&missing_initializer, context, None);
+        assert!(!missing_class.valid);
+        assert_eq!(missing_class.results[0].role, StorageExprRole::NoStorage);
+
+        let read_only = Expr {
+            kind: ExprKind::FsReadBytesView {
+                path: Box::new(Expr {
+                    kind: ExprKind::Str("path".to_string()),
+                    ty: Ty::Str,
+                    span,
+                }),
+            },
+            ty: Ty::Result(Scalar::Slice(PrimScalar::Int(u8_)), Scalar::Unit),
+            span,
+        };
+        let read_only_class = classify_storage_expression(&read_only, context, None);
+        assert!(read_only_class.valid);
+        assert_eq!(read_only_class.results[0].role, StorageExprRole::NoStorage);
+
+        let slice_ty = Ty::Slice(Scalar::Int(u8_));
+        let option_none = Expr {
+            kind: ExprKind::OptionNone,
+            ty: Ty::Option(Scalar::Slice(PrimScalar::Int(u8_))),
+            span,
+        };
+        assert_eq!(
+            classify_storage_expression(&option_none, context, None).results,
+            vec![StorageClassifiedResult {
+                role: StorageExprRole::NoStorage,
+                path: Vec::new(),
+                header_kind: None,
+                header_ty: None,
+                initializer: StorageContentInitializer::None,
+            }],
+            "None must not publish the inactive Some header",
+        );
+        let option_some = Expr {
+            kind: ExprKind::OptionSome(Box::new(Expr {
+                kind: ExprKind::Local(0),
+                ty: slice_ty,
+                span,
+            })),
+            ty: Ty::Option(Scalar::Slice(PrimScalar::Int(u8_))),
+            span,
+        };
+        let option_some_class = classify_storage_expression(&option_some, context, None);
+        assert_eq!(option_some_class.results.len(), 1);
+        assert_eq!(
+            option_some_class.results[0].path,
+            vec![BorrowProjection::OptionSome],
+        );
+
+        let enums = vec![hir::EnumDef {
+            name: "Choice".to_string(),
+            source_name: "Choice".to_string(),
+            variants: vec![
+                hir::EnumVariant {
+                    name: "Left".to_string(),
+                    payload: vec![Scalar::Slice(PrimScalar::Int(u8_))],
+                    field_base: 1,
+                },
+                hir::EnumVariant {
+                    name: "Right".to_string(),
+                    payload: vec![Scalar::Slice(PrimScalar::Int(u8_))],
+                    field_base: 2,
+                },
+            ],
+        }];
+        let sum_context = StorageTypeContext {
+            structs: &[],
+            tuples: &tuples,
+            enums: &enums,
+            tagged_types: &[],
+        };
+        let enum_value = Expr {
+            kind: ExprKind::EnumValue {
+                enum_id: 0,
+                variant: 1,
+                payload: vec![Expr {
+                    kind: ExprKind::Local(0),
+                    ty: slice_ty,
+                    span,
+                }],
+            },
+            ty: Ty::Enum(0),
+            span,
+        };
+        let enum_class = classify_storage_expression(&enum_value, sum_context, None);
+        assert!(enum_class.valid);
+        assert_eq!(enum_class.results.len(), 1);
+        assert_eq!(
+            enum_class.results[0].path,
+            vec![BorrowProjection::EnumPayload {
+                variant: 1,
+                index: 0,
+            }],
+            "an enum constructor must publish only its active payload ordinal",
+        );
+        let malformed_enum = Expr {
+            kind: ExprKind::EnumValue {
+                enum_id: 0,
+                variant: 9,
+                payload: Vec::new(),
+            },
+            ty: Ty::Enum(0),
+            span,
+        };
+        assert!(!classify_storage_expression(&malformed_enum, sum_context, None).valid);
+
+        let encoded = Expr {
+            kind: ExprKind::ArrayDictEncode {
+                base: 0,
+                struct_id: 0,
+                key_field: 0,
+            },
+            ty: Ty::DictEncoded(0, 0),
+            span,
+        };
+        let encoded_class = classify_storage_expression(&encoded, context, None);
+        assert!(encoded_class.valid);
+        assert_eq!(encoded_class.results[0].role, StorageExprRole::CarrierProducer);
+        assert_eq!(
+            encoded_class.results[0].initializer,
+            StorageContentInitializer::CarrierSource,
+        );
+
+        assert!(
+            !storage_type_paths(Ty::DynStructArray(0, Layout::Soa), context).valid,
+            "a malformed dynamic SoA header must fail closed",
+        );
+
+        for expression in [
+            Expr {
+                kind: ExprKind::BufferBytes {
+                    buffer: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::StrBytes {
+                    inner: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::RunBytesStdout {
+                    out: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::RunBytesStderr {
+                    out: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::HttpRespBody {
+                    resp: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::HttpCtxBody {
+                    ctx: Box::new(leaf()),
+                },
+                ty: slice_ty,
+                span,
+            },
+            Expr {
+                kind: ExprKind::ResourceViewFromRaw {
+                    owner: Box::new(leaf()),
+                    ptr: Box::new(leaf()),
+                    len: Box::new(leaf()),
+                    resource: 0,
+                    view: hir::ResourceViewKind::Slice(Scalar::Int(u8_)),
+                },
+                ty: slice_ty,
+                span,
+            },
+        ] {
+            let class = classify_storage_expression(&expression, context, None);
+            assert_eq!(class.results[0].role, StorageExprRole::HeaderProducer);
+            assert_eq!(
+                class.results[0].initializer,
+                StorageContentInitializer::UnknownView,
+                "non-header owners publish fallback-only views and never mint storage",
+            );
+        }
+
+        let malformed = Expr {
+            kind: ExprKind::Local(0),
+            ty: Ty::Tagged(99),
+            span,
+        };
+        assert!(
+            !classify_storage_expression(&malformed, context, None).valid,
+            "malformed type metadata must fail closed before any consumer mutates state",
+        );
+
+    }
+
+    #[test]
+    fn storage_generation_move_action_directory_matrix() {
+        let (mut program, diagnostics) = check(
+            "\
+Holder { values: array<i64>, ignored: i64 }
+fn explicit_array(source: array<i64>) -> array<i64> { return source }
+fn tail_array(source: array<i64>) -> array<i64> = source
+fn explicit_holder(source: Holder) -> Holder { return source }
+fn tail_holder(source: Holder) -> Holder = source
+fn harness(source: array<i64>) -> i32 = 0
+fn main() -> i32 = 0
+",
+        );
+        assert!(!diagnostics.has_errors(), "fixture must check");
+        let int = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let mixed_result = program.structs.len() as u32;
+        program.structs.push(StructDef {
+            name: "MixedStorageResult".to_string(),
+            source_name: "MixedStorageResult".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "owned".to_string(),
+                    ty: Ty::DynArray(int),
+                },
+                FieldDef {
+                    name: "chunks".to_string(),
+                    ty: Ty::DynSliceArray(PrimScalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        });
+        let nested_row = program.structs.len() as u32;
+        program.structs.push(StructDef {
+            name: "NestedStorageRow".to_string(),
+            source_name: "NestedStorageRow".to_string(),
+            fields: vec![FieldDef {
+                name: "view".to_string(),
+                ty: Ty::Slice(int),
+            }],
+            align: None,
+            c_repr: false,
+        });
+        let named = [
+            (
+                "carrier_selected".to_string(),
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![1],
+                    captures: Vec::new(),
+                },
+            ),
+            (
+                "mixed_selected".to_string(),
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![1],
+                    captures: Vec::new(),
+                },
+            ),
+            (
+                "owned_nested".to_string(),
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![0],
+                    captures: Vec::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let named_modes = std::collections::HashMap::new();
+        let named_borrow_mut_retention = std::collections::HashMap::new();
+        let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
+        let callable_target_ids = std::collections::HashMap::new();
+        let parallel_targets = CallableTransferSet::new();
+        macro_rules! checker {
+            ($function:expr, $sink:expr) => {{
+                let function = $function;
+                MoveCheck {
+                    f: function,
+                    diags: $sink,
+                    named_return_borrow: &named,
+                    named_parallel_transfer: &named,
+                    named_param_modes: &named_modes,
+                    named_borrow_mut_retention: &named_borrow_mut_retention,
+                    summary_dependencies: None,
+                    tuples: &program.tuples,
+                    structs: &program.structs,
+                    enums: &program.enums,
+                    tagged_types: &program.tagged_types,
+                    fn_types: &program.fn_types,
+                    callable_targets: &callable_targets,
+                    callable_target_ids: &callable_target_ids,
+                    callable_parallel_targets: &parallel_targets,
+                    loop_breaks: Vec::new(),
+                    #[cfg(test)]
+                    loop_borrow_breaks: Vec::new(),
+                    #[cfg(test)]
+                    loop_value_breaks: Vec::new(),
+                    borrows: BorrowState::default(),
+                    next_pipeline_snapshot: 0,
+                    loop_value_facts: std::collections::HashMap::new(),
+                    control_value_facts: std::collections::HashMap::new(),
+                    walked_value_facts: std::collections::HashMap::new(),
+                    walked_storage_facts: std::collections::HashMap::new(),
+                    walked_backing_facts: std::collections::HashMap::new(),
+                    pending_call_completions: std::collections::HashMap::new(),
+                    mutable_call_argument_snapshots: std::collections::HashSet::new(),
+                    borrow_mut_place_snapshots: std::collections::HashSet::new(),
+                    value_snapshot_frames: Vec::new(),
+                    reported_invalid_value_actions: std::collections::HashSet::new(),
+                    loop_iter_drops: Vec::new(),
+                    arena_depth: 0,
+                    return_roots: BorrowRoots::new(),
+                    parallel_transfer_roots: BorrowRoots::new(),
+                    borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+                    non_fallthrough: std::collections::HashSet::new(),
+                    borrow_fact_cache: std::cell::RefCell::new(None),
+                    collecting_move_children: false,
+                    move_children: Vec::new(),
+                    borrowed_projection_locals: borrowed_projection_locals(&function.body),
+                }
+            }};
+        }
+        let function = |name: &str| {
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+
+        for (name, expected_path, explicit) in [
+            ("explicit_array", Vec::new(), true),
+            ("tail_array", Vec::new(), false),
+            (
+                "explicit_holder",
+                vec![BorrowProjection::StructField(0)],
+                true,
+            ),
+            (
+                "tail_holder",
+                vec![BorrowProjection::StructField(0)],
+                false,
+            ),
+        ] {
+            let function = function(name);
+            let source = function.params[0];
+            let mut sink = Diagnostics::new();
+            let mut checker = checker!(function, &mut sink);
+            checker.seed_parameter_storage(0, source, ast::ParamMode::ByValue);
+            let mut moved = MovedSet::new();
+            let falls_through = checker.block(
+                &function.body,
+                &mut moved,
+                checker.is_move_ty(function.ret),
+                true,
+            );
+            if explicit {
+                assert!(!falls_through, "explicit return is a control edge");
+            } else {
+                assert!(falls_through, "tail return reaches the function action");
+                checker.finish_function_tail(true);
+            }
+            let headers = checker.borrows.headers.get(&source).expect("parameter headers");
+            let leaf = headers.leaves.get(&expected_path).expect("exact returned leaf");
+            assert_eq!(leaf.generations.len(), 1, "{name}");
+            let generation = &leaf.generations.iter().next().unwrap().generation;
+            let entry = checker
+                .borrows
+                .storage
+                .directory
+                .entries
+                .get(generation)
+                .expect("returned directory entry");
+            assert_eq!(
+                entry.releases,
+                [MoveReleasePlace::Returned {
+                    path: expected_path.clone(),
+                }]
+                .into_iter()
+                .collect(),
+                "{name} preserves the exact top-level/aggregate result path",
+            );
+            assert_eq!(entry.ended, None, "return transfers rather than ends ownership");
+            assert!(!entry.releases.iter().any(
+                |release| matches!(release, MoveReleasePlace::Local { local, .. } if *local == source)
+            ));
+        }
+
+        let harness = function("harness");
+        let source = harness.params[0];
+        let mut nested_parameter = harness.clone();
+        nested_parameter.locals[source as usize].ty = Ty::Array(
+            Scalar::Slice(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+            2,
+        );
+        let mut sink = Diagnostics::new();
+        let mut checker = checker!(&nested_parameter, &mut sink);
+        checker.seed_parameter_storage(0, source, ast::ParamMode::ByValue);
+        let root_generation = StorageGeneration::current(StorageOrigin::inline_place(
+            source,
+            &[],
+        ));
+        let root_content = &checker.borrows.storage.contents.entries[&root_generation];
+        for index in 0..2 {
+            let path = vec![BorrowProjection::ArrayElement(index)];
+            let leaf = root_content
+                .headers
+                .leaves
+                .get(&path)
+                .unwrap_or_else(|| panic!("missing nested parameter generation at {path:?}"));
+            assert_eq!(
+                leaf.generations,
+                [StorageGenerationRef::root(
+                    StorageGeneration::caller_storage(0, &path),
+                )]
+                .into_iter()
+                .collect(),
+                "a fixed parameter generation must publish every descendant view header in its content",
+            );
+        }
+
+        #[derive(Clone, Copy)]
+        enum RawStop {
+            None,
+            Guard,
+            Callee,
+            Argument,
+        }
+        let span = Span::new(0, 0, 0);
+        let raw_call = |source: LocalId, source_ty: Ty, stop: RawStop| Expr {
+            kind: ExprKind::RawCall {
+                guard: Some(Box::new(Expr {
+                    kind: if matches!(stop, RawStop::Guard) {
+                        ExprKind::ProcessAbort
+                    } else {
+                        ExprKind::Bool(true)
+                    },
+                    ty: Ty::Bool,
+                    span,
+                })),
+                callee: Box::new(Expr {
+                    kind: if matches!(stop, RawStop::Callee) {
+                        ExprKind::ProcessAbort
+                    } else {
+                        ExprKind::Unit
+                    },
+                    ty: Ty::Raw,
+                    span,
+                }),
+                args: vec![
+                    Expr {
+                        kind: ExprKind::Local(source),
+                        ty: source_ty,
+                        span,
+                    },
+                    Expr {
+                        kind: if matches!(stop, RawStop::Argument) {
+                            ExprKind::ProcessAbort
+                        } else {
+                            ExprKind::Unit
+                        },
+                        ty: Ty::Unit,
+                        span,
+                    },
+                ],
+                param_tys: vec![source_ty, Ty::Unit],
+                param_modes: vec![ast::ParamMode::ByValue; 2],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: Ty::Unit,
+            span,
+        };
+        let harness = function("harness");
+        let source = harness.params[0];
+        let source_ty = harness.locals[source as usize].ty;
+        for (label, stop, expected_fallthrough) in [
+            ("success", RawStop::None, true),
+            ("guard", RawStop::Guard, false),
+            ("callee", RawStop::Callee, false),
+            ("argument", RawStop::Argument, false),
+        ] {
+            let call = raw_call(source, source_ty, stop);
+            let mut sink = Diagnostics::new();
+            let mut checker = checker!(harness, &mut sink);
+            checker.seed_parameter_storage(0, source, ast::ParamMode::ByValue);
+            let generation = checker.borrows.headers[&source].leaves[&Vec::new()]
+                .generations
+                .iter()
+                .next()
+                .unwrap()
+                .generation
+                .clone();
+            let mut moved = MovedSet::new();
+            assert_eq!(
+                checker.expr(&call, &mut moved, false, false),
+                expected_fallthrough,
+                "RawCall {label} control edge",
+            );
+            let entry = &checker.borrows.storage.directory.entries[&generation];
+            if expected_fallthrough {
+                assert!(whole_moved(&moved, source), "successful RawCall commits its ByValue Move");
+                assert_eq!(entry.ended, Some(BorrowEnd::Consumed));
+            } else {
+                assert!(!whole_moved(&moved, source), "RawCall {label} publishes no parent action");
+                assert_eq!(entry.ended, None, "RawCall {label} leaves the release live");
+            }
+        }
+
+        let mut sink = Diagnostics::new();
+        let mut checker = checker!(harness, &mut sink);
+        checker.loop_iter_drops.push(Vec::new());
+        let outer = Expr {
+            kind: ExprKind::Call {
+                func: "outer_producer".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            ty: Ty::Struct(0),
+            span,
+        };
+        let outer_headers = checker.form_storage_completion(&outer, &BorrowFact::default());
+        checker.loop_iter_drops.push(Vec::new());
+        let inner = Expr {
+            kind: ExprKind::Call {
+                func: "inner_producer".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            ty: Ty::Struct(0),
+            span,
+        };
+        let inner_headers = checker.form_storage_completion(&inner, &BorrowFact::default());
+        let path = vec![BorrowProjection::StructField(0)];
+        for (headers, depth, expression) in [
+            (&outer_headers, 1, MoveCheck::expr_key(&outer)),
+            (&inner_headers, 2, MoveCheck::expr_key(&inner)),
+        ] {
+            let generation = &headers.leaves[&path]
+                .generations
+                .iter()
+                .next()
+                .unwrap()
+                .generation;
+            assert_eq!(
+                checker.borrows.storage.directory.entries[generation].releases,
+                [MoveReleasePlace::IterTemp {
+                    depth,
+                    expression,
+                    path: path.clone(),
+                }]
+                .into_iter()
+                .collect(),
+            );
+        }
+        MoveCheck::invalidate_iteration_drops(&mut checker.borrows, &[], 2);
+        let outer_generation = &outer_headers.leaves[&path]
+            .generations
+            .iter()
+            .next()
+            .unwrap()
+            .generation;
+        let inner_generation = &inner_headers.leaves[&path]
+            .generations
+            .iter()
+            .next()
+            .unwrap()
+            .generation;
+        assert_eq!(checker.borrows.storage.directory.entries[outer_generation].ended, None);
+        assert_eq!(
+            checker.borrows.storage.directory.entries[inner_generation].ended,
+            Some(BorrowEnd::Dropped),
+            "the exact loop edge ends depth-two IterTemp without touching its outer sibling",
+        );
+
+        let mut sink = Diagnostics::new();
+        let mut checker = checker!(harness, &mut sink);
+        let producer = Expr {
+            kind: ExprKind::Call {
+                func: "make".to_string(),
+                args: Vec::new(),
+                type_args: Vec::new(),
+            },
+            ty: source_ty,
+            span,
+        };
+        let scalar = Expr {
+            kind: ExprKind::Len(Box::new(producer)),
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span,
+        };
+        let ExprKind::Len(producer) = &scalar.kind else { unreachable!() };
+        let producer_key = MoveCheck::expr_key(producer);
+        checker.begin_value_snapshot_frame();
+        let mut moved = MovedSet::new();
+        assert!(checker.expr(&scalar, &mut moved, false, false));
+        let frontier = checker.finish_value_snapshot_frame();
+        assert!(
+            frontier.contains(&producer_key),
+            "a scalar wrapper propagates its storage-producing child completion",
+        );
+        let generation = checker.borrows.value_headers[&producer_key].leaves[&Vec::new()]
+            .generations
+            .iter()
+            .next()
+            .unwrap()
+            .generation
+            .clone();
+        let entry = &checker.borrows.storage.directory.entries[&generation];
+        assert!(entry.releases.iter().any(
+            |release| matches!(release, MoveReleasePlace::Staging { action, path, .. }
+                if *action == producer_key && path.is_empty())
+        ));
+        assert_eq!(
+            entry.ended,
+            Some(BorrowEnd::Dropped),
+            "make().len() drops the completed child staging generation at the scalar boundary",
+        );
+        let harness = function("harness");
+
+        let mut sink = Diagnostics::new();
+        let mut checker = checker!(harness, &mut sink);
+        let selected_generation = StorageGeneration::parameter_value(41, &[]);
+        let unrelated_generation = StorageGeneration::parameter_value(40, &[]);
+        let array_descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynArray(int),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let argument = |local| Expr {
+            kind: ExprKind::Local(local),
+            ty: Ty::DynArray(int),
+            span,
+        };
+        let carrier_call = Expr {
+            kind: ExprKind::Call {
+                func: "carrier_selected".to_string(),
+                args: vec![argument(0), argument(1)],
+                type_args: Vec::new(),
+            },
+            ty: Ty::DynSliceArray(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+            span,
+        };
+        let ExprKind::Call { args, .. } = &carrier_call.kind else { unreachable!() };
+        for (argument, generation) in args
+            .iter()
+            .zip([unrelated_generation.clone(), selected_generation.clone()])
+        {
+            checker.borrows.begin_value_headers(
+                MoveCheck::expr_key(argument),
+                ProjectedHeaderFact::from_leaf(
+                    Vec::new(),
+                    StorageHeaderLeaf::known_typed(generation, array_descriptor),
+                ),
+            );
+        }
+        let carrier_headers =
+            checker.form_storage_completion(&carrier_call, &BorrowFact::default());
+        assert_eq!(
+            carrier_headers.leaves[&Vec::new()].generations,
+            [StorageGenerationRef::root(selected_generation.clone())]
+                .into_iter()
+                .collect(),
+            "a call carrier retains only the return-summary-selected generation",
+        );
+
+        let response_call = Expr {
+            kind: ExprKind::Call {
+                func: "carrier_selected".to_string(),
+                args: vec![argument(0), argument(1)],
+                type_args: Vec::new(),
+            },
+            ty: Ty::DynResponseArray,
+            span,
+        };
+        let ExprKind::Call { args, .. } = &response_call.kind else { unreachable!() };
+        for (argument, generation) in args
+            .iter()
+            .zip([unrelated_generation.clone(), selected_generation.clone()])
+        {
+            checker.borrows.begin_value_headers(
+                MoveCheck::expr_key(argument),
+                ProjectedHeaderFact::from_leaf(
+                    Vec::new(),
+                    StorageHeaderLeaf::known_typed(generation, array_descriptor),
+                ),
+            );
+        }
+        assert!(
+            checker
+                .form_storage_completion(&response_call, &BorrowFact::default())
+                .leaves
+                .is_empty(),
+            "response/vector/mask carriers must not inherit unrelated storage dependencies",
+        );
+
+        let mixed_call = Expr {
+            kind: ExprKind::Call {
+                func: "mixed_selected".to_string(),
+                args: vec![argument(0), argument(1)],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Struct(mixed_result),
+            span,
+        };
+        let ExprKind::Call { args, .. } = &mixed_call.kind else { unreachable!() };
+        for (argument, generation) in args
+            .iter()
+            .zip([unrelated_generation.clone(), selected_generation.clone()])
+        {
+            checker.borrows.begin_value_headers(
+                MoveCheck::expr_key(argument),
+                ProjectedHeaderFact::from_leaf(
+                    Vec::new(),
+                    StorageHeaderLeaf::known_typed(generation, array_descriptor),
+                ),
+            );
+        }
+        let mixed_headers =
+            checker.form_storage_completion(&mixed_call, &BorrowFact::default());
+        let owned_path = vec![BorrowProjection::StructField(0)];
+        let carrier_path = vec![BorrowProjection::StructField(1)];
+        assert!(
+            mixed_headers.leaves[&owned_path]
+                .generations
+                .iter()
+                .all(|reference| reference.generation != selected_generation),
+            "the mixed owned result must form its own generation",
+        );
+        assert_eq!(
+            mixed_headers.leaves[&carrier_path].generations,
+            [StorageGenerationRef::root(selected_generation.clone())]
+                .into_iter()
+                .collect(),
+            "a mixed carrier sibling keeps the exact selected source without suppressing owned formation",
+        );
+
+        let nested_argument = Expr {
+            kind: ExprKind::Local(0),
+            ty: Ty::Slice(int),
+            span,
+        };
+        let nested_source = StorageGeneration::caller_storage(50, &[]);
+        let nested_call = Expr {
+            kind: ExprKind::Call {
+                func: "owned_nested".to_string(),
+                args: vec![nested_argument],
+                type_args: Vec::new(),
+            },
+            ty: Ty::DynStructArray(nested_row, Layout::Aos),
+            span,
+        };
+        let ExprKind::Call { args, .. } = &nested_call.kind else { unreachable!() };
+        checker.borrows.begin_value_headers(
+            MoveCheck::expr_key(&args[0]),
+            ProjectedHeaderFact::from_leaf(
+                Vec::new(),
+                StorageHeaderLeaf::known_typed(
+                    nested_source.clone(),
+                    StorageHeaderDescriptor {
+                        ty: Ty::Slice(int),
+                        kind: StorageHeaderKind::View,
+                    },
+                ),
+            ),
+        );
+        let nested_headers =
+            checker.form_storage_completion(&nested_call, &BorrowFact::default());
+        let nested_generation = &nested_headers.leaves[&Vec::new()]
+            .generations
+            .iter()
+            .next()
+            .expect("owned call result generation")
+            .generation;
+        assert_eq!(
+            checker.borrows.storage.contents.entries[nested_generation]
+                .headers
+                .leaves[&vec![BorrowProjection::StructField(0)]]
+                .generations,
+            [StorageGenerationRef::root(nested_source)]
+                .into_iter()
+                .collect(),
+            "owned call content normalizes a selected direct view into the exact nested field path",
+        );
+    }
+
+    #[test]
+    fn storage_generation_control_edge_join_matrix() {
+        let span = Span::new(0, 0, 0);
+        let expression = Expr {
+            kind: ExprKind::Unit,
+            ty: Ty::Unit,
+            span,
+        };
+        let origin = StorageOrigin::producer(&expression, &[]);
+        let current = StorageGeneration::current(origin.clone());
+        let prior = StorageGeneration::prior(origin.clone());
+        let descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynArray(Scalar::Int(IntTy {
+                signed: true,
+                bits: 64,
+            })),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let header = |generation: StorageGeneration| {
+            ProjectedHeaderFact::from_leaf(
+                Vec::new(),
+                StorageHeaderLeaf::known_typed(generation, descriptor),
+            )
+        };
+        let entry = |local| MoveGenerationEntry {
+            descriptor: Some(descriptor),
+            releases: [MoveReleasePlace::Local {
+                local,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            ended: None,
+        };
+        let content = |parameter| MoveValueFact {
+            non_storage: BorrowFact::from_direct(
+                [BorrowRoot::Param(parameter)].into_iter().collect(),
+            ),
+            headers: ProjectedHeaderFact::default(),
+        };
+        let state = |entries: Vec<(StorageGeneration, MoveGenerationEntry, MoveValueFact)>| {
+            let mut state = BorrowState::default();
+            for (generation, directory, content) in entries {
+                state
+                    .storage
+                    .directory
+                    .entries
+                    .insert(generation.clone(), directory);
+                state.storage.contents.entries.insert(generation, content);
+            }
+            state
+        };
+        let skip = MoveControlEdge {
+            moved: MovedSet::new(),
+            borrows: state(vec![(current.clone(), entry(0), content(0))]),
+            value: MoveValueFact {
+                non_storage: BorrowFact::default(),
+                headers: header(current.clone()),
+            },
+            advances: StorageGenerationRenames::default(),
+        };
+        let mut executed = MoveControlEdge {
+            moved: MovedSet::new(),
+            borrows: state(vec![
+                (prior.clone(), entry(0), content(0)),
+                (current.clone(), entry(1), content(1)),
+            ]),
+            value: MoveValueFact {
+                non_storage: BorrowFact::default(),
+                headers: header(current.clone()),
+            },
+            advances: StorageGenerationRenames::from_origins([origin.clone()]),
+        };
+
+        executed
+            .borrows
+            .storage
+            .directory
+            .entries
+            .get_mut(&prior)
+            .expect("executed edge prior generation")
+            .ended = Some(BorrowEnd::Dropped);
+
+        let joined = skip.clone().join(executed.clone());
+        assert!(
+            joined == executed.clone().join(skip.clone()),
+            "control-edge joins must be order-commutative",
+        );
+        assert_eq!(
+            joined.advances,
+            StorageGenerationRenames::from_origins([origin.clone()]),
+            "the joined edge must carry its finite advance frontier into the next outer join",
+        );
+        assert_eq!(
+            joined.value.headers.leaves[&Vec::new()].generations,
+            [
+                StorageGenerationRef::root(current.clone()),
+                StorageGenerationRef::root(prior.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            "the skipped old Current must be demoted before joining the executed edge's fresh Current",
+        );
+        assert_eq!(
+            joined
+                .borrows
+                .storage
+                .directory
+                .entries
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [current.clone(), prior.clone()].into_iter().collect(),
+            "a branch-local control result must keep both table generations reachable even before local installation",
+        );
+        assert_eq!(
+            joined.borrows.storage.contents.entries[&current]
+                .non_storage
+                .flatten(),
+            [BorrowRoot::Param(1)].into_iter().collect(),
+        );
+        assert_eq!(
+            joined.borrows.storage.contents.entries[&prior]
+                .non_storage
+                .flatten(),
+            [BorrowRoot::Param(0)].into_iter().collect(),
+        );
+        assert_eq!(
+            joined.borrows.storage.directory.entries[&prior].releases,
+            [MoveReleasePlace::Local {
+                local: 0,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            "the demoted generation keeps the skipped edge's stable release owner",
+        );
+        assert_eq!(
+            joined.borrows.storage.directory.entries[&prior].ended,
+            Some(BorrowEnd::Dropped),
+            "a generation ending is sticky when the peer edge still carries its old Current live",
+        );
+        assert_eq!(
+            joined.borrows.storage.directory.entries[&current].releases,
+            [MoveReleasePlace::Local {
+                local: 1,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            "the fresh generation keeps the executed edge's stable release owner",
+        );
+        assert!(
+            MoveControlEdge::join_reachable([Some(skip.clone()), None]) == Some(skip),
+            "a diverging edge contributes neither value nor state",
+        );
+    }
+
+    #[test]
+    fn escape_storage_generation_resolver_matrix() {
+        let int = Scalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let float = Scalar::Float(FloatTy { bits: 64 });
+        let parent_descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynStructArray(0, Layout::Aos),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let soa_descriptor = StorageHeaderDescriptor {
+            ty: Ty::Soa(0),
+            kind: StorageHeaderKind::View,
+        };
+        let int_owned_descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynArray(int),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let int_view_descriptor = StorageHeaderDescriptor {
+            ty: Ty::Slice(int),
+            kind: StorageHeaderKind::View,
+        };
+        let float_owned_descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynArray(float),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let generation = |parameter| StorageGeneration::parameter_value(parameter, &[]);
+        let parent = generation(0);
+        let exact_nested = generation(1);
+        let int_candidate = generation(7);
+        let float_candidate = generation(8);
+        let entry = |descriptor, region, local, ended| EscapeGenerationEntry {
+            descriptor: Some(descriptor),
+            storage_region: region,
+            allocation: EscapeAllocationMode {
+                individual: true,
+                may_individual: true,
+            },
+            releases: [EscapeReleasePlace::Local {
+                local,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            ended,
+        };
+
+        let mut state = EscapeState::default();
+        state.storage.directory.entries.insert(
+            parent.clone(),
+            entry(parent_descriptor, Region::Static, 7, None),
+        );
+        state.storage.directory.entries.insert(
+            exact_nested.clone(),
+            entry(
+                int_owned_descriptor,
+                Region::Caller(1),
+                99,
+                Some(BorrowEnd::Dropped),
+            ),
+        );
+        state.storage.contents.entries.insert(
+            exact_nested.clone(),
+            EscapeGenerationContent::default(),
+        );
+        state.storage.contents.entries.insert(
+            parent.clone(),
+            EscapeGenerationContent {
+                direct_regions: EscapeRegionFact::default(),
+                dependencies: ProjectedHeaderFact {
+                    leaves: [
+                        (
+                            vec![BorrowProjection::StructField(0)],
+                            StorageHeaderLeaf::known_typed(
+                                exact_nested.clone(),
+                                int_view_descriptor,
+                            ),
+                        ),
+                        (
+                            vec![BorrowProjection::StructField(1)],
+                            StorageHeaderLeaf::unknown_typed(
+                                [BorrowRoot::Param(3)].into_iter().collect(),
+                                int_view_descriptor,
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            },
+        );
+        let resolved = state.resolve_storage_headers(&ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::known_typed(parent.clone(), soa_descriptor),
+        ));
+        let resolved = &resolved[&Vec::new()];
+        assert_eq!(resolved.value_descriptor, Some(soa_descriptor));
+        assert_eq!(
+            resolved.storage_descriptor,
+            Some(parent_descriptor),
+            "a forwarded view descriptor must not overwrite the underlying generation shape",
+        );
+        assert!(
+            resolved.identity_known,
+            "unknown nested content must not poison the exact writable parent identity",
+        );
+        assert_eq!(resolved.storage_region, Some(Region::Static));
+        assert_eq!(
+            resolved.releases,
+            [EscapeReleasePlace::Local {
+                local: 7,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            "nested releases never become parent backing metadata",
+        );
+        assert_eq!(resolved.ended, None);
+        assert_eq!(
+            resolved.content.ended,
+            [(
+                vec![BorrowProjection::StructField(0)],
+                BorrowEnd::Dropped,
+            )]
+            .into_iter()
+            .collect(),
+            "a nested ending stays on its selected content field",
+        );
+        assert_eq!(
+            resolved.content.unknown,
+            [vec![BorrowProjection::StructField(1)]]
+                .into_iter()
+                .collect(),
+            "an unknown SoA field must not poison its exact sibling",
+        );
+        assert_eq!(
+            resolved.content.regions.projected,
+            [
+                (vec![BorrowProjection::StructField(0)], Region::Caller(1)),
+                (vec![BorrowProjection::StructField(1)], Region::Caller(3)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        state
+            .storage
+            .contents
+            .entries
+            .get_mut(&parent)
+            .expect("parent content")
+            .dependencies
+            .leaves
+            .insert(
+                vec![BorrowProjection::StructField(2)],
+                StorageHeaderLeaf::unknown_typed(
+                    [BorrowRoot::EndedParamStorage(9, BorrowEnd::Consumed)]
+                        .into_iter()
+                        .collect(),
+                    int_view_descriptor,
+                ),
+            );
+        let nested_ended = state.resolve_storage_headers(&ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::known_typed(parent.clone(), soa_descriptor),
+        ));
+        let nested_ended = &nested_ended[&Vec::new()];
+        assert_eq!(
+            nested_ended.ended, None,
+            "a nested fallback ending must not become the parent generation's ending",
+        );
+        assert_eq!(
+            nested_ended.content.ended[&vec![BorrowProjection::StructField(2)]],
+            BorrowEnd::Consumed,
+            "nested storage endings are projected into the selected content path",
+        );
+        assert_eq!(
+            nested_ended.content.regions.projected
+                [&vec![BorrowProjection::StructField(2)]],
+            Region::Caller(9),
+        );
+
+        let parameter_fallbacks = ProjectedHeaderFact {
+            leaves: [
+                (
+                    vec![BorrowProjection::TupleElement(0)],
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::Param(4)].into_iter().collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+                (
+                    vec![BorrowProjection::TupleElement(1)],
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::ParamStorage(5)].into_iter().collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+                (
+                    vec![BorrowProjection::TupleElement(2)],
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::EndedParam(6, BorrowEnd::Dropped)]
+                            .into_iter()
+                            .collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+                (
+                    vec![BorrowProjection::TupleElement(3)],
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::EndedParamStorage(7, BorrowEnd::Consumed)]
+                            .into_iter()
+                            .collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let resolved = state.resolve_storage_headers(&parameter_fallbacks);
+        let contained = &resolved[&vec![BorrowProjection::TupleElement(0)]];
+        assert_eq!(contained.storage_region, None);
+        assert_eq!(contained.content.regions.direct, Some(Region::Caller(4)));
+        assert!(!contained.identity_known);
+        let storage = &resolved[&vec![BorrowProjection::TupleElement(1)]];
+        assert_eq!(storage.storage_region, Some(Region::Caller(5)));
+        assert_eq!(storage.content.regions.direct, None);
+        assert!(!storage.identity_known);
+        let ended_content = &resolved[&vec![BorrowProjection::TupleElement(2)]];
+        assert_eq!(ended_content.ended, None);
+        assert_eq!(
+            ended_content.content.ended,
+            [(Vec::new(), BorrowEnd::Dropped)].into_iter().collect(),
+            "EndedParam is contained-value evidence, not an outer storage ending",
+        );
+        let ended_storage = &resolved[&vec![BorrowProjection::TupleElement(3)]];
+        assert_eq!(ended_storage.ended, Some(BorrowEnd::Consumed));
+        assert!(ended_storage.content.ended.is_empty());
+
+        state.storage.directory.entries.insert(
+            int_candidate.clone(),
+            entry(
+                int_owned_descriptor,
+                Region::Caller(7),
+                70,
+                Some(BorrowEnd::Dropped),
+            ),
+        );
+        state.storage.directory.entries.insert(
+            float_candidate.clone(),
+            entry(float_owned_descriptor, Region::Arena(2), 80, None),
+        );
+        state
+            .storage
+            .contents
+            .entries
+            .insert(int_candidate.clone(), EscapeGenerationContent::default());
+        state
+            .storage
+            .contents
+            .entries
+            .insert(float_candidate.clone(), EscapeGenerationContent::default());
+        state.storage_values.insert(
+            43,
+            EscapeValueFact {
+                headers: ProjectedHeaderFact {
+                    leaves: [
+                        (
+                            vec![BorrowProjection::StructField(0)],
+                            StorageHeaderLeaf::known_typed(
+                                int_candidate.clone(),
+                                int_owned_descriptor,
+                            ),
+                        ),
+                        (
+                            vec![BorrowProjection::StructField(1)],
+                            StorageHeaderLeaf::known_typed(
+                                float_candidate.clone(),
+                                float_owned_descriptor,
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                ..EscapeValueFact::default()
+            },
+        );
+        let compatible = state.resolve_storage_headers(&ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::unknown_typed(
+                [BorrowRoot::Local(43)].into_iter().collect(),
+                int_view_descriptor,
+            ),
+        ));
+        let compatible = &compatible[&Vec::new()];
+        assert_eq!(compatible.storage_region, Some(Region::Caller(7)));
+        assert_eq!(compatible.storage_descriptor, None);
+        assert_eq!(compatible.allocation, None);
+        assert!(
+            compatible.releases.is_empty(),
+            "a Local fallback must never acquire a candidate generation's release owner",
+        );
+        assert_eq!(
+            compatible.ended, None,
+            "a candidate generation ending is content evidence for a fallback, not outer metadata",
+        );
+        assert_eq!(
+            compatible.content.ended,
+            [(Vec::new(), BorrowEnd::Dropped)].into_iter().collect(),
+        );
+
+        let ended_local = state.resolve_storage_headers(&ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::unknown_typed(
+                [BorrowRoot::EndedLocal(43, BorrowEnd::Consumed)]
+                    .into_iter()
+                    .collect(),
+                int_view_descriptor,
+            ),
+        ));
+        let ended_local = &ended_local[&Vec::new()];
+        assert_eq!(ended_local.ended, Some(BorrowEnd::Consumed));
+        assert_eq!(ended_local.storage_descriptor, None);
+        assert_eq!(ended_local.allocation, None);
+        assert!(ended_local.releases.is_empty());
+        assert_eq!(
+            ended_local.content.ended,
+            [(Vec::new(), BorrowEnd::Dropped)].into_iter().collect(),
+            "the compatible candidate's own ending remains contained evidence",
+        );
+
+        state.storage_values.insert(
+            42,
+            EscapeValueFact {
+                headers: ProjectedHeaderFact::from_leaf(
+                    Vec::new(),
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::Local(42)].into_iter().collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+                ..EscapeValueFact::default()
+            },
+        );
+        let cycle_and_sibling = ProjectedHeaderFact {
+            leaves: [
+                (
+                    vec![BorrowProjection::TupleElement(0)],
+                    StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::Local(42)].into_iter().collect(),
+                        int_view_descriptor,
+                    ),
+                ),
+                (
+                    vec![BorrowProjection::TupleElement(1)],
+                    StorageHeaderLeaf::known_typed(
+                        int_candidate,
+                        int_owned_descriptor,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let resolved = state.resolve_storage_headers(&cycle_and_sibling);
+        let cycle = &resolved[&vec![BorrowProjection::TupleElement(0)]];
+        assert_eq!(
+            cycle.content.unknown,
+            [Vec::new()].into_iter().collect(),
+            "a Local↔generation fallback cycle marks only that value subtree unknown",
+        );
+        let sibling = &resolved[&vec![BorrowProjection::TupleElement(1)]];
+        assert!(sibling.identity_known);
+        assert!(sibling.content.unknown.is_empty());
+    }
+
+    #[test]
+    fn escape_storage_generation_parameter_seed_matrix() {
+        let int = Scalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let structures = vec![
+            StructDef {
+                name: "PlainBorrowAggregate".to_string(),
+                source_name: "PlainBorrowAggregate".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "plain".to_string(),
+                        ty: Ty::Str,
+                    },
+                    FieldDef {
+                        name: "optional".to_string(),
+                        ty: Ty::Option(Scalar::Str),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            },
+            StructDef {
+                name: "MixedBorrowAggregate".to_string(),
+                source_name: "MixedBorrowAggregate".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "plain".to_string(),
+                        ty: Ty::Str,
+                    },
+                    FieldDef {
+                        name: "values".to_string(),
+                        ty: Ty::Slice(Scalar::Str),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            },
+        ];
+        let context = StorageTypeContext {
+            structs: &structures,
+            tuples: &[],
+            enums: &[],
+            tagged_types: &[],
+        };
+        let mut state = EscapeState::default();
+
+        seed_escape_parameter_storage(
+            &mut state,
+            0,
+            0,
+            Ty::Str,
+            ast::ParamMode::ByValue,
+            context,
+        );
+        assert_eq!(
+            state.storage_values[&0].non_storage,
+            EscapeRegionFact::from_direct(Region::Caller(0)),
+        );
+        assert!(state.storage_values[&0].headers.leaves.is_empty());
+
+        seed_escape_parameter_storage(
+            &mut state,
+            1,
+            1,
+            Ty::Struct(0),
+            ast::ParamMode::ByValue,
+            context,
+        );
+        assert_eq!(
+            state.storage_values[&1].non_storage.projected,
+            [
+                (vec![BorrowProjection::StructField(0)], Region::Caller(1)),
+                (
+                    vec![
+                        BorrowProjection::StructField(1),
+                        BorrowProjection::OptionSome,
+                    ],
+                    Region::Caller(1),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            "a header-free aggregate still seeds every exact ordinary borrow leaf",
+        );
+        assert!(state.storage_values[&1].headers.leaves.is_empty());
+
+        seed_escape_parameter_storage(
+            &mut state,
+            2,
+            2,
+            Ty::Struct(1),
+            ast::ParamMode::ByValue,
+            context,
+        );
+        let mixed_path = vec![BorrowProjection::StructField(1)];
+        assert_eq!(
+            state.storage_values[&2].non_storage.projected,
+            [(vec![BorrowProjection::StructField(0)], Region::Caller(2))]
+                .into_iter()
+                .collect(),
+            "the header generation owns the slice's contained provenance without duplicating it in non_storage",
+        );
+        let mixed_generation = StorageGeneration::caller_storage(2, &mixed_path);
+        assert_eq!(
+            state.storage_values[&2].headers.leaves[&mixed_path].generations,
+            [StorageGenerationRef::root(mixed_generation.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            state.storage.directory.entries[&mixed_generation].storage_region,
+            Region::Caller(2),
+        );
+        assert!(state.storage.directory.entries[&mixed_generation]
+            .releases
+            .is_empty());
+        assert_eq!(
+            state.storage.contents.entries[&mixed_generation]
+                .direct_regions
+                .direct,
+            Some(Region::Caller(2)),
+        );
+
+        seed_escape_parameter_storage(
+            &mut state,
+            3,
+            3,
+            Ty::Array(Scalar::Str, 2),
+            ast::ParamMode::ByValue,
+            context,
+        );
+        let fixed_generation =
+            StorageGeneration::current(StorageOrigin::inline_place(3, &[]));
+        assert_eq!(
+            state.storage_values[&3].headers.leaves[&Vec::new()].generations,
+            [StorageGenerationRef::root(fixed_generation.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            state.storage.directory.entries[&fixed_generation].releases,
+            [EscapeReleasePlace::Local {
+                local: 3,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            state.storage.directory.entries[&fixed_generation].storage_region,
+            Region::Frame,
+        );
+        assert_eq!(
+            state.storage.contents.entries[&fixed_generation]
+                .direct_regions
+                .direct,
+            Some(Region::Caller(3)),
+        );
+
+        seed_escape_parameter_storage(
+            &mut state,
+            4,
+            4,
+            Ty::DynArray(Scalar::Str),
+            ast::ParamMode::ByValue,
+            context,
+        );
+        let owned_generation = StorageGeneration::parameter_value(4, &[]);
+        let owned_entry = &state.storage.directory.entries[&owned_generation];
+        assert_eq!(owned_entry.storage_region, Region::Frame);
+        assert_eq!(
+            owned_entry.releases,
+            [EscapeReleasePlace::Local {
+                local: 4,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            owned_entry.allocation,
+            EscapeAllocationMode {
+                individual: true,
+                may_individual: true,
+            },
+        );
+        assert!(state.storage_values[&4].storage_is_local);
+        assert!(state.storage_values[&4].individual);
+
+        seed_escape_parameter_storage(
+            &mut state,
+            5,
+            5,
+            Ty::DynArray(int),
+            ast::ParamMode::ByValue,
+            context,
+        );
+        let primitive_generation = StorageGeneration::parameter_value(5, &[]);
+        assert_eq!(
+            state.storage.contents.entries[&primitive_generation]
+                .direct_regions,
+            EscapeRegionFact::default(),
+            "primitive collection storage identity must not manufacture Param content provenance",
+        );
+
+        for (position, mode) in [
+            (6, ast::ParamMode::Borrow),
+            (7, ast::ParamMode::BorrowMut),
+            (8, ast::ParamMode::Out),
+        ] {
+            seed_escape_parameter_storage(
+                &mut state,
+                position,
+                position,
+                Ty::DynArray(Scalar::Str),
+                mode,
+                context,
+            );
+            let generation = StorageGeneration::caller_storage(position, &[]);
+            let entry = &state.storage.directory.entries[&generation];
+            assert_eq!(entry.storage_region, Region::Caller(position));
+            assert!(entry.releases.is_empty());
+            assert_eq!(
+                entry.allocation,
+                EscapeAllocationMode {
+                    individual: false,
+                    may_individual: false,
+                },
+            );
+            assert!(!state.storage_values[&position].storage_is_local);
+            assert!(!state.storage_values[&position].individual);
+            assert!(!state.storage_values[&position].may_individual);
+        }
+        assert_eq!(
+            state.storage.directory.entries.len(),
+            7,
+            "header-free parameters add value facts but no ghost generations",
+        );
+        assert_eq!(
+            state.storage.directory.entries.keys().collect::<Vec<_>>(),
+            state.storage.contents.entries.keys().collect::<Vec<_>>(),
+            "every seeded generation has exactly one directory and content initializer",
+        );
+    }
+
+    #[test]
+    fn storage_generation_deep_control_uses_recursive_join_authority() {
+        let control = (0..32).fold(
+            "if select_first { [first_view].to_array() } else { [second_view].to_array() }"
+                .to_string(),
+            |inner, _| format!("{{\n{inner}\n}}"),
+        );
+        let source = |replacement: &str| {
+            "\
+fn inspect(borrow value: Option<array<str>>) -> i32 = 0
+fn probe(select_first: bool) -> i32 {
+  mut first_owner := \"first\".clone()
+  first_view: str := first_owner
+  second_owner := \"second\".clone()
+  second_view: str := second_owner
+  wrapped: Option<array<str>> := Some(__CONTROL__)
+  __REPLACEMENT__
+  return inspect(wrapped)
+}
+fn main() -> i32 = 0
+"
+            .replace("__CONTROL__", &control)
+            .replace("__REPLACEMENT__", replacement)
+        };
+        let (_, diagnostics) = check(&source("first_owner = \"replacement\".clone()"));
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "use of invalidated borrow 'wrapped': its source 'first_owner' was moved or reassigned (or its storage was reallocated); create a new view from the current source",
+                "value snapshot was invalidated before the enclosing operation: owner 'first_owner' was moved, reassigned, or reallocated by a later eager operand",
+            ],
+            "the deep branch's exact diagnostic multiset must name only the invalidated owner",
+        );
+
+        let (_, clean) = check(&source("_ := first_owner.len()"));
+        assert!(
+            !clean.has_errors(),
+            "the same 32-wrapper recursive route must remain clean while both owners are live: {:?}",
+            clean
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn storage_generation_repeated_control_routes_keep_generation_recency() {
+        let wrap = |expression: &str| {
+            (0..32).fold(expression.to_string(), |inner, _| format!("{{\n{inner}\n}}"))
+        };
+        let common = |control: String, declaration: &str| {
+            "fn probe(advance: bool, stop: bool, choice: Option<i64>, stable_view: slice<i64>) -> i32 {
+  mut values := [0].to_array()
+  __DECLARATION__
+  _ := selected.len()
+  return 0
+}
+fn main() -> i32 = 0
+"
+            .replace("__DECLARATION__", declaration)
+            .replace("__CONTROL__", &control)
+        };
+        let if_source = |then_value: &str, else_value: &str| {
+            common(
+                wrap(
+                    &"if advance {
+  values = [1].to_array()
+  __THEN__
+} else {
+  __ELSE__
+}"
+                    .replace("__THEN__", then_value)
+                    .replace("__ELSE__", else_value),
+                ),
+                "mut selected: slice<i64> := stable_view
+  loop {
+    selected = __CONTROL__
+    if stop { break }
+  }",
+            )
+        };
+        let match_source = |then_value: &str, else_value: &str| {
+            common(
+                wrap(
+                    &"match choice {
+  Some(_) => {
+    values = [1].to_array()
+    __THEN__
+  }
+  None => __ELSE__
+}"
+                    .replace("__THEN__", then_value)
+                    .replace("__ELSE__", else_value),
+                ),
+                "mut selected: slice<i64> := stable_view
+  loop {
+    selected = __CONTROL__
+    if stop { break }
+  }",
+            )
+        };
+        let else_source = |success_value: &str, fallback_value: &str| {
+            common(
+                wrap(
+                    &"candidate else {
+  values = [1].to_array()
+  __FALLBACK__
+}"
+                    .replace("__FALLBACK__", fallback_value),
+                ),
+                &"mut selected: slice<i64> := stable_view
+  loop {
+    candidate: Option<slice<i64>> := if advance { None } else { Some(__SUCCESS__) }
+    selected = __CONTROL__
+    if stop { break }
+  }"
+                .replace("__SUCCESS__", success_value),
+            )
+        };
+        let loop_break_source = |break_value: &str| {
+            common(
+                wrap(
+                    &"loop {
+  if advance {
+    values = [1].to_array()
+    if stop { break __BREAK__ }
+  } else {
+    if stop { break __BREAK__ }
+  }
+}"
+                    .replace("__BREAK__", break_value),
+                ),
+                "selected: slice<i64> := __CONTROL__",
+            )
+        };
+
+        for (name, bad, clean) in [
+            ("if", if_source("values", "values"), if_source("stable_view", "stable_view")),
+            (
+                "match",
+                match_source("values", "values"),
+                match_source("stable_view", "stable_view"),
+            ),
+            (
+                "else",
+                else_source("values[..]", "values[..]"),
+                else_source("stable_view", "stable_view"),
+            ),
+            (
+                "loop-break",
+                loop_break_source("values"),
+                loop_break_source("stable_view"),
+            ),
+        ] {
+            let (_, diagnostics) = check(&bad);
+            let mut messages = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>();
+            let (invalid_borrowers, snapshot_count): (&[&str], usize) = match name {
+                "if" | "match" => (&["values", "selected"], 35),
+                "else" => (&["values", "candidate", "selected"], 3),
+                "loop-break" => (&["selected"], 1),
+                _ => unreachable!(),
+            };
+            let mut expected = invalid_borrowers
+                .iter()
+                .map(|borrower| {
+                    format!(
+                        "use of invalidated borrow '{borrower}': its source 'values' was moved or reassigned (or its storage was reallocated); create a new view from the current source"
+                    )
+                })
+                .chain(
+                    std::iter::repeat(
+                        "value snapshot was invalidated before the enclosing operation: owner 'values' was moved, reassigned, or reallocated by a later eager operand".to_string(),
+                    )
+                    .take(snapshot_count),
+                )
+                .collect::<Vec<_>>();
+            messages.sort();
+            expected.sort();
+            assert_eq!(
+                messages, expected,
+                "the repeated {name} route must preserve the exact old/new generation diagnostic multiset",
+            );
+
+            let (_, diagnostics) = check(&clean);
+            assert!(
+                !diagnostics.has_errors(),
+                "the repeated {name} producer may advance when the completed control value selects only stable storage: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_result_storage_materialization_inventory_is_closed() {
+        let int = Scalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let primitive_int = PrimScalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let owned = [
+            Ty::Array(int, 1),
+            Ty::StructArray(0, 1),
+            Ty::DynSliceArray(primitive_int),
+            Ty::DynArray(int),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::DynVecArray(int, 4),
+            Ty::DynMaskArray(int, 4),
+            Ty::DynFixedArray(int, 2),
+            Ty::DynFixedStructArray(0, 2),
+            Ty::DynResponseArray,
+        ];
+        assert!(owned
+            .into_iter()
+            .all(|ty| materializes_indexed_result_storage(ty, &[])));
+
+        for view in [Ty::Slice(int), Ty::Soa(0), Ty::SoaParam(0)] {
+            assert!(
+                !materializes_indexed_result_storage(view, &[]),
+                "a borrowed indexed header must remain eligible to forward compatible storage",
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_calls_publish_parallel_transfer_before_advancing_destinations() {
+        let (program, diagnostics) = check(
+            "\
+fn length(value: str) -> i64 = value.len()
+fn one(borrow mut values: slice<str>) -> i64 = values.par_map(length).sum()
+fn many(borrow mut values: slice<str>, offset: i64) -> i64 = values.par_map(length).sum() + offset
+fn scalar(borrow mut value: string) -> i64 {
+  view: str := value
+  return [view].par_map(length).sum()
+}
+fn direct(borrow mut values: slice<str>) -> i64 = one(values)
+fn eager(borrow mut values: slice<str>) -> i64 = many(values, 0)
+fn indirect(borrow mut value: string) -> i64 {
+  apply := scalar
+  return apply(value)
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "parallel-transfer owner must form valid HIR: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        let expected = hir::ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        for name in ["direct", "eager", "indirect"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name} function"));
+            assert_eq!(
+                function.parallel_transfer, expected,
+                "{name} must map its callee's worker-transfer root through the pre-call mutable-argument snapshot",
+            );
+        }
+    }
+
+    #[test]
     fn run_bytes_is_not_a_function_value_return() {
         assert!(!fn_value_ret_ok(Ty::RunBytes));
         assert!(fn_value_ret_ok(Ty::Result(
@@ -50133,6 +65892,35 @@ mod tests {
         assert!(
             !diagnostics.has_errors(),
             "generic resource Result must materialize at the concrete call boundary: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn result_constructor_transfers_its_resource_payload_without_self_invalidation() {
+        let internal = concat!(
+            "module pkg.resource.internal\n",
+            "pub fn drop_handle(value: raw) { unsafe { raw.free(value) } }\n",
+        );
+        let package = concat!(
+            "module pkg.resource\n",
+            "import pkg.resource.internal\n",
+            "pub Failure { Invalid }\n",
+            "pub resource Handle = pkg.resource.internal.drop_handle\n",
+            "pub fn open() -> Result<Handle, Failure> {\n",
+            "  unsafe {\n",
+            "    owner: Handle := resource.from_raw(raw.alloc(8))\n",
+            "    return Ok(owner)\n",
+            "  }\n",
+            "}\n",
+        );
+        let (_, diagnostics) = check_modules(&[
+            ("pkg.resource.internal", internal, false),
+            ("pkg.resource", package, true),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "an aggregate's own resource transfer must not look like later eager invalidation: {:?}",
             diagnostics.iter().collect::<Vec<_>>()
         );
     }
@@ -50567,13 +66355,20 @@ fn main() -> i32 = 0
             callable_target_ids: &callable_target_ids,
             callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_borrow_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_value_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
-            loop_borrow_breaks: Vec::new(),
-            loop_value_breaks: Vec::new(),
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -50896,13 +66691,20 @@ fn main() -> i32 = 0
             callable_target_ids: &callable_target_ids,
             callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_borrow_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_value_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
-            loop_borrow_breaks: Vec::new(),
-            loop_value_breaks: Vec::new(),
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -50917,11 +66719,11 @@ fn main() -> i32 = 0
             borrowed_projection_locals: borrowed_projection_locals(&function.body),
         };
         assert!(
-            checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(&args[0])),
+            checker.intentional_action_snapshot(call, MoveCheck::expr_key(&args[0])),
             "the exact exclusive-argument snapshot is the one intentional generation transition",
         );
         assert!(
-            !checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(callee)),
+            !checker.intentional_action_snapshot(call, MoveCheck::expr_key(callee)),
             "a single borrow-mut argument must not suppress the callee snapshot",
         );
 
@@ -51973,6 +67775,8 @@ fn exit_branch(flag: bool) -> i64 {
         // `shorter` picks the shorter-lived (the one that bounds a view over both).
         assert_eq!(Region::Static.shorter(Region::Arena(1)), Region::Arena(1));
         assert_eq!(Region::Arena(2).shorter(Region::Frame), Region::Arena(2));
+        assert_eq!(Region::Caller(3).shorter(Region::Caller(1)), Region::Caller(1));
+        assert_eq!(Region::Caller(1).shorter(Region::Caller(3)), Region::Caller(1));
         assert!(Region::Caller(0).is_region_owned());
         assert!(Region::Caller(0).is_returnable());
         assert!(!Region::Frame.is_returnable());
@@ -53563,6 +69367,26 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
+    fn str_bytes_view_preserves_headerless_source_region() {
+        let static_view =
+            "fn view() -> Result<str, Error> = \"hello\".bytes().as_str()\nfn main() -> i32 = 0\n";
+        let (_program, diagnostics) = check(static_view);
+        assert!(
+            !diagnostics.has_errors(),
+            "a byte view of a static str literal must remain returnable",
+        );
+
+        let local_view = "fn bad() -> Result<str, Error> {\n  owned := \"hello\".clone()\n  return owned.bytes().as_str()\n}\nfn main() -> i32 = 0\n";
+        let (_program, diagnostics) = check(local_view);
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("cannot return a view that borrows local storage")),
+            "the same view over a frame-owned string must remain non-returnable",
+        );
+    }
+
+    #[test]
     fn arena_owned_move_arguments_are_rejected() {
         let direct =
             "fn take(xs: array<i64>) -> i64 = xs.sum()\nfn main() -> i32 {\n  arena {\n    xs := [1, 2, 3].to_array()\n    return take(xs) as i32\n  }\n}\n";
@@ -53673,6 +69497,17 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             !diagnostics.has_errors(),
             "a free-standing Move call result must retain legal by-value transfer"
+        );
+    }
+
+    #[test]
+    fn nested_clone_in_value_retains_only_the_destination_region() {
+        let source = "ByteView { bytes: slice<u8> }\nValue { Bytes(ByteView) }\nfn copy(view: slice<u8>, out: region) -> array<Value> {\n  mut values: array_builder<Value> := array_builder(out)\n  values.push(Value.Bytes(ByteView { bytes: view.clone_in(out) }))\n  return values.build()\n}\nfn main() -> i32 = 0\n";
+        let (_, diagnostics) = check(source);
+        assert!(
+            !diagnostics.has_errors(),
+            "clone_in recursively severs a nested view's source provenance: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
         );
     }
 

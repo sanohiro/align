@@ -29,11 +29,9 @@ pkg_db_q5b1	meta_query_rejects_non_live_execution_targets_before_materialization
 pkg_db_q6	layer1_case_fingerprints_match_the_golden
 pkg_db_q6	postgres_compound_shaping_dispatches_once_on_connection_and_transaction
 pkg_db_q6	sqlite_user_groups_one_parent_and_segmented_matrices_are_exact
-return_provenance	product_projection_summaries_select_exact_parameter_roots
-runway_a2_binary_codec	append_own_bytes_survives_reallocation
 unit_cache	a_descriptor_owning_unit_is_never_cached
 
 # Triage of this baseline (see backlog for detail):
 #   A: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
 #      descriptor-owning unit_cache case) — owned by the db session
-#   B: the remaining two legacy reds — triaged one by one
+#   B: the remaining legacy red — triaged next

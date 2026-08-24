@@ -583,8 +583,10 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   `mut` array local or an `out slice<T>` parameter (a writable output buffer the callee fills),
   bounds-checked (abort on out-of-range, like a read). `out` is restricted to `slice<T>` params and
   marks the local writable; the store lowers through the slice buffer pointer (`SlicePtr` +
-  `PtrStore`) or a fixed array's slot (`StoreIndex`). First cut: primitive elements only (a `str`
-  element store needs a region check; struct/Move need ownership handling). (`examples/out_param.align`.)
+  `PtrStore`) or a fixed array's slot (`StoreIndex`). Copy scalar elements and borrowed `str` views
+  are supported; EscapeCheck enforces the `str` destination lifetime. Owned `string` and other Move
+  elements remain deferred because replacement needs drop-old and source-nulling operations;
+  struct elements use their separate ownership-aware paths. (`examples/out_param.align`.)
 - [done] **`out` no-alias check** — at a call site an `out` argument must not share its root buffer
   with any other argument (`fill(a, a)`, `fill(a, s)` with `s := a`, and sub-slice forms
   `fill(xs, xs[0..2])` all rejected; `fill(xs, ys)` fine), a conservative root-buffer comparison via

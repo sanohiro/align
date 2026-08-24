@@ -325,8 +325,7 @@ pub fn deferred_pipeline_projection(first: str, second: str) -> str {
         ),
         ("main.align", "import views\nfn main() -> i32 = 0\n"),
     ];
-    let differential =
-        diff_check_multi("l2b-a2-product-projections", files, "main.align");
+    let differential = diff_check_multi("l2b-a2-product-projections", files, "main.align");
     assert_eq!(
         differential.whole_errors, differential.per_unit_errors,
         "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
@@ -402,6 +401,1519 @@ pub fn deferred_pipeline_projection(first: str, second: str) -> str {
             "{name} must retain only the selected first parameter"
         );
     }
+}
+
+#[test]
+fn borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn install(out values: slice<str>, value: str) {\n  values[0] = value\n}\nfn main() -> i32 {\n  mut fixed := [\"old\", \"keep\"]\n  fixed[0] = \"fixed\"\n  mut dynamic := [\"left\", \"right\"].to_array()\n  dynamic[1] = \"fixed\"\n  install(dynamic, \"slice\")\n  if fixed[0] == \"fixed\" && dynamic[0] == \"slice\" && dynamic[1] == \"fixed\" { return 0 }\n  return 9\n}\n";
+    assert_eq!(
+        build_and_run("l2b-a2-indexed-str-stores", src)
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn indexed_str_store_accepts_frame_and_same_arena_storage() {
+    let src = "\
+fn main() -> i32 {
+  frame_owner := \"frame\".clone()
+  frame_value: str := frame_owner
+  mut frame_fixed := [\"old\"]
+  frame_fixed[0] = frame_value
+  mut frame_dynamic := [\"old\"].to_array()
+  frame_dynamic[0] = frame_value
+  arena {
+    n := 42
+    arena_value := template \"arena={n}\"
+    mut arena_fixed := [\"old\"]
+    arena_fixed[0] = arena_value
+    mut arena_dynamic := [\"old\"].to_array()
+    arena_dynamic[0] = arena_value
+    if arena_fixed[0] != arena_value || arena_dynamic[0] != arena_value {
+      return 1
+    }
+  }
+  if frame_fixed[0] == frame_value && frame_dynamic[0] == frame_value { return 0 }
+  return 2
+}
+";
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "l2b-a2-indexed-str-same-storage", src);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
+    assert!(
+        !checked.diags.has_errors(),
+        "fixed and dynamic arrays may retain a str for exactly their own storage lifetime:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_alias_uses_backing_storage_region() {
+    for (name, storage) in [
+        ("fixed", "mut values := [\"old\"]"),
+        ("dynamic", "mut values := [\"old\"].to_array()"),
+    ] {
+        let src = format!(
+            "fn main() -> i32 {{\n  {storage}\n  arena {{\n    mut alias: slice<str> := values\n    n := 42\n    short := template \"short={{n}}\"\n    alias[0] = short\n  }}\n  if values[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-indexed-str-alias-{name}"), &src);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived array"),
+            "a slice alias must keep its {name} backing lifetime:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn indexed_str_store_reassigned_and_joined_aliases_use_reaching_backings() {
+    for (name, transition) in [
+        ("straight", "    alias = outer"),
+        ("branch", "    if choose { alias = outer }"),
+        (
+            "loop",
+            "    loop {\n      if choose { alias = outer }\n      break\n    }",
+        ),
+    ] {
+        let src = format!(
+            "fn run(choose: bool) -> i32 {{\n  mut outer := [\"outer\"]\n  arena {{\n    mut inner := [\"inner\"]\n    mut alias: slice<str> := inner\n{transition}\n    n := 42\n    short := template \"short={{n}}\"\n    alias[0] = short\n  }}\n  if outer[0] == \"never\" {{ return 1 }}\n  return 0\n}}\nfn main() -> i32 = run(false)\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-indexed-str-join-{name}"), &src);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived array"),
+            "the {name} alias transition must retain every reaching outer backing:\n{diagnostics}"
+        );
+    }
+
+    let strong_update = "\
+fn main() -> i32 {
+  mut outer := [\"outer\"]
+  arena {
+    mut inner := [\"inner\"]
+    mut alias: slice<str> := outer
+    alias = inner
+    n := 42
+    short := template \"short={n}\"
+    alias[0] = short
+    if alias[0] == short { return 0 }
+  }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-reassign-strong", strong_update);
+    assert!(
+        diagnostics.is_empty(),
+        "a straight-line reassignment to same-arena storage must replace the obsolete outer backing:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_mixed_region_and_heap_join_keeps_the_longer_backing() {
+    let src = "\
+fn region_values(out: region) -> array<str> {
+  mut builder: array_builder<str> := array_builder(out)
+  builder.push(\"outer\")
+  return builder.build()
+}
+fn run(choose_heap: bool) -> i32 {
+  arena outer {
+    mut values := region_values(outer)
+    if choose_heap { values = [\"heap\"].to_array() }
+    arena inner {
+      n := 42
+      short := template \"short={n}\"
+      values[0] = short
+    }
+  }
+  return 0
+}
+fn main() -> i32 = run(false)
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-region-heap-join", src);
+    assert!(
+        diagnostics.contains("cannot be stored into a longer-lived array"),
+        "a caller-region/lexical-heap join must keep the longer possible destination lifetime:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_unknown_backing_fails_closed_for_all_region_bearing_values() {
+    let rejecting = "\
+fn identity(values: slice<str>) -> slice<str> = values
+fn main() -> i32 {
+  mut values := [\"old\"]
+  mut unknown: slice<str> := identity(values)
+  owner := \"frame\".clone()
+  view: str := owner
+  unknown[0] = view
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-unknown", rejecting);
+    assert!(
+        diagnostics.contains("cannot be stored into a longer-lived array"),
+        "a non-static view must not be retained through unresolved writable storage:\n{diagnostics}"
+    );
+
+    let static_control = rejecting.replace("unknown[0] = view", "unknown[0] = \"static\"");
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-unknown-static", &static_control);
+    assert!(
+        diagnostics.contains("cannot be stored into a longer-lived array"),
+        "an unresolved writable slice must reject every region-bearing write:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn non_borrowing_mutable_calls_do_not_require_region_backing() {
+    let scalar_slice = "\
+fn identity(values: slice<i64>) -> slice<i64> = values
+fn fill(out dst: slice<i64>) {
+  dst[0] = 7
+}
+fn touch(borrow mut dst: slice<i64>) {
+  dst[0] = 8
+}
+fn main() -> i32 {
+  mut values := [0]
+  fill(identity(values))
+  mut alias: slice<i64> := identity(values)
+  touch(alias)
+  if values[0] == 8 { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-non-borrowing-mutable-slice", scalar_slice);
+    assert!(
+        diagnostics.is_empty(),
+        "scalar-only out and borrow-mut calls cannot retain region provenance:\n{diagnostics}"
+    );
+
+    let scalar_soa_column = "\
+Point { x: i64, y: i64 }
+fn fill(out dst: slice<i64>) {
+  dst[0] = 7
+}
+fn main() -> i32 {
+  arena {
+    rows := [Point { x: 0, y: 0 }].to_soa()
+    fill(rows.x)
+  }
+  return 0
+}
+";
+    let diagnostics =
+        check_diagnostics("l2b-a2-non-borrowing-mutable-soa-column", scalar_soa_column);
+    assert!(
+        diagnostics.is_empty(),
+        "a primitive SoA column has no element retention backing to prove:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_requires_a_retaining_parameter_mode_for_caller_backing() {
+    for (name, mode) in [("by-value", ""), ("shared-borrow", "borrow ")] {
+        let src = format!(
+            "fn install({mode}dst: slice<str>, value: str) {{\n  mut alias: slice<str> := dst\n  alias[0] = value\n}}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  owner := \"source\".clone()\n  view: str := owner\n  install(values, view)\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-a2-indexed-str-untracked-parameter-{name}"),
+            &src,
+        );
+        assert!(
+            diagnostics.contains(
+                "may retain a borrowed view only through an `out` or `borrow mut` parameter"
+            ),
+            "a {name} slice parameter has no caller retention transition:\n{diagnostics}"
+        );
+    }
+
+    let static_control = "\
+fn install(dst: slice<str>) {
+  mut alias: slice<str> := dst
+  alias[0] = \"static\"
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  install(values)
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-indexed-str-untracked-parameter-static",
+        static_control,
+    );
+    assert!(
+        diagnostics
+            .contains("may retain a borrowed view only through an `out` or `borrow mut` parameter"),
+        "a caller-backed write needs an explicit retention transition even for a static value:\n{diagnostics}"
+    );
+
+    for (name, mode) in [("by-value", ""), ("shared-borrow", "borrow ")] {
+        let src = format!(
+            "User {{ name: str, age: i64 }}\nfn install({mode}rows: soa<User>, value: str) {{\n  mut alias: soa<User> := rows\n  alias[0].name = value\n}}\nfn main() -> i32 {{\n  arena {{\n    rows := [User {{ name: \"old\", age: 1 }}].to_soa()\n    install(rows, \"static\")\n  }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-a2-indexed-soa-untracked-parameter-{name}"),
+            &src,
+        );
+        assert!(
+            diagnostics.contains(
+                "may retain a borrowed view only through an `out` or `borrow mut` parameter"
+            ),
+            "a {name} soa parameter has no caller retention transition:\n{diagnostics}"
+        );
+    }
+
+    let retaining_control = "\
+fn install(borrow mut dst: slice<str>) {
+  mut alias: slice<str> := dst
+  alias[0] = \"static\"
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  mut destination: slice<str> := values
+  install(destination)
+  if values[0] == \"static\" { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-indexed-str-retaining-parameter-control",
+        retaining_control,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "a borrow-mut parameter publishes the caller retention transition:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn forwarded_mutable_str_stores_require_a_retaining_parameter_mode() {
+    for (leaf_name, leaf_mode) in [("out", "out "), ("borrow-mut", "borrow mut ")] {
+        for (wrapper_name, wrapper_mode) in [("by-value", ""), ("shared", "borrow ")] {
+            let src = format!(
+                "fn leaf({leaf_mode}dst: slice<str>, value: str) {{\n  dst[0] = value\n}}\nfn forward({wrapper_mode}dst: slice<str>, value: str) {{\n  mut alias: slice<str> := dst\n  leaf(alias, value)\n}}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  forward(values, \"static\")\n  return 0\n}}\n"
+            );
+            let diagnostics =
+                check_diagnostics(&format!("l2b-a2-{leaf_name}-forward-{wrapper_name}"), &src);
+            assert!(
+                diagnostics.contains(
+                    "may retain a borrowed view only through an `out` or `borrow mut` parameter"
+                ),
+                "a {wrapper_name} wrapper must not launder a {leaf_name} element mutation:\n{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn borrow_mut_str_store_checks_backing_and_preserves_same_region_control() {
+    let rejecting = "\
+fn install(borrow mut dst: slice<str>, value: str) {
+  dst[0] = value
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  arena {
+    mut alias: slice<str> := values
+    n := 42
+    short := template \"short={n}\"
+    install(alias, short)
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-str-backing", rejecting);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "borrow mut must validate the backing as well as the slice header:\n{diagnostics}"
+    );
+
+    let accepted = rejecting.replace(
+        "  mut values := [\"old\"]\n  arena {\n    mut alias: slice<str> := values",
+        "  arena {\n    mut values := [\"old\"]\n    mut alias: slice<str> := values",
+    );
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-str-same-region", &accepted);
+    assert!(
+        diagnostics.is_empty(),
+        "a same-region borrow-mut element mutation must stay accepted:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn moved_and_destructured_owned_arrays_use_binding_storage_lifetime() {
+    let moved = "\
+fn main() -> i32 {
+  mut outer := [\"old\"].to_array()
+  arena {
+    mut inner := outer
+    n := 42
+    short := template \"short={n}\"
+    inner[0] = short
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-moved-owner", moved);
+    assert!(
+        diagnostics.is_empty(),
+        "a moved dynamic buffer dies with its new inner binding:\n{diagnostics}"
+    );
+
+    let destructured = "\
+fn keep(value: str) -> bool = true
+fn main() -> i32 {
+  owner := \"source\".clone()
+  view: str := owner
+  (selected, _) := [view].partition(keep)
+  mut writable := selected
+  writable[0] = view
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-destructured-owner", destructured);
+    assert!(
+        diagnostics.is_empty(),
+        "a tuple-destructured owned array must regain an exact binding owner:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_ignores_diverging_backing_arms() {
+    let src = "\
+fn main() -> i32 {
+  owner := \"source\".clone()
+  view: str := owner
+  mut values := [\"old\"]
+  mut live: slice<str> := values
+  mut alias: slice<str> := match Some(true) {
+    Some(_) => live
+    None => { return 1 }
+  }
+  alias[0] = view
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-diverging-arm", src);
+    assert!(
+        diagnostics.is_empty(),
+        "a diverging arm cannot poison the only reachable backing:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_distinguishes_exact_and_conservative_overwrites() {
+    let exact = "\
+fn main() -> i32 {
+  mut old_owner := \"old\".clone()
+  old_view: str := old_owner
+  new_owner := \"new\".clone()
+  new_view: str := new_owner
+  mut values := [old_view, \"keep\"]
+  values[0] = new_view
+  old_owner = \"replaced\".clone()
+  if values[0] == new_view { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-exact-overwrite", exact);
+    assert!(
+        diagnostics.is_empty(),
+        "an exact fixed-index overwrite must clear the obsolete element owner:\n{diagnostics}"
+    );
+
+    for (name, storage, store, read) in [
+        (
+            "computed-fixed",
+            "mut values := [old_view, \"keep\"]\n  index := 0",
+            "values[index] = new_view",
+            "values[0]",
+        ),
+        (
+            "dynamic",
+            "mut values := [old_view].to_array()",
+            "values[0] = new_view",
+            "values[0]",
+        ),
+        (
+            "slice",
+            "mut values := [old_view]\n  mut alias: slice<str> := values",
+            "alias[0] = new_view",
+            "alias[0]",
+        ),
+    ] {
+        let src = format!(
+            "fn main() -> i32 {{\n  mut old_owner := \"old\".clone()\n  old_view: str := old_owner\n  new_owner := \"new\".clone()\n  new_view: str := new_owner\n  {storage}\n  {store}\n  old_owner = \"replaced\".clone()\n  if {read} == new_view {{ return 0 }}\n  return 1\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-indexed-str-{name}-overwrite"), &src);
+        assert!(
+            diagnostics.contains("use of invalidated borrow"),
+            "the {name} write has no exact element map and must conservatively retain the old owner:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn indexed_str_store_updates_the_contained_region_before_return() {
+    let src = "\
+fn leak(seed: str) -> str {
+  arena {
+    short := template \"short={seed}\"
+    mut values := [\"old\"]
+    values[0] = short
+    return values[0]
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-store-return", src);
+    assert!(
+        diagnostics.contains("cannot return a value allocated in an arena"),
+        "an accepted same-arena element store must update the base's contained region before a later read/return:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn out_str_store_rejects_callee_local_and_inner_arena_views() {
+    for (name, body) in [
+        (
+            "frame",
+            "  owner := \"local\".clone()\n  value: str := owner\n  dst[0] = value",
+        ),
+        (
+            "arena",
+            "  arena {\n    n := 42\n    value := template \"local={n}\"\n    dst[0] = value\n  }",
+        ),
+    ] {
+        let src = format!(
+            "fn install(out dst: slice<str>) {{\n{body}\n}}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  install(values)\n  if values[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-out-str-callee-{name}"), &src);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived array"),
+            "an out parameter must denote caller storage, not the callee's {name}:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn out_str_store_rejects_inner_arena_sources_at_the_call_site() {
+    for (name, storage, destination) in [
+        ("fixed", "mut values := [\"old\"]", "values"),
+        ("dynamic", "mut values := [\"old\"].to_array()", "values"),
+        (
+            "nested-range",
+            "mut values := [\"old\", \"keep\"]",
+            "values[0..2][0..1]",
+        ),
+    ] {
+        let src = format!(
+            "fn install(out dst: slice<str>, value: str) {{\n  dst[0] = value\n}}\nfn main() -> i32 {{\n  {storage}\n  arena {{\n    n := 42\n    short := template \"short={{n}}\"\n    install({destination}, short)\n  }}\n  if values[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-out-str-call-{name}"), &src);
+        assert!(
+            diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+            "the direct out summary must reject an inner-arena source retained by outer {name} storage:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn indexed_and_out_str_stores_keep_source_owners_live_through_backing_roots() {
+    for (name, storage, setup, store, read) in [
+        (
+            "direct-alias-fixed",
+            "mut values := [\"old\"]",
+            "  mut alias: slice<str> := values",
+            "  alias[0] = view",
+            "values[0]",
+        ),
+        (
+            "direct-alias-dynamic",
+            "mut values := [\"old\"].to_array()",
+            "  mut alias: slice<str> := values",
+            "  alias[0] = view",
+            "values[0]",
+        ),
+        (
+            "direct-range-fixed",
+            "mut values := [\"keep\", \"old\"]",
+            "  mut alias: slice<str> := values[1..2]",
+            "  alias[0] = view",
+            "values[1]",
+        ),
+        (
+            "direct-nested-range-fixed",
+            "mut values := [\"keep\", \"old\", \"keep\"]",
+            "  mut alias: slice<str> := values[0..3][1..2]",
+            "  alias[0] = view",
+            "values[1]",
+        ),
+        (
+            "inline-array-to-slice-out",
+            "mut values := [\"old\"]",
+            "",
+            "  install(values, view)",
+            "values[0]",
+        ),
+        (
+            "dynamic-alias-out",
+            "mut values := [\"old\"].to_array()",
+            "  mut alias: slice<str> := values",
+            "  install(alias, view)",
+            "values[0]",
+        ),
+        (
+            "nested-range-out",
+            "mut values := [\"old\", \"keep\"]",
+            "",
+            "  install(values[0..2][1..2], view)",
+            "values[1]",
+        ),
+    ] {
+        let src = format!(
+            "fn install(out dst: slice<str>, value: str) {{\n  dst[0] = value\n}}\nfn main() -> i32 {{\n  {storage}\n  mut owner := \"first\".clone()\n  view: str := owner\n{setup}\n{store}\n  owner = \"second\".clone()\n  if {read} == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-indexed-str-owner-{name}"), &src);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'values'"),
+            "the {name} store must publish the installed owner's generation to the original backing root:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn indexed_str_stores_update_preexisting_and_unresolved_alias_observers() {
+    for (name, alias, store) in [
+        (
+            "direct-known",
+            "mut alias: slice<str> := values",
+            "values[0] = view",
+        ),
+        (
+            "out-known",
+            "mut alias: slice<str> := values",
+            "install(values, view)",
+        ),
+        (
+            "direct-unresolved",
+            "mut alias: slice<str> := identity(values)",
+            "values[0] = view",
+        ),
+        (
+            "out-unresolved",
+            "mut alias: slice<str> := identity(values)",
+            "install(values, view)",
+        ),
+    ] {
+        let src = format!(
+            "fn identity(values: slice<str>) -> slice<str> = values\nfn install(out dst: slice<str>, value: str) {{\n  dst[0] = value\n}}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  {alias}\n  mut owner := \"source\".clone()\n  view: str := owner\n  {store}\n  owner = \"replacement\".clone()\n  if alias[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-indexed-str-observer-{name}"), &src);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'alias'"),
+            "the {name} store must publish new contents to an alias created before it:\n{diagnostics}"
+        );
+    }
+
+    for (name, alias) in [
+        ("known", "mut alias: slice<str> := values"),
+        ("unresolved", "mut alias: slice<str> := identity(values)"),
+    ] {
+        let src = format!(
+            "fn identity(values: slice<str>) -> slice<str> = values\nfn leak(seed: str) -> str {{\n  owner := seed.clone()\n  view: str := owner\n  mut values := [\"old\"]\n  {alias}\n  values[0] = view\n  return alias[0]\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("l2b-a2-indexed-str-observer-return-{name}"), &src);
+        assert!(
+            diagnostics.contains("cannot return a view that borrows local storage"),
+            "the {name} observer must receive the backing root's contained region:\n{diagnostics}"
+        );
+    }
+
+    let unrelated_contents = "\
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut left := [old_view]
+  mut right := [old_view]
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  left[0] = new_view
+  new_owner = \"replacement\".clone()
+  if right[0] == old_view { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-indexed-str-unrelated-content-control",
+        unrelated_contents,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "sharing an old element owner does not make two arrays backing aliases:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_str_retention_uses_argument_completion_snapshots() {
+    let destination = "\
+fn install(out dst: slice<str>, value: str, ignored: i64) {
+  dst[0] = value
+}
+fn main() -> i32 {
+  mut first := [\"first\"]
+  mut second := [\"second\"]
+  mut destination: slice<str> := first
+  mut owner := \"source\".clone()
+  view: str := owner
+  install(destination, view, {
+    destination = second
+    0
+  })
+  owner = \"replacement\".clone()
+  if first[0] == \"never\" { return 1 }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-destination-snapshot", destination);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'first'"),
+        "a later argument must not retarget an already-evaluated out slice:\n{diagnostics}"
+    );
+
+    let rebound_control = "\
+fn install(out dst: slice<str>, value: str, ignored: i64) {
+  dst[0] = value
+}
+fn select_rebound(seed: str) -> str = arena outer {
+  mut outer_values := [\"outer\"]
+  arena inner {
+    mut inner_values := [\"inner\"]
+    mut destination: slice<str> := inner_values
+    inner_owner := seed.clone()
+    inner_view: str := inner_owner
+    install(destination, inner_view, {
+      destination = outer_values
+      0
+    })
+    destination[0]
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-rebound-destination-control", rebound_control);
+    assert!(
+        diagnostics.is_empty(),
+        "the old captured backing must not publish contents into the rebound slice local:\n{diagnostics}"
+    );
+
+    let source_owner = "\
+fn install(out dst: slice<str>, value: str, ignored: i64) {
+  dst[0] = value
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  mut owner := \"source\".clone()
+  mut source: str := owner
+  install(values, source, {
+    source = \"static\"
+    0
+  })
+  owner = \"replacement\".clone()
+  if values[0] == \"never\" { return 1 }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-source-owner-snapshot", source_owner);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'values'"),
+        "a later argument must not replace an already-evaluated source owner:\n{diagnostics}"
+    );
+
+    let source_region = "\
+fn install(out dst: slice<str>, value: str, ignored: i64) {
+  dst[0] = value
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  arena {
+    n := 42
+    mut source: str := template \"short={n}\"
+    install(values, source, {
+      source = \"static\"
+      0
+    })
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-source-region-snapshot", source_region);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "escape checking must use the source region captured before a later argument rebinds it:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn out_str_retention_matches_whole_and_per_unit_checking() {
+    let files = &[
+        (
+            "views.align",
+            "module views\npub fn install(out dst: slice<str>, value: str) {\n  dst[0] = value\n}\n",
+        ),
+        (
+            "main.align",
+            "\
+import views
+fn main() -> i32 {
+  mut values := [\"old\"]
+  arena {
+    n := 42
+    short := template \"short={n}\"
+    views.install(values, short)
+  }
+  if values[0] == \"never\" { return 1 }
+  return 0
+}
+",
+        ),
+    ];
+    let checked = assert_same_verdict("l2b-a2-out-str-whole-per-unit", files, "main.align");
+    assert!(
+        checked.diags.has_errors(),
+        "both exact whole-program and conservative imported retention must reject the inner-arena source"
+    );
+
+    let exact_vs_fallback = diff_check_multi(
+        "l2b-a2-out-str-exact-vs-fallback",
+        &[
+            (
+                "views.align",
+                "module views\npub fn install(out dst: slice<str>, selected: str, ignored: str) {\n  dst[0] = selected\n}\n",
+            ),
+            (
+                "main.align",
+                "\
+import views
+fn main() -> i32 {
+  mut values := [\"old\"]
+  arena {
+    n := 42
+    ignored := template \"ignored={n}\"
+    views.install(values, \"static\", ignored)
+  }
+  if values[0] == \"static\" { return 0 }
+  return 1
+}
+",
+            ),
+        ],
+        "main.align",
+    );
+    assert!(
+        !exact_vs_fallback.whole_errors && exact_vs_fallback.per_unit_errors,
+        "the available body must select only the stored source while the interface-only fallback retains every compatible argument:\nwhole:\n{}\nper-unit:\n{}",
+        exact_vs_fallback.whole_diags,
+        exact_vs_fallback.per_unit_diags,
+    );
+}
+
+#[test]
+fn forwarded_and_branching_out_str_stores_retain_every_possible_source() {
+    for (name, helper, call, ended_owner) in [
+        (
+            "forwarded",
+            "fn forward(out dst: slice<str>, value: str) {\n  install(dst, value)\n}",
+            "forward(values, left_view)",
+            "left",
+        ),
+        (
+            "branch",
+            "fn choose(out dst: slice<str>, left: str, right: str, take_left: bool) {\n  if take_left { install(dst, left) } else { install(dst, right) }\n}",
+            "choose(values, left_view, right_view, true)",
+            "right",
+        ),
+        (
+            "match",
+            "fn choose_match(out dst: slice<str>, left: str, right: str, choice: Option<bool>) {\n  _ := match choice {\n    Some(_) => { install(dst, left) }\n    None => { install(dst, right) }\n  }\n}",
+            "choose_match(values, left_view, right_view, Some(true))",
+            "right",
+        ),
+        (
+            "loop",
+            "fn choose_loop(out dst: slice<str>, left: str, right: str, take_left: bool) {\n  loop {\n    if take_left {\n      install(dst, left)\n      break\n    }\n    install(dst, right)\n    break\n  }\n}",
+            "choose_loop(values, left_view, right_view, true)",
+            "right",
+        ),
+    ] {
+        let src = format!(
+            "fn install(out dst: slice<str>, value: str) {{\n  dst[0] = value\n}}\n{helper}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  mut left := \"left\".clone()\n  left_view: str := left\n  mut right := \"right\".clone()\n  right_view: str := right\n  {call}\n  {ended_owner} = \"replacement\".clone()\n  if values[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("l2b-a2-out-str-{name}"), &src);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'values'"),
+            "the {name} summary must retain every source that may reach the out destination:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn recursive_and_try_exit_out_str_summaries_retain_the_installed_source() {
+    let recursive = "\
+fn retain_recursive(out dst: slice<str>, value: str, remaining: i64) {
+  if remaining == 0 {
+    dst[0] = value
+    return
+  }
+  retain_recursive(dst, value, remaining - 1)
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  mut owner := \"source\".clone()
+  view: str := owner
+  retain_recursive(values, view, 2)
+  owner = \"replacement\".clone()
+  if values[0] == \"never\" { return 1 }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-str-recursive", recursive);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'values'"),
+        "recursive Out retention must converge through the direct-call fixed point:\n{diagnostics}"
+    );
+
+    let try_exit = "\
+fn retain_then_try(
+  out dst: slice<str>,
+  value: str,
+  pass: bool,
+) -> Result<(), i64> {
+  dst[0] = value
+  result: Result<(), i64> := if pass { Ok(()) } else { Err(1) }
+  _ := result?
+  dst[0] = \"cleared\"
+  return Ok(())
+}
+fn main() -> i32 {
+  mut values := [\"old\"]
+  mut owner := \"source\".clone()
+  view: str := owner
+  attempted := retain_then_try(values, view, false)
+  _ := match attempted { Ok(_) => 0 Err(_) => 1 }
+  owner = \"replacement\".clone()
+  if values[0] == \"never\" { return 1 }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-str-try-exit", try_exit);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'values'"),
+        "the `?` error exit must publish the Out destination state before the later clear:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn two_out_str_destinations_snapshot_regions_before_updates() {
+    let src = "\
+fn swap(out first: slice<str>, out second: slice<str>) {
+  saved := first[0]
+  first[0] = second[0]
+  second[0] = saved
+}
+fn main() -> i32 {
+  arena outer {
+    outer_n := 1
+    outer_text := template \"outer={outer_n}\"
+    mut outer_values := [outer_text]
+    arena inner {
+      inner_n := 2
+      inner_text := template \"inner={inner_n}\"
+      mut inner_values := [inner_text]
+      swap(inner_values, outer_values)
+    }
+    if outer_values[0] == \"never\" { return 1 }
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-out-str-two-destinations", src);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "both Out destinations and all sources must be snapshotted before either update:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn soa_str_field_store_keeps_the_installed_owner_live() {
+    let src = "\
+import core.json
+User { name: str, age: i64 }
+fn main() -> Result<(), Error> {
+  mut owner := \"source\".clone()
+  view: str := owner
+  arena {
+    mut rows: soa<User> := json.decode(\"[{\\\"name\\\":\\\"old\\\",\\\"age\\\":1}]\")?
+    rows[0].name = view
+    owner = \"replacement\".clone()
+    if rows[0].name == \"never\" { return Ok(()) }
+  }
+  return Ok(())
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-soa-str-owner", src);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'rows'"),
+        "AssignElemField on SoA storage must publish the installed owner to the collection root:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_str_store_updates_aggregate_alias_observers() {
+    for (name, declaration, setup, observe) in [
+        (
+            "struct",
+            "",
+            "holder := Holder { values: values }",
+            "holder.values.len()",
+        ),
+        (
+            "nested-option",
+            "",
+            "holder: Option<Option<Holder>> := Some(Some(Holder { values: values }))",
+            "match holder { Some(outer) => match outer { Some(inner) => inner.values.len() None => 0 } None => 0 }",
+        ),
+        (
+            "result",
+            "",
+            "holder: Result<Holder, i64> := Ok(Holder { values: values })",
+            "match holder { Ok(inner) => inner.values.len() Err(_) => 0 }",
+        ),
+        (
+            "user-sum",
+            "Envelope { Empty, Wrapped(Holder) }",
+            "holder := Envelope.Wrapped(Holder { values: values })",
+            "match holder { Wrapped(inner) => inner.values.len() Empty => 0 }",
+        ),
+    ] {
+        let src = format!(
+            "Holder {{ values: slice<str> }}\n{declaration}\nfn main() -> i32 {{\n  mut values := [\"old\"]\n  {setup}\n  mut owner := \"source\".clone()\n  view: str := owner\n  values[0] = view\n  owner = \"replacement\".clone()\n  _ := {observe}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-a2-indexed-str-aggregate-observer-{name}"),
+            &src,
+        );
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'holder'"),
+            "a collection header nested in a {name} must observe writes to its backing:\n{diagnostics}"
+        );
+    }
+
+    let tuple = "\
+fn main() -> i32 {
+  mut values := [\"old\"].to_array()
+  mut alias: slice<str> := values
+  holder := (values, 0)
+  mut owner := \"source\".clone()
+  view: str := owner
+  alias[0] = view
+  owner = \"replacement\".clone()
+  _ := holder.0.len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-indexed-str-aggregate-observer-tuple", tuple);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'holder'"),
+        "a dynamic collection header nested in a tuple must observe writes through its pre-move alias:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn scalar_element_views_are_not_collection_alias_observers() {
+    let src = "\
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut values := [old_view, \"keep\"]
+  old := values[0]
+  mut new_owner := \"new\".clone()
+  new_owner_view: str := new_owner
+  values[1] = new_owner_view
+  new_owner = \"replacement\".clone()
+  if old == old_view { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-scalar-element-observer-control", src);
+    assert!(
+        diagnostics.is_empty(),
+        "a scalar element view must not observe unrelated changes to its source collection:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn borrow_mut_places_and_numeric_storage_use_argument_completion_snapshots() {
+    let rebound_place = "\
+fn touch(borrow mut dst: slice<i64>, ignored: i64) {
+  dst[0] = ignored
+}
+fn main() -> i32 {
+  mut first := [1]
+  mut second := [2]
+  mut destination: slice<i64> := first
+  touch(destination, {
+    destination = second
+    3
+  })
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-place-snapshot", rebound_place);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "a later eager argument must not retarget an already-completed exclusive place:\n{diagnostics}"
+    );
+
+    let field_control = "\
+Holder { values: slice<i64>, tag: i64 }
+fn touch(borrow mut dst: slice<i64>, ignored: i64) {
+  dst[0] = ignored
+}
+fn main() -> i32 {
+  mut values := [1]
+  mut holder := Holder { values: values, tag: 0 }
+  touch(holder.values, {
+    holder.tag = 1
+    2
+  })
+  holder.values = values[..]
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-disjoint-field-control", field_control);
+    assert!(
+        diagnostics.is_empty(),
+        "a disjoint field write and a post-call rebind must not invalidate the reservation:\n{diagnostics}"
+    );
+
+    let alias_write = "\
+fn touch(borrow mut dst: slice<i64>, ignored: i64) {
+  dst[0] = ignored
+}
+fn main() -> i32 {
+  mut values := [1]
+  mut destination: slice<i64> := values
+  mut alias: slice<i64> := destination
+  touch(destination, {
+    alias[0] = 4
+    2
+  })
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-alias-write-snapshot", alias_write);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "a later write through a known alias must end the earlier exclusive reservation:\n{diagnostics}"
+    );
+
+    let numeric_storage = "\
+State { values: slice<i64> }
+fn retain(borrow mut state: State, borrow source: array<i64>, ignored: i64) {
+  state.values = source[..]
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  mut source := [1, 2, 3].to_array()
+  retain(state, source, {
+    source = [4, 5, 6].to_array()
+    0
+  })
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-numeric-storage-completion", numeric_storage);
+    assert!(
+        diagnostics.contains("value snapshot was invalidated"),
+        "a non-borrowing owned array's completed storage must not be re-read after replacement:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn nested_mutable_call_results_keep_completion_backing() {
+    let src = "\
+Holder { text: str, ignored: i64 }
+fn extract(value: Holder) -> str = value.text
+fn install(out dst: slice<str>, value: str) {
+  dst[0] = value
+}
+fn main() -> i32 {
+  outer_owner := \"outer\".clone()
+  outer_view: str := outer_owner
+  mut values := [\"old\"]
+  arena {
+    n := 42
+    short := template \"short={n}\"
+    mut selected: str := short
+    install(values, extract(Holder {
+      text: selected
+      ignored: {
+        selected = outer_view
+        0
+      }
+    }))
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-nested-completion-result", src);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "nested call/struct results must use their completed children, not live rebound syntax:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_call_results_use_post_call_completion() {
+    let src = "\
+fn replace_and_return(
+  borrow mut dst: slice<str>,
+  source: slice<str>,
+) -> slice<str> {
+  dst = source
+  return dst
+}
+fn leak(borrow mut seed: slice<str>) -> slice<str> {
+  arena {
+    mut destination: slice<str> := seed
+    inner := [\"inner\"]
+    return replace_and_return(destination, inner)
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-post-mutable-call-result", src);
+    assert!(
+        diagnostics.contains("cannot return a slice that views a local array"),
+        "a returned borrow-mut destination must use its post-call storage snapshot:\n{diagnostics}"
+    );
+
+    let clean = "\
+fn replace_and_return(
+  borrow mut dst: slice<str>,
+  source: slice<str>,
+) -> slice<str> {
+  dst = source
+  return dst
+}
+fn select(borrow mut seed: slice<str>) -> slice<str> {
+  arena {
+    inner := [\"inner\"]
+    mut destination: slice<str> := inner
+    return replace_and_return(destination, seed)
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-post-mutable-call-result-clean", clean);
+    assert!(
+        diagnostics.is_empty(),
+        "the post-call snapshot must also forget replaced local storage:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_call_owned_dynamic_results_materialize_their_own_storage() {
+    let dynamic = "\
+fn collect(borrow mut stamp: i64, value: str) -> array<str> {
+  stamp = stamp + 1
+  return [value].to_array()
+}
+fn leak(value: str, borrow mut stamp: i64) -> slice<str> {
+  return collect(stamp, value)[..]
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-mutable-call-owned-dynamic-result", dynamic);
+    assert!(
+        diagnostics.contains("cannot return a view that borrows local storage"),
+        "a selected content owner must not become the fresh dynamic result buffer's storage:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_call_result_backing_reaches_the_replacement_source() {
+    let slice = "\
+fn replace_return(
+  borrow mut dst: slice<i64>,
+  source: slice<i64>,
+) -> slice<i64> {
+  dst = source
+  return dst
+}
+fn touch(borrow mut dst: slice<i64>, ignored: i64) {}
+fn main() -> i32 {
+  mut first := [1]
+  mut second := [2]
+  mut destination: slice<i64> := first
+  mut second_view: slice<i64> := second
+  touch(second_view, {
+    mut alias := replace_return(destination, second_view)
+    alias[0] = 3
+    0
+  })
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-mutable-call-slice-result-backing", slice);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "a returned replacement slice must retain the selected post-call backing:\n{diagnostics}"
+    );
+
+    let soa = "\
+Point { x: i64, y: i64 }
+fn replace_return(
+  borrow mut dst: soa<Point>,
+  source: soa<Point>,
+) -> soa<Point> {
+  dst = source
+  return dst
+}
+fn touch(borrow mut rows: soa<Point>, ignored: i64) {}
+fn main() -> i32 {
+  arena {
+    mut first := [Point { x: 1, y: 1 }].to_soa()
+    mut second := [Point { x: 2, y: 2 }].to_soa()
+    mut destination := first
+    touch(second, {
+      mut alias := replace_return(destination, second)
+      alias[0].x = 3
+      0
+    })
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-mutable-call-soa-result-backing", soa);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "a returned replacement SoA must retain the selected post-call backing:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn borrow_mut_slice_replacement_updates_backing_storage() {
+    let src = "\
+fn replace(borrow mut dst: slice<str>, source: slice<str>) {
+  dst = source
+}
+fn main() -> i32 {
+  mut outer_values := [\"outer\"]
+  arena {
+    mut inner_values := [\"inner\"]
+    mut destination: slice<str> := inner_values
+    replace(destination, outer_values)
+    n := 42
+    short := template \"short={n}\"
+    destination[0] = short
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-borrow-mut-replacement-backing", src);
+    assert!(
+        diagnostics.contains("cannot be stored into a longer-lived array"),
+        "a strong slice-header replacement must replace its backing fact as well:\n{diagnostics}"
+    );
+
+    let owner_tracking = "\
+fn replace(borrow mut dst: slice<str>, source: slice<str>) {
+  dst = source
+}
+fn main() -> i32 {
+  mut original_values := [\"original\"]
+  mut installed_values := [\"installed\"]
+  mut destination: slice<str> := original_values
+  replace(destination, installed_values)
+  mut owner := \"source\".clone()
+  view: str := owner
+  destination[0] = view
+  owner = \"replacement\".clone()
+  if installed_values[0] == \"never\" { return 1 }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-borrow-mut-replacement-owner-tracking",
+        owner_tracking,
+    );
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'installed_values'"),
+        "MoveCheck must publish later indexed writes to the replacement backing:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn borrow_mut_dynamic_array_heap_replacement_re_marks_storage() {
+    let heap_replacement = "\
+fn replace_with_heap(borrow mut dst: array<i64>) {
+  dst = [4, 5, 6].to_array()
+}
+fn leak(out: region) -> slice<i64> {
+  mut builder: array_builder<i64> := array_builder(out)
+  builder.push(1)
+  mut dst := builder.build()
+  replace_with_heap(dst)
+  return dst[..]
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-borrow-mut-dynamic-replacement-heap",
+        heap_replacement,
+    );
+    assert!(
+        diagnostics.contains("cannot return a slice that views a local array"),
+        "replacing caller-region storage with heap storage must re-mark the destination as local:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn borrow_mut_dynamic_array_region_replacement_clears_local_storage() {
+    let region_replacement = "\
+fn replace_with_region(borrow mut dst: array<i64>, out: region) {
+  mut builder: array_builder<i64> := array_builder(out)
+  builder.push(7)
+  builder.push(8)
+  dst = builder.build()
+}
+fn make(out: region) -> slice<i64> {
+  mut dst := [1, 2, 3].to_array()
+  replace_with_region(dst, out)
+  return dst[..]
+}
+fn main() -> i32 {
+  arena out {
+    values := make(out)
+    if values.sum() == 15 { return 0 }
+    return 1
+  }
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-borrow-mut-dynamic-replacement-region",
+        region_replacement,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "replacing heap storage with caller-region storage must clear obsolete local ownership:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn region_builder_mutable_calls_keep_constructor_storage_separate_from_elements() {
+    let src = "\
+Item { name: str }
+fn push_copy(
+  borrow mut rows: array_builder<Item>,
+  value: str,
+  out: region,
+) {
+  rows.push(Item { name: value.clone_in(out) })
+}
+fn collect(value: str, out: region) -> array<Item> {
+  mut rows: array_builder<Item> := array_builder(out)
+  push_copy(rows, value, out)
+  push_copy(rows, value, out)
+  return rows.build()
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-region-builder-mutable-helper", src);
+    assert!(
+        diagnostics.is_empty(),
+        "a region builder's storage is its constructor region, while copied element views keep their own provenance:\n{diagnostics}"
+    );
+
+    let retained_control = "\
+fn main() -> i32 {
+  arena out {
+    owner := \"source\".clone()
+    view: str := owner
+    mut values: array_builder<str> := array_builder(out)
+    values.push(view)
+    values.push(\"later\")
+    built := values.build()
+    if built[0] == view { return 0 }
+  }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-region-builder-reallocation-keeps-elements-valid",
+        retained_control,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "later builder growth must not invalidate an earlier element whose owner remains live:\n{diagnostics}"
+    );
+
+    let retained_owner = "\
+fn main() -> i32 {
+  arena out {
+    mut owner := \"source\".clone()
+    view: str := owner
+    mut values: array_builder<str> := array_builder(out)
+    values.push(view)
+    values.push(\"later\")
+    owner = \"replacement\".clone()
+    built := values.build()
+    if built[0] == \"never\" { return 1 }
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-region-builder-reallocation-retains-elements",
+        retained_owner,
+    );
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'values'")
+            && diagnostics.contains("source 'owner'")
+            && !diagnostics.contains("source 'out'"),
+        "a later builder growth must not erase the owner retained by an earlier element:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn soa_alias_reassignment_does_not_cross_publish_contents() {
+    let src = "\
+User { name: str, age: i64 }
+fn select(rows: soa<User>) -> str {
+  arena {
+    mut first := rows
+    alias := first
+    other := [User { name: \"other\", age: 2 }].to_soa()
+    first = other
+    n := 42
+    short := template \"short={n}\"
+    first[0].name = short
+    return alias[0].name
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-soa-alias-rebind-control", src);
+    assert!(
+        diagnostics.is_empty(),
+        "reassigning a Copy SoA header must not alias its old and new column buffers:\n{diagnostics}"
+    );
 }
 
 #[test]
@@ -781,8 +2293,7 @@ pub fn odd(first: str, second: str, depth: i64) -> str {
         ),
         ("main.align", "import views\nfn main() -> i32 = 0\n"),
     ];
-    let differential =
-        diff_check_multi("l2b-return-summary-worklist", files, "main.align");
+    let differential = diff_check_multi("l2b-return-summary-worklist", files, "main.align");
     assert_eq!(
         differential.whole_errors, differential.per_unit_errors,
         "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
@@ -868,8 +2379,7 @@ fn main() -> i32 {
             &format!("l2b-loop-break-rejected-{name}"),
             source,
         );
-        let diagnostics =
-            align_driver::format_diagnostics(&source_map, &checked.diags);
+        let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
         assert!(
             diagnostics.contains(
                 "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet"
@@ -936,8 +2446,7 @@ pub fn bad(value: str) -> str = loop {
 fn main() -> i32 = 0
 ",
     );
-    let diagnostics =
-        align_driver::format_diagnostics(&source_map, &checked.diags);
+    let diagnostics = align_driver::format_diagnostics(&source_map, &checked.diags);
     assert!(
         diagnostics.contains(
             "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet"
@@ -1025,9 +2534,7 @@ fn main() -> i32 = 0
 ",
     );
     assert!(
-        nested_escape.contains(
-            "cannot return a slice that views a local array"
-        ),
+        nested_escape.contains("cannot return a slice that views a local array"),
         "a payload-internal return escape must survive rejection:\n{nested_escape}"
     );
     assert!(
@@ -1153,8 +2660,7 @@ fn main() -> i32 {
   return payload.len() as i32
 }
 ";
-    let direct_diagnostics =
-        check_diagnostics("l2b-unreachable-exits-direct", direct);
+    let direct_diagnostics = check_diagnostics("l2b-unreachable-exits-direct", direct);
     assert!(
         !check_errs("l2b-unreachable-exits-direct", direct),
         "dead returns and breaks must not retain an otherwise-unselected owner:\n{direct_diagnostics}"
@@ -1287,8 +2793,7 @@ fn main() -> i32 {
 ",
         ),
     ];
-    let checked =
-        assert_same_verdict("l2b-unreachable-exits-imported", files, "main.align");
+    let checked = assert_same_verdict("l2b-unreachable-exits-imported", files, "main.align");
     assert!(
         !checked.diags.has_errors(),
         "whole-program and per-unit summaries must exclude dead exits"
@@ -1347,8 +2852,7 @@ fn main() -> i32 = 0
 ",
         ),
     ];
-    let differential =
-        diff_check_multi("l2b-reachable-conditional-edges", files, "main.align");
+    let differential = diff_check_multi("l2b-reachable-conditional-edges", files, "main.align");
     assert_eq!(
         differential.whole_errors, differential.per_unit_errors,
         "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
@@ -1407,8 +2911,7 @@ fn main() -> i32 {
 ",
         ),
     ];
-    let checked =
-        assert_same_verdict("l2b-named-lambda-suffix", files, "main.align");
+    let checked = assert_same_verdict("l2b-named-lambda-suffix", files, "main.align");
     assert!(
         checked.diags.has_errors(),
         "the named dependency result must retain its owner in both compilation modes"
@@ -1463,8 +2966,7 @@ pub fn builtin<Option>(value: Option<str>) -> Option<str> = value
             "import names\nimport params\nfn main() -> i32 = 0\n",
         ),
     ];
-    let differential =
-        diff_check_multi("l2b-builtin-name-collisions", files, "main.align");
+    let differential = diff_check_multi("l2b-builtin-name-collisions", files, "main.align");
     assert_eq!(
         differential.whole_errors, differential.per_unit_errors,
         "verdict mismatch:\nwhole:\n{}\nper-unit:\n{}",
@@ -1523,11 +3025,8 @@ fn producer_and_importer_reject_generic_parameter_duplicates_and_shadowing() {
             ("bad.align", dependency.as_str()),
             ("main.align", "import bad\nfn main() -> i32 = 0\n"),
         ];
-        let differential = diff_check_multi(
-            &format!("l2b-generic-param-{case}"),
-            &files,
-            "main.align",
-        );
+        let differential =
+            diff_check_multi(&format!("l2b-generic-param-{case}"), &files, "main.align");
         assert!(
             differential.whole_errors && differential.per_unit_errors,
             "{case} must reject in both modes:\nwhole:\n{}\nper-unit:\n{}",
@@ -1543,9 +3042,7 @@ fn producer_and_importer_reject_generic_parameter_duplicates_and_shadowing() {
         );
         if case == "duplicate-before-shadow" {
             assert!(
-                !differential
-                    .whole_diags
-                    .contains("shadows a declared type")
+                !differential.whole_diags.contains("shadows a declared type")
                     && !differential
                         .per_unit_diags
                         .contains("shadows a declared type"),
@@ -1793,8 +3290,7 @@ fn main() -> i32 {
 
 #[test]
 fn compatibility_api_keeps_unknown_interface_provenance_conservative() {
-    let dependency =
-        "module dep\npub fn identity(value: str) -> str {}\n";
+    let dependency = "module dep\npub fn identity(value: str) -> str {}\n";
     let consumer = "\
 import dep
 fn consume(value: string) -> i64 = value.len()
@@ -1825,11 +3321,7 @@ fn main() -> i32 {
             interface_only: false,
         },
     ];
-    align_sema::check_program_with_effects(
-        &modules,
-        &std::collections::HashMap::new(),
-        &mut diags,
-    );
+    align_sema::check_program_with_effects(&modules, &std::collections::HashMap::new(), &mut diags);
     assert!(
         diags.has_errors(),
         "an interface-only import without explicit provenance facts must retain the all-compatible-input fallback"
@@ -1986,11 +3478,7 @@ pub fn stored(value: str) -> str {
         ),
         ("main.align", "import views\nfn main() -> i32 = 0\n"),
     ];
-    let checked = assert_same_verdict(
-        "l2b-captured-result-outer-summary",
-        files,
-        "main.align",
-    );
+    let checked = assert_same_verdict("l2b-captured-result-outer-summary", files, "main.align");
     assert!(
         !checked.diags.has_errors(),
         "a captured caller-owned parameter may flow through an indirect result"
@@ -2052,6 +3540,50 @@ fn main() -> i32 {
     assert!(
         checked.diags.has_errors(),
         "an indirect identity result must keep its selected argument owner live"
+    );
+}
+
+#[test]
+fn indirect_call_snapshots_the_callee_before_later_arguments() {
+    let short_then_static = "\
+fn leak() -> str {
+  arena {
+    n := 42
+    short := template \"short={n}\"
+    mut f := fn unused: i64 { short }
+    return f({
+      f = fn unused: i64 { \"static\" }
+      0
+    })
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-a2-indirect-callee-snapshot-short", short_then_static);
+    assert!(
+        diagnostics.contains("cannot return a value allocated in an arena"),
+        "the invoked closure is the short-lived callee evaluated before the rebinding argument:\n{diagnostics}"
+    );
+
+    let static_then_short = "\
+fn select() -> str {
+  arena {
+    n := 42
+    short := template \"short={n}\"
+    mut f := fn unused: i64 { \"static\" }
+    return f({
+      f = fn unused: i64 { short }
+      0
+    })
+  }
+}
+fn main() -> i32 = 0
+";
+    let diagnostics =
+        check_diagnostics("l2b-a2-indirect-callee-snapshot-static", static_then_short);
+    assert!(
+        diagnostics.is_empty(),
+        "a later argument must not replace the already-completed static callee capture:\n{diagnostics}"
     );
 }
 
@@ -2277,4 +3809,1619 @@ mod dyn_storage_locality {
             "slicing an outer-frame array inside an arena must keep its declaration scope:\n{diagnostics}",
         );
     }
+}
+
+#[test]
+fn unknown_soa_call_results_preserve_source_backing_roots() {
+    let forwarded = "\
+User { name: str, age: i64 }
+fn identity(rows: soa<User>) -> soa<User> = rows
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  arena {
+    mut rows := [User { name: old_view, age: 1 }].to_soa()
+    mut alias := identity(rows)
+    alias[0].name = new_view
+    new_owner = \"replacement\".clone()
+    if rows[0].name == \"never\" { return 1 }
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-unknown-soa-result-backing", forwarded);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'rows'"),
+        "a call-returned SoA header must keep the source backing roots for later writes:\n{diagnostics}"
+    );
+
+    let fresh_control = "\
+User { name: str, age: i64 }
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  arena {
+    rows := [User { name: old_view, age: 1 }].to_soa()
+    mut fresh := [User { name: \"fresh\", age: 2 }].to_soa()
+    fresh[0].name = new_view
+    new_owner = \"replacement\".clone()
+    if rows[0].name == old_view { return 0 }
+  }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-fresh-soa-backing-control", fresh_control);
+    assert!(
+        diagnostics.is_empty(),
+        "a direct to_soa allocation must keep a fresh backing unrelated to older rows:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn rand_receiver_mutation_invalidates_an_earlier_borrow_mut_place() {
+    let same_rng = "\
+import std.rand
+fn touch(borrow mut value: rng, ignored: i64) {}
+fn main() -> i32 {
+  mut r := rand.seed_with(1)
+  touch(r, r.next())
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-rand-receiver-reservation", same_rng);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "advancing the same rng in a later argument must invalidate the earlier exclusive place:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutating_a_distinct_rng_keeps_an_earlier_borrow_mut_place_valid() {
+    let distinct_rng = "\
+import std.rand
+fn touch(borrow mut value: rng, ignored: i64) {}
+fn main() -> i32 {
+  mut first := rand.seed_with(1)
+  mut second := rand.seed_with(2)
+  touch(first, second.next())
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-rand-receiver-reservation-control", distinct_rng);
+    assert!(
+        diagnostics.is_empty(),
+        "advancing a distinct rng must leave the earlier exclusive place valid:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn shuffle_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place() {
+    let aliased = "\
+import std.rand
+fn touch(borrow mut dst: slice<i64>, ignored: ()) {}
+fn main() -> i32 {
+  mut values := [1, 2, 3]
+  mut destination: slice<i64> := values
+  mut alias: slice<i64> := values
+  mut r := rand.seed_with(1)
+  touch(destination, r.shuffle(alias))
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-shuffle-alias-reservation", aliased);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "shuffling through a backing alias must invalidate the earlier exclusive slice place:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn shuffling_a_distinct_backing_keeps_an_earlier_borrow_mut_place_valid() {
+    let distinct = "\
+import std.rand
+fn touch(borrow mut dst: slice<i64>, ignored: ()) {}
+fn main() -> i32 {
+  mut first := [1, 2, 3]
+  mut second := [4, 5, 6]
+  mut destination: slice<i64> := first
+  mut shuffled: slice<i64> := second
+  mut r := rand.seed_with(1)
+  touch(destination, r.shuffle(shuffled))
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-shuffle-alias-reservation-control", distinct);
+    assert!(
+        diagnostics.is_empty(),
+        "shuffling a distinct backing must leave the earlier exclusive slice valid:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn map_into_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place() {
+    let aliased = "\
+fn touch(borrow mut dst: slice<i64>, ignored: ()) {}
+fn main() -> i32 {
+  source := [4, 5, 6]
+  mut values := [1, 2, 3]
+  mut destination: slice<i64> := values
+  mut alias: slice<i64> := values
+  touch(destination, source.map_into(alias))
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-map-into-alias-reservation", aliased);
+    assert!(
+        diagnostics.contains("borrow mut argument place was invalidated"),
+        "map_into through a backing alias must invalidate the earlier exclusive slice place:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn nested_mutable_call_results_snapshot_post_call_owners() {
+    let old_owner_control = "\
+fn replace_and_return(
+  borrow mut dst: slice<str>,
+  source: slice<str>,
+) -> slice<str> {
+  dst = source
+  return dst
+}
+fn observe(value: slice<str>, ignored: i32) -> i32 {
+  if value.len() > 0 { return ignored }
+  return 0
+}
+fn main() -> i32 {
+  mut old_owner := \"old\".clone()
+  old_view: str := old_owner
+  new_owner := \"new\".clone()
+  new_view: str := new_owner
+  mut old_values := [old_view]
+  mut new_values := [new_view]
+  mut destination: slice<str> := old_values
+  length := observe(
+    replace_and_return(destination, new_values),
+    {
+      old_owner = \"replacement\".clone()
+      0
+    },
+  )
+  return length
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-a2-post-call-result-old-owner-control",
+        old_owner_control,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "a mutable-call result must forget the replaced destination's old owner:\n{diagnostics}"
+    );
+
+    let selected_owner = "\
+fn replace_and_return(
+  borrow mut dst: slice<str>,
+  source: slice<str>,
+) -> slice<str> {
+  dst = source
+  return dst
+}
+fn observe(value: slice<str>, ignored: i32) -> i32 {
+  if value.len() > 0 { return ignored }
+  return 0
+}
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  mut old_values := [old_view]
+  mut new_values := [new_view]
+  mut destination: slice<str> := old_values
+  length := observe(
+    replace_and_return(destination, new_values),
+    {
+      new_owner = \"replacement\".clone()
+      0
+    },
+  )
+  return length
+}
+";
+    let diagnostics = check_diagnostics("l2b-a2-post-call-result-selected-owner", selected_owner);
+    assert!(
+        diagnostics.contains("value snapshot was invalidated"),
+        "a mutable-call result must retain the replacement source owner while a later argument is evaluated:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn storage_generation_producer_content_matrix() {
+    let mut failures = Vec::new();
+    let scalar_same_slot = "\
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut values := [old_view]
+  snapshot := values[0]
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  values[0] = new_view
+  new_owner = \"replacement\".clone()
+  if snapshot == old_view { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-scalar-same-slot-snapshot",
+        scalar_same_slot,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "same-slot scalar snapshot must not observe the later store:\n{diagnostics}"
+        ));
+    }
+
+    let scalar_keeps_old_content = "\
+fn main() -> i32 {
+  mut old_owner := \"old\".clone()
+  old_view: str := old_owner
+  values := [old_view]
+  snapshot := values[0]
+  old_owner = \"replacement\".clone()
+  return snapshot.len() as i32
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-scalar-snapshot-keeps-old-content",
+        scalar_keeps_old_content,
+    );
+    if !(diagnostics.contains("use of invalidated borrow 'snapshot'")
+        && diagnostics.contains("source 'old_owner'"))
+    {
+        failures.push(format!(
+            "a scalar snapshot must retain the content selected at read time:\n{diagnostics}"
+        ));
+    }
+
+    for (name, storage, index_setup, store_index, should_reject) in [
+        ("fixed-exact", "[seed, \"old\"]", "", "1", false),
+        (
+            "fixed-runtime-union",
+            "[seed, \"old\"]",
+            "index := 1",
+            "index",
+            true,
+        ),
+        (
+            "dynamic-literal-wildcard",
+            "[seed, \"old\"].to_array()",
+            "",
+            "1",
+            true,
+        ),
+        (
+            "dynamic-runtime-wildcard",
+            "[seed, \"old\"].to_array()",
+            "index := 1",
+            "index",
+            true,
+        ),
+    ] {
+        let src = format!(
+            "fn select(seed: str) -> str {{\n  arena {{\n    mut values := {storage}\n    {index_setup}\n    n := 42\n    short := template \"short={{n}}\"\n    values[{store_index}] = short\n    return values[0]\n  }}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("l2b-storage-generation-projection-{name}"), &src);
+        if diagnostics.contains("cannot return a value allocated in an arena") != should_reject {
+            failures.push(format!(
+                "fixed storage must select an exact element path while dynamic storage uses its direct wildcard ({name}):\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, predicate, binding) in [
+        ("result-0", "true", "selected"),
+        ("result-1", "false", "rejected"),
+    ] {
+        let src = format!(
+            "fn keep(value: str) -> bool = {predicate}\nfn leak() -> str {{\n  arena {{\n    n := 42\n    short := template \"short={{n}}\"\n    (selected, rejected) := [short].partition(keep)\n    return {binding}[0]\n  }}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("l2b-storage-generation-partition-{name}"), &src);
+        if !diagnostics.contains("cannot return a value allocated in an arena") {
+            failures.push(format!(
+                "partition result ordinal {name} must receive its own generation-content entry:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, store, observe) in [
+        (
+            "result-0-does-not-update-result-1",
+            "selected_view[0] = installed_view",
+            "rejected_view[0]",
+        ),
+        (
+            "result-1-does-not-update-result-0",
+            "rejected_view[0] = installed_view",
+            "selected_view[0]",
+        ),
+    ] {
+        let src = format!(
+            "fn keep(value: str) -> bool = value == \"selected\"\nfn main() -> i32 {{\n  (selected, rejected) := [\"selected\", \"rejected\"].partition(keep)\n  mut selected_view: slice<str> := selected\n  mut rejected_view: slice<str> := rejected\n  mut installed_owner := \"installed\".clone()\n  installed_view: str := installed_owner\n  {store}\n  installed_owner = \"replacement\".clone()\n  _ := {observe}.len()\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-storage-generation-partition-isolation-{name}"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "partition result generations must update independently ({name}):\n{diagnostics}"
+            ));
+        }
+    }
+
+    let aggregate_sources = "\
+Row { name: str }
+Sources {
+  left: slice<str>,
+  right: slice<str>,
+  rows: slice<Row>,
+}
+fn choose_from_sources(sources: Sources, choose_left: bool) -> slice<str> {
+  if choose_left { return sources.left }
+  return sources.right
+}
+fn choose_result(sources: Sources, choose_left: bool) -> Result<slice<str>, Error> =
+  Ok(choose_from_sources(sources, choose_left))
+";
+    for route in ["parameter", "capture"] {
+        for observer in ["left_values", "right_values"] {
+            let capture = if route == "capture" {
+                "  choose_view := fn choose_left: bool { choose_result(sources, choose_left) }\n"
+            } else {
+                ""
+            };
+            let call = if route == "capture" {
+                "choose_view(true)?"
+            } else {
+                "choose_from_sources(sources, true)"
+            };
+            let (main_result, returned) = if route == "capture" {
+                ("Result<i32, Error>", "Ok(0)")
+            } else {
+                ("i32", "0")
+            };
+            let src = format!(
+                "{aggregate_sources}fn probe() -> {main_result} {{\n  left_owner := \"left\".clone()\n  left_view: str := left_owner\n  right_owner := \"right\".clone()\n  right_view: str := right_owner\n  mut left_values := [left_view]\n  mut right_values := [right_view]\n  row_owner := \"row\".clone()\n  row_view: str := row_owner\n  mut row_values := [Row {{ name: row_view }}]\n  unrelated_owner := \"unrelated\".clone()\n  unrelated_view: str := unrelated_owner\n  mut unrelated_values := [unrelated_view]\n  sources := Sources {{\n    left: left_values\n    right: right_values\n    rows: row_values\n  }}\n{capture}  mut selected := {call}\n  mut installed_owner := \"installed\".clone()\n  installed_view: str := installed_owner\n  selected[0] = installed_view\n  installed_owner = \"replacement\".clone()\n  _ := {observer}[0].len()\n  _ := unrelated_values[0].len()\n  return {returned}\n}}\nfn main() -> i32 = 0\n"
+            );
+            let diagnostics = check_diagnostics(
+                &format!("l2b-storage-generation-unknown-aggregate-{route}-{observer}"),
+                &src,
+            );
+            let expected = format!("use of invalidated borrow '{observer}'");
+            if !diagnostics.contains(&expected)
+                || !diagnostics.contains("source 'installed_owner'")
+                || diagnostics.matches("use of invalidated borrow").count() != 1
+                || diagnostics.contains("unrelated_values")
+                || diagnostics.contains("row_values")
+            {
+                failures.push(format!(
+                    "an unknown {route} result must update exactly both same-type aggregate candidates ({observer}) and no unrelated storage:\n{diagnostics}"
+                ));
+            }
+        }
+
+        let capture = if route == "capture" {
+            "  choose_view := fn choose_left: bool { choose_result(sources, choose_left) }\n"
+        } else {
+            ""
+        };
+        let call = if route == "capture" {
+            "choose_view(true)?"
+        } else {
+            "choose_from_sources(sources, true)"
+        };
+        let (main_result, returned) = if route == "capture" {
+            ("Result<i32, Error>", "Ok(0)")
+        } else {
+            ("i32", "0")
+        };
+        let filtered = format!(
+            "{aggregate_sources}fn probe() -> {main_result} {{\n  left_owner := \"left\".clone()\n  left_view: str := left_owner\n  right_owner := \"right\".clone()\n  right_view: str := right_owner\n  mut left_values := [left_view]\n  mut right_values := [right_view]\n  row_owner := \"row\".clone()\n  row_view: str := row_owner\n  mut row_values := [Row {{ name: row_view }}]\n  unrelated_owner := \"unrelated\".clone()\n  unrelated_view: str := unrelated_owner\n  mut unrelated_values := [unrelated_view]\n  sources := Sources {{\n    left: left_values\n    right: right_values\n    rows: row_values\n  }}\n{capture}  mut selected := {call}\n  mut installed_owner := \"installed\".clone()\n  installed_view: str := installed_owner\n  selected[0] = installed_view\n  installed_owner = \"replacement\".clone()\n  _ := row_values[0].name.len()\n  _ := unrelated_values[0].len()\n  return {returned}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-storage-generation-unknown-aggregate-{route}-filtered"),
+            &filtered,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "an unknown {route} store must filter a different header type and storage outside the selected aggregate:\n{diagnostics}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn storage_generation_nonwritable_carrier_matrix() {
+    let mut failures = Vec::new();
+    for (name, body) in [
+        (
+            "source-move",
+            "mut source := [\"stable\"].to_array()\n  chunks := source.chunks(1)\n  moved_source := source\n  if chunks[0][0] == \"stable\" {\n    _ := moved_source.len()\n    return 0\n  }",
+        ),
+        (
+            "carrier-move",
+            "source := [\"stable\"].to_array()\n  chunks := source.chunks(1)\n  moved_chunks := chunks\n  if moved_chunks[0][0] == \"stable\" {\n    _ := source.len()\n    return 0\n  }",
+        ),
+    ] {
+        let src = format!("fn main() -> i32 {{\n  {body}\n  return 0\n}}\n");
+        let diagnostics = check_diagnostics(&format!("l2b-storage-generation-chunks-{name}"), &src);
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "moving the {name} release owner must preserve the chunk carrier's source-generation dependency:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let source_end = "\
+fn main() -> i32 {
+  mut source := [\"old\"].to_array()
+  chunks := source.chunks(1)
+  source = [\"replacement\"].to_array()
+  if chunks[0][0] == \"old\" { return 0 }
+  return 1
+}
+";
+    let diagnostics = check_diagnostics("l2b-storage-generation-chunks-source-end", source_end);
+    if !diagnostics.contains("use of invalidated borrow 'chunks'") {
+        failures.push(format!(
+            "replacing the source allocation must end the generation retained by a chunk carrier:\n{diagnostics}"
+        ));
+    }
+
+    let content_after_source_move = "\
+fn main() -> i32 {
+  mut owner := \"source\".clone()
+  view: str := owner
+  mut source := [view].to_array()
+  chunks := source.chunks(1)
+  moved_source := source
+  owner = \"replacement\".clone()
+  if chunks[0][0] == \"never\" {
+    _ := moved_source.len()
+    return 1
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-chunks-content-after-source-move",
+        content_after_source_move,
+    );
+    if !(diagnostics.contains("use of invalidated borrow 'chunks'")
+        && diagnostics.contains("source 'owner'"))
+    {
+        failures.push(format!(
+            "a source Move must preserve both the carrier dependency and its projected element content:\n{diagnostics}"
+        ));
+    }
+
+    for (name, src, observer, source) in [
+        (
+            "materialized-chunks",
+            "fn keep(value: slice<str>) -> bool = true\nfn main() -> i32 {\n  mut owner := \"source\".clone()\n  view: str := owner\n  source := [view]\n  carrier := source.chunks(1).where(keep).to_array()\n  owner = \"replacement\".clone()\n  return carrier[0][0].len() as i32\n}\n",
+            "carrier",
+            "owner",
+        ),
+        (
+            "builder-chunks",
+            "fn main() -> i32 {\n  mut source := [(1 as u8), (2 as u8)].to_array()\n  view: slice<u8> := source\n  arena out {\n    mut builder: array_builder<slice<u8>> := array_builder(out)\n    builder.push(view)\n    carrier := builder.build()\n    source = [(3 as u8), (4 as u8)].to_array()\n    return carrier[0].len() as i32\n  }\n}\n",
+            "carrier",
+            "source",
+        ),
+        (
+            "fixed-array",
+            "fn one<T: RegionPlain>(out: region, value: T) -> array<T> {\n  mut values: array_builder<T> := array_builder(out)\n  values.push(value)\n  return values.build()\n}\nfn main() -> i32 {\n  mut owner := \"source\".clone()\n  view: str := owner\n  arena out {\n    element := [view, \"fixed\"]\n    carrier := one(out, element)\n    owner = \"replacement\".clone()\n    selected := carrier[0]\n    return selected[0].len() as i32\n  }\n}\n",
+            "carrier",
+            "owner",
+        ),
+        (
+            "fixed-struct-array",
+            "Cell { value: str }\nfn one<T: RegionPlain>(out: region, value: T) -> array<T> {\n  mut values: array_builder<T> := array_builder(out)\n  values.push(value)\n  return values.build()\n}\nfn main() -> i32 {\n  mut owner := \"source\".clone()\n  view: str := owner\n  arena out {\n    element := [Cell { value: view }, Cell { value: \"fixed\" }]\n    carrier := one(out, element)\n    owner = \"replacement\".clone()\n    selected := carrier[0]\n    return selected[0].value.len() as i32\n  }\n}\n",
+            "carrier",
+            "owner",
+        ),
+        (
+            "dict-encoded-source",
+            "Row { key: str, value: i64 }\nfn main() -> i32 {\n  mut source := [Row { key: \"old\", value: 1 }].to_array()\n  encoded := source.dict_encode(.key)\n  source = [Row { key: \"new\", value: 2 }].to_array()\n  grouped := encoded.group_by(.key).sum(.value)\n  return grouped.0[0].len() as i32\n}\n",
+            "encoded",
+            "source",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("l2b-storage-generation-carrier-{name}"), src);
+        if !(diagnostics.contains(&format!("use of invalidated borrow '{observer}'"))
+            && diagnostics.contains(&format!("source '{source}'")))
+        {
+            failures.push(format!(
+                "{name} must retain its exact source-generation dependency at `{observer}`:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, setup, observe) in [
+        (
+            "vector",
+            "value: vec4<i32> := [1, 2, 3, 4]\n    carrier := one(out, value)",
+            "carrier[0][0]",
+        ),
+        (
+            "mask",
+            "left: vec4<i32> := [1, 2, 3, 4]\n    right: vec4<i32> := [4, 3, 2, 1]\n    carrier := one(out, left > right)",
+            "select(carrier[0], left, right)[0]",
+        ),
+    ] {
+        let src = format!(
+            "fn one<T: RegionPlain>(out: region, value: T) -> array<T> {{\n  mut values: array_builder<T> := array_builder(out)\n  values.push(value)\n  return values.build()\n}}\nfn main() -> i32 {{\n  mut unrelated := \"source\".clone()\n  view: str := unrelated\n  _ := view.len()\n  arena out {{\n    {setup}\n    unrelated = \"replacement\".clone()\n    return {observe}\n  }}\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-storage-generation-carrier-primitive-{name}"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "primitive-only {name} carriers must not acquire an unrelated view dependency:\n{diagnostics}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn storage_generation_move_replacement_escape_matrix() {
+    let mut failures = Vec::new();
+    for (name, transfer) in [
+        ("one-way", "mut destination := source"),
+        (
+            "round-trip",
+            "mut destination := source\n  source = destination",
+        ),
+    ] {
+        let writer = if name == "one-way" {
+            "destination[0] = view"
+        } else {
+            "source[0] = view"
+        };
+        let src = format!(
+            "fn main() -> i32 {{\n  mut source := [\"old\"].to_array()\n  mut alias: slice<str> := source\n  {transfer}\n  mut owner := \"installed\".clone()\n  view: str := owner\n  {writer}\n  owner = \"replacement\".clone()\n  if alias[0] == \"never\" {{ return 1 }}\n  return 0\n}}\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("l2b-storage-generation-moved-alias-{name}"), &src);
+        if !(diagnostics.contains("use of invalidated borrow 'alias'")
+            && diagnostics.contains("source 'owner'"))
+        {
+            failures.push(format!(
+                "a {name} Move must transfer the release owner without changing the allocation observed by an old alias:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let rebound_source = "\
+fn main() -> i32 {
+  mut source := [\"old\"].to_array()
+  alias: slice<str> := source
+  moved := source
+  mut rebound_owner := \"rebound\".clone()
+  rebound_view: str := rebound_owner
+  source = [rebound_view].to_array()
+  rebound_owner = \"replacement\".clone()
+  if alias[0] == \"old\" {
+    _ := moved.len()
+    return 0
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-moved-alias-rebound-control",
+        rebound_source,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "an old alias must follow the moved allocation, not an unrelated value rebound into the moved-from source:\n{diagnostics}"
+        ));
+    }
+
+    let closure_observer = "\
+fn main() -> i32 {
+  mut source := [\"old\"].to_array()
+  mut alias: slice<str> := source
+  holder := fn { alias[0] }
+  mut owner := \"installed\".clone()
+  view: str := owner
+  alias[0] = view
+  owner = \"replacement\".clone()
+  _ := holder().len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-moved-closure-observer",
+        closure_observer,
+    );
+    if !(diagnostics.contains("use of invalidated borrow 'holder'")
+        && diagnostics.contains("source 'owner'"))
+    {
+        failures.push(format!(
+            "a collection header captured by `holder` must resolve shared generation content at that local's observation:\n{diagnostics}"
+        ));
+    }
+
+    let fixed_or = "\
+fn probe(condition: bool) -> i32 {
+  mut source := [\"old\"]
+  alias: slice<str> := source
+  mut owner := \"installed\".clone()
+  view: str := owner
+  _ := condition || {
+    source[0] = view
+    true
+  }
+  owner = \"replacement\".clone()
+  if alias[0] == \"never\" { return 1 }
+  return 0
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-storage-generation-short-circuit-fixed-or", fixed_or);
+    if !(diagnostics.contains("use of invalidated borrow 'alias'")
+        && diagnostics.contains("source 'owner'"))
+    {
+        failures.push(format!(
+            "the fixed-storage `||` join must preserve the evaluated arm's installed content at `alias`:\n{diagnostics}"
+        ));
+    }
+
+    let copy_view_or = "\
+fn probe(condition: bool) -> i32 {
+  first := [\"first\"]
+  second := [\"second\"]
+  mut destination: slice<str> := first
+  alias := destination
+  _ := condition || {
+    destination = second
+    true
+  }
+  if alias[0] == \"first\" { return 0 }
+  return 1
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-short-circuit-copy-view-or",
+        copy_view_or,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "rebinding a Copy view on one `||` arm must not retarget the pre-existing alias:\n{diagnostics}"
+        ));
+    }
+
+    let owned_dynamic = "\
+fn freshen(borrow mut destination: array<i64>) {
+  destination = [7, 8].to_array()
+}
+fn main() -> i32 {
+  mut destination := [1, 2].to_array()
+  alias: slice<i64> := destination
+  freshen(destination)
+  _ := alias.len()
+  _ := destination.len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-owned-dynamic",
+        owned_dynamic,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'alias'")
+        || !diagnostics.contains("source 'destination'")
+        || diagnostics.matches("use of invalidated borrow").count() != 1
+        || diagnostics.contains("use of invalidated borrow 'destination'")
+    {
+        failures.push(format!(
+            "a sole-operand mutable call must end the old owned-dynamic generation and publish a live replacement:\n{diagnostics}"
+        ));
+    }
+
+    let fixed_inline = "\
+fn install(borrow mut destination: slice<str>, value: str) {
+  destination[0] = value
+}
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut values := [old_view]
+  alias: slice<str> := values
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  install(values, new_view)
+  new_owner = \"replacement\".clone()
+  return alias[0].len() as i32
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-fixed-inline",
+        fixed_inline,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'alias'")
+        || !diagnostics.contains("source 'new_owner'")
+        || diagnostics.matches("use of invalidated borrow").count() != 1
+        || diagnostics.contains("source 'old_owner'")
+    {
+        failures.push(format!(
+            "a mutable call whose source is the final operand must update the fixed inline generation exactly once:\n{diagnostics}"
+        ));
+    }
+
+    let fixed_clear = "\
+fn clear(borrow mut destination: slice<str>) {
+  destination[0] = \"static\"
+}
+fn main() -> i32 {
+  mut old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut values := [old_view]
+  mut destination: slice<str> := values
+  alias := destination
+  clear(destination)
+  old_owner = \"replacement\".clone()
+  _ := alias[0].len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-final-destination",
+        fixed_clear,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "a mutable destination in the final and only operand slot must still publish its post-call static content:\n{diagnostics}"
+        ));
+    }
+
+    let no_op_mutable_call = "\
+fn observe(borrow mut destination: slice<str>) {
+  _ := destination.len()
+}
+fn main() -> i32 {
+  mut owner := \"old\".clone()
+  view: str := owner
+  mut values := [view]
+  mut destination: slice<str> := values
+  alias := destination
+  observe(destination)
+  owner = \"replacement\".clone()
+  _ := alias[0].len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-no-op",
+        no_op_mutable_call,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'alias'")
+        || !diagnostics.contains("source 'owner'")
+        || diagnostics.matches("use of invalidated borrow").count() != 1
+    {
+        failures.push(format!(
+            "a mutable helper that does not write must preserve the caller's current generation:\n{diagnostics}"
+        ));
+    }
+
+    for (route, setup, call) in [("direct", "", "replace_view(destination, second)")] {
+        let copy_view = format!(
+            "fn replace_view(borrow mut destination: slice<str>, source: slice<str>) {{\n  destination = source\n}}\nfn main() -> i32 {{\n  first_owner := \"first\".clone()\n  first_view: str := first_owner\n  mut second_owner := \"second\".clone()\n  second_view: str := second_owner\n  mut first := [first_view]\n  mut second := [second_view]\n  mut destination: slice<str> := first\n  alias := destination\n{setup}  {call}\n  _ := alias[0].len()\n  second_owner = \"replacement\".clone()\n  _ := destination[0].len()\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("l2b-storage-generation-call-mutation-copy-view-{route}"),
+            &copy_view,
+        );
+        if !diagnostics.contains("use of invalidated borrow 'destination'")
+            || !diagnostics.contains("source 'second_owner'")
+            || diagnostics.matches("use of invalidated borrow").count() != 1
+            || diagnostics.contains("use of invalidated borrow 'alias'")
+            || diagnostics.contains("source 'first_owner'")
+        {
+            failures.push(format!(
+                "{route} mutable-call replacement must retarget only the Copy destination, not its pre-call alias:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let fn_value_string = "\
+fn replace_string(borrow mut destination: string, source: string) {
+  destination = source
+}
+fn main() -> i32 {
+  mut destination := \"old\".clone()
+  old_view: str := destination
+  replacement := \"new\".clone()
+  apply := replace_string
+  apply(destination, replacement)
+  _ := destination.len()
+  _ := old_view.len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-fn-value",
+        fn_value_string,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'old_view'")
+        || !diagnostics.contains("source 'destination'")
+        || diagnostics.matches("use of invalidated borrow").count() != 1
+        || diagnostics.contains("use of invalidated borrow 'destination'")
+    {
+        failures.push(format!(
+            "a function-value mutable call must end the old scalar-owned generation and publish the replacement:\n{diagnostics}"
+        ));
+    }
+
+    let imported_mutator = (
+        "mutator.align",
+        "\
+module mutator
+pub fn install(borrow mut destination: slice<str>, value: str) {
+  destination[0] = value
+}
+",
+    );
+    let imported_main = "\
+import mutator
+fn main() -> i32 {
+  old_owner := \"old\".clone()
+  old_view: str := old_owner
+  mut values := [old_view]
+  alias: slice<str> := values
+  mut new_owner := \"new\".clone()
+  new_view: str := new_owner
+  mutator.install(values, new_view)
+  new_owner = \"replacement\".clone()
+  _ := alias[0].len()
+  return 0
+}
+";
+    let differential = diff_check_multi(
+        "l2b-storage-generation-call-mutation-imported",
+        &[imported_mutator, ("main.align", imported_main)],
+        "main.align",
+    );
+    for (mode, has_errors, diagnostics) in [
+        (
+            "whole-program",
+            differential.whole_errors,
+            differential.whole_diags.as_str(),
+        ),
+        (
+            "per-unit",
+            differential.per_unit_errors,
+            differential.per_unit_diags.as_str(),
+        ),
+    ] {
+        if !has_errors
+            || !diagnostics.contains("use of invalidated borrow 'alias'")
+            || !diagnostics.contains("source 'new_owner'")
+            || diagnostics.matches("use of invalidated borrow").count() != 1
+            || diagnostics.contains("source 'old_owner'")
+        {
+            failures.push(format!(
+                "{mode} checking must apply the imported mutable-call transition to the exact fixed generation:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let clone_in = "\
+fn install_copy(
+  borrow mut destination: slice<str>,
+  source: str,
+  out: region,
+) {
+  destination[0] = source.clone_in(out)
+}
+fn probe() -> i32 {
+  mut source_owner := \"source\".clone()
+  source: str := source_owner
+  arena out {
+    mut values := [\"old\"]
+    mut destination: slice<str> := values
+    install_copy(destination, source, out)
+    source_owner = \"replacement\".clone()
+    _ := destination[0].len()
+  }
+  return 0
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics("l2b-storage-generation-call-mutation-clone-in", clone_in);
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "clone_in(out) must select the explicit region fallback instead of retaining the copied source owner:\n{diagnostics}"
+        ));
+    }
+
+    let repeated_mutation = "\
+fn freshen(borrow mut destination: array<i64>) {
+  destination = [7, 8].to_array()
+}
+fn probe() -> i32 {
+  stable := [9]
+  mut destination := [1, 2].to_array()
+  mut alias: slice<i64> := stable
+  mut phase := 0
+  loop {
+    freshen(destination)
+    if phase == 1 { break }
+    alias = destination
+    phase = 1
+  }
+  _ := alias.len()
+  return 0
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-repeated",
+        repeated_mutation,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'alias'")
+        || !diagnostics.contains("source 'destination'")
+        || diagnostics.matches("use of invalidated borrow").count() != 1
+    {
+        failures.push(format!(
+            "a repeated CallMutation origin must demote and end the preceding iteration's Current generation:\n{diagnostics}"
+        ));
+    }
+    let repeated_clean = repeated_mutation.replace(
+        "    alias = destination\n    phase = 1",
+        "    alias = stable\n    phase = 1",
+    );
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-repeated-clean",
+        &repeated_clean,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "the repeated CallMutation control must not invalidate a non-candidate stable slice:\n{diagnostics}"
+        ));
+    }
+
+    let multiple_destinations = "\
+fn install_two(
+  borrow mut left: slice<str>,
+  borrow mut right: slice<str>,
+  left_value: str,
+  right_value: str,
+) {
+  left[0] = left_value
+  right[0] = right_value
+}
+fn main() -> i32 {
+  mut left_values := [\"old-left\"]
+  mut right_values := [\"old-right\"]
+  left_alias: slice<str> := left_values
+  right_alias: slice<str> := right_values
+  mut left_owner := \"new-left\".clone()
+  left_view: str := left_owner
+  mut right_owner := \"new-right\".clone()
+  right_view: str := right_owner
+  install_two(left_values, right_values, left_view, right_view)
+  left_owner = \"replacement-left\".clone()
+  right_owner = \"replacement-right\".clone()
+  _ := left_alias[0].len()
+  _ := right_alias[0].len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-call-mutation-multiple-destinations",
+        multiple_destinations,
+    );
+    if !diagnostics.contains("use of invalidated borrow 'left_alias': its source 'left_owner'")
+        || !diagnostics
+            .contains("use of invalidated borrow 'right_alias': its source 'right_owner'")
+        || diagnostics.matches("use of invalidated borrow").count() != 2
+        || diagnostics.contains("left_alias': its source 'right_owner'")
+        || diagnostics.contains("right_alias': its source 'left_owner'")
+    {
+        failures.push(format!(
+            "multiple mutable destinations must publish parallel, destination-relative generation contents:\n{diagnostics}"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn storage_generation_interprocedural_allocation_parity_matrix() {
+    let mut failures = Vec::new();
+    let views = (
+        "views.align",
+        "\
+module views
+pub Row { name: str, score: i64 }
+pub fn owned(value: str) -> array<str> = [value].to_array()
+pub fn rows(value: str) -> array<Row> = [Row { name: value, score: 1 }].to_array()
+pub fn chunked(values: slice<str>) -> array<slice<str>> = values.chunks(1)
+pub fn region_owned(out: region, value: str) -> array<str> {
+  mut values: array_builder<str> := array_builder(out)
+  values.push(value)
+  return values.build()
+}
+pub FreshResult { values: array<i64>, count: i64 }
+pub fn consume_fresh(source: array<i64>) -> array<i64> {
+  count := source.len()
+  return [count].to_array()
+}
+pub fn consume_identity(source: array<i64>) -> array<i64> = source
+pub fn consume_aggregate(source: array<i64>) -> FreshResult {
+  count := source.len()
+  return FreshResult { values: [count].to_array(), count: count }
+}
+pub fn consume_fixed<T>(source: array<i64>, result: T) -> T {
+  _ := source.len()
+  return result
+}
+pub SelfRelative { owned: array<str>, view: slice<str> }
+pub fn consume_self_relative(source: SelfRelative) -> SelfRelative = source
+pub fn first_view(selected: slice<str>, ignored: slice<str>) -> slice<str> = selected
+",
+    );
+
+    for (name, main) in [
+        (
+            "owned-content-clean",
+            "\
+import views
+fn main() -> i32 {
+  owner := \"caller\".clone()
+  value: str := owner
+  result := views.owned(value)
+  return result[0].len() as i32
+}
+",
+        ),
+        (
+            "struct-content-clean",
+            "\
+import views
+fn main() -> i32 {
+  owner := \"caller\".clone()
+  value: str := owner
+  result := views.rows(value)
+  return result[0].name.len() as i32
+}
+",
+        ),
+        (
+            "carrier-content-clean",
+            "\
+import views
+fn main() -> i32 {
+  owner := \"caller\".clone()
+  value: str := owner
+  source := [value, \"fixed\"]
+  result := views.chunked(source)
+  return result[0][0].len() as i32
+}
+",
+        ),
+        (
+            "region-content-clean",
+            "\
+import views
+fn main() -> i32 {
+  owner := \"caller\".clone()
+  value: str := owner
+  arena out {
+    result := views.region_owned(out, value)
+    return result[0].len() as i32
+  }
+}
+",
+        ),
+        (
+            "function-value-owned-clean",
+            "\
+import views
+fn owned(value: i32) -> array<i32> = [value].to_array()
+fn main() -> i32 {
+  factory := owned
+  result := factory(7)
+  return result[0]
+}
+",
+        ),
+    ] {
+        let differential = diff_check_multi(
+            &format!("l2b-storage-generation-call-{name}"),
+            &[views, ("main.align", main)],
+            "main.align",
+        );
+        if differential.whole_errors {
+            failures.push(format!(
+                "whole-program checking must accept imported {name} and observe its content:\n{}",
+                differential.whole_diags
+            ));
+        }
+        if differential.per_unit_errors {
+            failures.push(format!(
+                "per-unit checking must independently accept imported {name} and observe its content:\n{}",
+                differential.per_unit_diags
+            ));
+        }
+    }
+
+    for (name, main, expected_observer, expected_source) in [
+        (
+            "owned-content-reject",
+            "\
+import views
+fn main() -> i32 {
+  mut owner := \"caller\".clone()
+  value: str := owner
+  result := views.owned(value)
+  owner = \"replacement\".clone()
+  return result[0].len() as i32
+}
+",
+            "use of invalidated borrow 'result'",
+            Some("source 'owner'"),
+        ),
+        (
+            "struct-content-reject",
+            "\
+import views
+fn main() -> i32 {
+  mut owner := \"caller\".clone()
+  value: str := owner
+  result := views.rows(value)
+  owner = \"replacement\".clone()
+  return result[0].name.len() as i32
+}
+",
+            "use of invalidated borrow 'result'",
+            Some("source 'owner'"),
+        ),
+        (
+            "carrier-content-reject",
+            "\
+import views
+fn main() -> i32 {
+  mut owner := \"caller\".clone()
+  value: str := owner
+  source := [value]
+  result := views.chunked(source)
+  owner = \"replacement\".clone()
+  return result[0][0].len() as i32
+}
+",
+            "use of invalidated borrow 'result'",
+            Some("source 'owner'"),
+        ),
+        (
+            "carrier-source-generation-end",
+            "\
+import views
+fn main() -> i32 {
+  mut source := [\"old\"].to_array()
+  result := views.chunked(source)
+  source = [\"replacement\"].to_array()
+  return result[0][0].len() as i32
+}
+",
+            "use of invalidated borrow 'result'",
+            Some("source 'source'"),
+        ),
+        (
+            "region-content-reject",
+            "\
+import views
+fn main() -> i32 {
+  mut owner := \"caller\".clone()
+  value: str := owner
+  arena out {
+    result := views.region_owned(out, value)
+    owner = \"replacement\".clone()
+    return result[0].len() as i32
+  }
+}
+",
+            "use of invalidated borrow 'result'",
+            Some("source 'owner'"),
+        ),
+        (
+            "function-value-owned-replacement",
+            "\
+import views
+fn owned(value: i32) -> array<i32> = [value].to_array()
+fn main() -> i32 {
+  factory := owned
+  mut result := factory(7)
+  alias: slice<i32> := result
+  result = factory(8)
+  _ := alias.len()
+  return 0
+}
+",
+            "use of invalidated borrow 'alias'",
+            Some("source 'result'"),
+        ),
+        (
+            "owned-escape-reject",
+            "\
+import views
+fn leak(value: str) -> slice<str> {
+  result := views.owned(value)
+  return result[..]
+}
+fn main() -> i32 = 0
+",
+            "cannot return",
+            None,
+        ),
+        (
+            "carrier-escape-reject",
+            "\
+import views
+fn leak(value: str) -> slice<str> {
+  source := [value]
+  result := views.chunked(source)
+  return result[0]
+}
+fn main() -> i32 = 0
+",
+            "cannot return",
+            None,
+        ),
+    ] {
+        let differential = diff_check_multi(
+            &format!("l2b-storage-generation-call-{name}"),
+            &[views, ("main.align", main)],
+            "main.align",
+        );
+        for (mode, has_errors, diagnostics) in [
+            (
+                "whole-program",
+                differential.whole_errors,
+                differential.whole_diags.as_str(),
+            ),
+            (
+                "per-unit",
+                differential.per_unit_errors,
+                differential.per_unit_diags.as_str(),
+            ),
+        ] {
+            let has_expected_source =
+                expected_source.is_none_or(|source| diagnostics.contains(source));
+            let has_exact_carrier_source_end = name != "carrier-source-generation-end"
+                || (diagnostics.matches("use of invalidated borrow").count() == 1
+                    && !diagnostics.contains("source 'owner'"));
+            if !has_errors
+                || !diagnostics.contains(expected_observer)
+                || !has_expected_source
+                || !has_exact_carrier_source_end
+            {
+                failures.push(format!(
+                    "{mode} checking must independently reject imported {name} with its owner diagnostic:\n{diagnostics}"
+                ));
+            }
+        }
+    }
+
+    let response_array_clean = "\
+import std.http
+fn probe() -> Result<i64, Error> {
+  cl := http.client()
+  mut urls := [\"http://127.0.0.1/first\"].to_array()
+  responses := cl.get_many(urls, 1)?
+  urls = [\"http://127.0.0.1/second\"].to_array()
+  return Ok(responses.len())
+}
+fn main() -> i32 = 0
+";
+    let clean_files = [("main.align", response_array_clean)];
+    let differential = diff_check_multi(
+        "l2b-storage-generation-response-array-unrelated-clean",
+        &clean_files,
+        "main.align",
+    );
+    if differential.whole_errors || differential.per_unit_errors {
+        failures.push(format!(
+            "a fresh DynResponseArray must not retain the URL array generation in either checking mode:\nwhole:\n{}\nper-unit:\n{}",
+            differential.whole_diags, differential.per_unit_diags
+        ));
+    } else {
+        let mir = whole_mir_multi(
+            "l2b-storage-generation-response-array-unrelated-mir",
+            &clean_files,
+            "main.align",
+        );
+        if mir.matches("http_get_many(").count() != 1 {
+            failures.push(format!(
+                "the clean control must still lower exactly one DynResponseArray producer:\n{mir}"
+            ));
+        }
+    }
+
+    let response_array_ended = "\
+import std.http
+fn probe(urls: slice<str>) -> Result<i64, Error> {
+  cl := http.client()
+  mut responses := cl.get_many(urls, 1)?
+  body := responses[0].body()
+  responses = cl.get_many(urls, 1)?
+  return Ok(body.len())
+}
+fn main() -> i32 = 0
+";
+    let differential = diff_check_multi(
+        "l2b-storage-generation-response-array-generation-end",
+        &[("main.align", response_array_ended)],
+        "main.align",
+    );
+    for (mode, has_errors, diagnostics) in [
+        (
+            "whole-program",
+            differential.whole_errors,
+            differential.whole_diags.as_str(),
+        ),
+        (
+            "per-unit",
+            differential.per_unit_errors,
+            differential.per_unit_diags.as_str(),
+        ),
+    ] {
+        if !has_errors
+            || !diagnostics.contains("use of invalidated borrow 'body'")
+            || !diagnostics.contains("source 'responses'")
+            || diagnostics.matches("use of invalidated borrow").count() != 1
+            || diagnostics.contains("source 'urls'")
+        {
+            failures.push(format!(
+                "{mode} checking must end only the replaced DynResponseArray generation:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let selected_argument_snapshot = "\
+import views
+fn main() -> i32 {
+  mut selected_owner := [\"selected\"].to_array()
+  mut ignored_owner := [\"ignored\"].to_array()
+  mut current: slice<str> := selected_owner
+  result := views.first_view(
+    current,
+    {
+      current = ignored_owner
+      current
+    },
+  )
+  selected_owner = [\"replacement-selected\"].to_array()
+  ignored_owner = [\"replacement-ignored\"].to_array()
+  _ := result[0].len()
+  return 0
+}
+";
+    let differential = diff_check_multi(
+        "l2b-storage-generation-selected-argument-snapshot",
+        &[views, ("main.align", selected_argument_snapshot)],
+        "main.align",
+    );
+    for (mode, has_errors, diagnostics) in [
+        (
+            "whole-program",
+            differential.whole_errors,
+            differential.whole_diags.as_str(),
+        ),
+        (
+            "per-unit",
+            differential.per_unit_errors,
+            differential.per_unit_diags.as_str(),
+        ),
+    ] {
+        if !has_errors
+            || !diagnostics
+                .contains("use of invalidated borrow 'result': its source 'selected_owner'")
+            || diagnostics.matches("use of invalidated borrow").count() != 1
+            || diagnostics.contains("source 'ignored_owner'")
+        {
+            failures.push(format!(
+                "{mode} call results must retain only the selected same-typed argument's frozen generation when a later argument rebinds that view local:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let target_relative_capture_generations = "\
+fn wrapped(value: slice<str>) -> Result<slice<str>, Error> = Ok(value)
+fn probe(choose_right: bool) -> Result<i32, Error> {
+  left_owner := \"left\".clone()
+  left_view: str := left_owner
+  mut left_values := [left_view]
+  left_slice: slice<str> := left_values
+  right_owner := \"right\".clone()
+  right_view: str := right_owner
+  mut right_values := [right_view]
+  right_slice: slice<str> := right_values
+  ignored_owner := \"ignored\".clone()
+  ignored_view: str := ignored_owner
+  mut ignored_values := [ignored_view]
+  ignored_slice: slice<str> := ignored_values
+  mut callback := fn {
+    _ := left_slice.len()
+    _ := ignored_slice.len()
+    wrapped(left_slice)
+  }
+  if choose_right {
+    callback = fn {
+      _ := right_slice.len()
+      _ := ignored_slice.len()
+      wrapped(right_slice)
+    }
+  }
+  mut result := callback()?
+  mut installed_owner := \"installed\".clone()
+  installed_view: str := installed_owner
+  result[0] = installed_view
+  installed_owner = \"replacement\".clone()
+  _ := left_values[0].len()
+  _ := right_values[0].len()
+  _ := ignored_values[0].len()
+  return Ok(0)
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics(
+        "l2b-storage-generation-target-relative-capture",
+        target_relative_capture_generations,
+    );
+    if !diagnostics
+        .contains("use of invalidated borrow 'left_values': its source 'installed_owner'")
+        || !diagnostics
+            .contains("use of invalidated borrow 'right_values': its source 'installed_owner'")
+        || diagnostics.matches("use of invalidated borrow").count() != 2
+        || diagnostics.contains("use of invalidated borrow 'ignored_values'")
+    {
+        failures.push(format!(
+            "two callable targets must translate capture ordinal zero through their own target-relative environment and exclude the unselected ordinal:\n{diagnostics}"
+        ));
+    }
+
+    let consumed_input_distinct_results = "\
+import views
+fn direct_fresh(source: array<i64>) -> array<i64> {
+  count := source.len()
+  return [count].to_array()
+}
+fn fn_fresh(source: string) -> array<i64> {
+  count := source.len()
+  return [count].to_array()
+}
+fn main() -> i32 {
+  direct_source := [1].to_array()
+  direct_old: slice<i64> := direct_source
+  direct_result := direct_fresh(direct_source)
+  direct_result_view: slice<i64> := direct_result
+  _ := direct_result_view.len()
+  _ := direct_old.len()
+
+  imported_source := [2].to_array()
+  imported_old: slice<i64> := imported_source
+  imported_result := views.consume_fresh(imported_source)
+  imported_result_view: slice<i64> := imported_result
+  _ := imported_result_view.len()
+  _ := imported_old.len()
+
+  identity_source := [3].to_array()
+  identity_old: slice<i64> := identity_source
+  identity_result := views.consume_identity(identity_source)
+  identity_result_view: slice<i64> := identity_result
+  _ := identity_result_view.len()
+  _ := identity_old.len()
+
+  fixed_source := [4].to_array()
+  fixed_old: slice<i64> := fixed_source
+  fixed_publish := [40, 41]
+  fixed_result := views.consume_fixed(fixed_source, fixed_publish)
+  _ := fixed_result[0]
+  _ := fixed_old.len()
+
+  aggregate_source := [5].to_array()
+  aggregate_old: slice<i64> := aggregate_source
+  aggregate_result := views.consume_aggregate(aggregate_source)
+  aggregate_result_view: slice<i64> := aggregate_result.values
+  _ := aggregate_result_view.len()
+  _ := aggregate_old.len()
+
+  fn_source := \"six\".clone()
+  fn_old: str := fn_source
+  factory := fn_fresh
+  fn_result := factory(fn_source)
+  fn_result_view: slice<i64> := fn_result
+  _ := fn_result_view.len()
+  _ := fn_old.len()
+
+  self_owner := [\"seven\"].to_array()
+  self_view: slice<str> := self_owner
+  self_source := views.SelfRelative { owned: self_owner, view: self_view }
+  self_result := views.consume_self_relative(self_source)
+  self_owned_alias: slice<str> := self_result.owned
+  _ := self_owned_alias.len()
+  _ := self_result.view[0].len()
+  return 0
+}
+";
+    let differential = diff_check_multi(
+        "l2b-storage-generation-consumed-input-distinct-results",
+        &[views, ("main.align", consumed_input_distinct_results)],
+        "main.align",
+    );
+    let expected = [
+        ("direct_old", "direct_source"),
+        ("imported_old", "imported_source"),
+        ("identity_old", "identity_source"),
+        ("fixed_old", "fixed_source"),
+        ("aggregate_old", "aggregate_source"),
+        ("fn_old", "fn_source"),
+        ("self_result", "self_source"),
+    ];
+    let live_result_observers = [
+        "direct_result_view",
+        "imported_result_view",
+        "identity_result_view",
+        "fixed_result",
+        "aggregate_result_view",
+        "fn_result_view",
+        "self_owned_alias",
+    ];
+    for (mode, has_errors, diagnostics) in [
+        (
+            "whole-program",
+            differential.whole_errors,
+            differential.whole_diags.as_str(),
+        ),
+        (
+            "per-unit",
+            differential.per_unit_errors,
+            differential.per_unit_diags.as_str(),
+        ),
+    ] {
+        let exact_sources = expected.iter().all(|(observer, source)| {
+            diagnostics.contains(&format!(
+                "use of invalidated borrow '{observer}': its source '{source}'"
+            ))
+        });
+        let result_stayed_live = live_result_observers.iter().all(|observer| {
+            !diagnostics.contains(&format!("use of invalidated borrow '{observer}'"))
+        });
+        if !has_errors
+            || !exact_sources
+            || !result_stayed_live
+            || diagnostics.matches("use of invalidated borrow").count() != expected.len()
+        {
+            failures.push(format!(
+                "{mode} checking must end each consumed input independently of its direct/imported/function-value fixed, owned, and aggregate result, while keeping a self-relative result view conservative:\n{diagnostics}"
+            ));
+        }
+    }
+
+    // Align source cannot forge `ExprKind::RawCall`. Its exact ByValue consume/no-action
+    // boundary remains owned by
+    // `align_sema::tests::storage_generation_move_action_directory_matrix`.
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
