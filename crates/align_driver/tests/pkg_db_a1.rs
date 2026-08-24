@@ -719,7 +719,7 @@ fn live_binary_formats(borrow connection: pkg.db.conn) -> i32 {
   return 0
 }
 
-fn prepared_values(
+fn prepared_buffered_values(
   borrow mut statement: pkg.db.stmt<app.live_stream.Params, app.live_stream.Row>,
 ) -> i32 {
   mut buffered := pkg.db.postgres.rows_stmt_native(statement, params(1, 1), [], []) else {
@@ -729,7 +729,12 @@ fn prepared_values(
   buffered_value := buffered_row else { return 3 }
   if buffered_value.value != 1 { return 4 }
   match pkg.db.next(buffered) else { return 5 } { Some(_) => { return 6 } None => {} }
+  return 0
+}
 
+fn prepared_single_values(
+  borrow mut statement: pkg.db.stmt<app.live_stream.Params, app.live_stream.Row>,
+) -> i32 {
   mut singles := pkg.db.postgres.rows_stmt_native(
     statement, params(2, 4), [],
     [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
@@ -737,7 +742,16 @@ fn prepared_values(
   single_batch := pkg.db.next_batch(singles, 8) else { return 8 }
   single_values := single_batch else { return 9 }
   if (pkg.db.batch_len(single_values) else { return 10 }) != 3 { return 11 }
+  return 0
+}
 
+fn prepared_values(
+  borrow mut statement: pkg.db.stmt<app.live_stream.Params, app.live_stream.Row>,
+) -> i32 {
+  buffered_status := prepared_buffered_values(statement)
+  if buffered_status != 0 { return buffered_status }
+  single_status := prepared_single_values(statement)
+  if single_status != 0 { return single_status }
   mut chunks := pkg.db.postgres.rows_stmt_native(
     statement, params(5, 7), [],
     [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
@@ -1734,15 +1748,10 @@ fn invalid_query(
   }
 }
 
-fn consume(
+fn consume_unknown_option(
   borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
-  binary_id: bool,
+  bytes: slice<u8>,
 ) -> i32 {
-  if !pkg.db.a1_test.stmt_shape(statement, 2 as u8) { return 1 }
-  id_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "id")
-  label_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "label")
-  if id_binary != (if binary_id { 1 } else { 0 }) || label_binary != 0 { return 29 }
-  bytes := [1 as u8, 2 as u8, 3 as u8]
   unknown := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [pkg.db.postgres.ExecuteOption.ParameterFormat("missing", pkg.db.postgres.Format.Text)],
@@ -1755,7 +1764,13 @@ fn consume(
     }
     Ok(_) => false
   }
-  if !unknown_ok { return 2 }
+  return if unknown_ok { 0 } else { 2 }
+}
+
+fn consume_missing_proof(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   missing_proof := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [pkg.db.postgres.ExecuteOption.ParameterFormat("label", pkg.db.postgres.Format.Binary)],
@@ -1768,7 +1783,13 @@ fn consume(
     }
     Ok(_) => false
   }
-  if !missing_proof_ok { return 27 }
+  return if missing_proof_ok { 0 } else { 27 }
+}
+
+fn consume_duplicate_option(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   duplicate := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [
@@ -1787,7 +1808,13 @@ fn consume(
     }
     Ok(_) => false
   }
-  if !duplicate_ok { return 3 }
+  return if duplicate_ok { 0 } else { 3 }
+}
+
+fn consume_invalid_delivery(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   invalid_after := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [
@@ -1803,8 +1830,13 @@ fn consume(
     }
     Ok(_) => false
   }
-  if !invalid_ok { return 4 }
+  return if invalid_ok { 0 } else { 4 }
+}
 
+fn consume_expired_delivery(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   unsafe { align_pg_delay_next_nonblocking_enable() }
   expired := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]),
@@ -1815,8 +1847,13 @@ fn consume(
     Err(error) => match error { Timeout(_) => true, _ => false }
     Ok(_) => false
   }
-  if !expired_ok { return 28 }
+  return if expired_ok { 0 } else { 28 }
+}
 
+fn consume_buffered_delivery(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   mut buffered := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [], [],
   ) else { return 5 }
@@ -1826,7 +1863,13 @@ fn consume(
     || !pkg.db.a1_test.rows_shape(buffered, 2 as u8, 1 as u8, 0 as u8, false, 0, false) {
     return 9
   }
+  return 0
+}
 
+fn consume_single_delivery(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  bytes: slice<u8>,
+) -> i32 {
   mut singles := pkg.db.postgres.rows_stmt_native(
     statement, params(8, "second", bytes[..]), [],
     [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
@@ -1838,7 +1881,32 @@ fn consume(
     Some(_) => { return 14 }
     None => {}
   }
+  return 0
+}
 
+fn consume(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  binary_id: bool,
+) -> i32 {
+  if !pkg.db.a1_test.stmt_shape(statement, 2 as u8) { return 1 }
+  id_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "id")
+  label_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "label")
+  if id_binary != (if binary_id { 1 } else { 0 }) || label_binary != 0 { return 29 }
+  bytes := [1 as u8, 2 as u8, 3 as u8]
+  unknown_status := consume_unknown_option(statement, bytes[..])
+  if unknown_status != 0 { return unknown_status }
+  missing_status := consume_missing_proof(statement, bytes[..])
+  if missing_status != 0 { return missing_status }
+  duplicate_status := consume_duplicate_option(statement, bytes[..])
+  if duplicate_status != 0 { return duplicate_status }
+  invalid_status := consume_invalid_delivery(statement, bytes[..])
+  if invalid_status != 0 { return invalid_status }
+  expired_status := consume_expired_delivery(statement, bytes[..])
+  if expired_status != 0 { return expired_status }
+  buffered_status := consume_buffered_delivery(statement, bytes[..])
+  if buffered_status != 0 { return buffered_status }
+  single_status := consume_single_delivery(statement, bytes[..])
+  if single_status != 0 { return single_status }
   mut chunks := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
@@ -3068,7 +3136,7 @@ pkg-db-a1-postgres-binary-format-products fe62e2b915ad9168
 pkg-db-a1-postgres-binary-malformed f5147f6f40568d5f
 pkg-db-a1-postgres-buffered-batches 2e40921dad4c84b1
 pkg-db-a1-postgres-delivery-validation 1e37b4a4dc266d2f
-pkg-db-a1-postgres-prepared-streamed-modes ca82f5ab6b28e07d
+pkg-db-a1-postgres-prepared-streamed-modes 2ce825c4129518b1
 pkg-db-a1-postgres-streamed-failures 6b0aeba03b414028
 pkg-db-a1-postgres-streamed-modes 5d6a50af791450c7
 pkg-db-a1-postgres-streamed-one 485206604faf2733

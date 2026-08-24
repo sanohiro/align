@@ -16565,12 +16565,22 @@ impl<'a> EscapeCheck<'a> {
             let resolved = self
                 .state
                 .resolve_storage_leaf(leaf, &mut Vec::new());
+            let lifetime_only = !leaf.known
+                && leaf.generations.is_empty()
+                && leaf.fallback_roots.is_empty()
+                && value
+                    .non_storage
+                    .project_path(path)
+                    .shortest_region()
+                    .is_some();
             exact &= leaf.known && resolved.identity_known;
             if let Some(region) = resolved.content.regions.shortest_region() {
                 content_region = content_region.shorter(region);
                 retained_region = retained_region.shorter(region);
             }
-            if !resolved.content.ended.is_empty() || !resolved.content.unknown.is_empty() {
+            if !resolved.content.ended.is_empty()
+                || (!lifetime_only && !resolved.content.unknown.is_empty())
+            {
                 content_region = content_region.shorter(Region::Frame);
                 retained_region = retained_region.shorter(Region::Frame);
             }
@@ -17768,6 +17778,12 @@ impl<'a> EscapeCheck<'a> {
         }
 
         let baseline = self.legacy_escape_value(expression);
+        let baseline_content_region = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(expression))
+            .map(|snapshot| snapshot.content_region)
+            .unwrap_or(Region::Frame);
         let mut value = EscapeValueFact {
             non_storage: baseline.non_storage,
             headers: ProjectedHeaderFact::default(),
@@ -17796,7 +17812,7 @@ impl<'a> EscapeCheck<'a> {
                             depth,
                             storage_provenance,
                         );
-                        let fallback_roots = self.unknown_escape_fallback_roots(
+                        let mut fallback_roots = self.unknown_escape_fallback_roots(
                             expression,
                             storage_provenance,
                         );
@@ -17837,6 +17853,24 @@ impl<'a> EscapeCheck<'a> {
                                 }),
                             });
                             continue;
+                        }
+                        // A call summary can prove the returned view's lifetime without proving
+                        // writable header identity. Resource owners/references are the canonical
+                        // cases: their header type differs from the returned row view, while the
+                        // legacy return-region summary still identifies the exact caller lifetime.
+                        // Keep the leaf unknown for aliasing, but do not replace that region with a
+                        // synthetic local fallback.
+                        if sources.iter().all(|source| {
+                            source.content_ended.is_empty()
+                                && source.content_unknown.is_empty()
+                        }) {
+                            fallback_roots.clear();
+                            value.non_storage = value.non_storage.join(
+                                &EscapeRegionFact::at_path(
+                                    &result.path,
+                                    baseline_content_region,
+                                ),
+                            );
                         }
                         value.headers.leaves.insert(
                             result.path.clone(),
@@ -22921,6 +22955,23 @@ impl<'a> EscapeCheck<'a> {
         }
 
         let mut installed = incoming;
+        if typed.headers.is_empty()
+            && borrow_leaf_paths_for_type(
+                destination_ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            .is_empty()
+        {
+            // A direct fact on an indexed aggregate element conservatively applies to every
+            // runtime-selected alternative. Once match/destructuring selects a payload whose type
+            // cannot carry a borrow or storage header, that outer fact is no longer type-valid.
+            // Clear it at the common projected-install boundary so scalar siblings cannot inherit
+            // an arena or frame lifetime from a view-bearing alternative.
+            installed = EscapeValueFact::default();
+        }
         for header in &typed.headers {
             if header.kind != StorageHeaderKind::InlineFixed {
                 continue;
@@ -23519,7 +23570,16 @@ impl<'a> EscapeCheck<'a> {
                     // binding stays rejected, and a frame-local view assigned whole into a
                     // `borrow mut` parameter place is rejected against its caller lifetime.
                     let target = self.mutable_root_storage_region(*local, depth);
-                    if !retained.outlives(target) {
+                    let typed = storage_type_paths(value.ty, self.storage_type_context());
+                    let completed = self.completed_escape_value(value);
+                    let exact_local_generation = !matches!(target, Region::Caller(_))
+                        && !typed.headers.is_empty()
+                        && typed.headers.iter().all(|header| {
+                            completed.headers.leaves.get(&header.path).is_some_and(|leaf| {
+                                leaf.known && !leaf.generations.is_empty()
+                            })
+                        });
+                    if !retained.outlives(target) && !exact_local_generation {
                         let message = if matches!(target, Region::Caller(_)) {
                             "this value cannot be stored into a longer-lived mutable destination (it would escape its region)"
                         } else {
@@ -23531,6 +23591,10 @@ impl<'a> EscapeCheck<'a> {
                         // the shorter region from all reaching paths, while a straight-line overwrite
                         // can precisely replace an obsolete shorter-lived view. Owned Move locals may
                         // now change region: their path-local MIR flag keeps cleanup provenance exact.
+                        // A fully known generation may also flow into a lexically longer local: its
+                        // release action invalidates that local before any later out-of-region use.
+                        // Unknown headers and caller destinations still require the eager region
+                        // proof above because neither has an exact local invalidation authority.
                         // The check above includes the assigned value's storage; this state records
                         // only its contents because `backing_storage` owns the separate header/buffer
                         // lifetime. Otherwise rebinding a slice to longer-lived storage would make
@@ -26871,6 +26935,32 @@ impl BorrowFact {
         self
     }
 
+    /// Remove legacy roots only from values carried through one of the selected storage headers.
+    /// A product may contain both a header-mediated view and an ordinary borrowed sibling; moving
+    /// the header generation must not erase the sibling's independent provenance.
+    fn without_root_sources_at_paths(
+        mut self,
+        excluded: &BorrowRoots,
+        header_paths: impl IntoIterator<Item = StoragePath>,
+    ) -> Self {
+        let header_paths = header_paths.into_iter().collect::<Vec<_>>();
+        let retain = |root: &BorrowRoot| {
+            !excluded.contains(root)
+                && !root
+                    .ended_source()
+                    .is_some_and(|(source, _)| excluded.contains(&source))
+        };
+        if header_paths.iter().any(Vec::is_empty) {
+            self.direct.retain(&retain);
+        }
+        for (path, roots) in &mut self.projected {
+            if header_paths.iter().any(|header| path.starts_with(header)) {
+                roots.retain(&retain);
+            }
+        }
+        self.projected.retain(|_, roots| !roots.is_empty());
+        self
+    }
 }
 
 /// Which ended source generations a borrower depends on, and how each ended. `Ord` on
@@ -27660,6 +27750,42 @@ impl BorrowState {
     /// End every source generation matching `ended`. One entry point for both endings: a named
     /// local being consumed, and a whole class of roots (a loop depth's temporaries plus its owned
     /// locals) being dropped at an iteration edge.
+    fn mark_matching_roots_ended(
+        &mut self,
+        how: BorrowEnd,
+        ended: impl std::ops::Fn(BorrowRoot) -> bool,
+    ) {
+        let state = &mut *self.0;
+        let mark_headers = |headers: &mut ProjectedHeaderFact| {
+            for leaf in headers.leaves.values_mut() {
+                leaf.fallback_roots = std::mem::take(&mut leaf.fallback_roots)
+                    .into_iter()
+                    .map(|root| if ended(root) { root.ended(how) } else { root })
+                    .collect();
+            }
+        };
+        for headers in state.headers.values_mut() {
+            mark_headers(headers);
+        }
+        for headers in state.value_headers.values_mut() {
+            mark_headers(headers);
+        }
+        for headers in state.pipeline_headers.values_mut() {
+            mark_headers(headers);
+        }
+        for content in state.storage.contents.entries.values_mut() {
+            mark_headers(&mut content.headers);
+            let invalid = content
+                .non_storage
+                .live_roots()
+                .into_iter()
+                .filter(|root| ended(*root))
+                .map(|root| (root, how))
+                .collect();
+            content.non_storage.mark_ended(&invalid);
+        }
+    }
+
     fn invalidate_matching(&mut self, how: BorrowEnd, ended: impl std::ops::Fn(BorrowRoot) -> bool) {
         let state = &mut *self.0;
         for (&borrower, roots) in &state.sources {
@@ -27698,41 +27824,27 @@ impl BorrowState {
     }
 
     fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
-        let mark_headers = |headers: &mut ProjectedHeaderFact| {
-            for leaf in headers.leaves.values_mut() {
-                leaf.fallback_roots = std::mem::take(&mut leaf.fallback_roots)
-                    .into_iter()
-                    .map(|root| {
-                        if root == BorrowRoot::Local(owner) {
-                            root.ended(how)
-                        } else {
-                            root
-                        }
-                    })
-                    .collect();
-            }
-        };
-        for headers in self.headers.values_mut() {
-            mark_headers(headers);
-        }
-        for headers in self.value_headers.values_mut() {
-            mark_headers(headers);
-        }
-        for headers in self.pipeline_headers.values_mut() {
-            mark_headers(headers);
-        }
-        for content in self.storage.contents.entries.values_mut() {
-            mark_headers(&mut content.headers);
-        }
-        let ended = [(BorrowRoot::Local(owner), how)].into_iter().collect();
-        for content in self.storage.contents.entries.values_mut() {
-            content.non_storage.mark_ended(&ended);
-        }
+        self.mark_matching_roots_ended(how, |r| r == BorrowRoot::Local(owner));
         self.invalidate_matching(how, |r| r == BorrowRoot::Local(owner));
     }
 
     fn invalidate_roots(&mut self, roots: &BorrowRoots, how: BorrowEnd) {
         self.invalidate_matching(how, |root| roots.contains(&root));
+    }
+
+    fn invalidate_roots_except_local(
+        &mut self,
+        roots: &BorrowRoots,
+        how: BorrowEnd,
+        excluded: LocalId,
+    ) {
+        self.invalidate_roots(roots, how);
+        if let Some(invalid) = self.invalid.get_mut(&excluded) {
+            invalid.retain(|root, _| !roots.contains(root));
+            if invalid.is_empty() {
+                self.invalid.remove(&excluded);
+            }
+        }
     }
 
     /// Join states whose storage tables were already pruned against every external control-value
@@ -29022,7 +29134,7 @@ impl<'a> MoveCheck<'a> {
     /// place. This follows aliases as well as the parameter local itself; exact self-assignment
     /// callers deliberately do not invoke it.
     fn mark_borrow_mut_modified(&mut self, local: LocalId) {
-        let parameters = self
+        let mut parameters = self
             .local_headers(local)
             .leaves
             .values()
@@ -29037,6 +29149,20 @@ impl<'a> MoveCheck<'a> {
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
+        // A header-free aggregate such as `{ text: str }` still denotes the borrowed parameter
+        // place itself. Its projected value provenance describes the old contents, not whether the
+        // caller place was mutated, so seed the exact syntactic parameter independently.
+        if let Some(parameter) = self
+            .f
+            .params
+            .iter()
+            .position(|candidate| *candidate == local)
+            .filter(|parameter| {
+                self.f.param_modes.get(*parameter) == Some(&ast::ParamMode::BorrowMut)
+            })
+        {
+            parameters.insert(parameter as u32);
+        }
         for parameter in parameters {
             self.borrows
                 .unmodified_borrow_mut_params
@@ -29402,9 +29528,9 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .map(|argument| self.completed_storage_fact(argument))
             .collect::<Vec<_>>();
-        // An exclusive borrow conflicts with a live dependent even when the callee's summary
-        // proves that it does not replace the value. Such a no-mutation summary suppresses the
-        // generation advance below, but it cannot weaken the source-level exclusivity contract.
+        // Snapshot every root observed by an exclusive argument. The call action ends that
+        // observed generation even when the callee's retention summary proves no replacement;
+        // the distinction only controls whether a live Drop-bearing child must block beforehand.
         let exclusive_roots = modes
             .iter()
             .enumerate()
@@ -29412,6 +29538,7 @@ impl<'a> MoveCheck<'a> {
             .filter_map(|(index, _)| {
                 args.get(index).map(|argument| {
                     (
+                        index,
                         argument.span,
                         self.completed_borrow_mut_invalidation_roots(
                             argument,
@@ -29421,9 +29548,6 @@ impl<'a> MoveCheck<'a> {
                 })
             })
             .collect::<Vec<_>>();
-        for (span, roots) in exclusive_roots {
-            self.reject_live_resource_dependents_of_roots(&roots, moved, span);
-        }
         let mut header_argument_facts = args
             .iter()
             .map(|argument| self.completed_headers(argument))
@@ -29443,6 +29567,7 @@ impl<'a> MoveCheck<'a> {
                 backing,
             })
             .collect::<Vec<_>>();
+
         let mut post_argument_completions = pre_argument_completions.clone();
         let destinations = modes
             .iter()
@@ -29515,6 +29640,16 @@ impl<'a> MoveCheck<'a> {
                 ))
             })
             .collect::<Vec<_>>();
+
+        // Every exclusive call ends the generation observed by values completed before its
+        // action, including a callee whose exact retention summary proves that it leaves the
+        // destination unchanged. This makes a later use diagnose against the old generation
+        // without rejecting a Copy dependent whose last source use already occurred. A live
+        // Drop-bearing child still blocks every exclusive action because its eventual Drop needs
+        // the parent throughout the borrow, even when the callee preserves the whole value.
+        for (_, span, roots) in &exclusive_roots {
+            self.reject_live_resource_dependents_of_roots(roots, moved, *span);
+        }
 
         for (index, mode, ..) in &destinations {
             if *mode != ast::ParamMode::BorrowMut {
@@ -29799,9 +29934,36 @@ impl<'a> MoveCheck<'a> {
                 );
             }
         }
-        for (_, mode, roots, _, _, _, _, _) in &destinations {
-            if *mode == ast::ParamMode::BorrowMut {
-                self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
+        for (index, _, roots) in &exclusive_roots {
+            if args.get(*index).is_some_and(|argument| {
+                matches!(
+                    expand_tagged_ty(argument.ty, self.tagged_types),
+                    Ty::Resource(_)
+                )
+            }) {
+                // A resource mutation advances the generation observed by values returned from
+                // an earlier action (`rows.next` is the canonical case). Rewrite those roots in
+                // generation content before installing this call's result, while the exclusion
+                // below keeps the receiver local itself available for its post-call generation.
+                // Copy views do not take this path: rebinding one header must not end its backing.
+                self.borrows.mark_matching_roots_ended(
+                    BorrowEnd::Consumed,
+                    |root| roots.contains(&root),
+                );
+            }
+            if let Some(owner) = args
+                .get(*index)
+                .and_then(Self::mutable_actual_place)
+                .map(|place| place.root)
+            {
+                self.borrows.invalidate_roots_except_local(
+                    roots,
+                    BorrowEnd::Consumed,
+                    owner,
+                );
+            } else {
+                self.borrows
+                    .invalidate_roots(roots, BorrowEnd::Consumed);
             }
         }
         let mut backing_updates = std::collections::HashMap::new();
@@ -31658,6 +31820,15 @@ impl<'a> MoveCheck<'a> {
             };
             let releases = if result.header_kind == Some(StorageHeaderKind::InlineFixed) {
                 [individual].into_iter().collect()
+            } else if result.header_kind == Some(StorageHeaderKind::View)
+                && result.initializer == StorageContentInitializer::FixedLiteral
+            {
+                // A fixed literal copies each nested view header; it does not own the storage
+                // that header observes. The initializer's projected content carries the child's
+                // actual owner roots/generations, so attaching the literal's staging release to
+                // this Copy view would spuriously end static and caller-backed elements at the
+                // end of the construction statement.
+                std::collections::BTreeSet::new()
             } else if result.initializer == StorageContentInitializer::CloneIn {
                 // `clone_in` allocates in its explicit region. Only an exact active named arena is
                 // locally released; a parameter/caller region has no release in this frame.
@@ -33297,7 +33468,10 @@ impl<'a> MoveCheck<'a> {
             // release place. Remove that completion-time storage identity as well; nested value
             // provenance remains in the generation content table and is resolved lazily.
             releases.extend(completed_storage_roots);
-            fact = fact.without_root_sources(&releases);
+            fact = fact.without_root_sources_at_paths(
+                &releases,
+                headers.leaves.keys().cloned(),
+            );
         }
         self.borrows.assign(local, fact);
     }
@@ -33359,26 +33533,37 @@ impl<'a> MoveCheck<'a> {
             .headers
             .iter()
             .filter_map(|(&local, candidate)| {
-                candidate
+                let paths = candidate
                     .leaves
-                    .values()
-                    .any(|leaf| {
+                    .iter()
+                    .filter_map(|(path, leaf)| {
                         leaf.generations
                             .iter()
                             .any(|reference| generations.contains(&reference.generation))
+                            .then_some(path.clone())
                     })
-                    .then_some(local)
+                    .collect::<Vec<_>>();
+                (!paths.is_empty()).then_some((local, paths))
             })
             .collect::<Vec<_>>();
         let excluded = [BorrowRoot::Local(source)].into_iter().collect();
-        for local in affected {
+        for (local, paths) in affected {
+            let mut retains_source = false;
             if let Some(fact) = self.borrows.facts.get(&local).cloned() {
-                self.borrows
-                    .update_fact(local, fact.without_root_sources(&excluded));
+                let fact = fact.without_root_sources_at_paths(&excluded, paths);
+                retains_source = fact.flatten().iter().any(|root| {
+                    *root == BorrowRoot::Local(source)
+                        || root
+                            .ended_source()
+                            .is_some_and(|(root, _)| root == BorrowRoot::Local(source))
+                });
+                self.borrows.update_fact(local, fact);
             } else if let Some(roots) = self.borrows.sources.get_mut(&local) {
                 roots.remove(&BorrowRoot::Local(source));
             }
-            if let Some(invalid) = self.borrows.invalid.get_mut(&local) {
+            if !retains_source
+                && let Some(invalid) = self.borrows.invalid.get_mut(&local)
+            {
                 invalid.remove(&BorrowRoot::Local(source));
             }
         }
@@ -33708,7 +33893,10 @@ impl<'a> MoveCheck<'a> {
         if !headers.leaves.is_empty() {
             let mut releases = self.borrows.header_release_roots(&headers);
             releases.extend(self.completed_storage_fact(value).live_roots());
-            incoming = incoming.without_root_sources(&releases);
+            incoming = incoming.without_root_sources_at_paths(
+                &releases,
+                headers.leaves.keys().cloned(),
+            );
         }
         self.replace_local_borrow_fact_projection(local, path, value.ty, incoming);
     }
@@ -33968,9 +34156,10 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    /// A resource/reference borrower is itself live native state, not merely a view whose later use
-    /// can diagnose lazily. End the owner generation only after every such dependent value has been
-    /// consumed, so a child resource's eventual Drop can never run against a moved/replaced parent.
+    /// A Drop-bearing resource borrower is itself live native state, not merely a view whose later
+    /// use can diagnose lazily. End the owner generation only after every such dependent value has
+    /// been consumed, so a child resource's eventual Drop can never run against a moved/replaced
+    /// parent. A Copy reference rooted in a borrowed parameter may instead end at its last use.
     fn reject_live_resource_dependents(
         &mut self,
         owner: LocalId,
@@ -33992,18 +34181,32 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) -> bool {
+        let parameter_root = matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_));
         let dependent = self.borrows.sources.iter().find_map(|(&borrower, roots)| {
             (borrower != owner
                 && !whole_moved(moved, borrower)
                 && roots.contains(&root)
                 && self.f.locals.get(borrower as usize).is_some_and(|local| {
-                    ty_mentions_resource(
+                    let mentions_resource = ty_mentions_resource(
                         local.ty,
                         self.structs,
                         self.tuples,
                         self.enums,
                         self.tagged_types,
-                    )
+                    );
+                    // A Copy reference rooted in a borrowed parameter can end at its last use;
+                    // any later use observes the ended generation through the ordinary borrow
+                    // check. A Drop-bearing child cannot be deferred that way: its implicit Drop
+                    // still needs the parent alive, so it must block the exclusive operation.
+                    mentions_resource
+                        && (!parameter_root
+                            || needs_drop_flag(
+                                local.ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            ))
                 }))
             .then_some(borrower)
         });
@@ -34102,21 +34305,24 @@ impl<'a> MoveCheck<'a> {
     /// points at freed storage past this edge. Declaration order within `drops` is irrelevant: a
     /// local not yet bound on this path has no live borrower to invalidate.
     fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
-        for &local in drops {
-            state.end_local_releases(local, BorrowEnd::Dropped);
-        }
-        state.end_iteration_releases(depth, BorrowEnd::Dropped);
-        state.invalidate_matching(BorrowEnd::Dropped, |root| match root {
+        let ended = |root| match root {
             BorrowRoot::Local(id) => drops.contains(&id),
-            // Deeper temporaries are already dead — an inner loop's own edges ended them — but
-            // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
             BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => false,
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => false,
-        });
+        };
+        state.mark_matching_roots_ended(BorrowEnd::Dropped, &ended);
+        for &local in drops {
+            state.end_local_releases(local, BorrowEnd::Dropped);
+        }
+        state.end_iteration_releases(depth, BorrowEnd::Dropped);
+        // Deeper temporaries are already dead — an inner loop's own edges ended them — but the
+        // shared predicate keeps both the generation-content and legacy lanes independent of that
+        // ordering.
+        state.invalidate_matching(BorrowEnd::Dropped, ended);
     }
 
     /// The owned locals a `loop` body drops per iteration, in `body_locals` order.
@@ -34160,6 +34366,14 @@ impl<'a> MoveCheck<'a> {
         path: &[BorrowProjection],
         span: Span,
     ) {
+        let selected_headers = self.local_headers(local).project_path(path);
+        let header_ended = self
+            .borrows
+            .resolve_headers(&selected_headers)
+            .non_storage
+            .flatten()
+            .into_iter()
+            .find_map(|root| root.ended_source());
         let selected = self.local_borrow_fact(local).project_path(path).flatten();
         let ended = selected.iter().find_map(|root| root.ended_source());
         let invalid = self.borrows.invalid.get(&local).and_then(|owners| {
@@ -34168,7 +34382,7 @@ impl<'a> MoveCheck<'a> {
                 .find(|(root, _)| selected.contains(root))
                 .map(|(&root, &how)| (root, how))
         });
-        if let Some((root, how)) = ended.or(invalid) {
+        if let Some((root, how)) = header_ended.or(ended).or(invalid) {
             self.emit_invalid_borrow(local, root, how, span);
         }
     }

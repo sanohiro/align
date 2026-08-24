@@ -769,21 +769,13 @@ fn main() -> i32 {
     assert!(!check_errs("borrow-temp-same-iteration", same_pass));
 }
 
-/// **KNOWN OVER-REJECTION, PRE-EXISTING — pinned here because the loop rule widened its reach.**
-///
 /// `ch[0]` is a `{ptr,len}` view into `data`, not into the chunks header: dropping (or reassigning)
 /// `ch` frees the header array only, and the bytes `keep` points at belong to `data`, which
-/// outlives both. `local_owns_view_storage` nevertheless counts a `DynSliceArray` local as owning
-/// its elements' storage, so the header contributes itself as a root and any end of its generation
-/// invalidates the element views.
-///
-/// This predates the scope-end-drop rule — the plain reassignment below is rejected on the same
-/// path `MoveCheck` has always had — but that rule made the far more common loop shape hit it too.
-/// The fix belongs with `local_owns_view_storage`, not here; changing it is a type-class question
-/// (which owned containers actually own the bytes their elements view) that deserves its own slice.
+/// outlives both. Generation content therefore retains `data` while the `DynSliceArray` release
+/// ends only its own header generation.
 #[test]
-fn over_rejects_a_view_into_the_source_of_a_dropped_chunks_header() {
-    // Pre-existing: no loop, just a reassignment of the header.
+fn views_into_a_chunks_source_survive_header_replacement_and_loop_drop() {
+    // No loop: replacing the carrier header does not end the source buffer.
     let reassign = "\
 fn dbl(x: i64) -> i64 = x * 2
 fn main() -> i32 {
@@ -794,13 +786,9 @@ fn main() -> i32 {
   return keep[0] as i32
 }
 ";
-    assert!(
-        check_errs("borrow-chunks-reassign-over-reject", reassign),
-        "KNOWN OVER-REJECTION (pre-existing): `keep` views `data`, which is still live. If this now \
-         checks, `local_owns_view_storage` stopped over-claiming the header — flip both assertions."
-    );
+    assert!(!check_errs("borrow-chunks-reassign-source-live", reassign));
 
-    // The loop shape the scope-end-drop rule exposed, same root cause.
+    // Loop-local carrier headers are likewise independent of the outer source buffer.
     let in_loop = "\
 fn dbl(x: i64) -> i64 = x * 2
 fn main() -> i32 {
@@ -816,7 +804,7 @@ fn main() -> i32 {
   return keep[0] as i32
 }
 ";
-    assert!(check_errs("borrow-chunks-loop-over-reject", in_loop));
+    assert!(!check_errs("borrow-chunks-loop-source-live", in_loop));
 }
 
 /// **The borrow-vs-move split, and the false positive that proved it is needed.**
