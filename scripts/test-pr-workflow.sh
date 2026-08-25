@@ -145,6 +145,17 @@ git -C "$docs_repo" update-ref refs/remotes/origin/main main
 git -C "$docs_repo" switch -qc docs-change
 printf '\nupdated\n' >>"$docs_repo/docs/note.md"
 git -C "$docs_repo" commit -qam docs
+docs_base="$(git -C "$docs_repo" rev-parse 'main^{commit}')"
+docs_candidate="$(git -C "$docs_repo" rev-parse HEAD)"
+(
+  cd "$docs_repo"
+  # shellcheck source=scripts/pr-tier.sh
+  . "$repo_root/scripts/pr-tier.sh"
+  pr_tier_docs_only "$docs_base" "$docs_candidate"
+) || {
+  echo "the shared classifier did not recognize an ordinary Markdown-only diff" >&2
+  exit 1
+}
 (
   cd "$docs_repo"
   "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null
@@ -154,6 +165,15 @@ grep -Fqx 'kind=docs-only' "$docs_repo/.git/align-preflight/$docs_head"
 printf '#!/usr/bin/env bash\n' >"$docs_repo/tool.sh"
 git -C "$docs_repo" add tool.sh
 git -C "$docs_repo" commit -qm tool
+if (
+  cd "$docs_repo"
+  # shellcheck source=scripts/pr-tier.sh
+  . "$repo_root/scripts/pr-tier.sh"
+  pr_tier_docs_only "$docs_base" "$(git rev-parse HEAD)"
+); then
+  echo "the shared classifier accepted a documentation-plus-tool diff as docs-only" >&2
+  exit 1
+fi
 if (
   cd "$docs_repo"
   "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
@@ -201,6 +221,15 @@ printf '\nupdated\n' >>"$compiled_prose_repo/docs/impl/pkg-design/web.md"
 git -C "$compiled_prose_repo" commit -qam 'docs: touch compiled prose'
 if (
   cd "$compiled_prose_repo"
+  # shellcheck source=scripts/pr-tier.sh
+  . "$repo_root/scripts/pr-tier.sh"
+  pr_tier_docs_only "$(git rev-parse 'main^{commit}')" "$(git rev-parse HEAD)"
+); then
+  echo "the shared classifier accepted compiled prose as docs-only" >&2
+  exit 1
+fi
+if (
+  cd "$compiled_prose_repo"
   "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
 ); then
   echo "docs-only preflight accepted a compiled-prose path" >&2
@@ -222,6 +251,15 @@ git -C "$delete_md_repo" commit -qm baseline
 git -C "$delete_md_repo" switch -qc delete-md-change
 git -C "$delete_md_repo" rm -q docs/stale.md
 git -C "$delete_md_repo" commit -qm 'docs: delete a stale note'
+if (
+  cd "$delete_md_repo"
+  # shellcheck source=scripts/pr-tier.sh
+  . "$repo_root/scripts/pr-tier.sh"
+  pr_tier_docs_only "$(git rev-parse 'main^{commit}')" "$(git rev-parse HEAD)"
+); then
+  echo "the shared classifier accepted a Markdown deletion as docs-only" >&2
+  exit 1
+fi
 if (
   cd "$delete_md_repo"
   "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
@@ -573,6 +611,52 @@ untrusted_fetch="$(grep -oE 'git show "\$\{?[A-Za-z_][A-Za-z0-9_]*\}?:' "$prefli
 [[ -z "$untrusted_fetch" ]] || {
   echo "preflight.yml fetches machinery from a source other than the trusted tip:" >&2
   echo "  $untrusted_fetch" >&2
+  exit 1
+}
+
+# True docs-only pull requests must not launch the compiler platform matrix.
+# The scope step loads the one shared classifier from the live trusted base;
+# the always-running aggregate preserves one stable branch-protection context
+# and fails closed if classification or a required matrix run fails.
+ci_workflow="$repo_root/.github/workflows/ci.yml"
+grep -Fq 'git show "$TRUSTED_TIP:scripts/pr-tier.sh"' "$ci_workflow" || {
+  echo "ci.yml no longer loads the platform classifier from the trusted base" >&2
+  exit 1
+}
+grep -Fq 'elif [ "$BASE_REF" != main ]; then' "$ci_workflow" || {
+  echo "ci.yml no longer fails closed for author-controlled stacked-PR bases" >&2
+  exit 1
+}
+[[ "$(grep -Fc 'TRUSTED_TIP="$(git rev-parse refs/remotes/origin/main)"' "$ci_workflow")" -eq 2 ]] || {
+  echo "both CI scope classifiers must pin their machinery to protected main" >&2
+  exit 1
+}
+[[ "$(grep -Fc 'reason=non-main-base' "$ci_workflow")" -eq 2 ]] || {
+  echo "both CI scope classifiers must fail closed for stacked-PR bases" >&2
+  exit 1
+}
+if grep -Fq 'TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"' "$ci_workflow"; then
+  echo "ci.yml trusts an author-controlled PR base for platform classification" >&2
+  exit 1
+fi
+grep -Fq 'pr_tier_docs_only "$BASE_SHA" "$HEAD_SHA"' "$ci_workflow" || {
+  echo "ci.yml no longer uses the shared docs-only predicate" >&2
+  exit 1
+}
+grep -Fq "if: needs.db-scope.outputs.platform_required == 'true'" "$ci_workflow" || {
+  echo "ci.yml no longer skips the platform matrix for docs-only pull requests" >&2
+  exit 1
+}
+[[ "$(grep -Fc 'name: Platform CI (required)' "$ci_workflow")" -eq 1 ]] || {
+  echo "ci.yml must expose exactly one stable platform aggregate" >&2
+  exit 1
+}
+grep -Fq 'false) test "$PLATFORM_RESULT" = skipped ;;' "$ci_workflow" || {
+  echo "the platform aggregate no longer requires a classified skip" >&2
+  exit 1
+}
+grep -Fq 'true) test "$PLATFORM_RESULT" = success ;;' "$ci_workflow" || {
+  echo "the platform aggregate no longer requires a successful matrix" >&2
   exit 1
 }
 

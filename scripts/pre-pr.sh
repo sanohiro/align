@@ -97,16 +97,13 @@ git diff --quiet "$base_sha"...HEAD && {
 review_head="$head_sha"
 review_state="docs-only"
 rust_changed=false
-non_documentation_changed=false
 # shellcheck source=scripts/pr-tier.sh
 . "$(dirname "$0")/pr-tier.sh"
 library_changed=false
 pr_tier_library_changed "$base_sha" "$head_sha" && library_changed=true
+docs_only_diff=false
+pr_tier_docs_only "$base_sha" "$head_sha" && docs_only_diff=true
 while IFS= read -r path; do
-  # Match scripts/pr-tier.sh's documentation classification exactly: only
-  # *.md files are documentation. A non-Markdown file under docs/ (a fixture,
-  # a script, a generated asset) is not.
-  case "$path" in *.md | docs/*.md) ;; *) non_documentation_changed=true ;; esac
   case "$path" in
     crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*) rust_changed=true ;;
   esac
@@ -250,18 +247,11 @@ else
   esac
 fi
 if [[ "$docs_only" == true ]]; then
-  [[ "$non_documentation_changed" == false ]] || {
-    echo "--docs-only requires Markdown/documentation changes only" >&2
-    exit 1
-  }
-  # The per-path *.md check alone misses two things the shared classifier
-  # already knows: a compiled-prose document (PR_TIER_COMPILED_PROSE, e.g.
-  # docs/impl/pkg-design/web.md) is a source input to a test binary despite
-  # its extension, and any deletion is library tier regardless of path shape.
-  # Require its full verdict too, so a --docs-only PR that would fail CI's
-  # recomputed tier cannot pass here first.
-  [[ "$library_changed" == false ]] || {
-    echo "--docs-only requires Markdown/documentation changes only (scripts/pr-tier.sh still classifies this diff as library tier — a compiled-prose path or a deletion)" >&2
+  # One shared predicate owns both local preflight and CI platform skipping.
+  # It requires ordinary Markdown paths and also rejects compiled prose,
+  # deletions, empty ranges, and every fail-closed classifier result.
+  [[ "$docs_only_diff" == true ]] || {
+    echo "--docs-only requires ordinary Markdown changes only (compiled prose, deletions, and non-documentation paths are not docs-only)" >&2
     exit 1
   }
 fi

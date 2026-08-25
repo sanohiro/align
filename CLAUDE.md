@@ -149,8 +149,12 @@ internal checkpoint landed.
   review.
 - Use `scripts/pre-pr.sh --docs-only` for such a PR. Its SHA-bound attestation
   does not require preflight or post-open code-review evidence; the PR wrappers
-  mark the required status context as docs-only exempt. A broad normative
-  design change still follows the design review gate below.
+  mark the required status context as docs-only exempt. CI recomputes the same
+  fail-closed tier with `scripts/pr-tier.sh` from the trusted base: a true
+  docs-only pull request skips the Linux/macOS compiler matrix and satisfies
+  the stable platform aggregate, while compiled prose, deletions, unknown
+  paths, non-PR events, nightly, and release flows retain their full checks. A
+  broad normative design change still follows the design review gate below.
 - A code PR may omit documentation changes when it implements the existing
   contract without changing user-visible behavior. Finish any required
   normative prose before the final-SHA attestation; do not mutate status prose
