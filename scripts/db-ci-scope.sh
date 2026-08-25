@@ -44,7 +44,8 @@ while IFS= read -r -d '' path; do
     .cargo/config | .cargo/config.toml | crates/*/Cargo.toml | \
     .github/workflows/ci.yml | \
     scripts/db-ci-scope.sh | scripts/test-db-ci-scope.sh | \
-    scripts/db-verify-local.sh | scripts/check-libpq-version.sh | \
+    scripts/db-verify-local.sh | scripts/run-db-suites.sh | \
+    scripts/check-libpq-version.sh | \
     scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | scripts/cargo.sh | \
     apps/db/* | \
     crates/align_driver/tests/pkg_db_*.rs | \

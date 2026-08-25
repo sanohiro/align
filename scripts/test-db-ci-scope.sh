@@ -105,12 +105,18 @@ git -C "$fixture" commit -qm db-workflow
 workflow="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$db_package" "$workflow"
 
+printf '#!/usr/bin/env bash\n' > "$fixture/scripts/run-db-suites.sh"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm db-suite-runner
+suite_runner="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$workflow" "$suite_runner"
+
 # An unrelated deletion stays out of the service job.
 rm "$fixture/apps/web/main.align"
 git -C "$fixture" add -u
 git -C "$fixture" commit -qm unrelated-deletion
 unrelated_deleted="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope false "$workflow" "$unrelated_deleted"
+assert_scope false "$suite_runner" "$unrelated_deleted"
 
 # Deleted DB-naming source is classified from its base content, and a deleted
 # direct DB path is classified by path. Unreadable ranges still fail closed.
@@ -147,5 +153,15 @@ grep -Fq 'reason=classifier-bootstrap' "$ci_workflow"
 grep -Fq 'test "$SCOPE_RESULT" = success' "$ci_workflow"
 grep -Fq 'true) test "$DB_RESULT" = success' "$ci_workflow"
 grep -Fq 'false) test "$DB_RESULT" = skipped' "$ci_workflow"
+grep -Fq 'timeout-minutes: 30' "$ci_workflow"
+test "$(grep -Fc 'run: scripts/run-db-suites.sh' "$ci_workflow")" -eq 1
+test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
+
+for owner in \
+  pkg_db_q1 pkg_db_q2 pkg_db_q3 pkg_db_q4a pkg_db_q4b pkg_db_q5a \
+  pkg_db_q5b1 pkg_db_q5b2 pkg_db_q6 pkg_db_a1 pkg_db_pool pkg_db_a2 \
+  pkg_db_callbacks pkg_db_vc1; do
+  test "$(grep -Ec "^[[:space:]]*--test $owner( |$)" "$repo_root/scripts/run-db-suites.sh")" -eq 1
+done
 
 echo "database CI scope tests passed"

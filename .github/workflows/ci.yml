@@ -80,6 +80,7 @@ jobs:
     needs: db-scope
     if: needs.db-scope.outputs.required == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # Keep both server images explicit. The ordinary service remains the no-extension
     # compatibility floor; VC1's isolated service proves the existing SQL-native pgvector path.
     services:
@@ -229,75 +230,9 @@ jobs:
             exit 1
           fi
 
-      - name: Required static query descriptor owners
+      - name: Required database owner suites
         shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q1 -- --nocapture
-
-      - name: Required portable dual-driver integration
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q2 -- --nocapture
-
-      - name: Required checked-metadata integration
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q3 -- --nocapture
-
-      - name: Required reusable execution owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q4a -- --nocapture
-
-      - name: Required streaming resilience owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q4b -- --nocapture
-
-      - name: Required migration lifecycle integration
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5a -- --nocapture
-
-      - name: Required static query metadata owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5b1 -- --nocapture
-
-      - name: Required catalog and EXPLAIN integration
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5b2 -- --nocapture
-
-      - name: Required compound product owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_q6 -- --nocapture
-
-      - name: Required streamed delivery owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_a1 -- --nocapture
-
-      - name: Required explicit pool owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_pool -- --nocapture
-
-      - name: Required dynamic SQL owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_a2 -- --nocapture
-
-      - name: Required SQLite callback owners
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_callbacks -- --nocapture
-
-      - name: Required vector compatibility owner
-        shell: bash
-        run: |
-          scripts/cargo.sh test --locked -p align_driver --test pkg_db_vc1 -- --nocapture
+        run: scripts/run-db-suites.sh
 
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'

@@ -330,7 +330,11 @@ required service run succeeded. PRs execute the trusted base's classifier; its
 one-PR introduction fails closed to running the service. A `main` push avoids
 the duplicate service run only when GitHub identifies its exact head as a
 merged PR into that branch; an unassociated direct push uses the preceding main
-classifier, and manual dispatch always runs it. Keep
+classifier, and manual dispatch always runs it. The service job and
+`scripts/db-verify-local.sh` both use `scripts/run-db-suites.sh`: Cargo builds
+the fourteen owner binaries in one graph, then the shared binary runner executes
+them concurrently under `ALIGN_GATE_JOBS`. The service job has the same hard
+30-minute budget as nightly. Keep
 `scripts/test-db-ci-scope.sh` synchronized with this workflow contract.
 
 **Independent review and local gates may run concurrently.** The one fresh
