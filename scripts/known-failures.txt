@@ -31,6 +31,6 @@ pkg_db_q6	sqlite_user_groups_one_parent_and_segmented_matrices_are_exact
 unit_cache	a_descriptor_owning_unit_is_never_cached
 
 # Triage of this baseline (see backlog for detail):
-#   A: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
-#      descriptor-owning unit_cache case) — owned by the db session
+#   A: four out-of-gate pkg.db cells (pkg_db_q6 and the descriptor-owning
+#      unit_cache case) — owned by the db session
 #   B: the remaining legacy red — triaged next
