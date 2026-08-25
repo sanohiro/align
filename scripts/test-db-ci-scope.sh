@@ -159,14 +159,31 @@ grep -Fq 'test "$SCOPE_RESULT" = success' "$ci_workflow"
 grep -Fq 'true) test "$DB_RESULT" = success' "$ci_workflow"
 grep -Fq 'false) test "$DB_RESULT" = skipped' "$ci_workflow"
 grep -Fq 'timeout-minutes: 30' "$ci_workflow"
-test "$(grep -Fc 'run: scripts/run-db-suites.sh' "$ci_workflow")" -eq 1
+grep -Fq 'name: PostgreSQL integration (${{ matrix.db-shard }})' "$ci_workflow"
+grep -Fq 'run: scripts/run-db-suites.sh "${{ matrix.db-shard }}"' "$ci_workflow"
+grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
 test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
 
-for owner in \
+expected_owners="$(printf '%s\n' \
   pkg_db_q1 pkg_db_q2 pkg_db_q3 pkg_db_q4a pkg_db_q4b pkg_db_q5a \
   pkg_db_q5b1 pkg_db_q5b2 pkg_db_q6 pkg_db_a1 pkg_db_pool pkg_db_a2 \
-  pkg_db_callbacks pkg_db_vc1; do
-  test "$(grep -Ec "^[[:space:]]*--test $owner( |$)" "$repo_root/scripts/run-db-suites.sh")" -eq 1
+  pkg_db_callbacks pkg_db_vc1 | LC_ALL=C sort)"
+all_owners="$($repo_root/scripts/run-db-suites.sh --list all | LC_ALL=C sort)"
+test "$all_owners" = "$expected_owners"
+
+observed_shards=""
+for db_shard in catalog-stream delivery-callbacks vector-static portable-pool; do
+  grep -Fq "          - $db_shard" "$ci_workflow"
+  observed_shards="$observed_shards
+$($repo_root/scripts/run-db-suites.sh --list "$db_shard")"
 done
+observed_shards="$(printf '%s\n' "$observed_shards" | sed '/^$/d' | LC_ALL=C sort)"
+test "$observed_shards" = "$expected_owners"
+test -z "$(printf '%s\n' "$observed_shards" | uniq -d)"
+
+if "$repo_root/scripts/run-db-suites.sh" --list not-a-shard >/dev/null 2>&1; then
+  echo "unknown database shard was accepted" >&2
+  exit 1
+fi
 
 echo "database CI scope tests passed"

@@ -412,9 +412,10 @@ Operational rules:
   full-suite job, judged against `scripts/known-failures.txt`;
   `ALIGN_GATE_JOBS` sets the concurrency both it and `scripts/test-pr.sh` read.
 - The conditional PostgreSQL job and `scripts/db-verify-local.sh` share
-  `scripts/run-db-suites.sh`: one Cargo build produces the exact fourteen owner
-  binaries, the shared runner executes them concurrently, and CI stops at the
-  hard 30-minute budget.
+  `scripts/run-db-suites.sh`: the local gate builds the exact fourteen owners in
+  one graph, while CI partitions that same set into four isolated, measured
+  service shards. The required result aggregates every shard, each of which
+  stops at the hard 30-minute budget.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
 

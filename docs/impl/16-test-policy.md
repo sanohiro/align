@@ -235,12 +235,16 @@ disposable Docker `postgres:16.4` with no optional extension and an isolated
 `pgvector/pgvector:0.8.6-pg16-bookworm` service with CI's exact credentials and environment,
 runs the same inverted required-mode self-tests, and tears both containers down.
 Both it and CI delegate the fourteen `pkg.db` owner suites to
-`scripts/run-db-suites.sh`. That script builds `q1`, `q2`, `q3`, `q4a`, `q4b`,
-`q5a`, `q5b1`, `q5b2`, `q6`, `a1`, `pool`, `a2`, `callbacks`, and `vc1` in one
-Cargo graph, checks the produced binary set in both directions, and runs those
-binaries concurrently through the bounded gate's shared runner. `ALIGN_GATE_JOBS`
-sets the process count and divides libtest threads across it. The required CI
-job carries the repository's hard 30-minute test budget; crossing it is a
+`scripts/run-db-suites.sh`. The local gate builds `q1`, `q2`, `q3`, `q4a`,
+`q4b`, `q5a`, `q5b1`, `q5b2`, `q6`, `a1`, `pool`, `a2`, `callbacks`, and
+`vc1` in one Cargo graph. CI partitions that exact set into four measured
+shards, each with disposable PostgreSQL and pgvector services; the required
+result aggregates all four. Every invocation checks its produced binary set in
+both directions and runs the binaries through the bounded gate's shared runner.
+`ALIGN_GATE_JOBS` sets the process count and divides libtest threads across it;
+each four-core CI shard uses two processes with two libtest threads rather than
+serializing the large owners inside one single-threaded process. Every shard
+carries the repository's hard 30-minute test budget; crossing it is a
 performance failure, not a reason to extend the timeout. The VC1 setup explicitly
 creates `vector`, verifies extension version `0.8.6`, and retains the ordinary service as the
 no-extension control. A diff touching
@@ -713,10 +717,14 @@ Recorded so the gap is explicit rather than implied:
   workspace build together were only about 80 seconds. Separate Cargo test
   invocations held the target lock through each run and made the job pay the
   sum. `scripts/run-db-suites.sh` now performs one no-run build and passes the
-  exact binary set to the shared concurrent runner. CI and the local Docker
-  gate use that same entrypoint, and CI fails at 30 minutes rather than allowing
-  a one-hour detector. The final candidate measurement is recorded with the
-  implementation PR.
+  exact binary set to the shared concurrent runner. A single four-core CI job
+  still exceeded the available CPU budget: its owner step was cancelled after
+  29 minutes and the job after 30 minutes 17 seconds. The timeout was not
+  raised. CI now balances the historical owner durations across four isolated
+  service shards; the required result succeeds only when every shard succeeds.
+  The local Docker gate retains one complete invocation, and each CI shard
+  fails at 30 minutes rather than allowing a one-hour detector. The final
+  sharded measurement is recorded with the implementation PR.
 - **`pkg_db_q1`, `q3`, and `q5a`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness
