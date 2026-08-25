@@ -341,9 +341,9 @@ facts must live in this repository.
   2a are shipped; item 3's ordinary non-ThinLTO pipeline is merged by #884 and
   locally measured at a 12.51 s to 10.11 s median reduction on the 14-unit
   cache-off corpus with identical output. Item 2b narrows service provisioning
-  to direct DB/gate paths or changed compiler hunks that name the boundary, so
-  an unrelated function in a monolithic source no longer inherits dormant DB
-  markers elsewhere in that file. Prebuilt cache distribution,
+  to direct DB/gate/dedicated-production paths or changed mixed-source hunks
+  that name the boundary, so an unrelated function in a monolithic source no
+  longer inherits dormant DB markers elsewhere in that file. Prebuilt cache distribution,
   residency, and function-level incrementality are the remaining items 4-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed

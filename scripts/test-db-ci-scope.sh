@@ -91,13 +91,29 @@ git -C "$fixture" commit -qm rename-database-source
 renamed_database_source="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$database_monolithic" "$renamed_database_source"
 
+# Dedicated database production modules are owned by path, so a generic helper
+# and marker-free body edit cannot evade the service merely because neither the
+# changed line nor its function header says PostgreSQL/libpq/SQLite.
+printf 'fn pq_text() {\n  value.to_str();\n}\n' > "$fixture/crates/demo/src/db_prepare_native.rs"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm dedicated-database-source
+dedicated_database_source="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$renamed_database_source" "$dedicated_database_source"
+
+sed -i.bak 's/value.to_str()/value.as_str()/' "$fixture/crates/demo/src/db_prepare_native.rs"
+rm "$fixture/crates/demo/src/db_prepare_native.rs.bak"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm marker-free-database-helper
+marker_free_database_helper="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$dedicated_database_source" "$marker_free_database_helper"
+
 # Shared owner infrastructure reaches every pkg.db suite even when its own text
 # does not name a database.
 printf 'pub fn shared_fixture() {}\n' > "$fixture/crates/demo/tests/common/mod.rs"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm shared-test-harness
 shared_harness="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$renamed_database_source" "$shared_harness"
+assert_scope true "$marker_free_database_helper" "$shared_harness"
 
 # A non-pkg_db owner test that directly names the boundary is also classified
 # by content.

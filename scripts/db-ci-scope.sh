@@ -55,6 +55,12 @@ while IFS= read -r -d '' path; do
     scripts/check-libpq-version.sh | \
     scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | scripts/cargo.sh | \
     apps/db/* | \
+    crates/*/src/db_*.rs | \
+    crates/align_driver/src/query_meta_codegen.rs | \
+    crates/align_driver/src/static_artifacts.rs | \
+    crates/align_driver/src/static_inputs.rs | \
+    crates/align_driver/src/static_runtime.rs | \
+    crates/align_interface/src/static_artifact.rs | \
     crates/align_driver/tests/pkg_db_*.rs | \
     crates/*/tests/common* | crates/*/tests/helpers/* | \
     crates/align_driver/tests/db_harness/* | \

@@ -323,9 +323,12 @@ not.
 
 The PostgreSQL required check is lightweight on unrelated diffs. Its separate
 service job runs only when `scripts/db-ci-scope.sh` classifies the committed
-range as reaching the database boundary; deletions use the same path and
-base/head-content rules, while classification failure runs it. The always-running
-required result fails unless that decision and any
+range as reaching the database boundary. Direct DB/gate, shared-owner, and
+dedicated DB-production paths qualify unconditionally; mixed compiler sources
+qualify when a zero-context changed hunk or its function header names the
+boundary. Deletions use those same path and changed-hunk rules, while
+classification failure runs the service. The always-running required result
+fails unless that decision and any
 required service run succeeded. PRs execute the trusted base's classifier; its
 one-PR introduction fails closed to running the service. A `main` push avoids
 the duplicate service run only when GitHub identifies its exact head as a
