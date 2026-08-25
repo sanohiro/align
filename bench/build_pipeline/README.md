@@ -14,7 +14,8 @@ Build each revision with `scripts/cargo.sh build --release --workspace` first;
 the linker consumes that revision's adjacent `libalign_runtime.a`.
 
 It alternates seven measured pairs after one warm-up pair, reports medians and
-work counts, requires byte-identical executables, and on Linux samples `/proc`
-task CPU ticks to observe intervals where the coordinator and an LLVM worker
-both advance. `ALIGN_PIPELINE_SAMPLES` may increase the pair count but must be
-at least three.
+work counts from each compiler's cold-cache frontend/codegen outcome stream,
+requires those counts and the executables to be identical, and on Linux
+samples `/proc` task CPU ticks to observe intervals where the coordinator and
+an LLVM worker both advance. `ALIGN_PIPELINE_SAMPLES` may increase the pair
+count but must be at least three.

@@ -56,6 +56,39 @@ run_timed() {
   awk '/^real / { value=$2 } END { if (value == "") exit 1; print value }' "$timing" >>"$times"
 }
 
+measure_work() {
+  binary="$1"
+  dir="$2"
+  cache="$3"
+  label="$4"
+  log="$work/$label-work.log"
+  (
+    cd "$dir"
+    ALIGNC_CACHE="$cache" "$binary" build main.align -j 4 --profile release --no-rt-lto \
+      --cache-stats >/dev/null 2>"$log"
+  )
+  frontend_misses="$(awk '/^alignc: cache: .* frontend miss \(/ { count++ } END { print count + 0 }' "$log")"
+  frontend_hits="$(awk '/^alignc: cache: .* frontend hit$/ { count++ } END { print count + 0 }' "$log")"
+  codegen_misses="$(awk '/^alignc: cache: .* miss \(/ && $0 !~ / frontend miss \(/ { count++ } END { print count + 0 }' "$log")"
+  codegen_hits="$(awk '/^alignc: cache: .* hit$/ && $0 !~ / frontend hit$/ { count++ } END { print count + 0 }' "$log")"
+  if [ "$frontend_hits" -ne 0 ] || [ "$codegen_hits" -ne 0 ]; then
+    echo "$label work audit unexpectedly hit a fresh cache" >&2
+    sed -n '/^alignc: cache:/p' "$log" >&2
+    exit 1
+  fi
+  echo "$frontend_misses $codegen_misses"
+}
+
+baseline_work="$(measure_work "$baseline" "$work/baseline" "$work/baseline-cache" baseline)"
+pipelined_work="$(measure_work "$pipelined" "$work/pipelined" "$work/pipelined-cache" pipelined)"
+if [ "$baseline_work" != "$pipelined_work" ]; then
+  echo "frontend/codegen work differs: baseline $baseline_work, pipelined $pipelined_work" >&2
+  exit 1
+fi
+set -- $baseline_work
+frontend_invocations="$1"
+codegen_invocations="$2"
+
 export ALIGNC_CACHE=off
 run_timed "$baseline" "$work/baseline" "$work/baseline-warmup.txt"
 run_timed "$pipelined" "$work/pipelined" "$work/pipeline-warmup.txt"
@@ -73,13 +106,12 @@ while [ "$i" -le "$samples" ]; do
 done
 
 cmp "$work/baseline/main" "$work/pipelined/main"
-units="$($pipelined check-per-unit "$work/pipelined/main.align" 2>/dev/null | awk '/^unit / { count++ } END { print count + 0 }')"
 middle=$(((samples + 1) / 2))
 baseline_median="$(sort -n "$work/baseline-times.txt" | sed -n "${middle}p")"
 pipeline_median="$(sort -n "$work/pipeline-times.txt" | sed -n "${middle}p")"
 
-echo "units/frontend invocations: $units"
-echo "cache-off codegen invocations: $units"
+echo "cold-cache frontend invocations per revision: $frontend_invocations"
+echo "cold-cache codegen invocations per revision: $codegen_invocations"
 echo "baseline seconds: $(tr '\n' ' ' <"$work/baseline-times.txt")"
 echo "pipelined seconds: $(tr '\n' ' ' <"$work/pipeline-times.txt")"
 echo "baseline median: $baseline_median s"

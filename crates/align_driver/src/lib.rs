@@ -4594,6 +4594,7 @@ struct PipelineWorkers {
     queue: std::sync::Arc<PipelineQueue>,
     config: PipelineEmitConfig,
     handles: Vec<std::thread::JoinHandle<()>>,
+    background_limit: usize,
 }
 
 impl PipelineWorkers {
@@ -4610,20 +4611,41 @@ impl PipelineWorkers {
             }),
             ready: std::sync::Condvar::new(),
         });
-        let mut handles = Vec::with_capacity(jobs.saturating_sub(1));
-        for _ in 0..jobs.saturating_sub(1) {
-            let worker_queue = std::sync::Arc::clone(&queue);
-            let worker_config = config.clone();
-            handles.push(std::thread::spawn(move || pipeline_worker(worker_queue, &worker_config)));
+        PipelineWorkers {
+            queue,
+            config,
+            handles: Vec::new(),
+            background_limit: jobs.saturating_sub(1),
         }
-        PipelineWorkers { queue, config, handles }
     }
 
-    fn enqueue(&self, task: PipelineTask) {
+    /// Grow only as outstanding work can use another background worker. `Builder::spawn` is
+    /// fallible, so process thread exhaustion degrades to fewer workers and the coordinator still
+    /// drains the queue instead of unwinding with already-created handles detached.
+    fn ensure_background_workers(&mut self, available_work: usize) {
+        let target = self.background_limit.min(available_work);
+        while self.handles.len() < target {
+            let worker_queue = std::sync::Arc::clone(&self.queue);
+            let worker_config = self.config.clone();
+            let worker_number = self.handles.len();
+            let spawned = std::thread::Builder::new()
+                .name(format!("align-codegen-{worker_number}"))
+                .spawn(move || pipeline_worker(worker_queue, &worker_config));
+            match spawned {
+                Ok(handle) => self.handles.push(handle),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn enqueue(&mut self, task: PipelineTask) {
         let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.cancelled {
             state.tasks.push_back(task);
             self.queue.ready.notify_one();
+            let available_work = state.tasks.len() + state.in_flight;
+            drop(state);
+            self.ensure_background_workers(available_work);
         }
     }
 
@@ -4856,7 +4878,7 @@ pub fn build_package_pipelined(
                         return;
                     }
                     if let Some(mir) = pending.body.take_lowered() {
-                        workers.as_ref().expect("pipeline workers just started").enqueue(
+                        workers.as_mut().expect("pipeline workers just started").enqueue(
                             PipelineTask {
                                 index,
                                 unit: unit.to_string(),
@@ -4954,7 +4976,7 @@ pub fn build_package_pipelined(
             ));
         }
         if let Some(mir) = build.units[index].body.take_lowered() {
-            workers.as_ref().expect("pipeline workers just started").enqueue(PipelineTask {
+            workers.as_mut().expect("pipeline workers just started").enqueue(PipelineTask {
                 index,
                 unit,
                 mir,
@@ -5058,7 +5080,9 @@ mod pipeline_tests {
     fn job_budget_is_global() {
         let _serial = serial();
         for (jobs, background) in [(1usize, 0usize), (2, 1), (4, 3)] {
-            let pool = PipelineWorkers::start(jobs, config());
+            let mut pool = PipelineWorkers::start(jobs, config());
+            assert!(pool.handles.is_empty(), "workers are lazy until work exists");
+            pool.ensure_background_workers(background);
             assert_eq!(pool.handles.len(), background, "coordinator occupies one of {jobs} jobs");
             pool.cancel();
             assert!(pool.finish(false).is_empty());
@@ -5066,10 +5090,48 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn oversized_job_count_is_capped_by_available_work() {
+        let _serial = serial();
+        let mut pool = PipelineWorkers::start(usize::MAX, config());
+        pool.ensure_background_workers(1);
+        assert_eq!(pool.handles.len(), 1, "one task can use at most one background worker");
+        pool.cancel();
+        assert!(pool.finish(false).is_empty());
+    }
+
+    #[test]
+    fn bad_profdata_header_is_rejected_before_any_tail_read() {
+        struct BadHeaderThenPanic {
+            served_header: bool,
+        }
+
+        impl std::io::Read for BadHeaderThenPanic {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.served_header {
+                    panic!("a rejected header must prevent every tail read");
+                }
+                self.served_header = true;
+                let n = out.len().min(8);
+                out[..n].fill(0);
+                Ok(n)
+            }
+        }
+
+        let mut reader = BadHeaderThenPanic { served_header: false };
+        let error = read_validated_profdata_bytes(
+            std::path::Path::new("huge-garbage.profdata"),
+            &mut reader,
+            u64::MAX,
+        )
+        .expect_err("bad magic must be rejected");
+        assert!(error.contains("bad magic"), "unexpected diagnostic: {error}");
+    }
+
+    #[test]
     fn panicking_worker_notifies_joins_then_resumes() {
         let _serial = serial();
         let stage = ArtifactStage::temp("align-pipeline-panic-test").expect("stage");
-        let pool = PipelineWorkers::start(2, config());
+        let mut pool = PipelineWorkers::start(2, config());
         pool.enqueue(PipelineTask {
             index: 0,
             unit: "panic-owner".to_string(),
@@ -5590,15 +5652,37 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
 /// Read a profile exactly once after the public path-shape checks and validate only the indexed
 /// profile header. Deeper format/version validation remains libLLVM's job on a cache miss.
 fn read_and_validate_profdata(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    if !path.exists() {
-        return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
-    }
-    if !path.is_file() {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("--pgo-use: cannot inspect profile data file '{}': {error}", path.display()))?;
+    if !metadata.is_file() {
         return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
-    validate_profdata_header(path, &bytes)?;
+    read_validated_profdata_bytes(path, &mut file, metadata.len())
+}
+
+/// Validate the bounded header before allocating or reading the remaining snapshot. Kept as a
+/// separate owner so a malformed first eight bytes can prove that no tail read is attempted.
+fn read_validated_profdata_bytes(
+    path: &std::path::Path,
+    reader: &mut impl std::io::Read,
+    expected_len: u64,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut head = Vec::with_capacity(8);
+    (&mut *reader)
+        .take(8)
+        .read_to_end(&mut head)
+        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
+    validate_profdata_header(path, &head)?;
+    let mut bytes = Vec::with_capacity(expected_len.try_into().unwrap_or(8).max(8));
+    bytes.extend_from_slice(&head);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
     Ok(bytes)
 }
 

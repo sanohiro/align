@@ -348,13 +348,13 @@ The implementation closure pass maps the rows as follows:
 | Cells | Diff owner | Regression owner |
 |------|------------|------------------|
 | PL1-PL2 | `walk_inner`'s single ready-unit callback runs only after the unit summary, MIR, diagnostics, static inputs, and artifacts are final; all frontend and rehydration calls remain on the coordinator | `pipeline_tests::ready_seam_preserves_per_unit_projection`, `pipeline_tests::ready_seam_preserves_package_projection`, and the measured overlap corpus |
-| PL3-PL4 | `PipelineWorkers::start` creates `jobs - 1` background workers and `UnitBody::take_lowered` destructively transfers MIR into one task | `pipeline_tests::job_budget_is_global`, `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
+| PL3-PL4 | `PipelineWorkers` lazily creates at most `min(jobs - 1, outstanding work)` fallible background workers and `UnitBody::take_lowered` destructively transfers MIR into one task | `pipeline_tests::job_budget_is_global`, `pipeline_tests::oversized_job_count_is_capped_by_available_work`, and `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
 | PL5-PL6 | the callback selects hit, lowered miss, or deferred reused miss; the coordinator materializes deferred indices in DAG order through the existing complete identity checker | `pipelined_compilation::cache_product_selects_exact_work` and `unit_cache::a_stale_entry_makes_the_cli_retry_once_and_succeed` |
-| PL7-PL8 | the coordinator completes the walk before selecting retained setup/key/stale/target/ordinary errors; valid-magic deep PGO rejection remains in `emit_unit_object` | `pipelined_compilation::frontend_diagnostics_precede_shallow_setup_failure`, `pipelined_compilation::shallow_profile_failure_is_codegen_failure_with_no_paths`, `pgo_sv::gate_sv2c_corrupt_profile_valid_magic_hard_errors` |
+| PL7-PL8 | the coordinator completes the walk before selecting retained setup/key/stale/target/ordinary errors; the single PGO file handle validates its bounded header before allocating or reading the tail, while valid-magic deep rejection remains in `emit_unit_object` | `pipeline_tests::bad_profdata_header_is_rejected_before_any_tail_read`, `pipelined_compilation::frontend_diagnostics_precede_shallow_setup_failure`, `pipelined_compilation::shallow_profile_failure_is_codegen_failure_with_no_paths`, and `pgo_sv::gate_sv2c_corrupt_profile_valid_magic_hard_errors` |
 | PL9-PL10 | `PipelineClaimGuard`, `PipelineWorkers::finish`, and the post-validation publication loop own every exit, resumed unwind, and cache commit | `pipeline_tests::panicking_worker_notifies_joins_then_resumes`, `pipelined_compilation::object_publication_waits_for_validation_commit` |
 | PL11-PL15 | the existing key, lookup, emitter, PGO/runtime-LTO, and link inputs are reused unchanged; only their schedule and publication point move | `cache_parallel`, `unit_cache`, `pgo`, `pgo_cache`, `pgo_sv`, `rt_lto`, and `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
 | PL16-PL19 | pool construction is lazy, excluded verbs never call the new API, every malformed-input variant exposes no object, and results sort by DAG index | `pipeline_tests::all_hit_starts_no_worker`, `pipelined_compilation::excluded_verbs_keep_their_existing_driver`, `pipelined_compilation::only_complete_results_lend_objects`, and `cache_parallel::parallel_dag_build_is_deterministic` |
-| PL20 | `bench/build_pipeline/run.sh` alternates revisions, checks work/output identity, and samples coordinator/worker overlap | the local measurement below |
+| PL20 | `bench/build_pipeline/run.sh` alternates revisions, derives each revision's frontend/codegen invocation counts from a fresh cold-cache outcome stream, checks work/output identity, and samples coordinator/worker overlap | the local measurement below |
 | PL21-PL23 | the no-hook projections remain field-complete, complete results alone own unique stages, and the CLI keeps one map per one attempt/retry | both `ready_seam_preserves_*` owners, `pipelined_compilation::concurrent_pipelines_own_distinct_stages`, `pipelined_compilation::only_complete_results_lend_objects`, and `unit_cache::a_stale_entry_makes_the_cli_retry_once_and_succeed` |
 
 ### Measurement
@@ -369,14 +369,15 @@ counts and output bytes. No fixed percentage becomes a correctness gate, and
 the benchmark never enters `scripts/test-pr.sh`.
 
 The 2026-08-25 implementation measurement compared optimized compilers at exact
-base `79e68944` and the item-3 candidate on x86-64 Linux, using the 14-unit
+base `79e68944` and the final item-3 candidate on x86-64 Linux, using the 14-unit
 `apps/db` corpus, `ALIGNC_CACHE=off`, `--profile release`, `--no-rt-lto`, and
-`-j 4`. Seven alternating pairs after a warm-up produced a 12.48 s baseline
-median and 10.15 s pipelined median (18.7% lower), with 14 frontend and 14
-codegen invocations in both revisions and byte-identical executables. Linux
-`/proc` task sampling observed the coordinator and LLVM workers both advancing
-in 113 ten-millisecond buckets. No PostgreSQL service ran; the corpus only
-supplied compiler work.
+`-j 4`. Seven alternating pairs after a warm-up produced a 12.51 s baseline
+median and 10.11 s pipelined median (19.2% lower). Separate fresh cold-cache
+builds derived 14 frontend and 14 codegen invocations from each revision's
+actual outcome stream, and the timed builds produced byte-identical
+executables. Linux `/proc` task sampling observed the coordinator and LLVM
+workers both advancing in 115 ten-millisecond buckets. No PostgreSQL service
+ran; the corpus only supplied compiler work.
 
 ## Item 2a: required DB owner build-once/run-many
 
