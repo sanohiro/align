@@ -193,7 +193,7 @@ The observable failure precedence stays:
 1  complete frontend semantic diagnostics, in DAG order
 2  static-publication-lock validation
 3  unique object-stage creation
-4  PGO snapshot read and format validation
+4  PGO snapshot read and shallow path/header validation
 5  first codegen-key/lookup setup error, in DAG order
 6  first stale reused frontend entry, in DAG order
 7  LLVM target initialization
@@ -203,20 +203,27 @@ The observable failure precedence stays:
 
 Operations may execute early to permit overlap, but their errors are retained
 and selected only by this logical order. If stage creation fails, no object
-lookup or worker starts. Otherwise PGO input is read once, validated with the
-existing missing/read/bad-magic/malformed precedence, snapshotted, and digested
-before the first object lookup, so every key and libLLVM see the exact same
-bytes. Key construction proceeds in DAG order and stops logically at its first
-error. Target initialization may run before the walk finishes, but its error is
-reported only after every deferred rehydration has agreed. Thus a stale entry
-still wins over target initialization as on the existing two-phase path.
+lookup or worker starts. Otherwise PGO path metadata is checked and the input is
+read once with the existing missing/non-regular/unreadable/empty/short-or-bad-
+magic precedence, then those bytes are snapshotted and digested before the
+first object lookup, so every key and libLLVM see the exact same bytes. This is
+deliberately shallow: a valid-magic profile with a corrupt or unsupported
+version reaches libLLVM only on an object-cache miss and is an ordinary per-unit
+codegen failure. An all-object-hit build runs no LLVM and therefore succeeds,
+unchanged. Key construction proceeds in DAG order and stops logically at its
+first error. Target initialization may run before the walk finishes, but its
+error is reported only after every deferred rehydration has agreed. Thus a
+stale entry still wins over target initialization as on the existing two-phase
+path.
 
 All setup errors are held while the frontend finishes and are reported only if
 the frontend is clean. `pipeline_tests::setup_failure_order_is_total` covers
-stage + unreadable/bad PGO, PGO + key setup, key setup + stale entry, and stale
-entry + target initialization as multi-invalid pairs. PGO warnings and match
-counts are aggregated in DAG order and reported only after successful codegen,
-unchanged.
+stage + unreadable/bad-magic PGO, shallow PGO + key setup, key setup + stale
+entry, and stale entry + target initialization as multi-invalid pairs.
+`pipeline_tests::valid_magic_profile_rejection_stays_on_miss_codegen` separately
+pins a deep profile failure behind cache lookup and at the failing unit's DAG
+index. PGO warnings and match counts are aggregated in DAG order and reported
+only after successful codegen, unchanged.
 
 An ordinary worker error stops new codegen claims but never truncates the
 frontend walk. If frontend later fails and no internal panic occurs, in-progress
@@ -288,8 +295,9 @@ separating its raw diagnostics from the fresh `SourceMap` that owns their file
 ids. It also grouped independently fallible setup phases and tried to convert a
 worker panic without accounting for Rust's process-global panic hook. The final
 boundary keeps one map per one library attempt, leaves retry and diagnostic
-rendering in the CLI, totally orders setup failures, and treats internal panic
-as cleanup-then-unwind rather than a returned diagnostic.
+rendering in the CLI, totally orders shallow setup failures while leaving deep
+valid-magic PGO rejection on cache-miss codegen, and treats internal panic as
+cleanup-then-unwind rather than a returned diagnostic.
 
 `check`, `check-per-unit`, `emit-mir`, `emit-llvm`, `emit-obj`, `explain-opt`,
 and export-root tooling retain their existing serial or two-phase paths.
@@ -313,12 +321,12 @@ several rows when it discriminates every listed state.
 | PL5 | cache-state product | frontend hit/miss × object hit/miss selects no-rehydrate, enqueue-lowered, or deferred-rehydrate exactly once | `pipelined_compilation::cache_product_selects_exact_work` |
 | PL6 | rehydration | deferred misses rehydrate serially in DAG order; every existing identity component is checked; the first mismatch unlinks and returns stale for the CLI's one reuse-forbidden whole-package retry | `pipelined_compilation::stale_entries_retry_once_after_speculative_work`, reusing the `unit_cache` tamper fixtures |
 | PL7 | diagnostics | warnings and errors are byte-identical and DAG-ordered; a later ordinary codegen failure never hides or truncates frontend diagnostics | `pipelined_compilation::frontend_diagnostics_precede_speculative_codegen_failures` |
-| PL8 | failure precedence | frontend, lock, stage, PGO, first DAG key, first DAG stale entry, target initialization, lowest claimed DAG-index ordinary codegen error, and link form the total order above regardless of execution timing | `pipeline_tests::failure_precedence_is_deterministic` and `pipeline_tests::setup_failure_order_is_total` |
+| PL8 | failure precedence | frontend, lock, stage, shallow PGO, first DAG key, first DAG stale entry, target initialization, lowest claimed DAG-index ordinary codegen error (including deep valid-magic profile rejection), and link form the total order above regardless of execution timing | `pipeline_tests::failure_precedence_is_deterministic`, `pipeline_tests::setup_failure_order_is_total`, and `pipeline_tests::valid_magic_profile_rejection_stays_on_miss_codegen` |
 | PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; panic resumes only after notification/join without touching the global hook; the PGO snapshot outlives LLVM but not the function; a failed build drops its unique stage before return, while a complete result owns its stage through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_notifies_joins_then_resumes` |
 | PL10 | publication commit | no object miss publishes before frontend, lock, setup, and rehydration validation; after that point successful siblings publish despite a codegen sibling failure | `pipelined_compilation::object_publication_waits_for_validation_commit` |
 | PL11 | cache identity | keys, first-difference reasons, hit/miss outcomes, cache-off bypass, corruption recovery, and DAG-ordered stats equal the existing path | `pipelined_compilation::pipelined_cache_matches_two_phase_cache` |
 | PL12 | static descriptors | codegen may overlap static resolution only after that unit's MIR is fixed; lock-validation failure publishes neither object nor executable | `pipelined_compilation::metadata_race_publishes_nothing` |
-| PL13 | PGO product | Off/Instrument/Use use the same snapshot digest and optimized pipeline as today; all-hit Use still validates; warnings and tallies remain DAG-ordered | `pipelined_compilation::pgo_modes_preserve_cache_and_diagnostics`, reusing `pgo_cache` and `pgo_sv` fixtures |
+| PL13 | PGO product | Off/Instrument/Use use the same snapshot digest and optimized pipeline as today; all-hit Use performs shallow validation but no deep libLLVM validation, while a valid-magic malformed profile fails only on a miss; warnings and tallies remain DAG-ordered | `pipelined_compilation::pgo_modes_preserve_cache_and_diagnostics`, reusing `pgo_cache` and `pgo_sv` fixtures |
 | PL14 | runtime LTO | off/on keys and object bytes remain isolated and `--rt-lto` still merges before the unit's single optimization run | `pipelined_compilation::runtime_lto_preserves_key_and_object_parity`, reusing `rt_lto` fixtures |
 | PL15 | output identity | cache off/on, `-j 1`/`-j N`, cold/all-hit/private-edit, and retry produce byte-identical per-unit objects, executable, stdout, and link-library order to the existing driver | `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
 | PL16 | all-hit cost | an all-object-hit build starts no worker and rehydrates no MIR | `pipeline_tests::all_hit_starts_no_worker` |
