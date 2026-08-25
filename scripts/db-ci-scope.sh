@@ -8,10 +8,11 @@
 #   reason=<single-line explanation>
 #
 # Classification fails closed for an unreadable range. Dependency or DB-gate
-# machinery, a pkg.db surface/owner, or compiler source that names the database
-# boundary in either the base or head all require the provisioned job. Deletions
-# use those same path/content rules rather than provisioning PostgreSQL merely
-# because something unrelated was removed.
+# machinery and pkg.db surfaces/owners require the provisioned job by path.
+# Other compiler sources qualify only when a changed zero-context hunk (including
+# its function header) names the database boundary. That keeps an unrelated edit
+# in a monolithic source file from inheriting an unchanged DB marker elsewhere in
+# the file. Deletions use the same diff, so removed markers remain visible.
 set -euo pipefail
 
 cd "${DB_CI_REPO_ROOT:-$(dirname "$0")/..}"
@@ -31,9 +32,13 @@ if [ -z "$base_sha" ] || [ -z "$head_sha" ] ||
   exit 0
 fi
 
-source_names_database_boundary() {
-  local revision="$1" path="$2"
-  git show "$revision:$path" 2>/dev/null |
+source_change_names_database_boundary() {
+  local path="$1" changed
+  if ! changed="$(git diff --no-ext-diff --no-textconv --no-renames --unified=0 \
+    "$base_sha..$head_sha" -- "$path" 2>/dev/null)"; then
+    return 0
+  fi
+  printf '%s\n' "$changed" |
     grep -Ei 'pkg[._]db|postgres|libpq|sqlite|align_pkg_db' >/dev/null
 }
 
@@ -50,6 +55,12 @@ while IFS= read -r -d '' path; do
     scripts/check-libpq-version.sh | \
     scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | scripts/cargo.sh | \
     apps/db/* | \
+    crates/*/src/db_*.rs | \
+    crates/align_driver/src/query_meta_codegen.rs | \
+    crates/align_driver/src/static_artifacts.rs | \
+    crates/align_driver/src/static_inputs.rs | \
+    crates/align_driver/src/static_runtime.rs | \
+    crates/align_interface/src/static_artifact.rs | \
     crates/align_driver/tests/pkg_db_*.rs | \
     crates/*/tests/common* | crates/*/tests/helpers/* | \
     crates/align_driver/tests/db_harness/* | \
@@ -61,8 +72,7 @@ while IFS= read -r -d '' path; do
       exit 0
       ;;
     crates/*/src/* | crates/*/build.rs | crates/*/tests/*.rs | crates/*/tests/*/*.rs)
-      if source_names_database_boundary "$base_sha" "$path" ||
-         source_names_database_boundary "$head_sha" "$path"; then
+      if source_change_names_database_boundary "$path"; then
         emit true database-source
         exit 0
       fi
