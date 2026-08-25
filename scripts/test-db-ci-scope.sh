@@ -105,18 +105,23 @@ git -C "$fixture" commit -qm db-workflow
 workflow="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$db_package" "$workflow"
 
-printf '#!/usr/bin/env bash\n' > "$fixture/scripts/run-db-suites.sh"
-git -C "$fixture" add .
-git -C "$fixture" commit -qm db-suite-runner
-suite_runner="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$workflow" "$suite_runner"
+runner_parent="$workflow"
+for runner_dependency in \
+  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh; do
+  printf '#!/usr/bin/env bash\n' > "$fixture/scripts/$runner_dependency"
+  git -C "$fixture" add .
+  git -C "$fixture" commit -qm "db-runner-$runner_dependency"
+  runner_head="$(git -C "$fixture" rev-parse HEAD)"
+  assert_scope true "$runner_parent" "$runner_head"
+  runner_parent="$runner_head"
+done
 
 # An unrelated deletion stays out of the service job.
 rm "$fixture/apps/web/main.align"
 git -C "$fixture" add -u
 git -C "$fixture" commit -qm unrelated-deletion
 unrelated_deleted="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope false "$suite_runner" "$unrelated_deleted"
+assert_scope false "$runner_parent" "$unrelated_deleted"
 
 # Deleted DB-naming source is classified from its base content, and a deleted
 # direct DB path is classified by path. Unreadable ranges still fail closed.

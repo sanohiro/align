@@ -204,8 +204,9 @@ round-trips for failures that reproduce locally in seconds.
 The required check remains present on every PR, but the provisioned service job
 runs only when the exact committed diff reaches the database boundary. Direct
 `apps/db`, `pkg_db_*`, DB harness/fixture/golden, dependency, DB toolchain, and
-CI-gate changes qualify. Shared test harnesses consumed by the DB suites also
-qualify. A changed or deleted compiler source or owner-test file qualifies when
+CI-gate changes qualify. Shared test harnesses and binary-runner machinery
+consumed by the DB suites also qualify. A changed or deleted compiler source or
+owner-test file qualifies when
 its base or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite
 boundary. Deleted direct DB paths qualify by path; unrelated deletions do not.
 Uncomputable diffs fail closed. Other documentation, tooling,
