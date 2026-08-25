@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Compare the exact Request 6 Copy-row codegen inputs between the fixed baseline and an
-# implementation head. The cross-worktree Rust owner is copied into the baseline worktree because
-# that commit predates this checked-in integration test. The production CodegenKey classifier is
-# owned by the implementation-side cache_codegen test, which cannot be copied into the older
-# baseline without changing the compiler under test.
+# Replay the exact Request 6 Copy-row codegen comparison between its fixed baseline and reviewed
+# implementation. The Rust owner and fixture come from the implementation commit so later compiler
+# and interface evolution cannot turn this historical evidence into a current-tree failure.
 set -euo pipefail
 
 BASELINE_SHA="576e57307fe4ef34e74566f5e389a2f0e2a04acd"
-IMPLEMENTATION_SHA="${1:-${ALIGN_JSON_SCAN_IMPLEMENTATION_SHA:-}}"
+IMPLEMENTATION_SHA="aa5bb7d66d0436c2d9ebf89f252b0ba5d528c2a8"
 TOOLCHAIN="1.96.1"
-if [[ -z "$IMPLEMENTATION_SHA" ]]; then
-    echo "usage: $0 <implementation-head-sha>" >&2
+if [[ $# -ne 0 ]]; then
+    echo "usage: $0" >&2
     exit 2
 fi
 
@@ -57,14 +55,17 @@ run_probe() {
     local worktree="$1"
     local output="$2"
     mkdir -p "$output" "$worktree/crates/align_driver/tests/fixtures"
-    cp "$REPO_ROOT/crates/align_driver/tests/json_scan_identity.rs" "$worktree/crates/align_driver/tests/json_scan_identity.rs"
-    cp "$REPO_ROOT/crates/align_driver/tests/fixtures/json_scan_copy_identity.align" "$worktree/crates/align_driver/tests/fixtures/json_scan_copy_identity.align"
+    git --git-dir="$COMMON_DIR" show \
+        "${IMPLEMENTATION_SHA}:crates/align_driver/tests/json_scan_identity.rs" \
+        >"$worktree/crates/align_driver/tests/json_scan_identity.rs"
+    git --git-dir="$COMMON_DIR" show \
+        "${IMPLEMENTATION_SHA}:crates/align_driver/tests/fixtures/json_scan_copy_identity.align" \
+        >"$worktree/crates/align_driver/tests/fixtures/json_scan_copy_identity.align"
     (
         cd "$worktree"
         env -u RUSTFLAGS LC_ALL=C ALIGNC_CACHE=off ALIGN_JSON_SCAN_IDENTITY_OUT="$output" \
             cargo +"$TOOLCHAIN" test --release --locked --target x86_64-unknown-linux-gnu \
-            -p align_driver --test json_scan_identity -- \
-            --exact --ignored json_scan_cross_compiler_identity
+            -p align_driver --test json_scan_identity -- --exact json_scan_cross_compiler_identity
     )
 }
 

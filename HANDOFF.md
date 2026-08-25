@@ -222,7 +222,11 @@ class (#745), the open-world callback rule that had broken `apps/web` since #672
 and the silent-empty-MIR break it hid (#742), the validator's private copy of
 the mangling scheme (#744), and fixed struct-array slicing for the router
 (#743). The manifest is empty; any new red must be triaged before an entry is
-added.
+added. The retired environment-dependent row was the Request 6 implementation-time
+cross-compiler probe: `scripts/compare-json-scan-identity.sh` now replays its
+fixed `576e5730`/`aa5bb7d` evidence from pinned historical sources, while the
+current test graph no longer compiles that one-time owner against later interface
+and cache evolution.
 
 The silent-empty-MIR class — a body validator re-deriving a fact the producer
 owns — reached eight occurrences and is closed at its root by #774: the fallible
