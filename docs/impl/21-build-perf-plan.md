@@ -19,7 +19,7 @@ Order is priority.
 | 1 | Persistent unit cache v1 | Shipped — in-process memo #757 (`docs/impl/10-cache-first-optimization.md` §6.6) and the persistent per-unit frontend cache #761 (§6.7, Slice C3) |
 | 2 | lld linking on ELF | Shipped as #763 — see below |
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
-| 3 | Pipelined compilation | Design recorded below; implementation is next. Start a dependent unit's frontend as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget |
+| 3 | Pipelined compilation | Implemented. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
@@ -343,6 +343,20 @@ ready-unit producer, coordinator, worker, publication step, and a regression.
 A later finding audits the whole matrix for its root-cause class rather than
 patching one schedule edge.
 
+The implementation closure pass maps the rows as follows:
+
+| Cells | Diff owner | Regression owner |
+|------|------------|------------------|
+| PL1-PL2 | `walk_inner`'s single ready-unit callback runs only after the unit summary, MIR, diagnostics, static inputs, and artifacts are final; all frontend and rehydration calls remain on the coordinator | `pipeline_tests::ready_seam_preserves_per_unit_projection`, `pipeline_tests::ready_seam_preserves_package_projection`, and the measured overlap corpus |
+| PL3-PL4 | `PipelineWorkers::start` creates `jobs - 1` background workers and `UnitBody::take_lowered` destructively transfers MIR into one task | `pipeline_tests::job_budget_is_global`, `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
+| PL5-PL6 | the callback selects hit, lowered miss, or deferred reused miss; the coordinator materializes deferred indices in DAG order through the existing complete identity checker | `pipelined_compilation::cache_product_selects_exact_work` and `unit_cache::a_stale_entry_makes_the_cli_retry_once_and_succeed` |
+| PL7-PL8 | the coordinator completes the walk before selecting retained setup/key/stale/target/ordinary errors; valid-magic deep PGO rejection remains in `emit_unit_object` | `pipelined_compilation::frontend_diagnostics_precede_shallow_setup_failure`, `pipelined_compilation::shallow_profile_failure_is_codegen_failure_with_no_paths`, `pgo_sv::gate_sv2c_corrupt_profile_valid_magic_hard_errors` |
+| PL9-PL10 | `PipelineClaimGuard`, `PipelineWorkers::finish`, and the post-validation publication loop own every exit, resumed unwind, and cache commit | `pipeline_tests::panicking_worker_notifies_joins_then_resumes`, `pipelined_compilation::object_publication_waits_for_validation_commit` |
+| PL11-PL15 | the existing key, lookup, emitter, PGO/runtime-LTO, and link inputs are reused unchanged; only their schedule and publication point move | `cache_parallel`, `unit_cache`, `pgo`, `pgo_cache`, `pgo_sv`, `rt_lto`, and `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
+| PL16-PL19 | pool construction is lazy, excluded verbs never call the new API, every malformed-input variant exposes no object, and results sort by DAG index | `pipeline_tests::all_hit_starts_no_worker`, `pipelined_compilation::excluded_verbs_keep_their_existing_driver`, `pipelined_compilation::only_complete_results_lend_objects`, and `cache_parallel::parallel_dag_build_is_deterministic` |
+| PL20 | `bench/build_pipeline/run.sh` alternates revisions, checks work/output identity, and samples coordinator/worker overlap | the local measurement below |
+| PL21-PL23 | the no-hook projections remain field-complete, complete results alone own unique stages, and the CLI keeps one map per one attempt/retry | both `ready_seam_preserves_*` owners, `pipelined_compilation::concurrent_pipelines_own_distinct_stages`, `pipelined_compilation::only_complete_results_lend_objects`, and `unit_cache::a_stale_entry_makes_the_cli_retry_once_and_succeed` |
+
 ### Measurement
 
 The benchmark uses a release `alignc`, the repository's multi-unit `pkg.db`
@@ -353,6 +367,16 @@ frontend/codegen invocation counts and the observed overlap interval. The
 acceptance condition is a lower median paired wall time with identical work
 counts and output bytes. No fixed percentage becomes a correctness gate, and
 the benchmark never enters `scripts/test-pr.sh`.
+
+The 2026-08-25 implementation measurement compared optimized compilers at exact
+base `79e68944` and the item-3 candidate on x86-64 Linux, using the 14-unit
+`apps/db` corpus, `ALIGNC_CACHE=off`, `--profile release`, `--no-rt-lto`, and
+`-j 4`. Seven alternating pairs after a warm-up produced a 12.48 s baseline
+median and 10.15 s pipelined median (18.7% lower), with 14 frontend and 14
+codegen invocations in both revisions and byte-identical executables. Linux
+`/proc` task sampling observed the coordinator and LLVM workers both advancing
+in 113 ten-millisecond buckets. No PostgreSQL service ran; the corpus only
+supplied compiler work.
 
 ## Item 2a: required DB owner build-once/run-many
 

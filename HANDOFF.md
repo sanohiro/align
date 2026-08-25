@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-23._ Request 18's retained-root regular-file constructors are implemented
+_Last updated: 2026-08-25._ Request 18's retained-root regular-file constructors are implemented
 against the accepted design in `docs/impl/29-fs-retained-root-plan.md` and real-client verified by
 align-llm PR #99 at `78eae459fd1f88bad1c3c3ca7b86921a08ecf168`, pinned to Align merge
 `19c3db144c462bf7d6784f88d64cc124229b7ec2`; C6d is complete. Request 16's sum-payload projection and
@@ -338,9 +338,10 @@ facts must live in this repository.
   instrumented PGO, and `ld.lld` linking on ELF are complete. The roadmap
   retains the implementation evidence; it is not the live backlog. The dedicated
   build-performance track is `docs/impl/21-build-perf-plan.md`: items 1, 2, and
-  2a are shipped; item 3's pipelined-frontend/codegen design is the next
-  implementation; prebuilt cache distribution, residency, and function-level
-  incrementality remain behind it.
+  2a are shipped; item 3's ordinary non-ThinLTO pipeline is implemented and
+  locally measured at a 12.48 s to 10.15 s median reduction on the 14-unit
+  cache-off corpus with identical output. Prebuilt cache distribution,
+  residency, and function-level incrementality are the remaining items 4-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

@@ -39,8 +39,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
-    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PackageBuild,
-    PerUnitWalk, Profile, UnitReuse,
+    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PerUnitWalk,
+    Profile, UnitReuse,
 };
 use align_span::SourceMap;
 
@@ -1216,48 +1216,11 @@ fn read(path: &str) -> Option<String> {
     }
 }
 
-/// Run the per-unit walk for `path` (front end → per-unit sema → per-unit MIR, bottom-up over the
-/// import DAG), printing any diagnostics. Returns the walk on success (at least one unit), or `None`
-/// on a read/parse/check error (diagnostics already emitted). This is the shared front half of every
-/// codegen verb (`build`/`run`/`size`/`emit-obj`/`emit-llvm`/`emit-mir`) after the M15 S2b flip.
 /// Whether a package build should print the diagnostics it produced.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiagnosticEcho {
     All,
     ErrorsOnly,
-}
-
-/// [`walk_or_report`]'s package-build twin: the same read/report/empty-check contract, but through
-/// [`align_driver::build_package`], so a unit whose frontend result is already cached is served from
-/// disk instead of re-checked. Owns its own `SourceMap`, which is what lets the one bounded
-/// rehydration retry start from a clean one.
-fn package_or_report(
-    path: &str,
-    cache: &CacheContext,
-    reuse: UnitReuse,
-    echo: DiagnosticEcho,
-) -> Option<PackageBuild> {
-    let src = read(path)?;
-    let mut sm = SourceMap::new();
-    let build = align_driver::build_package(&mut sm, path, &src, cache, reuse);
-    let echo_now = match echo {
-        DiagnosticEcho::All => !build.diags.is_empty(),
-        // The retry pass re-derives the identical warnings the first attempt already printed;
-        // printing them again would break the "a diagnostic is emitted exactly once" rule. An
-        // ERROR is different: it is new information and must never be swallowed.
-        DiagnosticEcho::ErrorsOnly => build.diags.has_errors(),
-    };
-    if echo_now {
-        eprint!("{}", format_diagnostics(&sm, &build.diags));
-    }
-    if build.diags.has_errors() {
-        return None;
-    }
-    if build.units.is_empty() {
-        eprintln!("alignc: no units to build");
-        return None;
-    }
-    Some(build)
 }
 
 /// The deterministic capability-library union across units: first-seen in DAG (unit) order, never
@@ -1275,6 +1238,10 @@ fn link_lib_union<'a>(per_unit: impl Iterator<Item = &'a [String]>) -> Vec<Strin
     union
 }
 
+/// Run the per-unit walk for `path` (front end → per-unit sema → per-unit MIR, bottom-up over the
+/// import DAG), printing any diagnostics. Returns the walk on success (at least one unit), or `None`
+/// on a read/parse/check error (diagnostics already emitted). This is the shared front half of the
+/// inspection and ThinLTO codegen verbs after the ordinary build path moved to the pipeline.
 fn walk_or_report(path: &str) -> Option<PerUnitWalk> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
@@ -1699,43 +1666,68 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
     // printed. (`UnitReuse` is `#[non_exhaustive]`, so this is a first-attempt-vs-retry test rather
     // than an exhaustive match.)
     let echo = if reuse == UnitReuse::Allowed { DiagnosticEcho::All } else { DiagnosticEcho::ErrorsOnly };
-    let mut build = package_or_report(path, &CacheContext::from_env(), reuse, echo).ok_or(ExitCode::FAILURE)?;
-    let object_stage = align_driver::ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
-        eprintln!("alignc: cannot create object staging directory: {e}");
-        ExitCode::FAILURE
-    })?;
-    let obj_paths: Vec<PathBuf> = (0..build.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
+    let src = read(path).ok_or(ExitCode::FAILURE)?;
+    let mut source_map = SourceMap::new();
     let cache = CacheContext::from_env();
-    if let align_driver::PgoMode::Use(p) = pgo
-        && let Err(e) = align_driver::validate_profdata(p)
-    {
-        eprintln!("alignc: {e}");
-        return Err(ExitCode::FAILURE);
-    }
-    let result = align_driver::codegen_package_parallel(&mut build, &obj_paths, &cache, &target, profile, rt_lto, jobs, pgo);
-    let built = match result {
-        Ok(built) => built,
+    let cache_enabled = cache.is_enabled();
+    let result = align_driver::build_package_pipelined(
+        &mut source_map,
+        path,
+        &src,
+        cache,
+        reuse,
+        &target,
+        profile,
+        rt_lto,
+        jobs,
+        pgo,
+    );
+    let render = |diags: &align_diag::Diagnostics| {
+        let echo_now = match echo {
+            DiagnosticEcho::All => !diags.is_empty(),
+            // The retry re-derives first-attempt warnings. New errors are never suppressed.
+            DiagnosticEcho::ErrorsOnly => diags.has_errors(),
+        };
+        if echo_now {
+            eprint!("{}", format_diagnostics(&source_map, diags));
+        }
+    };
+    let build = match result {
+        align_driver::PipelinedPackageBuild::FrontendFailed { diags } => {
+            render(&diags);
+            return Err(ExitCode::FAILURE);
+        }
+        align_driver::PipelinedPackageBuild::Complete(build) => {
+            render(&build.diags);
+            build
+        }
         // The one recoverable failure, matched on its SHAPE. The entry is already unlinked, so one
         // reuse-forbidden rebuild both succeeds and leaves the cache clean; a forbidden build never
-        // rehydrates, so this cannot recur. Nothing has been reported yet — the stats blocks below
-        // run only on the attempt that finishes — so the retry prints exactly one report.
-        Err(align_driver::PackageCodegenError::StaleCacheEntry { unit, failure }) => {
+        // rehydrates, so this cannot recur. The attempt's diagnostics are rendered against its own
+        // still-live SourceMap before a retry creates a fresh one.
+        align_driver::PipelinedPackageBuild::CodegenFailed {
+            diags,
+            error: align_driver::PackageCodegenError::StaleCacheEntry { unit, failure },
+        } if reuse == UnitReuse::Allowed => {
+            render(&diags);
             eprintln!(
                 "alignc: cached unit `{unit}`: {failure}; rebuilding this package without cache reuse"
             );
             return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Forbidden);
         }
-        Err(e) => {
-            eprintln!("alignc: {e}");
+        align_driver::PipelinedPackageBuild::CodegenFailed { diags, error } => {
+            render(&diags);
+            eprintln!("alignc: {error}");
             return Err(ExitCode::FAILURE);
         }
     };
     if cache_stats {
-        render_frontend_cache_stats(&build);
-        render_cache_stats(&built.outcomes, cache.is_enabled());
+        render_frontend_cache_stats(&build.units);
+        render_cache_stats(&build.codegen.outcomes, cache_enabled);
     }
-    report_pgo_use(pgo, &built);
+    report_pgo_use(pgo, &build.codegen);
     let link_libs = link_lib_union(build.units.iter().map(|u| u.link_libs.as_slice()));
+    let obj_paths: Vec<PathBuf> = build.units.iter().map(|unit| unit.object().to_path_buf()).collect();
     finish_link(&link_libs, &obj_paths, exe, profile, &target, pgo)
 }
 
@@ -1820,18 +1812,15 @@ fn render_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
     eprintln!("alignc: cache: {} unit(s): {hits} hit, {misses} miss", outcomes.len());
 }
 
-/// Render the `--cache-stats` report for a `--thin-lto` build: one `<unit> <phase> hit`/`miss (<r>)`
-/// line per phase per unit (`prelink` then `backend`), then a per-phase summary. A disabled cache
-/// prints the single disabled note (there are no per-unit lookups to report).
 /// The `--cache-stats` FRONTEND block, printed before the unchanged codegen block. One line per
 /// unit that actually consulted the stage, then its own summary. A unit whose `frontend` is `None`
 /// declined the stage (cache disabled, reuse forbidden, descriptor-owning) and is counted in
 /// neither hits nor misses — the same accounting rule the in-process memo uses. When no unit
 /// consulted it, the block is absent entirely, so a `--thin-lto` or cache-off build prints exactly
 /// what it printed before.
-fn render_frontend_cache_stats(build: &PackageBuild) {
+fn render_frontend_cache_stats(units: &[align_driver::PipelinedBuiltUnit]) {
     let outcomes: Vec<&align_driver::CacheOutcome> =
-        build.units.iter().filter_map(|unit| unit.frontend.as_ref()).collect();
+        units.iter().filter_map(|unit| unit.frontend.as_ref()).collect();
     if outcomes.is_empty() {
         return;
     }
@@ -1849,6 +1838,9 @@ fn render_frontend_cache_stats(build: &PackageBuild) {
     eprintln!("alignc: cache: {} frontend: {hits} hit, {misses} miss", outcomes.len());
 }
 
+/// Render the `--cache-stats` report for a `--thin-lto` build: one `<unit> <phase> hit`/`miss (<r>)`
+/// line per phase per unit (`prelink` then `backend`), then a per-phase summary. A disabled cache
+/// prints the single disabled note (there are no per-unit lookups to report).
 fn render_thin_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
     if !enabled {
         eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");

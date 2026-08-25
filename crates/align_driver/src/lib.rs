@@ -2493,6 +2493,28 @@ struct PendingPerUnitArtifact {
     static_artifacts: Vec<BuiltStaticArtifact>,
 }
 
+type ReadyUnitHook<'a> = dyn FnMut(
+    usize,
+    &str,
+    &[(String, align_interface::Hash128)],
+    &mut PendingPerUnitArtifact,
+) + 'a;
+
+fn store_ready_unit(
+    mirs: &mut std::collections::HashMap<String, PendingPerUnitArtifact>,
+    ready_index: &mut usize,
+    unit: &str,
+    dep_interface_hashes: &[(String, align_interface::Hash128)],
+    mut pending: PendingPerUnitArtifact,
+    on_ready: &mut Option<&mut ReadyUnitHook<'_>>,
+) {
+    if let Some(hook) = on_ready.as_deref_mut() {
+        hook(*ready_index, unit, dep_interface_hashes, &mut pending);
+    }
+    *ready_index += 1;
+    mirs.insert(unit.to_string(), pending);
+}
+
 /// M15 S1b: check every unit **per-unit**, each against only its own AST plus the interface summaries
 /// of its (transitively-closed) imports — the literal reading of `draft.md` §17 ("each module is
 /// checked against the already-checked interfaces of its imports"). This is an ADDITIVE capability
@@ -2550,7 +2572,15 @@ fn closure_of(
 fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: bool) -> PerUnitWalk {
     // `UnitReuse::Forbidden` makes the persistent unit cache inert, so this is byte-for-byte the
     // pre-cache walk: every unit is computed and every body is `Lowered`.
-    let walk = walk_inner(source_map, name, src, located, &CacheContext::Disabled, UnitReuse::Forbidden);
+    let walk = walk_inner(
+        source_map,
+        name,
+        src,
+        located,
+        &CacheContext::Disabled,
+        UnitReuse::Forbidden,
+        None,
+    );
     walk.into_per_unit()
 }
 
@@ -2567,6 +2597,7 @@ fn walk_inner(
     located: bool,
     cache: &CacheContext,
     reuse: UnitReuse,
+    mut on_ready: Option<&mut ReadyUnitHook<'_>>,
 ) -> PackageWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
@@ -2671,6 +2702,7 @@ fn walk_inner(
     let mut frontend_outcomes: HashMap<String, CacheOutcome> = HashMap::new();
     let mut unit_keys: HashMap<String, unit_cache::UnitKey> = HashMap::new();
     let mut replayed_diagnostics: HashMap<String, Vec<unit_cache::CachedDiagnostic>> = HashMap::new();
+    let mut ready_index = 0usize;
 
     for unit_path in &order {
         let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
@@ -2682,6 +2714,10 @@ fn walk_inner(
             .filter_map(|d| summaries.get(d).map(|s| (d.clone(), s.interface_hash)))
             .collect();
         dep_interface_hashes.push((unit_path.clone(), hset));
+        let hset = &dep_interface_hashes
+            .last()
+            .expect("the dependency-hash record was just appended")
+            .1;
 
         // ---- DIGEST path -------------------------------------------------------------------
         // Build this unit's persistent key from digests alone: no interface is rendered and no
@@ -2745,8 +2781,7 @@ fn walk_inner(
                         .insert(u.path.clone(), unit_cache::outcome(&u.path, true, None));
                     unit_keys.insert(u.path.clone(), key.clone());
                     summaries.insert(u.path.clone(), hit.summary.clone());
-                    mirs.insert(
-                        u.path.clone(),
+                    let pending =
                         PendingPerUnitArtifact {
                             summary: hit.summary,
                             body: UnitBody::Reused { link_libs: hit.entry.link_libs },
@@ -2754,7 +2789,14 @@ fn walk_inner(
                             static_descriptors: Vec::new(),
                             static_inputs,
                             static_artifacts: Vec::new(),
-                        },
+                        };
+                    store_ready_unit(
+                        &mut mirs,
+                        &mut ready_index,
+                        &u.path,
+                        hset,
+                        pending,
+                        &mut on_ready,
                     );
                     continue;
                 }
@@ -2906,8 +2948,7 @@ fn walk_inner(
                 );
             }
             summaries.insert(u.path.clone(), hit.summary.clone());
-            mirs.insert(
-                u.path.clone(),
+            let pending =
                 PendingPerUnitArtifact {
                     summary: hit.summary,
                     body: UnitBody::Lowered(hit.mir),
@@ -2915,7 +2956,14 @@ fn walk_inner(
                     static_descriptors: Vec::new(),
                     static_inputs: hit.static_inputs,
                     static_artifacts: Vec::new(),
-                },
+                };
+            store_ready_unit(
+                &mut mirs,
+                &mut ready_index,
+                &u.path,
+                hset,
+                pending,
+                &mut on_ready,
             );
             continue;
         }
@@ -3155,8 +3203,7 @@ fn walk_inner(
                     );
                 }
                 summaries.insert(u.path.clone(), s.clone());
-                mirs.insert(
-                    u.path.clone(),
+                let pending =
                     PendingPerUnitArtifact {
                         summary: s,
                         body: UnitBody::Lowered(mir),
@@ -3164,7 +3211,14 @@ fn walk_inner(
                         static_descriptors,
                         static_inputs: resolved.manifest,
                         static_artifacts,
-                    },
+                    };
+                store_ready_unit(
+                    &mut mirs,
+                    &mut ready_index,
+                    &u.path,
+                    hset,
+                    pending,
+                    &mut on_ready,
                 );
             }
         }
@@ -3298,6 +3352,30 @@ enum UnitBody {
     /// Served from the cache. The MIR is absent; the link libraries are not, because the link never
     /// needs MIR and they cannot be re-derived from the summary's capability set.
     Reused { link_libs: Vec<String> },
+    /// The pipelined package driver moved this unit's MIR into an owned codegen task. The link
+    /// libraries remain because final link order is derived from the DAG record, never from worker
+    /// completion order. This private state never escapes through `build_package`.
+    Consumed { link_libs: Vec<String> },
+}
+
+impl UnitBody {
+    fn link_libs(&self) -> &[String] {
+        match self {
+            UnitBody::Lowered(mir) => &mir.link_libs,
+            UnitBody::Reused { link_libs } | UnitBody::Consumed { link_libs } => link_libs,
+        }
+    }
+
+    fn take_lowered(&mut self) -> Option<MirProgram> {
+        let link_libs = match self {
+            UnitBody::Lowered(mir) => mir.link_libs.clone(),
+            UnitBody::Reused { .. } | UnitBody::Consumed { .. } => return None,
+        };
+        match std::mem::replace(self, UnitBody::Consumed { link_libs }) {
+            UnitBody::Lowered(mir) => Some(mir),
+            UnitBody::Reused { .. } | UnitBody::Consumed { .. } => None,
+        }
+    }
 }
 
 /// One unit as the shared walk produces it, before it is projected into either public shape.
@@ -3354,6 +3432,17 @@ impl PackageWalk {
                     );
                     None
                 }
+                UnitBody::Consumed { .. } => {
+                    diags.error(
+                        format!(
+                            "internal error: unit `{}` was consumed by package codegen on a walk \
+                             that requires MIR — report this",
+                            unit.unit
+                        ),
+                        align_span::Span::new(0, 0, 0),
+                    );
+                    None
+                }
             })
             .collect();
         PerUnitWalk { units, dep_interface_hashes, diags }
@@ -3364,10 +3453,7 @@ impl PackageWalk {
         let units = units
             .into_iter()
             .map(|unit| BuiltUnit {
-                link_libs: match &unit.body {
-                    UnitBody::Lowered(mir) => mir.link_libs.clone(),
-                    UnitBody::Reused { link_libs } => link_libs.clone(),
-                },
+                link_libs: unit.body.link_libs().to_vec(),
                 unit: unit.unit,
                 is_entry: unit.is_entry,
                 summary: unit.summary,
@@ -3410,7 +3496,7 @@ impl BuiltUnit {
     pub fn mir(&self) -> Option<&MirProgram> {
         match &self.body {
             UnitBody::Lowered(mir) => Some(mir),
-            UnitBody::Reused { .. } => None,
+            UnitBody::Reused { .. } | UnitBody::Consumed { .. } => None,
         }
     }
 }
@@ -3544,6 +3630,48 @@ pub enum PackageCodegenError {
     Failed(String),
 }
 
+/// One attempt at the ordinary non-ThinLTO package pipeline.
+///
+/// Failure variants deliberately expose no object path: their private staging directory has
+/// already been removed when the value is returned. Diagnostics always belong to the `SourceMap`
+/// passed to this attempt.
+pub enum PipelinedPackageBuild {
+    FrontendFailed {
+        diags: Diagnostics,
+    },
+    CodegenFailed {
+        diags: Diagnostics,
+        error: PackageCodegenError,
+    },
+    Complete(PipelinedPackageComplete),
+}
+
+/// A complete pipelined package. The private stage owns every object lent by [`PipelinedBuiltUnit`]
+/// and keeps it alive until the caller has finished linking.
+pub struct PipelinedPackageComplete {
+    pub units: Vec<PipelinedBuiltUnit>,
+    pub diags: Diagnostics,
+    pub codegen: UnitCodegen,
+    // Ownership is the read: dropping this field removes the objects after link. It is deliberately
+    // never otherwise inspected outside the in-module ownership tests.
+    #[allow(dead_code)]
+    object_stage: ArtifactStage,
+}
+
+/// The link-facing record for one complete unit, in bottom-up DAG order.
+pub struct PipelinedBuiltUnit {
+    pub unit: String,
+    pub link_libs: Vec<String>,
+    pub frontend: Option<CacheOutcome>,
+    object: std::path::PathBuf,
+}
+
+impl PipelinedBuiltUnit {
+    pub fn object(&self) -> &std::path::Path {
+        &self.object
+    }
+}
+
 impl std::fmt::Display for PackageCodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3581,8 +3709,13 @@ impl PackageBuild {
                     // Cannot occur: the arm above matched `Lowered` on the same index, and nothing
                     // between the two reads mutates `self`. Reported rather than panicked so a
                     // future refactor that breaks the pairing fails the build, not the process.
-                    UnitBody::Reused { .. } => Err(RehydrateFailure::Errors),
+                    UnitBody::Reused { .. } | UnitBody::Consumed { .. } => {
+                        Err(RehydrateFailure::Errors)
+                    }
                 };
+            }
+            Some(BuiltUnit { body: UnitBody::Consumed { .. }, .. }) => {
+                return Err(RehydrateFailure::Errors);
             }
             Some(unit) => unit.unit.clone(),
             // No such unit: nothing to materialize and nothing to invalidate.
@@ -3631,7 +3764,7 @@ impl PackageBuild {
         match &self.units[index].body {
             UnitBody::Lowered(mir) => Ok(mir),
             // Cannot occur: just assigned. Same fail-closed reasoning as above.
-            UnitBody::Reused { .. } => Err(RehydrateFailure::Errors),
+            UnitBody::Reused { .. } | UnitBody::Consumed { .. } => Err(RehydrateFailure::Errors),
         }
     }
 
@@ -3847,7 +3980,7 @@ pub fn build_package(
     cache: &CacheContext,
     reuse: UnitReuse,
 ) -> PackageBuild {
-    walk_inner(source_map, name, src, false, cache, reuse).into_package()
+    walk_inner(source_map, name, src, false, cache, reuse, None).into_package()
 }
 
 /// M15 S2b per-unit build with **source locations** — like [`build_per_unit`], but each unit's MIR is
@@ -4404,6 +4537,722 @@ struct StagedPgo {
     _guard: Option<StagedProfdata>,
 }
 
+struct PipelineTask {
+    index: usize,
+    unit: String,
+    mir: MirProgram,
+    object: std::path::PathBuf,
+    #[cfg(test)]
+    panic_before_emit: bool,
+}
+
+#[cfg(test)]
+static PIPELINE_POOLS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct PipelineQueueState {
+    tasks: std::collections::VecDeque<PipelineTask>,
+    results: Vec<(usize, Result<UnitPgoRun, String>)>,
+    in_flight: usize,
+    closed: bool,
+    cancelled: bool,
+}
+
+struct PipelineQueue {
+    state: std::sync::Mutex<PipelineQueueState>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Clone)]
+struct PipelineEmitConfig {
+    target: BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    pgo: PgoMode,
+}
+
+struct PipelineClaimGuard {
+    queue: std::sync::Arc<PipelineQueue>,
+}
+
+impl Drop for PipelineClaimGuard {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.in_flight > 0, "a claimed pipeline task must be in flight");
+        if state.in_flight > 0 {
+            state.in_flight -= 1;
+        }
+        if std::thread::panicking() {
+            state.cancelled = true;
+            state.tasks.clear();
+        }
+        self.queue.ready.notify_all();
+    }
+}
+
+struct PipelineWorkers {
+    queue: std::sync::Arc<PipelineQueue>,
+    config: PipelineEmitConfig,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl PipelineWorkers {
+    fn start(jobs: usize, config: PipelineEmitConfig) -> PipelineWorkers {
+        #[cfg(test)]
+        PIPELINE_POOLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let queue = std::sync::Arc::new(PipelineQueue {
+            state: std::sync::Mutex::new(PipelineQueueState {
+                tasks: std::collections::VecDeque::new(),
+                results: Vec::new(),
+                in_flight: 0,
+                closed: false,
+                cancelled: false,
+            }),
+            ready: std::sync::Condvar::new(),
+        });
+        let mut handles = Vec::with_capacity(jobs.saturating_sub(1));
+        for _ in 0..jobs.saturating_sub(1) {
+            let worker_queue = std::sync::Arc::clone(&queue);
+            let worker_config = config.clone();
+            handles.push(std::thread::spawn(move || pipeline_worker(worker_queue, &worker_config)));
+        }
+        PipelineWorkers { queue, config, handles }
+    }
+
+    fn enqueue(&self, task: PipelineTask) {
+        let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.cancelled {
+            state.tasks.push_back(task);
+            self.queue.ready.notify_one();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled
+    }
+
+    fn cancel(&self) {
+        let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        state.tasks.clear();
+        self.queue.ready.notify_all();
+    }
+
+    fn finish(mut self, coordinator_works: bool) -> Vec<(usize, Result<UnitPgoRun, String>)> {
+        {
+            let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            self.queue.ready.notify_all();
+        }
+        let coordinator_panic = if coordinator_works {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pipeline_worker(std::sync::Arc::clone(&self.queue), &self.config)
+            }))
+            .err()
+        } else {
+            None
+        };
+        let mut worker_panic = None;
+        for handle in self.handles.drain(..) {
+            if let Err(payload) = handle.join()
+                && worker_panic.is_none()
+            {
+                worker_panic = Some(payload);
+            }
+        }
+        if let Some(payload) = coordinator_panic.or(worker_panic) {
+            std::panic::resume_unwind(payload);
+        }
+        let mut state = self.queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut state.results)
+    }
+}
+
+fn pipeline_worker(queue: std::sync::Arc<PipelineQueue>, config: &PipelineEmitConfig) {
+    loop {
+        let task = {
+            let mut state = queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if state.cancelled {
+                    return;
+                }
+                if let Some(task) = state.tasks.pop_front() {
+                    state.in_flight += 1;
+                    break task;
+                }
+                if state.closed {
+                    return;
+                }
+                state = queue.ready.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        let _claim = PipelineClaimGuard { queue: std::sync::Arc::clone(&queue) };
+        #[cfg(test)]
+        if task.panic_before_emit {
+            panic!("injected pipeline worker panic");
+        }
+        let result = emit_unit_object(
+            &task.mir,
+            &task.object,
+            &config.target,
+            config.profile,
+            config.rt_lto,
+            &config.pgo,
+        )
+        .map_err(|error| format!("codegen failed for unit `{}`: {error}", task.unit));
+        let failed = result.is_err();
+        let mut state = queue.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.results.push((task.index, result));
+        if failed {
+            state.cancelled = true;
+            state.tasks.clear();
+            queue.ready.notify_all();
+        }
+        drop(state);
+        drop(_claim);
+    }
+}
+
+/// Build one ordinary non-ThinLTO package while ready-unit codegen overlaps the remaining serial
+/// frontend work. The CLI owns the one stale-entry retry so each attempt's diagnostics stay paired
+/// with the exact `SourceMap` that allocated their file ids.
+#[allow(clippy::too_many_arguments)]
+pub fn build_package_pipelined(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    cache: CacheContext,
+    reuse: UnitReuse,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+) -> PipelinedPackageBuild {
+    let jobs = jobs.max(1);
+
+    // Setup may execute before the walk to enable overlap, but its failure is retained until the
+    // complete frontend verdict is known. Each later setup phase is attempted only when the prior
+    // phase succeeded, preserving the public precedence and avoiding paths/workers without an owner.
+    let object_stage = ArtifactStage::temp("align-per-unit-obj")
+        .map_err(|error| format!("cannot create object staging directory: {error}"));
+    let staged_pgo = object_stage.as_ref().ok().map(|_| stage_pgo_shallow(pgo));
+    let target_init = staged_pgo
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|_| align_codegen_llvm::ensure_target_initialized().map_err(|error| error.to_string()));
+    let emit_config = target_init
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|_| staged_pgo.as_ref()?.as_ref().ok())
+        .map(|staged| PipelineEmitConfig {
+            target: target.clone(),
+            profile,
+            rt_lto,
+            pgo: staged.effective.clone(),
+        });
+
+    let mut keys: Vec<Option<CodegenKey>> = Vec::new();
+    let mut outcomes: Vec<Option<CacheOutcome>> = Vec::new();
+    let mut objects: Vec<std::path::PathBuf> = Vec::new();
+    let mut deferred: Vec<usize> = Vec::new();
+    let mut key_error: Option<String> = None;
+    let mut workers: Option<PipelineWorkers> = None;
+
+    let walk = {
+        let mut on_ready = |index: usize,
+                            unit: &str,
+                            dep_interface_hashes: &[(String, Hash128)],
+                            pending: &mut PendingPerUnitArtifact| {
+            debug_assert_eq!(
+                index,
+                objects.len(),
+                "ready-unit indices must be dense and DAG ordered"
+            );
+            let object = object_stage
+                .as_ref()
+                .ok()
+                .map(|stage| stage.path().join(format!("unit{index}.o")))
+                .unwrap_or_default();
+            objects.push(object.clone());
+            keys.push(None);
+            outcomes.push(None);
+
+            // Stage/PGO setup failures preclude every cache operation. A first key error likewise
+            // ends logical setup; the frontend itself continues so its diagnostics retain precedence.
+            if object_stage.is_err()
+                || staged_pgo.as_ref().is_some_and(Result::is_err)
+                || key_error.is_some()
+            {
+                return;
+            }
+            let pgo_key = staged_pgo
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|staged| staged.key)
+                .unwrap_or(cache::PgoKey::Off);
+            let key = if cache.is_enabled() {
+                match build_codegen_key(
+                    unit,
+                    pending.summary.impl_hash,
+                    dep_interface_hashes,
+                    target,
+                    profile,
+                    &[],
+                    rt_lto,
+                    pgo_key,
+                ) {
+                    Ok(key) => Some(key),
+                    Err(error) => {
+                        key_error = Some(error);
+                        if let Some(pool) = workers.as_ref() {
+                            pool.cancel();
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let lookup = match key.as_ref() {
+                Some(key) => cache.lookup(key, &object),
+                None => CacheLookup::Miss { reason: None },
+            };
+            keys[index] = key;
+            match lookup {
+                CacheLookup::Hit(outcome) => {
+                    outcomes[index] = Some(outcome);
+                    // A hit needs no MIR. Destructive extraction proves the pipeline never retains
+                    // a second owner while a miss task owns the same lowered program.
+                    let _ = pending.body.take_lowered();
+                }
+                CacheLookup::Miss { reason } => {
+                    outcomes[index] = Some(CacheOutcome {
+                        stage: CacheStage::Codegen,
+                        unit: unit.to_string(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
+                    if matches!(pending.body, UnitBody::Reused { .. }) {
+                        deferred.push(index);
+                        return;
+                    }
+                    // A target-init error is selected only after stale-entry validation, but it
+                    // must prevent workers from entering LLVM. Keep the MIR in the package until
+                    // that error is returned.
+                    let Some(config) = emit_config.as_ref() else {
+                        return;
+                    };
+                    if workers.is_none() {
+                        workers = Some(PipelineWorkers::start(jobs, config.clone()));
+                    }
+                    if workers.as_ref().is_some_and(PipelineWorkers::is_cancelled) {
+                        let _ = pending.body.take_lowered();
+                        return;
+                    }
+                    if let Some(mir) = pending.body.take_lowered() {
+                        workers.as_ref().expect("pipeline workers just started").enqueue(
+                            PipelineTask {
+                                index,
+                                unit: unit.to_string(),
+                                mir,
+                                object,
+                                #[cfg(test)]
+                                panic_before_emit: false,
+                            },
+                        );
+                    }
+                }
+            }
+        };
+        walk_inner(source_map, name, src, false, &cache, reuse, Some(&mut on_ready))
+    };
+    let mut build = walk.into_package();
+
+    if build.diags.has_errors() {
+        if let Some(pool) = workers.take() {
+            pool.cancel();
+            let _ = pool.finish(false);
+        }
+        return PipelinedPackageBuild::FrontendFailed { diags: build.diags };
+    }
+    if build.units.is_empty() {
+        if let Some(pool) = workers.take() {
+            pool.cancel();
+            let _ = pool.finish(false);
+        }
+        return PipelinedPackageBuild::CodegenFailed {
+            diags: build.diags,
+            error: PackageCodegenError::Failed("no units to build".to_string()),
+        };
+    }
+
+    let stage = match object_stage {
+        Ok(stage) => stage,
+        Err(error) => {
+            return PipelinedPackageBuild::CodegenFailed {
+                diags: build.diags,
+                error: PackageCodegenError::Failed(error),
+            };
+        }
+    };
+    let staged = match staged_pgo.expect("PGO setup exists when the object stage exists") {
+        Ok(staged) => staged,
+        Err(error) => {
+            return PipelinedPackageBuild::CodegenFailed {
+                diags: build.diags,
+                error: PackageCodegenError::Failed(error),
+            };
+        }
+    };
+    if let Some(error) = key_error {
+        if let Some(pool) = workers.take() {
+            pool.cancel();
+            let _ = pool.finish(false);
+        }
+        return PipelinedPackageBuild::CodegenFailed {
+            diags: build.diags,
+            error: PackageCodegenError::Failed(error),
+        };
+    }
+
+    // Reused frontend misses are recomputed serially in DAG order. This remains mandatory after a
+    // speculative worker error because a stale entry has higher observable precedence.
+    for index in deferred {
+        let unit = build.units[index].unit.clone();
+        if let Err(failure) = build.materialize(index) {
+            if let Some(pool) = workers.take() {
+                pool.cancel();
+                let _ = pool.finish(false);
+            }
+            return PipelinedPackageBuild::CodegenFailed {
+                diags: build.diags,
+                error: PackageCodegenError::StaleCacheEntry { unit, failure },
+            };
+        }
+        if target_init.as_ref().is_some_and(Result::is_err) {
+            continue;
+        }
+        if workers.as_ref().is_some_and(PipelineWorkers::is_cancelled) {
+            let _ = build.units[index].body.take_lowered();
+            continue;
+        }
+        if workers.is_none() {
+            workers = Some(PipelineWorkers::start(
+                jobs,
+                PipelineEmitConfig {
+                    target: target.clone(),
+                    profile,
+                    rt_lto,
+                    pgo: staged.effective.clone(),
+                },
+            ));
+        }
+        if let Some(mir) = build.units[index].body.take_lowered() {
+            workers.as_ref().expect("pipeline workers just started").enqueue(PipelineTask {
+                index,
+                unit,
+                mir,
+                object: objects[index].clone(),
+                #[cfg(test)]
+                panic_before_emit: false,
+            });
+        }
+    }
+
+    if let Some(Err(error)) = target_init {
+        if let Some(pool) = workers.take() {
+            pool.cancel();
+            let _ = pool.finish(false);
+        }
+        return PipelinedPackageBuild::CodegenFailed {
+            diags: build.diags,
+            error: PackageCodegenError::Failed(error),
+        };
+    }
+
+    let mut runs = workers.take().map(|pool| pool.finish(true)).unwrap_or_default();
+    runs.sort_by_key(|(index, _)| *index);
+
+    // The validation commit has passed. Publish every successful claimed miss, even when a sibling
+    // failed, matching the existing two-phase driver's useful-sibling behavior.
+    for (index, result) in &runs {
+        if result.is_ok()
+            && let Some(key) = &keys[*index]
+        {
+            cache.publish_after_miss(key, &objects[*index]);
+        }
+    }
+    if let Some((_, Err(error))) = runs.iter().find(|(_, result)| result.is_err()) {
+        return PipelinedPackageBuild::CodegenFailed {
+            diags: build.diags,
+            error: PackageCodegenError::Failed(error.clone()),
+        };
+    }
+
+    let mut pgo_warnings = Vec::new();
+    let mut pgo_matched = 0;
+    let mut pgo_total = 0;
+    if matches!(staged.effective, PgoMode::Use(_)) {
+        for (_, result) in &runs {
+            if let Ok(run) = result {
+                pgo_warnings.extend(run.warnings.iter().cloned());
+                pgo_matched += run.matched_fns;
+                pgo_total += run.total_fns;
+            }
+        }
+    }
+    let codegen = UnitCodegen {
+        outcomes: outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every clean unit completes codegen lookup setup"))
+            .collect(),
+        pgo_warnings,
+        pgo_matched,
+        pgo_total,
+    };
+    let units = build
+        .units
+        .into_iter()
+        .zip(objects)
+        .map(|(unit, object)| PipelinedBuiltUnit {
+            unit: unit.unit,
+            link_libs: unit.link_libs,
+            frontend: unit.frontend,
+            object,
+        })
+        .collect();
+    PipelinedPackageBuild::Complete(PipelinedPackageComplete {
+        units,
+        diags: build.diags,
+        codegen,
+        object_stage: stage,
+    })
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn config() -> PipelineEmitConfig {
+        PipelineEmitConfig {
+            target: BuildTarget::Baseline,
+            profile: Profile::Dev,
+            rt_lto: false,
+            pgo: PgoMode::Off,
+        }
+    }
+
+    #[test]
+    fn job_budget_is_global() {
+        let _serial = serial();
+        for (jobs, background) in [(1usize, 0usize), (2, 1), (4, 3)] {
+            let pool = PipelineWorkers::start(jobs, config());
+            assert_eq!(pool.handles.len(), background, "coordinator occupies one of {jobs} jobs");
+            pool.cancel();
+            assert!(pool.finish(false).is_empty());
+        }
+    }
+
+    #[test]
+    fn panicking_worker_notifies_joins_then_resumes() {
+        let _serial = serial();
+        let stage = ArtifactStage::temp("align-pipeline-panic-test").expect("stage");
+        let pool = PipelineWorkers::start(2, config());
+        pool.enqueue(PipelineTask {
+            index: 0,
+            unit: "panic-owner".to_string(),
+            mir: MirProgram::default(),
+            object: stage.path().join("unit0.o"),
+            panic_before_emit: true,
+        });
+        let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.finish(true)));
+        assert!(resumed.is_err(), "the original worker panic must resume after every join");
+    }
+
+    #[test]
+    fn all_hit_starts_no_worker() {
+        let _serial = serial();
+        if !backend_available() {
+            return;
+        }
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "align-pipeline-all-hit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("project dir");
+        let entry = root.join("main.align");
+        let source = "fn main() {\n  print(1)\n}\n";
+        std::fs::write(&entry, source).expect("entry source");
+        let cache_root = root.join("cache");
+        let run = || {
+            let mut source_map = SourceMap::new();
+            build_package_pipelined(
+                &mut source_map,
+                entry.to_str().expect("utf-8 entry"),
+                source,
+                CacheContext::at(cache_root.clone()),
+                UnitReuse::Allowed,
+                &BuildTarget::Baseline,
+                Profile::Dev,
+                false,
+                4,
+                &PgoMode::Off,
+            )
+        };
+
+        PIPELINE_POOLS_STARTED.store(0, Ordering::Relaxed);
+        assert!(matches!(run(), PipelinedPackageBuild::Complete(_)));
+        let after_cold = PIPELINE_POOLS_STARTED.load(Ordering::Relaxed);
+        assert_eq!(after_cold, 1, "a cold object miss starts one pool");
+        assert!(matches!(run(), PipelinedPackageBuild::Complete(_)));
+        assert_eq!(
+            PIPELINE_POOLS_STARTED.load(Ordering::Relaxed),
+            after_cold,
+            "an all-object-hit build must create no pool or worker"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ready_seam_preserves_per_unit_projection() {
+        let _serial = serial();
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "align-ready-per-unit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("project dir");
+        std::fs::write(root.join("dep.align"), "module dep\npub fn value() -> i64 = 4\n")
+            .expect("dependency");
+        let entry = root.join("main.align");
+        let source = "import dep\nfn main() {\n  print(dep.value())\n}\n";
+        std::fs::write(&entry, source).expect("entry");
+        let name = entry.to_str().expect("utf-8 entry");
+
+        let mut expected_map = SourceMap::new();
+        let expected = build_per_unit(&mut expected_map, name, source);
+        let mut actual_map = SourceMap::new();
+        let mut noop = |_: usize,
+                        _: &str,
+                        _: &[(String, Hash128)],
+                        _: &mut PendingPerUnitArtifact| {};
+        let actual = walk_inner(
+            &mut actual_map,
+            name,
+            source,
+            false,
+            &CacheContext::Disabled,
+            UnitReuse::Forbidden,
+            Some(&mut noop),
+        )
+        .into_per_unit();
+        assert_eq!(
+            format_diagnostics(&expected_map, &expected.diags),
+            format_diagnostics(&actual_map, &actual.diags)
+        );
+        assert_eq!(expected.dep_interface_hashes, actual.dep_interface_hashes);
+        assert_eq!(expected.units.len(), actual.units.len());
+        for (expected, actual) in expected.units.iter().zip(&actual.units) {
+            assert_eq!(expected.unit, actual.unit);
+            assert_eq!(expected.is_entry, actual.is_entry);
+            assert_eq!(
+                align_mir::print::program_to_string(&expected.mir),
+                align_mir::print::program_to_string(&actual.mir)
+            );
+            assert_eq!(
+                align_interface::serialize(&expected.summary),
+                align_interface::serialize(&actual.summary)
+            );
+            assert_eq!(expected.dep_interface_hashes, actual.dep_interface_hashes);
+            assert_eq!(expected.file, actual.file);
+            assert_eq!(expected.static_descriptors, actual.static_descriptors);
+            assert_eq!(expected.static_inputs, actual.static_inputs);
+            assert_eq!(expected.static_artifacts, actual.static_artifacts);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ready_seam_preserves_package_projection() {
+        let _serial = serial();
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "align-ready-package-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("project dir");
+        std::fs::write(root.join("dep.align"), "module dep\npub fn value() -> i64 = 4\n")
+            .expect("dependency");
+        let entry = root.join("main.align");
+        let source = "import dep\nfn main() {\n  print(dep.value())\n}\n";
+        std::fs::write(&entry, source).expect("entry");
+        let name = entry.to_str().expect("utf-8 entry");
+
+        let mut expected_map = SourceMap::new();
+        let expected = build_package(
+            &mut expected_map,
+            name,
+            source,
+            &CacheContext::Disabled,
+            UnitReuse::Forbidden,
+        );
+        let mut actual_map = SourceMap::new();
+        let mut noop = |_: usize,
+                        _: &str,
+                        _: &[(String, Hash128)],
+                        _: &mut PendingPerUnitArtifact| {};
+        let actual = walk_inner(
+            &mut actual_map,
+            name,
+            source,
+            false,
+            &CacheContext::Disabled,
+            UnitReuse::Forbidden,
+            Some(&mut noop),
+        )
+        .into_package();
+        assert_eq!(
+            format_diagnostics(&expected_map, &expected.diags),
+            format_diagnostics(&actual_map, &actual.diags)
+        );
+        assert_eq!(expected.units.len(), actual.units.len());
+        for (expected, actual) in expected.units.iter().zip(&actual.units) {
+            assert_eq!(expected.unit, actual.unit);
+            assert_eq!(expected.is_entry, actual.is_entry);
+            assert_eq!(
+                align_interface::serialize(&expected.summary),
+                align_interface::serialize(&actual.summary)
+            );
+            assert_eq!(expected.dep_interface_hashes, actual.dep_interface_hashes);
+            assert_eq!(expected.link_libs, actual.link_libs);
+            assert_eq!(expected.static_inputs, actual.static_inputs);
+            assert_eq!(expected.frontend, actual.frontend);
+            assert_eq!(expected.is_reused(), actual.is_reused());
+            assert_eq!(
+                expected.mir().map(align_mir::print::program_to_string),
+                actual.mir().map(align_mir::print::program_to_string)
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 /// Read, digest, and snapshot a `--pgo-use` profile — see the note in [`codegen_produce_phase`].
 fn stage_pgo(pgo: &PgoMode) -> Result<StagedPgo, String> {
     match pgo {
@@ -4414,9 +5263,32 @@ fn stage_pgo(pgo: &PgoMode) -> Result<StagedPgo, String> {
             _guard: None,
         }),
         PgoMode::Use(path) => {
-            let bytes = std::fs::read(path).map_err(|e| {
-                format!("--pgo-use: cannot read profile data file '{}': {e}", path.display())
+            let bytes = std::fs::read(path).map_err(|error| {
+                format!(
+                    "--pgo-use: cannot read profile data file '{}': {error}",
+                    path.display()
+                )
             })?;
+            let digest = Hash128::of(&bytes);
+            let staged = StagedProfdata::new(&bytes)?;
+            let staged_path = staged.path().to_path_buf();
+            Ok(StagedPgo {
+                key: cache::PgoKey::Use(digest),
+                effective: PgoMode::Use(staged_path),
+                _guard: Some(staged),
+            })
+        }
+    }
+}
+
+/// Pipelined-path PGO setup: shallow validation and the snapshot digest consume the same single
+/// read, so a concurrent rewrite cannot separate the cache key from libLLVM's bytes.
+fn stage_pgo_shallow(pgo: &PgoMode) -> Result<StagedPgo, String> {
+    match pgo {
+        PgoMode::Off => stage_pgo(pgo),
+        PgoMode::Instrument => stage_pgo(pgo),
+        PgoMode::Use(path) => {
+            let bytes = read_and_validate_profdata(path)?;
             let digest = Hash128::of(&bytes);
             let staged = StagedProfdata::new(&bytes)?;
             let staged_path = staged.path().to_path_buf();
@@ -4700,27 +5572,43 @@ impl PgoMode {
 /// guiding the user to run `merge` first.
 pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     use std::io::Read;
-    // The exact on-disk header of a merged indexed `.profdata` on our little-endian targets, and its
-    // byte-reversed form (what a hypothetical big-endian producer would write) — both accepted so the
-    // check is endianness-robust. `MAGIC` is the empirically-verified on-disk order.
-    const MAGIC: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
-    const MAGIC_SWAPPED: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
     if !path.exists() {
         return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
     }
     if !path.is_file() {
         return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
     }
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
     let mut head = [0u8; 8];
-    let n = f
+    let read = file
         .read(&mut head)
+        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
+    validate_profdata_header(path, &head[..read])
+}
+
+/// Read a profile exactly once after the public path-shape checks and validate only the indexed
+/// profile header. Deeper format/version validation remains libLLVM's job on a cache miss.
+fn read_and_validate_profdata(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    if !path.exists() {
+        return Err(format!("--pgo-use: profile data file '{}' does not exist", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
+    }
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("--pgo-use: cannot read profile data file '{}': {e}", path.display()))?;
-    if n == 0 {
+    validate_profdata_header(path, &bytes)?;
+    Ok(bytes)
+}
+
+fn validate_profdata_header(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    const MAGIC: [u8; 8] = [0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81];
+    const MAGIC_SWAPPED: [u8; 8] = [0x81, 0x69, 0x66, 0x6f, 0x72, 0x70, 0x6c, 0xff];
+    if bytes.is_empty() {
         return Err(format!("--pgo-use: profile data file '{}' is empty", path.display()));
     }
-    if n < 8 || (head != MAGIC && head != MAGIC_SWAPPED) {
+    if bytes.len() < 8 || (bytes[..8] != MAGIC && bytes[..8] != MAGIC_SWAPPED) {
         return Err(format!(
             "--pgo-use: '{}' is not a valid LLVM indexed profile data file (bad magic); \
              merge your `.profraw` first: `llvm-profdata-22 merge -o out.profdata <raw>`",
