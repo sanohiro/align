@@ -19,7 +19,7 @@ Order is priority.
 | 1 | Persistent unit cache v1 | Shipped — in-process memo #757 (`docs/impl/10-cache-first-optimization.md` §6.6) and the persistent per-unit frontend cache #761 (§6.7, Slice C3) |
 | 2 | lld linking on ELF | Shipped as #763 — see below |
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
-| 3 | Pipelined compilation | Design proposed below; implementation is next. Start a dependent unit's frontend as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget |
+| 3 | Pipelined compilation | Design recorded below; implementation is next. Start a dependent unit's frontend as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
@@ -82,11 +82,15 @@ order. `codegen` is `None` exactly when frontend diagnostics contain an error;
 otherwise it is the result of the same codegen contract used today. The object
 paths are process-private `unit<N>.o` files under `object_stage`; the caller
 still performs the deterministic library union, link, and same-directory
-atomic executable publication. Every owned value lives until the returned
-record or the worker consuming it is dropped. MIR moves into a work item; it is
-never cloned to cross the stage boundary. Allocation is the work queue, result
-slots, and at most `jobs - 1` background thread stacks, replacing the existing
-post-frontend worker allocation rather than adding another pool.
+atomic executable publication. `object_stage` is borrowed only while the
+function creates and writes paths; `PipelinedPackageBuild` deliberately does
+not own it. The CLI-owned `ArtifactStage` outlives the returned paths through
+the final link and is dropped on every command exit, after the paths' last use.
+Every other owned value lives until the returned record or the worker consuming
+it is dropped. MIR moves into a work item; it is never cloned to cross the stage
+boundary. Allocation is the work queue, result slots, and at most `jobs - 1`
+background thread stacks, replacing the existing post-frontend worker
+allocation rather than adding another pool.
 
 The persisted frontend and object caches keep their formats and structural
 keys. A cache hit still materializes the exact CAS bytes into its private object
@@ -179,10 +183,21 @@ existing single whole-package retry with `UnitReuse::Forbidden` and a fresh
 `SourceMap` and object stage. The retry cannot rehydrate and therefore cannot
 loop.
 
-Dropping any outcome closes the queue, joins every worker, removes the private
-stage through its existing RAII owner, and drops the PGO snapshot after the
-last LLVM consumer. There is no detached compiler work after the command
-returns.
+An LLVM emitter panic is caught outside every shared queue/result lock. A
+per-claim RAII guard decrements the in-flight count and notifies the condition
+variable on success, ordinary error, or unwind. Panic records the deterministic
+codegen error `codegen worker panicked for unit \`<unit>\`` at that unit's DAG
+index, cancels new claims, and participates in the same lowest-index codegen
+failure rule; `alignc` never unwinds for it. Background workers and the
+coordinator's final-worker path use the same guarded task runner.
+
+Before `build_package_pipelined` returns on any outcome it closes the queue,
+joins every background worker, and drops the PGO snapshot after the last LLVM
+consumer. The caller-owned `ArtifactStage` remains alive across a successful
+return so linking can read the objects, then its existing RAII Drop removes the
+stage. On every early command return the same caller scope drops it. There is no
+detached compiler work after the function returns and no temporary stage after
+the command returns.
 
 ### Scope
 
@@ -221,8 +236,8 @@ several rows when it discriminates every listed state.
 | PL5 | cache-state product | frontend hit/miss × object hit/miss selects no-rehydrate, enqueue-lowered, or deferred-rehydrate exactly once | `pipelined_compilation::cache_product_selects_exact_work` |
 | PL6 | rehydration | deferred misses rehydrate serially in DAG order; every existing identity component is checked; first mismatch unlinks and retries the complete package once | `pipelined_compilation::stale_entries_retry_once_after_speculative_work`, reusing the `unit_cache` tamper fixtures |
 | PL7 | diagnostics | warnings and errors are byte-identical and DAG-ordered; later codegen failure never hides or truncates frontend diagnostics | `pipelined_compilation::frontend_diagnostics_precede_speculative_codegen_failures` |
-| PL8 | failure precedence | setup precedes stale-entry, stale-entry precedes codegen, lowest claimed DAG-index codegen error wins, link remains last | `pipeline_tests::failure_precedence_is_deterministic` |
-| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, codegen failure, and normal return all close the queue and join workers; no task or temp stage survives | `pipeline_tests::every_exit_joins_workers` |
+| PL8 | failure precedence | setup precedes stale-entry, stale-entry precedes codegen, lowest claimed DAG-index ordinary error or panic wins, link remains last | `pipeline_tests::failure_precedence_is_deterministic` |
+| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; the PGO snapshot outlives LLVM but not the function; the caller-owned object stage outlives a successful function return through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_cancels_notifies_and_joins` |
 | PL10 | publication commit | no object miss publishes before frontend, lock, setup, and rehydration validation; after that point successful siblings publish despite a codegen sibling failure | `pipelined_compilation::object_publication_waits_for_validation_commit` |
 | PL11 | cache identity | keys, first-difference reasons, hit/miss outcomes, cache-off bypass, corruption recovery, and DAG-ordered stats equal the existing path | `pipelined_compilation::pipelined_cache_matches_two_phase_cache` |
 | PL12 | static descriptors | codegen may overlap static resolution only after that unit's MIR is fixed; lock-validation failure publishes neither object nor executable | `pipelined_compilation::metadata_race_publishes_nothing` |
@@ -234,6 +249,7 @@ several rows when it discriminates every listed state.
 | PL18 | malformed/error input | cyclic imports, parse/sema failure, rejected HIR lowering, invalid profile, and codegen refusal return diagnostics/errors rather than panic or partial executable | `pipelined_compilation::invalid_inputs_publish_no_executable` |
 | PL19 | worker-independent order | reversing completion order does not change units, outcomes, PGO report, chosen error, link inputs, or bytes | `pipeline_tests::reverse_completion_preserves_every_ordered_result` |
 | PL20 | performance promise | cold multi-unit build performs the same frontend and codegen counts and demonstrates actual stage overlap; wall time is lower under the same compiler/profile/cache state and `-j` budget | local `bench/build_pipeline/run.sh`, not CI |
+| PL21 | legacy library projections | the ready-unit seam preserves every `PerUnitArtifact` field (`unit`, `is_entry`, MIR, summary bytes, dependency hashes, file, static descriptors, static inputs, static artifacts), every `BuiltUnit` field (`unit`, `is_entry`, summary bytes, dependency hashes, link libraries, static inputs, frontend outcome), package diagnostics, reuse state, and materialization result | mutation-verified `pipeline_tests::ready_seam_preserves_per_unit_projection` and `pipeline_tests::ready_seam_preserves_package_projection`, over cold, frontend-hit, and rehydrated units |
 
 Before review, the implementation author maps every applicable row to the
 ready-unit producer, coordinator, worker, publication step, and a regression.
