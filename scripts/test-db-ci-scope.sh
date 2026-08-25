@@ -55,12 +55,41 @@ db_source="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$unusual" "$db_source"
 
 # Removing the last visible DB marker still qualifies because the base content
-# participates in classification.
+# remains in the deletion hunk.
 printf 'pub fn ordinary_again() {}\n' > "$fixture/crates/demo/src/lib.rs"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm remove-db-source
 db_source_removed="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$db_source" "$db_source_removed"
+
+# A monolithic source file can contain DB-specific and unrelated functions. An
+# unrelated function edit must not inherit the unchanged marker elsewhere in
+# the file, while a body-only edit inside the DB function is owned through the
+# zero-context hunk's function header.
+printf 'fn postgres_owner() {\n  let version = 1;\n}\n\nfn ordinary() {\n  let value = 1;\n}\n' \
+  > "$fixture/crates/demo/src/lib.rs"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm monolithic-source
+monolithic_source="$(git -C "$fixture" rev-parse HEAD)"
+
+sed -i.bak 's/let value = 1/let value = 2/' "$fixture/crates/demo/src/lib.rs"
+rm "$fixture/crates/demo/src/lib.rs.bak"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm unrelated-monolithic-function
+unrelated_monolithic="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$monolithic_source" "$unrelated_monolithic"
+
+sed -i.bak 's/let version = 1/let version = 2/' "$fixture/crates/demo/src/lib.rs"
+rm "$fixture/crates/demo/src/lib.rs.bak"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm database-monolithic-function
+database_monolithic="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$unrelated_monolithic" "$database_monolithic"
+
+git -C "$fixture" mv crates/demo/src/lib.rs crates/demo/src/renamed.rs
+git -C "$fixture" commit -qm rename-database-source
+renamed_database_source="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$database_monolithic" "$renamed_database_source"
 
 # Shared owner infrastructure reaches every pkg.db suite even when its own text
 # does not name a database.
@@ -68,7 +97,7 @@ printf 'pub fn shared_fixture() {}\n' > "$fixture/crates/demo/tests/common/mod.r
 git -C "$fixture" add .
 git -C "$fixture" commit -qm shared-test-harness
 shared_harness="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$db_source_removed" "$shared_harness"
+assert_scope true "$renamed_database_source" "$shared_harness"
 
 # A non-pkg_db owner test that directly names the boundary is also classified
 # by content.

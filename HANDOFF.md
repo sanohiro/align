@@ -338,9 +338,12 @@ facts must live in this repository.
   instrumented PGO, and `ld.lld` linking on ELF are complete. The roadmap
   retains the implementation evidence; it is not the live backlog. The dedicated
   build-performance track is `docs/impl/21-build-perf-plan.md`: items 1, 2, and
-  2a are shipped; item 3's ordinary non-ThinLTO pipeline is implemented and
-  locally measured at a 12.48 s to 10.15 s median reduction on the 14-unit
-  cache-off corpus with identical output. Prebuilt cache distribution,
+  2a are shipped; item 3's ordinary non-ThinLTO pipeline is merged by #884 and
+  locally measured at a 12.51 s to 10.11 s median reduction on the 14-unit
+  cache-off corpus with identical output. Item 2b narrows service provisioning
+  to direct DB/gate paths or changed compiler hunks that name the boundary, so
+  an unrelated function in a monolithic source no longer inherits dormant DB
+  markers elsewhere in that file. Prebuilt cache distribution,
   residency, and function-level incrementality are the remaining items 4-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed

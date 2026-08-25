@@ -19,7 +19,8 @@ Order is priority.
 | 1 | Persistent unit cache v1 | Shipped — in-process memo #757 (`docs/impl/10-cache-first-optimization.md` §6.6) and the persistent per-unit frontend cache #761 (§6.7, Slice C3) |
 | 2 | lld linking on ELF | Shipped as #763 — see below |
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
-| 3 | Pipelined compilation | Implemented. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
+| 2b | DB CI changed-function scope | Implemented — direct DB/gate paths remain unconditional, while other compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
+| 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
@@ -416,6 +417,25 @@ set, rejects duplicate membership, pins every matrix name, and proves unknown
 shards fail closed. `scripts/run-gate-binaries.sh` separately rejects a missing
 or extra Cargo artifact inside each shard. The required result aggregates the
 matrix job, so one cancelled, failed, missing, or timed-out shard is red.
+
+## Item 2b: DB CI changed-function scope
+
+The database scope classifier keeps dependency, workflow, shared harness,
+`apps/db`, and `pkg_db_*` owner paths unconditional. For other compiler source
+files it inspects only the zero-context changed hunks, including Git's nearest
+function header, instead of searching the complete base and head files. A
+body-only edit inside a PostgreSQL-named function therefore provisions the
+service, as do additions, deletions, and renamed DB sources, while an unrelated
+function in a monolithic file no longer inherits a dormant `pkg.db` marker
+elsewhere in that file. Unreadable ranges still fail closed.
+
+The direct regression is #884: its pipeline-only changes to
+`crates/align_driver/src/lib.rs` previously classified as `database-source`
+because unchanged DB code shares that file, starting four service shards whose
+longest took 15:35. The changed-hunk classifier returns
+`required=false` for that exact implementation range. Synthetic owners pin
+both directions in one monolithic source: an unrelated function edit skips,
+and a marker-free body edit under `fn postgres_owner` provisions PostgreSQL.
 
 ## Item 2: lld linking on ELF
 
