@@ -55,7 +55,6 @@ pub fn build_package_pipelined(
     src: &str,
     cache: CacheContext,
     reuse: UnitReuse,
-    object_stage: &Path,
     target: &BuildTarget,
     profile: Profile,
     rt_lto: bool,
@@ -63,34 +62,62 @@ pub fn build_package_pipelined(
     pgo: &PgoMode,
 ) -> PipelinedPackageBuild
 
-pub struct PipelinedPackageBuild {
+pub enum PipelinedPackageBuild {
+    FrontendFailed {
+        diags: Diagnostics,
+    },
+    CodegenFailed {
+        diags: Diagnostics,
+        error: PackageCodegenError,
+    },
+    Complete(PipelinedPackageComplete),
+}
+
+pub struct PipelinedPackageComplete {
     pub units: Vec<PipelinedBuiltUnit>,
     pub diags: Diagnostics,
-    pub codegen: Option<Result<UnitCodegen, PackageCodegenError>>,
+    pub codegen: UnitCodegen,
+    object_stage: ArtifactStage,
 }
 
 pub struct PipelinedBuiltUnit {
     pub unit: String,
     pub link_libs: Vec<String>,
-    pub object: PathBuf,
     pub frontend: Option<CacheOutcome>,
+    object: PathBuf,
+}
+
+impl PipelinedBuiltUnit {
+    pub fn object(&self) -> &Path {
+        &self.object
+    }
 }
 ```
 
-`units` and every nested result use bottom-up DAG order, never completion
-order. `codegen` is `None` exactly when frontend diagnostics contain an error;
-otherwise it is the result of the same codegen contract used today. The object
-paths are process-private `unit<N>.o` files under `object_stage`; the caller
-still performs the deterministic library union, link, and same-directory
-atomic executable publication. `object_stage` is borrowed only while the
-function creates and writes paths; `PipelinedPackageBuild` deliberately does
-not own it. The CLI-owned `ArtifactStage` outlives the returned paths through
-the final link and is dropped on every command exit, after the paths' last use.
+`FrontendFailed` is present exactly when `diags.has_errors()` after the complete
+walk; it exposes no unit or object record. `CodegenFailed` carries clean-or-
+warning diagnostics plus the setup, stale-entry, worker, or codegen error; it
+also exposes no unit or object record. `Complete` is the only variant carrying
+units. Its units and codegen results use bottom-up DAG order, never completion
+order, and every `object()` denotes a complete object while the enclosing
+`PipelinedPackageComplete` remains alive.
+
+The function creates one `ArtifactStage::temp("align-per-unit-obj")` itself.
+Atomic unique-directory creation is the exclusive claim; neither a caller nor a
+concurrent build can supply or share its `unit<N>.o` namespace. A stage-creation
+error is held until the frontend finishes and becomes `CodegenFailed` only if
+the frontend is clean. On either failure variant the local stage is dropped
+before return and no path escapes. On success it moves into the complete record
+as the private `object_stage` owner. The caller retains that record through the
+deterministic library union, link, and same-directory atomic executable
+publication; dropping it after the link removes the stage. Copying a path out
+of `object()` does not extend its validity beyond the complete record.
+
 Every other owned value lives until the returned record or the worker consuming
 it is dropped. MIR moves into a work item; it is never cloned to cross the stage
-boundary. Allocation is the work queue, result slots, and at most `jobs - 1`
-background thread stacks, replacing the existing post-frontend worker
-allocation rather than adding another pool.
+boundary. Allocation is the unique stage, work queue, result slots, and at most
+`jobs - 1` background thread stacks, replacing the existing post-frontend
+stage/pool allocation rather than adding a second one.
 
 The persisted frontend and object caches keep their formats and structural
 keys. A cache hit still materializes the exact CAS bytes into its private object
@@ -180,8 +207,8 @@ If the frontend is clean, every deferred rehydration still runs before a
 speculative codegen error can be returned; a mismatch invalidates the entry,
 cancels the queue, publishes no speculative object miss, and triggers the
 existing single whole-package retry with `UnitReuse::Forbidden` and a fresh
-`SourceMap` and object stage. The retry cannot rehydrate and therefore cannot
-loop.
+`SourceMap`; the recursive invocation claims a new unique object stage. The
+retry cannot rehydrate and therefore cannot loop.
 
 An LLVM emitter panic is caught outside every shared queue/result lock. A
 per-claim RAII guard decrements the in-flight count and notifies the condition
@@ -193,9 +220,9 @@ coordinator's final-worker path use the same guarded task runner.
 
 Before `build_package_pipelined` returns on any outcome it closes the queue,
 joins every background worker, and drops the PGO snapshot after the last LLVM
-consumer. The caller-owned `ArtifactStage` remains alive across a successful
-return so linking can read the objects, then its existing RAII Drop removes the
-stage. On every early command return the same caller scope drops it. There is no
+consumer. A failure drops the function-owned `ArtifactStage` before returning;
+a success moves it into `PipelinedPackageComplete`, which remains alive while
+linking reads the objects and then removes the stage on Drop. There is no
 detached compiler work after the function returns and no temporary stage after
 the command returns.
 
@@ -213,6 +240,15 @@ coordinator is the only useful owner of the ready-unit producer seam, while the
 publication commit and retry rules jointly span both. Splitting the producer,
 queue, or CLI consumer would land dormant machinery and duplicate the same
 ordering and cleanup proof without isolating a usable failure domain.
+
+**Closure matrix reopened — `exclusive-artifact-ownership`.** The first API
+candidate borrowed an arbitrary directory and returned public paths on both
+success and failure. That missed the concurrency invariant: two callers can
+borrow the same path, overwrite each other's deterministic `unit<N>.o`, and
+publish the wrong bytes under a valid cache key. It also made partial paths
+look consumable. The owning-result boundary above replaces that strategy: the
+function alone claims the unique stage, failure variants expose no paths, and
+only a complete result owns and lends usable object paths through link.
 
 `check`, `check-per-unit`, `emit-mir`, `emit-llvm`, `emit-obj`, `explain-opt`,
 and export-root tooling retain their existing serial or two-phase paths.
@@ -237,7 +273,7 @@ several rows when it discriminates every listed state.
 | PL6 | rehydration | deferred misses rehydrate serially in DAG order; every existing identity component is checked; first mismatch unlinks and retries the complete package once | `pipelined_compilation::stale_entries_retry_once_after_speculative_work`, reusing the `unit_cache` tamper fixtures |
 | PL7 | diagnostics | warnings and errors are byte-identical and DAG-ordered; later codegen failure never hides or truncates frontend diagnostics | `pipelined_compilation::frontend_diagnostics_precede_speculative_codegen_failures` |
 | PL8 | failure precedence | setup precedes stale-entry, stale-entry precedes codegen, lowest claimed DAG-index ordinary error or panic wins, link remains last | `pipeline_tests::failure_precedence_is_deterministic` |
-| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; the PGO snapshot outlives LLVM but not the function; the caller-owned object stage outlives a successful function return through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_cancels_notifies_and_joins` |
+| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; the PGO snapshot outlives LLVM but not the function; a failed build drops its unique stage before return, while a complete result owns its stage through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_cancels_notifies_and_joins` |
 | PL10 | publication commit | no object miss publishes before frontend, lock, setup, and rehydration validation; after that point successful siblings publish despite a codegen sibling failure | `pipelined_compilation::object_publication_waits_for_validation_commit` |
 | PL11 | cache identity | keys, first-difference reasons, hit/miss outcomes, cache-off bypass, corruption recovery, and DAG-ordered stats equal the existing path | `pipelined_compilation::pipelined_cache_matches_two_phase_cache` |
 | PL12 | static descriptors | codegen may overlap static resolution only after that unit's MIR is fixed; lock-validation failure publishes neither object nor executable | `pipelined_compilation::metadata_race_publishes_nothing` |
@@ -250,6 +286,7 @@ several rows when it discriminates every listed state.
 | PL19 | worker-independent order | reversing completion order does not change units, outcomes, PGO report, chosen error, link inputs, or bytes | `pipeline_tests::reverse_completion_preserves_every_ordered_result` |
 | PL20 | performance promise | cold multi-unit build performs the same frontend and codegen counts and demonstrates actual stage overlap; wall time is lower under the same compiler/profile/cache state and `-j` budget | local `bench/build_pipeline/run.sh`, not CI |
 | PL21 | legacy library projections | the ready-unit seam preserves every `PerUnitArtifact` field (`unit`, `is_entry`, MIR, summary bytes, dependency hashes, file, static descriptors, static inputs, static artifacts), every `BuiltUnit` field (`unit`, `is_entry`, summary bytes, dependency hashes, link libraries, static inputs, frontend outcome), package diagnostics, reuse state, and materialization result | mutation-verified `pipeline_tests::ready_seam_preserves_per_unit_projection` and `pipeline_tests::ready_seam_preserves_package_projection`, over cold, frontend-hit, and rehydrated units |
+| PL22 | exclusive artifact availability | concurrent invocations always claim distinct stage directories; failure variants expose no unit/path and remove their stage; complete paths all exist, are immutable for their record lifetime, cannot be overwritten by a sibling build, and disappear only after the complete record drops following link | `pipeline_tests::concurrent_pipelines_own_distinct_stages` and `pipeline_tests::only_complete_results_lend_objects` |
 
 Before review, the implementation author maps every applicable row to the
 ready-unit producer, coordinator, worker, publication step, and a regression.
