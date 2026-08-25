@@ -47,6 +47,8 @@ jobs:
         run: |
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             printf 'required=true\nreason=manual-dispatch\n' >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$BASE_REF" != main ]; then
+            printf 'required=true\nreason=non-main-base\n' >> "$GITHUB_OUTPUT"
           elif [ "$GITHUB_EVENT_NAME" = push ] && gh api \
                  "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" | \
                  jq -e --arg head "$HEAD_SHA" --arg base "$GITHUB_REF_NAME" \
@@ -59,7 +61,7 @@ jobs:
           else
             if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
               BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-              TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"
+              TRUSTED_TIP="$(git rev-parse refs/remotes/origin/main)"
             else
               # A direct push is classified by machinery from the preceding
               # protected main revision, never by code introduced by the push.
@@ -87,9 +89,14 @@ jobs:
         run: |
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             printf 'required=true\nreason=non-pull-request\n' >> "$GITHUB_OUTPUT"
+          elif [ "$BASE_REF" != main ]; then
+            # A stacked PR's base branch is author-controlled. Never source
+            # classifier code from it or let its child diff skip protected
+            # platform checks; only pull requests targeting main may be light.
+            printf 'required=true\nreason=non-main-base\n' >> "$GITHUB_OUTPUT"
           else
             BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-            TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"
+            TRUSTED_TIP="$(git rev-parse refs/remotes/origin/main)"
             trusted_classifier="$RUNNER_TEMP/pr-tier.sh"
             if git show "$TRUSTED_TIP:scripts/pr-tier.sh" > "$trusted_classifier" 2>/dev/null; then
               # shellcheck source=scripts/pr-tier.sh

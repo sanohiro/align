@@ -623,6 +623,22 @@ grep -Fq 'git show "$TRUSTED_TIP:scripts/pr-tier.sh"' "$ci_workflow" || {
   echo "ci.yml no longer loads the platform classifier from the trusted base" >&2
   exit 1
 }
+grep -Fq 'elif [ "$BASE_REF" != main ]; then' "$ci_workflow" || {
+  echo "ci.yml no longer fails closed for author-controlled stacked-PR bases" >&2
+  exit 1
+}
+[[ "$(grep -Fc 'TRUSTED_TIP="$(git rev-parse refs/remotes/origin/main)"' "$ci_workflow")" -eq 2 ]] || {
+  echo "both CI scope classifiers must pin their machinery to protected main" >&2
+  exit 1
+}
+[[ "$(grep -Fc 'reason=non-main-base' "$ci_workflow")" -eq 2 ]] || {
+  echo "both CI scope classifiers must fail closed for stacked-PR bases" >&2
+  exit 1
+}
+if grep -Fq 'TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"' "$ci_workflow"; then
+  echo "ci.yml trusts an author-controlled PR base for platform classification" >&2
+  exit 1
+fi
 grep -Fq 'pr_tier_docs_only "$BASE_SHA" "$HEAD_SHA"' "$ci_workflow" || {
   echo "ci.yml no longer uses the shared docs-only predicate" >&2
   exit 1
