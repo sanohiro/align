@@ -601,7 +601,7 @@ the few boundaries that remain:
   inputs are baseline Align commit `576e57307fe4ef34e74566f5e389a2f0e2a04acd` and the exact
   implementation-head SHA recorded in the implementation PR and `HANDOFF.md`. In two clean release
   worktrees it runs `cargo test --release --locked --target x86_64-unknown-linux-gnu -p align_driver
-  --test json_scan_identity -- --exact json_scan_cross_compiler_identity` with
+  --test json_scan_identity -- --exact --ignored json_scan_cross_compiler_identity` with
   `rustc 1.96.1`, `llvm-config-22 22.1.8`, `cc`, `LC_ALL=C`, `ALIGNC_CACHE=off`, and no custom
   `RUSTFLAGS`; the test writes exact files in an explicit per-worktree output directory. The owner
   compares, with `cmp` and no normalization, canonical serialized interface bytes

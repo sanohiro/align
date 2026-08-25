@@ -63,7 +63,8 @@ run_probe() {
         cd "$worktree"
         env -u RUSTFLAGS LC_ALL=C ALIGNC_CACHE=off ALIGN_JSON_SCAN_IDENTITY_OUT="$output" \
             cargo +"$TOOLCHAIN" test --release --locked --target x86_64-unknown-linux-gnu \
-            -p align_driver --test json_scan_identity -- --exact json_scan_cross_compiler_identity
+            -p align_driver --test json_scan_identity -- \
+            --exact --ignored json_scan_cross_compiler_identity
     )
 }
 

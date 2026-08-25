@@ -78,6 +78,7 @@ fn write_key_fields(dir: &Path, key: &align_driver::CodegenKey) {
 }
 
 #[test]
+#[ignore = "run through scripts/compare-json-scan-identity.sh"]
 fn json_scan_cross_compiler_identity() {
     let dir = output_dir();
     let fixture =
