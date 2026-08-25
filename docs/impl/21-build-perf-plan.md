@@ -96,11 +96,15 @@ impl PipelinedBuiltUnit {
 
 `FrontendFailed` is present exactly when `diags.has_errors()` after the complete
 walk; it exposes no unit or object record. `CodegenFailed` carries clean-or-
-warning diagnostics plus the setup, stale-entry, worker, or codegen error; it
-also exposes no unit or object record. `Complete` is the only variant carrying
-units. Its units and codegen results use bottom-up DAG order, never completion
-order, and every `object()` denotes a complete object while the enclosing
-`PipelinedPackageComplete` remains alive.
+warning diagnostics plus the setup, stale-entry, or ordinary codegen error for
+this one attempt; it also exposes no unit or object record. An internal worker
+panic unwinds after cleanup and is not represented by this enum. `Complete` is
+the only variant carrying units. Its units and codegen results use bottom-up
+DAG order, never completion order, and every `object()` denotes a complete
+object while the enclosing `PipelinedPackageComplete` remains alive.
+Every variant's diagnostics use file ids allocated in the borrowed
+`source_map`; the caller must render them before that same map is dropped and
+must never render one attempt with another attempt's map.
 
 The function creates one `ArtifactStage::temp("align-per-unit-obj")` itself.
 Atomic unique-directory creation is the exclusive claim; neither a caller nor a
@@ -186,37 +190,65 @@ final link succeeds.
 The observable failure precedence stays:
 
 ```text
-1  complete frontend diagnostics, in DAG order
+1  complete frontend semantic diagnostics, in DAG order
 2  static-publication-lock validation
-3  PGO snapshot/validation or codegen setup
-4  first stale reused frontend entry, in DAG order
-5  lowest DAG-index codegen failure among claimed work
-6  link and executable-publication failure
+3  unique object-stage creation
+4  PGO snapshot read and format validation
+5  first codegen-key/lookup setup error, in DAG order
+6  first stale reused frontend entry, in DAG order
+7  LLVM target initialization
+8  lowest DAG-index ordinary codegen failure among claimed work
+9  link and executable-publication failure
 ```
 
-PGO input is snapshotted once before the first object lookup so its content
-digest keys every unit and libLLVM reads those exact bytes. A snapshot error is
-held while the frontend finishes and is reported only if the frontend is
-clean, preserving the precedence above. PGO warnings and match counts are
-aggregated in DAG order and reported only after successful codegen, unchanged.
+Operations may execute early to permit overlap, but their errors are retained
+and selected only by this logical order. If stage creation fails, no object
+lookup or worker starts. Otherwise PGO input is read once, validated with the
+existing missing/read/bad-magic/malformed precedence, snapshotted, and digested
+before the first object lookup, so every key and libLLVM see the exact same
+bytes. Key construction proceeds in DAG order and stops logically at its first
+error. Target initialization may run before the walk finishes, but its error is
+reported only after every deferred rehydration has agreed. Thus a stale entry
+still wins over target initialization as on the existing two-phase path.
 
-A worker error stops new codegen claims but never truncates the frontend walk.
-If frontend later fails, in-progress workers finish, queued work is discarded,
-no object miss is published, and only the frontend diagnostics are reported.
-If the frontend is clean, every deferred rehydration still runs before a
-speculative codegen error can be returned; a mismatch invalidates the entry,
-cancels the queue, publishes no speculative object miss, and triggers the
-existing single whole-package retry with `UnitReuse::Forbidden` and a fresh
-`SourceMap`; the recursive invocation claims a new unique object stage. The
-retry cannot rehydrate and therefore cannot loop.
+All setup errors are held while the frontend finishes and are reported only if
+the frontend is clean. `pipeline_tests::setup_failure_order_is_total` covers
+stage + unreadable/bad PGO, PGO + key setup, key setup + stale entry, and stale
+entry + target initialization as multi-invalid pairs. PGO warnings and match
+counts are aggregated in DAG order and reported only after successful codegen,
+unchanged.
 
-An LLVM emitter panic is caught outside every shared queue/result lock. A
-per-claim RAII guard decrements the in-flight count and notifies the condition
-variable on success, ordinary error, or unwind. Panic records the deterministic
-codegen error `codegen worker panicked for unit \`<unit>\`` at that unit's DAG
-index, cancels new claims, and participates in the same lowest-index codegen
-failure rule; `alignc` never unwinds for it. Background workers and the
-coordinator's final-worker path use the same guarded task runner.
+An ordinary worker error stops new codegen claims but never truncates the
+frontend walk. If frontend later fails and no internal panic occurs, in-progress
+workers finish, queued work is discarded, no object miss is published, and only
+the frontend diagnostics are reported. If the frontend is clean, every
+deferred rehydration still runs before a speculative ordinary codegen error can
+be returned. A mismatch invalidates the entry, cancels the queue, publishes no
+speculative object miss, and returns
+`CodegenFailed { error: StaleCacheEntry, .. }` for this attempt.
+
+The CLI, not `build_package_pipelined`, owns retry orchestration. It creates one
+`SourceMap`, calls one attempt, and formats that attempt's diagnostics while the
+same map is alive. On the first attempt's stale-entry result it prints the
+existing retry notice and starts exactly one new attempt with
+`UnitReuse::Forbidden`, a new `SourceMap`, and a newly claimed stage. It formats
+the retry diagnostics against that new map before dropping it. A successful
+retry links its `Complete` result; a frontend, setup, or codegen failure on the
+retry is returned normally and never retries again. The existing `All` first-
+attempt / `ErrorsOnly` retry echo rule prevents successful-retry warnings from
+being printed twice.
+
+An LLVM emitter panic is deliberately outside the returned-error precedence.
+No shared queue/result lock is held across the emitter, and a per-claim RAII
+guard decrements the in-flight count and notifies the condition variable on
+success, ordinary error, or unwind; when `std::thread::panicking()` is true the
+guard also sets the cancellation flag before notifying. The coordinator joins
+every remaining worker and resumes the original panic only after cleanup. It
+does not replace or temporarily mutate Rust's process-global panic hook, so
+concurrent compiler/library callers cannot race hook installation or
+restoration. PL18 proves malformed or rejected user input reaches a diagnostic
+or ordinary error rather than this internal-defect path. Background workers
+and the coordinator's final-worker path use the same guarded task runner.
 
 Before `build_package_pipelined` returns on any outcome it closes the queue,
 joins every background worker, and drops the PGO snapshot after the last LLVM
@@ -250,6 +282,15 @@ look consumable. The owning-result boundary above replaces that strategy: the
 function alone claims the unique stage, failure variants expose no paths, and
 only a complete result owns and lends usable object paths through link.
 
+**Closure matrix reopened — `failure-precedence`.** The owning-result redesign
+initially placed the bounded stale-entry retry inside the library attempt,
+separating its raw diagnostics from the fresh `SourceMap` that owns their file
+ids. It also grouped independently fallible setup phases and tried to convert a
+worker panic without accounting for Rust's process-global panic hook. The final
+boundary keeps one map per one library attempt, leaves retry and diagnostic
+rendering in the CLI, totally orders setup failures, and treats internal panic
+as cleanup-then-unwind rather than a returned diagnostic.
+
 `check`, `check-per-unit`, `emit-mir`, `emit-llvm`, `emit-obj`, `explain-opt`,
 and export-root tooling retain their existing serial or two-phase paths.
 `--thin-lto` also stays unchanged in this boundary: its frontend cache is
@@ -270,10 +311,10 @@ several rows when it discriminates every listed state.
 | PL3 | job budget | `frontend_active + codegen_active <= max(jobs, 1)` for `0`, `1`, `2`, and `N`; `-j 1` has no overlap | `pipeline_tests::job_budget_is_global` |
 | PL4 | move boundary | a lowered MIR has one owner and is moved, not cloned or retained in a second package body | `pipeline_tests::queue_accepts_a_non_clone_payload` plus the producer's destructive `UnitBody::Lowered` extraction |
 | PL5 | cache-state product | frontend hit/miss × object hit/miss selects no-rehydrate, enqueue-lowered, or deferred-rehydrate exactly once | `pipelined_compilation::cache_product_selects_exact_work` |
-| PL6 | rehydration | deferred misses rehydrate serially in DAG order; every existing identity component is checked; first mismatch unlinks and retries the complete package once | `pipelined_compilation::stale_entries_retry_once_after_speculative_work`, reusing the `unit_cache` tamper fixtures |
-| PL7 | diagnostics | warnings and errors are byte-identical and DAG-ordered; later codegen failure never hides or truncates frontend diagnostics | `pipelined_compilation::frontend_diagnostics_precede_speculative_codegen_failures` |
-| PL8 | failure precedence | setup precedes stale-entry, stale-entry precedes codegen, lowest claimed DAG-index ordinary error or panic wins, link remains last | `pipeline_tests::failure_precedence_is_deterministic` |
-| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; the PGO snapshot outlives LLVM but not the function; a failed build drops its unique stage before return, while a complete result owns its stage through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_cancels_notifies_and_joins` |
+| PL6 | rehydration | deferred misses rehydrate serially in DAG order; every existing identity component is checked; the first mismatch unlinks and returns stale for the CLI's one reuse-forbidden whole-package retry | `pipelined_compilation::stale_entries_retry_once_after_speculative_work`, reusing the `unit_cache` tamper fixtures |
+| PL7 | diagnostics | warnings and errors are byte-identical and DAG-ordered; a later ordinary codegen failure never hides or truncates frontend diagnostics | `pipelined_compilation::frontend_diagnostics_precede_speculative_codegen_failures` |
+| PL8 | failure precedence | frontend, lock, stage, PGO, first DAG key, first DAG stale entry, target initialization, lowest claimed DAG-index ordinary codegen error, and link form the total order above regardless of execution timing | `pipeline_tests::failure_precedence_is_deterministic` and `pipeline_tests::setup_failure_order_is_total` |
+| PL9 | cancellation and Drop | frontend failure, stale entry, setup failure, ordinary codegen failure, worker panic, and normal return all close the queue and join workers; panic resumes only after notification/join without touching the global hook; the PGO snapshot outlives LLVM but not the function; a failed build drops its unique stage before return, while a complete result owns its stage through link and no command exit | `pipeline_tests::every_exit_joins_workers` and `pipeline_tests::panicking_worker_notifies_joins_then_resumes` |
 | PL10 | publication commit | no object miss publishes before frontend, lock, setup, and rehydration validation; after that point successful siblings publish despite a codegen sibling failure | `pipelined_compilation::object_publication_waits_for_validation_commit` |
 | PL11 | cache identity | keys, first-difference reasons, hit/miss outcomes, cache-off bypass, corruption recovery, and DAG-ordered stats equal the existing path | `pipelined_compilation::pipelined_cache_matches_two_phase_cache` |
 | PL12 | static descriptors | codegen may overlap static resolution only after that unit's MIR is fixed; lock-validation failure publishes neither object nor executable | `pipelined_compilation::metadata_race_publishes_nothing` |
@@ -282,11 +323,12 @@ several rows when it discriminates every listed state.
 | PL15 | output identity | cache off/on, `-j 1`/`-j N`, cold/all-hit/private-edit, and retry produce byte-identical per-unit objects, executable, stdout, and link-library order to the existing driver | `pipelined_compilation::pipeline_is_byte_identical_to_two_phase_build` |
 | PL16 | all-hit cost | an all-object-hit build starts no worker and rehydrates no MIR | `pipeline_tests::all_hit_starts_no_worker` |
 | PL17 | unchanged verbs | all excluded verbs and `--thin-lto` call the pre-existing entry points and retain output | `pipelined_compilation::excluded_verbs_keep_their_existing_driver` plus the existing verb suites |
-| PL18 | malformed/error input | cyclic imports, parse/sema failure, rejected HIR lowering, invalid profile, and codegen refusal return diagnostics/errors rather than panic or partial executable | `pipelined_compilation::invalid_inputs_publish_no_executable` |
+| PL18 | malformed/error input | cyclic imports, parse/sema failure, rejected HIR lowering, invalid profile, and codegen refusal return diagnostics/errors rather than reaching the internal panic path or publishing a partial executable | `pipelined_compilation::invalid_inputs_publish_no_executable` |
 | PL19 | worker-independent order | reversing completion order does not change units, outcomes, PGO report, chosen error, link inputs, or bytes | `pipeline_tests::reverse_completion_preserves_every_ordered_result` |
 | PL20 | performance promise | cold multi-unit build performs the same frontend and codegen counts and demonstrates actual stage overlap; wall time is lower under the same compiler/profile/cache state and `-j` budget | local `bench/build_pipeline/run.sh`, not CI |
 | PL21 | legacy library projections | the ready-unit seam preserves every `PerUnitArtifact` field (`unit`, `is_entry`, MIR, summary bytes, dependency hashes, file, static descriptors, static inputs, static artifacts), every `BuiltUnit` field (`unit`, `is_entry`, summary bytes, dependency hashes, link libraries, static inputs, frontend outcome), package diagnostics, reuse state, and materialization result | mutation-verified `pipeline_tests::ready_seam_preserves_per_unit_projection` and `pipeline_tests::ready_seam_preserves_package_projection`, over cold, frontend-hit, and rehydrated units |
 | PL22 | exclusive artifact availability | concurrent invocations always claim distinct stage directories; failure variants expose no unit/path and remove their stage; complete paths all exist, are immutable for their record lifetime, cannot be overwritten by a sibling build, and disappear only after the complete record drops following link | `pipeline_tests::concurrent_pipelines_own_distinct_stages` and `pipeline_tests::only_complete_results_lend_objects` |
+| PL23 | retry map identity | each attempt renders diagnostics against the exact `SourceMap` that produced them; stale attempt 1 prints the notice and retries once; clean retry warnings do not repeat; retry errors use retry-map paths and never recurse | `pipelined_compilation::stale_retry_keeps_each_diagnostic_map_alive` |
 
 Before review, the implementation author maps every applicable row to the
 ready-unit producer, coordinator, worker, publication step, and a regression.
