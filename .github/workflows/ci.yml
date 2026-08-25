@@ -24,11 +24,13 @@ env:
 
 jobs:
   db-scope:
-    name: PostgreSQL change scope
+    name: CI change scope
     runs-on: ubuntu-24.04
     outputs:
       required: ${{ steps.scope.outputs.required }}
       reason: ${{ steps.scope.outputs.reason }}
+      platform_required: ${{ steps.platform-scope.outputs.required }}
+      platform_reason: ${{ steps.platform-scope.outputs.reason }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -71,6 +73,36 @@ jobs:
             else
               # One-PR bootstrap: origin/main does not own the classifier yet.
               # Provisioning the service is the only trusted fallback.
+              printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Classify platform build scope
+        id: platform-scope
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            printf 'required=true\nreason=non-pull-request\n' >> "$GITHUB_OUTPUT"
+          else
+            BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+            TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"
+            trusted_classifier="$RUNNER_TEMP/pr-tier.sh"
+            if git show "$TRUSTED_TIP:scripts/pr-tier.sh" > "$trusted_classifier" 2>/dev/null; then
+              # shellcheck source=scripts/pr-tier.sh
+              . "$trusted_classifier"
+              if declare -F pr_tier_docs_only >/dev/null && \
+                 pr_tier_docs_only "$BASE_SHA" "$HEAD_SHA"; then
+                printf 'required=false\nreason=docs-only\n' >> "$GITHUB_OUTPUT"
+              else
+                printf 'required=true\nreason=non-docs-only\n' >> "$GITHUB_OUTPUT"
+              fi
+            else
+              # The trusted base cannot prove this diff docs-only. Run the
+              # complete matrix; the first PR adding machinery takes this arm.
               printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -283,6 +315,8 @@ jobs:
 
   build-and-test:
     name: ${{ matrix.name }}
+    needs: db-scope
+    if: needs.db-scope.outputs.platform_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -490,3 +524,27 @@ jobs:
             target
             target/clippy
           key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+  platform-required:
+    name: Platform CI (required)
+    needs:
+      - db-scope
+      - build-and-test
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enforce classified platform result
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.db-scope.result }}
+          PLATFORM_REQUIRED: ${{ needs.db-scope.outputs.platform_required }}
+          PLATFORM_RESULT: ${{ needs.build-and-test.result }}
+          PLATFORM_REASON: ${{ needs.db-scope.outputs.platform_reason }}
+        run: |
+          echo "scope=$SCOPE_RESULT required=$PLATFORM_REQUIRED platform=$PLATFORM_RESULT reason=$PLATFORM_REASON"
+          test "$SCOPE_RESULT" = success
+          case "$PLATFORM_REQUIRED" in
+            true) test "$PLATFORM_RESULT" = success ;;
+            false) test "$PLATFORM_RESULT" = skipped ;;
+            *) echo "platform scope produced no valid decision" >&2; exit 1 ;;
+          esac

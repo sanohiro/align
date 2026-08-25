@@ -78,3 +78,22 @@ pr_tier_library_changed() {
   done < <(git diff --no-renames --name-only "$base_sha...$head_sha")
   return "$status"
 }
+
+# Succeeds only for a non-empty diff made exclusively of ordinary Markdown
+# files. Keep this stricter than merely "not library": leaf owner tests are
+# tooling tier, while compiled prose and every deletion fail closed through
+# pr_tier_library_changed.
+pr_tier_docs_only() {
+  local base_sha="$1" head_sha="$2" path saw_path=false
+  git diff --no-renames --name-only "$base_sha...$head_sha" >/dev/null 2>&1 || return 1
+  pr_tier_library_changed "$base_sha" "$head_sha" && return 1
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    saw_path=true
+    case "$path" in
+      *.md | docs/*.md) ;;
+      *) return 1 ;;
+    esac
+  done < <(git diff --no-renames --name-only "$base_sha...$head_sha")
+  [[ "$saw_path" == true ]]
+}
