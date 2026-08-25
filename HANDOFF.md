@@ -211,9 +211,8 @@ concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed
 failures against `scripts/known-failures.txt` in both directions. That manifest —
 not this file — is the live baseline: a new failure is named, and a line whose
 test starts passing is red until the fixing change deletes it. The 2026-08-13
-baseline (#782, run 31669771705) is now burned down to 0 strict entries plus
-one environment-dependent entry in one triage class recorded in the manifest's
-own comment, and running
+baseline (#782, run 31669771705) is now burned down to 0 strict and 0
+environment-dependent entries, and running
 `scripts/run-suite-binaries.sh` with no arguments reproduces the same judgement
 locally. The job budget is 30 minutes and exceeding it is the signal, not
 something to raise.
@@ -222,8 +221,12 @@ The nightly's own findings are closed: the Gate-3 rejected-operand sentinel
 class (#745), the open-world callback rule that had broken `apps/web` since #672
 and the silent-empty-MIR break it hid (#742), the validator's private copy of
 the mangling scheme (#744), and fixed struct-array slicing for the router
-(#743). What remains red is exactly `scripts/known-failures.txt`; its triage
-comment carries the open questions.
+(#743). The manifest is empty; any new red must be triaged before an entry is
+added. The retired environment-dependent row was the Request 6 implementation-time
+cross-compiler probe: `scripts/compare-json-scan-identity.sh` now replays its
+fixed `576e5730`/`aa5bb7d` evidence from pinned historical sources, while the
+current test graph no longer compiles that one-time owner against later interface
+and cache evolution.
 
 The silent-empty-MIR class — a body validator re-deriving a fact the producer
 owns — reached eight occurrences and is closed at its root by #774: the fallible
@@ -408,6 +411,11 @@ Operational rules:
 - `scripts/run-suite-binaries.sh` is the local equivalent of the nightly
   full-suite job, judged against `scripts/known-failures.txt`;
   `ALIGN_GATE_JOBS` sets the concurrency both it and `scripts/test-pr.sh` read.
+- The conditional PostgreSQL job and `scripts/db-verify-local.sh` share
+  `scripts/run-db-suites.sh`: the local gate builds the exact fourteen owners in
+  one graph, while CI partitions that same set into four isolated, measured
+  service shards. The required result aggregates every shard, each of which
+  stops at the hard 30-minute budget.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
 

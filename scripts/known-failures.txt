@@ -22,9 +22,4 @@
 # Comments and blank lines are ignored. Keep entries sorted by target.
 #
 # baseline recorded from run 31669771705 (2026-08-13, after the runner fix
-# #781); burn-down list — delete lines as fixes land
-
-json_scan_identity	json_scan_cross_compiler_identity	env
-
-# Triage of this baseline (see backlog for detail):
-#   A: the remaining environment-dependent legacy red — triaged next
+# #781); burn-down complete — add no entry without a fresh triage

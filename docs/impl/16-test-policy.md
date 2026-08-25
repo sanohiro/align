@@ -204,10 +204,12 @@ round-trips for failures that reproduce locally in seconds.
 The required check remains present on every PR, but the provisioned service job
 runs only when the exact committed diff reaches the database boundary. Direct
 `apps/db`, `pkg_db_*`, DB harness/fixture/golden, dependency, DB toolchain, and
-CI-gate changes qualify. Shared test harnesses consumed by the DB suites also
-qualify. A changed compiler source or owner-test file qualifies when its base
-or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite boundary.
-Deletions and uncomputable diffs fail closed. Other documentation, tooling,
+CI-gate changes qualify. Shared test harnesses and binary-runner machinery
+consumed by the DB suites also qualify. A changed or deleted compiler source or
+owner-test file qualifies when
+its base or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite
+boundary. Deleted direct DB paths qualify by path; unrelated deletions do not.
+Uncomputable diffs fail closed. Other documentation, tooling,
 applications, leaf tests, and compiler source do not spend the roughly one-hour
 service gate. `scripts/db-ci-scope.sh` owns that classification and
 `scripts/test-db-ci-scope.sh` pins its positive, negative, and fail-closed
@@ -231,9 +233,19 @@ services.
 `scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
 disposable Docker `postgres:16.4` with no optional extension and an isolated
 `pgvector/pgvector:0.8.6-pg16-bookworm` service with CI's exact credentials and environment,
-runs the same inverted required-mode self-tests and all fourteen `pkg.db` owner
-suites (`q1`, `q2`, `q3`, `q4a`, `q4b`, `q5a`, `q5b1`, `q5b2`, `q6`, `a1`,
-`pool`, `a2`, `callbacks`, and `vc1`), and tears both containers down. The VC1 setup explicitly
+runs the same inverted required-mode self-tests, and tears both containers down.
+Both it and CI delegate the fourteen `pkg.db` owner suites to
+`scripts/run-db-suites.sh`. The local gate builds `q1`, `q2`, `q3`, `q4a`,
+`q4b`, `q5a`, `q5b1`, `q5b2`, `q6`, `a1`, `pool`, `a2`, `callbacks`, and
+`vc1` in one Cargo graph. CI partitions that exact set into four measured
+shards, each with disposable PostgreSQL and pgvector services; the required
+result aggregates all four. Every invocation checks its produced binary set in
+both directions and runs the binaries through the bounded gate's shared runner.
+`ALIGN_GATE_JOBS` sets the process count and divides libtest threads across it;
+each four-core CI shard uses two processes with two libtest threads rather than
+serializing the large owners inside one single-threaded process. Every shard
+carries the repository's hard 30-minute test budget; crossing it is a
+performance failure, not a reason to extend the timeout. The VC1 setup explicitly
 creates `vector`, verifies extension version `0.8.6`, and retains the ordinary service as the
 no-extension control. A diff touching
 `apps/db` or a `pkg_db_*` test must pass it before push. The
@@ -699,6 +711,20 @@ Recorded so the gap is explicit rather than implied:
   The final closure deliberately also runs stub- and SQLite-owned suites in
   that job: it is the one required cross-rail product gate, while individual
   cases retain their exact native/live gating.
+- **Required DB owner execution is build-once/run-many.** By #881 the same
+  fourteen suites had regressed to roughly 58 minutes of serial test execution
+  in a roughly 60-minute service job; setup, packages, cache restore, and the
+  workspace build together were only about 80 seconds. Separate Cargo test
+  invocations held the target lock through each run and made the job pay the
+  sum. `scripts/run-db-suites.sh` now performs one no-run build and passes the
+  exact binary set to the shared concurrent runner. A single four-core CI job
+  still exceeded the available CPU budget: its owner step was cancelled after
+  29 minutes and the job after 30 minutes 17 seconds. The timeout was not
+  raised. CI now balances the historical owner durations across four isolated
+  service shards; the required result succeeds only when every shard succeeds.
+  The local Docker gate retains one complete invocation, and each CI shard
+  fails at 30 minutes rather than allowing a one-hour detector. The final
+  sharded measurement is recorded with the implementation PR.
 - **`pkg_db_q1`, `q3`, and `q5a`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness

@@ -323,13 +323,20 @@ not.
 
 The PostgreSQL required check is lightweight on unrelated diffs. Its separate
 service job runs only when `scripts/db-ci-scope.sh` classifies the committed
-range as reaching the database boundary; deletion and classification failure
-run it. The always-running required result fails unless that decision and any
+range as reaching the database boundary; deletions use the same path and
+base/head-content rules, while classification failure runs it. The always-running
+required result fails unless that decision and any
 required service run succeeded. PRs execute the trusted base's classifier; its
 one-PR introduction fails closed to running the service. A `main` push avoids
 the duplicate service run only when GitHub identifies its exact head as a
 merged PR into that branch; an unassociated direct push uses the preceding main
-classifier, and manual dispatch always runs it. Keep
+classifier, and manual dispatch always runs it. The service job and
+`scripts/db-verify-local.sh` both use `scripts/run-db-suites.sh`: Cargo builds
+the fourteen owner binaries in one graph locally, while CI partitions their
+exact set into four measured, isolated service shards. Each shard runs two
+binary processes with two libtest threads on its four-core runner; the required
+result succeeds only when every shard succeeds. Every shard has the same hard
+30-minute budget as nightly. Keep
 `scripts/test-db-ci-scope.sh` synchronized with this workflow contract.
 
 **Independent review and local gates may run concurrently.** The one fresh

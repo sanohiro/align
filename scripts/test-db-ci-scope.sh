@@ -78,13 +78,26 @@ git -C "$fixture" commit -qm direct-db-owner
 direct_owner="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$shared_harness" "$direct_owner"
 
+# Adding and deleting an unrelated leaf owner must not provision PostgreSQL.
+printf 'fn identity_owner() {}\n' > "$fixture/crates/demo/tests/json_identity.rs"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm unrelated-leaf-owner
+leaf_owner="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$direct_owner" "$leaf_owner"
+
+rm "$fixture/crates/demo/tests/json_identity.rs"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-unrelated-leaf-owner
+leaf_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$leaf_owner" "$leaf_deleted"
+
 # Direct package and workflow machinery changes are always included.
 mkdir -p "$fixture/apps/db" "$fixture/.github/workflows"
 printf 'db\n' > "$fixture/apps/db/main.align"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm db-package
 db_package="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$direct_owner" "$db_package"
+assert_scope true "$leaf_deleted" "$db_package"
 
 printf 'name: CI\n' > "$fixture/.github/workflows/ci.yml"
 git -C "$fixture" add .
@@ -92,13 +105,38 @@ git -C "$fixture" commit -qm db-workflow
 workflow="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$db_package" "$workflow"
 
-# Deletions and unreadable ranges fail closed.
+runner_parent="$workflow"
+for runner_dependency in \
+  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh; do
+  printf '#!/usr/bin/env bash\n' > "$fixture/scripts/$runner_dependency"
+  git -C "$fixture" add .
+  git -C "$fixture" commit -qm "db-runner-$runner_dependency"
+  runner_head="$(git -C "$fixture" rev-parse HEAD)"
+  assert_scope true "$runner_parent" "$runner_head"
+  runner_parent="$runner_head"
+done
+
+# An unrelated deletion stays out of the service job.
 rm "$fixture/apps/web/main.align"
 git -C "$fixture" add -u
-git -C "$fixture" commit -qm deletion
-deleted="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$workflow" "$deleted"
-assert_scope true not-a-commit "$deleted"
+git -C "$fixture" commit -qm unrelated-deletion
+unrelated_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$runner_parent" "$unrelated_deleted"
+
+# Deleted DB-naming source is classified from its base content, and a deleted
+# direct DB path is classified by path. Unreadable ranges still fail closed.
+rm "$fixture/crates/demo/tests/direct.rs"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-db-source
+db_source_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$unrelated_deleted" "$db_source_deleted"
+
+rm "$fixture/apps/db/main.align"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-db-path
+db_path_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$db_source_deleted" "$db_path_deleted"
+assert_scope true not-a-commit "$db_path_deleted"
 
 # CI extracts the trusted classifier outside the checkout. Its explicit root
 # binding must still classify the repository rather than the temporary file's
@@ -120,5 +158,32 @@ grep -Fq 'reason=classifier-bootstrap' "$ci_workflow"
 grep -Fq 'test "$SCOPE_RESULT" = success' "$ci_workflow"
 grep -Fq 'true) test "$DB_RESULT" = success' "$ci_workflow"
 grep -Fq 'false) test "$DB_RESULT" = skipped' "$ci_workflow"
+grep -Fq 'timeout-minutes: 30' "$ci_workflow"
+grep -Fq 'name: PostgreSQL integration (${{ matrix.db-shard }})' "$ci_workflow"
+grep -Fq 'run: scripts/run-db-suites.sh "${{ matrix.db-shard }}"' "$ci_workflow"
+grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
+test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
+
+expected_owners="$(printf '%s\n' \
+  pkg_db_q1 pkg_db_q2 pkg_db_q3 pkg_db_q4a pkg_db_q4b pkg_db_q5a \
+  pkg_db_q5b1 pkg_db_q5b2 pkg_db_q6 pkg_db_a1 pkg_db_pool pkg_db_a2 \
+  pkg_db_callbacks pkg_db_vc1 | LC_ALL=C sort)"
+all_owners="$($repo_root/scripts/run-db-suites.sh --list all | LC_ALL=C sort)"
+test "$all_owners" = "$expected_owners"
+
+observed_shards=""
+for db_shard in catalog-stream delivery-callbacks vector-static portable-pool; do
+  grep -Fq "          - $db_shard" "$ci_workflow"
+  observed_shards="$observed_shards
+$($repo_root/scripts/run-db-suites.sh --list "$db_shard")"
+done
+observed_shards="$(printf '%s\n' "$observed_shards" | sed '/^$/d' | LC_ALL=C sort)"
+test "$observed_shards" = "$expected_owners"
+test -z "$(printf '%s\n' "$observed_shards" | uniq -d)"
+
+if "$repo_root/scripts/run-db-suites.sh" --list not-a-shard >/dev/null 2>&1; then
+  echo "unknown database shard was accepted" >&2
+  exit 1
+fi
 
 echo "database CI scope tests passed"

@@ -475,7 +475,7 @@ the few boundaries that remain:
   | ABI and persistence | N/A: no source syntax, HIR/MIR node, descriptor, runtime ABI, wire format, or cache identity changes for accepted programs. |
   | Runtime cleanup | N/A for accepted rows because the complete row graph has no `Drop`; existing scanner input and scalar-accumulator cleanup remains authoritative. |
   | Compatibility prerequisite | The implementation PR is gated on this design and must retain the existing JSON schema and scanner terminal contracts. Request 6 align-llm adoption is a later consumer gate after the implementation release is pinned. |
-  | Acceptance and benchmark | The owner tests, `scripts/compare-json-scan-identity.sh` cross-compiler identity probe, and the `json_scan_copy_row_no_owned_alloc` allocation probe below close the contract; performance is N/A and no benchmark improvement is claimed. |
+  | Acceptance and benchmark | The current owner tests and the `json_scan_copy_row_no_owned_alloc` allocation probe below close the live contract. `scripts/compare-json-scan-identity.sh` preserves the fixed implementation-time cross-compiler evidence; performance is N/A and no benchmark improvement is claimed. |
   | Source-of-truth map | This English design, `docs/impl/core-design/ja/json.md`, `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, `docs/open-questions.md`, `docs/impl/17-library-boundary-prerequisites.md`, `docs/impl/19-hir-validation-ledger.md`, and the align-llm Request 6 register must agree. |
   | Concurrent scanners | N/A to the compile-time gate; independent accepted scanners retain their existing independent handles and slots. |
   | Performance | N/A: no performance claim and no production MIR, codegen, or runtime change. |
@@ -591,15 +591,14 @@ the few boundaries that remain:
   `modules::json_scan_imported_row_ownership`, `modules::json_scan_imported_generic_return_context_ownership`,
   `cache_codegen::json_scan_row_schema_rejection`,
   `cache_codegen::json_scan_per_unit_interface_row_ownership`,
-  `cache_codegen::json_scan_generic_return_context_no_publication`, and
-  `json_scan_cross_compiler_identity`; the feature-gated runtime allocation
+  `cache_codegen::json_scan_generic_return_context_no_publication`; the historical implementation-time
+  evidence is `json_scan_cross_compiler_identity`, and the feature-gated runtime allocation
   probes are `json_scan_copy_row_no_owned_alloc` and
   `json_scan_copy_row_copy_composites_no_owned_alloc`. The named cross-compiler probe is
-  `scripts/compare-json-scan-identity.sh`, which runs the checked-in Rust owner
-  `crates/align_driver/tests/json_scan_identity.rs::json_scan_cross_compiler_identity` against the
-  fixture `crates/align_driver/tests/fixtures/json_scan_copy_identity.align`. Its two explicit
-  inputs are baseline Align commit `576e57307fe4ef34e74566f5e389a2f0e2a04acd` and the exact
-  implementation-head SHA recorded in the implementation PR and `HANDOFF.md`. In two clean release
+  `scripts/compare-json-scan-identity.sh`, which replays the Rust owner and fixture stored at the
+  reviewed implementation commit rather than compiling them as a current-tree test. Its two fixed
+  inputs are baseline Align commit `576e57307fe4ef34e74566f5e389a2f0e2a04acd` and implementation
+  commit `aa5bb7d66d0436c2d9ebf89f252b0ba5d528c2a8`. In two clean release
   worktrees it runs `cargo test --release --locked --target x86_64-unknown-linux-gnu -p align_driver
   --test json_scan_identity -- --exact json_scan_cross_compiler_identity` with
   `rustc 1.96.1`, `llvm-config-22 22.1.8`, `cc`, `LC_ALL=C`, `ALIGNC_CACHE=off`, and no custom
@@ -622,8 +621,10 @@ the few boundaries that remain:
   production `CodegenKey::non_compiler_build_digest()` and `CodegenKey::first_diff()` classifier
   with a compiler-build variant, recording `FirstDiff::CompilerBuildId` rather than merely echoing
   an expected label. The cross-worktree shell owner remains baseline-compatible by comparing the
-  explicit serialized fields and the production full/slot digests exposed by the identity test; it
-  does not copy newer cache APIs into the historical compiler checkout. That expected build-id
+  explicit serialized fields and the production full/slot digests exposed by the pinned identity
+  test; it does not copy newer cache APIs into the historical compiler checkout. Current `main` is
+  deliberately not an input: later interface and cache evolution belongs to current owner tests,
+  not this fixed implementation-time comparison. That expected build-id
   difference is not treated as a scanner identity failure. The existing
   `cache_codegen::json_scan_row_schema_rejection` and
   `cache_codegen::json_scan_per_unit_interface_row_ownership` separately own cold/hot, schema

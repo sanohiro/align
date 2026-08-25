@@ -18,6 +18,7 @@ Order is priority.
 |---|------|--------|
 | 1 | Persistent unit cache v1 | Shipped — in-process memo #757 (`docs/impl/10-cache-first-optimization.md` §6.6) and the persistent per-unit frontend cache #761 (§6.7, Slice C3) |
 | 2 | lld linking on ELF | Shipped as #763 — see below |
+| 2a | Required DB owner build-once/run-many | In progress in #882 — exact-set concurrent execution across four isolated CI shards, each with a hard 30-minute budget |
 | 3 | Pipelined compilation | Next in priority order. Start a dependent unit's frontend as soon as the dependency's interface summary exists; same work, shorter wall clock |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
@@ -28,6 +29,44 @@ Order is priority.
 Measured on `pkg.db`: cold per-unit codegen ~9s versus frontend ~3.4s.
 Caching (items 1–4) removes re-paying, parallelism (3) and residency (5)
 shorten the wall clock, and granularity (6) shrinks the unit of re-payment.
+
+## Item 2a: required DB owner build-once/run-many
+
+PR #881's first required PostgreSQL run spent roughly 80 seconds on service
+setup, packages, cache restore, and the workspace build, then roughly 58 minutes
+running fourteen owner suites through separate Cargo invocations. Cargo retains
+the target-directory lock while a test binary runs, so the job paid the serial
+sum even though the suites own independent test processes and the services are
+disposable per job.
+
+`scripts/run-db-suites.sh` selects the exact fourteen binaries from one
+authoritative partition, checks the observed set in both directions, and
+executes them through the bounded gate's shared concurrent runner. The local
+Docker gate consumes the complete set in one invocation. CI balances the set
+across four isolated service shards and aggregates their results; each four-core
+runner uses two binary processes with two libtest threads. Output optimization
+and test coverage are unchanged.
+
+The first single-runner candidate proved that build-once/run-many alone was not
+enough: the owner step reached 29 minutes and the job was cancelled at 30
+minutes 17 seconds. The timeout stays fixed. Parallel service shards supply the
+additional CPU needed to reduce wall time without weakening the detector; every
+shard retains the hard 30-minute budget.
+
+The shard closure matrix is authoritative:
+
+| Shard | Exact owners | #881 serial time | Isolation and acceptance |
+|-------|--------------|------------------:|--------------------------|
+| `catalog-stream` | `q3`, `q4b`, `q5b1` | 15:17 | disposable PostgreSQL + pgvector; required-mode configuration owners also run here |
+| `delivery-callbacks` | `a1`, `callbacks`, `q6`, `q5a` | 13:14 | disposable PostgreSQL + pgvector |
+| `vector-static` | `vc1`, `q1`, `q5b2` | 13:58 | disposable PostgreSQL + pgvector |
+| `portable-pool` | `q2`, `q4a`, `pool`, `a2` | 16:17 | disposable PostgreSQL + pgvector |
+
+`scripts/test-db-ci-scope.sh` compares the union to the canonical fourteen-name
+set, rejects duplicate membership, pins every matrix name, and proves unknown
+shards fail closed. `scripts/run-gate-binaries.sh` separately rejects a missing
+or extra Cargo artifact inside each shard. The required result aggregates the
+matrix job, so one cancelled, failed, missing, or timed-out shard is red.
 
 ## Item 2: lld linking on ELF
 
