@@ -337,7 +337,10 @@ facts must live in this repository.
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
   instrumented PGO, and `ld.lld` linking on ELF are complete. The roadmap
   retains the implementation evidence; it is not the live backlog. The dedicated
-  build-performance track is `docs/impl/21-build-perf-plan.md`.
+  build-performance track is `docs/impl/21-build-perf-plan.md`: items 1, 2, and
+  2a are shipped; item 3's pipelined-frontend/codegen design is the next
+  implementation; prebuilt cache distribution, residency, and function-level
+  incrementality remain behind it.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
