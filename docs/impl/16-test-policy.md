@@ -201,6 +201,25 @@ locally and their first execution silently moves to CI. That made CI the
 discovery loop: recent `pkg.db` waves paid repeated push→wait→read-log
 round-trips for failures that reproduce locally in seconds.
 
+The required check remains present on every PR, but the provisioned service job
+runs only when the exact committed diff reaches the database boundary. Direct
+`apps/db`, `pkg_db_*`, DB harness/fixture/golden, dependency, DB toolchain, and
+CI-gate changes qualify. A changed compiler source file also qualifies when its
+base or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite boundary.
+Deletions and uncomputable diffs fail closed. Other documentation, tooling,
+applications, leaf tests, and compiler source do not spend the roughly one-hour
+service gate. `scripts/db-ci-scope.sh` owns that classification and
+`scripts/test-db-ci-scope.sh` pins its positive, negative, and fail-closed
+cases.
+
+The lightweight `PostgreSQL integration (required)` result always runs and
+fails if classification failed or if a required service job did not succeed;
+job-level skipping therefore cannot conceal a classifier failure. A protected
+PR merge already passed the same required check against GitHub's test merge, so
+the subsequent two-parent `main` push does not repeat the service job. A direct
+push still classifies its exact diff, and manual dispatch always provisions both
+database services.
+
 `scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
 disposable Docker `postgres:16.4` with no optional extension and an isolated
 `pgvector/pgvector:0.8.6-pg16-bookworm` service with CI's exact credentials and environment,

@@ -321,6 +321,15 @@ explicit investigation phase (reproducing a CI-only failure, gathering
 platform data) may use CI runs as an instrument; ordinary implementation may
 not.
 
+The PostgreSQL required check is lightweight on unrelated diffs. Its separate
+service job runs only when `scripts/db-ci-scope.sh` classifies the committed
+range as reaching the database boundary; deletion and classification failure
+run it. The always-running required result fails unless that decision and any
+required service run succeeded. A protected two-parent PR merge does not repeat
+the service job on the following `main` push; direct pushes still classify and
+manual dispatch always runs it. Keep `scripts/test-db-ci-scope.sh` synchronized
+with this workflow contract.
+
 **Independent review and local gates may run concurrently.** The one fresh
 full-diff review is inspection-only (no builds or tests), so on a committed
 candidate it can run in parallel with the owner tests, the bounded gate, and
