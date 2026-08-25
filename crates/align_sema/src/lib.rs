@@ -17365,8 +17365,12 @@ impl<'a> EscapeCheck<'a> {
             // value here would falsely keep a frame-local input alive through the explicit copy.
             StorageContentInitializer::CloneIn => EscapeValueFact::default(),
             StorageContentInitializer::JsonDecoded => match &expression.kind {
+                // The owned route copies every accepted leaf into free-standing storage. Its
+                // generation must not retain the input fact: doing so turns a returned owner into
+                // a false frame/arena borrow even though `region_of` and `BorrowRootAnalyzer`
+                // correctly classify the same producer as independent.
+                ExprKind::JsonOwnedDecode { .. } => EscapeValueFact::default(),
                 ExprKind::JsonDecode { input, .. }
-                | ExprKind::JsonOwnedDecode { input, .. }
                 | ExprKind::JsonDecodeArray { input, .. }
                 | ExprKind::JsonDecodeStructArray { input, .. }
                 | ExprKind::JsonDecodeUnion { input, .. } => self.completed_escape_value(input),
@@ -18833,6 +18837,13 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::CloneIn { .. } | ExprKind::ArrayBuilderBuild(_)
         ) {
             return None;
+        }
+        // The dedicated owned JSON runtime ignores the enclosing arena and allocates every
+        // accepted owner free-standing. Keep this producer aligned with `region_of` and the
+        // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
+        // allocation context like the ordinary arena-aware collection producers below.
+        if matches!(expression.kind, ExprKind::JsonOwnedDecode { .. }) {
+            return Some(true);
         }
         if matches!(
             &expression.kind,
