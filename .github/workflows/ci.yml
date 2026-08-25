@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -22,8 +23,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  db-scope:
+    name: PostgreSQL change scope
+    runs-on: ubuntu-24.04
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify database boundary changes
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            printf 'required=true\nreason=manual-dispatch\n' >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = push ] && gh api \
+                 "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" | \
+                 jq -e --arg head "$HEAD_SHA" --arg base "$GITHUB_REF_NAME" \
+                   'any(.[]; .merged_at != null and .merge_commit_sha == $head and .base.ref == $base)' \
+                   >/dev/null; then
+            # The API, not the commit shape or message, establishes that this
+            # exact main commit is the protected PR merge that already passed
+            # the required check against GitHub's test merge.
+            printf 'required=false\nreason=protected-pr-merge\n' >> "$GITHUB_OUTPUT"
+          else
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+              BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+              TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"
+            else
+              # A direct push is classified by machinery from the preceding
+              # protected main revision, never by code introduced by the push.
+              TRUSTED_TIP="$BASE_SHA"
+            fi
+            trusted_classifier="$RUNNER_TEMP/db-ci-scope.sh"
+            if git show "$TRUSTED_TIP:scripts/db-ci-scope.sh" > "$trusted_classifier" 2>/dev/null; then
+              chmod +x "$trusted_classifier"
+              DB_CI_REPO_ROOT="$GITHUB_WORKSPACE" \
+                "$trusted_classifier" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            else
+              # One-PR bootstrap: origin/main does not own the classifier yet.
+              # Provisioning the service is the only trusted fallback.
+              printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   db-postgres:
-    name: PostgreSQL integration (required)
+    name: PostgreSQL integration
+    needs: db-scope
+    if: needs.db-scope.outputs.required == 'true'
     runs-on: ubuntu-24.04
     # Keep both server images explicit. The ordinary service remains the no-extension
     # compatibility floor; VC1's isolated service proves the existing SQL-native pgvector path.
@@ -253,6 +308,30 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+  db-required:
+    name: PostgreSQL integration (required)
+    needs:
+      - db-scope
+      - db-postgres
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enforce classified PostgreSQL result
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.db-scope.result }}
+          DB_REQUIRED: ${{ needs.db-scope.outputs.required }}
+          DB_RESULT: ${{ needs.db-postgres.result }}
+          DB_REASON: ${{ needs.db-scope.outputs.reason }}
+        run: |
+          echo "scope=$SCOPE_RESULT required=$DB_REQUIRED database=$DB_RESULT reason=$DB_REASON"
+          test "$SCOPE_RESULT" = success
+          case "$DB_REQUIRED" in
+            true) test "$DB_RESULT" = success ;;
+            false) test "$DB_RESULT" = skipped ;;
+            *) echo "database scope produced no valid decision" >&2; exit 1 ;;
+          esac
 
   build-and-test:
     name: ${{ matrix.name }}
