@@ -25,7 +25,6 @@
 # #781); burn-down list — delete lines as fixes land
 
 json_scan_identity	json_scan_cross_compiler_identity	env
-pkg_db_q5b1	meta_query_rejects_non_live_execution_targets_before_materialization
 pkg_db_q6	layer1_case_fingerprints_match_the_golden
 pkg_db_q6	postgres_compound_shaping_dispatches_once_on_connection_and_transaction
 pkg_db_q6	sqlite_user_groups_one_parent_and_segmented_matrices_are_exact
