@@ -857,6 +857,23 @@ would fail for the changed defect.
 | P33 | fid-space identity | F-1..F-4, including the negative that a fresh map would collide with unit 0 | `walk_tests::load_units_owns_the_low_file_id_space` |
 | P34 | link libs not derivable | an FFI `link("m")` with empty `capabilities` survives reuse | `ffi_declared_link_libraries_survive_reuse` |
 
+### 6.8 PLANNED — immutable release fallback
+
+Build-performance item 4 is specified by the public-contract ledger in
+`docs/impl/21-build-perf-plan.md`. It does not change either v1 codec or key.
+For unset/`on` `ALIGNC_CACHE`, the existing writable XDG root remains primary
+and an exact release may additionally read
+`<real-alignc-dir>/share/align/cache/<CACHE_SCHEMA_VERSION>` as an immutable
+fallback. `off`/empty disables both; an explicit path and `CacheContext::at`
+remain isolated to their one writable root. Lookup is primary, then packaged,
+then producer; publication and `cache clear` stay primary-only.
+
+The fallback is warmed by the final native release binary from byte-identical
+first-party `pkg` sources. `core`/`std` are compiler builtins rather than file
+units and therefore have no entry to distribute. The implementation remains
+pending; until it lands, the shipped behavior is the single writable root
+described in §§6.1 and 6.7.
+
 ---
 
 ## 7. Cache validation matrix

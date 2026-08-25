@@ -343,8 +343,12 @@ facts must live in this repository.
   cache-off corpus with identical output. Item 2b narrows service provisioning
   to direct DB/gate/dedicated-production paths or changed mixed-source hunks
   that name the boundary, so an unrelated function in a monolithic source no
-  longer inherits dormant DB markers elsewhere in that file. Prebuilt cache distribution,
-  residency, and function-level incrementality are the remaining items 4-6.
+  longer inherits dormant DB markers elsewhere in that file. Item 4's
+  prebuilt-cache distribution contract is settled: exact native release
+  compilers may read an adjacent immutable cache of byte-identical first-party
+  `pkg` units behind the writable XDG cache; `core`/`std` have no file-backed
+  unit to distribute, package source resolution is unchanged, and implementation
+  remains pending. Residency and function-level incrementality remain items 5-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

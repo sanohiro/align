@@ -30,6 +30,39 @@ Only a versioned release pays for that tuning: ordinary `--release` builds stay 
 
 The optional secrets make the external publishing steps fail closed: no secret means no tap or apt-repository mutation. Release assets are still produced.
 
+## Planned prebuilt-cache extension
+
+Build-performance item 4 is settled in `docs/impl/21-build-perf-plan.md` but is
+not implemented yet. Its implementation will add one target-native,
+compiler-exact tree to each archive:
+
+```text
+share/align/cache/1/
+  cas/
+  actions/
+    codegen/
+    unit/
+  index/
+    codegen/
+    unit/
+```
+
+Debian and Homebrew will retain this path relative to the real `alignc`
+executable. The tree is warmed only after the final PGO-use compiler is built,
+and the same binary that warmed it is the one copied into the package. At run
+time it is an immutable fallback behind the ordinary XDG cache, never a
+publication or `cache clear` target. Missing or unusable packaged bytes are a
+cache miss, not an installation failure.
+
+The corpus is the byte-exact first-party `pkg.db`, `pkg.web`, and `pkg.jwt`
+source at the release tag. Those source trees remain separately vendored by
+users and are not added to compiler import search or to the release archive.
+Compiler-provided `core` and `std` imports have no file-backed compilation unit,
+so they have no distributable unit-cache entry. Only the default
+release/baseline/runtime-LTO-on/non-ThinLTO codegen tuple is warmed; the
+frontend entries remain applicable to every backend configuration under their
+existing exact keys.
+
 ## Runtime dependencies are part of the product contract
 
 The distributed compiler is not self-contained:
