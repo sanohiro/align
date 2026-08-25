@@ -359,12 +359,11 @@ facts must live in this repository.
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,
   Requests 16–17 through #98, and Request 18 through #99.
-  Request 20's active Align capability adds the existing `m5_owned_json` owner to the required
-  `macos-15` PR leg and closes the discovered storage-generation regression that falsely retained a
-  `JsonOwnedDecode` input/arena fact; the complete owner passes locally on Apple Silicon. Its merge
-  condition is the required macOS PR leg running that owner green. After Request 20 completes,
-  Request 19's large-by-value-struct code-generation cost is the highest-priority align-llm request
-  and should start on the other development machine.
+  Request 20 is merged in PR #887: the required `macos-15` PR leg now runs the existing
+  `m5_owned_json` owner, and the discovered storage-generation regression no longer falsely retains
+  a `JsonOwnedDecode` input/arena fact. The complete owner passed locally on Apple Silicon and in the
+  required macOS CI leg. Request 19's large-by-value-struct code-generation cost is now the
+  highest-priority align-llm request and should start on the other development machine.
 
 Consumer-gated deferrals that remain intentional:
 
