@@ -15,8 +15,9 @@ Request 17's
 dynamic aggregate projection are implemented and real-client verified by align-llm PR #98 at
 `e44b3cca9f834266d6f541d7a68eec2b2c3de9ec`, pinned to this Align revision; C6c2 is complete.
 Request 14's exclusive-create and no-replace publication primitives are
-merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its
-`c6f2-request14-adoption` real-client gate remains pending. Request 7's signed merge verification (#848), decoded-owner cleanup
+merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` and real-client verified by
+align-llm PR #100 at `282062bf00416f5e0df678b8bd885709084b4e16`, pinned to Align merge
+`19c3db144c462bf7d6784f88d64cc124229b7ec2`; C6f2 is complete. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
@@ -135,8 +136,8 @@ work directory, with the prepare-time digest supplied to direct execution and an
 sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
-correctness/boundary owners, not accepted x86_64 performance evidence. Request 7 is now
-`ALIGN_MERGED`; no emulation is accepted
+correctness/boundary owners, not accepted x86_64 performance evidence. Request 7 is closed after
+the exact pin/adoption target and final capable gate passed in align-llm PR #94; no emulation is accepted
 in any evidence lane.
 
 The C-B borrow/ownership capability is complete
@@ -290,11 +291,9 @@ final preflight stamp was
 Owner tests, the bounded gate, Clippy, lint ratchet, Preflight, CI, and the
 required `Post-open review` status passed. The branch policy required
 `--auto --merge`; the merge completed after the final status was present.
-The Request 13 entry in `../align-llm/docs/align-requests.md` now records
-`ALIGN_MERGED`, PR #854, and the merge commit; that sibling edit remains
-intentionally uncommitted. The required `cargo build --release --workspace`
-also passed. Request 14's design and implementation are now merged; its
-`c6f2-request14-adoption` align-llm gate remains pending.
+The required `cargo build --release --workspace` also passed. Request 13 was later real-client
+verified and closed by the C6-LIFECYCLE pin wave in align-llm PR #94. Request 14's design and
+implementation are merged and its real-client adoption is closed by align-llm PR #100.
 
 ## Request 14 merge handoff
 
@@ -313,8 +312,8 @@ cleanup. The implementation merged in PR #861
 (`https://github.com/sanohiro/align/pull/861`) as
 `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`, with implementation head
 `cc89e637106343c87e9b6fe463d2d8b6f1b8676b`. Owner tests, the ABI golden, and
-the native race/symlink regressions are shipped; the
-`c6f2-request14-adoption` gate remains pending.
+the native race/symlink regressions are shipped. The `c6f2-request14-adoption` owner and final
+capable integration gate passed in align-llm PR #100, closing the request.
 
 ## Start here
 
@@ -356,29 +355,24 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **align-llm requests:** Request 4 is merged through Align design #798 and implementation #800;
-  Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
-  Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
-  implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
-  implementation is merged at `5aa5b23a`. Request 7 is `ALIGN_MERGED` through #850, including its
-  evidence boundary, decoded-owner prerequisite, and escaped-string implementation. Request 15 is
-  also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is merged through #852
-  against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON implementation is
-  merged through PR #854 as `340a3304724fefb56c2b1aa642e6b2b2c169e6d7` against
-  `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption is verified.
-  Request 14 is `ALIGN_MERGED` through implementation PR #861, merged as
-  `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its align-llm adoption gate remains pending.
-  Request 16 is `ALIGN_LLM_VERIFIED` through Align #857 and align-llm #98. Request 17's dynamic
-  aggregate projection implementation is merged through Align PR #865 at
-  `cdf333dc0707edbc4984dc8b1cb6b52edf7b48d0` and is `ALIGN_LLM_VERIFIED` through align-llm #98.
-  Request 18 is `ALIGN_LLM_VERIFIED` through Align #867 and align-llm #99.
+- **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
+  surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
+  evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,
+  Requests 16–17 through #98, and Request 18 through #99.
+  Request 20's active Align capability adds the existing `m5_owned_json` owner to the required
+  `macos-15` PR leg and closes the discovered storage-generation regression that falsely retained a
+  `JsonOwnedDecode` input/arena fact; the complete owner passes locally on Apple Silicon. Its merge
+  condition is the required macOS PR leg running that owner green. After Request 20 completes,
+  Request 19's large-by-value-struct code-generation cost is the highest-priority align-llm request
+  and should start on the other development machine.
 
 Consumer-gated deferrals that remain intentional:
 
 - Fully escaping function values wait for a consumer and a settled heap-owned
   environment/drop model.
-- `std.process` bounded/binary capture is complete for align-llm Request 11; client adoption still
-  requires pinning the merged implementation and running the request's focused real-client gate.
+- `std.process` bounded string capture and its real-client adoption are complete for align-llm
+  Request 11. The arbitrary-byte terminal is shipped as `run_bytes`; no additional adoption is
+  pending.
 - Top-level `array<str> := json.decode(...)` waits for a result representation
   that carries the input region. Struct fields of `array<str>` already ship;
   see `docs/impl/core-design/json.md`.

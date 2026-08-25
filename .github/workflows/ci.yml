@@ -452,6 +452,10 @@ jobs:
         if: ${{ !matrix.lint }}
         run: scripts/cargo.sh build --workspace --locked
 
+      - name: Owned-JSON boundary regressions (macOS)
+        if: runner.os == 'macOS'
+        run: scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
+
       - name: Bounded PR test gate
         if: matrix.lint
         run: scripts/test-pr.sh
