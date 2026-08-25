@@ -21,7 +21,7 @@ Order is priority.
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
 | 2b | DB CI changed-function scope | Implemented — direct DB/gate and dedicated DB-production paths remain unconditional, while mixed compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
-| 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
+| 4 | Prebuilt optimized cache distribution | Design settled below; implementation pending — ship warmed first-party `pkg` entries with each exact native compiler (compiler-provided `core`/`std` imports have no cacheable source unit) |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
 
@@ -379,6 +379,89 @@ actual outcome stream, and the timed builds produced byte-identical
 executables. Linux `/proc` task sampling observed the coordinator and LLVM
 workers both advancing in 115 ten-millisecond buckets. No PostgreSQL service
 ran; the corpus only supplied compiler work.
+
+## Item 4: prebuilt optimized cache distribution
+
+### Boundary and public-contract ledger
+
+This item makes an exact release compiler reuse work that the release runner has
+already performed for the first-party package corpus. It does not add compiled
+libraries, ambient package lookup, a package registry, or a binary interface
+between independently built compilers. Consumers still vendor source under
+`pkg/`; the ordinary source walk remains the only way a package enters a build.
+
+The original track shorthand said “std/pkg”. That is too broad. `core` and
+`std` imports are compiler-provided builtins and never become `LoadedUnit`s, so
+there is no independent frontend or object-cache entry to warm for them. The
+cacheable release corpus is the checked-in first-party source under
+`apps/web/pkg`, `apps/jwt/pkg`, and `apps/db/pkg`. A consumer receives a hit only
+for byte-identical reachable units from the same tagged source. The release
+still does not embed or ambiently resolve those source trees.
+
+| Public surface | Exact contract | Ownership, identity, and failure | Prerequisite and acceptance owner |
+|---|---|---|---|
+| release payload | Every native archive adds `share/align/cache/1/{cas,actions,index}` beside `alignc`, `align-repl`, and `libalign_runtime.a`; `1` is `CACHE_SCHEMA_VERSION`. Debian and Homebrew preserve that tree under the real executable directory, so the runtime path is always `<real-alignc-dir>/share/align/cache/<schema>`. Directly copying only the executable remains supported and simply has no packaged cache. | `.github/workflows/release.yml` owns creation after the final PGO-use binary exists. The archive checksum authenticates the payload as today; every manifest/key/blob is still decoded and digest-checked as untrusted input. The compiler never writes, removes, renames, or recursively scans this tree. Homebrew must suppress any cleanup/strip rewrite of the real compiler; re-keying after installation is forbidden because the published cache and archive compiler are one artifact. | Item 1 persistent cache and the final native release binary. Release layout tests enumerate the exact tree and reject staging files, unknown top-level namespaces, or writable publication into it. A generated local Homebrew formula is installed through Homebrew's real install/cleanup path on the native release runner; the installed real compiler must retain the warmed binary's SHA-256 and hit the packaged corpus. |
+| enable and root selection | Unset `ALIGNC_CACHE` or `ALIGNC_CACHE=on` resolves the existing XDG writable root and additionally enables the adjacent packaged root when it exists. Empty or `off` disables both. Any other value selects only that explicit writable root and deliberately excludes the packaged root, preserving an isolated test/build cache. An unresolvable default root or an unidentifiable compiler disables both. The four measurement toggles continue to disable both. | `CacheContext::from_env()` owns two `PathBuf`s for one invocation: the existing writable primary and at most one read-only fallback. `CacheContext::at(root)` remains isolated and has no fallback. No environment variable, CLI flag, cwd lookup, source-tree search, network access, or process-global mutable state is added. | Existing cache-root matrix plus a complete unset/on/off/empty/custom × packaged present/absent × default resolvable/unresolvable owner. |
+| lookup order | For both unit-frontend and codegen actions, lookup is exact key in writable primary, then exact key in packaged fallback, then producer. A packaged hit materializes/decodes directly and is not promoted into the writable root. A miss produces once and publishes only to the writable root. Primary publication therefore shadows a damaged or absent packaged entry on later processes. | Existing key equality is the authorization to reuse. Primary and packaged stores use the same codecs and lookup functions parameterized by read policy; there is no relaxed “trusted release” decoder. All returned summaries and objects retain their current owners and lifetimes; the extra allocation is one optional owned fallback path, while reads allocate the same bounded manifest/value buffers as an ordinary hit. | Parameterized frontend/codegen owners cover primary hit, fallback hit, both hit (primary wins), both miss, fallback hit after primary corrupt, and publish-after-fallback-miss. A producer counter proves a fallback hit invokes no frontend or LLVM producer. |
+| slot diagnostics | If the exact action misses, `FirstDiff` consults the writable slot first and the packaged slot second. The existing fixed component precedence is unchanged. `--cache-stats` continues to print `hit`/`miss`; it does not expose store provenance. | Slot pointers remain observability-only and can never authorize a hit. A malformed/foreign packaged slot is ignored exactly like a malformed/foreign writable slot. | Owners pin primary-before-packaged selection and prove changing vendored source reports the existing `unit source`/dependency reason rather than a false hit. |
+| corruption and I/O | Missing packaged root/file, permission denial, unknown format, key mismatch, or foreign schema is a clean miss. After an exact key match, malformed value bytes or a digest-bad blob print `alignc: packaged cache entry corrupt; rebuilding` at most once per process, leave the packaged bytes untouched, and fall through to production/publication. Writable corruption retains its existing unlink-and-rebuild behavior before fallback is tried. Producer, output-write, and link errors retain their current diagnostics and precedence. | The packaged tree is immutable even when filesystem permissions would allow writes. Exact-path reads may traverse installer-owned links, but every decoded key and content digest must match; runtime performs no directory walk. A packaged failure cannot fail an otherwise valid build. | Mutation owners cover every decoder stage, blob truncation/digest mismatch, unreadable paths, symlinked exact files, primary/fallback double corruption, and verify no packaged path changes. |
+| compiler/cache identity | Unit keys remain `UNIT_KEY_FORMAT_VERSION=1` plus `align_interface::FORMAT_VERSION` and the running-`alignc` byte hash. Every codegen/prelink/backend key additionally gains `llvm_build_id: Hash128` immediately after the exact `llvm_version` string; implementation bumps `CACHE_KEY_FORMAT_VERSION` 3→4 and `MANIFEST_FORMAT_VERSION` 3→4 while `CACHE_SCHEMA_VERSION` stays 1. `llvm_build_id` is the loader-producer's nominal build identity, not a structural digest of all library bytes: `Hash128::of(tag || raw-id)`, where tag `0` is the ELF GNU build-id note bytes and tag `1` is the Mach-O `LC_UUID` 16-byte payload from the dynamic library containing `LLVMGetVersion`. `Hash128` is encoded as existing little-endian `lo: u64`, then `hi: u64`. No path, package-version, or release-version fallback exists. | A bounded fail-closed ELF/Mach-O parser resolves the loaded library through `dladdr`, accepts native non-UTF-8 paths, validates every offset/size/count before reading the declared header/command/note range, and memoizes the result once per process. `dli_fname`'s required terminal NUL is removed; supported OS paths cannot contain an embedded NUL, and a null path pointer is rejected. Missing symbol/path/file, unknown object/tag, absent/duplicate build id, malformed range, or I/O failure disables codegen cache lookup/publication with one note while leaving frontend reuse and uncached production available. No loader/global state is changed. Version and build id are compared before target/profile/source components; `FirstDiff::LlvmVersion` keeps its ordinal and reports `llvm version/build`. | Independent semantic→byte and byte→semantic goldens pin all three v4 key/manifest layouts and the new field order. ELF32/ELF64 × endian and Mach-O 32/64 parsing owners cover valid, every truncation, overflow, duplicate/missing ID, non-UTF-8 path, and changed-build-id/same-version. Same LLVM version with a different build id must frontend-hit and codegen-miss. Release final-layout smoke requires both compiler and LLVM identities to match. |
+| warmed corpus and configuration | An empty private root is warmed once from a generated `module align_release_cache_warm` project with a trivial `main` that merges the three checked-in `pkg/` trees and imports `pkg.db`, `pkg.db.sqlite`, `pkg.db.postgres`, `pkg.db.pool`, `pkg.web`, `pkg.web.types`, `pkg.web.cookie`, `pkg.web.cors`, `pkg.web.multipart`, and `pkg.jwt`. The command is ordinary non-ThinLTO `alignc build`, `--profile release`, `--target-cpu baseline`, default runtime LTO on, PGO off. Only `actions/unit`, `actions/codegen`, their `index` slots, and referenced `cas` blobs enter the bundle. | The generated entry is training machinery, not a shipped API or source package; its exact cache entries are retained but cannot match an ordinary consumer entry. A manifest produced from the loaded-unit outcome stream records every expected first-party unit plus that one entry. The release fails if a checked-in first-party `.align` file is unreachable, any other unit is bundled, a referenced blob is absent, or an unreferenced blob remains. Descriptor/static-input application fixtures are excluded because their identities belong to consuming projects. | Release workflow owner compares source inventory, loaded outcomes, manifest inventory, and CAS references in both directions on every target. |
+| applicability | On the ordinary non-ThinLTO build/run/size path, frontend entries may serve every profile/CPU/runtime-LTO/PGO choice because those inputs remain absent from `UnitKey`. Shipped codegen entries serve only the default release/baseline/runtime-LTO-on/PGO-off tuple. Other ordinary backend tuples may take a packaged frontend hit but must codegen-miss. `--thin-lto` continues to require every MIR through `build_per_unit`, so it uses neither packaged frontend entries nor packaged codegen/prelink/backend entries; item 4 adds no reusable-MIR format. | Exact existing keys and verb routing enforce every case; no option is normalized toward the warmed tuple. Package private-body edits invalidate that unit's codegen; public/interface edits also invalidate importers according to the existing structural dependency closure. Exact revert may re-hit the packaged entry. | Cartesian owner crosses package unchanged/private edit/public edit with frontend/codegen and default/dev/fast/native/no-rt-lto/PGO modes on the ordinary path, then separately proves ThinLTO performs zero packaged lookups and preserves its current ordered prelink/backend report. |
+| clearing and upgrade | `alignc cache clear` removes only `cas`, `actions`, and `index` below the resolved writable root, exactly as today. It never touches packaged entries, so a later default build may still hit them. `ALIGNC_CACHE=off` is the single way to demand a genuinely cache-free build. Installing a new compiler selects its adjacent bundle and a new compiler fingerprint; stale writable entries remain unreachable under existing content keys until explicitly cleared. | User cache deletion remains bounded to its resolved root and keeps the existing symlink-safe removal. Package managers own removal of the packaged tree on uninstall/upgrade. | CLI owners prove clear → packaged hit, off → producer, custom root → no packaged hit, and uninstall/missing bundle → ordinary writable behavior. |
+| source/package contract | The cache does not make first-party packages available. Imports still resolve only from the entry tree, and users still audit/update vendored source. A source tree from another tag or with any byte edit cleanly misses the affected entries. No source tree, package manifest, lockfile, registry metadata, or download operation is added to the release surface by this item. | Compiler owns import discovery; release machinery owns only derived cache bytes. Generic body slices already present inside an interface summary remain governed by the existing cache codec and are not a usable or resolvable package source tree. | Existing package-resolution negatives plus a packaged-cache smoke where absent source still yields the normal `cannot find module` diagnostic before any applicable cache lookup. |
+| performance/resource evidence | Correctness requires exact eligible-unit hits and zero producer calls, not a wall-time threshold. Release evidence records archive-size delta and alternating cache-off versus empty-writable-plus-packaged-hit build time for each native artifact, with identical source, options, diagnostics, objects, executable, and stdout. | Measurements run after correctness on the final archive and do not enter the PR gate. No fixed speedup or bundle-size number is a public promise. | `bench/prebuilt_cache/run.sh` (implementation owner) and release summary artifact. |
+
+The additive library surface is exact:
+
+```text
+align_codegen_llvm::loaded_llvm_build_id() -> Option<Hash128>
+CacheContext::codegen_is_enabled(&self) -> bool
+```
+
+`loaded_llvm_build_id` owns the once-per-process loader/path/object parsing and
+returns `None` on every identity failure above. `CacheContext::is_enabled`
+continues to mean frontend/root availability;
+`CacheContext::codegen_is_enabled` additionally requires the LLVM identity.
+The existing public codegen-key builders retain their signatures and return
+their existing `Result`; every production caller checks `codegen_is_enabled`
+before key construction, while a direct caller under an unidentified LLVM gets
+the exact error `cannot identify loaded LLVM build for codegen cache`. Lookup
+then behaves as disabled and publication is a no-op, so the error never turns a
+valid CLI build into a failure. Both functions borrow no caller data and return
+no native handle or retained path.
+
+There are no detail levels, verification states, user-visible unavailable
+fields, retained native handles, connection-global operations, or user-visible
+record ordinals in this contract. The one native text input is `dladdr`'s
+borrowed NUL-terminated path; its encoding, NUL, ownership, validation, and
+pre-side-effect rules are fixed in the identity row. The applicable products
+are the environment matrix, lookup matrix, object-format parser matrix, and
+build-configuration matrix enumerated above; their orders and first failures
+are fixed there rather than delegated to an installer.
+
+### Implementation closure
+
+The implementation is one capability PR because the release producer and the
+runtime fallback are dormant without each other: landing either alone creates
+no stable consumer. Before coding, map these cells to the diff and owner tests:
+
+| Cell | Required closure |
+|---|---|
+| C1 root formation | Resolve the real executable directory once; append `share/align/cache/<CACHE_SCHEMA_VERSION>` without canonicalizing or scanning; preserve every existing `ALIGNC_CACHE` branch exactly. |
+| C2 frontend read | Parameterize unit-manifest lookup by writable versus immutable policy; preserve key-before-value validation, diagnostic `FileId` reattachment, stale-entry retry, construction, move-out, and return. |
+| C3 codegen read | Parameterize action/CAS lookup by policy; preserve digest verification, object materialization, primary corruption unlink, and no packaged mutation. |
+| C4 publication | Every miss/retry/error/early exit publishes only complete entries to the primary root; fallback hits, failures, and Drop publish nothing. |
+| C5 control paths | Cover build/run/size, cache-stats, package retry, malformed source, producer error, link error, `ALIGNC_CACHE=off`, custom roots, and `cache clear`; check/emit/explain paths remain unchanged. |
+| C6 artifact graph | Warm only after final PGO compiler/runtime production, copy the exact bundle into tar/Debian/Homebrew layouts, and verify every manifest/blob/source-inventory edge in both directions. |
+| C7 identity parity | Whole-program/per-unit construction, generic interface serialization, runtime-LTO digest, target resolution, compiler provenance, and allocation behavior reuse existing keys/codecs; the one v4 codegen-family codec adds the loaded LLVM build id to ordinary/prelink/backend keys and nowhere else. |
+| C8 output parity | Primary hit, packaged hit, cold miss, source edit, and exact revert produce byte-identical diagnostics, object bytes, link inputs, executable, and stdout for the same key. |
+| C9 installed identity | Native tar, extracted Debian/Homebrew layouts, and a real local-formula Homebrew installation retain the final compiler bytes, resolve the intended adjacent bundle, identify the exact loaded LLVM build, and hit before publication; any post-warm executable mutation fails the release. |
+
+The author-side matrix pass must point each cell to implementation and a
+regression before the implementation review. A finding in root selection,
+immutability, decoding, identity, or release inventory triggers a class-wide
+audit across both frontend and codegen stores.
 
 ## Item 2a: required DB owner build-once/run-many
 

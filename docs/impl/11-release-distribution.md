@@ -30,6 +30,52 @@ Only a versioned release pays for that tuning: ordinary `--release` builds stay 
 
 The optional secrets make the external publishing steps fail closed: no secret means no tap or apt-repository mutation. Release assets are still produced.
 
+## Planned prebuilt-cache extension
+
+Build-performance item 4 is settled in `docs/impl/21-build-perf-plan.md` but is
+not implemented yet. Its implementation will add one target-native,
+compiler-exact tree to each archive:
+
+```text
+share/align/cache/1/
+  cas/
+  actions/
+    codegen/
+    unit/
+  index/
+    codegen/
+    unit/
+```
+
+Debian and Homebrew will retain this path relative to the real `alignc`
+executable. The tree is warmed only after the final PGO-use compiler is built,
+and the same binary that warmed it is the one copied into the package. At run
+time it is an immutable fallback behind the ordinary XDG cache, never a
+publication or `cache clear` target. Missing or unusable packaged bytes are a
+cache miss, not an installation failure. The native release gate will install
+the generated Homebrew formula through Homebrew's real cleanup/relocation path,
+compare the installed real compiler with the warmed binary byte-for-byte, and
+require packaged hits; a formula that rewrites or strips the compiler after
+warming cannot ship.
+
+The corpus is the byte-exact first-party `pkg.db`, `pkg.web`, and `pkg.jwt`
+source at the release tag. Those source trees remain separately vendored by
+users and are not added to compiler import search or to the release archive.
+Compiler-provided `core` and `std` imports have no file-backed compilation unit,
+so they have no distributable unit-cache entry. Only the default
+release/baseline/runtime-LTO-on/non-ThinLTO codegen tuple is warmed. Frontend
+entries remain applicable to every ordinary non-ThinLTO backend configuration;
+ThinLTO deliberately keeps its existing all-MIR path and consults none of the
+packaged entries.
+
+The implementation also closes the existing dynamic-LLVM identity gap before
+distributing objects. Codegen, prelink, and backend keys will move to v4 and
+carry the loaded ELF GNU build id or Mach-O UUID in addition to the reported
+LLVM version. If that native identifier cannot be obtained and validated,
+frontend reuse remains available but all codegen cache reads and publications
+are disabled; a same-version generator from another package build can never
+consume the release objects.
+
 ## Runtime dependencies are part of the product contract
 
 The distributed compiler is not self-contained:
