@@ -325,10 +325,12 @@ The PostgreSQL required check is lightweight on unrelated diffs. Its separate
 service job runs only when `scripts/db-ci-scope.sh` classifies the committed
 range as reaching the database boundary; deletion and classification failure
 run it. The always-running required result fails unless that decision and any
-required service run succeeded. A protected two-parent PR merge does not repeat
-the service job on the following `main` push; direct pushes still classify and
-manual dispatch always runs it. Keep `scripts/test-db-ci-scope.sh` synchronized
-with this workflow contract.
+required service run succeeded. PRs execute the trusted base's classifier; its
+one-PR introduction fails closed to running the service. A `main` push avoids
+the duplicate service run only when GitHub identifies its exact head as a
+merged PR into that branch; an unassociated direct push uses the preceding main
+classifier, and manual dispatch always runs it. Keep
+`scripts/test-db-ci-scope.sh` synchronized with this workflow contract.
 
 **Independent review and local gates may run concurrently.** The one fresh
 full-diff review is inspection-only (no builds or tests), so on a committed

@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -37,23 +38,41 @@ jobs:
         id: scope
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             printf 'required=true\nreason=manual-dispatch\n' >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_EVENT_NAME" = push ] &&
-               [ "$(git rev-list --parents -n 1 "$HEAD_SHA" | awk '{ print NF }')" -gt 2 ]; then
-            # Protected PR merges already passed this required check against
-            # GitHub's test merge. Do not spend another hour proving the same
-            # tree on the subsequent main push. A direct push still classifies
-            # its exact diff and fails closed like a PR.
+          elif [ "$GITHUB_EVENT_NAME" = push ] && gh api \
+                 "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" | \
+                 jq -e --arg head "$HEAD_SHA" --arg base "$GITHUB_REF_NAME" \
+                   'any(.[]; .merged_at != null and .merge_commit_sha == $head and .base.ref == $base)' \
+                   >/dev/null; then
+            # The API, not the commit shape or message, establishes that this
+            # exact main commit is the protected PR merge that already passed
+            # the required check against GitHub's test merge.
             printf 'required=false\nreason=protected-pr-merge\n' >> "$GITHUB_OUTPUT"
           else
             if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
               BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+              TRUSTED_TIP="$(git rev-parse "origin/$BASE_REF")"
+            else
+              # A direct push is classified by machinery from the preceding
+              # protected main revision, never by code introduced by the push.
+              TRUSTED_TIP="$BASE_SHA"
             fi
-            scripts/db-ci-scope.sh "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            trusted_classifier="$RUNNER_TEMP/db-ci-scope.sh"
+            if git show "$TRUSTED_TIP:scripts/db-ci-scope.sh" > "$trusted_classifier" 2>/dev/null; then
+              chmod +x "$trusted_classifier"
+              DB_CI_REPO_ROOT="$GITHUB_WORKSPACE" \
+                "$trusted_classifier" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            else
+              # One-PR bootstrap: origin/main does not own the classifier yet.
+              # Provisioning the service is the only trusted fallback.
+              printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   db-postgres:

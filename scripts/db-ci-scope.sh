@@ -12,7 +12,7 @@
 # database boundary all require the provisioned job.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "${DB_CI_REPO_ROOT:-$(dirname "$0")/..}"
 
 base_sha="${1:-}"
 head_sha="${2:-}"
@@ -43,13 +43,15 @@ source_names_database_boundary() {
 while IFS= read -r -d '' path; do
   [ -n "$path" ] || continue
   case "$path" in
-    Cargo.toml | Cargo.lock | rust-toolchain.toml | crates/*/Cargo.toml | \
+    Cargo.toml | Cargo.lock | build.rs | rust-toolchain | rust-toolchain.toml | \
+    .cargo/config | .cargo/config.toml | crates/*/Cargo.toml | \
     .github/workflows/ci.yml | \
     scripts/db-ci-scope.sh | scripts/test-db-ci-scope.sh | \
     scripts/db-verify-local.sh | scripts/check-libpq-version.sh | \
-    scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | \
+    scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | scripts/cargo.sh | \
     apps/db/* | \
     crates/align_driver/tests/pkg_db_*.rs | \
+    crates/*/tests/common* | crates/*/tests/helpers/* | \
     crates/align_driver/tests/db_harness/* | \
     crates/align_driver/tests/fixtures/pkg_db_* | \
     crates/align_driver/tests/golden/*postgres* | \
@@ -58,7 +60,7 @@ while IFS= read -r -d '' path; do
       emit true database-boundary
       exit 0
       ;;
-    crates/*/src/*)
+    crates/*/src/* | crates/*/build.rs | crates/*/tests/*.rs | crates/*/tests/*/*.rs)
       if source_names_database_boundary "$base_sha" "$path" ||
          source_names_database_boundary "$head_sha" "$path"; then
         emit true database-source
