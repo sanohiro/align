@@ -78,13 +78,26 @@ git -C "$fixture" commit -qm direct-db-owner
 direct_owner="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$shared_harness" "$direct_owner"
 
+# Adding and deleting an unrelated leaf owner must not provision PostgreSQL.
+printf 'fn identity_owner() {}\n' > "$fixture/crates/demo/tests/json_identity.rs"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm unrelated-leaf-owner
+leaf_owner="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$direct_owner" "$leaf_owner"
+
+rm "$fixture/crates/demo/tests/json_identity.rs"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-unrelated-leaf-owner
+leaf_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$leaf_owner" "$leaf_deleted"
+
 # Direct package and workflow machinery changes are always included.
 mkdir -p "$fixture/apps/db" "$fixture/.github/workflows"
 printf 'db\n' > "$fixture/apps/db/main.align"
 git -C "$fixture" add .
 git -C "$fixture" commit -qm db-package
 db_package="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$direct_owner" "$db_package"
+assert_scope true "$leaf_deleted" "$db_package"
 
 printf 'name: CI\n' > "$fixture/.github/workflows/ci.yml"
 git -C "$fixture" add .
@@ -92,13 +105,27 @@ git -C "$fixture" commit -qm db-workflow
 workflow="$(git -C "$fixture" rev-parse HEAD)"
 assert_scope true "$db_package" "$workflow"
 
-# Deletions and unreadable ranges fail closed.
+# An unrelated deletion stays out of the service job.
 rm "$fixture/apps/web/main.align"
 git -C "$fixture" add -u
-git -C "$fixture" commit -qm deletion
-deleted="$(git -C "$fixture" rev-parse HEAD)"
-assert_scope true "$workflow" "$deleted"
-assert_scope true not-a-commit "$deleted"
+git -C "$fixture" commit -qm unrelated-deletion
+unrelated_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope false "$workflow" "$unrelated_deleted"
+
+# Deleted DB-naming source is classified from its base content, and a deleted
+# direct DB path is classified by path. Unreadable ranges still fail closed.
+rm "$fixture/crates/demo/tests/direct.rs"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-db-source
+db_source_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$unrelated_deleted" "$db_source_deleted"
+
+rm "$fixture/apps/db/main.align"
+git -C "$fixture" add -u
+git -C "$fixture" commit -qm delete-db-path
+db_path_deleted="$(git -C "$fixture" rev-parse HEAD)"
+assert_scope true "$db_source_deleted" "$db_path_deleted"
+assert_scope true not-a-commit "$db_path_deleted"
 
 # CI extracts the trusted classifier outside the checkout. Its explicit root
 # binding must still classify the repository rather than the temporary file's

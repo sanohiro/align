@@ -7,9 +7,11 @@
 #   required=true|false
 #   reason=<single-line explanation>
 #
-# Classification fails closed. An unreadable range, a deletion, dependency or
-# DB-gate machinery, a pkg.db surface/owner, or compiler source that names the
-# database boundary all require the provisioned job.
+# Classification fails closed for an unreadable range. Dependency or DB-gate
+# machinery, a pkg.db surface/owner, or compiler source that names the database
+# boundary in either the base or head all require the provisioned job. Deletions
+# use those same path/content rules rather than provisioning PostgreSQL merely
+# because something unrelated was removed.
 set -euo pipefail
 
 cd "${DB_CI_REPO_ROOT:-$(dirname "$0")/..}"
@@ -26,11 +28,6 @@ if [ -z "$base_sha" ] || [ -z "$head_sha" ] ||
    ! git cat-file -e "$head_sha^{commit}" 2>/dev/null ||
    ! git diff --no-renames --name-only "$base_sha..$head_sha" >/dev/null 2>&1; then
   emit true uncomputable-diff
-  exit 0
-fi
-
-if ! git diff --quiet --no-renames --diff-filter=D "$base_sha..$head_sha" --; then
-  emit true deletion
   exit 0
 fi
 

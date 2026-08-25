@@ -205,9 +205,10 @@ The required check remains present on every PR, but the provisioned service job
 runs only when the exact committed diff reaches the database boundary. Direct
 `apps/db`, `pkg_db_*`, DB harness/fixture/golden, dependency, DB toolchain, and
 CI-gate changes qualify. Shared test harnesses consumed by the DB suites also
-qualify. A changed compiler source or owner-test file qualifies when its base
-or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite boundary.
-Deletions and uncomputable diffs fail closed. Other documentation, tooling,
+qualify. A changed or deleted compiler source or owner-test file qualifies when
+its base or head content names the `pkg.db`, PostgreSQL/libpq, or SQLite
+boundary. Deleted direct DB paths qualify by path; unrelated deletions do not.
+Uncomputable diffs fail closed. Other documentation, tooling,
 applications, leaf tests, and compiler source do not spend the roughly one-hour
 service gate. `scripts/db-ci-scope.sh` owns that classification and
 `scripts/test-db-ci-scope.sh` pins its positive, negative, and fail-closed
