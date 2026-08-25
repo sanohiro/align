@@ -870,9 +870,18 @@ then producer; publication and `cache clear` stay primary-only.
 
 The fallback is warmed by the final native release binary from byte-identical
 first-party `pkg` sources. `core`/`std` are compiler builtins rather than file
-units and therefore have no entry to distribute. The implementation remains
-pending; until it lands, the shipped behavior is the single writable root
-described in §§6.1 and 6.7.
+units and therefore have no entry to distribute. Ordinary non-ThinLTO builds
+may reuse packaged frontend entries across backend options; ThinLTO keeps its
+existing all-MIR walk and consults no packaged entry.
+
+Before distribution, the codegen-family keys move from v3 to v4 and add the
+validated build identity of the dynamically loaded LLVM library beside its
+reported version: ELF GNU build-id bytes or the Mach-O `LC_UUID`, hashed with a
+format tag. A same-version different build therefore misses. Failure to locate,
+parse, or identify the loaded library disables codegen cache reads and writes
+while leaving frontend reuse and uncached production available. The
+implementation remains pending; until it lands, the shipped behavior is the
+single writable root and v3 codegen identity described in §§6.1–6.7.
 
 ---
 

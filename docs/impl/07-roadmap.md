@@ -3493,6 +3493,15 @@ Remainders → S3b (all per the settled record): parallel codegen over misses, `
 `-j` / `ALIGNC_JOBS` / `cache clear`, runtime-archive mtime → content digest, default-ON flip
 gated on the cold-vs-hit gate; then SV.
 
+**Planned item-4 identity strengthening:** the shipped version string does not
+distinguish two vendor builds of the same dynamically loaded LLVM. Before any
+release cache is distributed, doc-21 item 4 bumps all codegen-family keys to v4
+and adds the loaded ELF GNU build id or Mach-O UUID. Failure to identify that
+library disables codegen caching while leaving frontend reuse and uncached
+production available. This applies equally to the ordinary, ThinLTO prelink,
+and ThinLTO backend keys; the historical S3a evidence above remains the v3
+implementation record.
+
 **M15 S3b SHIPPED — MERGED as #455 (2026-07-15; workspace 2061 green + clippy `-D warnings`
 clean). S3 is COMPLETE.** All five S3b items per the settled record: **(1) parallel unit codegen
 over cache misses** — serial lookups first (they produce the DAG ordering), then

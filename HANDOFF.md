@@ -347,8 +347,11 @@ facts must live in this repository.
   prebuilt-cache distribution contract is settled: exact native release
   compilers may read an adjacent immutable cache of byte-identical first-party
   `pkg` units behind the writable XDG cache; `core`/`std` have no file-backed
-  unit to distribute, package source resolution is unchanged, and implementation
-  remains pending. Residency and function-level incrementality remain items 5-6.
+  unit to distribute, package source resolution is unchanged, and ThinLTO keeps
+  its all-MIR path. Implementation first bumps codegen-family keys to include
+  the loaded LLVM build id and release-gates the actual installed Homebrew
+  binary, and remains pending. Residency and function-level incrementality
+  remain items 5-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
