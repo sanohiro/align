@@ -21004,8 +21004,11 @@ fn main() -> i32 = 0
                       }\n\
                       fn main() -> i32 = 0\n";
         let program = mir(source);
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
-            .expect("a matching borrowed array-to-slice projection must lower");
+        let valid = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None);
+        assert!(
+            valid.is_ok(),
+            "a matching borrowed array-to-slice projection must lower: {valid:?}"
+        );
 
         let mut malformed = program;
         let mut changed = false;
@@ -21028,9 +21031,14 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the projected slice call operand");
-        let error = emit_llvm_ir(&malformed, &BuildTarget::Baseline, false, &[], None)
-            .expect_err("a slice view forged from an array with another element must fail closed");
-        assert_lowering(error, "borrowed place type disagrees with its field path");
+        let malformed = emit_llvm_ir(&malformed, &BuildTarget::Baseline, false, &[], None);
+        assert!(
+            malformed.is_err(),
+            "a slice view forged from an array with another element must fail closed"
+        );
+        if let Err(error) = malformed {
+            assert_lowering(error, "borrowed place type disagrees with its field path");
+        }
     }
 
     #[test]

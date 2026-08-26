@@ -276,9 +276,16 @@ pub fn run() -> i64 {\n\
     );
     let mut source_map = SourceMap::new();
     let checked = check(&mut source_map, "borrowed-sum-array-view-retype-mir", &source);
-    let mir = align_mir::lower_program_checked(&checked.hir, false, None)
-        .expect("borrowed projection view retypes must validate");
-    let rendered = align_mir::print::program_to_string(&mir);
+    let mir = align_mir::lower_program_checked(&checked.hir, false, None);
+    assert!(
+        mir.is_ok(),
+        "borrowed projection view retypes must validate: {mir:?}"
+    );
+    let rendered = if let Ok(mir) = mir {
+        align_mir::print::program_to_string(&mir)
+    } else {
+        String::new()
+    };
     assert!(
         rendered.contains("call program argc(borrow slot")
             && rendered.contains("call program row_total(borrow slot"),
