@@ -1,6 +1,7 @@
 # Borrow-safe dynamic aggregate projection
 
-Status: **IMPLEMENTED; exact align-llm Request 17 adoption pending.**
+Status: **IMPLEMENTED; Request 17 adopted, Request 21 projection-view repair implemented with
+align-llm adoption pending.**
 
 This document extends the borrowed sum-payload projection shipped by
 `26-borrowed-sum-projection-plan.md`. The shipped capability intentionally rejects every dynamic
@@ -411,6 +412,30 @@ owner drops a direct borrowed place during the reservation and must fail before 
 Together these owners close formation order, lexical lifetime, projection storage, and direct-place
 derivation as one use-site validity axis.
 
+### Closure matrix reopened: borrowed projection view retype
+
+The Request 21 real-client owner exposed one final cross-stage type-identity gap. Sema correctly
+formed `ArrayToSlice` when a dynamic array field below a borrowed sum projection was passed to a
+`slice<T>` parameter. MIR retained the borrowed field path and changed only its declared result
+type to the layout-identical slice view. LLVM's malformed-place guard nevertheless required that
+view type to equal the owning array type reached by the field path, so `check` succeeded and
+`build` failed before code generation.
+
+The field path and the view type have distinct exact roles. Path replay must first recover the
+owning source type. A retyped borrowed place is then valid only for the existing layout-identical
+`string` to `str`/byte-slice conversions, `DynArray<S>` to `slice<S>`, or AoS
+`DynStructArray<R>` to `slice<R>`, with canonical structural element identity. No other array
+class, layout, or element change is admitted. Pointer lowering continues to address the original
+owner in place and loads only the two-word view; it creates no owner, allocation, clone, source
+nulling, or cleanup.
+
+The focused owner covers scalar and AoS record arrays under `Some`, the `None` arm, sibling fields
+before and after the match, repeated use and calls, whole/per-unit execution, and source-owner
+survival. A codegen mutation redirects a valid `slice<str>` descriptor to an `array<i64>` sibling
+while retaining the forged view type and requires rejection before LLVM GEP/load construction.
+The existing checked-HIR and MIR representation, public contract, interface, cache, and runtime ABI
+are unchanged; no benchmark or target-local qualification is required.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -490,3 +515,4 @@ The author-side ledger-to-prose pass is complete:
 | P1 use-site-root review: checked HIR accepted a same-typed local that was declared later, out of scope, or projection-only | Add one stack-safe source-order/scope pass. Require the exact root to be live at the `BorrowedIndex` event and independently storage-owning before path and owner-fact validation. Add later-local, exited-scope, and projection-binding mutations. |
 | P1 direct-place review: operand-based termination could free the root through `BorrowedPlace` | Extend the shared derivation query to direct and nested borrowed places, and add a malformed direct-place `DropValue` owner that fails before pointer construction. |
 | P2 final review: index checking dropped the i64 result context needed to infer generic index-producing calls | Route ordinary and borrowed-element indices through one index-specific contextual checker. It supplies i64 to producer inference, skips final value reconciliation only when the checked index cannot fall through, and retains the existing integer rejection on reachable values. One owner covers generic result inference in both index paths; the termination-family owners preserve return, break, exit, abort, and divergence behavior. |
+| Request 21 real-client finding: `ArrayToSlice` below a borrowed sum projection checked successfully but LLVM validation compared its slice view type directly with the owning array field-path type | Replay the owning path first, then admit only exact canonical scalar/AoS array-to-slice layout retypes beside the existing string view retypes. Whole/per-unit Some/None execution and a mismatched-element malformed-MIR mutation close the source/view distinction. |

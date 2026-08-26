@@ -232,6 +232,109 @@ fn main() -> i32 = 0\n\
 }
 
 #[test]
+fn borrowed_sum_array_views_build_and_run_whole_and_per_unit() {
+    let body = "\
+Command { argv: array<str> }\n\
+Task { build: Command, targeted: Option<Command>, full: Command }\n\
+Row { value: i64 }\n\
+Rows { values: array<Row> }\n\
+fn argc(argv: slice<str>) -> i64 = argv.len()\n\
+fn row_total(rows: slice<Row>) -> i64 = rows.len()\n\
+fn inspect(borrow task: Task) -> i64 {\n\
+  before := argc(task.build.argv) + argc(task.full.argv)\n\
+  targeted := match task.targeted {\n\
+    Some(command) => argc(command.argv) + argc(command.argv)\n\
+    None => 0\n\
+  }\n\
+  return before + targeted + argc(task.build.argv) + argc(task.full.argv)\n\
+}\n\
+fn inspect_rows(borrow rows: Option<Rows>) -> i64 = match rows {\n\
+  Some(value) => row_total(value.values) + row_total(value.values)\n\
+  None => 0\n\
+}\n\
+pub fn run() -> i64 {\n\
+  arena {\n\
+    present := Task {\n\
+      build: Command { argv: [\"build\"].to_array() },\n\
+      targeted: Some(Command { argv: [\"target\", \"fast\"].to_array() }),\n\
+      full: Command { argv: [\"full\", \"suite\", \"all\"].to_array() },\n\
+    }\n\
+    absent := Task {\n\
+      build: Command { argv: [\"build\"].to_array() },\n\
+      targeted: None,\n\
+      full: Command { argv: [\"full\", \"suite\", \"all\"].to_array() },\n\
+    }\n\
+    rows: Option<Rows> := Some(Rows { values: [Row { value: 5 }, Row { value: 6 }].to_array() })\n\
+    return inspect(present) + inspect(present) + inspect(absent) + inspect_rows(rows)\n\
+  }\n\
+}\n";
+    let source = format!("{body}fn main() -> i32 {{ if run() == 36 {{ return 42 }}; return 0 }}\n");
+    assert!(
+        !check_errs("borrowed-sum-array-view-retype", &source),
+        "{}",
+        check_diagnostics("borrowed-sum-array-view-retype", &source)
+    );
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "borrowed-sum-array-view-retype-mir", &source);
+    let mir = align_mir::lower_program_checked(&checked.hir, false, None)
+        .expect("borrowed projection view retypes must validate");
+    let rendered = align_mir::print::program_to_string(&mir);
+    assert!(
+        rendered.contains("call program argc(borrow slot")
+            && rendered.contains("call program row_total(borrow slot"),
+        "array-to-slice views must retain borrowed field paths:\n{rendered}"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-sum-array-view-retype", &source)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+
+    let module = format!("module views\n{body}");
+    let files = &[
+        ("views.align", module.as_str()),
+        (
+            "main.align",
+            "import views\nfn main() -> i32 { if views.run() == 36 { return 42 }; return 0 }\n",
+        ),
+    ];
+    let differential = diff_check_multi(
+        "borrowed-sum-array-view-retype-per-unit",
+        files,
+        "main.align",
+    );
+    assert_eq!(
+        differential.whole_errors,
+        differential.per_unit_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    assert!(
+        !differential.whole_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    if backend_available() {
+        assert_eq!(
+            build_per_unit_multi(
+                "borrowed-sum-array-view-retype-per-unit",
+                files,
+                "main.align",
+            )
+            .link_and_run()
+            .status
+            .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
 fn borrowed_sum_match_reads_copy_scalars_through_nested_move_payloads() {
     let source = "\
 Record { text: string, count: i64 }\n\

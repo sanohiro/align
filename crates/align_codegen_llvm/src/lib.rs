@@ -19167,11 +19167,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 },
             };
         }
-        let layout_retype = matches!((ty, place.ty),
+        let layout_retype = match (ty, place.ty) {
             (Ty::String, Ty::Str)
-                | (Ty::String, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })))
-                | (Ty::Str, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })))
-        );
+            | (Ty::String, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })))
+            | (Ty::Str, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))) => true,
+            (Ty::DynArray(actual), Ty::Slice(expected)) => source_ty_matches(
+                align_sema::scalar_to_ty(actual),
+                align_sema::scalar_to_ty(expected),
+                self.program,
+            )?,
+            (
+                Ty::DynStructArray(actual, align_sema::Layout::Aos),
+                Ty::Slice(Scalar::Struct(expected)),
+            ) => source_ty_matches(
+                Ty::Struct(actual),
+                Ty::Struct(expected),
+                self.program,
+            )?,
+            _ => false,
+        };
         if ty != place.ty && !layout_retype {
             return Err(self.err("borrowed place type disagrees with its field path"));
         }
@@ -20978,6 +20992,45 @@ fn main() -> i32 = 0
         let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a borrowed place with a forged type must fail closed");
         assert_lowering(error, "callable target invalid:696e7370656374");
+    }
+
+    #[test]
+    fn borrowed_projection_array_view_retype_checks_the_source_element() {
+        let source = "Payload { numbers: array<i64>, words: array<str> }\n\
+                      fn argc(values: slice<str>) -> i64 = values.len()\n\
+                      fn inspect(borrow value: Option<Payload>) -> i64 = match value {\n\
+                        Some(payload) => argc(payload.words)\n\
+                        None => 0\n\
+                      }\n\
+                      fn main() -> i32 = 0\n";
+        let program = mir(source);
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect("a matching borrowed array-to-slice projection must lower");
+
+        let mut malformed = program;
+        let mut changed = false;
+        for function in &mut malformed.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), args)) = statement
+                    else {
+                        continue;
+                    };
+                    if target.as_str() == "argc"
+                        && let Operand::BorrowedPlace(place) = &mut args[0]
+                        && let Some(hir::BorrowedPathSegment::StructField(field)) =
+                            place.path.last_mut()
+                    {
+                        *field = 0;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the projected slice call operand");
+        let error = emit_llvm_ir(&malformed, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a slice view forged from an array with another element must fail closed");
+        assert_lowering(error, "borrowed place type disagrees with its field path");
     }
 
     #[test]
