@@ -79,6 +79,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         base: inkwell::values::PointerValue<'c>,
         ty: Ty,
     ) -> Result<(), CodegenError> {
+        self.emit_drop_at_iterative_in(self.func, base, ty)
+    }
+
+    /// The target-selectable form used to define a private struct destructor while an ordinary
+    /// function body is being emitted. Cleanup itself remains one iterative CFG inside `function`;
+    /// it never calls another generated struct helper, so runtime stack depth does not follow the
+    /// nominal type depth.
+    pub(super) fn emit_drop_at_iterative_in(
+        &self,
+        function: FunctionValue<'c>,
+        base: inkwell::values::PointerValue<'c>,
+        ty: Ty,
+    ) -> Result<(), CodegenError> {
         enum Work<'c> {
             Drop {
                 base: inkwell::values::PointerValue<'c>,
@@ -148,8 +161,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_load(self.ctx.i8_type(), tag_ptr, "dropopttag")
                             .map_err(|error| self.err(error))?
                             .into_int_value();
-                        let some = self.ctx.append_basic_block(self.func, "drop.opt.some");
-                        let cont = self.ctx.append_basic_block(self.func, "drop.opt.cont");
+                        let some = self.ctx.append_basic_block(function, "drop.opt.some");
+                        let cont = self.ctx.append_basic_block(function, "drop.opt.cont");
                         let is_some = self
                             .builder
                             .build_int_compare(
@@ -189,7 +202,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_load(self.ctx.i8_type(), tag_ptr, "droprestag")
                             .map_err(|error| self.err(error))?
                             .into_int_value();
-                        let cont = self.ctx.append_basic_block(self.func, "drop.result.cont");
+                        let cont = self.ctx.append_basic_block(function, "drop.result.cont");
                         let candidates = [
                             (0u64, 1u32, scalar_to_ty(ok), "drop.result.ok"),
                             (1u64, 2u32, scalar_to_ty(err), "drop.result.err"),
@@ -206,7 +219,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 )
                             })
                             .map(|(tag, field, ty, name)| {
-                                (tag, field, ty, self.ctx.append_basic_block(self.func, name))
+                                (tag, field, ty, self.ctx.append_basic_block(function, name))
                             })
                             .collect::<Vec<_>>();
                         let cases = branches
@@ -287,14 +300,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_load(self.ctx.i32_type(), tag_ptr, "droptagv")
                             .map_err(|error| self.err(error))?
                             .into_int_value();
-                        let cont = self.ctx.append_basic_block(self.func, "drop.enum.cont");
+                        let cont = self.ctx.append_basic_block(function, "drop.enum.cont");
                         let branches = owned
                             .into_iter()
                             .map(|(tag, fields)| {
                                 (
                                     tag,
                                     fields,
-                                    self.ctx.append_basic_block(self.func, "drop.enum.v"),
+                                    self.ctx.append_basic_block(function, "drop.enum.v"),
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -341,9 +354,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .get(id as usize)
                             .ok_or_else(|| self.err(format!("struct type id {id} is missing")))?;
                         let i64_type = self.ctx.i64_type();
-                        let head = self.ctx.append_basic_block(self.func, "dropdeep.head");
-                        let body = self.ctx.append_basic_block(self.func, "dropdeep.body");
-                        let done = self.ctx.append_basic_block(self.func, "dropdeep.done");
+                        let head = self.ctx.append_basic_block(function, "dropdeep.head");
+                        let body = self.ctx.append_basic_block(function, "dropdeep.body");
+                        let done = self.ctx.append_basic_block(function, "dropdeep.done");
                         let predecessor = self
                             .builder
                             .get_insert_block()
@@ -472,7 +485,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::String
                     | Ty::DynArray(_)
                     | Ty::DynStructArray(..)
-                    | Ty::DynSliceArray(_) => {
+                    | Ty::DynSliceArray(_)
+                    | Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..) => {
                         let aggregate = self
                             .builder
                             .build_load(slice_struct_type(self.ctx), base, "dropslicev")

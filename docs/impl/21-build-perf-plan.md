@@ -21,6 +21,7 @@ Order is priority.
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
 | 2b | DB CI changed-function scope | Implemented — direct DB/gate and dedicated DB-production paths remain unconditional, while mixed compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
+| 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
 | 4 | Prebuilt optimized cache distribution | Design settled below; implementation pending — ship warmed first-party `pkg` entries with each exact native compiler (compiler-provided `core`/`std` imports have no cacheable source unit) |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
@@ -30,6 +31,86 @@ Order is priority.
 Measured on `pkg.db`: cold per-unit codegen ~9s versus frontend ~3.4s.
 Caching (items 1–4) removes re-paying, parallelism (3) and residency (5)
 shorten the wall clock, and granularity (6) shrinks the unit of re-payment.
+
+## Item 3a: shared recursive-Drop codegen
+
+### Measured problem and contract
+
+align-llm Request 19 supplies the first real-client owner: a 1,573-line verifier
+fixture with 39 wide Move-record types and many early exits. At Align
+`f57b986bc9326ba8d75dad5dbe4c6531c0f872b6` on Linux x86_64,
+`alignc check` completes in 2.23 seconds and raw LLVM emission completes in 7.80
+seconds, but the fixture unit's `main` contains about 1.42 million raw IR lines.
+The dominant repeated shape is not an aggregate load or store: every cleanup
+site receives a fresh copy of the complete recursive Drop CFG, including loops
+over owned dynamic arrays. A cold optimized build remains inside one LLVM job
+after minutes while its resident set grows past 800 MiB.
+
+This item changes compiler-internal lowering only. Language ownership,
+source-visible diagnostics and their order, MIR, interfaces, runtime ABI,
+package ABI, allocation, generated-program effects, cleanup eligibility, field
+order, active tagged-arm selection, element order, and exactly-once Drop remain
+unchanged. Codegen emits one private `nounwind void(ptr)` helper for each Move
+struct reached as a Drop-site root in a module. Each ordinary struct Drop,
+replacement Drop, fixed-array element Drop, and dynamic-array element Drop
+passes the exact existing storage pointer to that helper. The helper contains
+the existing canonical pointer-based **iterative** Drop plan once and returns
+only after all children have been released in their current order. A generated
+helper never calls another compiler-generated Drop helper: nested structs and
+tagged/array children stay on that helper's compiler-emitted iterative CFG, so
+generated-program call-stack depth is one regardless of nominal type depth.
+Its symbol is module-private and its authoritative handle is indexed only by
+the module-local struct id; it is neither an interface symbol nor a cross-unit
+dependency.
+
+The running `alignc` byte hash already participates in every codegen, prelink,
+and backend cache key, so changed helper emission invalidates old objects
+without a cache-format or manifest-format change. Frontend cache entries remain
+valid because HIR, MIR, interfaces, and their formats do not change.
+
+### Implementation closure matrix
+
+| Axis | Required closure | Owner |
+| --- | --- | --- |
+| Formation and construction | Copy structs emit no helper. Every Move struct reached as a Drop-site root gets at most one private, defined `void(ptr)` helper, including roots reached from fixed-array and dynamic-array cleanup; nested and tagged children stay inside that root helper's iterative CFG. A missing/out-of-range type record remains a diagnosed lowering error rather than a panic. | `align_codegen_llvm` helper inventory and malformed-id unit owners |
+| Move-in, move-out, and source nulling | Moves keep the existing aggregate transfer and cleanup-bit behavior. The helper receives only the selected live storage pointer; moved or uninitialized storage remains zeroed before a possible call, so null-safe leaves stay null-safe. | existing Move struct transfer/nulling owners plus helper IR assertions |
+| Normal Drop and replacement | Standalone struct Drop and reassignment, fixed Move-struct array Drop and element replacement, and dynamic Move-struct array element cleanup all call the same helper. Field and element order is semantically identical to the former inline plan. | focused codegen IR owner; existing nested/owned-array runtime owners |
+| Control exits | `if`, `match`, `else`, `?`, `map_err`, branch joins, loop back edges and breaks, return, and early error exits retain their existing cleanup guards and call the helper only on the same live paths. A terminating path manufactures no helper call. | existing ownership/control regression targets; Request 19 raw-IR call-count bound |
+| Nested and tagged graphs | Nested Move structs, `Option`, `Result`, user sums, `array<string>`, `array<MoveStruct>`, handles, resources, and recursively owned record arrays retain active-arm selection, loop bounds, native thunk choice, and exact child-before-parent restoration order. Helper bodies use the existing compiler-owned iterative worklist/CFG and never call a generated Drop helper, so a 4,096-record valid acyclic graph executes with one helper stack frame rather than a type-depth call chain. | parameterized Drop-plan/codegen owners, an executable deep finite graph stack-bound owner, and runtime exactly-once controls |
+| Direct, imported, generic, and function-value paths | Whole-program and per-unit compilation emit equivalent private helpers in each owning module. Generic instances follow their concrete module-local struct ids. Calls, returns, imports, and function-value ABI are unchanged. | whole/per-unit IR and executable parity owners |
+| Runtime and allocation parity | Helpers allocate nothing and perform no artifact/source I/O. They call the same runtime free/handle/resource thunks with the same pointers and counts. Helper calls are `nounwind`; no unwind cleanup path is introduced. | IR call inventory and existing allocation/failpoint owners |
+| Cache and artifact identity | The running compiler-byte hash invalidates every affected object/prelink/backend key; no persisted field changes. Same compiler and inputs remain byte-deterministic, including parallel per-unit builds. | cache edit/revert and deterministic-object owners |
+| Resource promise | The Request 19 fixture's raw IR no longer scales with cleanup sites times the recursive Drop graph. Its optimized build completes within the consumer's per-target budget with peak memory well below the recorded 1,525,732 KiB, and output remains byte-identical. A representative small one-shot Move-record program is measured before and after for frontend/codegen work counts, wall time, peak memory, object size, and cleanup runtime; the optimization is not accepted if that unaffected path shows a material regression outside run-to-run spread. Counts come from actual compiler/cache outcomes and executed destructor counters, not an expected source/unit count. | local `bench/large_drop_codegen` pathological and unaffected controls plus align-llm `make prompt-verifier-smoke`; final consumer lane/fresh-worker proof belongs to align-llm |
+
+### Candidate evidence
+
+Measured on 2026-08-26 on Linux x86_64 with release compilers. The Request 19
+raw-IR lens fell from 1,517,324 lines / 113.6 MB to 109,992 lines / 5.96 MB.
+Its three-unit default-runtime-LTO cold build fell from 471.074 seconds with an
+observed resident set above 832,704 KiB to 13.555 seconds and 266,400 KiB peak
+RSS. Fresh cache outcomes reported exactly three frontend misses and three
+codegen misses. The resulting executable prints the exact required PASS line.
+
+The one-shot Move-record control retained one frontend miss, one codegen miss,
+a 1,240-byte release object, and an executed allocation/free count of 1 / 1.
+Its single-run wall/RSS observation changed from 0.283 seconds / 87,144 KiB to
+0.294 seconds / 86,852 KiB, within run-to-run noise. The focused codegen owner
+pins one private helper across functions and all struct-root Drop-site shapes;
+the 4,096-record executable owner pins stack-bounded generated cleanup. Seven
+separate executions of the control reported 0.001 seconds in both revisions;
+peak RSS was 12,112–12,380 KiB before and 12,380 KiB after.
+
+### Implementation review closure
+
+| Finding | Class-wide closure |
+| --- | --- |
+| P1: the extracted iterative leaf dispatcher omitted four admitted dynamic aggregate-array field types that the deleted inline struct path freed | Add `DynVecArray`, `DynMaskArray`, `DynFixedArray`, and `DynFixedStructArray` to the canonical flat-buffer free arm. One helper owner places all four in the same Move struct and requires four runtime frees, so another sibling omission fails the owner. |
+| P2: the benchmark measured compiler build time but only captured the generated program's output | Measure the executable separately for every baseline/candidate case and report `cleanup_timing` beside `build_timing`; retain the independent output and destructor-count checks. |
+
+The implementation boundary is one codegen capability because helper creation
+and every consuming Drop site must agree in the same module. Splitting a dormant
+helper producer from call-site conversion would add unreachable code without a
+stable consumer and would duplicate the correctness proof.
 
 ## Item 3: pipelined frontend and codegen
 

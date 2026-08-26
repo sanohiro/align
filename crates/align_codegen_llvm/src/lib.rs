@@ -34,7 +34,7 @@ use align_mir::{
 };
 use align_sema::{
     ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
-    drop_plan, enum_is_move, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
+    drop_plan, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
 use inkwell::AddressSpace;
@@ -2807,7 +2807,10 @@ fn build_module<'c>(
         }
     }
 
-    // Pass 2: define bodies.
+    // Pass 2: define bodies. Move-struct destructors are created lazily while these bodies are
+    // emitted, but the authoritative handles are module-wide: every function that drops the same
+    // nominal struct must call the one helper rather than cloning its recursive cleanup CFG.
+    let drop_helpers = std::cell::RefCell::new(HashMap::new());
     for f in &program.fns {
         let builder = ctx.create_builder();
         let stack_headers = stack_header_plan(f);
@@ -2845,6 +2848,7 @@ fn build_module<'c>(
             callable_preflight: &callable_preflight,
             program,
             runtime_funcs: &runtime_funcs,
+            drop_helpers: &drop_helpers,
             fn_sigs: &fn_sigs,
             extern_abi: &extern_abi,
             structs: &program.structs,
@@ -8512,6 +8516,10 @@ struct FnGen<'c, 'a> {
     /// Typed handles for every fixed keyed native declaration. Runtime calls never share the
     /// program-call namespace, even when their logical spellings happen to match.
     runtime_funcs: &'a HashMap<RuntimeKey, FunctionValue<'c>>,
+    /// One lazily defined private destructor per module-local Move struct. The map handle, rather
+    /// than a symbol-name lookup, is authoritative so an extern with the same spelling cannot be
+    /// mistaken for a compiler helper.
+    drop_helpers: &'a std::cell::RefCell<HashMap<u32, FunctionValue<'c>>>,
     /// Semantic signatures for every direct callable. LLVM's physical integer types do not retain
     /// signedness, so the range-kernel boundary checks these `Ty`s as well as the generated LLVM
     /// function type before emitting a direct call.
@@ -11526,9 +11534,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             self.drop_ty_at(elem_ptr, scalar_to_ty(*s))?;
                         }
                     } else if let Ty::Struct(sid) = ty {
-                        // A Move struct: recursively free each owned field's buffer, in declared order,
-                        // recursing into nested Move-struct fields (null-safe — a moved-out struct was
-                        // zeroed, and Copy fields are skipped).
+                        // A Move struct: call the module-private iterative destructor shared by every
+                        // Drop site for this root type. It frees owned fields in declaration order,
+                        // including nested Move structs (null-safe — moved-out storage was zeroed).
                         self.drop_struct_fields(self.slots[slot], sid)?;
                     } else if let Ty::StructArray(sid, n) = ty {
                         // A fixed array of a Move struct: drop each element's owned fields in turn
@@ -16552,170 +16560,89 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(ptr)
     }
 
-    /// Recursively free the owned fields of a Move struct at `base` (a pointer to the struct value),
-    /// in declared order. A `string` field's `{ptr,len}` buffer is freed; a nested Move-struct field
-    /// recurses. Null-safe: an unconstructed / moved-out struct was zeroed (`DropFlagInit`), so each
-    /// owned leaf reads `{null,0}` and `free(null)` is a no-op. Copy fields (scalars, `str` borrows,
-    /// plain-data nested structs) are skipped. (Slice 3 of `08-nested-structs.md`.)
+    /// Call the module's one private iterative destructor for a Move struct at `base`.
+    /// Null-safe: an unconstructed / moved-out struct was zeroed (`DropFlagInit`), so each owned
+    /// leaf reads `{null,0}` and `free(null)` is a no-op. Copy structs need no helper or call.
     fn drop_struct_fields(&self, base: inkwell::values::PointerValue<'c>, struct_id: u32) -> Result<(), CodegenError> {
-        let st = self.struct_types[struct_id as usize];
-        // Snapshot (index, field type) so we don't hold a borrow of `self.structs` across the
-        // builder/recursion calls (`Ty` is `Copy`).
-        let fields: Vec<(u32, Ty)> = self.structs[struct_id as usize].fields.iter().enumerate().map(|(i, f)| (i as u32, f.ty)).collect();
-        for (i, fty) in fields {
-            // `i` is the logical field index; the GEP needs its physical (reordered) slot.
-            let pi = self.pfield(struct_id, i);
-            match fty {
-                // An owned `string` field — free its heap buffer (field 0 of the `{ptr,len}`).
-                Ty::String => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropfld").map_err(|e| self.err(e))?;
-                    let agg = self
-                        .builder
-                        .build_load(slice_struct_type(self.ctx), fp, "dropfldv")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "dropfldptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
-                }
-                // A tagged field owns only its active payload. Reuse the canonical recursive
-                // destructor so `Option<MoveStruct>` and later nested owned shapes cannot diverge
-                // from standalone Option/Result cleanup.
-                ty @ (Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                    if drop_plan(
-                        ty,
-                        self.structs,
-                        self.enums,
-                        self.tagged_defs,
-                    )
-                    .needs_drop() =>
-                {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "dropopt").map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, ty)?;
-                }
-                // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
-                Ty::Struct(nid)
-                    if struct_is_move(nid, self.structs, self.enums, self.tagged_defs) =>
-                {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropnest")
-                        .map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, Ty::Struct(nid))?;
-                }
-                // A Move sum-type field (J3) — an owned `array<T>` payload variant makes the enclosing
-                // struct Move through the recursive DropPlan. Tag-switch and free the live variant's
-                // owned buffer via `drop_enum` (a non-Move enum owns nothing → not a Move struct field →
-                // never reaches here). `DropFlagInit` zeroes the aggregate, so a moved-out / unconstructed
-                // enum field reads tag 0 and frees `null` — null-safe, single-free every path.
-                Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_defs) => {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropenumfld")
-                        .map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, Ty::Enum(eid))?;
-                }
-                // An owned `array<Move-struct>` field (J3b) — the `Chat { messages: array<Message> }`
-                // shape, where each element owns a buffer (a `string`/owned-array field, or a Move-enum
-                // field like `Message`'s `content`). Deep-free each element then the AoS (`free(null)` is
-                // a no-op for an empty array) via the shared helper.
-                ty @ Ty::DynStructArray(eid, _)
-                    if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
-                {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropdeeparr")
-                        .map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, ty)?;
-                }
-                // A direct `array<string>` field owns every element buffer as well as the outer
-                // array. Route it through the canonical dispatcher so aggregate cleanup is the
-                // same deep `FreeStringArray` operation as a standalone local or tagged payload.
-                ty @ Ty::DynArray(Scalar::String) => {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropstrarr")
-                        .map_err(|e| self.err(e))?;
-                    self.drop_ty_at(fp, ty)?;
-                }
-                // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
-                // free its single heap buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an
-                // empty array). A scalar / `str`-view / plain-data-struct element owns nothing, so this is
-                // one flat free — no per-element deep free — and `array<Struct>`'s `str` fields are
-                // borrowed views into the input, not freed here. (A Move-struct element is deep-freed by
-                // the arm above.)
-                Ty::DynArray(_)
-                | Ty::DynVecArray(..)
-                | Ty::DynMaskArray(..)
-                | Ty::DynFixedArray(..)
-                | Ty::DynFixedStructArray(..)
-                | Ty::DynStructArray(..)
-                | Ty::DynSliceArray(_) => {
-                    let fp = self.builder.build_struct_gep(st, base, pi, "droparr").map_err(|e| self.err(e))?;
-                    let agg = self
-                        .builder
-                        .build_load(slice_struct_type(self.ctx), fp, "droparrv")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "droparrptr").map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.runtime(RuntimeKey::Free), &[ptr.into()], "").map_err(|e| self.err(e))?;
-                }
-                // A nested Move-struct *array* field — drop each element (defensive: struct fields
-                // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
-                // owned case here means a future array-valued field can't silently fail-open and leak).
-                Ty::StructArray(eid, n)
-                    if struct_is_move(eid, self.structs, self.enums, self.tagged_defs) =>
-                {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropnestarr")
-                        .map_err(|e| self.err(e))?;
-                    let arr_ty = self.struct_types[eid as usize].array_type(n);
-                    let zero = self.ctx.i64_type().const_zero();
-                    for e in 0..n {
-                        let idx = self.ctx.i64_type().const_int(e as u64, false);
-                        let ep = unsafe {
-                            self.builder.build_in_bounds_gep(arr_ty, fp, &[zero, idx], "dropnestel").map_err(|e| self.err(e))?
-                        };
-                        self.drop_ty_at(ep, Ty::Struct(eid))?;
-                    }
-                }
-                // A Move **handle** field (F1②): a bare pointer handle — `http_request_ctx`, `file`,
-                // a reader/writer/buffer, a socket, an http request/response/client/server/stream, a
-                // cli command/parsed. Load the pointer and call its null-safe `*_free`, exactly like a
-                // standalone handle local's `Stmt::Drop` (shared `handle_free_key` — one source of
-                // truth). A moved-out / zeroed field reads a null handle, so the free is a no-op —
-                // the resource is closed at most once. `is_field_ok` admits exactly this handle set,
-                // so no allowed field type reaches the `_` arm below and silently leaks.
-                ty if handle_free_key(ty).is_some() => {
-                    let free_key = handle_free_key(ty).expect("guarded by the arm pattern");
-                    let fp = self.builder.build_struct_gep(st, base, pi, "drophandle").map_err(|e| self.err(e))?;
-                    let p = self
-                        .builder
-                        .build_load(self.ctx.ptr_type(AddressSpace::default()), fp, "drophandlev")
-                        .map_err(|e| self.err(e))?;
-                    self.builder.build_call(self.runtime(free_key), &[p.into()], "").map_err(|e| self.err(e))?;
-                }
-                // A package-defined resource field uses its declaration-owned hidden thunk. Keep
-                // aggregate cleanup on the same pointer-based dispatcher as a standalone resource
-                // local so adding a nominal wrapper cannot suppress the package destructor.
-                ty @ Ty::Resource(_) => {
-                    let fp = self
-                        .builder
-                        .build_struct_gep(st, base, pi, "dropresourcefield")
-                        .map_err(|error| self.err(error))?;
-                    self.drop_ty_at(fp, ty)?;
-                }
-                _ => {}
-            }
+        // Validate every parallel type table before the first indexed lookup. Producer-valid MIR
+        // always has all three rows; malformed/hand-built MIR must diagnose instead of panicking.
+        self.structs
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err(format!("struct definition id {struct_id} is missing")))?;
+        self.struct_types
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err(format!("struct LLVM type id {struct_id} is missing")))?;
+        self.field_perm
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err(format!("struct layout id {struct_id} is missing")))?;
+        if !struct_is_move(struct_id, self.structs, self.enums, self.tagged_defs) {
+            return Ok(());
         }
+
+        let existing = self.drop_helpers.borrow().get(&struct_id).copied();
+        let helper = if let Some(helper) = existing {
+            helper
+        } else {
+            let helper_ty = self.ctx.void_type().fn_type(
+                &[self.ctx.ptr_type(AddressSpace::default()).into()],
+                false,
+            );
+            let helper = self
+                .module
+                .add_function(&format!("__align_drop_struct${struct_id}"), helper_ty, None);
+            mark_nounwind(self.ctx, helper);
+            mark_private_helper(helper);
+            // Publish the handle before body construction. The iterative emitter does not call a
+            // generated Drop helper, but early insertion still makes the one-helper invariant
+            // explicit and prevents a later refactor from duplicating a self-reachable helper.
+            self.drop_helpers.borrow_mut().insert(struct_id, helper);
+
+            let saved = self.builder.get_insert_block();
+            let saved_debug = self
+                .dibuilder
+                .is_some()
+                .then(|| self.builder.get_current_debug_location())
+                .flatten();
+            if self.dibuilder.is_some() {
+                // The private helper has no DISubprogram. Retaining the outer function's location
+                // would attach wrong-scope metadata and make the module fail verification.
+                self.builder.unset_current_debug_location();
+            }
+            let emitted = (|| -> Result<(), CodegenError> {
+                let entry = self.ctx.append_basic_block(helper, "entry");
+                self.builder.position_at_end(entry);
+                let pointer = helper
+                    .get_nth_param(0)
+                    .ok_or_else(|| self.err("struct Drop helper lost its pointer parameter"))?
+                    .into_pointer_value();
+                self.emit_drop_at_iterative_in(helper, pointer, Ty::Struct(struct_id))?;
+                self.builder
+                    .build_return(None)
+                    .map_err(|error| self.err(error))?;
+                Ok(())
+            })();
+            match saved {
+                Some(block) => self.builder.position_at_end(block),
+                None => self.builder.clear_insertion_position(),
+            }
+            if let Some(location) = saved_debug {
+                self.builder.set_current_debug_location(location);
+            } else if self.dibuilder.is_some() {
+                // A debug-enabled outer function always needs a location on later inlinable calls.
+                // Fall back defensively if helper construction was reached before one was active.
+                self.set_line(self.fn_line, 0);
+            }
+            emitted?;
+            helper
+        };
+
+        self.builder
+            .build_call(helper, &[base.into()], "")
+            .map_err(|error| self.err(error))?;
         Ok(())
     }
 
-    /// Recursively drop the owned value stored at `base`.
-    ///
-    /// This is the codegen counterpart of sema's canonical [`drop_plan`]: tagged containers inspect
-    /// only their live arm, nominal values recurse, deep arrays run their element destructor, and
-    /// leaves use the same null-safe runtime free as standalone locals.
+    /// Recursively drop the owned value stored at `base` using the canonical iterative Drop plan.
     fn drop_ty_at(
         &self,
         base: inkwell::values::PointerValue<'c>,
@@ -16727,9 +16654,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Deep-free an owned `array<Move-struct>` (J3b) whose `{ptr,len}` aggregate lives at `slice_ptr`:
     /// loop over the `len` elements, recursively `drop_struct_fields` each (freeing its own owned
     /// fields — a `string`/owned-array/Move-enum field, transitively), then free the AoS buffer itself.
-    /// A flat free alone would leak every element's owned buffer. `drop_struct_fields` may append basic
-    /// blocks (a Move-enum element's `drop_enum`), so the loop back-edge branches from the block current
-    /// *after* the recursive call (`get_insert_block`). An empty array (len 0 / null ptr) skips the loop
+    /// A flat free alone would leak every element's owned buffer. `drop_struct_fields` emits one helper
+    /// call in the loop body; helper definition temporarily changes the shared builder's insertion point
+    /// but restores this outer block before returning. An empty array (len 0 / null ptr) skips the loop
     /// and frees null. Shared by the struct-field drop (`drop_struct_fields`) and the standalone-local
     /// drop (`Stmt::Drop`), so a bare `array<Move-struct>` local and an `array<Move-struct>` field free
     /// identically.
@@ -21908,6 +21835,188 @@ fn main() -> i32 = 0
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
     }
 
+    fn test_struct(name: &str, fields: &[Ty]) -> StructDef {
+        StructDef {
+            name: name.to_owned(),
+            source_name: name.to_owned(),
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(index, &ty)| align_sema::FieldDef {
+                    name: format!("field{index}"),
+                    ty,
+                })
+                .collect(),
+            align: None,
+            c_repr: false,
+        }
+    }
+
+    #[test]
+    fn move_struct_drop_sites_share_one_private_iterative_helper() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let second_function = Function {
+            name: program_call("drop_in_another_function"),
+            params: vec![],
+            param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            ret: i32_ty,
+            slots: vec![Ty::Struct(1)],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+                stmt_lines: vec![(0, 0), (0, 0)],
+                term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let result = codegen_program(
+            vec![
+                Stmt::DropFlagInit(0),
+                Stmt::DropFlagInit(1),
+                Stmt::DropFlagInit(2),
+                Stmt::DropFlagInit(3),
+                // Reach the helper first from a dynamic-array element loop; helper construction
+                // must restore that loop body's insertion point before its back-edge is emitted.
+                Stmt::Drop(3),
+                Stmt::Drop(0),
+                Stmt::Drop(1),
+                Stmt::Drop(2),
+                Stmt::DropElem(
+                    2,
+                    Operand::Const(Const::Int(0, i64_ty)),
+                    1,
+                ),
+            ],
+            vec![],
+            vec![
+                Ty::Struct(1),
+                Ty::Struct(1),
+                Ty::StructArray(1, 2),
+                Ty::DynStructArray(1, Layout::Aos),
+            ],
+            vec![
+                test_struct("Inner", &[Ty::String]),
+                test_struct("Outer", &[Ty::Struct(0), Ty::String]),
+            ],
+            vec![],
+            vec![second_function],
+        );
+        assert!(result.is_ok(), "shared Drop helper must lower: {result:?}");
+        let ir = result.unwrap_or_default();
+
+        let helper_name = "__align_drop_struct$1";
+        assert_eq!(
+            ir.lines()
+                .filter(|line| line.starts_with("define private") && line.contains(helper_name))
+                .count(),
+            1,
+            "one helper definition per Drop-site root:\n{ir}"
+        );
+        assert_eq!(
+            ir.lines()
+                .filter(|line| line.contains("call void") && line.contains(helper_name))
+                .count(),
+            7,
+            "all functions and direct, fixed-array, replacement, and dynamic-array sites must share the helper:\n{ir}"
+        );
+        let helper = function_body(&ir, helper_name);
+        assert_eq!(
+            helper.matches("align_rt_free").count(),
+            2,
+            "direct and nested owned string leaves must both be dropped:\n{helper}"
+        );
+        assert!(
+            !helper.contains("__align_drop_struct$"),
+            "the iterative helper must not call generated Drop helpers:\n{helper}"
+        );
+        assert!(
+            !ir.contains("__align_drop_struct$0"),
+            "a nested child is part of the root helper and must not create a helper on its own"
+        );
+    }
+
+    #[test]
+    fn shared_struct_drop_frees_every_dynamic_aggregate_array_field() {
+        let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let result = codegen_program(
+            vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+            vec![],
+            vec![Ty::Struct(1)],
+            vec![
+                test_struct("Element", &[Ty::Int(IntTy { bits: 64, signed: true })]),
+                test_struct(
+                    "AggregateArrays",
+                    &[
+                        Ty::DynVecArray(i64_scalar, 4),
+                        Ty::DynMaskArray(i64_scalar, 4),
+                        Ty::DynFixedArray(i64_scalar, 3),
+                        Ty::DynFixedStructArray(0, 2),
+                    ],
+                ),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(
+            result.is_ok(),
+            "every admitted dynamic aggregate-array field must lower through shared Drop: {result:?}"
+        );
+        let ir = result.unwrap_or_default();
+
+        let helper = function_body(&ir, "__align_drop_struct$1");
+        assert_eq!(
+            helper.matches("call void @align_rt_free(").count(),
+            4,
+            "every dynamic aggregate-array field owns one buffer:\n{helper}"
+        );
+    }
+
+    #[test]
+    fn copy_struct_drop_emits_no_helper() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let result = codegen_program(
+            vec![Stmt::Drop(0)],
+            vec![],
+            vec![Ty::Struct(0)],
+            vec![test_struct("CopyRecord", &[i32_ty])],
+            vec![],
+            vec![],
+        );
+        assert!(result.is_ok(), "Copy struct Drop is a no-op: {result:?}");
+        let ir = result.unwrap_or_default();
+        assert!(!ir.contains("__align_drop_struct$"), "Copy structs need no Drop helper:\n{ir}");
+    }
+
+    #[test]
+    fn malformed_drop_helper_struct_id_is_diagnosed() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let error = codegen_program(
+            vec![Stmt::DropElem(
+                0,
+                Operand::Const(Const::Int(0, i64_ty)),
+                1,
+            )],
+            vec![],
+            vec![Ty::StructArray(0, 1)],
+            vec![test_struct("Element", &[Ty::String])],
+            vec![],
+            vec![],
+        )
+        .expect_err("an out-of-range Drop helper id must fail closed");
+        assert!(
+            error.to_string().contains("struct definition id 1 is missing"),
+            "unexpected malformed-id diagnostic: {error}"
+        );
+    }
+
     #[test]
     fn relocation_bearing_static_data_fails_closed_before_llvm() {
         let emit = |data: StaticData, result: Ty| {
@@ -24733,9 +24842,12 @@ fn main() -> i32 = 0
             .into_iter()
             .flatten()
             .find_map(|candidate| {
-                let unquoted = format!(" @{candidate}(");
-                let quoted = format!(" @\"{candidate}\"(");
-                ir.find(&unquoted).or_else(|| ir.find(&quoted))
+                let unquoted = format!("@{candidate}(");
+                let quoted = format!("@\"{candidate}\"(");
+                ir.match_indices("define ").find_map(|(start, _)| {
+                    let header = &ir[start..ir[start..].find('\n').map_or(ir.len(), |end| start + end)];
+                    (header.contains(&unquoted) || header.contains(&quoted)).then_some(start)
+                })
             })
             .map(|start| &ir[start..])
             .and_then(|tail| tail.split_once("{\n").map(|(_, body)| body))
@@ -25232,9 +25344,19 @@ fn main() -> i32 = 0
                     vec![],
                 )
                 .expect("deep recursive Drop emission must use compiler-owned frames");
+                let main = function_body(&llvm, "main");
                 assert!(
-                    function_body(&llvm, "main").contains("@align_rt_free"),
+                    main.contains("__align_drop_struct$0"),
+                    "the deep root Drop site must call its shared helper"
+                );
+                let helper = function_body(&llvm, "__align_drop_struct$0");
+                assert!(
+                    helper.contains("@align_rt_free"),
                     "the deepest owned leaf must still be dropped"
+                );
+                assert!(
+                    !helper.contains("__align_drop_struct$"),
+                    "deep nominal type depth must not become helper call-stack depth"
                 );
             })
             .expect("spawn deep type codegen owner")
