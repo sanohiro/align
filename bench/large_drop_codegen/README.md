@@ -21,9 +21,10 @@ bench/large_drop_codegen/run.sh
 ```
 
 The harness uses fresh caches to report actual frontend/codegen miss counts,
-then reports raw-IR lines, release object bytes, wall time, and peak compiler
-RSS. It requires byte-identical program output, the exact `1 / 1` control
-allocation/free result, and Request 19's PASS line. Both arms use `--no-rt-lto`
-so the allocation counters come from the instrumented archive rather than the
-ordinary runtime bitcode. Run the real consumer build separately with its
-default runtime-LTO policy before accepting the item.
+then reports raw-IR lines, release object bytes, build wall time and peak
+compiler RSS, and generated-program cleanup wall time and peak RSS. It requires
+byte-identical program output, the exact `1 / 1` control allocation/free result,
+and Request 19's PASS line. Both arms use `--no-rt-lto` so the allocation
+counters come from the instrumented archive rather than the ordinary runtime
+bitcode. Run the real consumer build separately with its default runtime-LTO
+policy before accepting the item.

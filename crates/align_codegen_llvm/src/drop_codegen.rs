@@ -485,7 +485,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::String
                     | Ty::DynArray(_)
                     | Ty::DynStructArray(..)
-                    | Ty::DynSliceArray(_) => {
+                    | Ty::DynSliceArray(_)
+                    | Ty::DynVecArray(..)
+                    | Ty::DynMaskArray(..)
+                    | Ty::DynFixedArray(..)
+                    | Ty::DynFixedStructArray(..) => {
                         let aggregate = self
                             .builder
                             .build_load(slice_struct_type(self.ctx), base, "dropslicev")

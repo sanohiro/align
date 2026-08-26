@@ -21877,7 +21877,7 @@ fn main() -> i32 = 0
             entry: 0,
             exportable: false,
         };
-        let ir = codegen_program(
+        let result = codegen_program(
             vec![
                 Stmt::DropFlagInit(0),
                 Stmt::DropFlagInit(1),
@@ -21908,8 +21908,9 @@ fn main() -> i32 = 0
             ],
             vec![],
             vec![second_function],
-        )
-        .expect("shared Drop helper must lower");
+        );
+        assert!(result.is_ok(), "shared Drop helper must lower: {result:?}");
+        let ir = result.unwrap_or_default();
 
         let helper_name = "__align_drop_struct$1";
         assert_eq!(
@@ -21943,17 +21944,54 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn shared_struct_drop_frees_every_dynamic_aggregate_array_field() {
+        let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let result = codegen_program(
+            vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+            vec![],
+            vec![Ty::Struct(1)],
+            vec![
+                test_struct("Element", &[Ty::Int(IntTy { bits: 64, signed: true })]),
+                test_struct(
+                    "AggregateArrays",
+                    &[
+                        Ty::DynVecArray(i64_scalar, 4),
+                        Ty::DynMaskArray(i64_scalar, 4),
+                        Ty::DynFixedArray(i64_scalar, 3),
+                        Ty::DynFixedStructArray(0, 2),
+                    ],
+                ),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(
+            result.is_ok(),
+            "every admitted dynamic aggregate-array field must lower through shared Drop: {result:?}"
+        );
+        let ir = result.unwrap_or_default();
+
+        let helper = function_body(&ir, "__align_drop_struct$1");
+        assert_eq!(
+            helper.matches("call void @align_rt_free(").count(),
+            4,
+            "every dynamic aggregate-array field owns one buffer:\n{helper}"
+        );
+    }
+
+    #[test]
     fn copy_struct_drop_emits_no_helper() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let ir = codegen_program(
+        let result = codegen_program(
             vec![Stmt::Drop(0)],
             vec![],
             vec![Ty::Struct(0)],
             vec![test_struct("CopyRecord", &[i32_ty])],
             vec![],
             vec![],
-        )
-        .expect("Copy struct Drop is a no-op");
+        );
+        assert!(result.is_ok(), "Copy struct Drop is a no-op: {result:?}");
+        let ir = result.unwrap_or_default();
         assert!(!ir.contains("__align_drop_struct$"), "Copy structs need no Drop helper:\n{ir}");
     }
 

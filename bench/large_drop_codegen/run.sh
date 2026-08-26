@@ -64,13 +64,14 @@ measure_case() {
     "$compiler" emit-llvm main.align --stage raw --no-rt-lto >raw.ll
     "$compiler" emit-obj main.align main.o --profile release --no-rt-lto
   )
-  timing="$(ALIGNC_CACHE=off python3 "$here/measure.py" "$dir" -- \
+  build_timing="$(ALIGNC_CACHE=off python3 "$here/measure.py" "$dir" -- \
     "$compiler" build main.align --profile release --no-rt-lto)"
   "$dir/main" >"$dir/program.stdout"
+  cleanup_timing="$(python3 "$here/measure.py" "$dir" -- "$dir/main")"
 
   raw_lines="$(wc -l <"$dir/raw.ll" | tr -d ' ')"
   object_bytes="$(wc -c <"$dir/main.o" | tr -d ' ')"
-  echo "$revision/$case_name: frontend_misses=$frontend_misses codegen_misses=$codegen_misses raw_ir_lines=$raw_lines object_bytes=$object_bytes timing=$timing"
+  echo "$revision/$case_name: frontend_misses=$frontend_misses codegen_misses=$codegen_misses raw_ir_lines=$raw_lines object_bytes=$object_bytes build_timing=$build_timing cleanup_timing=$cleanup_timing"
 }
 
 measure_case baseline "$baseline" control "$here/control.align"

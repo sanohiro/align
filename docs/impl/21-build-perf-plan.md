@@ -21,7 +21,7 @@ Order is priority.
 | 2a | Required DB owner build-once/run-many | Shipped in #882 — exact-set concurrent execution across four isolated CI shards; required wall time fell from about 60 minutes to 15:25 while every shard kept the hard 30-minute budget |
 | 2b | DB CI changed-function scope | Implemented — direct DB/gate and dedicated DB-production paths remain unconditional, while mixed compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
-| 3a | Shared recursive-Drop codegen | Implementing for align-llm Request 19 — emit one private pointer-based destructor per Move struct reached as a Drop-site root instead of cloning its recursive cleanup CFG at every site |
+| 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
 | 4 | Prebuilt optimized cache distribution | Design settled below; implementation pending — ship warmed first-party `pkg` entries with each exact native compiler (compiler-provided `core`/`std` imports have no cacheable source unit) |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
@@ -96,7 +96,16 @@ a 1,240-byte release object, and an executed allocation/free count of 1 / 1.
 Its single-run wall/RSS observation changed from 0.283 seconds / 87,144 KiB to
 0.294 seconds / 86,852 KiB, within run-to-run noise. The focused codegen owner
 pins one private helper across functions and all struct-root Drop-site shapes;
-the 4,096-record executable owner pins stack-bounded generated cleanup.
+the 4,096-record executable owner pins stack-bounded generated cleanup. Seven
+separate executions of the control reported 0.001 seconds in both revisions;
+peak RSS was 12,112–12,380 KiB before and 12,380 KiB after.
+
+### Implementation review closure
+
+| Finding | Class-wide closure |
+| --- | --- |
+| P1: the extracted iterative leaf dispatcher omitted four admitted dynamic aggregate-array field types that the deleted inline struct path freed | Add `DynVecArray`, `DynMaskArray`, `DynFixedArray`, and `DynFixedStructArray` to the canonical flat-buffer free arm. One helper owner places all four in the same Move struct and requires four runtime frees, so another sibling omission fails the owner. |
+| P2: the benchmark measured compiler build time but only captured the generated program's output | Measure the executable separately for every baseline/candidate case and report `cleanup_timing` beside `build_timing`; retain the independent output and destructor-count checks. |
 
 The implementation boundary is one codegen capability because helper creation
 and every consuming Drop site must agree in the same module. Splitting a dormant
