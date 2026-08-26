@@ -7,12 +7,16 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-26._ Request 19's shared recursive-Drop codegen is implemented against
-`docs/impl/21-build-perf-plan.md` item 3a. On its real-client fixture, raw IR fell from 1,517,324
-lines / 113.6 MB to 109,992 lines / 5.96 MB, while the cold three-unit release build fell from
-471.074 seconds and more than 832,704 KiB observed RSS to 13.555 seconds and 266,400 KiB peak RSS;
-the executable prints the exact required PASS line. Merge and align-llm's consumer-owned pin/lane
-restoration remain. Request 18's retained-root regular-file constructors are implemented
+_Last updated: 2026-08-26._ align-llm Request 21's borrowed projection view repair is implemented
+against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
+an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
+checking, then LLVM validation rejected the same field path because it compared the view type with
+the owning array type. Codegen now admits only the existing exact scalar/AoS array-to-slice layout
+retypes with canonical element identity and rejects forged mismatched elements. The focused owner
+covers Some/None, sibling and repeated access, scalar/AoS arrays, whole/per-unit execution, and
+malformed MIR. Review, merge, and align-llm pin adoption remain. Request 19's shared recursive-Drop
+codegen is merged and real-client adopted through Align `4b515f8d37de2e9a9ba06170c5842fd12dc1cba2`.
+Request 18's retained-root regular-file constructors are implemented
 against the accepted design in `docs/impl/29-fs-retained-root-plan.md` and real-client verified by
 align-llm PR #99 at `78eae459fd1f88bad1c3c3ca7b86921a08ecf168`, pinned to Align merge
 `19c3db144c462bf7d6784f88d64cc124229b7ec2`; C6d is complete. Request 16's sum-payload projection and
