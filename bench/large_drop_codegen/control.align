@@ -1,0 +1,27 @@
+extern "C" {
+  fn align_rt_alloc_count() -> i64
+  fn align_rt_free_count() -> i64
+}
+
+SmallDrop { text: string, number: i64 }
+
+fn allocations() -> i64 {
+  unsafe { return align_rt_alloc_count() }
+}
+
+fn frees() -> i64 {
+  unsafe { return align_rt_free_count() }
+}
+
+fn one_drop() {
+  value := SmallDrop { text: "control".clone(), number: 7 }
+  print(value.number)
+}
+
+fn main() {
+  allocations_before := allocations()
+  frees_before := frees()
+  one_drop()
+  print(allocations() - allocations_before)
+  print(frees() - frees_before)
+}
