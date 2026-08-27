@@ -54,7 +54,7 @@ pub use codec::{
     deserialize, deserialize_for_target, encode_interface_surface, serialize, DecodeError,
     FORMAT_VERSION,
 };
-pub use hash::Hash128;
+pub use hash::{Hash128, Hash128Stream};
 pub use owned_json::{
     OwnedJsonGraphInterfaceEntry, OwnedJsonObjectFormat, OwnedJsonTarget,
     encode_owned_json_graph_descriptor, encode_owned_json_graph_envelope,

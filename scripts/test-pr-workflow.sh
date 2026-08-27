@@ -1953,8 +1953,23 @@ if [[ "$historical_guards" -ne 3 ]]; then
   echo "release.yml no longer preserves historical workflow_dispatch tags" >&2
   exit 1
 fi
-grep -Fq 'libpq-dev, libssl-dev' "$release_workflow" || {
-  echo "the Debian compiler package cannot link the cached pkg.db corpus" >&2
+corpus_links="$(
+  find "$repo_root/apps/web/pkg" "$repo_root/apps/jwt/pkg" "$repo_root/apps/db/pkg" \
+    -name '*.align' -type f -exec \
+    sed -n 's/.*extern "C" link("\([^"]*\)").*/\1/p' '{}' + \
+    | LC_ALL=C sort -u | paste -sd, -
+)"
+if [[ "$corpus_links" != "crypto,pq,sqlite3,ssl,z,zstd" ]]; then
+  echo "the prebuilt-cache native-link declaration inventory changed: $corpus_links" >&2
+  exit 1
+fi
+grep -Fq 'libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev' "$release_workflow" || {
+  echo "the release runner cannot link the complete cached pkg.db corpus" >&2
+  exit 1
+}
+grep -Fq 'libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev' \
+  "$release_workflow" || {
+  echo "the Debian compiler package cannot link the complete cached pkg.db corpus" >&2
   exit 1
 }
 grep -Fq 'brew install --formula --build-from-source' "$release_workflow" || {
@@ -1967,8 +1982,17 @@ grep -Fq 'bench/prebuilt_cache/run.sh package' "$release_workflow" || {
 }
 
 formula_template="$repo_root/.github/align.rb.template"
-grep -Fq 'depends_on "libpq"' "$formula_template" || {
-  echo "the Homebrew compiler package cannot link the cached pkg.db corpus" >&2
+formula_dependencies="$(
+  sed -n 's/^  depends_on "\([^"]*\)"$/\1/p' "$formula_template" \
+    | LC_ALL=C sort | paste -sd, -
+)"
+if [[ "$formula_dependencies" != "libpq,llvm@22,openssl@3,zstd" ]]; then
+  echo "the Homebrew dependency mapping changed: $formula_dependencies" >&2
+  exit 1
+fi
+grep -Fq '#{Formula["libpq"].opt_lib}:#{Formula["openssl@3"].opt_lib}:#{Formula["zstd"].opt_lib}' \
+  "$formula_template" || {
+  echo "the Homebrew linker search path does not cover every keg-only corpus dependency" >&2
   exit 1
 }
 grep -Fq 'skip_clean "libexec/alignc"' "$formula_template" || {
@@ -1980,6 +2004,21 @@ grep -Fq 'libexec.install "alignc", "align-repl", "libalign_runtime.a", "share"'
   echo "the Homebrew formula no longer installs the adjacent cache tree" >&2
   exit 1
 }
+
+cache_source="$repo_root/crates/align_driver/src/cache.rs"
+cache_inventory="$repo_root/scripts/prebuilt-cache-inventory.py"
+grep -Fq 'CACHE_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024' "$cache_source" &&
+  grep -Fq 'MANIFEST_MAX_BYTES = 64 * 1024 * 1024' "$cache_inventory" || {
+  echo "runtime and release inventory manifest bounds differ" >&2
+  exit 1
+}
+grep -Fq 'CACHE_CAS_MAX_BYTES: u64 = 256 * 1024 * 1024' "$cache_source" &&
+  grep -Fq 'CAS_MAX_BYTES = 256 * 1024 * 1024' "$cache_inventory" || {
+  echo "runtime and release inventory CAS bounds differ" >&2
+  exit 1
+}
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$cache_inventory"
 
 for script in \
   bench/prebuilt_cache/run.sh \

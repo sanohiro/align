@@ -34,7 +34,7 @@ jobs:
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libpq-dev libssl-dev zlib1g-dev libzstd-dev
+        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev
       # Fail closed on the linker per platform, same rule as ci.yml: the PGO
       # training phase links the whole examples/pkg.db corpus, so a missing
       # lld-22 would quietly make a release build slower rather than fail.
@@ -366,7 +366,7 @@ jobs:
           Priority: optional
           Architecture: $DEB_ARCH
           Maintainer: sanohiro
-          Depends: llvm-22, clang-22, libclang-rt-22-dev, libpq-dev, libssl-dev, zlib1g-dev, libzstd-dev
+          Depends: llvm-22, clang-22, libclang-rt-22-dev, libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev
           Description: AOT compiler for the Align programming language
            Align is a data-oriented language with predictable native performance.
            Ships alignc and align-repl, an AOT REPL that compiles and runs each

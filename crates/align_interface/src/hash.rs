@@ -33,8 +33,60 @@ impl Hash128 {
     }
 }
 
+/// Incremental form of [`Hash128::of`] for a stream whose exact length is known before reading.
+/// The state is fixed-size and rejects excess or incomplete input rather than changing the digest
+/// convention used by persisted cache entries.
+pub struct Hash128Stream {
+    lo: align_hash::WyHashStream,
+    hi: align_hash::WyHashStream,
+}
+
+impl Hash128Stream {
+    pub fn for_len(len: usize) -> Self {
+        Self {
+            lo: align_hash::WyHashStream::for_len(SEED_LO, len),
+            hi: align_hash::WyHashStream::for_len(SEED_HI, len),
+        }
+    }
+
+    /// Consume one chunk. Returns `false` without consuming it when it would exceed the declared
+    /// length.
+    pub fn update(&mut self, bytes: &[u8]) -> bool {
+        let lo = self.lo.update(bytes);
+        let hi = self.hi.update(bytes);
+        debug_assert_eq!(lo, hi);
+        lo
+    }
+
+    /// Return the digest only after exactly the declared length was consumed.
+    pub fn finish(self) -> Option<Hash128> {
+        Some(Hash128 { lo: self.lo.finish()?, hi: self.hi.finish()? })
+    }
+}
+
 impl core::fmt::Debug for Hash128 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Hash128({})", self.to_hex())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash128_stream_matches_the_persisted_one_shot_identity() {
+        let bytes: Vec<u8> = (0..2049)
+            .map(|index| u8::try_from((index * 19 + 5) % 256).unwrap())
+            .collect();
+        for len in 0..=bytes.len() {
+            for chunk in [1, 15, 16, 17, 47, 48, 49, 127] {
+                let mut stream = Hash128Stream::for_len(len);
+                for part in bytes[..len].chunks(chunk) {
+                    assert!(stream.update(part));
+                }
+                assert_eq!(stream.finish(), Some(Hash128::of(&bytes[..len])));
+            }
+        }
     }
 }

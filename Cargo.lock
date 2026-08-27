@@ -58,6 +58,7 @@ dependencies = [
  "align_parser",
  "align_sema",
  "align_span",
+ "libc",
  "mimalloc",
 ]
 

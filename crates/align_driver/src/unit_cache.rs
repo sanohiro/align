@@ -558,9 +558,9 @@ fn lookup_with_policy(
     policy: ReadPolicy,
 ) -> UnitLookup {
     let path = action_path(root, key.full_digest());
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) },
+    let bytes = match cache::read_cache_manifest(&path) {
+        Some(bytes) => bytes,
+        None => return UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) },
     };
     match deserialize_manifest(&bytes, key) {
         // A version-skewed or structurally foreign manifest: unreferenced, rebuild fresh.
@@ -625,12 +625,12 @@ pub fn invalidate(root: &Path, key: &UnitKey) {
 }
 
 fn diff_against_slot(root: &Path, key: &UnitKey) -> FirstDiff {
-    match std::fs::read(slot_path(root, key.slot_digest())) {
-        Ok(bytes) => match deserialize_key_only(&bytes) {
+    match cache::read_cache_manifest(&slot_path(root, key.slot_digest())) {
+        Some(bytes) => match deserialize_key_only(&bytes) {
             Ok(stored) => first_diff(&stored, key),
             Err(_) => FirstDiff::NoPriorEntry,
         },
-        Err(_) => FirstDiff::NoPriorEntry,
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -895,6 +895,38 @@ mod tests {
             deserialize_manifest(&bytes, &key).expect("decode").expect("matches");
         assert_eq!(decoded_key, key);
         assert_eq!(decoded_entry, entry);
+    }
+
+    #[test]
+    fn oversized_packaged_frontend_manifest_is_an_immutable_clean_miss() {
+        let root = std::env::temp_dir().join(format!(
+            "align-unit-cache-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        let path = action_path(&root, key.full_digest());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(cache::CACHE_MANIFEST_MAX_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            lookup_packaged(&root, &key, 0),
+            UnitLookup::Miss {
+                reason: Some(FirstDiff::NoPriorEntry)
+            }
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            cache::CACHE_MANIFEST_MAX_BYTES + 1,
+            "packaged rejection must not mutate installer-owned bytes"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

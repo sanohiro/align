@@ -12,6 +12,8 @@ import struct
 
 
 HEX128 = re.compile(r"^[0-9a-f]{32}$")
+MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+CAS_MAX_BYTES = 256 * 1024 * 1024
 
 
 def fail(message: str) -> None:
@@ -110,6 +112,9 @@ def inventory(root: Path, expected_count: int) -> tuple[list[Path], list[Path], 
     ]:
         if len(files) != expected_count:
             fail(f"{label}: expected {expected_count}, observed {len(files)}")
+        oversized = [path for path in files if path.stat().st_size > MANIFEST_MAX_BYTES]
+        if oversized:
+            fail(f"{label} exceed the runtime manifest bound: {oversized}")
 
     if manifest_contents(unit_actions) != manifest_contents(unit_indexes):
         fail("unit action/index manifests differ")
@@ -127,6 +132,8 @@ def inventory(root: Path, expected_count: int) -> tuple[list[Path], list[Path], 
         for blob in regular_files(shard):
             if not blob.name.startswith(shard.name):
                 fail(f"CAS blob is in the wrong shard: {blob}")
+            if blob.stat().st_size > CAS_MAX_BYTES:
+                fail(f"CAS blob exceeds the runtime object bound: {blob}")
             blobs.add(blob)
     observed = {path.name for path in blobs}
     if observed != references:

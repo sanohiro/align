@@ -29,11 +29,15 @@
 //! read; a mismatch unlinks the blob, prints an always-on corruption note, and rebuilds. Publication
 //! is private staging + same-directory atomic rename, so a partial entry is never visible.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use align_interface::Hash128;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use align_interface::{Hash128, Hash128Stream};
 
 /// The cache **schema** version — the on-disk layout namespace. A bump changes the default-root
 /// subdirectory (`.../alignc/<schema>/`), isolating an old tree wholesale. Independent of the KEY
@@ -74,6 +78,16 @@ pub(crate) const CORRUPT_NOTE: &str = "alignc: cache entry corrupt; rebuilding";
 /// front (mirrors `align_interface::codec`'s `n.min(1024)` guard), so a garbage/huge length cannot
 /// drive an allocation bomb — the real bytes still have to be present to grow past it.
 const SEQ_PREALLOC_CAP: usize = 1024;
+
+/// Cache manifests embed frontend summaries, so the bound is deliberately far above the release
+/// corpus while still preventing an installer-owned exact path from driving an unbounded read.
+pub(crate) const CACHE_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cache objects are per-unit native artifacts. Larger objects remain valid build outputs but are
+/// deliberately not published/reused until this explicit resource contract is widened.
+const CACHE_CAS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+const CACHE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 // ---- key ----------------------------------------------------------------------------------------
 
@@ -688,10 +702,13 @@ pub fn clear_cache(root: &Path) -> Result<bool, String> {
 /// the unit-slot pointer. Any I/O failure is logged and swallowed — populating the cache is never
 /// allowed to fail a build whose object was produced correctly.
 fn publish(root: &Path, key: &CodegenKey, obj_out: &Path) {
-    let bytes = match std::fs::read(obj_out) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("alignc: cache not populated (cannot read produced object {}): {e}", obj_out.display());
+    let bytes = match read_regular_bounded_file(obj_out, CACHE_CAS_MAX_BYTES) {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!(
+                "alignc: cache not populated (produced object is unavailable, non-regular, or exceeds 256 MiB): {}",
+                obj_out.display()
+            );
             return;
         }
     };
@@ -884,6 +901,71 @@ enum ReadPolicy {
     Packaged,
 }
 
+/// Open an exact cache path without letting a followed FIFO block before it can be classified.
+/// The metadata belongs to the opened handle, so a concurrent path replacement cannot substitute a
+/// different target after validation.
+fn open_regular_bounded(path: &Path, max_bytes: Option<u64>) -> Option<(std::fs::File, usize)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || max_bytes.is_some_and(|limit| metadata.len() > limit) {
+        return None;
+    }
+    let length = usize::try_from(metadata.len()).ok()?;
+    Some((file, length))
+}
+
+fn read_regular_bounded_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let (file, expected) = open_regular_bounded(path, Some(max_bytes))?;
+    read_regular_bounded_from(file, expected, max_bytes)
+}
+
+fn read_regular_bounded_from(
+    mut reader: impl Read,
+    expected: usize,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
+    let expected_u64 = u64::try_from(expected).ok()?;
+    if expected_u64 > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(expected);
+    reader
+        .by_ref()
+        .take(expected_u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() == expected).then_some(bytes)
+}
+
+/// Read one action/index manifest through the fixed cache-format resource bound. Exact regular-file
+/// symlinks remain supported. Length disagreement catches shrink/growth after the handle metadata
+/// snapshot, and the declared-length-plus-one reader caps both allocation and read work.
+pub(crate) fn read_cache_manifest(path: &Path) -> Option<Vec<u8>> {
+    read_regular_bounded_file(path, CACHE_MANIFEST_MAX_BYTES)
+}
+
+#[cfg(test)]
+fn read_cache_manifest_from(reader: impl Read, expected: usize) -> Option<Vec<u8>> {
+    read_regular_bounded_from(reader, expected, CACHE_MANIFEST_MAX_BYTES)
+}
+
+struct MaterializedStage {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for MaterializedStage {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Attempt a hit at `action_path`. Fail-closed at every step: a missing/undecodable manifest is a
 /// clean [`HitResult::Miss`]; a manifest whose stored key does not match `key` (a hash collision) is a
 /// miss; a missing or digest-mismatched blob is [`HitResult::Corrupt`] (note + unlink + rebuild). On a
@@ -895,9 +977,9 @@ fn try_hit(
     obj_out: &Path,
     policy: ReadPolicy,
 ) -> HitResult {
-    let manifest_bytes = match std::fs::read(action_path) {
-        Ok(b) => b,
-        Err(_) => return HitResult::Miss,
+    let manifest_bytes = match read_cache_manifest(action_path) {
+        Some(bytes) => bytes,
+        None => return HitResult::Miss,
     };
     let (stored_key, blob_digest) = match deserialize_manifest(&manifest_bytes) {
         Ok(v) => v,
@@ -921,9 +1003,9 @@ fn materialize_blob(
     policy: ReadPolicy,
 ) -> HitResult {
     let blob_path = cas_blob_path(root, blob_digest);
-    let blob = match std::fs::read(&blob_path) {
-        Ok(b) => b,
-        Err(_) => {
+    let (mut blob, expected) = match open_regular_bounded(&blob_path, Some(CACHE_CAS_MAX_BYTES)) {
+        Some(opened) => opened,
+        None => {
             // A writable action pointing at an unavailable blob retains the existing self-heal
             // diagnosis. An immutable packaged blob may simply be absent or unreadable after an
             // installer/permission change; the public contract makes every such I/O failure a
@@ -938,7 +1020,42 @@ fn materialize_blob(
             };
         }
     };
-    if Hash128::of(&blob) != blob_digest {
+    let stage_path = staging_sibling(out_path);
+    let mut stage = MaterializedStage {
+        path: stage_path.clone(),
+        committed: false,
+    };
+    let mut staged_file = match std::fs::File::create(&stage_path) {
+        Ok(file) => file,
+        Err(_) => return HitResult::Miss,
+    };
+    let mut hasher = Hash128Stream::for_len(expected);
+    let mut copied = 0usize;
+    let mut buffer = [0u8; CACHE_COPY_BUFFER_BYTES];
+    loop {
+        let read = match blob.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => return HitResult::Miss,
+        };
+        let Some(next) = copied.checked_add(read) else {
+            return HitResult::Miss;
+        };
+        if next > expected || !hasher.update(&buffer[..read]) {
+            return HitResult::Miss;
+        }
+        if staged_file.write_all(&buffer[..read]).is_err() {
+            return HitResult::Miss;
+        }
+        copied = next;
+    }
+    if copied != expected {
+        return HitResult::Miss;
+    }
+    let Some(actual_digest) = hasher.finish() else {
+        return HitResult::Miss;
+    };
+    if actual_digest != blob_digest {
         // Corrupted blob bytes: unlink + always-on note + rebuild.
         if matches!(policy, ReadPolicy::Writable) {
             let _ = std::fs::remove_file(&blob_path);
@@ -946,11 +1063,12 @@ fn materialize_blob(
         note_corrupt(policy);
         return HitResult::Corrupt;
     }
-    match std::fs::write(out_path, &blob) {
-        Ok(()) => HitResult::Hit,
-        // Cannot materialize the artifact from a verified blob: fall back to rebuilding it in place.
-        Err(_) => HitResult::Miss,
+    drop(staged_file);
+    if std::fs::rename(&stage_path, out_path).is_err() {
+        return HitResult::Miss;
     }
+    stage.committed = true;
+    HitResult::Hit
 }
 
 fn note_corrupt(policy: ReadPolicy) {
@@ -969,12 +1087,12 @@ pub(crate) fn note_packaged_corrupt() {
 /// against `key`. No slot pointer (or an undecodable one) ⇒ [`FirstDiff::NoPriorEntry`].
 fn diff_against_slot(root: &Path, key: &CodegenKey) -> FirstDiff {
     let path = slot_pointer_path(root, key.slot_digest());
-    match std::fs::read(&path) {
-        Ok(bytes) => match deserialize_manifest(&bytes) {
+    match read_cache_manifest(&path) {
+        Some(bytes) => match deserialize_manifest(&bytes) {
             Ok((stored_key, _)) => first_diff(&stored_key, key),
             Err(_) => FirstDiff::NoPriorEntry,
         },
-        Err(_) => FirstDiff::NoPriorEntry,
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -1610,9 +1728,9 @@ fn try_hit_phase(
     out_path: &Path,
     matched_blob: impl FnOnce(&[u8]) -> Option<Hash128>,
 ) -> HitResult {
-    let manifest_bytes = match std::fs::read(action_path) {
-        Ok(b) => b,
-        Err(_) => return HitResult::Miss,
+    let manifest_bytes = match read_cache_manifest(action_path) {
+        Some(bytes) => bytes,
+        None => return HitResult::Miss,
     };
     match matched_blob(&manifest_bytes) {
         Some(blob_digest) => materialize_blob(root, blob_digest, out_path, ReadPolicy::Writable),
@@ -1628,9 +1746,9 @@ fn diff_phase_slot(
     diff: impl FnOnce(&[u8]) -> Option<FirstDiff>,
 ) -> FirstDiff {
     let path = phase_slot_path(root, kind, slot_digest);
-    match std::fs::read(&path) {
-        Ok(bytes) => diff(&bytes).unwrap_or(FirstDiff::NoPriorEntry),
-        Err(_) => FirstDiff::NoPriorEntry,
+    match read_cache_manifest(&path) {
+        Some(bytes) => diff(&bytes).unwrap_or(FirstDiff::NoPriorEntry),
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -1643,10 +1761,13 @@ fn publish_phase(
     out_path: &Path,
     make_manifest: impl Fn(Hash128) -> Vec<u8>,
 ) {
-    let bytes = match std::fs::read(out_path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("alignc: cache not populated (cannot read produced artifact {}): {e}", out_path.display());
+    let bytes = match read_regular_bounded_file(out_path, CACHE_CAS_MAX_BYTES) {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!(
+                "alignc: cache not populated (produced artifact is unavailable, non-regular, or exceeds 256 MiB): {}",
+                out_path.display()
+            );
             return;
         }
     };
@@ -2168,6 +2289,91 @@ mod tests {
     }
 
     #[test]
+    fn cache_file_bounds_accept_the_exact_limit_and_reject_the_next_byte() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-bounds-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sparse");
+        let file = std::fs::File::create(&path).unwrap();
+
+        for limit in [CACHE_MANIFEST_MAX_BYTES, CACHE_CAS_MAX_BYTES] {
+            file.set_len(limit).unwrap();
+            let (_, observed) = open_regular_bounded(&path, Some(limit)).expect("exact limit");
+            assert_eq!(u64::try_from(observed).unwrap(), limit);
+            file.set_len(limit + 1).unwrap();
+            assert!(open_regular_bounded(&path, Some(limit)).is_none(), "limit={limit}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cache_manifest_read_requires_metadata_and_stream_lengths_to_agree() {
+        assert_eq!(
+            read_cache_manifest_from(std::io::Cursor::new(b"abc"), 3),
+            Some(b"abc".to_vec())
+        );
+        assert!(read_cache_manifest_from(std::io::Cursor::new(b"abc"), 4).is_none());
+        assert!(read_cache_manifest_from(std::io::Cursor::new(b"abc"), 2).is_none());
+    }
+
+    #[test]
+    fn private_materialization_is_removed_on_rename_failure_and_unwind() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-stage-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let bytes = b"valid-object";
+        let digest = Hash128::of(bytes);
+        let blob = cas_blob_path(&root, digest);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, bytes).unwrap();
+        let output = root.join("output-directory");
+        std::fs::create_dir(&output).unwrap();
+        assert!(matches!(
+            materialize_blob(&root, digest, &output, ReadPolicy::Packaged),
+            HitResult::Miss
+        ));
+        assert!(output.is_dir());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".cache-stage-")));
+
+        let unwind_path = root.join("unwind-stage");
+        let result = std::panic::catch_unwind(|| {
+            std::fs::write(&unwind_path, b"partial").unwrap();
+            let _stage = MaterializedStage { path: unwind_path.clone(), committed: false };
+            panic!("test unwind");
+        });
+        assert!(result.is_err());
+        assert!(!unwind_path.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_manifest_open_rejects_fifo_and_device_targets_without_reading() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-special-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(read_cache_manifest(&fifo).is_none());
+        assert!(read_cache_manifest(Path::new("/dev/zero")).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn codegen_fallback_hits_without_promotion_or_production() {
         let (primary, packaged, cache) = fallback_context("hit");
         let key = sample_key();
@@ -2244,6 +2450,63 @@ mod tests {
         assert_eq!(std::fs::read(&blob).unwrap(), before);
         assert!(action_manifest_path(&primary, key.full_digest()).is_file());
         assert_eq!(std::fs::read(&output).unwrap(), b"rebuilt-object");
+        assert!(
+            std::fs::read_dir(&primary)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".cache-stage-")),
+            "a rejected streamed object must leave no private materialization"
+        );
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_packaged_object_is_a_clean_miss_without_materialization() {
+        let (primary, packaged, cache) = fallback_context("oversized-object");
+        let key = sample_key();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let source = packaged.join("source.o");
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+        let blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+
+        std::fs::create_dir_all(&primary).unwrap();
+        let output = primary.join("out.o");
+        assert!(matches!(
+            cache.lookup(&key, &output),
+            CacheLookup::Miss {
+                reason: Some(FirstDiff::NoPriorEntry)
+            }
+        ));
+        assert!(!output.exists());
+        assert_eq!(std::fs::metadata(&blob).unwrap().len(), CACHE_CAS_MAX_BYTES + 1);
+        assert!(
+            std::fs::read_dir(&primary)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".cache-stage-"))
+        );
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_produced_object_is_not_published() {
+        let (primary, _, _) = fallback_context("oversized-publication");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        let source = primary.join("oversized.o");
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+        publish(&primary, &key, &source);
+        assert!(!action_manifest_path(&primary, key.full_digest()).exists());
+        assert!(!primary.join("cas").exists());
+        assert_eq!(std::fs::metadata(source).unwrap().len(), CACHE_CAS_MAX_BYTES + 1);
         std::fs::remove_dir_all(primary.parent().unwrap()).ok();
     }
 
