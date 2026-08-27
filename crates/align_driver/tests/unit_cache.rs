@@ -120,6 +120,19 @@ fn list(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("create copied cache directory");
+    for entry in std::fs::read_dir(source).expect("read copied cache source") {
+        let entry = entry.expect("cache entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("cache entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy cache file");
+        }
+    }
+}
+
 fn frontend(build: &PackageBuild, unit: &str) -> Option<align_driver::CacheOutcome> {
     build.units.iter().find(|u| u.unit == unit).and_then(|u| u.frontend.clone())
 }
@@ -394,6 +407,242 @@ fn a_second_process_reuses_the_first_process_frontend() {
     assert!(frontend_at < codegen_at, "the frontend block precedes the unchanged codegen block");
 }
 
+#[test]
+fn copied_compiler_reads_adjacent_packaged_frontend_and_codegen_cache() {
+    let _serial = serial();
+    let proj = two_module("packaged-install");
+    let source_alignc = Path::new(env!("CARGO_BIN_EXE_alignc"));
+
+    let warm = std::process::Command::new(source_alignc)
+        .args(["build", &proj.entry(), "--cache-stats"])
+        .env("ALIGNC_CACHE", &proj.cache)
+        .current_dir(&proj.dir)
+        .output()
+        .expect("warm explicit cache");
+    assert!(
+        warm.status.success(),
+        "warm stderr:\n{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+
+    let install = proj.dir.parent().unwrap().join("install");
+    std::fs::create_dir_all(&install).expect("create install root");
+    let installed_alignc = install.join("alignc");
+    std::fs::copy(source_alignc, &installed_alignc).expect("copy byte-identical compiler");
+    let source_runtime = source_alignc.parent().unwrap().join("libalign_runtime.a");
+    std::fs::copy(source_runtime, install.join("libalign_runtime.a"))
+        .expect("copy runtime archive");
+    let packaged = install
+        .join("share")
+        .join("align")
+        .join("cache")
+        .join(align_driver::cache::CACHE_SCHEMA_VERSION.to_string());
+    copy_tree(&proj.cache, &packaged);
+
+    let writable_home = proj.dir.parent().unwrap().join("xdg");
+    let run = |cache_value: Option<&str>| {
+        let mut command = std::process::Command::new(&installed_alignc);
+        command
+            .args(["build", &proj.entry(), "--cache-stats"])
+            .env("XDG_CACHE_HOME", &writable_home)
+            .env_remove("ALIGNC_CACHE")
+            .current_dir(&proj.dir);
+        if let Some(value) = cache_value {
+            command.env("ALIGNC_CACHE", value);
+        }
+        command.output().expect("run installed compiler")
+    };
+
+    let packaged_hit = run(None);
+    let stderr = String::from_utf8_lossy(&packaged_hit.stderr);
+    assert!(packaged_hit.status.success(), "packaged stderr:\n{stderr}");
+    assert!(
+        stderr.contains("lib frontend hit")
+            && stderr.contains("main frontend hit")
+            && stderr.contains("2 unit(s): 2 hit, 0 miss"),
+        "the copied compiler must hit both adjacent stages:\n{stderr}"
+    );
+    assert!(
+        !writable_home.join("alignc/1/actions").exists(),
+        "packaged hits are not promoted into the writable cache"
+    );
+
+    for (label, extra) in [
+        ("dev", &["--profile", "dev"][..]),
+        ("fast", &["--profile", "fast"][..]),
+        ("native", &["--target-cpu", "native"][..]),
+        ("no-rt-lto", &["--no-rt-lto"][..]),
+    ] {
+        let variant_home = proj.dir.parent().unwrap().join(format!("xdg-{label}"));
+        let variant = std::process::Command::new(&installed_alignc)
+            .args(["build", &proj.entry(), "--cache-stats"])
+            .args(extra)
+            .env("XDG_CACHE_HOME", &variant_home)
+            .env_remove("ALIGNC_CACHE")
+            .current_dir(&proj.dir)
+            .output()
+            .unwrap_or_else(|error| panic!("run installed compiler ({label}): {error}"));
+        let variant_stderr = String::from_utf8_lossy(&variant.stderr);
+        assert!(
+            variant.status.success(),
+            "{label} variant stderr:\n{variant_stderr}"
+        );
+        assert!(
+            variant_stderr.contains("2 frontend: 2 hit, 0 miss")
+                && variant_stderr.contains("2 unit(s): 0 hit, 2 miss"),
+            "{label} must reuse packaged frontend entries but reject the release backend tuple:\n\
+             {variant_stderr}"
+        );
+    }
+
+    let packaged_entry = list(&packaged.join("actions").join("unit"))
+        .into_iter()
+        .next()
+        .expect("packaged frontend entry");
+    let original = std::fs::read(&packaged_entry).expect("read packaged frontend fixture");
+    let mut damaged = original.clone();
+    damaged.pop();
+    std::fs::write(&packaged_entry, &damaged).expect("truncate packaged frontend fixture");
+
+    let primary = writable_home.join("alignc/1");
+    copy_tree(&packaged, &primary);
+    let primary_entry = primary
+        .join("actions/unit")
+        .join(packaged_entry.file_name().expect("frontend action name"));
+    std::fs::write(&primary_entry, &original).expect("keep primary frontend entry valid");
+    let primary_hit = run(None);
+    let primary_stderr = String::from_utf8_lossy(&primary_hit.stderr);
+    assert!(
+        primary_hit.status.success(),
+        "primary stderr:\n{primary_stderr}"
+    );
+    assert!(
+        primary_stderr.contains("2 frontend: 2 hit, 0 miss")
+            && !primary_stderr.contains("packaged cache entry corrupt"),
+        "writable primary must win before a damaged packaged entry:\n{primary_stderr}"
+    );
+
+    std::fs::remove_dir_all(&primary).expect("remove copied writable primary");
+    let rebuilt = run(None);
+    let rebuilt_stderr = String::from_utf8_lossy(&rebuilt.stderr);
+    assert!(
+        rebuilt.status.success(),
+        "rebuilt stderr:\n{rebuilt_stderr}"
+    );
+    assert!(
+        rebuilt_stderr.contains("packaged cache entry corrupt; rebuilding"),
+        "packaged frontend corruption must be reported once:\n{rebuilt_stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&packaged_entry).expect("read immutable packaged entry"),
+        damaged,
+        "frontend corruption must never mutate the packaged tree"
+    );
+    assert!(
+        writable_home.join("alignc/1/actions/unit").is_dir(),
+        "the recomputed frontend entry is published only to writable primary"
+    );
+
+    std::fs::write(&packaged_entry, &original).expect("restore packaged frontend fixture");
+    let mut primary_damaged = std::fs::read(&primary_entry).expect("read rebuilt primary entry");
+    primary_damaged.pop();
+    std::fs::write(&primary_entry, primary_damaged).expect("truncate writable frontend entry");
+    let fallback = run(None);
+    let fallback_stderr = String::from_utf8_lossy(&fallback.stderr);
+    assert!(
+        fallback.status.success(),
+        "fallback stderr:\n{fallback_stderr}"
+    );
+    assert!(
+        fallback_stderr.contains("cache entry corrupt; rebuilding")
+            && fallback_stderr.contains("2 frontend: 2 hit, 0 miss"),
+        "writable corruption must unlink then hit packaged fallback:\n{fallback_stderr}"
+    );
+    assert!(
+        !primary_entry.exists(),
+        "a corrupt writable frontend action is unlinked, never promoted from packaged"
+    );
+    assert_eq!(
+        std::fs::read(&packaged_entry).expect("read restored packaged entry"),
+        original,
+        "writable corruption never mutates packaged bytes"
+    );
+
+    // A well-formed packaged value that disagrees with recomputation proves the key itself
+    // incomplete. Restoring the immutable value afterwards must not reauthorize fallback reuse.
+    let (packaged_lib_entry, packaged_lib_bytes, rejected_key) = list(&packaged.join("actions/unit"))
+        .into_iter()
+        .find_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let (key, mut entry) = unit_cache::decode_manifest(&bytes)?;
+            if key.unit != "lib" {
+                return None;
+            }
+            entry.link_libs.push("definitely-not-a-real-library".to_string());
+            std::fs::write(&path, unit_cache::serialize_manifest(&key, &entry)).expect("tamper packaged lib");
+            Some((path, bytes, key))
+        })
+        .expect("packaged lib frontend entry");
+    std::fs::remove_dir_all(&primary).expect("remove writable primary before packaged rejection");
+    proj.clear_objects();
+    let packaged_rejected = std::process::Command::new(&installed_alignc)
+        .args(["build", &proj.entry(), "--cache-stats", "--profile", "dev"])
+        .env("XDG_CACHE_HOME", &writable_home)
+        .env_remove("ALIGNC_CACHE")
+        .current_dir(&proj.dir)
+        .output()
+        .expect("run installed compiler for packaged rejection");
+    let packaged_rejected_stderr = String::from_utf8_lossy(&packaged_rejected.stderr);
+    assert!(
+        packaged_rejected.status.success(),
+        "packaged rejection retry stderr:\n{packaged_rejected_stderr}"
+    );
+    assert!(
+        packaged_rejected_stderr.contains("rebuilding this package without cache reuse"),
+        "packaged rehydration disagreement must take the bounded retry:\n{packaged_rejected_stderr}"
+    );
+    std::fs::write(&packaged_lib_entry, &packaged_lib_bytes).expect("restore packaged lib");
+    let marker = primary
+        .join("rejected/unit")
+        .join(rejected_key.full_digest().to_hex());
+    assert!(marker.exists(), "packaged rejection must persist authority in the writable root");
+
+    proj.clear_objects();
+    let suppressed = run(None);
+    let suppressed_stderr = String::from_utf8_lossy(&suppressed.stderr);
+    assert!(suppressed.status.success(), "suppressed fallback stderr:\n{suppressed_stderr}");
+    assert!(
+        suppressed_stderr.contains("lib frontend miss (corrupt entry rebuilt)"),
+        "a restored packaged action cannot bypass the rejected-key marker:\n{suppressed_stderr}"
+    );
+    assert!(
+        !primary
+            .join("actions/unit")
+            .join(rejected_key.full_digest().to_hex())
+            .exists(),
+        "recomputation cannot republish the rejected key"
+    );
+
+    let isolated = proj.dir.parent().unwrap().join("isolated-cache");
+    let isolated_value = isolated.to_string_lossy();
+    let custom = run(Some(&isolated_value));
+    let custom_stderr = String::from_utf8_lossy(&custom.stderr);
+    assert!(custom.status.success(), "custom stderr:\n{custom_stderr}");
+    assert!(
+        custom_stderr.contains("2 frontend: 0 hit, 2 miss")
+            && custom_stderr.contains("2 unit(s): 0 hit, 2 miss"),
+        "an explicit root must exclude the packaged fallback:\n{custom_stderr}"
+    );
+
+    let off = run(Some("off"));
+    let off_stderr = String::from_utf8_lossy(&off.stderr);
+    assert!(off.status.success(), "off stderr:\n{off_stderr}");
+    assert!(
+        off_stderr.contains("cache: disabled"),
+        "off disables both stores:\n{off_stderr}"
+    );
+}
+
 // ---- P10 / P10b: diagnostics ------------------------------------------------------------------
 
 /// A warning-bearing unit. A clean unit that still warns is the common case — `pkg.db` alone emits
@@ -552,6 +801,7 @@ fn tamper_and_expect_rejection(tag: &str, mutate: impl FnOnce(&mut UnitEntry)) {
     let entries = proj.unit_entries();
     assert!(!entries.is_empty(), "the fixture must have published something");
     let mut tampered_any = false;
+    let mut rejected_key = None;
     for path in &entries {
         let bytes = std::fs::read(path).expect("read manifest");
         // Decode against every candidate key by asking the store: the manifest carries its own key,
@@ -563,6 +813,7 @@ fn tamper_and_expect_rejection(tag: &str, mutate: impl FnOnce(&mut UnitEntry)) {
         let Some(apply) = mutate.take() else { break };
         apply(&mut entry);
         std::fs::write(path, unit_cache::serialize_manifest(&key, &entry)).expect("rewrite");
+        rejected_key = Some(key);
         tampered_any = true;
     }
     assert!(tampered_any, "the `lib` entry must exist to tamper with");
@@ -573,9 +824,23 @@ fn tamper_and_expect_rejection(tag: &str, mutate: impl FnOnce(&mut UnitEntry)) {
     assert!(warm.units[index].is_reused(), "the tampered entry still decodes, so it is served");
     let failure = warm.materialize(index).expect_err("verification must reject the tampered entry");
     eprintln!("{tag}: rejected with {failure:?}");
-    // Self-healing: the entry is gone, so the next build recomputes and republishes.
+    let rejected_key = rejected_key.expect("tampered key");
+    let action = proj
+        .cache
+        .join("actions/unit")
+        .join(rejected_key.full_digest().to_hex());
+    let marker = proj
+        .cache
+        .join("rejected/unit")
+        .join(rejected_key.full_digest().to_hex());
+    assert!(!action.exists(), "the rejected action must be unlinked");
+    assert!(marker.exists(), "the rejected key must gain a persistent marker");
+
+    // The next build recomputes but cannot republish under the revoked key.
     let after = proj.build(UnitReuse::Allowed);
     assert!(!hit(&after, "lib"), "the rejected entry must have been unlinked");
+    assert!(!action.exists(), "a recomputed value cannot regain rejected-key authorization");
+    assert!(marker.exists(), "the rejection marker survives later builds");
 }
 
 #[test]
@@ -1171,23 +1436,18 @@ fn a_stale_entry_makes_the_cli_retry_once_and_succeed() {
         0,
         "the retry forbids reuse, so it consults no frontend entry and prints no frontend block:\n{stderr}"
     );
-    // Healing takes one more ordinary build, and that is the correct shape: the retry FORBIDS
-    // reuse, and a forbidden walk neither serves nor publishes, so the rejected entry is simply
-    // absent afterwards. The next ordinary build recomputes and republishes it...
-    let republish = build(&["--cache-stats"]);
-    let republish_err = String::from_utf8_lossy(&republish.stderr).into_owned();
-    assert!(republish.status.success());
+    // The disagreement proved the key incomplete, so later ordinary builds keep recomputing that
+    // unit instead of republishing a different value under the same unauthorized key.
+    let rejected = build(&["--cache-stats"]);
+    let rejected_err = String::from_utf8_lossy(&rejected.stderr).into_owned();
+    assert!(rejected.status.success());
     assert!(
-        republish_err.contains("lib frontend miss (no prior entry)"),
-        "the rejected entry must be gone, not silently reused:\n{republish_err}"
+        rejected_err.contains("lib frontend miss (corrupt entry rebuilt)"),
+        "the rejected key must remain a fail-closed miss:\n{rejected_err}"
     );
-    // ...and the one after it hits again.
-    let healed = build(&["--cache-stats"]);
-    let healed_err = String::from_utf8_lossy(&healed.stderr);
-    assert!(healed.status.success());
     assert!(
-        healed_err.contains("2 frontend: 2 hit, 0 miss"),
-        "the cache must be healthy again two builds later:\n{healed_err}"
+        rejected_err.contains("main frontend hit") && rejected_err.contains("2 frontend: 1 hit, 1 miss"),
+        "rejection is per key, so unrelated entries still hit:\n{rejected_err}"
     );
 }
 

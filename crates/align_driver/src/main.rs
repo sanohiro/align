@@ -1581,7 +1581,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
             }
         };
         if cache_stats {
-            render_thin_cache_stats(&outcomes, cache.is_enabled());
+            render_thin_cache_stats(&outcomes, cache.codegen_is_enabled());
         }
         let link_libs = link_lib_union(walk.units.iter().map(|u| u.mir.link_libs.as_slice()));
         return finish_link(&link_libs, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
@@ -1610,7 +1610,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         }
     };
     if cache_stats {
-        render_cache_stats(&build.outcomes, cache.is_enabled());
+        render_cache_stats(&build.outcomes, cache.codegen_is_enabled());
     }
     // One aggregated Align-voice `--pgo-use` report over the units that actually ran (cache MISSES), then
     // proceed — a mismatched profile is a PERFORMANCE concern, never a correctness one (clang parity), so
@@ -1669,7 +1669,7 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
     let src = read(path).ok_or(ExitCode::FAILURE)?;
     let mut source_map = SourceMap::new();
     let cache = CacheContext::from_env();
-    let cache_enabled = cache.is_enabled();
+    let cache_enabled = cache.codegen_is_enabled();
     let result = align_driver::build_package_pipelined(
         &mut source_map,
         path,

@@ -24,6 +24,7 @@ align_mir = { path = "../align_mir" }
 align_interface = { path = "../align_interface" }
 align_codegen_llvm = { path = "../align_codegen_llvm" }
 align_hash = { path = "../align_hash" }
+libc = "0.2"
 mimalloc = "0.1.52"
 
 [build-dependencies]

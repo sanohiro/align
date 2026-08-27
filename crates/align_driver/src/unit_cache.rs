@@ -43,7 +43,9 @@
 //! carries its own digest — the key covers none of the summary, diagnostics, or link libraries, so
 //! without it a bit flip in `impl_hash` could address a genuine OLDER object for the same unit.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use align_interface::Hash128;
 
@@ -511,6 +513,62 @@ fn slot_path(root: &Path, slot: Hash128) -> PathBuf {
     root.join("index").join("unit").join(slot.to_hex())
 }
 
+fn rejection_path(root: &Path, full: Hash128) -> PathBuf {
+    root.join("rejected").join("unit").join(full.to_hex())
+}
+
+const MAX_UNPERSISTED_REJECTIONS: usize = 1_024;
+
+#[derive(Default)]
+struct RejectedInProcess {
+    exact: HashSet<(PathBuf, Hash128)>,
+    all: bool,
+}
+
+impl RejectedInProcess {
+    fn contains(&self, root: &Path, digest: Hash128) -> bool {
+        self.all || self.exact.contains(&(root.to_path_buf(), digest))
+    }
+
+    fn insert(&mut self, root: &Path, digest: Hash128) {
+        if self.all || self.exact.contains(&(root.to_path_buf(), digest)) {
+            return;
+        }
+        if self.exact.len() == MAX_UNPERSISTED_REJECTIONS {
+            self.exact.clear();
+            self.all = true;
+            return;
+        }
+        self.exact.insert((root.to_path_buf(), digest));
+    }
+
+    fn persisted(&mut self, root: &Path, digest: Hash128) {
+        self.exact.remove(&(root.to_path_buf(), digest));
+    }
+}
+
+fn rejected_in_process() -> &'static Mutex<RejectedInProcess> {
+    static REJECTED: OnceLock<Mutex<RejectedInProcess>> = OnceLock::new();
+    REJECTED.get_or_init(|| Mutex::new(RejectedInProcess::default()))
+}
+
+/// Whether complete rehydration has revoked this key. Any exact marker object disables reuse; its
+/// contents and file type cannot grant authority. Non-NotFound metadata failures also fail closed.
+pub(crate) fn is_rejected(root: &Path, key: &UnitKey) -> bool {
+    let digest = key.full_digest();
+    if rejected_in_process()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(root, digest)
+    {
+        return true;
+    }
+    match std::fs::symlink_metadata(rejection_path(root, digest)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// A verified hit: the stored entry plus its already-decoded summary. `lookup` has to decode the
 /// summary anyway to prove the entry is intact, so it hands the value over rather than making the
 /// caller decode the same bytes twice.
@@ -536,17 +594,69 @@ pub enum UnitLookup {
 /// an out-of-range offset here is damage, not skew (a corrupted manifest is not bound by the key).
 /// Rejecting it is what keeps a later `format_diagnostics` from slicing past end-of-file.
 pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
+    lookup_authorized_with_policy(root, root, key, source_len, ReadPolicy::Writable, || {})
+}
+
+/// Immutable packaged-cache lookup. It uses the identical decoder and validation order as the
+/// writable store, but never mutates installer-owned bytes on corruption.
+pub(crate) fn lookup_packaged(
+    root: &Path,
+    rejection_root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+) -> UnitLookup {
+    lookup_authorized_with_policy(root, rejection_root, key, source_len, ReadPolicy::Packaged, || {})
+}
+
+/// Linearize a successfully decoded primary or packaged hit against rejection. The caller performs
+/// an early marker check to avoid needless I/O, then passes every hit through this check after all
+/// untrusted bytes have been read and validated. A marker installed between those two points wins.
+fn authorize_lookup(root: &Path, key: &UnitKey, candidate: UnitLookup) -> UnitLookup {
+    if matches!(candidate, UnitLookup::Hit(_)) && is_rejected(root, key) {
+        UnitLookup::Miss {
+            reason: Some(FirstDiff::CorruptEntry),
+        }
+    } else {
+        candidate
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadPolicy {
+    Writable,
+    Packaged,
+}
+
+fn lookup_authorized_with_policy(
+    root: &Path,
+    rejection_root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+    policy: ReadPolicy,
+    before_authorize: impl FnOnce(),
+) -> UnitLookup {
+    let candidate = lookup_with_policy(root, key, source_len, policy);
+    before_authorize();
+    authorize_lookup(rejection_root, key, candidate)
+}
+
+fn lookup_with_policy(
+    root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+    policy: ReadPolicy,
+) -> UnitLookup {
     let path = action_path(root, key.full_digest());
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) },
+    let bytes = match cache::read_cache_manifest(&path) {
+        Some(bytes) => bytes,
+        None => return UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) },
     };
     match deserialize_manifest(&bytes, key) {
         // A version-skewed or structurally foreign manifest: unreferenced, rebuild fresh.
         Err(CacheDecodeError::UnknownVersion(_)) | Ok(None) => {
             UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) }
         }
-        Err(_) => corrupt(&path),
+        Err(_) => corrupt(&path, policy),
         Ok(Some((_, entry))) => {
             // Steps 8 then 9, in that order: decode the summary before range-checking the spans, so
             // a manifest that fails both reports the earlier cause. Both are past the key
@@ -554,7 +664,7 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             let object_format = match key.object_format {
                 0 => align_interface::OwnedJsonObjectFormat::Elf,
                 1 => align_interface::OwnedJsonObjectFormat::MachO,
-                _ => return corrupt(&path),
+                _ => return corrupt(&path, policy),
             };
             let target = align_interface::OwnedJsonTarget {
                 triple: key.target_triple.clone(),
@@ -563,14 +673,14 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             let Ok(summary) =
                 align_interface::deserialize_for_target(&entry.summary_bytes, &target)
             else {
-                return corrupt(&path);
+                return corrupt(&path, policy);
             };
             if entry
                 .diagnostics
                 .iter()
                 .any(|d| d.lo > d.hi || d.hi as usize > source_len)
             {
-                return corrupt(&path);
+                return corrupt(&path, policy);
             }
             UnitLookup::Hit(Box::new(UnitHit { entry, summary }))
         }
@@ -585,9 +695,14 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
 /// slot pointer is deliberately left alone: it is observability only (it names the first differing
 /// component of a later miss) and removing it would cost that diagnosis with no safety gain, since
 /// a hit always requires the full-key manifest this just removed.
-fn corrupt(path: &Path) -> UnitLookup {
-    let _ = std::fs::remove_file(path);
-    eprintln!("{}", cache::CORRUPT_NOTE);
+fn corrupt(path: &Path, policy: ReadPolicy) -> UnitLookup {
+    match policy {
+        ReadPolicy::Writable => {
+            let _ = std::fs::remove_file(path);
+            eprintln!("{}", cache::CORRUPT_NOTE);
+        }
+        ReadPolicy::Packaged => cache::note_packaged_corrupt(),
+    }
     UnitLookup::Miss { reason: Some(FirstDiff::CorruptEntry) }
 }
 
@@ -598,13 +713,32 @@ pub fn invalidate(root: &Path, key: &UnitKey) {
     let _ = std::fs::remove_file(slot_path(root, key.slot_digest()));
 }
 
+/// Permanently revoke a key whose stored value disagreed with complete recomputation. The marker is
+/// installed before the action is removed so concurrent lookup/publication observes at least one
+/// rejection authority. The process-local set keeps this process fail-closed if persistence fails.
+pub(crate) fn reject(root: &Path, key: &UnitKey) {
+    let digest = key.full_digest();
+    rejected_in_process()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root, digest);
+    match cache::publish_file(&rejection_path(root, digest), &[]) {
+        Ok(()) => rejected_in_process()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .persisted(root, digest),
+        Err(error) => eprintln!("alignc: cache rejection marker not persisted: {error}"),
+    }
+    invalidate(root, key);
+}
+
 fn diff_against_slot(root: &Path, key: &UnitKey) -> FirstDiff {
-    match std::fs::read(slot_path(root, key.slot_digest())) {
-        Ok(bytes) => match deserialize_key_only(&bytes) {
+    match cache::read_cache_manifest(&slot_path(root, key.slot_digest())) {
+        Some(bytes) => match deserialize_key_only(&bytes) {
             Ok(stored) => first_diff(&stored, key),
             Err(_) => FirstDiff::NoPriorEntry,
         },
-        Err(_) => FirstDiff::NoPriorEntry,
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -616,11 +750,25 @@ fn diff_against_slot(root: &Path, key: &UnitKey) -> FirstDiff {
 /// link libraries are in MIR order, and the digest is a function of those bytes), so the
 /// staged-write + same-directory rename's last-writer-wins is harmless.
 pub fn publish(root: &Path, key: &UnitKey, entry: &UnitEntry) {
+    if is_rejected(root, key) {
+        return;
+    }
     let manifest = serialize_manifest(key, entry);
     let result = cache::publish_file(&action_path(root, key.full_digest()), &manifest)
         .and_then(|()| cache::publish_file(&slot_path(root, key.slot_digest()), &manifest));
+    finish_publication(root, key);
     if let Err(error) = result {
         eprintln!("alignc: cache not populated: {error}");
+    }
+}
+
+/// Complete the publication/rejection handshake. If rejection raced after the publisher's early
+/// check, this side removes the bytes it may have installed; if rejection starts after this check,
+/// `reject` installs the marker before performing the same invalidation. Either ordering leaves the
+/// marker authoritative and no reachable action after both operations complete.
+fn finish_publication(root: &Path, key: &UnitKey) {
+    if is_rejected(root, key) {
+        invalidate(root, key);
     }
 }
 
@@ -689,6 +837,31 @@ mod tests {
                 hi: 11,
             }],
             link_libs: vec!["sqlite3".to_string()],
+        }
+    }
+
+    fn sample_summary(unit: &str) -> align_interface::InterfaceSummary {
+        let mut summary = align_interface::InterfaceSummary {
+            unit: unit.to_string(),
+            fns: Vec::new(),
+            structs: Vec::new(),
+            owned_json_graphs: Vec::new(),
+            enums: Vec::new(),
+            resources: Vec::new(),
+            consts: Vec::new(),
+            capabilities: Vec::new(),
+            interface_hash: Hash128 { lo: 0, hi: 0 },
+            impl_hash: hh(50),
+        };
+        summary.interface_hash = Hash128::of(&align_interface::encode_interface_surface(&summary));
+        summary
+    }
+
+    fn sample_valid_entry(unit: &str) -> UnitEntry {
+        UnitEntry {
+            summary_bytes: align_interface::serialize(&sample_summary(unit)),
+            diagnostics: Vec::new(),
+            link_libs: Vec::new(),
         }
     }
 
@@ -869,6 +1042,150 @@ mod tests {
             deserialize_manifest(&bytes, &key).expect("decode").expect("matches");
         assert_eq!(decoded_key, key);
         assert_eq!(decoded_entry, entry);
+    }
+
+    #[test]
+    fn oversized_packaged_frontend_manifest_is_an_immutable_clean_miss() {
+        let root = std::env::temp_dir().join(format!(
+            "align-unit-cache-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        let path = action_path(&root, key.full_digest());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(cache::CACHE_MANIFEST_MAX_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            lookup_packaged(&root, &root, &key, 0),
+            UnitLookup::Miss {
+                reason: Some(FirstDiff::NoPriorEntry)
+            }
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            cache::CACHE_MANIFEST_MAX_BYTES + 1,
+            "packaged rejection must not mutate installer-owned bytes"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejected_key_marker_blocks_later_frontend_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "align-unit-cache-rejected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        let entry = sample_valid_entry(&key.unit);
+        publish(&root, &key, &entry);
+        assert!(action_path(&root, key.full_digest()).exists());
+
+        reject(&root, &key);
+        assert!(is_rejected(&root, &key));
+        assert!(!action_path(&root, key.full_digest()).exists());
+        assert!(rejection_path(&root, key.full_digest()).exists());
+
+        publish(&root, &key, &sample_valid_entry(&key.unit));
+        assert!(
+            !action_path(&root, key.full_digest()).exists(),
+            "a later producer cannot republish under the rejected key"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejection_wins_after_a_frontend_action_was_already_read() {
+        let base = std::env::temp_dir().join(format!(
+            "align-unit-cache-rejected-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        for (label, policy) in [
+            ("primary", ReadPolicy::Writable),
+            ("packaged", ReadPolicy::Packaged),
+        ] {
+            let rejection_root = base.join(label).join("primary");
+            let lookup_root = if matches!(policy, ReadPolicy::Writable) {
+                rejection_root.clone()
+            } else {
+                base.join(label).join("packaged")
+            };
+            publish(&lookup_root, &key, &sample_valid_entry(&key.unit));
+            let callback_root = rejection_root.clone();
+            let callback_key = key.clone();
+            assert!(
+                matches!(
+                    lookup_authorized_with_policy(
+                        &lookup_root,
+                        &rejection_root,
+                        &key,
+                        usize::MAX,
+                        policy,
+                        || reject(&callback_root, &callback_key),
+                    ),
+                    UnitLookup::Miss {
+                        reason: Some(FirstDiff::CorruptEntry)
+                    }
+                ),
+                "{label} candidate must lose to rejection after its value read"
+            );
+        }
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rejection_wins_after_a_frontend_publication_passed_its_early_check() {
+        let root = std::env::temp_dir().join(format!(
+            "align-unit-cache-rejected-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        assert!(!is_rejected(&root, &key), "publisher's early check");
+        reject(&root, &key);
+
+        let manifest = serialize_manifest(&key, &sample_entry());
+        cache::publish_file(&action_path(&root, key.full_digest()), &manifest).unwrap();
+        cache::publish_file(&slot_path(&root, key.slot_digest()), &manifest).unwrap();
+        finish_publication(&root, &key);
+        assert!(!action_path(&root, key.full_digest()).exists());
+        assert!(!slot_path(&root, key.slot_digest()).exists());
+        assert!(is_rejected(&root, &key));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unpersisted_rejection_memory_is_bounded_and_then_fails_closed() {
+        let mut rejected = RejectedInProcess::default();
+        let root = Path::new("cache-root");
+        for n in 0..MAX_UNPERSISTED_REJECTIONS {
+            rejected.insert(root, hh(n as u64));
+        }
+        assert!(!rejected.all);
+        assert_eq!(rejected.exact.len(), MAX_UNPERSISTED_REJECTIONS);
+
+        rejected.insert(root, hh(MAX_UNPERSISTED_REJECTIONS as u64));
+        assert!(rejected.all, "the rejected-next key disables unit reuse process-wide");
+        assert!(rejected.exact.is_empty(), "exact paths are released after the fail-closed transition");
+        assert!(rejected.contains(Path::new("another-root"), hh(u64::MAX - 1)));
     }
 
     #[test]

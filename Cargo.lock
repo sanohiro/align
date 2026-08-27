@@ -25,6 +25,7 @@ dependencies = [
  "align_ast",
  "align_diag",
  "align_hash",
+ "align_interface",
  "align_lexer",
  "align_mir",
  "align_parser",
@@ -57,6 +58,7 @@ dependencies = [
  "align_parser",
  "align_sema",
  "align_span",
+ "libc",
  "mimalloc",
 ]
 

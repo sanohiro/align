@@ -97,6 +97,142 @@ pub fn wyhash(key: &[u8], seed: u64) -> u64 {
     wymix(lo ^ WY_SECRET[0] ^ (len as u64), hi ^ WY_SECRET[1])
 }
 
+/// Incremental wyhash for a byte stream whose exact length is known before the first byte.
+///
+/// Wyhash's final lanes overlap the last processed block, so an ordinary state that knows only the
+/// bytes seen so far cannot preserve the one-shot result. The declared length fixes the 48-byte and
+/// 16-byte block boundaries up front; this state retains only the current block and the final 16
+/// bytes. [`finish`](Self::finish) returns `None` unless exactly the declared byte count arrived.
+pub struct WyHashStream {
+    expected: usize,
+    received: usize,
+    triple_bytes: usize,
+    process_bytes: usize,
+    processed: usize,
+    seed: u64,
+    see1: u64,
+    see2: u64,
+    block: [u8; 48],
+    block_len: usize,
+    tail: [u8; 16],
+    tail_len: usize,
+}
+
+impl WyHashStream {
+    pub fn for_len(seed: u64, len: usize) -> Self {
+        let triple_bytes = if len > 48 { ((len - 1) / 48) * 48 } else { 0 };
+        let remaining = len - triple_bytes;
+        let single_bytes = if len > 16 { ((remaining - 1) / 16) * 16 } else { 0 };
+        let seed = seed ^ wymix(seed ^ WY_SECRET[0], WY_SECRET[1]);
+        Self {
+            expected: len,
+            received: 0,
+            triple_bytes,
+            process_bytes: triple_bytes + single_bytes,
+            processed: 0,
+            seed,
+            see1: seed,
+            see2: seed,
+            block: [0; 48],
+            block_len: 0,
+            tail: [0; 16],
+            tail_len: 0,
+        }
+    }
+
+    /// Consume one chunk. An update that would exceed the declared length returns `false` without
+    /// changing the state.
+    pub fn update(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.expected - self.received {
+            return false;
+        }
+        self.update_tail(bytes);
+        self.received += bytes.len();
+
+        let mut cursor = 0;
+        while cursor < bytes.len() && self.processed + self.block_len < self.process_bytes {
+            let target = if self.processed < self.triple_bytes { 48 } else { 16 };
+            let remaining_prefix = self.process_bytes - self.processed - self.block_len;
+            let take = (target - self.block_len)
+                .min(remaining_prefix)
+                .min(bytes.len() - cursor);
+            self.block[self.block_len..self.block_len + take]
+                .copy_from_slice(&bytes[cursor..cursor + take]);
+            self.block_len += take;
+            cursor += take;
+            if self.block_len == target {
+                self.process_block(target);
+            }
+        }
+        true
+    }
+
+    /// Finish only after the exact declared length has been consumed.
+    pub fn finish(self) -> Option<u64> {
+        if self.received != self.expected
+            || self.processed != self.process_bytes
+            || self.block_len != 0
+        {
+            return None;
+        }
+        let (a, b) = if self.expected <= 16 {
+            if self.expected >= 4 {
+                let off = (self.expected >> 3) << 2;
+                (
+                    (wyr4(&self.tail) << 32) | wyr4(&self.tail[off..]),
+                    (wyr4(&self.tail[self.expected - 4..]) << 32)
+                        | wyr4(&self.tail[self.expected - 4 - off..]),
+                )
+            } else if self.expected > 0 {
+                (wyr3(&self.tail, self.expected), 0)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (wyr8(&self.tail), wyr8(&self.tail[8..]))
+        };
+        let length = u64::try_from(self.expected).ok()?;
+        let (lo, hi) = wymum(a ^ WY_SECRET[1], b ^ self.seed);
+        Some(wymix(lo ^ WY_SECRET[0] ^ length, hi ^ WY_SECRET[1]))
+    }
+
+    fn update_tail(&mut self, bytes: &[u8]) {
+        let tail_capacity = self.tail.len();
+        if bytes.len() >= tail_capacity {
+            self.tail.copy_from_slice(&bytes[bytes.len() - tail_capacity..]);
+            self.tail_len = tail_capacity;
+            return;
+        }
+        let keep = self.tail_len.min(tail_capacity - bytes.len());
+        if keep > 0 {
+            self.tail.copy_within(self.tail_len - keep..self.tail_len, 0);
+        }
+        self.tail[keep..keep + bytes.len()].copy_from_slice(bytes);
+        self.tail_len = keep + bytes.len();
+    }
+
+    fn process_block(&mut self, size: usize) {
+        if size == 48 {
+            self.seed = wymix(wyr8(&self.block) ^ WY_SECRET[1], wyr8(&self.block[8..]) ^ self.seed);
+            self.see1 = wymix(
+                wyr8(&self.block[16..]) ^ WY_SECRET[2],
+                wyr8(&self.block[24..]) ^ self.see1,
+            );
+            self.see2 = wymix(
+                wyr8(&self.block[32..]) ^ WY_SECRET[3],
+                wyr8(&self.block[40..]) ^ self.see2,
+            );
+        } else {
+            self.seed = wymix(wyr8(&self.block) ^ WY_SECRET[1], wyr8(&self.block[8..]) ^ self.seed);
+        }
+        self.processed += size;
+        self.block_len = 0;
+        if self.triple_bytes != 0 && self.processed == self.triple_bytes {
+            self.seed ^= self.see1 ^ self.see2;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +254,33 @@ mod tests {
     #[test]
     fn phf_pinned_vector() {
         assert_eq!(wyhash(b"score", 0), 0x1300_a50c_fadb_78d9);
+    }
+
+    #[test]
+    fn streamed_hash_matches_one_shot_at_every_block_boundary() {
+        let bytes: Vec<u8> = (0..4097)
+            .map(|i| u8::try_from((i * 37 + 11) % 256).unwrap())
+            .collect();
+        for len in 0..=bytes.len() {
+            for chunk in [1, 2, 3, 7, 15, 16, 17, 47, 48, 49, 64, 257] {
+                let mut stream = WyHashStream::for_len(23, len);
+                for part in bytes[..len].chunks(chunk) {
+                    assert!(stream.update(part));
+                }
+                assert_eq!(stream.finish(), Some(wyhash(&bytes[..len], 23)), "len={len} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_hash_requires_the_declared_length_without_consuming_excess() {
+        let mut short = WyHashStream::for_len(0, 4);
+        assert!(short.update(b"abc"));
+        assert_eq!(short.finish(), None);
+
+        let mut excess = WyHashStream::for_len(0, 3);
+        assert!(!excess.update(b"abcd"));
+        assert!(excess.update(b"abc"));
+        assert_eq!(excess.finish(), Some(wyhash(b"abc", 0)));
     }
 }

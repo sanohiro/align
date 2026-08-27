@@ -34,7 +34,7 @@ jobs:
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libpq-dev libssl-dev zlib1g-dev libzstd-dev
+        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev
       # Fail closed on the linker per platform, same rule as ci.yml: the PGO
       # training phase links the whole examples/pkg.db corpus, so a missing
       # lld-22 would quietly make a release build slower rather than fail.
@@ -212,7 +212,7 @@ jobs:
           ./target/dist/align-repl --version
           printf '40 + 2\n:quit\n' | ./target/dist/align-repl | grep -x 42
 
-      - name: Create archive
+      - name: Create and verify archive
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
@@ -222,14 +222,69 @@ jobs:
           cp target/dist/align-repl package/
           cp target/dist/libalign_runtime.a package/
           cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md package/
-          tar -C package -czf "$ARTIFACT.tar.gz" \
-            alignc align-repl libalign_runtime.a \
+          ARCHIVE_MEMBERS=(
+            alignc align-repl libalign_runtime.a
             LICENSE-APACHE LICENSE-MIT README.md README.ja.md
+          )
+          if [[ -x scripts/build-prebuilt-cache.sh && \
+                -x scripts/verify-prebuilt-cache-layout.sh ]]; then
+            mkdir -p package/share/align/cache/1
+            scripts/build-prebuilt-cache.sh \
+              package/alignc package/share/align/cache/1
+            scripts/verify-prebuilt-cache-layout.sh package
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum package/alignc | awk '{ print $1 }' > "$RUNNER_TEMP/packaged-alignc.sha256"
+            else
+              shasum -a 256 package/alignc | awk '{ print $1 }' > "$RUNNER_TEMP/packaged-alignc.sha256"
+            fi
+            ARCHIVE_MEMBERS+=(share)
+          else
+            echo "historical tag: prebuilt-cache release machinery is absent"
+          fi
+          tar -C package -czf "$ARTIFACT.tar.gz" "${ARCHIVE_MEMBERS[@]}"
+
+      - name: Verify real Homebrew installation
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          if [[ ! -x scripts/verify-prebuilt-cache-layout.sh ]]; then
+            echo "historical tag: skipping prebuilt-cache Homebrew verification"
+            exit 0
+          fi
+          VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          ARCHIVE="$GITHUB_WORKSPACE/$ARTIFACT.tar.gz"
+          ARCHIVE_SHA="$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')"
+          sed -e "s|{{VERSION}}|$VERSION|g" \
+              -e "s|{{URL_MACOS_ARM}}|file://$ARCHIVE|g" \
+              -e "s|{{SHA_MACOS_ARM}}|$ARCHIVE_SHA|g" \
+              .github/align.rb.template > "$RUNNER_TEMP/align.rb"
+          brew install --formula --build-from-source "$RUNNER_TEMP/align.rb"
+          FORMULA_ROOT="$(brew --prefix align)/libexec"
+          test "$(shasum -a 256 "$FORMULA_ROOT/alignc" | awk '{ print $1 }')" = \
+            "$(cat "$RUNNER_TEMP/packaged-alignc.sha256")"
+          scripts/verify-prebuilt-cache-layout.sh "$FORMULA_ROOT"
+          brew uninstall align
+
+      - name: Measure prebuilt cache
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          if [[ ! -x bench/prebuilt_cache/run.sh ]]; then
+            echo "historical tag: skipping prebuilt-cache measurement"
+            exit 0
+          fi
+          bench/prebuilt_cache/run.sh package "$ARTIFACT.tar.gz" \
+            "$ARTIFACT.prebuilt-cache.md"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.prebuilt-cache.md
           if-no-files-found: error
 
   publish:
@@ -281,8 +336,13 @@ jobs:
             ROOT="deb-$DEB_ARCH"
             mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/align" \
               "$ROOT/usr/share/doc/alignc"
-            tar -xzf "release/alignc-linux-$ARCHIVE_ARCH.tar.gz" \
-              -C "$ROOT/usr/lib/align" alignc align-repl libalign_runtime.a
+            ARCHIVE="release/alignc-linux-$ARCHIVE_ARCH.tar.gz"
+            ARCHIVE_MEMBERS=(alignc align-repl libalign_runtime.a)
+            tar -tzf "$ARCHIVE" > "$RUNNER_TEMP/$DEB_ARCH.archive-members"
+            if grep -q '^share/' "$RUNNER_TEMP/$DEB_ARCH.archive-members"; then
+              ARCHIVE_MEMBERS+=(share)
+            fi
+            tar -xzf "$ARCHIVE" -C "$ROOT/usr/lib/align" "${ARCHIVE_MEMBERS[@]}"
             cat > "$ROOT/usr/bin/alignc" <<'EOF'
           #!/bin/sh
           exec /usr/lib/align/alignc "$@"
@@ -306,7 +366,7 @@ jobs:
           Priority: optional
           Architecture: $DEB_ARCH
           Maintainer: sanohiro
-          Depends: llvm-22, clang-22, libclang-rt-22-dev, libssl-dev, zlib1g-dev, libzstd-dev
+          Depends: llvm-22, clang-22, libclang-rt-22-dev, libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev
           Description: AOT compiler for the Align programming language
            Align is a data-oriented language with predictable native performance.
            Ships alignc and align-repl, an AOT REPL that compiles and runs each
@@ -322,6 +382,7 @@ jobs:
         run: |
           SHA_MACOS_ARM="$(sha256sum release/alignc-macos-aarch64.tar.gz | cut -d' ' -f1)"
           sed -e "s/{{VERSION}}/$VERSION/g" \
+              -e "s|{{URL_MACOS_ARM}}|https://github.com/sanohiro/align/releases/download/v$VERSION/alignc-macos-aarch64.tar.gz|g" \
               -e "s/{{SHA_MACOS_ARM}}/$SHA_MACOS_ARM/g" \
               .github/align.rb.template > release/align.rb
 

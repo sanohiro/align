@@ -1923,8 +1923,106 @@ release_driver_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dis
   echo "release.yml no longer builds the runtime and compiler separately in both PGO phases" >&2
   exit 1
 }
+grep -Fq 'scripts/build-prebuilt-cache.sh' "$release_workflow" || {
+  echo "release.yml no longer warms the final release compiler's adjacent cache" >&2
+  exit 1
+}
+grep -Fq 'scripts/verify-prebuilt-cache-layout.sh package' "$release_workflow" || {
+  echo "release.yml no longer verifies the staged native cache layout" >&2
+  exit 1
+}
+grep -Fq 'ARCHIVE_MEMBERS+=(share)' "$release_workflow" || {
+  echo "release.yml no longer includes the cache tree in native archives" >&2
+  exit 1
+}
+grep -Fq 'tar -C package -czf "$ARTIFACT.tar.gz" "${ARCHIVE_MEMBERS[@]}"' \
+  "$release_workflow" || {
+  echo "release.yml no longer archives its exact selected artifact graph" >&2
+  exit 1
+}
+grep -Fq "grep -q '^share/'" "$release_workflow" || {
+  echo "release.yml no longer detects cache-bearing archives for Debian packaging" >&2
+  exit 1
+}
+grep -Fq -- '-C "$ROOT/usr/lib/align" "${ARCHIVE_MEMBERS[@]}"' "$release_workflow" || {
+  echo "release.yml no longer preserves the adjacent cache in Debian packages" >&2
+  exit 1
+}
+historical_guards="$(grep -Fc 'historical tag:' "$release_workflow")"
+if [[ "$historical_guards" -ne 3 ]]; then
+  echo "release.yml no longer preserves historical workflow_dispatch tags" >&2
+  exit 1
+fi
+corpus_links="$(
+  find "$repo_root/apps/web/pkg" "$repo_root/apps/jwt/pkg" "$repo_root/apps/db/pkg" \
+    -name '*.align' -type f -exec \
+    sed -n 's/.*extern "C" link("\([^"]*\)").*/\1/p' '{}' + \
+    | LC_ALL=C sort -u | paste -sd, -
+)"
+if [[ "$corpus_links" != "crypto,pq,sqlite3,ssl,z,zstd" ]]; then
+  echo "the prebuilt-cache native-link declaration inventory changed: $corpus_links" >&2
+  exit 1
+fi
+grep -Fq 'libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev' "$release_workflow" || {
+  echo "the release runner cannot link the complete cached pkg.db corpus" >&2
+  exit 1
+}
+grep -Fq 'libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev' \
+  "$release_workflow" || {
+  echo "the Debian compiler package cannot link the complete cached pkg.db corpus" >&2
+  exit 1
+}
+grep -Fq 'brew install --formula --build-from-source' "$release_workflow" || {
+  echo "release.yml no longer tests Homebrew's real install/cleanup path" >&2
+  exit 1
+}
+grep -Fq 'bench/prebuilt_cache/run.sh package' "$release_workflow" || {
+  echo "release.yml no longer records prebuilt-cache release evidence" >&2
+  exit 1
+}
+
+formula_template="$repo_root/.github/align.rb.template"
+formula_dependencies="$(
+  sed -n 's/^  depends_on "\([^"]*\)"$/\1/p' "$formula_template" \
+    | LC_ALL=C sort | paste -sd, -
+)"
+if [[ "$formula_dependencies" != "libpq,llvm@22,openssl@3,zstd" ]]; then
+  echo "the Homebrew dependency mapping changed: $formula_dependencies" >&2
+  exit 1
+fi
+grep -Fq '#{Formula["libpq"].opt_lib}:#{Formula["openssl@3"].opt_lib}:#{Formula["zstd"].opt_lib}' \
+  "$formula_template" || {
+  echo "the Homebrew linker search path does not cover every keg-only corpus dependency" >&2
+  exit 1
+}
+grep -Fq 'skip_clean "libexec/alignc"' "$formula_template" || {
+  echo "the Homebrew formula may rewrite the compiler after its cache is keyed" >&2
+  exit 1
+}
+grep -Fq 'libexec.install "alignc", "align-repl", "libalign_runtime.a", "share"' \
+  "$formula_template" || {
+  echo "the Homebrew formula no longer installs the adjacent cache tree" >&2
+  exit 1
+}
+
+cache_source="$repo_root/crates/align_driver/src/cache.rs"
+cache_inventory="$repo_root/scripts/prebuilt-cache-inventory.py"
+grep -Fq 'CACHE_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024' "$cache_source" &&
+  grep -Fq 'MANIFEST_MAX_BYTES = 64 * 1024 * 1024' "$cache_inventory" || {
+  echo "runtime and release inventory manifest bounds differ" >&2
+  exit 1
+}
+grep -Fq 'CACHE_CAS_MAX_BYTES: u64 = 256 * 1024 * 1024' "$cache_source" &&
+  grep -Fq 'CAS_MAX_BYTES = 256 * 1024 * 1024' "$cache_inventory" || {
+  echo "runtime and release inventory CAS bounds differ" >&2
+  exit 1
+}
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$cache_inventory"
 
 for script in \
+  bench/prebuilt_cache/run.sh \
+  scripts/build-prebuilt-cache.sh \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
   scripts/ci-apt-llvm.sh \
@@ -1939,7 +2037,8 @@ for script in \
   scripts/test-apt-llvm.sh \
   scripts/test-binaries-lib.sh \
   scripts/test-pr-workflow.sh \
-  scripts/test-pr.sh
+  scripts/test-pr.sh \
+  scripts/verify-prebuilt-cache-layout.sh
 do
   bash -n "$repo_root/$script"
 done

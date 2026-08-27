@@ -29,11 +29,15 @@
 //! read; a mismatch unlinks the blob, prints an always-on corruption note, and rebuilds. Publication
 //! is private staging + same-directory atomic rename, so a partial entry is never visible.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use align_interface::Hash128;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use align_interface::{Hash128, Hash128Stream};
 
 /// The cache **schema** version — the on-disk layout namespace. A bump changes the default-root
 /// subdirectory (`.../alignc/<schema>/`), isolating an old tree wholesale. Independent of the KEY
@@ -53,7 +57,10 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// settled `PgoMode { Off | Instrument | Use(Hash128) }` cache identity), so an instrumented / profile-
 /// use object can never be served to an ordinary build. The bump also drops every pre-PGO codegen entry
 /// cleanly (they carried `cache_format_version == 2`), so no PGO-blind object survives the layout change.
-pub const CACHE_KEY_FORMAT_VERSION: u32 = 3;
+///
+/// **Bumped to 4 at build-performance item 4**: every codegen-family key gains the nominal build id
+/// of the dynamically loaded LLVM library immediately after its semantic version.
+pub const CACHE_KEY_FORMAT_VERSION: u32 = 4;
 
 /// The manifest wire-format version. Bump on ANY change to the encoded byte layout; an old manifest
 /// then fails closed on decode (treated as a miss, its bytes unreferenced). **Bumped to 2 at ThinLTO
@@ -61,7 +68,7 @@ pub const CACHE_KEY_FORMAT_VERSION: u32 = 3;
 /// separate `prelink`/`thinbackend` phase keys instead), and the two ThinLTO manifests were added.
 /// **Bumped to 3 at instrument-PGO S2**: the codegen-key manifest body gains the [`PgoKey`] `pgo_mode`
 /// field (a tag byte + an optional `Hash128` profdata digest), so the wire layout changed.
-const MANIFEST_FORMAT_VERSION: u32 = 3;
+const MANIFEST_FORMAT_VERSION: u32 = 4;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
@@ -71,6 +78,16 @@ pub(crate) const CORRUPT_NOTE: &str = "alignc: cache entry corrupt; rebuilding";
 /// front (mirrors `align_interface::codec`'s `n.min(1024)` guard), so a garbage/huge length cannot
 /// drive an allocation bomb — the real bytes still have to be present to grow past it.
 const SEQ_PREALLOC_CAP: usize = 1024;
+
+/// Cache manifests embed frontend summaries, so the bound is deliberately far above the release
+/// corpus while still preventing an installer-owned exact path from driving an unbounded read.
+pub(crate) const CACHE_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cache objects are per-unit native artifacts. Larger objects remain valid build outputs but are
+/// deliberately not published/reused until this explicit resource contract is widened.
+const CACHE_CAS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+const CACHE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 // ---- key ----------------------------------------------------------------------------------------
 
@@ -145,6 +162,8 @@ pub struct CodegenKey {
     pub code_model: String,
     /// #10 exact LLVM version (`major.minor.patch`).
     pub llvm_version: String,
+    /// #10 (cont.) nominal producer identity of the loaded LLVM library.
+    pub llvm_build_id: Hash128,
     /// #11 rt-lto mode.
     pub rt_lto: bool,
     /// #11 (cont.) merged runtime-bitcode digest (present iff `rt_lto`).
@@ -244,7 +263,7 @@ impl FirstDiff {
             FirstDiff::FrontendSchema => "frontend schema",
             FirstDiff::Target => "target",
             FirstDiff::Cpu => "cpu/features",
-            FirstDiff::LlvmVersion => "llvm version",
+            FirstDiff::LlvmVersion => "llvm version/build",
             FirstDiff::RelocCodeModel => "reloc/code model",
             FirstDiff::MirDigest => "implementation changed",
             FirstDiff::DepInterfaceHashes => "dependency interface changed",
@@ -269,14 +288,14 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
     if stored.frontend_schema != current.frontend_schema || stored.located != current.located {
         return FirstDiff::FrontendSchema;
     }
+    if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
+        return FirstDiff::LlvmVersion;
+    }
     if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
         return FirstDiff::Target;
     }
     if stored.resolved_cpu != current.resolved_cpu || stored.resolved_features != current.resolved_features {
         return FirstDiff::Cpu;
-    }
-    if stored.llvm_version != current.llvm_version {
-        return FirstDiff::LlvmVersion;
     }
     if stored.reloc_model != current.reloc_model || stored.code_model != current.code_model {
         return FirstDiff::RelocCodeModel;
@@ -368,7 +387,10 @@ pub enum CacheContext {
     /// compiler, silently bypassing that rule. Nothing outside `cache.rs` constructs or matches this
     /// variant today, so the attribute costs nothing.
     #[non_exhaustive]
-    Enabled { root: PathBuf },
+    Enabled {
+        primary: PathBuf,
+        packaged: Option<PathBuf>,
+    },
 }
 
 impl CacheContext {
@@ -413,13 +435,17 @@ impl CacheContext {
         // Resolve the ROOT first and probe the compiler identity only if one exists: every arm that
         // yields no root returns here, before the thunk is ever called.
         let resolved = match std::env::var("ALIGNC_CACHE") {
-            Err(_) => default_cache_root(),                    // unset ⇒ default-ON
-            Ok(v) if v.is_empty() || v == "off" => None,       // explicit off
-            Ok(v) if v == "on" => default_cache_root(),
-            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) => default_cache_root().map(|root| (root, true)), // unset ⇒ default-ON
+            Ok(v) if v.is_empty() || v == "off" => None,             // explicit off
+            Ok(v) if v == "on" => default_cache_root().map(|root| (root, true)),
+            Ok(path) => Some((PathBuf::from(path), false)),
         };
         match resolved {
-            Some(root) => enable_or_note(root, build_id_available()),
+            Some((primary, include_packaged)) => enable_or_note(
+                primary,
+                include_packaged.then(packaged_cache_root).flatten(),
+                build_id_available(),
+            ),
             None => CacheContext::Disabled,
         }
     }
@@ -434,7 +460,7 @@ impl CacheContext {
     /// [`CacheContext::at`] with the build-id availability supplied as a thunk — the owner-test
     /// seam. `at` always intends an enabled cache, so the thunk is always called.
     fn at_when(root: PathBuf, build_id_available: impl FnOnce() -> bool) -> CacheContext {
-        enable_or_note(root, build_id_available())
+        enable_or_note(root, None, build_id_available())
     }
 
     /// Whether the cache is on. The caller gates key construction on this so a disabled build (the
@@ -442,6 +468,23 @@ impl CacheContext {
     /// [`compiler_build_id`] and the target/LLVM identity resolution.
     pub fn is_enabled(&self) -> bool {
         matches!(self, CacheContext::Enabled { .. })
+    }
+
+    /// Whether codegen-family cache reuse is available. Frontend reuse needs only the compiler
+    /// fingerprint, while object/prelink/backend reuse additionally requires the nominal identity
+    /// of the dynamically loaded LLVM producer.
+    pub fn codegen_is_enabled(&self) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        if align_codegen_llvm::loaded_llvm_build_id().is_some() {
+            return true;
+        }
+        static NOTED: OnceLock<()> = OnceLock::new();
+        NOTED.get_or_init(|| {
+            eprintln!("alignc: codegen cache disabled (cannot identify loaded LLVM build)")
+        });
+        false
     }
 
     /// The root `alignc cache clear` operates on, honoring `ALIGNC_CACHE` path resolution even when the
@@ -461,7 +504,56 @@ impl CacheContext {
     pub(crate) fn root(&self) -> Option<&Path> {
         match self {
             CacheContext::Disabled => None,
-            CacheContext::Enabled { root } => Some(root),
+            CacheContext::Enabled { primary, .. } => Some(primary),
+        }
+    }
+
+    /// Adjacent immutable release cache, present only for the default/on environment modes.
+    pub(crate) fn packaged_root(&self) -> Option<&Path> {
+        match self {
+            CacheContext::Disabled => None,
+            CacheContext::Enabled { packaged, .. } => packaged.as_deref(),
+        }
+    }
+
+    /// Unit-frontend lookup in primary-then-packaged order. Provenance is intentionally absent
+    /// from the outcome: an exact hit has identical semantics, while publication always targets
+    /// the primary root through the existing walk.
+    pub(crate) fn lookup_unit(
+        &self,
+        key: &crate::unit_cache::UnitKey,
+        source_len: usize,
+    ) -> crate::unit_cache::UnitLookup {
+        let Some(primary) = self.root() else {
+            return crate::unit_cache::UnitLookup::Miss { reason: None };
+        };
+        if crate::unit_cache::is_rejected(primary, key) {
+            return crate::unit_cache::UnitLookup::Miss {
+                reason: Some(FirstDiff::CorruptEntry),
+            };
+        }
+        match crate::unit_cache::lookup(primary, key, source_len) {
+            hit @ crate::unit_cache::UnitLookup::Hit(_) => hit,
+            crate::unit_cache::UnitLookup::Miss {
+                reason: primary_reason,
+            } => match self.packaged_root() {
+                Some(packaged) => {
+                    match crate::unit_cache::lookup_packaged(packaged, primary, key, source_len) {
+                        hit @ crate::unit_cache::UnitLookup::Hit(_) => hit,
+                        crate::unit_cache::UnitLookup::Miss {
+                            reason: packaged_reason,
+                        } => crate::unit_cache::UnitLookup::Miss {
+                            reason: match primary_reason {
+                                Some(FirstDiff::NoPriorEntry) | None => packaged_reason,
+                                reason => reason,
+                            },
+                        },
+                    }
+                }
+                None => crate::unit_cache::UnitLookup::Miss {
+                    reason: primary_reason,
+                },
+            },
         }
     }
 
@@ -472,21 +564,64 @@ impl CacheContext {
     /// reason (its object is NOT produced — the caller must `produce` it then [`publish_after_miss`]).
     /// A disabled cache is [`CacheLookup::Miss`] with `None` reason (never consulted, no key work).
     pub fn lookup(&self, key: &CodegenKey, obj_out: &Path) -> CacheLookup {
-        let root = match self {
+        if !self.codegen_is_enabled() {
+            return CacheLookup::Miss { reason: None };
+        }
+        let (primary, packaged) = match self {
             CacheContext::Disabled => return CacheLookup::Miss { reason: None },
-            CacheContext::Enabled { root } => root,
+            CacheContext::Enabled { primary, packaged } => (primary, packaged.as_deref()),
         };
-        let action_path = action_manifest_path(root, key.full_digest());
-        match try_hit(root, &action_path, key, obj_out) {
+        let primary_result = try_hit(
+            primary,
+            &action_manifest_path(primary, key.full_digest()),
+            key,
+            obj_out,
+            ReadPolicy::Writable,
+        );
+        if matches!(primary_result, HitResult::Hit) {
+            return CacheLookup::Hit(CacheOutcome {
+                stage: CacheStage::Codegen,
+                unit: key.unit.clone(),
+                hit: true,
+                miss_reason: None,
+            });
+        }
+        let packaged_result = packaged.map_or(HitResult::Miss, |root| {
+            try_hit(
+                root,
+                &action_manifest_path(root, key.full_digest()),
+                key,
+                obj_out,
+                ReadPolicy::Packaged,
+            )
+        });
+        match packaged_result {
             HitResult::Hit => CacheLookup::Hit(CacheOutcome {
                 stage: CacheStage::Codegen,
                 unit: key.unit.clone(),
                 hit: true,
                 miss_reason: None,
             }),
-            HitResult::Corrupt => CacheLookup::Miss { reason: Some(FirstDiff::CorruptEntry) },
+            HitResult::Corrupt | HitResult::Miss
+                if matches!(primary_result, HitResult::Corrupt)
+                    || matches!(packaged_result, HitResult::Corrupt) =>
+            {
+                CacheLookup::Miss {
+                    reason: Some(FirstDiff::CorruptEntry),
+                }
+            }
+            HitResult::Corrupt => CacheLookup::Miss {
+                reason: Some(FirstDiff::CorruptEntry),
+            },
             // Reason computed BEFORE any publish overwrites the slot pointer (the prior key is diffed).
-            HitResult::Miss => CacheLookup::Miss { reason: Some(diff_against_slot(root, key)) },
+            HitResult::Miss => CacheLookup::Miss {
+                reason: Some(match diff_against_slot(primary, key) {
+                    FirstDiff::NoPriorEntry => packaged
+                        .map(|root| diff_against_slot(root, key))
+                        .unwrap_or(FirstDiff::NoPriorEntry),
+                    reason => reason,
+                }),
+            },
         }
     }
 
@@ -495,8 +630,11 @@ impl CacheContext {
     /// valid and link reads it directly). A no-op when the cache is disabled. Safe to call from a
     /// worker thread (only writes into the content-addressed store + index).
     pub fn publish_after_miss(&self, key: &CodegenKey, obj_out: &Path) {
-        if let CacheContext::Enabled { root } = self {
-            publish(root, key, obj_out);
+        if !self.codegen_is_enabled() {
+            return;
+        }
+        if let CacheContext::Enabled { primary, .. } = self {
+            publish(primary, key, obj_out);
         }
     }
 
@@ -569,10 +707,13 @@ pub fn clear_cache(root: &Path) -> Result<bool, String> {
 /// the unit-slot pointer. Any I/O failure is logged and swallowed — populating the cache is never
 /// allowed to fail a build whose object was produced correctly.
 fn publish(root: &Path, key: &CodegenKey, obj_out: &Path) {
-    let bytes = match std::fs::read(obj_out) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("alignc: cache not populated (cannot read produced object {}): {e}", obj_out.display());
+    let bytes = match read_regular_bounded_file(obj_out, CACHE_CAS_MAX_BYTES) {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!(
+                "alignc: cache not populated (produced object is unavailable, non-regular, or exceeds 256 MiB): {}",
+                obj_out.display()
+            );
             return;
         }
     };
@@ -596,9 +737,13 @@ const UNIDENTIFIABLE_COMPILER_NOTE: &str = "alignc: cache disabled (cannot read 
 /// Split from the printing on purpose. The rule under test is "an unidentifiable compiler yields no
 /// enabled cache", and a test for it must not depend on stderr capture or on which earlier test
 /// happened to consume the print-once latch.
-fn decide_enabled(root: PathBuf, build_id_available: bool) -> Result<CacheContext, &'static str> {
+fn decide_enabled(
+    primary: PathBuf,
+    packaged: Option<PathBuf>,
+    build_id_available: bool,
+) -> Result<CacheContext, &'static str> {
     if build_id_available {
-        Ok(CacheContext::Enabled { root })
+        Ok(CacheContext::Enabled { primary, packaged })
     } else {
         Err(UNIDENTIFIABLE_COMPILER_NOTE)
     }
@@ -607,8 +752,12 @@ fn decide_enabled(root: PathBuf, build_id_available: bool) -> Result<CacheContex
 /// [`decide_enabled`], printing the note once per process on the disabled outcome. Once, because it
 /// is a persistent-state decision the user should see, but repeating it per unit would bury the
 /// build's real output.
-fn enable_or_note(root: PathBuf, build_id_available: bool) -> CacheContext {
-    decide_enabled(root, build_id_available).unwrap_or_else(|note| {
+fn enable_or_note(
+    primary: PathBuf,
+    packaged: Option<PathBuf>,
+    build_id_available: bool,
+) -> CacheContext {
+    decide_enabled(primary, packaged, build_id_available).unwrap_or_else(|note| {
         static NOTED: OnceLock<()> = OnceLock::new();
         NOTED.get_or_init(|| eprintln!("{note}"));
         CacheContext::Disabled
@@ -713,6 +862,19 @@ fn default_cache_root() -> Option<PathBuf> {
     Some(base.join("alignc").join(CACHE_SCHEMA_VERSION.to_string()))
 }
 
+/// `<real-alignc-dir>/share/align/cache/<schema>`, without canonicalizing or scanning the tree.
+/// Absence is ordinary (copying only the executable remains supported).
+fn packaged_cache_root() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let root = directory
+        .join("share")
+        .join("align")
+        .join("cache")
+        .join(CACHE_SCHEMA_VERSION.to_string());
+    root.is_dir().then_some(root)
+}
+
 fn action_manifest_path(root: &Path, full: Hash128) -> PathBuf {
     root.join("actions").join("codegen").join(full.to_hex())
 }
@@ -729,6 +891,7 @@ pub fn cas_blob_path(root: &Path, digest: Hash128) -> PathBuf {
     root.join("cas").join(&hex[..2]).join(&hex)
 }
 
+#[derive(Clone, Copy)]
 enum HitResult {
     Hit,
     /// No usable prior entry (absent / undecodable / foreign manifest): a clean miss.
@@ -737,14 +900,91 @@ enum HitResult {
     Corrupt,
 }
 
+#[derive(Clone, Copy)]
+enum ReadPolicy {
+    Writable,
+    Packaged,
+}
+
+/// Open an exact cache path without letting a followed FIFO block before it can be classified.
+/// The metadata belongs to the opened handle, so a concurrent path replacement cannot substitute a
+/// different target after validation.
+fn open_regular_bounded(path: &Path, max_bytes: Option<u64>) -> Option<(std::fs::File, usize)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || max_bytes.is_some_and(|limit| metadata.len() > limit) {
+        return None;
+    }
+    let length = usize::try_from(metadata.len()).ok()?;
+    Some((file, length))
+}
+
+fn read_regular_bounded_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let (file, expected) = open_regular_bounded(path, Some(max_bytes))?;
+    read_regular_bounded_from(file, expected, max_bytes)
+}
+
+fn read_regular_bounded_from(
+    mut reader: impl Read,
+    expected: usize,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
+    let expected_u64 = u64::try_from(expected).ok()?;
+    if expected_u64 > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(expected);
+    reader
+        .by_ref()
+        .take(expected_u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() == expected).then_some(bytes)
+}
+
+/// Read one action/index manifest through the fixed cache-format resource bound. Exact regular-file
+/// symlinks remain supported. Length disagreement catches shrink/growth after the handle metadata
+/// snapshot, and the declared-length-plus-one reader caps both allocation and read work.
+pub(crate) fn read_cache_manifest(path: &Path) -> Option<Vec<u8>> {
+    read_regular_bounded_file(path, CACHE_MANIFEST_MAX_BYTES)
+}
+
+#[cfg(test)]
+fn read_cache_manifest_from(reader: impl Read, expected: usize) -> Option<Vec<u8>> {
+    read_regular_bounded_from(reader, expected, CACHE_MANIFEST_MAX_BYTES)
+}
+
+struct MaterializedStage {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for MaterializedStage {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Attempt a hit at `action_path`. Fail-closed at every step: a missing/undecodable manifest is a
 /// clean [`HitResult::Miss`]; a manifest whose stored key does not match `key` (a hash collision) is a
 /// miss; a missing or digest-mismatched blob is [`HitResult::Corrupt`] (note + unlink + rebuild). On a
 /// verified hit the blob is written to `obj_out`.
-fn try_hit(root: &Path, action_path: &Path, key: &CodegenKey, obj_out: &Path) -> HitResult {
-    let manifest_bytes = match std::fs::read(action_path) {
-        Ok(b) => b,
-        Err(_) => return HitResult::Miss,
+fn try_hit(
+    root: &Path,
+    action_path: &Path,
+    key: &CodegenKey,
+    obj_out: &Path,
+    policy: ReadPolicy,
+) -> HitResult {
+    let manifest_bytes = match read_cache_manifest(action_path) {
+        Some(bytes) => bytes,
+        None => return HitResult::Miss,
     };
     let (stored_key, blob_digest) = match deserialize_manifest(&manifest_bytes) {
         Ok(v) => v,
@@ -754,46 +994,123 @@ fn try_hit(root: &Path, action_path: &Path, key: &CodegenKey, obj_out: &Path) ->
     if &stored_key != key {
         return HitResult::Miss;
     }
-    materialize_blob(root, blob_digest, obj_out)
+    materialize_blob(root, blob_digest, obj_out, policy)
 }
 
 /// Read the CAS blob for `blob_digest`, verify its content digest, and write it to `out_path`. A
 /// missing or digest-mismatched blob is [`HitResult::Corrupt`] (always-on note + unlink; doc-10 §6.4
 /// fail-closed matrix); a verified blob that cannot be written back is a clean [`HitResult::Miss`]
 /// (rebuild in place). Shared by the single-phase codegen cache and both ThinLTO phases.
-fn materialize_blob(root: &Path, blob_digest: Hash128, out_path: &Path) -> HitResult {
+fn materialize_blob(
+    root: &Path,
+    blob_digest: Hash128,
+    out_path: &Path,
+    policy: ReadPolicy,
+) -> HitResult {
     let blob_path = cas_blob_path(root, blob_digest);
-    let blob = match std::fs::read(&blob_path) {
-        Ok(b) => b,
-        Err(_) => {
-            // The action manifest references a blob that is gone: treat as corruption, rebuild.
-            eprintln!("{CORRUPT_NOTE}");
-            return HitResult::Corrupt;
+    let (mut blob, expected) = match open_regular_bounded(&blob_path, Some(CACHE_CAS_MAX_BYTES)) {
+        Some(opened) => opened,
+        None => {
+            // A writable action pointing at an unavailable blob retains the existing self-heal
+            // diagnosis. An immutable packaged blob may simply be absent or unreadable after an
+            // installer/permission change; the public contract makes every such I/O failure a
+            // clean miss and reserves the packaged-corruption note for bytes we actually read and
+            // prove digest-bad.
+            return match policy {
+                ReadPolicy::Writable => {
+                    remove_writable_cache_entry(&blob_path);
+                    note_corrupt(policy);
+                    HitResult::Corrupt
+                }
+                ReadPolicy::Packaged => HitResult::Miss,
+            };
         }
     };
-    if Hash128::of(&blob) != blob_digest {
+    let stage_path = staging_sibling(out_path);
+    let mut stage = MaterializedStage {
+        path: stage_path.clone(),
+        committed: false,
+    };
+    let mut staged_file = match std::fs::File::create(&stage_path) {
+        Ok(file) => file,
+        Err(_) => return HitResult::Miss,
+    };
+    let mut hasher = Hash128Stream::for_len(expected);
+    let mut copied = 0usize;
+    let mut buffer = [0u8; CACHE_COPY_BUFFER_BYTES];
+    loop {
+        let read = match blob.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => return HitResult::Miss,
+        };
+        let Some(next) = copied.checked_add(read) else {
+            return HitResult::Miss;
+        };
+        if next > expected || !hasher.update(&buffer[..read]) {
+            return HitResult::Miss;
+        }
+        if staged_file.write_all(&buffer[..read]).is_err() {
+            return HitResult::Miss;
+        }
+        copied = next;
+    }
+    if copied != expected {
+        return HitResult::Miss;
+    }
+    let Some(actual_digest) = hasher.finish() else {
+        return HitResult::Miss;
+    };
+    if actual_digest != blob_digest {
         // Corrupted blob bytes: unlink + always-on note + rebuild.
-        let _ = std::fs::remove_file(&blob_path);
-        eprintln!("{CORRUPT_NOTE}");
+        if matches!(policy, ReadPolicy::Writable) {
+            remove_writable_cache_entry(&blob_path);
+        }
+        note_corrupt(policy);
         return HitResult::Corrupt;
     }
-    match std::fs::write(out_path, &blob) {
-        Ok(()) => HitResult::Hit,
-        // Cannot materialize the artifact from a verified blob: fall back to rebuilding it in place.
-        Err(_) => HitResult::Miss,
+    drop(staged_file);
+    if std::fs::rename(&stage_path, out_path).is_err() {
+        return HitResult::Miss;
     }
+    stage.committed = true;
+    HitResult::Hit
+}
+
+/// Remove one exact writable cache entry without following it when it is a symlink. A malformed
+/// real directory at a blob path is cache-owned too and must be removed recursively; otherwise it
+/// would make every later atomic publication fail permanently.
+fn remove_writable_cache_entry(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else { return };
+    if metadata.file_type().is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn note_corrupt(policy: ReadPolicy) {
+    match policy {
+        ReadPolicy::Writable => eprintln!("{CORRUPT_NOTE}"),
+        ReadPolicy::Packaged => note_packaged_corrupt(),
+    }
+}
+
+pub(crate) fn note_packaged_corrupt() {
+    static NOTED: OnceLock<()> = OnceLock::new();
+    NOTED.get_or_init(|| eprintln!("alignc: packaged cache entry corrupt; rebuilding"));
 }
 
 /// Compute the [`FirstDiff`] for a miss by reading the unit's slot pointer and diffing its decoded key
 /// against `key`. No slot pointer (or an undecodable one) ⇒ [`FirstDiff::NoPriorEntry`].
 fn diff_against_slot(root: &Path, key: &CodegenKey) -> FirstDiff {
     let path = slot_pointer_path(root, key.slot_digest());
-    match std::fs::read(&path) {
-        Ok(bytes) => match deserialize_manifest(&bytes) {
+    match read_cache_manifest(&path) {
+        Some(bytes) => match deserialize_manifest(&bytes) {
             Ok((stored_key, _)) => first_diff(&stored_key, key),
             Err(_) => FirstDiff::NoPriorEntry,
         },
-        Err(_) => FirstDiff::NoPriorEntry,
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -937,6 +1254,7 @@ fn write_full_key(w: &mut Writer, k: &CodegenKey) {
     w.str(&k.reloc_model);
     w.str(&k.code_model);
     w.str(&k.llvm_version);
+    w.h128(k.llvm_build_id);
     w.bool(k.rt_lto);
     w.opt_h128(k.rt_lto_digest);
     w.pgo(k.pgo_mode);
@@ -1070,6 +1388,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
     let reloc_model = r.str()?;
     let code_model = r.str()?;
     let llvm_version = r.str()?;
+    let llvm_build_id = r.h128()?;
     let rt_lto = r.bool()?;
     let rt_lto_digest = r.opt_h128()?;
     let pgo_mode = r.pgo()?;
@@ -1095,6 +1414,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
             reloc_model,
             code_model,
             llvm_version,
+            llvm_build_id,
             rt_lto,
             rt_lto_digest,
             pgo_mode,
@@ -1137,6 +1457,7 @@ pub struct PrelinkKey {
     pub profile_name: String,
     pub pipeline: String,
     pub llvm_version: String,
+    pub llvm_build_id: Hash128,
     pub rt_lto: bool,
     pub rt_lto_digest: Option<Hash128>,
     pub unit: String,
@@ -1166,11 +1487,11 @@ fn prelink_first_diff(stored: &PrelinkKey, current: &PrelinkKey) -> FirstDiff {
     if stored.frontend_schema != current.frontend_schema || stored.located != current.located {
         return FirstDiff::FrontendSchema;
     }
+    if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
+        return FirstDiff::LlvmVersion;
+    }
     if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
         return FirstDiff::Target;
-    }
-    if stored.llvm_version != current.llvm_version {
-        return FirstDiff::LlvmVersion;
     }
     if stored.impl_hash != current.impl_hash {
         return FirstDiff::MirDigest;
@@ -1222,6 +1543,7 @@ pub struct BackendKey {
     pub cache_format_version: u32,
     pub compiler_build_id: Hash128,
     pub llvm_version: String,
+    pub llvm_build_id: Hash128,
     pub target_triple: String,
     pub object_format: u8,
     pub resolved_cpu: String,
@@ -1263,7 +1585,8 @@ impl BackendKey {
 /// come first (they subsume many entries at once), then the unit's own prelink content, then the
 /// cross-unit inputs, then the export set.
 fn backend_first_diff(stored: &BackendKey, current: &BackendKey) -> FirstDiff {
-    if stored.llvm_version != current.llvm_version {
+    if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id
+    {
         return FirstDiff::LlvmVersion;
     }
     if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
@@ -1315,9 +1638,12 @@ impl CacheContext {
     /// and [`CacheLookup::Hit`] carries the [`CacheStage::ThinLtoPrelink`] outcome; a miss carries the
     /// first-differing reason (the caller then produces the bitcode and calls [`publish_prelink`]).
     pub fn lookup_prelink(&self, key: &PrelinkKey, bc_out: &Path) -> CacheLookup {
+        if !self.codegen_is_enabled() {
+            return CacheLookup::Miss { reason: None };
+        }
         let root = match self {
             CacheContext::Disabled => return CacheLookup::Miss { reason: None },
-            CacheContext::Enabled { root } => root,
+            CacheContext::Enabled { primary, .. } => primary,
         };
         let action_path = phase_action_path(root, "prelink", key.full_digest());
         let hit = try_hit_phase(root, &action_path, bc_out, |bytes| {
@@ -1342,11 +1668,14 @@ impl CacheContext {
     /// Publish an already-produced prelink `.bc` (best-effort; a cache-write failure never fails an
     /// otherwise-correct build). No-op when disabled. Safe from a worker thread.
     pub fn publish_prelink(&self, key: &PrelinkKey, bc_out: &Path) {
-        if let CacheContext::Enabled { root } = self {
+        if !self.codegen_is_enabled() {
+            return;
+        }
+        if let CacheContext::Enabled { primary, .. } = self {
             publish_phase(
-                root,
-                &phase_action_path(root, "prelink", key.full_digest()),
-                &phase_slot_path(root, "prelink", key.slot_digest()),
+                primary,
+                &phase_action_path(primary, "prelink", key.full_digest()),
+                &phase_slot_path(primary, "prelink", key.slot_digest()),
                 bc_out,
                 |digest| serialize_prelink_manifest(key, digest),
             );
@@ -1357,9 +1686,12 @@ impl CacheContext {
     /// [`CacheLookup::Hit`] carries the [`CacheStage::ThinLtoBackend`] outcome; a miss carries the
     /// first-differing reason.
     pub fn lookup_backend(&self, key: &BackendKey, obj_out: &Path) -> CacheLookup {
+        if !self.codegen_is_enabled() {
+            return CacheLookup::Miss { reason: None };
+        }
         let root = match self {
             CacheContext::Disabled => return CacheLookup::Miss { reason: None },
-            CacheContext::Enabled { root } => root,
+            CacheContext::Enabled { primary, .. } => primary,
         };
         let action_path = phase_action_path(root, "thinbackend", key.full_digest());
         let hit = try_hit_phase(root, &action_path, obj_out, |bytes| {
@@ -1383,11 +1715,14 @@ impl CacheContext {
 
     /// Publish an already-produced backend object (best-effort). No-op when disabled.
     pub fn publish_backend(&self, key: &BackendKey, obj_out: &Path) {
-        if let CacheContext::Enabled { root } = self {
+        if !self.codegen_is_enabled() {
+            return;
+        }
+        if let CacheContext::Enabled { primary, .. } = self {
             publish_phase(
-                root,
-                &phase_action_path(root, "thinbackend", key.full_digest()),
-                &phase_slot_path(root, "thinbackend", key.slot_digest()),
+                primary,
+                &phase_action_path(primary, "thinbackend", key.full_digest()),
+                &phase_slot_path(primary, "thinbackend", key.slot_digest()),
                 obj_out,
                 |digest| serialize_backend_manifest(key, digest),
             );
@@ -1411,12 +1746,12 @@ fn try_hit_phase(
     out_path: &Path,
     matched_blob: impl FnOnce(&[u8]) -> Option<Hash128>,
 ) -> HitResult {
-    let manifest_bytes = match std::fs::read(action_path) {
-        Ok(b) => b,
-        Err(_) => return HitResult::Miss,
+    let manifest_bytes = match read_cache_manifest(action_path) {
+        Some(bytes) => bytes,
+        None => return HitResult::Miss,
     };
     match matched_blob(&manifest_bytes) {
-        Some(blob_digest) => materialize_blob(root, blob_digest, out_path),
+        Some(blob_digest) => materialize_blob(root, blob_digest, out_path, ReadPolicy::Writable),
         None => HitResult::Miss,
     }
 }
@@ -1429,9 +1764,9 @@ fn diff_phase_slot(
     diff: impl FnOnce(&[u8]) -> Option<FirstDiff>,
 ) -> FirstDiff {
     let path = phase_slot_path(root, kind, slot_digest);
-    match std::fs::read(&path) {
-        Ok(bytes) => diff(&bytes).unwrap_or(FirstDiff::NoPriorEntry),
-        Err(_) => FirstDiff::NoPriorEntry,
+    match read_cache_manifest(&path) {
+        Some(bytes) => diff(&bytes).unwrap_or(FirstDiff::NoPriorEntry),
+        None => FirstDiff::NoPriorEntry,
     }
 }
 
@@ -1444,10 +1779,13 @@ fn publish_phase(
     out_path: &Path,
     make_manifest: impl Fn(Hash128) -> Vec<u8>,
 ) {
-    let bytes = match std::fs::read(out_path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("alignc: cache not populated (cannot read produced artifact {}): {e}", out_path.display());
+    let bytes = match read_regular_bounded_file(out_path, CACHE_CAS_MAX_BYTES) {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!(
+                "alignc: cache not populated (produced artifact is unavailable, non-regular, or exceeds 256 MiB): {}",
+                out_path.display()
+            );
             return;
         }
     };
@@ -1508,6 +1846,7 @@ fn write_prelink_key(w: &mut Writer, k: &PrelinkKey) {
     w.str(&k.profile_name);
     w.str(&k.pipeline);
     w.str(&k.llvm_version);
+    w.h128(k.llvm_build_id);
     w.bool(k.rt_lto);
     w.opt_h128(k.rt_lto_digest);
     w.str(&k.unit);
@@ -1518,6 +1857,7 @@ fn write_backend_key(w: &mut Writer, k: &BackendKey) {
     w.u32(k.cache_format_version);
     w.h128(k.compiler_build_id);
     w.str(&k.llvm_version);
+    w.h128(k.llvm_build_id);
     w.str(&k.target_triple);
     w.u8(k.object_format);
     w.str(&k.resolved_cpu);
@@ -1594,6 +1934,7 @@ fn deserialize_prelink_manifest(bytes: &[u8]) -> Result<(PrelinkKey, Hash128), C
         profile_name: r.str()?,
         pipeline: r.str()?,
         llvm_version: r.str()?,
+        llvm_build_id: r.h128()?,
         rt_lto: r.bool()?,
         rt_lto_digest: r.opt_h128()?,
         unit: r.str()?,
@@ -1614,6 +1955,7 @@ fn deserialize_backend_manifest(bytes: &[u8]) -> Result<(BackendKey, Hash128), C
         cache_format_version: r.u32()?,
         compiler_build_id: r.h128()?,
         llvm_version: r.str()?,
+        llvm_build_id: r.h128()?,
         target_triple: r.str()?,
         object_format: r.u8()?,
         resolved_cpu: r.str()?,
@@ -1658,11 +2000,62 @@ mod tests {
             reloc_model: "PIC".to_string(),
             code_model: "Default".to_string(),
             llvm_version: "22.1.8".to_string(),
+            llvm_build_id: Hash128 { lo: 7, hi: 8 },
             rt_lto: false,
             rt_lto_digest: None,
             pgo_mode: PgoKey::Off,
             unit: "main".to_string(),
         }
+    }
+
+    fn golden_bytes(hex: &str) -> Vec<u8> {
+        let compact: String = hex.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        assert_eq!(compact.len() % 2, 0);
+        (0..compact.len() / 2)
+            .map(|index| {
+                u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).expect("golden hex")
+            })
+            .collect()
+    }
+
+    const CODEGEN_V4_GOLDEN: &str = concat!(
+        "04000000",                         // manifest v4
+        "04000000",                         // key v4
+        "01000000000000000200000000000000", // compiler build
+        "01000000",
+        "00",                               // frontend schema, located
+        "03000000000000000400000000000000", // impl
+        "01000000",
+        "03000000646570",
+        "05000000000000000600000000000000", // deps
+        "02000000",
+        "0100000061",
+        "0100000062", // exports
+        "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
+        "00", // target
+        "090000007838362d36342d7632",
+        "00000000", // cpu, features
+        "0700000072656c65617365",
+        "0b00000064656661756c743c4f323e", // profile, pipeline
+        "0700000064656661756c74",
+        "03000000504943",
+        "0700000044656661756c74", // backend
+        "0600000032322e312e38",
+        "07000000000000000800000000000000", // LLVM version/build
+        "00",
+        "00",
+        "00",                               // rt-lto, optional digest, PGO
+        "040000006d61696e",                 // unit
+        "09000000000000000a00000000000000", // blob
+    );
+
+    #[test]
+    fn codegen_v4_manifest_golden_is_bidirectional() {
+        let expected = golden_bytes(CODEGEN_V4_GOLDEN);
+        let key = sample_key();
+        let blob = Hash128 { lo: 9, hi: 10 };
+        assert_eq!(serialize_manifest(&key, blob), expected);
+        assert_eq!(deserialize_manifest(&expected), Ok((key, blob)));
     }
 
     #[test]
@@ -1731,6 +2124,16 @@ mod tests {
         let mut k = base.clone();
         k.llvm_version = "23.0.0".to_string();
         assert_eq!(first_diff(&base, &k), FirstDiff::LlvmVersion);
+        let mut k = base.clone();
+        k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(first_diff(&base, &k), FirstDiff::LlvmVersion);
+        k.target_triple = "aarch64-unknown-linux-gnu".to_string();
+        k.resolved_cpu = "other-cpu".to_string();
+        assert_eq!(
+            first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes simultaneous target/cpu differences"
+        );
         let mut k = base.clone();
         k.reloc_model = "Static".to_string();
         assert_eq!(first_diff(&base, &k), FirstDiff::RelocCodeModel);
@@ -1817,16 +2220,25 @@ mod tests {
         // The decision is a value, so the note is asserted without stderr capture and without
         // depending on which earlier test consumed the print-once latch.
         assert_eq!(
-            decide_enabled(root.clone(), false).err(),
+            decide_enabled(root.clone(), None, false).err(),
             Some(UNIDENTIFIABLE_COMPILER_NOTE),
             "an unidentifiable compiler must yield the note, never an enabled cache"
         );
-        assert!(decide_enabled(root.clone(), true).is_ok());
+        assert!(decide_enabled(root.clone(), None, true).is_ok());
         // Both construction seams are wired to that one decision.
-        assert!(matches!(CacheContext::at_when(root.clone(), || false), CacheContext::Disabled));
-        assert!(matches!(CacheContext::at_when(root, || true), CacheContext::Enabled { .. }));
+        assert!(matches!(
+            CacheContext::at_when(root.clone(), || false),
+            CacheContext::Disabled
+        ));
+        assert!(matches!(
+            CacheContext::at_when(root, || true),
+            CacheContext::Enabled { .. }
+        ));
         // And it outranks every `ALIGNC_CACHE` value.
-        assert!(matches!(CacheContext::from_env_when(|| false), CacheContext::Disabled));
+        assert!(matches!(
+            CacheContext::from_env_when(|| false),
+            CacheContext::Disabled
+        ));
     }
 
     /// The executable read + two hash passes must not be paid by a build that ends up disabled —
@@ -1862,9 +2274,15 @@ mod tests {
         }
         std::fs::create_dir_all(root.join("keep")).unwrap();
         std::fs::write(root.join("keep").join("f"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("rejected").join("unit")).unwrap();
+        std::fs::write(root.join("rejected").join("unit").join("marker"), b"").unwrap();
         assert_eq!(clear_cache(&root), Ok(true));
         assert!(!root.join("cas").exists() && !root.join("actions").exists() && !root.join("index").exists());
         assert!(root.join("keep").join("f").exists(), "clear must not touch anything but its own subtrees");
+        assert!(
+            root.join("rejected").join("unit").join("marker").exists(),
+            "an optimization-state clear cannot reauthorize a rejected key"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1889,6 +2307,391 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    fn fallback_context(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, CacheContext) {
+        let base = std::env::temp_dir().join(format!(
+            "align-fallback-{tag}-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let primary = base.join("primary");
+        let packaged = base.join("packaged");
+        let context = decide_enabled(primary.clone(), Some(packaged.clone()), true).unwrap();
+        (primary, packaged, context)
+    }
+
+    #[test]
+    fn cache_file_bounds_accept_the_exact_limit_and_reject_the_next_byte() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-bounds-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sparse");
+        let file = std::fs::File::create(&path).unwrap();
+
+        for limit in [CACHE_MANIFEST_MAX_BYTES, CACHE_CAS_MAX_BYTES] {
+            file.set_len(limit).unwrap();
+            let (_, observed) = open_regular_bounded(&path, Some(limit)).expect("exact limit");
+            assert_eq!(u64::try_from(observed).unwrap(), limit);
+            file.set_len(limit + 1).unwrap();
+            assert!(open_regular_bounded(&path, Some(limit)).is_none(), "limit={limit}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cache_manifest_read_requires_metadata_and_stream_lengths_to_agree() {
+        assert_eq!(
+            read_cache_manifest_from(std::io::Cursor::new(b"abc"), 3),
+            Some(b"abc".to_vec())
+        );
+        assert!(read_cache_manifest_from(std::io::Cursor::new(b"abc"), 4).is_none());
+        assert!(read_cache_manifest_from(std::io::Cursor::new(b"abc"), 2).is_none());
+    }
+
+    #[test]
+    fn private_materialization_is_removed_on_rename_failure_and_unwind() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-stage-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let bytes = b"valid-object";
+        let digest = Hash128::of(bytes);
+        let blob = cas_blob_path(&root, digest);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, bytes).unwrap();
+        let output = root.join("output-directory");
+        std::fs::create_dir(&output).unwrap();
+        assert!(matches!(
+            materialize_blob(&root, digest, &output, ReadPolicy::Packaged),
+            HitResult::Miss
+        ));
+        assert!(output.is_dir());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".cache-stage-")));
+
+        let unwind_path = root.join("unwind-stage");
+        let result = std::panic::catch_unwind(|| {
+            std::fs::write(&unwind_path, b"partial").unwrap();
+            let _stage = MaterializedStage { path: unwind_path.clone(), committed: false };
+            panic!("test unwind");
+        });
+        assert!(result.is_err());
+        assert!(!unwind_path.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_manifest_open_rejects_fifo_and_device_targets_without_reading() {
+        let root = std::env::temp_dir().join(format!(
+            "align-cache-special-{}-{}",
+            std::process::id(),
+            STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(read_cache_manifest(&fifo).is_none());
+        assert!(read_cache_manifest(Path::new("/dev/zero")).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn codegen_fallback_hits_without_promotion_or_production() {
+        let (primary, packaged, cache) = fallback_context("hit");
+        let key = sample_key();
+        let source = packaged.join("produced.o");
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+
+        let output = packaged.join("materialized.o");
+        let produced = std::cell::Cell::new(0usize);
+        let outcome = cache
+            .codegen(&key, &output, |_| {
+                produced.set(produced.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(outcome.hit);
+        assert_eq!(produced.get(), 0);
+        assert_eq!(std::fs::read(&output).unwrap(), b"packaged-object");
+        assert!(!primary.exists(), "a packaged hit is never promoted");
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn writable_hit_wins_and_packaged_survives_primary_corruption() {
+        let (primary, packaged, cache) = fallback_context("precedence");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let primary_source = primary.join("primary.o");
+        let packaged_source = packaged.join("packaged.o");
+        std::fs::write(&primary_source, b"primary-object").unwrap();
+        std::fs::write(&packaged_source, b"packaged-object").unwrap();
+        publish(&primary, &key, &primary_source);
+        publish(&packaged, &key, &packaged_source);
+
+        let output = primary.join("out.o");
+        assert!(matches!(cache.lookup(&key, &output), CacheLookup::Hit(_)));
+        assert_eq!(std::fs::read(&output).unwrap(), b"primary-object");
+
+        let primary_blob = cas_blob_path(&primary, Hash128::of(b"primary-object"));
+        std::fs::write(&primary_blob, b"damaged").unwrap();
+        assert!(matches!(cache.lookup(&key, &output), CacheLookup::Hit(_)));
+        assert_eq!(std::fs::read(&output).unwrap(), b"packaged-object");
+        assert!(
+            !primary_blob.exists(),
+            "writable corruption self-heals by unlinking"
+        );
+        assert_eq!(std::fs::read(&packaged_source).unwrap(), b"packaged-object");
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn packaged_corruption_is_immutable_and_a_miss_publishes_only_primary() {
+        let (primary, packaged, cache) = fallback_context("corrupt");
+        let key = sample_key();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let source = packaged.join("source.o");
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+        let blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::write(&blob, b"damaged-but-immutable").unwrap();
+        let before = std::fs::read(&blob).unwrap();
+
+        let output = primary.join("out.o");
+        std::fs::create_dir_all(&primary).unwrap();
+        let outcome = cache
+            .codegen(&key, &output, |path| {
+                std::fs::write(path, b"rebuilt-object").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(!outcome.hit);
+        assert_eq!(outcome.miss_reason, Some(FirstDiff::CorruptEntry));
+        assert_eq!(std::fs::read(&blob).unwrap(), before);
+        assert!(action_manifest_path(&primary, key.full_digest()).is_file());
+        assert_eq!(std::fs::read(&output).unwrap(), b"rebuilt-object");
+        assert!(
+            std::fs::read_dir(&primary)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".cache-stage-")),
+            "a rejected streamed object must leave no private materialization"
+        );
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_packaged_object_is_a_clean_miss_without_materialization() {
+        let (primary, packaged, cache) = fallback_context("oversized-object");
+        let key = sample_key();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let source = packaged.join("source.o");
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+        let blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+
+        std::fs::create_dir_all(&primary).unwrap();
+        let output = primary.join("out.o");
+        assert!(matches!(
+            cache.lookup(&key, &output),
+            CacheLookup::Miss {
+                reason: Some(FirstDiff::NoPriorEntry)
+            }
+        ));
+        assert!(!output.exists());
+        assert_eq!(std::fs::metadata(&blob).unwrap().len(), CACHE_CAS_MAX_BYTES + 1);
+        assert!(
+            std::fs::read_dir(&primary)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".cache-stage-"))
+        );
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_produced_object_is_not_published() {
+        let (primary, _, _) = fallback_context("oversized-publication");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        let source = primary.join("oversized.o");
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+        publish(&primary, &key, &source);
+        assert!(!action_manifest_path(&primary, key.full_digest()).exists());
+        assert!(!primary.join("cas").exists());
+        assert_eq!(std::fs::metadata(source).unwrap().len(), CACHE_CAS_MAX_BYTES + 1);
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_writable_blob_is_removed_republished_and_hits_next_time() {
+        let (primary, _, cache) = fallback_context("oversized-writable");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        let source = primary.join("source.o");
+        std::fs::write(&source, b"stable-object").unwrap();
+        publish(&primary, &key, &source);
+        let blob = cas_blob_path(&primary, Hash128::of(b"stable-object"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+
+        let output = primary.join("out.o");
+        let outcome = cache
+            .codegen(&key, &output, |path| {
+                std::fs::write(path, b"stable-object").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(!outcome.hit);
+        assert_eq!(outcome.miss_reason, Some(FirstDiff::CorruptEntry));
+        assert_eq!(std::fs::read(&blob).unwrap(), b"stable-object");
+
+        std::fs::remove_file(&output).unwrap();
+        assert!(matches!(cache.lookup(&key, &output), CacheLookup::Hit(_)));
+        assert_eq!(std::fs::read(output).unwrap(), b"stable-object");
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn unavailable_packaged_blob_is_a_clean_miss_and_remains_immutable() {
+        let (primary, packaged, cache) = fallback_context("missing-blob");
+        let key = sample_key();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let source = packaged.join("source.o");
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+        let action = action_manifest_path(&packaged, key.full_digest());
+        let action_before = std::fs::read(&action).unwrap();
+        let blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::remove_file(&blob).unwrap();
+
+        std::fs::create_dir_all(&primary).unwrap();
+        let output = primary.join("out.o");
+        let outcome = cache
+            .codegen(&key, &output, |path| {
+                std::fs::write(path, b"rebuilt-object").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(!outcome.hit);
+        assert_eq!(outcome.miss_reason, Some(FirstDiff::NoPriorEntry));
+        assert_eq!(std::fs::read(&action).unwrap(), action_before);
+        assert!(!blob.exists(), "a missing packaged blob stays missing");
+        assert!(action_manifest_path(&primary, key.full_digest()).is_file());
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn primary_and_packaged_corruption_unlinks_only_the_writable_blob() {
+        let (primary, packaged, cache) = fallback_context("double-corrupt");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let primary_source = primary.join("primary.o");
+        let packaged_source = packaged.join("packaged.o");
+        std::fs::write(&primary_source, b"primary-object").unwrap();
+        std::fs::write(&packaged_source, b"packaged-object").unwrap();
+        publish(&primary, &key, &primary_source);
+        publish(&packaged, &key, &packaged_source);
+
+        let primary_blob = cas_blob_path(&primary, Hash128::of(b"primary-object"));
+        let packaged_blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::write(&primary_blob, b"damaged-primary").unwrap();
+        std::fs::write(&packaged_blob, b"damaged-packaged").unwrap();
+        let packaged_before = std::fs::read(&packaged_blob).unwrap();
+        let output = primary.join("out.o");
+
+        assert!(matches!(
+            cache.lookup(&key, &output),
+            CacheLookup::Miss {
+                reason: Some(FirstDiff::CorruptEntry)
+            }
+        ));
+        assert!(!primary_blob.exists(), "writable corruption is unlinked");
+        assert_eq!(
+            std::fs::read(&packaged_blob).unwrap(),
+            packaged_before,
+            "packaged corruption remains immutable"
+        );
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_lookup_accepts_installer_symlinks_at_exact_manifest_and_blob_paths() {
+        use std::os::unix::fs::symlink;
+
+        let (primary, packaged, cache) = fallback_context("exact-symlinks");
+        let source_root = primary.parent().unwrap().join("installer-owned");
+        let key = sample_key();
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("source.o");
+        std::fs::write(&source, b"linked-packaged-object").unwrap();
+        publish(&source_root, &key, &source);
+
+        let source_action = action_manifest_path(&source_root, key.full_digest());
+        let packaged_action = action_manifest_path(&packaged, key.full_digest());
+        std::fs::create_dir_all(packaged_action.parent().unwrap()).unwrap();
+        symlink(&source_action, &packaged_action).unwrap();
+        let digest = Hash128::of(b"linked-packaged-object");
+        let source_blob = cas_blob_path(&source_root, digest);
+        let packaged_blob = cas_blob_path(&packaged, digest);
+        std::fs::create_dir_all(packaged_blob.parent().unwrap()).unwrap();
+        symlink(&source_blob, &packaged_blob).unwrap();
+
+        std::fs::create_dir_all(&primary).unwrap();
+        let output = primary.join("out.o");
+        assert!(matches!(cache.lookup(&key, &output), CacheLookup::Hit(_)));
+        assert_eq!(std::fs::read(&output).unwrap(), b"linked-packaged-object");
+        assert!(packaged_action.is_symlink());
+        assert!(packaged_blob.is_symlink());
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn miss_diagnostics_prefer_writable_slot_then_packaged_slot() {
+        let (primary, packaged, cache) = fallback_context("diff");
+        let current = sample_key();
+        let mut primary_prior = current.clone();
+        primary_prior.impl_hash = Hash128 { lo: 90, hi: 91 };
+        let mut packaged_prior = current.clone();
+        packaged_prior.target_triple = "aarch64-unknown-linux-gnu".to_string();
+        for (root, key) in [(&primary, &primary_prior), (&packaged, &packaged_prior)] {
+            std::fs::create_dir_all(root).unwrap();
+            let source = root.join("source.o");
+            std::fs::write(&source, b"prior").unwrap();
+            publish(root, key, &source);
+        }
+        let output = primary.join("out.o");
+        assert!(matches!(
+            cache.lookup(&current, &output),
+            CacheLookup::Miss {
+                reason: Some(FirstDiff::MirDigest)
+            }
+        ));
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
     // ---- ThinLTO S2 key codecs + first-diff -----------------------------------------------------
 
     fn sample_prelink_key() -> PrelinkKey {
@@ -1905,6 +2708,7 @@ mod tests {
             profile_name: "release".to_string(),
             pipeline: "default<O2>".to_string(),
             llvm_version: "22.1.8".to_string(),
+            llvm_build_id: Hash128 { lo: 12, hi: 13 },
             rt_lto: false,
             rt_lto_digest: None,
             unit: "main".to_string(),
@@ -1916,6 +2720,7 @@ mod tests {
             cache_format_version: CACHE_KEY_FORMAT_VERSION,
             compiler_build_id: Hash128 { lo: 1, hi: 2 },
             llvm_version: "22.1.8".to_string(),
+            llvm_build_id: Hash128 { lo: 12, hi: 13 },
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
             object_format: 0,
             resolved_cpu: "x86-64-v2".to_string(),
@@ -1932,6 +2737,90 @@ mod tests {
             exports: Vec::new(),
             unit: "main".to_string(),
         }
+    }
+
+    const PRELINK_V4_GOLDEN: &str = concat!(
+        "04000000",
+        "01",
+        "04000000", // manifest, phase, key
+        "01000000000000000200000000000000",
+        "03000000",
+        "00",                               // compiler, frontend, located
+        "04000000000000000500000000000000", // impl
+        "01000000",
+        "03000000646570",
+        "06000000000000000700000000000000", // deps
+        "01000000",
+        "0100000061", // exports
+        "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
+        "00", // target
+        "0700000072656c65617365",
+        "0b00000064656661756c743c4f323e", // profile, pipeline
+        "0600000032322e312e38",
+        "0c000000000000000d00000000000000", // LLVM
+        "00",
+        "00",
+        "040000006d61696e",                 // rt-lto, optional, unit
+        "63000000000000006400000000000000", // blob
+    );
+
+    const BACKEND_V4_GOLDEN: &str = concat!(
+        "04000000",
+        "02",
+        "04000000",                         // manifest, phase, key
+        "01000000000000000200000000000000", // compiler
+        "0600000032322e312e38",
+        "0c000000000000000d00000000000000", // LLVM
+        "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
+        "00", // target
+        "090000007838362d36342d7632",
+        "00000000", // cpu, features
+        "03000000504943",
+        "0700000044656661756c74", // reloc, code model
+        "0700000072656c65617365",
+        "0b00000064656661756c743c4f323e",   // profile, pipeline
+        "0700000064656661756c74",           // codegen opt
+        "08000000000000000900000000000000", // own prelink
+        "01000000",
+        "030000006c6962",
+        "2a00000000000000",
+        "01", // inbound
+        "02000000",
+        "0700000000000000",
+        "0b00000000000000", // outbound
+        "01000000",
+        "030000006c6962",
+        "0a000000000000000b00000000000000", // imports
+        "00000000",
+        "040000006d61696e",                 // exports, unit
+        "05000000000000000600000000000000", // blob
+    );
+
+    #[test]
+    fn thin_codegen_v4_manifest_goldens_are_bidirectional() {
+        let prelink = golden_bytes(PRELINK_V4_GOLDEN);
+        let prelink_key = sample_prelink_key();
+        let prelink_blob = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(
+            serialize_prelink_manifest(&prelink_key, prelink_blob),
+            prelink
+        );
+        assert_eq!(
+            deserialize_prelink_manifest(&prelink),
+            Ok((prelink_key, prelink_blob))
+        );
+
+        let backend = golden_bytes(BACKEND_V4_GOLDEN);
+        let backend_key = sample_backend_key();
+        let backend_blob = Hash128 { lo: 5, hi: 6 };
+        assert_eq!(
+            serialize_backend_manifest(&backend_key, backend_blob),
+            backend
+        );
+        assert_eq!(
+            deserialize_backend_manifest(&backend),
+            Ok((backend_key, backend_blob))
+        );
     }
 
     #[test]
@@ -2005,6 +2894,12 @@ mod tests {
         let mut k = base.clone();
         k.target_triple = "aarch64-unknown-linux-gnu".to_string();
         assert_eq!(prelink_first_diff(&base, &k), FirstDiff::Target);
+        k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(
+            prelink_first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes a simultaneous target difference"
+        );
         // impl_hash wins over a simultaneous dep change.
         let mut k = base.clone();
         k.impl_hash = Hash128 { lo: 2, hi: 2 };
@@ -2043,5 +2938,11 @@ mod tests {
         k.resolved_cpu = "z".to_string();
         k.own_prelink_digest = Hash128 { lo: 0, hi: 0 };
         assert_eq!(backend_first_diff(&base, &k), FirstDiff::Cpu);
+        k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(
+            backend_first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes simultaneous backend/source differences"
+        );
     }
 }
