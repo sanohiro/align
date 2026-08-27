@@ -924,9 +924,18 @@ fn materialize_blob(
     let blob = match std::fs::read(&blob_path) {
         Ok(b) => b,
         Err(_) => {
-            // The action manifest references a blob that is gone: treat as corruption, rebuild.
-            note_corrupt(policy);
-            return HitResult::Corrupt;
+            // A writable action pointing at an unavailable blob retains the existing self-heal
+            // diagnosis. An immutable packaged blob may simply be absent or unreadable after an
+            // installer/permission change; the public contract makes every such I/O failure a
+            // clean miss and reserves the packaged-corruption note for bytes we actually read and
+            // prove digest-bad.
+            return match policy {
+                ReadPolicy::Writable => {
+                    note_corrupt(policy);
+                    HitResult::Corrupt
+                }
+                ReadPolicy::Packaged => HitResult::Miss,
+            };
         }
     };
     if Hash128::of(&blob) != blob_digest {
@@ -2235,6 +2244,34 @@ mod tests {
         assert_eq!(std::fs::read(&blob).unwrap(), before);
         assert!(action_manifest_path(&primary, key.full_digest()).is_file());
         assert_eq!(std::fs::read(&output).unwrap(), b"rebuilt-object");
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn unavailable_packaged_blob_is_a_clean_miss_and_remains_immutable() {
+        let (primary, packaged, cache) = fallback_context("missing-blob");
+        let key = sample_key();
+        std::fs::create_dir_all(&packaged).unwrap();
+        let source = packaged.join("source.o");
+        std::fs::write(&source, b"packaged-object").unwrap();
+        publish(&packaged, &key, &source);
+        let action = action_manifest_path(&packaged, key.full_digest());
+        let action_before = std::fs::read(&action).unwrap();
+        let blob = cas_blob_path(&packaged, Hash128::of(b"packaged-object"));
+        std::fs::remove_file(&blob).unwrap();
+
+        std::fs::create_dir_all(&primary).unwrap();
+        let output = primary.join("out.o");
+        let outcome = cache
+            .codegen(&key, &output, |path| {
+                std::fs::write(path, b"rebuilt-object").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(!outcome.hit);
+        assert_eq!(outcome.miss_reason, Some(FirstDiff::NoPriorEntry));
+        assert_eq!(std::fs::read(&action).unwrap(), action_before);
+        assert!(!blob.exists(), "a missing packaged blob stays missing");
+        assert!(action_manifest_path(&primary, key.full_digest()).is_file());
         std::fs::remove_dir_all(primary.parent().unwrap()).ok();
     }
 

@@ -1,21 +1,27 @@
 //! Nominal identity of the dynamically loaded LLVM library.
 //!
 //! Codegen cache entries must distinguish two LLVM builds that report the same
-//! semantic version. The loader gives us the object containing `LLVMGetVersion`;
-//! this module reads that exact file and extracts its producer-owned ELF GNU
-//! build-id or Mach-O UUID. Every malformed or unavailable input fails closed.
+//! semantic version. The identity is read from the loader-owned mapped image
+//! containing `LLVMGetVersion`, never by reopening its pathname: replacing a
+//! package on disk cannot relabel code emitted by an already-running process.
 
-use std::ffi::CStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 use std::sync::OnceLock;
 
 use align_interface::Hash128;
 
-const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const PT_LOAD: u32 = 1;
 const PT_NOTE: u32 = 4;
 const NT_GNU_BUILD_ID: u32 = 3;
+#[cfg(any(target_os = "macos", test))]
 const LC_UUID: u32 = 0x1b;
+const MAX_ELF_PROGRAM_HEADERS: usize = 1_024;
+const MAX_ELF_NOTE_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const MAX_DYLD_IMAGES: u32 = 4_096;
+#[cfg(any(target_os = "macos", test))]
+const MAX_MACH_LOAD_COMMANDS: usize = 4_096;
+#[cfg(any(target_os = "macos", test))]
+const MAX_MACH_LOAD_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 
 /// Return the nominal build identity of the loaded library that provides LLVM.
 ///
@@ -27,12 +33,16 @@ pub fn loaded_llvm_build_id() -> Option<Hash128> {
 }
 
 fn resolve_loaded_llvm_build_id() -> Option<Hash128> {
-    let path = loaded_llvm_path()?;
-    let bytes = std::fs::read(path).ok()?;
-    parse_object_build_id(&bytes)
+    let base = loaded_llvm_base()?;
+    #[cfg(target_os = "linux")]
+    return mapped_elf_build_id(base);
+    #[cfg(target_os = "macos")]
+    return mapped_macho_build_id(base);
+    #[allow(unreachable_code)]
+    None
 }
 
-fn loaded_llvm_path() -> Option<std::path::PathBuf> {
+fn loaded_llvm_base() -> Option<usize> {
     let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
     // SAFETY: `LLVMGetVersion` is a linked function symbol, `dladdr` only
     // inspects the address, and `info` points to writable initialized storage.
@@ -45,54 +55,23 @@ fn loaded_llvm_path() -> Option<std::path::PathBuf> {
     if found == 0 {
         return None;
     }
-    // SAFETY: successful `dladdr` initializes `Dl_info`. A non-null `dli_fname`
-    // is a borrowed NUL-terminated loader path for the duration of the process.
+    // SAFETY: successful `dladdr` initializes `Dl_info`. `dli_fbase` is the
+    // loader-owned mapped image base; no borrowed pointer escapes this call.
     let info = unsafe { info.assume_init() };
-    if info.dli_fname.is_null() {
-        return None;
-    }
-    // SAFETY: `dli_fname` has the `dladdr(3)` NUL-terminated-string contract.
-    let bytes = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
-    loader_path(bytes)
+    (!info.dli_fbase.is_null()).then_some(info.dli_fbase as usize)
 }
 
-fn loader_path(bytes: &[u8]) -> Option<std::path::PathBuf> {
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(Path::new(std::ffi::OsStr::from_bytes(bytes)).to_path_buf())
-}
-
-fn parse_object_build_id(bytes: &[u8]) -> Option<Hash128> {
-    let raw = if bytes.starts_with(ELF_MAGIC) {
-        let id = parse_elf_build_id(bytes)?;
-        tagged_identity(0, id)
-    } else {
-        let id = parse_macho_uuid(bytes)?;
-        tagged_identity(1, id)
-    };
-    Some(Hash128::of(&raw))
-}
-
-fn tagged_identity(tag: u8, raw: &[u8]) -> Vec<u8> {
+fn tagged_identity(tag: u8, raw: &[u8]) -> Hash128 {
     let mut tagged = Vec::with_capacity(raw.len().saturating_add(1));
     tagged.push(tag);
     tagged.extend_from_slice(raw);
-    tagged
+    Hash128::of(&tagged)
 }
 
 #[derive(Clone, Copy)]
 enum Endian {
     Little,
     Big,
-}
-
-fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> Option<u16> {
-    let raw: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
-    Some(match endian {
-        Endian::Little => u16::from_le_bytes(raw),
-        Endian::Big => u16::from_be_bytes(raw),
-    })
 }
 
 fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> Option<u32> {
@@ -103,18 +82,6 @@ fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> Option<u32> {
     })
 }
 
-fn read_u64(bytes: &[u8], offset: usize, endian: Endian) -> Option<u64> {
-    let raw: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
-    Some(match endian {
-        Endian::Little => u64::from_le_bytes(raw),
-        Endian::Big => u64::from_be_bytes(raw),
-    })
-}
-
-fn usize_from_u64(value: u64) -> Option<usize> {
-    usize::try_from(value).ok()
-}
-
 fn range(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
     bytes.get(offset..offset.checked_add(len)?)
 }
@@ -123,134 +90,289 @@ fn align4(value: usize) -> Option<usize> {
     value.checked_add(3).map(|n| n & !3)
 }
 
-fn parse_elf_build_id(bytes: &[u8]) -> Option<&[u8]> {
-    if !bytes.starts_with(ELF_MAGIC) || *bytes.get(6)? != 1 {
-        return None;
-    }
-    let class = *bytes.get(4)?;
-    let endian = match *bytes.get(5)? {
-        1 => Endian::Little,
-        2 => Endian::Big,
-        _ => return None,
-    };
-    let (header_len, phoff, phentsize_offset, phnum_offset, min_phentsize) = match class {
-        1 => (
-            52usize,
-            read_u32(bytes, 28, endian)? as u64,
-            42usize,
-            44usize,
-            32usize,
-        ),
-        2 => (
-            64usize,
-            read_u64(bytes, 32, endian)?,
-            54usize,
-            56usize,
-            56usize,
-        ),
-        _ => return None,
-    };
-    range(bytes, 0, header_len)?;
-    let phoff = usize_from_u64(phoff)?;
-    let phentsize = usize::from(read_u16(bytes, phentsize_offset, endian)?);
-    let phnum = usize::from(read_u16(bytes, phnum_offset, endian)?);
-    if phentsize < min_phentsize {
-        return None;
-    }
-    let table_len = phentsize.checked_mul(phnum)?;
-    range(bytes, phoff, table_len)?;
-
+fn parse_elf_notes(notes: &[u8], endian: Endian) -> Result<Option<&[u8]>, ()> {
+    let mut cursor = 0usize;
     let mut found = None;
-    for index in 0..phnum {
-        let header = phoff.checked_add(index.checked_mul(phentsize)?)?;
-        if read_u32(bytes, header, endian)? != PT_NOTE {
-            continue;
-        }
-        let (note_offset, note_len) = if class == 1 {
-            (
-                read_u32(bytes, header.checked_add(4)?, endian)? as u64,
-                read_u32(bytes, header.checked_add(16)?, endian)? as u64,
-            )
-        } else {
-            (
-                read_u64(bytes, header.checked_add(8)?, endian)?,
-                read_u64(bytes, header.checked_add(32)?, endian)?,
-            )
-        };
-        let notes = range(
-            bytes,
-            usize_from_u64(note_offset)?,
-            usize_from_u64(note_len)?,
-        )?;
-        let mut cursor = 0usize;
-        while cursor < notes.len() {
-            let namesz = usize::try_from(read_u32(notes, cursor, endian)?).ok()?;
-            let descsz = usize::try_from(read_u32(notes, cursor.checked_add(4)?, endian)?).ok()?;
-            let kind = read_u32(notes, cursor.checked_add(8)?, endian)?;
-            cursor = cursor.checked_add(12)?;
-            let name = range(notes, cursor, namesz)?;
-            cursor = cursor.checked_add(align4(namesz)?)?;
-            let desc = range(notes, cursor, descsz)?;
-            cursor = cursor.checked_add(align4(descsz)?)?;
-            if kind == NT_GNU_BUILD_ID && name == b"GNU\0" {
-                if desc.is_empty() || found.is_some() {
-                    return None;
-                }
-                found = Some(desc);
+    while cursor < notes.len() {
+        let namesz = usize::try_from(read_u32(notes, cursor, endian).ok_or(())?).map_err(|_| ())?;
+        let descsz = usize::try_from(read_u32(notes, cursor.checked_add(4).ok_or(())?, endian).ok_or(())?)
+            .map_err(|_| ())?;
+        let kind = read_u32(notes, cursor.checked_add(8).ok_or(())?, endian).ok_or(())?;
+        cursor = cursor.checked_add(12).ok_or(())?;
+        let padded_namesz = align4(namesz).ok_or(())?;
+        let name_region = range(notes, cursor, padded_namesz).ok_or(())?;
+        let name = name_region.get(..namesz).ok_or(())?;
+        cursor = cursor.checked_add(padded_namesz).ok_or(())?;
+        let padded_descsz = align4(descsz).ok_or(())?;
+        let desc_region = range(notes, cursor, padded_descsz).ok_or(())?;
+        let desc = desc_region.get(..descsz).ok_or(())?;
+        cursor = cursor.checked_add(padded_descsz).ok_or(())?;
+        if kind == NT_GNU_BUILD_ID && name == b"GNU\0" {
+            if desc.is_empty() || found.is_some() {
+                return Err(());
             }
+            found = Some(desc);
         }
     }
-    found
+    Ok(found)
 }
 
-fn parse_macho_uuid(bytes: &[u8]) -> Option<&[u8]> {
-    let magic: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    let (is_64, endian) = match magic {
-        [0xce, 0xfa, 0xed, 0xfe] => (false, Endian::Little),
-        [0xcf, 0xfa, 0xed, 0xfe] => (true, Endian::Little),
-        [0xfe, 0xed, 0xfa, 0xce] => (false, Endian::Big),
-        [0xfe, 0xed, 0xfa, 0xcf] => (true, Endian::Big),
-        _ => return None,
-    };
-    let header_len = if is_64 { 32usize } else { 28usize };
-    range(bytes, 0, header_len)?;
-    let ncmds = usize::try_from(read_u32(bytes, 16, endian)?).ok()?;
-    let sizeofcmds = usize::try_from(read_u32(bytes, 20, endian)?).ok()?;
-    let commands = range(bytes, header_len, sizeofcmds)?;
+fn elf_inventory_is_bounded(program_headers: usize, note_bytes: usize) -> bool {
+    program_headers <= MAX_ELF_PROGRAM_HEADERS && note_bytes <= MAX_ELF_NOTE_BYTES
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn dyld_image_count_is_bounded(images: u32) -> bool {
+    images <= MAX_DYLD_IMAGES
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mach_commands_are_bounded(commands: usize, bytes: usize) -> bool {
+    commands <= MAX_MACH_LOAD_COMMANDS
+        && bytes <= MAX_MACH_LOAD_COMMAND_BYTES
+        && commands.checked_mul(8).is_some_and(|minimum| minimum <= bytes)
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(target_pointer_width = "64")]
+type NativePhdr = libc::Elf64_Phdr;
+#[cfg(target_os = "linux")]
+#[cfg(target_pointer_width = "32")]
+type NativePhdr = libc::Elf32_Phdr;
+
+#[cfg(target_os = "linux")]
+struct ElfSearch {
+    base: usize,
+    matched: bool,
+    invalid: bool,
+    raw_id: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+fn phdr_range(phdr: &NativePhdr) -> Option<(usize, usize, usize)> {
+    Some((
+        usize::try_from(phdr.p_vaddr).ok()?,
+        usize::try_from(phdr.p_filesz).ok()?,
+        usize::try_from(phdr.p_memsz).ok()?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn note_is_inside_readable_load(phdrs: &[NativePhdr], start: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(len) else { return false };
+    phdrs.iter().any(|load| {
+        if load.p_type != PT_LOAD || load.p_flags & libc::PF_R == 0 {
+            return false;
+        }
+        let Some((load_start, load_len, _)) = phdr_range(load) else { return false };
+        load_start <= start
+            && load_start.checked_add(load_len).is_some_and(|load_end| end <= load_end)
+    })
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn find_elf_image(
+    info: *mut libc::dl_phdr_info,
+    size: libc::size_t,
+    data: *mut libc::c_void,
+) -> libc::c_int {
+    if info.is_null() || data.is_null() {
+        return 0;
+    }
+    let required = std::mem::offset_of!(libc::dl_phdr_info, dlpi_phnum)
+        .saturating_add(std::mem::size_of::<u16>());
+    if size < required {
+        return 0;
+    }
+    // SAFETY: `dl_iterate_phdr` supplies both pointers for this callback invocation.
+    let info = unsafe { &*info };
+    let search = unsafe { &mut *(data as *mut ElfSearch) };
+    let Ok(image_base) = usize::try_from(info.dlpi_addr) else { return 0 };
+    if image_base != search.base {
+        return 0;
+    }
+    search.matched = true;
+    let phnum = usize::from(info.dlpi_phnum);
+    if !elf_inventory_is_bounded(phnum, 0) || phnum == 0 || info.dlpi_phdr.is_null() {
+        search.invalid = true;
+        return 1;
+    }
+    // SAFETY: the loader owns `dlpi_phdr` and reports exactly `dlpi_phnum`
+    // initialized entries for the duration of this callback.
+    let phdrs = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, phnum) };
+
+    // First validate every range and the aggregate byte bound. No note bytes
+    // are sliced or copied until the complete mapped-image inventory passes.
+    let mut total = 0usize;
+    for phdr in phdrs.iter().filter(|phdr| phdr.p_type == PT_NOTE) {
+        let Some((start, file_len, mem_len)) = phdr_range(phdr) else {
+            search.invalid = true;
+            return 1;
+        };
+        if file_len > mem_len || !note_is_inside_readable_load(phdrs, start, file_len) {
+            search.invalid = true;
+            return 1;
+        }
+        let Some(next) = total.checked_add(file_len) else {
+            search.invalid = true;
+            return 1;
+        };
+        total = next;
+    }
+    if !elf_inventory_is_bounded(phnum, total) {
+        search.invalid = true;
+        return 1;
+    }
+
+    let endian = if cfg!(target_endian = "little") { Endian::Little } else { Endian::Big };
+    for phdr in phdrs.iter().filter(|phdr| phdr.p_type == PT_NOTE) {
+        let Some((start, len, _)) = phdr_range(phdr) else {
+            search.invalid = true;
+            return 1;
+        };
+        if len == 0 {
+            continue;
+        }
+        let Some(address) = search.base.checked_add(start) else {
+            search.invalid = true;
+            return 1;
+        };
+        if address == 0 {
+            search.invalid = true;
+            return 1;
+        }
+        // SAFETY: the first pass proved this file-backed note range lies
+        // completely inside a readable PT_LOAD mapping owned by this image.
+        let notes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
+        match parse_elf_notes(notes, endian) {
+            Ok(Some(id)) if search.raw_id.is_none() => search.raw_id = Some(id.to_vec()),
+            Ok(Some(_)) | Err(()) => {
+                search.invalid = true;
+                return 1;
+            }
+            Ok(None) => {}
+        }
+    }
+    1
+}
+
+#[cfg(target_os = "linux")]
+fn mapped_elf_build_id(base: usize) -> Option<Hash128> {
+    let mut search = ElfSearch { base, matched: false, invalid: false, raw_id: None };
+    // SAFETY: `find_elf_image` obeys the callback ABI, retains no loader
+    // pointers, and `search` remains live for the synchronous traversal.
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(find_elf_image),
+            (&mut search as *mut ElfSearch).cast::<libc::c_void>(),
+        );
+    }
+    if !search.matched || search.invalid {
+        return None;
+    }
+    search.raw_id.as_deref().map(|id| tagged_identity(0, id))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macho_commands(commands: &[u8], ncmds: usize, endian: Endian) -> Result<Option<&[u8]>, ()> {
     let mut cursor = 0usize;
     let mut found = None;
     for _ in 0..ncmds {
-        let cmd = read_u32(commands, cursor, endian)?;
-        let cmdsize = usize::try_from(read_u32(commands, cursor.checked_add(4)?, endian)?).ok()?;
+        let cmd = read_u32(commands, cursor, endian).ok_or(())?;
+        let cmdsize = usize::try_from(
+            read_u32(commands, cursor.checked_add(4).ok_or(())?, endian).ok_or(())?,
+        )
+        .map_err(|_| ())?;
         if cmdsize < 8 || cmdsize % 4 != 0 {
-            return None;
+            return Err(());
         }
-        let command = range(commands, cursor, cmdsize)?;
+        let command = range(commands, cursor, cmdsize).ok_or(())?;
         if cmd == LC_UUID {
             if cmdsize != 24 || found.is_some() {
-                return None;
+                return Err(());
             }
-            found = Some(command.get(8..24)?);
+            found = Some(command.get(8..24).ok_or(())?);
         }
-        cursor = cursor.checked_add(cmdsize)?;
+        cursor = cursor.checked_add(cmdsize).ok_or(())?;
     }
     if cursor != commands.len() {
+        return Err(());
+    }
+    Ok(found)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[repr(C)]
+struct MachHeader {
+    magic: u32,
+    cpu_type: i32,
+    cpu_subtype: i32,
+    file_type: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_header(index: u32) -> *const MachHeader;
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mapped_macho_build_id_from(
+    base: usize,
+    image_count: u32,
+    mut image_header: impl FnMut(u32) -> *const MachHeader,
+) -> Option<Hash128> {
+    if !dyld_image_count_is_bounded(image_count) {
         return None;
     }
-    found
+    for index in 0..image_count {
+        let header = image_header(index);
+        if header.is_null() || header as usize != base {
+            continue;
+        }
+        // SAFETY: the caller supplies loader-owned mapped headers for every
+        // index below `image_count` and retains them through this call.
+        let header = unsafe { &*header };
+        const MH_MAGIC: u32 = 0xfeed_face;
+        const MH_MAGIC_64: u32 = 0xfeed_facf;
+        let header_len = match header.magic {
+            MH_MAGIC => 28usize,
+            MH_MAGIC_64 => 32usize,
+            _ => return None,
+        };
+        let ncmds = usize::try_from(header.ncmds).ok()?;
+        let command_bytes = usize::try_from(header.sizeofcmds).ok()?;
+        if !mach_commands_are_bounded(ncmds, command_bytes) {
+            return None;
+        }
+        let address = base.checked_add(header_len)?;
+        // SAFETY: dyld accepts and maps the complete load-command region after
+        // the returned header. Both counts have passed the explicit bounds,
+        // and the non-null image base makes the zero-length case valid too.
+        let commands = unsafe { std::slice::from_raw_parts(address as *const u8, command_bytes) };
+        let id = parse_macho_commands(commands, ncmds, Endian::Little).ok()??;
+        return Some(tagged_identity(1, id));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn mapped_macho_build_id(base: usize) -> Option<Hash128> {
+    // SAFETY: dyld's image table is process-owned and these accessors do not
+    // mutate it. `mapped_macho_build_id_from` copies the UUID before returning.
+    let image_count = unsafe { _dyld_image_count() };
+    mapped_macho_build_id_from(base, image_count, |index| {
+        // SAFETY: every requested index is below the snapshot count.
+        unsafe { _dyld_get_image_header(index) }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn put_u16(bytes: &mut [u8], offset: usize, value: u16, endian: Endian) {
-        let raw = match endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
-        };
-        bytes[offset..offset + 2].copy_from_slice(&raw);
-    }
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32, endian: Endian) {
         let raw = match endian {
@@ -260,153 +382,130 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&raw);
     }
 
-    fn put_u64(bytes: &mut [u8], offset: usize, value: u64, endian: Endian) {
-        let raw = match endian {
-            Endian::Little => value.to_le_bytes(),
-            Endian::Big => value.to_be_bytes(),
-        };
-        bytes[offset..offset + 8].copy_from_slice(&raw);
-    }
-
-    fn elf(class: u8, endian: Endian, id: &[u8]) -> Vec<u8> {
-        let header_len = if class == 1 { 52 } else { 64 };
-        let ph_len = if class == 1 { 32 } else { 56 };
-        let note_offset = header_len + ph_len;
-        let note_len = 12 + 4 + align4(id.len()).unwrap();
-        let mut bytes = vec![0; note_offset + note_len];
-        bytes[..4].copy_from_slice(ELF_MAGIC);
-        bytes[4] = class;
-        bytes[5] = match endian {
-            Endian::Little => 1,
-            Endian::Big => 2,
-        };
-        bytes[6] = 1;
-        if class == 1 {
-            put_u32(&mut bytes, 28, header_len as u32, endian);
-            put_u16(&mut bytes, 42, ph_len as u16, endian);
-            put_u16(&mut bytes, 44, 1, endian);
-            put_u32(&mut bytes, header_len, PT_NOTE, endian);
-            put_u32(&mut bytes, header_len + 4, note_offset as u32, endian);
-            put_u32(&mut bytes, header_len + 16, note_len as u32, endian);
-        } else {
-            put_u64(&mut bytes, 32, header_len as u64, endian);
-            put_u16(&mut bytes, 54, ph_len as u16, endian);
-            put_u16(&mut bytes, 56, 1, endian);
-            put_u32(&mut bytes, header_len, PT_NOTE, endian);
-            put_u64(&mut bytes, header_len + 8, note_offset as u64, endian);
-            put_u64(&mut bytes, header_len + 32, note_len as u64, endian);
-        }
-        put_u32(&mut bytes, note_offset, 4, endian);
-        put_u32(&mut bytes, note_offset + 4, id.len() as u32, endian);
-        put_u32(&mut bytes, note_offset + 8, NT_GNU_BUILD_ID, endian);
-        bytes[note_offset + 12..note_offset + 16].copy_from_slice(b"GNU\0");
-        bytes[note_offset + 16..note_offset + 16 + id.len()].copy_from_slice(id);
+    fn elf_notes(endian: Endian, id: &[u8]) -> Vec<u8> {
+        let len = 12 + 4 + align4(id.len()).unwrap();
+        let mut bytes = vec![0; len];
+        put_u32(&mut bytes, 0, 4, endian);
+        put_u32(&mut bytes, 4, id.len() as u32, endian);
+        put_u32(&mut bytes, 8, NT_GNU_BUILD_ID, endian);
+        bytes[12..16].copy_from_slice(b"GNU\0");
+        bytes[16..16 + id.len()].copy_from_slice(id);
         bytes
     }
 
-    fn macho(is_64: bool, endian: Endian, id: [u8; 16]) -> Vec<u8> {
-        let header_len = if is_64 { 32 } else { 28 };
-        let mut bytes = vec![0; header_len + 24];
-        bytes[..4].copy_from_slice(match (is_64, endian) {
-            (false, Endian::Little) => &[0xce, 0xfa, 0xed, 0xfe],
-            (true, Endian::Little) => &[0xcf, 0xfa, 0xed, 0xfe],
-            (false, Endian::Big) => &[0xfe, 0xed, 0xfa, 0xce],
-            (true, Endian::Big) => &[0xfe, 0xed, 0xfa, 0xcf],
-        });
-        put_u32(&mut bytes, 16, 1, endian);
-        put_u32(&mut bytes, 20, 24, endian);
-        put_u32(&mut bytes, header_len, LC_UUID, endian);
-        put_u32(&mut bytes, header_len + 4, 24, endian);
-        bytes[header_len + 8..header_len + 24].copy_from_slice(&id);
+    fn macho_commands(endian: Endian, id: [u8; 16]) -> Vec<u8> {
+        let mut bytes = vec![0; 24];
+        put_u32(&mut bytes, 0, LC_UUID, endian);
+        put_u32(&mut bytes, 4, 24, endian);
+        bytes[8..24].copy_from_slice(&id);
         bytes
     }
 
     #[test]
-    fn parses_elf32_and_elf64_in_both_endiannesses() {
-        for class in [1, 2] {
-            for endian in [Endian::Little, Endian::Big] {
-                let bytes = elf(class, endian, b"build-id");
-                assert_eq!(parse_elf_build_id(&bytes), Some(&b"build-id"[..]));
-            }
+    fn parses_elf_notes_in_both_endiannesses() {
+        for endian in [Endian::Little, Endian::Big] {
+            let bytes = elf_notes(endian, b"build-id");
+            assert_eq!(parse_elf_notes(&bytes, endian), Ok(Some(&b"build-id"[..])));
         }
     }
 
     #[test]
-    fn parses_macho32_and_macho64_in_both_endiannesses() {
+    fn parses_macho_commands_in_both_endiannesses() {
         let id = *b"0123456789abcdef";
-        for is_64 in [false, true] {
-            for endian in [Endian::Little, Endian::Big] {
-                let bytes = macho(is_64, endian, id);
-                assert_eq!(parse_macho_uuid(&bytes), Some(&id[..]));
-            }
+        for endian in [Endian::Little, Endian::Big] {
+            let bytes = macho_commands(endian, id);
+            assert_eq!(parse_macho_commands(&bytes, 1, endian), Ok(Some(&id[..])));
         }
     }
 
     #[test]
     fn rejects_every_truncation_and_duplicate_or_missing_identity() {
-        let elf = elf(2, Endian::Little, b"id");
-        for len in 0..elf.len() {
-            assert_eq!(
-                parse_elf_build_id(&elf[..len]),
-                None,
-                "ELF truncation {len}"
-            );
-        }
-        let mut duplicate = elf.clone();
-        duplicate.extend_from_slice(&elf[64 + 56..]);
-        let duplicate_note_len = (duplicate.len() - 64 - 56) as u64;
-        put_u64(&mut duplicate, 64 + 32, duplicate_note_len, Endian::Little);
-        assert_eq!(parse_elf_build_id(&duplicate), None);
-        let mut missing = elf;
-        put_u32(&mut missing, 64 + 56 + 8, 0, Endian::Little);
-        assert_eq!(parse_elf_build_id(&missing), None);
+        for endian in [Endian::Little, Endian::Big] {
+            let elf = elf_notes(endian, b"id");
+            assert_eq!(parse_elf_notes(&[], endian), Ok(None));
+            for len in 1..elf.len() {
+                assert_eq!(parse_elf_notes(&elf[..len], endian), Err(()), "ELF truncation {len}");
+            }
+            let mut duplicate = elf.clone();
+            duplicate.extend_from_slice(&elf);
+            assert_eq!(parse_elf_notes(&duplicate, endian), Err(()));
+            let mut missing = elf;
+            put_u32(&mut missing, 8, 0, endian);
+            assert_eq!(parse_elf_notes(&missing, endian), Ok(None));
 
-        let macho = macho(true, Endian::Little, *b"0123456789abcdef");
-        for len in 0..macho.len() {
-            assert_eq!(
-                parse_macho_uuid(&macho[..len]),
-                None,
-                "Mach-O truncation {len}"
-            );
+            let macho = macho_commands(endian, *b"0123456789abcdef");
+            for len in 0..macho.len() {
+                assert_eq!(
+                    parse_macho_commands(&macho[..len], 1, endian),
+                    Err(()),
+                    "Mach-O truncation {len}"
+                );
+            }
+            let mut duplicate = macho.clone();
+            duplicate.extend_from_slice(&macho);
+            assert_eq!(parse_macho_commands(&duplicate, 2, endian), Err(()));
+            assert_eq!(parse_macho_commands(&[], 0, endian), Ok(None));
         }
-        let mut duplicate = macho.clone();
-        duplicate.extend_from_slice(&macho[32..]);
-        put_u32(&mut duplicate, 16, 2, Endian::Little);
-        put_u32(&mut duplicate, 20, 48, Endian::Little);
-        assert_eq!(parse_macho_uuid(&duplicate), None);
-        let mut missing = macho;
-        put_u32(&mut missing, 32, 0, Endian::Little);
-        assert_eq!(parse_macho_uuid(&missing), None);
     }
 
     #[test]
-    fn rejects_overflowing_ranges_and_preserves_non_utf8_loader_paths() {
-        let mut elf = elf(2, Endian::Little, b"identity");
-        put_u64(&mut elf, 32, u64::MAX, Endian::Little);
-        assert_eq!(parse_elf_build_id(&elf), None);
+    fn resource_bounds_pin_accepted_limit_and_rejected_next() {
+        assert!(elf_inventory_is_bounded(MAX_ELF_PROGRAM_HEADERS, MAX_ELF_NOTE_BYTES));
+        assert!(!elf_inventory_is_bounded(MAX_ELF_PROGRAM_HEADERS + 1, 0));
+        assert!(!elf_inventory_is_bounded(0, MAX_ELF_NOTE_BYTES + 1));
+        assert!(dyld_image_count_is_bounded(MAX_DYLD_IMAGES));
+        assert!(!dyld_image_count_is_bounded(MAX_DYLD_IMAGES + 1));
+        assert!(mach_commands_are_bounded(
+            MAX_MACH_LOAD_COMMANDS,
+            MAX_MACH_LOAD_COMMAND_BYTES
+        ));
+        assert!(!mach_commands_are_bounded(1, 7));
+        assert!(!mach_commands_are_bounded(MAX_MACH_LOAD_COMMANDS + 1, 0));
+        assert!(!mach_commands_are_bounded(0, MAX_MACH_LOAD_COMMAND_BYTES + 1));
+    }
 
-        let mut macho = macho(true, Endian::Little, *b"0123456789abcdef");
-        put_u32(&mut macho, 20, u32::MAX, Endian::Little);
-        assert_eq!(parse_macho_uuid(&macho), None);
-        assert_eq!(parse_object_build_id(b"not an object"), None);
-
-        let raw = b"/tmp/libLLVM-\xff.so";
-        let path = loader_path(raw).expect("native non-UTF-8 loader path");
-        assert_eq!(path.as_os_str().as_bytes(), raw);
-        assert_eq!(loader_path(b""), None);
+    #[test]
+    fn macho_identity_is_bound_to_the_selected_mapped_header() {
+        #[repr(C)]
+        struct Fixture {
+            header: MachHeader,
+            reserved: u32,
+            command: u32,
+            command_size: u32,
+            uuid: [u8; 16],
+        }
+        let fixture = Fixture {
+            header: MachHeader {
+                magic: 0xfeed_facf,
+                cpu_type: 0,
+                cpu_subtype: 0,
+                file_type: 0,
+                ncmds: 1,
+                sizeofcmds: 24,
+                flags: 0,
+            },
+            reserved: 0,
+            command: LC_UUID,
+            command_size: 24,
+            uuid: *b"0123456789abcdef",
+        };
+        let base = &fixture.header as *const MachHeader as usize;
+        assert_eq!(
+            mapped_macho_build_id_from(base, 1, |_| &fixture.header),
+            Some(tagged_identity(1, &fixture.uuid))
+        );
+        assert_eq!(mapped_macho_build_id_from(base + 4, 1, |_| &fixture.header), None);
     }
 
     #[test]
     fn tag_distinguishes_equal_raw_identity_bytes() {
         let raw = b"0123456789abcdef";
-        assert_ne!(
-            Hash128::of(&tagged_identity(0, raw)),
-            Hash128::of(&tagged_identity(1, raw))
-        );
+        assert_ne!(tagged_identity(0, raw), tagged_identity(1, raw));
     }
 
     #[test]
-    fn current_process_loaded_llvm_has_an_identity() {
+    fn current_process_resolves_the_mapped_llvm_image() {
+        assert!(loaded_llvm_base().is_some());
         assert!(loaded_llvm_build_id().is_some());
     }
 }
