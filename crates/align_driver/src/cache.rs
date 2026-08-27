@@ -288,14 +288,14 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
     if stored.frontend_schema != current.frontend_schema || stored.located != current.located {
         return FirstDiff::FrontendSchema;
     }
+    if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
+        return FirstDiff::LlvmVersion;
+    }
     if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
         return FirstDiff::Target;
     }
     if stored.resolved_cpu != current.resolved_cpu || stored.resolved_features != current.resolved_features {
         return FirstDiff::Cpu;
-    }
-    if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
-        return FirstDiff::LlvmVersion;
     }
     if stored.reloc_model != current.reloc_model || stored.code_model != current.code_model {
         return FirstDiff::RelocCodeModel;
@@ -527,6 +527,11 @@ impl CacheContext {
         let Some(primary) = self.root() else {
             return crate::unit_cache::UnitLookup::Miss { reason: None };
         };
+        if crate::unit_cache::is_rejected(primary, key) {
+            return crate::unit_cache::UnitLookup::Miss {
+                reason: Some(FirstDiff::CorruptEntry),
+            };
+        }
         match crate::unit_cache::lookup(primary, key, source_len) {
             hit @ crate::unit_cache::UnitLookup::Hit(_) => hit,
             crate::unit_cache::UnitLookup::Miss {
@@ -1013,6 +1018,7 @@ fn materialize_blob(
             // prove digest-bad.
             return match policy {
                 ReadPolicy::Writable => {
+                    remove_writable_cache_entry(&blob_path);
                     note_corrupt(policy);
                     HitResult::Corrupt
                 }
@@ -1058,7 +1064,7 @@ fn materialize_blob(
     if actual_digest != blob_digest {
         // Corrupted blob bytes: unlink + always-on note + rebuild.
         if matches!(policy, ReadPolicy::Writable) {
-            let _ = std::fs::remove_file(&blob_path);
+            remove_writable_cache_entry(&blob_path);
         }
         note_corrupt(policy);
         return HitResult::Corrupt;
@@ -1069,6 +1075,18 @@ fn materialize_blob(
     }
     stage.committed = true;
     HitResult::Hit
+}
+
+/// Remove one exact writable cache entry without following it when it is a symlink. A malformed
+/// real directory at a blob path is cache-owned too and must be removed recursively; otherwise it
+/// would make every later atomic publication fail permanently.
+fn remove_writable_cache_entry(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else { return };
+    if metadata.file_type().is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn note_corrupt(policy: ReadPolicy) {
@@ -1469,11 +1487,11 @@ fn prelink_first_diff(stored: &PrelinkKey, current: &PrelinkKey) -> FirstDiff {
     if stored.frontend_schema != current.frontend_schema || stored.located != current.located {
         return FirstDiff::FrontendSchema;
     }
-    if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
-        return FirstDiff::Target;
-    }
     if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
         return FirstDiff::LlvmVersion;
+    }
+    if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
+        return FirstDiff::Target;
     }
     if stored.impl_hash != current.impl_hash {
         return FirstDiff::MirDigest;
@@ -2109,6 +2127,13 @@ mod tests {
         let mut k = base.clone();
         k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
         assert_eq!(first_diff(&base, &k), FirstDiff::LlvmVersion);
+        k.target_triple = "aarch64-unknown-linux-gnu".to_string();
+        k.resolved_cpu = "other-cpu".to_string();
+        assert_eq!(
+            first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes simultaneous target/cpu differences"
+        );
         let mut k = base.clone();
         k.reloc_model = "Static".to_string();
         assert_eq!(first_diff(&base, &k), FirstDiff::RelocCodeModel);
@@ -2249,9 +2274,15 @@ mod tests {
         }
         std::fs::create_dir_all(root.join("keep")).unwrap();
         std::fs::write(root.join("keep").join("f"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("rejected").join("unit")).unwrap();
+        std::fs::write(root.join("rejected").join("unit").join("marker"), b"").unwrap();
         assert_eq!(clear_cache(&root), Ok(true));
         assert!(!root.join("cas").exists() && !root.join("actions").exists() && !root.join("index").exists());
         assert!(root.join("keep").join("f").exists(), "clear must not touch anything but its own subtrees");
+        assert!(
+            root.join("rejected").join("unit").join("marker").exists(),
+            "an optimization-state clear cannot reauthorize a rejected key"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2507,6 +2538,38 @@ mod tests {
         assert!(!action_manifest_path(&primary, key.full_digest()).exists());
         assert!(!primary.join("cas").exists());
         assert_eq!(std::fs::metadata(source).unwrap().len(), CACHE_CAS_MAX_BYTES + 1);
+        std::fs::remove_dir_all(primary.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_writable_blob_is_removed_republished_and_hits_next_time() {
+        let (primary, _, cache) = fallback_context("oversized-writable");
+        let key = sample_key();
+        std::fs::create_dir_all(&primary).unwrap();
+        let source = primary.join("source.o");
+        std::fs::write(&source, b"stable-object").unwrap();
+        publish(&primary, &key, &source);
+        let blob = cas_blob_path(&primary, Hash128::of(b"stable-object"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(CACHE_CAS_MAX_BYTES + 1)
+            .unwrap();
+
+        let output = primary.join("out.o");
+        let outcome = cache
+            .codegen(&key, &output, |path| {
+                std::fs::write(path, b"stable-object").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(!outcome.hit);
+        assert_eq!(outcome.miss_reason, Some(FirstDiff::CorruptEntry));
+        assert_eq!(std::fs::read(&blob).unwrap(), b"stable-object");
+
+        std::fs::remove_file(&output).unwrap();
+        assert!(matches!(cache.lookup(&key, &output), CacheLookup::Hit(_)));
+        assert_eq!(std::fs::read(output).unwrap(), b"stable-object");
         std::fs::remove_dir_all(primary.parent().unwrap()).ok();
     }
 
@@ -2831,6 +2894,12 @@ mod tests {
         let mut k = base.clone();
         k.target_triple = "aarch64-unknown-linux-gnu".to_string();
         assert_eq!(prelink_first_diff(&base, &k), FirstDiff::Target);
+        k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(
+            prelink_first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes a simultaneous target difference"
+        );
         // impl_hash wins over a simultaneous dep change.
         let mut k = base.clone();
         k.impl_hash = Hash128 { lo: 2, hi: 2 };
@@ -2869,5 +2938,11 @@ mod tests {
         k.resolved_cpu = "z".to_string();
         k.own_prelink_digest = Hash128 { lo: 0, hi: 0 };
         assert_eq!(backend_first_diff(&base, &k), FirstDiff::Cpu);
+        k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
+        assert_eq!(
+            backend_first_diff(&base, &k),
+            FirstDiff::LlvmVersion,
+            "LLVM identity precedes simultaneous backend/source differences"
+        );
     }
 }

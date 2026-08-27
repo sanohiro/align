@@ -3724,17 +3724,17 @@ impl PackageBuild {
         let recomputed = self.rehydrate.recompute(&unit_name)?;
         let stored = &self.units[index];
         if recomputed.summary.impl_hash != stored.summary.impl_hash {
-            return self.reject(index, RehydrateFailure::ImplHash, &recomputed);
+            return self.reject(index, RehydrateFailure::ImplHash);
         }
         if align_interface::serialize(&recomputed.summary) != align_interface::serialize(&stored.summary) {
-            return self.reject(index, RehydrateFailure::Summary, &recomputed);
+            return self.reject(index, RehydrateFailure::Summary);
         }
         if recomputed.mir.link_libs != stored.link_libs {
-            return self.reject(index, RehydrateFailure::LinkLibs, &recomputed);
+            return self.reject(index, RehydrateFailure::LinkLibs);
         }
         let replayed = self.rehydrate.replayed.get(&unit_name);
         if Some(&recomputed.diagnostics) != replayed {
-            return self.reject(index, RehydrateFailure::Diagnostics, &recomputed);
+            return self.reject(index, RehydrateFailure::Diagnostics);
         }
         // Verified. Promote the complete result into the in-process memo before adopting it: this
         // walk consulted the DISK stage first (the digest path is cheaper than rendering), so
@@ -3773,23 +3773,15 @@ impl PackageBuild {
         &mut self,
         index: usize,
         failure: RehydrateFailure,
-        recomputed: &Recomputed,
     ) -> Result<&MirProgram, RehydrateFailure> {
         let unit = &self.units[index].unit;
         if let (Some(root), Some(key)) = (self.rehydrate.root.as_ref(), self.rehydrate.keys.get(unit)) {
-            unit_cache::invalidate(root, key);
-            // A stale immutable fallback must remain untouched. Publish the independently
-            // recomputed value to the writable primary immediately, so this process's fail-closed
-            // retry stays uncached while subsequent processes are shadowed by the repaired entry.
-            unit_cache::publish(
-                root,
-                key,
-                &unit_cache::UnitEntry {
-                    summary_bytes: align_interface::serialize(&recomputed.summary),
-                    diagnostics: recomputed.diagnostics.clone(),
-                    link_libs: recomputed.mir.link_libs.clone(),
-                },
-            );
+            unit_cache::reject(root, key);
+            // The disagreement proves this key did not cover every semantic input. A packaged
+            // action remains immutable, but publishing the recomputed value under the same rejected
+            // key would merely replace one omitted-input state with another and authorize a false
+            // hit later. The caller's one retry is uncached; later processes may safely repeat the
+            // verification miss until the key contract is widened.
         }
         eprintln!("{}", cache::CORRUPT_NOTE);
         Err(failure)
