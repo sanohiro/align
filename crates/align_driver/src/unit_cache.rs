@@ -594,19 +594,50 @@ pub enum UnitLookup {
 /// an out-of-range offset here is damage, not skew (a corrupted manifest is not bound by the key).
 /// Rejecting it is what keeps a later `format_diagnostics` from slicing past end-of-file.
 pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
-    lookup_with_policy(root, key, source_len, ReadPolicy::Writable)
+    lookup_authorized_with_policy(root, root, key, source_len, ReadPolicy::Writable, || {})
 }
 
 /// Immutable packaged-cache lookup. It uses the identical decoder and validation order as the
 /// writable store, but never mutates installer-owned bytes on corruption.
-pub(crate) fn lookup_packaged(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
-    lookup_with_policy(root, key, source_len, ReadPolicy::Packaged)
+pub(crate) fn lookup_packaged(
+    root: &Path,
+    rejection_root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+) -> UnitLookup {
+    lookup_authorized_with_policy(root, rejection_root, key, source_len, ReadPolicy::Packaged, || {})
+}
+
+/// Linearize a successfully decoded primary or packaged hit against rejection. The caller performs
+/// an early marker check to avoid needless I/O, then passes every hit through this check after all
+/// untrusted bytes have been read and validated. A marker installed between those two points wins.
+fn authorize_lookup(root: &Path, key: &UnitKey, candidate: UnitLookup) -> UnitLookup {
+    if matches!(candidate, UnitLookup::Hit(_)) && is_rejected(root, key) {
+        UnitLookup::Miss {
+            reason: Some(FirstDiff::CorruptEntry),
+        }
+    } else {
+        candidate
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ReadPolicy {
     Writable,
     Packaged,
+}
+
+fn lookup_authorized_with_policy(
+    root: &Path,
+    rejection_root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+    policy: ReadPolicy,
+    before_authorize: impl FnOnce(),
+) -> UnitLookup {
+    let candidate = lookup_with_policy(root, key, source_len, policy);
+    before_authorize();
+    authorize_lookup(rejection_root, key, candidate)
 }
 
 fn lookup_with_policy(
@@ -725,8 +756,19 @@ pub fn publish(root: &Path, key: &UnitKey, entry: &UnitEntry) {
     let manifest = serialize_manifest(key, entry);
     let result = cache::publish_file(&action_path(root, key.full_digest()), &manifest)
         .and_then(|()| cache::publish_file(&slot_path(root, key.slot_digest()), &manifest));
+    finish_publication(root, key);
     if let Err(error) = result {
         eprintln!("alignc: cache not populated: {error}");
+    }
+}
+
+/// Complete the publication/rejection handshake. If rejection raced after the publisher's early
+/// check, this side removes the bytes it may have installed; if rejection starts after this check,
+/// `reject` installs the marker before performing the same invalidation. Either ordering leaves the
+/// marker authoritative and no reachable action after both operations complete.
+fn finish_publication(root: &Path, key: &UnitKey) {
+    if is_rejected(root, key) {
+        invalidate(root, key);
     }
 }
 
@@ -795,6 +837,31 @@ mod tests {
                 hi: 11,
             }],
             link_libs: vec!["sqlite3".to_string()],
+        }
+    }
+
+    fn sample_summary(unit: &str) -> align_interface::InterfaceSummary {
+        let mut summary = align_interface::InterfaceSummary {
+            unit: unit.to_string(),
+            fns: Vec::new(),
+            structs: Vec::new(),
+            owned_json_graphs: Vec::new(),
+            enums: Vec::new(),
+            resources: Vec::new(),
+            consts: Vec::new(),
+            capabilities: Vec::new(),
+            interface_hash: Hash128 { lo: 0, hi: 0 },
+            impl_hash: hh(50),
+        };
+        summary.interface_hash = Hash128::of(&align_interface::encode_interface_surface(&summary));
+        summary
+    }
+
+    fn sample_valid_entry(unit: &str) -> UnitEntry {
+        UnitEntry {
+            summary_bytes: align_interface::serialize(&sample_summary(unit)),
+            diagnostics: Vec::new(),
+            link_libs: Vec::new(),
         }
     }
 
@@ -996,7 +1063,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            lookup_packaged(&root, &key, 0),
+            lookup_packaged(&root, &root, &key, 0),
             UnitLookup::Miss {
                 reason: Some(FirstDiff::NoPriorEntry)
             }
@@ -1020,7 +1087,8 @@ mod tests {
                 .as_nanos()
         ));
         let key = sample_key();
-        publish(&root, &key, &sample_entry());
+        let entry = sample_valid_entry(&key.unit);
+        publish(&root, &key, &entry);
         assert!(action_path(&root, key.full_digest()).exists());
 
         reject(&root, &key);
@@ -1028,11 +1096,79 @@ mod tests {
         assert!(!action_path(&root, key.full_digest()).exists());
         assert!(rejection_path(&root, key.full_digest()).exists());
 
-        publish(&root, &key, &sample_entry());
+        publish(&root, &key, &sample_valid_entry(&key.unit));
         assert!(
             !action_path(&root, key.full_digest()).exists(),
             "a later producer cannot republish under the rejected key"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejection_wins_after_a_frontend_action_was_already_read() {
+        let base = std::env::temp_dir().join(format!(
+            "align-unit-cache-rejected-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        for (label, policy) in [
+            ("primary", ReadPolicy::Writable),
+            ("packaged", ReadPolicy::Packaged),
+        ] {
+            let rejection_root = base.join(label).join("primary");
+            let lookup_root = if matches!(policy, ReadPolicy::Writable) {
+                rejection_root.clone()
+            } else {
+                base.join(label).join("packaged")
+            };
+            publish(&lookup_root, &key, &sample_valid_entry(&key.unit));
+            let callback_root = rejection_root.clone();
+            let callback_key = key.clone();
+            assert!(
+                matches!(
+                    lookup_authorized_with_policy(
+                        &lookup_root,
+                        &rejection_root,
+                        &key,
+                        usize::MAX,
+                        policy,
+                        || reject(&callback_root, &callback_key),
+                    ),
+                    UnitLookup::Miss {
+                        reason: Some(FirstDiff::CorruptEntry)
+                    }
+                ),
+                "{label} candidate must lose to rejection after its value read"
+            );
+        }
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn rejection_wins_after_a_frontend_publication_passed_its_early_check() {
+        let root = std::env::temp_dir().join(format!(
+            "align-unit-cache-rejected-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let key = sample_key();
+        assert!(!is_rejected(&root, &key), "publisher's early check");
+        reject(&root, &key);
+
+        let manifest = serialize_manifest(&key, &sample_entry());
+        cache::publish_file(&action_path(&root, key.full_digest()), &manifest).unwrap();
+        cache::publish_file(&slot_path(&root, key.slot_digest()), &manifest).unwrap();
+        finish_publication(&root, &key);
+        assert!(!action_path(&root, key.full_digest()).exists());
+        assert!(!slot_path(&root, key.slot_digest()).exists());
+        assert!(is_rejected(&root, &key));
         std::fs::remove_dir_all(root).ok();
     }
 

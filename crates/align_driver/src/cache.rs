@@ -538,7 +538,7 @@ impl CacheContext {
                 reason: primary_reason,
             } => match self.packaged_root() {
                 Some(packaged) => {
-                    match crate::unit_cache::lookup_packaged(packaged, key, source_len) {
+                    match crate::unit_cache::lookup_packaged(packaged, primary, key, source_len) {
                         hit @ crate::unit_cache::UnitLookup::Hit(_) => hit,
                         crate::unit_cache::UnitLookup::Miss {
                             reason: packaged_reason,
