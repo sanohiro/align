@@ -857,7 +857,7 @@ would fail for the changed defect.
 | P33 | fid-space identity | F-1..F-4, including the negative that a fresh map would collide with unit 0 | `walk_tests::load_units_owns_the_low_file_id_space` |
 | P34 | link libs not derivable | an FFI `link("m")` with empty `capabilities` survives reuse | `ffi_declared_link_libraries_survive_reuse` |
 
-### 6.8 PLANNED — immutable release fallback
+### 6.8 SHIPPED 2026-08-27 (#893) — immutable release fallback
 
 Build-performance item 4 is specified by the public-contract ledger in
 `docs/impl/21-build-perf-plan.md`. It does not change either v1 codec or key.
@@ -879,9 +879,10 @@ validated build identity of the dynamically loaded LLVM library beside its
 reported version: ELF GNU build-id bytes or the Mach-O `LC_UUID`, hashed with a
 format tag. A same-version different build therefore misses. Failure to locate,
 parse, or identify the loaded library disables codegen cache reads and writes
-while leaving frontend reuse and uncached production available. The
-implementation remains pending; until it lands, the shipped behavior is the
-single writable root and v3 codegen identity described in §§6.1–6.7.
+while leaving frontend reuse and uncached production available. PR #893 ships
+this fallback, the v4 codegen identity, rejection-marker authorization, bounded
+immutable reads, and native release-layout verification; the complete closure
+matrix remains in `docs/impl/21-build-perf-plan.md` item 4.
 
 ---
 

@@ -22,8 +22,8 @@ Order is priority.
 | 2b | DB CI changed-function scope | Implemented — direct DB/gate and dedicated DB-production paths remain unconditional, while mixed compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
 | 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
-| 4 | Prebuilt optimized cache distribution | Design settled below; implementation pending — ship warmed first-party `pkg` entries with each exact native compiler (compiler-provided `core`/`std` imports have no cacheable source unit) |
-| 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
+| 4 | Prebuilt optimized cache distribution | Shipped as #893 — exact native releases carry an adjacent immutable cache for the 20 first-party `pkg` units; compiler-provided `core`/`std` imports have no cacheable source unit |
+| 5 | Foreground watch builds | Design settled below; implementation pending. `align-repl` (`docs/impl/22-repl-plan.md`) already realizes memo residency for interactive sessions; `alignc build FILE --watch` extends the same explicit long-lived-process model to editor and AI-agent loops without a detached daemon |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
 
 ## Background
@@ -583,6 +583,201 @@ same primary-marker check after complete decoding. C4 is the symmetric write
 boundary: its post-publication check and `reject`'s marker-before-invalidation
 order ensure either interleaving leaves the marker authoritative and no action
 reachable after both operations finish.
+
+## Item 5: foreground watch builds
+
+### Boundary and public-contract ledger
+
+Item 5 adds one explicit foreground mode:
+
+```text
+alignc build FILE.align --watch
+```
+
+It is not a detached daemon, socket protocol, project server, or hidden
+background process. The invoking terminal owns one compiler process, its
+in-process memo, and its lifetime. This is the same residency mechanism already
+used by `align-repl`, applied to the ordinary `build` path. A later language
+server may consume the input-observation surface below, but it does not acquire
+an IPC contract from this item.
+
+The public contract is:
+
+| id | Surface | Exact contract | Ownership, allocation, and errors | Owner |
+|---|---|---|---|---|
+| W1 | CLI | `alignc build FILE.align --watch`. `--watch` is a valueless, idempotent flag accepted only by `build`; every existing `build` flag and environment setting keeps its current meaning. `run`, `size`, inspection verbs, `cache clear`, and `db` reject it before reading source. There is no interval, debounce, daemon, socket, or background option. | Arguments, resolved target/profile/jobs/cache/linker choice, PGO mode, and current working directory are fixed at startup. Invalid combinations exit 1 before watcher creation. No new environment variable. | CLI parser table and real-binary invalid-combination owner. |
+| W2 | Attempt protocol | Revision 1 starts immediately. Each attempt writes exactly `alignc: watch: revision N started` to stderr before reading an input, then preserves the ordinary build's diagnostics, cache-stat report, and success line. It terminates with exactly one stderr line: `alignc: watch: revision N ready` after atomic executable publication, or `alignc: watch: revision N failed` after an ordinary build failure. `N` starts at 1 and increments by one; exhaustion at `u64::MAX` is a watcher error. | Marker strings are static. Formatting allocates one bounded line. stdout remains the ordinary build surface; automation waits for the terminal stderr marker and never infers readiness from quiet time. | Transcript owner covers initial success/failure and two rebuilds. |
+| W3 | Publication | Every attempt uses the existing optimized per-unit pipeline, one stale-entry retry, link, and same-directory atomic rename. Absent an external writer, a failed revision neither removes nor replaces an earlier executable. Only `ready` reports that this process completed publication; a pre-existing or last-good file may remain after `failed`. | Each attempt owns and drops its private object and publish stages before waiting. The process retains no object path between attempts. Existing link/publication errors remain ordinary build failures and the loop continues. | Real-binary owner runs last-good output after a later compile and link failure. |
+| W4 | Observed build inputs | `align_driver::build_path_pipelined_observed` owns the entry read and one call to the same private pipeline implementation as `build_package_pipelined`. It returns the complete ordered `BuildInputSet` even when the entry read or pipeline fails. The set records the entry source, every present or missing user-module path, every validated file-backed static source and checked-metadata path, and the exact `--pgo-use` file. Inline static sources and static paths rejected before root/path validation add no target; their owning Align source is already watched and is the only input that can repair that error. Paths are absolute lexical paths rooted at the startup cwd/project root; missing paths are not canonicalized. The installed compiler directory, its baked runtime-LTO bytes, adjacent runtime archive, loaded LLVM image, linker, and system libraries are an immutable toolchain precondition for one session and require process restart when replaced. | Each record owns one `PathBuf` and a small semantic state. Regular-file state owns only `Hash128` and length, never file bytes. Missing, non-regular, and I/O states own no payload. The set is sorted by platform path bytes and deduplicated; observing one path under two different states sets `changed_during_attempt`. Native file identity belongs to the private watcher snapshot, not the build/cache identity. | Library owner crosses entry/import/static/metadata/PGO present, missing, replacement, invalid-path exclusion, invalid UTF-8, and duplicate-read cells. |
+| W5 | Input record | `pub struct BuildInput { pub path: PathBuf, pub state: BuildInputState }`; `pub enum BuildInputState { Missing, Regular { content_hash: Hash128, len: u64 }, NonRegular, Unreadable }`; `pub struct BuildInputSet`; `impl BuildInputSet { pub fn inputs(&self) -> &[BuildInput]; pub fn changed_during_attempt(&self) -> bool }`; `pub enum BuildSourceError { Missing, NonRegular, InvalidUtf8 { offset: u64 }, Io { message: String } }`; `pub enum ObservedBuildAttempt { SourceFailed { error: BuildSourceError, inputs: BuildInputSet }, Pipeline { build: PipelinedPackageBuild, inputs: BuildInputSet } }`. These are the complete new `align_driver` exports. Constructors and mutation stay private. | `Hash128` is `Hash128::of` over the exact bytes consumed by the build. A failed read is recorded before its diagnostic/error returns. Invalid UTF-8 is regular-byte state and retains the hash; its first invalid byte is widened to `u64`. An embedded-NUL path becomes `Io` before any backend call for that path. No `FileId`, borrowed source, descriptor, HIR, MIR, or object escapes in this surface. | Public-surface inventory and state/error table. |
+| W6 | Watch-set transition | Before waiting, the watcher adds handles for every new logical input, every existing file target, and each missing path's nearest existing ancestor. It then re-snapshots every candidate and compares it with W5. Only after that comparison may it remove obsolete handles. After a successful revision the next set is exactly that revision's set. After a failed revision it is `last_successful ∪ current_attempt`, never earlier failed sets; with no success it is the current set. Entry is always present. | The watcher owns all native handles. Add, snapshot, or removal failure is fail-closed: emit `alignc: watch: watcher error: MESSAGE` and exit 1. A changed post-registration snapshot or `changed_during_attempt` schedules an immediate next revision. The add-before-remove order closes the read-to-registration gap. | Injected watcher owner mutates before registration, during build, during transition, and at removal failure. |
+| W7 | Event and coalescing model | Linux uses inotify and macOS uses the native file-event backend selected by the implementation dependency. An event for a watched file, its logical parent entry, an ancestor capable of creating a missing path, rename/replacement, or an overflow wakes the loop. Events are collected until 50 ms of quiet or 250 ms from the first event, whichever comes first. The watcher then snapshots the tracked set; identical state starts no revision. Any difference starts exactly one revision. Events received while compiling remain pending and are handled after W6. | The callback retains no event or path payload: it sets an atomic dirty bit and performs nonblocking `try_send(())` into a one-slot wake channel. A full channel is successful coalescing. A backend-overflow event additionally sets an atomic uncertain bit; the next drain performs an unconditional snapshot and rebuild only if semantic identity cannot be proved unchanged. | Deterministic fake-event owner covers quiet/max debounce, irrelevant/no-op events, wake coalescing, backend overflow, rename, and event-during-build. Native smoke owner covers replacement on each release OS. |
+| W8 | Resource ceiling | At most 16,384 distinct logical inputs may be installed after W6's success/failure union. 16,384 is accepted; 16,385 emits `alignc: watch: too many inputs (maximum 16384)` and exits 1 before installing the oversized set. Add-before-remove may temporarily retain the old and new accepted sets: at most 32,768 logical records and 65,537 deduplicated file/ancestor/backend handles. Memo retention remains the existing byte-accounted 768 MiB default and refuses new entries at its bound without changing build output. | Snapshots retain private Linux/macOS device/inode identity to re-arm a replaced target, but semantic change is W5 state: an atomic same-content replacement re-arms and starts no revision. Hashing streams regular bytes through a fixed 64 KiB buffer and never allocates `len` bytes. Opens are nonblocking, then `fstat` must prove a regular target before any read; symlinks may resolve exactly as existing import reads do, while the logical parent handle detects replacement. Arithmetic for counts/lengths is checked. | Exact-limit/rejected-next input owner, disjoint-set transition owner, identical-content inode-replacement owner, sparse-large-file RSS owner, FIFO/device no-block owner, and memo-budget owner. |
+| W9 | Failure and process exit | Source, frontend-cache, codegen, PGO, link, and executable-publication failures produce `failed` and keep watching. Watcher initialization/transition/backend errors produce the W6 watcher-error line and exit 1 because future changes could be missed. EOF is irrelevant. On SIGINT/SIGTERM the OS terminates the foreground process normally; this item installs no process-global signal handler. | Kernel process teardown closes native handles. All per-attempt stages and workers have already joined/dropped before the wait boundary. A signal during an attempt has ordinary process semantics and publishes no partially staged executable. | Child-process owner has a local deadline, signals/reaps the watcher, and proves no staging residue or partial executable. |
+| W10 | Cache and artifact identity | No persisted format, namespace, cache key, compiler fingerprint, interface, object, runtime, or link identity changes. An attempt consults the existing persistent caches and process memo in their settled order. Source edit/revert is content identity, never mtime identity. `ALIGNC_CACHE=off` disables persistent reuse but leaves the already-settled in-process memo active. ThinLTO and PGO keep their existing key spaces and validation order. | The only long-lived allocation is the memo and watch state. Cache rejection markers remain process/persistence authoritative. A watch event cannot authorize a cache key or artifact. | Memo-on/off, cache-on/off, edit/revert, rejected-key, ThinLTO, and PGO owners reuse existing cache matrices plus one multi-revision driver owner. |
+| W11 | Platform and installation | Supported release hosts are Linux and macOS on the architectures already built by CI. An unsupported native backend or backend initialization failure is a watcher error, never polling fallback. Release archives need no service file, launch agent, socket directory, or new executable. `alignc --version` and one-shot commands are byte-for-byte unchanged. | The watcher dependency is linked into `alignc`; no runtime package or daemon ownership is added. | Linux x86_64/ARM64 and Apple Silicon CI build plus native replacement smoke; release inventory remains unchanged. |
+| W12 | Concurrent invocations | Revisions are serial within one watch process. Separate watch and one-shot compiler processes keep the existing independent-publication rule: each uses a private stage and atomic rename, and the last successful rename to the same executable path wins. There is no process-global lock. W2 markers attest only that their own process completed that revision; they do not reserve the path against external writers. | No connection-global or process-global state is mutated. Native watcher handles and memo state are process-owned. An application that requires one publisher must own that orchestration outside `alignc`, as it does for concurrent one-shot builds today. | Barrier owner runs two publishers to the same final path, proves every observed image is complete, and accepts either complete winner. |
+
+`build_path_pipelined_observed` is additive. The existing
+`build_package_pipelined` remains shape- and behavior-identical and calls the
+same private implementation with observation disabled. Observation never
+changes a diagnostic, cache decision, read order, static-input lock, codegen
+schedule, link argument, or published byte. The exact signature is:
+
+```text
+pub fn build_path_pipelined_observed(
+    source_map: &mut SourceMap,
+    path: &Path,
+    cache: CacheContext,
+    reuse: UnitReuse,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+) -> ObservedBuildAttempt
+```
+
+The wrapper resolves `path` against the startup cwd, opens it nonblocking,
+proves it regular with `fstat`, reads it once, records the exact bytes and file
+identity, validates UTF-8, then calls the shared pipeline. Import and
+static-input producers record their outcome at the read that already owns those
+bytes. `PgoMode::Use` records the snapshotted profile bytes used for all keys
+and LLVM consumers. No second discovery walk, directory scan, path guessing,
+or ambient project configuration is allowed. `SourceFailed` prints the same
+`alignc: cannot read 'PATH': ...` prefix as the one-shot helper, followed by
+`revision N failed`; `Pipeline` uses the existing diagnostic rendering and
+retry rules.
+
+Input classification is total and precedes parsing or any cache/native side
+effect for that input:
+
+```text
+1  missing path                    BuildInputState::Missing + BuildSourceError::Missing for entry
+2  opened target is not regular   BuildInputState::NonRegular + BuildSourceError::NonRegular for entry
+3  open/stat/read failure         BuildInputState::Unreadable + BuildSourceError::Io for entry
+4  complete regular bytes         BuildInputState::Regular(Hash128::of(bytes), len)
+5  invalid UTF-8 regular bytes     the same Regular state + BuildSourceError::InvalidUtf8 for entry
+```
+
+Imported-source and static/metadata failures retain their existing diagnostic
+types after recording the matching W5 state. A path that is missing and whose
+parent is also missing is still `Missing`; the watcher separately locates its
+nearest existing ancestor. A complete read that observes a different state for
+the same logical path sets `changed_during_attempt` rather than choosing one
+observation as authoritative.
+
+### Validation and event order
+
+One revision has this logical order:
+
+```text
+started marker
+entry read and input observation
+complete frontend/static-input observation
+existing cache/rehydration/codegen validation and one retry
+existing link and atomic publication
+ready or failed marker
+add new watches
+post-registration snapshots
+remove obsolete watches
+drain/coalesce queued events
+state comparison
+next revision or wait
+```
+
+An ordinary failure does not skip observation or the terminal marker. The one
+stale-cache retry belongs to the same revision: its inputs are unioned with the
+first attempt, it prints no second `started`, and it produces one terminal
+marker. If the two attempts observe different state, W6 schedules the next
+revision after the retry completes. The existing diagnostic echo rule remains
+first-attempt `All`, retry `ErrorsOnly`.
+
+Validation precedence within an attempt remains item 3's order. Watch-only
+failures occur outside it:
+
+```text
+1  invalid CLI / unsupported flag combination
+2  initial native-watcher construction
+3  ordinary revision result and terminal marker
+4  live-input limit
+5  watch-handle addition
+6  post-registration snapshot
+7  obsolete-handle removal
+8  wait/backend delivery
+```
+
+For multi-invalid watch transitions, the lowest numbered failure wins. An
+overflow is not an error and cannot outrank a build failure; it requests the
+post-attempt state comparison. A watcher error after `ready` does not retract
+the published executable, but the process exits nonzero because it cannot
+promise another revision.
+
+Watcher-error messages identify the failing phase and path when one exists:
+`initialize: MESSAGE`, `add 'PATH': MESSAGE`, `snapshot 'PATH': MESSAGE`,
+`remove 'PATH': MESSAGE`, `backend: MESSAGE`, or `revision counter exhausted`,
+each behind the single `alignc: watch: watcher error: ` prefix. The underlying
+OS message is informational and has no control-flow meaning.
+
+### Implementation closure matrix
+
+This is one implementation capability. Input observation without the
+foreground consumer is a dormant producer, while a watcher without exact
+producer-owned inputs either misses changes or scans unrelated state. The
+expected hand-written diff may exceed 1,000 lines because keeping these halves
+together avoids a second path-discovery algorithm and one unreviewable gap
+between read identity and event registration.
+
+| Cell | Required closure | Planned implementation and owner |
+|---|---|---|
+| D1 CLI parity | Every existing build flag/default/error composes with W1; every other verb rejects `--watch`. Startup state is resolved once. | `main.rs` parser table and `watch_build` real-binary matrix. |
+| D2 input formation | Formation, validation, construction, move-in/out, return, duplicate observation, retry union, success replacement, and failure union cover entry/import/static/metadata/PGO paths and every W5 state. | One private observer threaded through the existing read owners; `observed_build_inputs` parameterized library target. |
+| D3 read/register race | A change before, during, or after registration cannot leave the process waiting on bytes it did not build. Symlink/replacement and missing-parent creation are included. | Add-snapshot-remove transition with deterministic barriers and native replacement smoke. |
+| D4 event lifecycle | Normal event, identical rewrite, burst, max-debounce traffic, full-channel coalescing, backend overflow, event during compile, backend disconnect, and Drop each wake/stop exactly once. | Injectable event source and one-slot-channel owner; native backend is only a thin adapter. |
+| D5 build control paths | Initial/repeated success; frontend, rehydration, codegen, PGO, link, and publication failures; one retry; ThinLTO; cache on/off; cache stats; edit/revert; malformed input. | Existing owners remain authoritative; `watch_build` adds only revision sequencing, last-good publication, and recovery witnesses. |
+| D6 concurrency and cleanup | Worker panic retains item 3 cleanup; watcher callback never blocks; event overflow is atomic; no worker, stage, handle, or child survives normal/error return. Signal death leaves no partial published executable. Independent publishers preserve complete-image atomicity and last-successful-rename semantics. | Existing pipeline panic owner plus watcher channel/Drop, two-publisher barrier, and bounded child-process owners. No process-global hook, signal handler, or output lock. |
+| D7 identity and authorization | Memo, persistent frontend, packaged fallback, object, ThinLTO, PGO, compiler/LLVM, target, and runtime identities are unchanged. Rejected frontend keys remain rejected across every revision and process. | Existing cache codec/rejection owners plus multi-revision exact-key test. |
+| D8 resource bound | Exact/rejected-next input count, one-slot wake channel, streaming snapshots, nonblocking special-file rejection, checked counters, and memo refusal are all reachable. | Parameterized limit/overflow/FIFO/sparse-file/RSS owners. |
+| D9 observable transcript | Marker count/order, ordinary diagnostics, cache stats, stdout, object bytes, link-input order, executable behavior, and exit behavior are exact for success, failure, recovery, and watcher error. The linked executable itself is not byte-compared: macOS link products carry link-time `LC_UUID`/page-hash identity. | Runtime-loaded golden transcript plus object/link-input/program-output comparison with one-shot `alignc build`. |
+| D10 non-impact | One-shot build/run/size, `align-repl`, inspection verbs, release layout, and docs remain unchanged except for the additive flag/help text. | Existing bounded gate, REPL owners, release workflow structural test, and usage snapshot. |
+
+The author-side matrix-to-diff pass must bind every applicable cell to an
+implementation site and a discriminating owner before the implementation
+review. A review finding about a missed input, registration window, event
+overflow, cache authorization, or cleanup reopens that entire class across D2,
+D3, D4, D6, and D7 rather than patching one path.
+
+### Acceptance and measurement
+
+No latency number is a public promise, so no benchmark is a correctness gate.
+Acceptance proves the mechanism directly:
+
+- one process performs at least three revisions while its PID and memo stats
+  remain continuous;
+- an entry edit rebuilds only the content identities the existing pipeline
+  reports as changed, and exact revert obtains producer-owned memo/cache hits;
+- each unaffected imported unit's frontend and object outcome is measured from
+  the real pipeline result, never inferred from corpus size;
+- one-shot and watch revision object bytes, link-input order, diagnostics, and
+  program output are identical for the same inputs;
+- changes to an imported source, file-backed static source, checked metadata,
+  and `--pgo-use` snapshot each trigger one revision; and
+- an unrelated event and an identical-content rewrite trigger none after state
+  comparison.
+
+A local `bench/watch_build` harness may report initial, edit, and revert wall
+times plus the producer-owned stage counts. Those numbers guide later work but
+do not gate this item or justify function-level incremental compilation.
+
+### Documents and prerequisites
+
+Prerequisites are items 1, 3, and 4 plus the already-shipped `align-repl`
+residency consumer. Implementation updates this section's status,
+`docs/impl/01-pipeline.md`, the CLI help/README command inventory, and
+`docs/impl/16-test-policy.md`. It changes no language syntax or semantics, so
+`draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, and
+`docs/open-questions.md` do not change. Function-level invalidation remains
+item 6 and is not smuggled into this boundary.
 
 ## Item 2a: required DB owner build-once/run-many
 
