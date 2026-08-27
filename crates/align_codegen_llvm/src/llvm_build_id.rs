@@ -383,10 +383,12 @@ mod tests {
     }
 
     fn elf_notes(endian: Endian, id: &[u8]) -> Vec<u8> {
-        let len = 12 + 4 + align4(id.len()).unwrap();
+        let Some(aligned_id_len) = align4(id.len()) else { return Vec::new() };
+        let Some(len) = 16usize.checked_add(aligned_id_len) else { return Vec::new() };
+        let Ok(id_len) = u32::try_from(id.len()) else { return Vec::new() };
         let mut bytes = vec![0; len];
         put_u32(&mut bytes, 0, 4, endian);
-        put_u32(&mut bytes, 4, id.len() as u32, endian);
+        put_u32(&mut bytes, 4, id_len, endian);
         put_u32(&mut bytes, 8, NT_GNU_BUILD_ID, endian);
         bytes[12..16].copy_from_slice(b"GNU\0");
         bytes[16..16 + id.len()].copy_from_slice(id);
