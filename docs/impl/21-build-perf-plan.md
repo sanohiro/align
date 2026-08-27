@@ -22,8 +22,8 @@ Order is priority.
 | 2b | DB CI changed-function scope | Implemented — direct DB/gate and dedicated DB-production paths remain unconditional, while mixed compiler sources provision PostgreSQL only when a changed zero-context hunk or its function header names the database boundary |
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
 | 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
-| 4 | Prebuilt optimized cache distribution | Design settled below; implementation pending — ship warmed first-party `pkg` entries with each exact native compiler (compiler-provided `core`/`std` imports have no cacheable source unit) |
-| 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
+| 4 | Prebuilt optimized cache distribution | Shipped as #893 — exact native releases carry an adjacent immutable cache warmed from 19 first-party `pkg` modules plus one generated entry unit (20 total); compiler-provided `core`/`std` imports have no cacheable source unit |
+| 5 | Foreground watch builds | Design settled below; implementation pending. `align-repl` (`docs/impl/22-repl-plan.md`) already realizes memo residency for interactive sessions; `alignc build FILE --watch` extends the same explicit long-lived-process model to editor and AI-agent loops without a detached daemon |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
 
 ## Background
@@ -583,6 +583,1102 @@ same primary-marker check after complete decoding. C4 is the symmetric write
 boundary: its post-publication check and `reject`'s marker-before-invalidation
 order ensure either interleaving leaves the marker authoritative and no action
 reachable after both operations finish.
+
+## Item 5: foreground watch builds
+
+### Boundary and public-contract ledger
+
+Item 5 adds one explicit foreground mode:
+
+```text
+alignc build FILE.align --watch
+```
+
+It is not a detached daemon, socket protocol, project server, or hidden
+background process. The invoking terminal owns one compiler process, its
+in-process memo, and its lifetime. This is the same residency mechanism already
+used by `align-repl`, applied to the ordinary `build` path. A later language
+server may consume the input-observation surface below, but it does not acquire
+an IPC contract from this item.
+
+The public contract is:
+
+| id | Surface | Exact contract | Ownership, allocation, and errors | Owner |
+|---|---|---|---|---|
+| W1 | CLI | `alignc build FILE.align --watch`. `--watch` is a valueless, idempotent flag accepted only by `build`; every existing `build` flag and environment setting keeps its current meaning. `run`, `size`, inspection verbs, `cache clear`, and `db` reject it before reading source. `build --help` describes it as `rebuild on compiler-observed file changes; other toolchain/library changes need another observed change or restart`. There is no configurable interval/debounce, daemon, socket, or background option. | Arguments, resolved target/profile/jobs/cache/linker choice, PGO mode, current working directory, and external search environment are fixed at startup. The running compiler and loaded LLVM image are process-fixed identities. Runtime/profile archives, linker/tool executables, system libraries, and capability/user `-lNAME` results are explicit trigger-excluded inputs: their paths, metadata, and bytes are not watched, so replacing one alone starts no revision. The next compiler-observed change performs an ordinary new build/link step and may consume the replacement under the fixed configuration; restart forces that step immediately. Configured `cc`/linker/strip executables are trusted code-generation inputs: successful direct-child exit must mean every tool-owned descendant has finished writing and has released every writable descriptor or pathname access to the output. A tool that returns while such a writer survives violates the supported-tool contract; W13 process cleanup and isolation do not detect or make that configuration safe. A workspace-built compiler's baked `crates/align_runtime/src` freshness tree is a separate trigger-excluded pre-link input: changing it alone starts no revision, while the next observed change or restart runs the existing recursive digest check and may produce the ordinary stale-runtime failure. An installed compiler's absent/unreadable tree retains the existing no-op rule. Invalid combinations exit 1 before watcher creation. No new environment variable. | CLI parser/help table and real-binary invalid-combination/non-impact owner, including archive replacement, workspace freshness-tree edit/restore, and direct plus internally spawning production `cc`/linker/strip routes that join every output writer before successful return. |
+| W2 | Attempt protocol | Watch mode owns exactly one ordered protocol stream: process stderr and writes nothing to process stdout. The only unframed records are terminal lines. Every other logical record is emitted as one or more exact lines `alignc: watch: record KIND STATE: ENCODED_BYTES\n`, where `KIND` is `started`, `diagnostic`, `cache`, `success`, `notice`, `watcher-error`, `stop`, `child-stdout`, or `child-stderr`; `STATE` is `more` for every nonfinal chunk and `end` for the final chunk. Raw payload chunks are at most 4,096 bytes; an empty record has one `end` frame with an empty payload. `ENCODED_BYTES` retains ASCII `0x20..=0x7e` except `%` and percent-encodes every other byte plus `%` as uppercase `%HH`. Concatenating decoded chunks through `end` reconstructs that logical record exactly. After the final startup snapshot selects continuation, revision 1 starts immediately with a `started` record whose decoded payload is `alignc: watch: revision N started`; a startup stop/error emits no `started` or revision marker. After successful atomic publication, a `success` record's decoded payload is `alignc: built executable: ENCODED_PATH`. Before either terminal marker, the owner completes the preceding frame and flushes the stream. While holding its sole lock, it then performs one unbuffered same-descriptor write of the complete <=128-byte line `alignc: watch: revision N ready\n` or `alignc: watch: revision N failed\n`; `EINTR` retries, and a short/failed write exits 1 without another marker. On a pipe the terminal write is below `PIPE_BUF` and atomic. Framing makes marker-shaped payload bytes inert; same-descriptor order makes every preceding complete record observable before the marker. `N` starts at 1 and increments by one; exhaustion is a watcher error. Any prior protocol write/flush failure emits W9's framed error only if a later write remains possible, then exits without a terminal marker; another failure exits without recursion. | `WatchPath` percent-encodes each raw Unix path byte outside `[A-Za-z0-9._/-]` as uppercase `%HH` (including `%` as `%25`). `WatchText` retains printable ASCII except `%` and percent-encodes every other UTF-8 byte; it accepts at most 16,384 input bytes, after which the value is the static `message exceeds 16384-byte limit`. These inner encodings remain reversible after the outer record is decoded. A private single-writer `WatchTranscript` owns one 4,096-byte input chunk and one reusable 12,331-byte maximum frame, routes every in-process/child/control record, and alone writes terminal lines. Every spawned `cc`/linker/strip stdout and stderr is piped through W13, never inherited. Automation consumes only this stderr stream, treats every record line as data, accepts only an unframed complete terminal line, and never infers readiness from quiet time. | One-pipe transcript owner covers every startup outcome, kind/state, empty/exact/multi-chunk records, write/partial-write/flush failures at each frame, same-stream ordering, no process stdout, atomic marker write/short-write/`EINTR`, decoded ordinary parity under equivalent pipe-backed one-shot stdout/stderr, every-byte path/message/diagnostic/cache/child round trip, and exact marker-shaped payloads at every chunk boundary. |
+| W3 | Publication | Each attempt uses the existing applicable ordinary or ThinLTO per-unit pipeline and its current retry rule. Before a successful candidate may link/publish, `finalize_watch_inputs(inputs, Some(output))` first resolves the current W6 graph and streams every logical input again to form the same total W5 semantic state. It compares that current state plus its before/opened-leaf/after identities with every original W4 read-time state and node. Any content hash/length, missing/nonregular/unreadable state, or path identity disagreement sets `changed_during_attempt`; such a candidate emits exactly `alignc: watch: inputs changed during revision`, produces `failed`, schedules a comparison, and never links. Only a stable candidate compares the fixed cwd/output lookup with every original and final directory-entry node. Exact absolute lexical equality rejects even a missing slot; an existing output whose nofollow `(device,inode)` matches any existing node or opened leaf also rejects, deliberately including distinct hard links and case-/Unicode-folded names. When both the output and a compared graph node are absent, W14 proves filesystem-folded slot equivalence through their retained common parent before link. The lowest platform-byte-sorted logical input aliased by any exact, identity, or W14 comparison emits exactly `alignc: watch: output 'ENCODED_OUT' aliases observed input 'ENCODED_INPUT'`, produces `failed`, and runs no link or rename. Other candidates pass the final output path to the matching W13 `_with_output` function. That function exclusively precreates one randomized same-directory regular tool stage, retains its open close-on-exec descriptor and identity before spawn, and exposes only its pathname to `cc`/linker/strip. Supported tools must write through that inode rather than replace it and must satisfy W1's writer-joined successful-return handoff; every production route has both owners. After a successful final tool return, W13 first nofollow-verifies that the pathname still names the retained inode; missing or unequal selects exact `tool stage ownership lost`, preserves an unequal entry, and publishes nothing. It then snapshots the retained descriptor's identity/length/permission mode, accepts at most 8,589,934,592 bytes, rejects any larger value before hashing or publication-stage creation with exact `link output exceeds 8589934592-byte isolation limit`, hashes the source, and streams the accepted length through one 64-KiB buffer into a separately randomized publication stage, created only at that point and never named or opened by external code, before it resnapshots the tool stage's identity/length/permission mode and the publication stage's identity/length/permission mode/hash. Unequal source-before/source-after/destination length, permission mode, or hash, or unequal source identity, returns exact `link output changed during isolation`, performs identity-aware cleanup, produces `failed`, and publishes nothing. Equality nofollow-verifies the tool-stage pathname again before unlink; a matching entry is unlinked, a missing entry is already clean, while an unequal entry returns exact `tool stage ownership lost` and preserves the replacement without publication. W13 then nofollow-verifies the publication-stage pathname still names its retained descriptor identity before the existing atomic rename publishes only that isolated inode; missing or unequal identity returns exact `publication stage ownership lost` and preserves a foreign replacement. Under W1's handoff, no surviving descendant can mutate the source when isolation begins; a configured tool that leaves such a writer is outside W12's guarantees. Copy/open/mode/close/unlink failure remains an ordinary phase-specific link/publication failure and publishes nothing. | `ENCODED_OUT` is `WatchPath` over the absolute startup-cwd path for the existing `stem(FILE)` output. Final semantic reads are nonblocking, use the W8 streaming buffer, and replace the returned set's states with the final snapshot. Retaining original read-time identities until that revalidation means a node removed/retargeted after supplying bytes cannot disappear; hashing the final target means an in-place same-inode write cannot publish stale or torn observed bytes. Mutation after the final graph/hash/alias/probe snapshot retains W12's last-writer rule. Each attempt owns and drops private object and W14 probe stages, while W13 owns and drops its tool-output/publication stages; other link/publication errors remain ordinary failures and preserve last-good output. W13's isolation copy preserves the tool stage's executable mode and exact bytes but no pathname-derived external metadata; Align's executable link routes produce no required sidecar artifact. | Parameterized same-resource/state owner covers every W5 transition and direct slot, traversed node, parent alias, leaf symlink, existing and both-absent folded lookup, hard link, output absent, W14 intermediate-node/probe cleanup, in-place write, truncate/extend, and removal/retarget barriers before/open/after both original and final reads. Isolation barriers cover injected mutation after the first source snapshot and during copy, supported-tool writer joining and inode preservation across direct and internally spawning production routes, identity/length/mode/hash mismatch, tool-stage pre-unlink ownership loss, publication-stage pre-rename ownership loss, every stage operation failure, mode/byte parity, and final atomic publication. Real-binary owner runs last-good output after later failure. |
+| W4 | Observed build inputs | The ordinary route uses `align_driver::build_path_pipelined_observed`, which owns the entry read and one call to the same private pipeline implementation as `build_package_pipelined`. The ThinLTO route uses `align_driver::build_path_per_unit_observed`, which owns the same read/observation front half and returns the existing `PerUnitWalk` consumed by the current ThinLTO CLI branch. Before retaining or issuing a filesystem call for any input, both form its absolute lexical path and apply W8 path validation with `ObservationFailed`. Otherwise they return the complete ordered `BuildInputSet` even when entry read or frontend fails. One call assigns encounter ordinals in this exact producer order: entry source first; the ordinary route's `--pgo-use` file at its existing pre-walk snapshot read; then newly discovered user modules in the existing breadth-first importer and source-import order; and each file-backed static source and checked-metadata path at its existing descriptor-validation read in unit/source order. Inline static sources and static paths rejected before root/path validation add no target; their owning Align source is already watched and is the only input that can repair that error. Missing paths are not canonicalized. W1's external link-time resources and workspace runtime-source freshness tree are trigger-excluded, not observation targets, even when `LIBRARY_PATH` or the baked workspace path names a project directory. Under watch, all path fields passed to the diagnostic renderer use W2 `WatchPath`; non-path diagnostic meaning/order remains unchanged before W2 record framing. | For each admissible read, the observer privately retains the bounded W6 graph immediately before open, the opened leaf's `(device,inode)` from `fstat`, and the graph immediately after open/read. The union is the read-time evidence of bytes actually consumed even if a link is removed/retargeted before W3. Its distinct key is `(logical input path, access path, node kind plus identity or raw target)`, so different identities at one path and both retry attempts survive deduplication. It retains at most 131,072 keys across one attempt/retry; the rejected next key is `ObservationFailed`. Each public record owns one bounded `PathBuf` and semantic state; regular state owns only `Hash128`/length. Trigger-excluded resource mutation follows W1 and never authorizes a cache artifact. | Parameterized library owner runs entry/import/static/metadata present, missing, replacement during every original/final read barrier, invalid-path exclusion, length/NUL boundaries, invalid UTF-8, producer/PGO-before-walk/duplicate/retry order, read-time identity, and arbitrary non-NUL path bytes through ordinary/ThinLTO; ordinary also covers PGO. Trigger owner replaces each external resource class or edits/restores the workspace runtime tree, proves no revision occurs from that alone, then proves a source edit and restart match the corresponding one-shot replacement or stale-runtime result. |
+| W5 | Input, finalization, and repair records | `#[derive(Clone, PartialEq, Eq)] pub struct BuildInput { path: PathBuf, state: BuildInputState }`; `impl BuildInput { pub fn path(&self) -> &Path; pub fn state(&self) -> BuildInputState }`; `#[derive(Clone, Copy, PartialEq, Eq)] pub enum BuildInputState { Missing, Regular { content_hash: Hash128, len: u64 }, NonRegular, Unreadable }`; `pub struct BuildInputSet`; `impl BuildInputSet { pub fn inputs(&self) -> &[BuildInput]; pub fn changed_during_attempt(&self) -> bool }`; `pub struct FinalBuildInputSet`; `impl FinalBuildInputSet { pub fn inputs(&self) -> &[BuildInput]; pub fn changed_during_attempt(&self) -> bool }`; `#[derive(PartialEq, Eq)] pub struct WatchRepairDependency`; `impl WatchRepairDependency { pub fn path(&self) -> &Path }`; `pub struct FinalizedWatchInputs`; `impl FinalizedWatchInputs { pub fn inputs(&self) -> &FinalBuildInputSet; pub fn alias_index(&self) -> Option<usize>; pub fn repair_dependency(&self) -> Option<&WatchRepairDependency>; pub fn into_parts(self) -> (FinalBuildInputSet, Option<WatchRepairDependency>) }`; `pub struct BuildInputTopologyError`; `impl Debug + Display + Error for BuildInputTopologyError`; `pub fn merge_observed_build_inputs(first: BuildInputSet, retry: BuildInputSet) -> Result<BuildInputSet, BuildInputTopologyError>`; `pub fn snapshot_watch_repair(path: &Path) -> Result<WatchRepairDependency, BuildInputTopologyError>`; `pub fn finalize_watch_inputs(inputs: BuildInputSet, output: Option<&Path>) -> Result<FinalizedWatchInputs, BuildInputTopologyError>`; `pub enum BuildSourceError { Missing, NonRegular, InvalidUtf8 { offset: u64 }, Io { message: String } }`; `pub enum ObservedBuildAttempt { ObservationFailed { error: BuildInputTopologyError }, SourceFailed { error: BuildSourceError, inputs: BuildInputSet }, Pipeline { build: PipelinedPackageBuild, inputs: BuildInputSet } }`; `pub enum ObservedPerUnitBuild { ObservationFailed { error: BuildInputTopologyError }, SourceFailed { error: BuildSourceError, inputs: BuildInputSet }, Walk { walk: PerUnitWalk, inputs: BuildInputSet } }`. These are the complete new exports; fields/constructors/mutation/evidence stay private. | `inputs()` always contains one row per logical path sorted by ascending raw platform bytes. Within one call, the highest W4 encounter ordinal supplies a duplicate path's state; unequal state or evidence sets `changed_during_attempt`. Retry ordinals are ordered after every first-attempt ordinal, so retry state wins overlaps; merge unions evidence, ORs prior flags, sets the flag for any unequal overlap, adds retry-only paths, enforces W8's 32,768-row retry-merge limit before retaining the rejected next row, and re-sorts the union by path. The first aliased row in that same order is `alias_index`. `finalize_watch_inputs(Some)` performs W3 validation. When stable and aliased, it returns matching `alias_index` and an opaque repair dependency containing the bounded fixed output path plus alias-time W6 graph; otherwise both are `None`. `output=None` returns neither. Both public path arguments must be absolute and pass W8 validation before allocation or graph lookup. `snapshot_watch_repair` rebuilds the same bounded graph for transition/audit comparison. `into_parts` is the sole consuming projection and frees all read-time evidence; both components remain owned. `FinalBuildInputSet` is a distinct final-phase type with no conversion to `BuildInputSet`, so safe callers cannot pass consumed state to merge or finalization. Repair equality covers path plus every graph node/identity/raw target. | Exact export/trait inventory; external construction/mutation negatives; producer/duplicate/retry ordering; merge; finalization stable/unstable/alias/None; absolute/relative/NUL repair/output paths; repair snapshot/equality/changed-during-install/removal; evidence consumption; external compile-fail negatives for final-to-observed conversion/merge/refinalization; topology-error Display; and state/error owners. |
+| W6 | Watch-set transition | A private topology graph resolves each absolute lexical W5 path with filesystem lookup semantics. It records every lexical and target-side directory-entry node visited, not only the final path: missing; directory `(device,inode)`; symlink `(device,inode,raw target bytes)`; leaf regular target `(device,inode)`; or other. Every existing node's tuple comes from nofollow metadata for that entry, so W3 can compare output against traversed nodes and filesystem folding is reflected by kernel lookup. Relative/absolute targets resolve through nested symlinks until a leaf, missing suffix, loop, or W8 bound. W3 finalization compares the current graph and semantic re-read with W4 evidence, returns the final semantic snapshot, then consumes evidence. An alias rejection additionally retains the fixed output path as `repair_output`; its complete W6 graph participates in handles and every event/audit comparison until a revision finds no alias or publishes successfully. Before waiting, W15 adds handles for every existing input/repair graph node and deepest existing directory above each unresolved suffix, rebuilds both graphs and semantic snapshot, and removes obsolete handles only after a stable pass. After success the next logical set is exactly the finalized inputs with no repair output. After failure, form the logical-path union from the current attempt plus absent last-success paths, using a checked union whose two at-most-32,768-row operands structurally cap retained watch state at 65,536 rows before graph construction, and retain only that revision's optional repair output. Before installing that failed baseline or waiting, W15 rebuilds the graph and W5 total semantic state for every union path; these refreshed current states, never the stored last-success states, become the comparison baseline. Earlier failed sets never contribute paths; entry is always present. | The watcher owns current input/repair graph paths, raw targets, native identities, and handles; read-time evidence exists only through W5 finalization. A loop is stable topology for W5 `Unreadable`; traversal excess is W8 error. Nofollow `ENOENT`, add `ENOENT`/`PathLost`, removal `ENOENT`/`PathLost`/`WatchLost`, and callback path/watch loss follow W15's nonfatal uncertain/replan contract. Other metadata, topology, snapshot, add, rollback, or removal failures are W9 fail-closed. Changed semantic state, changed input topology, any repair-output topology/identity change, or `changed_during_attempt` schedules one revision. A regular input inode-only change with identical state re-arms without revision unless it is also the retained repair output. W15's stable-baseline add-before-remove pass plus post-add rebuild closes ordinary registration gaps; its explicitly bounded tentative-generation compaction uses pre/post total snapshots and W7 audit as the correctness owner for the deliberate obsolete-handle gap. | Injected owner covers overlapping/disjoint exact-limit retry merges and exact-maximum failure retention, refresh of a changed last-success-only path after entry failure without repeated revisions, no-spin, all mutation barriers, output-named nodes, missing/symlink/cycle repair, every registration path-loss barrier/retry budget, repeated-generation compaction/bound, unexpected removal failure, and direct/folded/distinct-hard-link alias removal/replacement with native event deliberately dropped. |
+| W7 | Event and verification model | Linux uses inotify and macOS uses the native file-event backend selected by the implementation dependency for low-latency wakes. An event for any W6 node, rename/replacement, or overflow wakes the loop through W9's shared pipe. The idle loop polls that read end with the current debounce, W15 transition-retry, or audit deadline, consumes at most 4,096 hint bytes per wake, and then checks atomic state; readable, hangup/error, and deadline are the only wait results. Events are collected until 50 ms of quiet or 250 ms from the first event, whichever comes first. Independently, after every completed no-change comparison the loop arms one fixed two-second audit deadline. Either an event drain or a due deadline rebuilds W6 topology, runs W15 registration, and reclassifies every logical input through W5's total classifier: missing lookup is `Missing`, existing nonregular target is `NonRegular`, open/stat/read failure is `Unreadable`, and a complete regular read streams its hash/length. Every prior-to-current state pair is compared, including recovery with unchanged topology; any semantic state change starts exactly one revision. A topology change also starts one revision except when a regular logical input has only an inode change, its `BuildInputState` is identical, and it is not the retained repair output; that W6 case re-arms without a revision. Every repair-output topology or identity change starts one revision. Otherwise the next two-second deadline starts after that comparison completes. The audit is the correctness owner for dropped/native-unreported events, permission/readability recovery, transient registration incompleteness, writable-`mmap` changes, and remote changes once ordinary reads expose their bytes; native events are the latency path, not correctness authority. Events received while compiling or comparing remain pending and cause a following comparison after the current attempt/scan completes. | Semantic classification failure is a W5 state, not a watcher error; only graph traversal other than expected loss, resource/backend-wide, unexpected handle, or control-pipe failure is fail-closed. The callback retains no event or path payload. A normal event stores the atomic dirty bit with `Release`; overflow, `PathLost`, and `WatchLost` store the atomic uncertain bit with `Release`. Only a backend-wide fatal asynchronous error maps to one fixed class: 1 `Disconnected`, 2 `Io`, 3 `Capacity`, 4 `InvalidConfig`, or 5 `Other`. W7 and W9 share one preallocated `AtomicU16` control word: bits 0..=2 encode signal 0 none, 1 SIGHUP, 2 SIGINT, 3 SIGQUIT, or 4 SIGTERM; bits 3..=5 encode fatal class 0..=5; bits 6..=15 remain zero. A backend callback uses a `Release` compare-exchange loop to set `class << 3` only while the fatal field is zero and preserves the signal field. The first fatal class wins and later fatal errors are discarded. Every event/error path then writes one byte to W9's nonblocking shared wake pipe, retrying `EINTR`; `EAGAIN` is successful coalescing because the atomics retain all control state. The owner keeps the read end open until the backend and all callback delivery are stopped, so no other write error is reachable. At each post-revision/idle wake and immediately before and after every W6/W15 transition operation, the loop performs one `Acquire` load of the shared control word. That single load is the post-return linearization point: a nonzero signal field wins over a simultaneously present fatal field, otherwise fatal wins over a synchronous unexpected operation error; expected path/watch loss has already become `uncertain` and is not an error candidate. Only after this control/error order does the loop inspect dirty bits, debounce, transition retry, or audit work. Event, signal, and timer wakes share one poll and one non-overlapping comparison; audits and transition retries never accumulate or overlap, and classification hashing retains only the W8 fixed buffer. Pipe reads retry `EINTR`; `EAGAIN` returns to poll, and EOF/other error enters the same final control snapshot as a synchronous watcher error. The loop `AcqRel`-swaps dirty and uncertain to false before, never after, a comparison so a concurrent callback cannot be erased. Neither control-word field is cleared before process exit. | Deterministic event/timer owner covers the complete 4x4 W5 state transition product, with explicit `Unreadable` permission/read recovery and read failure from each other state; W15 eight-attempt/50-ms churn and repeated tentative-generation compaction, quiet/max debounce, irrelevant/no-op events, pipe readability/error, bounded hint reads, coalescing, overflow/path/watch loss, rename, same-content regular inode replacement without a revision, repair-output identity replacement with a revision, dropped/no-event mutation, target-side missing creation, symlink topology, event-during-build/scan, comparison non-overlap, every fatal class/order, transition-error/control-state Cartesian order, and signal/fatal simultaneity. Native smoke covers replacement on each release OS and writable `mmap` on Linux. |
+| W8 | Resource ceiling | Before retaining, encoding, allocating a graph for, or using a path as a filesystem-call argument, every absolute lexical input, fixed output, raw symlink target, and expanded graph path is checked in this order over borrowed raw bytes: length, first embedded NUL, then absolute-path shape where W5 accepts a public path. 1,023 bytes are accepted and 1,024 produce `path too long (maximum 1023 bytes; got LEN; hash HEX)`; an admitted path's first NUL produces `path 'ENCODED_PATH' contains NUL byte at offset OFFSET`; a relative public output/repair path produces `path 'ENCODED_PATH' is not absolute`. No rejected path reaches lookup or another side effect. One W4 producer call admits at most 16,384 distinct logical inputs; first-plus-retry merge admits 32,768; failure retention of that current set plus absent last-success paths is structurally bounded at 65,536 by its two admitted operands. The installed input-plus-repair W6 graph admits at most 65,536 distinct nodes, with at most 40 followed symlinks per logical input or repair output. One attempt/retry merge retains at most 131,072 distinct W4 evidence keys. Behind W9's fixed prefix, the remaining rejected-next suffixes are exactly `too many inputs (maximum 16384; next 'ENCODED_PATH')`, `too many merged inputs (maximum 32768; next 'ENCODED_PATH')`, `too many path components while resolving 'ENCODED_PATH' (maximum 65536)`, `too many read-time path components while reading 'ENCODED_PATH' (maximum 131072)`, or `too many symlink traversals for 'ENCODED_PATH' (maximum 40)`; each names the rejected logical path and exits before retaining/installing the rejected value. | Finalization may own at most 196,608 evidence-plus-current nodes and consumes evidence before transition. Add-before-remove may retain at most 131,072 logical records and 131,072 combined registrations. W15 permits eight immediate same-state registration replans, one 50-ms retry deadline, and at most one tentative generation. Before another generation is added, compaction reduces the retained union to at most the current 65,536 desired handles; the following at-most-65,536 additions therefore preserve the 131,072 simultaneous-registration bound across arbitrary churn. The backend owns those registrations, dirty/uncertain atomics, and one fixed 4,096-byte hint-read buffer, while W7/W9 share one control `AtomicU16` and W9 owns the shared pipe at the kernel's finite default capacity; it never requests a resize and pipe bytes carry no state. There is no second wake channel. Every watcher/control descriptor is close-on-exec before child spawn. Finalization/event/audit hashing uses one 64 KiB buffer. W2 owns one 4,096-byte record chunk plus one 12,331-byte maximum frame; W13 owns one process-global captured-child `AtomicBool`, one fixed armed guard record, two 4,096-byte read buffers, one fixed status record, two checked post-exit/pre-reap byte counters of at most 1,048,576, and at most one caller-allocated opaque panic payload at a time. W13 internal isolation accepts at most 8,589,934,592 tool-output bytes, owns at most two such simultaneously live output stages (17,179,869,184 bytes total), one 64-KiB copy/hash buffer, fixed source/destination identity/length/permission-mode records and `Hash128` snapshots; the rejected next byte is W13's exact isolation-limit error before second-stage creation. The pump neither copies nor grows that payload and retains no process list, output total, or cleanup timeout. Opens are nonblocking and `fstat`-regular. `LEN` and `OFFSET` are checked decimal byte counts; `HEX` is lowercase 32-digit `Hash128`; `ENCODED_PATH` is W2 `WatchPath`; `WatchPath` expands to 3,069 bytes; `WatchText` admits 16,384; all arithmetic is checked. Memo retains 768 MiB. | Exact/rejected-next length/NUL/absolute path and per-producer/retry-merge input, exact retained-watch maximum, combined graph, merged evidence, combined finalization, symlink, encoding/message/record-frame, disjoint transition/repair, registration churn/generation compaction, offending identity, sparse/FIFO, shared-pipe/control-fd close-on-exec, child-buffer/post-exit/pre-reap, output-isolation stage/buffer/identity/mode, control-word, and memo owners. |
+| W9 | Failure and process exit | Source, frontend-cache, W3 alias/input-instability, codegen, PGO, link, and publication failures produce `failed` and keep watching. `ObservationFailed`, topology/resource/finalization failure, watcher initialization/transition failure, a fatal W7 backend class, W7 shared-wake read failure, W14 probe failure, and W2/W13 transcript/pump failure produce `alignc: watch: watcher error: MESSAGE` and exit 1. SIGHUP/SIGINT/SIGQUIT/SIGTERM request graceful stop; the first signal wins over a simultaneous backend error. An active revision finishes its ordinary result unless W2/W13 transcript/pump or W14 probe infrastructure fails, or W13 observes a graceful stop while a captured child is live. In the stop case W13 forwards the same signal, performs bounded grace plus mandatory group cleanup, and returns directly to W9 selection without `failed`; otherwise the revision waits every child, drops every stage, then emits exactly `alignc: watch: stopped by SIGHUP`, `alignc: watch: stopped by SIGINT`, `alignc: watch: stopped by SIGQUIT`, or `alignc: watch: stopped by SIGTERM` and exits 129/130/131/143. After mandatory probe/child cleanup, an infrastructure failure instead takes the post-return signal/fatal/error snapshot and emits only the selected stop or watcher error; an unavailable transcript emits neither. Idle handling is immediate because the shared pipe is the sole blocking wake; later signals coalesce; SIGKILL is ordinary immediate termination. | A process-global compare-exchange admits exactly one private signal installation. A second attempt fails before side effects. On the still-single-threaded CLI path, setup blocks SIGHUP, SIGINT, SIGQUIT, and SIGTERM in that order, saves the prior mask, creates the shared wake-pipe descriptors nonblocking and close-on-exec atomically where supported or applies `O_NONBLOCK` then `FD_CLOEXEC` to read and write ends before handler registration, registers handlers in that same order, publishes the owner, then restores the mask. W7 callbacks borrow the same write descriptor only while the native backend owner is alive. Any pre-publication pipe/flag/registration/mask failure rolls back while signals remain blocked: unregister in reverse order, close write then read, clear owner/guard, restore mask last. Publication transfers the handlers, atomics, guard, and both pipe descriptors to process-lifetime storage with no `Drop` path and no descriptor reuse. Every post-publication terminal path explicitly waits children, drops stages/handles, stops and drops the native backend, writes and flushes its final W2 line when possible, then calls `std::process::exit`; only kernel process teardown removes the handlers and closes the still-valid pipe descriptors. In the shared W7/W9 `AtomicU16`, each handler uses a compare-exchange loop to set bits 0..=2 to 1 SIGHUP, 2 SIGINT, 3 SIGQUIT, or 4 SIGTERM only while that field is zero, preserves the fatal field, and writes one byte after its successful or already-set decision, retrying `EINTR`; `EAGAIN` from a full pipe is successful coalescing. The retained read end makes every other handler write result unreachable, including during cleanup. No handler allocates, locks, formats, closes, or touches compiler state. | Child-process barrier and forwarded-stop owner covers every setup operation/failure and each pending SIGHUP/SIGINT/SIGQUIT/SIGTERM, then execs a helper during every child phase and proves all watcher/control descriptor numbers are closed there; it also proves explicit pre-exit cleanup and no staging residue. Shared-wake owner covers startup, idle, event, signal, timer, and infrastructure-failure multiplexing, readable/error/hangup, pipe-full signal precedence, backend shutdown with a still-live pipe, a signal at every terminal cleanup barrier, kernel-only handler/fd teardown, and no second wait primitive. Backend/pump/probe owners cover static fatal classes, mandatory cleanup, group-preserving descendants, direct detachment, W1's supported-tool writer-joined handoff, and W12's explicit detached-writer contract negative. SIGKILL and every other default-fatal process signal remain explicit no-cleanup process-failure exits; because W13 never exposes the publication stage to a child, they cannot mutate an already published candidate. |
+| W10 | Cache and artifact identity | No persisted format, namespace, cache key, compiler fingerprint, interface, object, runtime, or link identity changes. An attempt consults the existing persistent caches and process memo in their settled order. Source edit/revert is content identity, never mtime identity. `ALIGNC_CACHE=off` disables persistent reuse but leaves the already-settled in-process memo active. ThinLTO and PGO keep their existing key spaces and validation order. | The only long-lived allocation is the memo and watch state. Cache rejection markers remain process/persistence authoritative. A watch event cannot authorize a cache key or artifact. W1's trigger-excluded external resources affect each actual codegen/link step exactly as in one-shot builds but remain outside compiler/cache identity; their mutation alone does not schedule that step. The workspace runtime-source tree likewise remains outside cache identity and runs its existing freshness digest only when a revision reaches pre-link validation. | Memo-on/off, cache-on/off, edit/revert, rejected-key, ThinLTO, PGO, external-resource, and workspace-runtime trigger owners reuse existing cache matrices plus one multi-revision driver owner. |
+| W11 | Platform and installation | Supported release hosts are Linux and macOS on the architectures already built by CI. An unsupported native backend, signal-handler/pipe setup failure, or backend initialization failure is a watcher error; the universal W7 audit is not a fallback for an unavailable native backend. Release archives need no service file, launch agent, socket directory, or new executable. `alignc --version` and one-shot commands are byte-for-byte unchanged. | The native-watcher and signal-hook dependencies are linked into `alignc`; the timer uses the standard library. No runtime package or daemon ownership is added. | Linux x86_64/ARM64 and Apple Silicon CI build plus native replacement/signal smoke; release inventory remains unchanged. |
+| W12 | Concurrent invocations | Revisions are serial within one watch process. Separate watch and one-shot compiler processes keep the existing independent-publication rule: each uses a private publication stage and atomic rename, each captured-output link additionally isolates its external tool stage, and the last successful rename to the same executable path wins. There is no cross-process or output-path lock. W2 markers attest only that their own process completed that revision; they do not reserve the path against external writers. | Watcher handles and memo state are process-owned. The only process-global mutations are W9's binary-owned singleton signal disposition/pipe lifetime and W13's captured-child lease. W9 failed overlap and partial setup restore there, while a successful watch exits without restoration; W13 overlap is side-effect-free and every pre-spawn or post-cleanup path releases its lease. Separate OS processes have independent dispositions and leases. An application that requires one publisher, protection from a same-uid process that scans or guesses private stage names, a tool that violates W1's successful-return handoff, or a filesystem transaction across W3's final alias/isolation snapshots must own that orchestration outside `alignc`, as it does for concurrent one-shot builds today. | Barrier owner runs two processes publishing the same final path, proves every observed image is complete, and accepts either winner; production-tool owners establish W1's writer-joined handoff for direct and internally spawning routes; W9's child owner and W13's lease/disposition owner close both same-process singleton states. |
+| W13 | Child-output pump and public link seam | `#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum LinkOutputStream { Stdout, Stderr }`; `#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum LinkStopSignal { SigHup, SigInt, SigQuit, SigTerm }`; `pub trait LinkOutputSink { fn write(&mut self, stream: LinkOutputStream, bytes: &[u8]) -> std::io::Result<()>; fn stop_signal(&mut self) -> Option<LinkStopSignal> { None } }`; `pub fn link_objects_with_output(objs: &[&Path], exe: &Path, link_libs: &[String], profile: Profile, sink: &mut dyn LinkOutputSink) -> Result<(), String>`; `pub fn link_objects_instrumented_with_output(objs: &[&Path], exe: &Path, link_libs: &[String], profile: Profile, profile_rt: &Path, sink: &mut dyn LinkOutputSink) -> Result<(), String>`. These are W13's complete five-symbol export inventory. Existing `link_objects` and `link_objects_instrumented` retain inherited stdio and byte-for-byte behavior; watch uses only the matching `_with_output` function, including ordinary, PGO-use, PGO-instrument, ELF in-link strip, and macOS external `strip`. | Before pipe creation or spawn, each `_with_output` call acquires one process-wide captured-child lease; an overlapping call returns exact `child wait setup: another captured child is active` without side effects. It then queries `SIGCHLD` and accepts only `SIG_DFL` without `SA_NOCLDWAIT`; explicit `SIG_IGN`, `SA_NOCLDWAIT`, or another handler returns exact `child wait setup: incompatible SIGCHLD disposition`. The lease does not mutate signal state. Callers of this public seam must not change `SIGCHLD` disposition or reap children from unsafe/native code until return; the child pid is never exposed to safe callers. The `exe` argument is always the final output path. Each `_with_output` function itself exclusively precreates and retains the tool inode, passes only its private pathname to every configured tool, verifies/copies it into a distinct unexposed publication inode, and atomically renames that isolated inode to `exe` only on complete success. It returns only after publication or identity-aware cleanup; callers receive no stage path, descriptor, token, or opportunity to publish the child-visible inode. Internal isolation assumes W1's supported-tool successful-return handoff; it detects mutation during its snapshots but cannot certify that an arbitrary surviving writer has become quiescent. Partial pipe/group/spawn setup drops the lease after closing every created descriptor. Immediately after successful spawn, one allocation-free private armed `CapturedChildGuard` owns all four parent pipe ends, pid/PGID, and lease; it closes both parent write copies before the first fallible pump operation; explicit completion performs the no-panic group-signal/direct-child-reap sequence and disarms it, while `Drop` performs that same sequence before any unexpected unwind can cross the link seam. Each `cc` or `strip` child is created as leader of one private same-effective-uid process group and spawned with separate blocking stdout/stderr pipe write ends. A process-group setup/spawn failure returns the existing phase-specific launch error before a child runs. All four original pipe ends are close-on-exec. Before spawn, the parent applies `O_NONBLOCK` only to its two read ends; read and write ends are distinct open-file descriptions, so command setup maps the still-blocking write ends onto child stdout/stderr, closes every other child end, and leaves only those two blocking standard descriptors open across exec. The parent closes its copies of both write ends immediately after spawn. One parent-owned loop verifies `getpgid(pid)` still equals the captured PGID and then calls `stop_signal` before each status observation and after each at-most-50-ms poll, then observes direct-child exit without reaping through `waitid` with fixed `P_PID`, `WEXITED`, `WNOHANG`, and `WNOWAIT` arguments before every poll, services stdout then stderr when both are ready, and reads at most 4,096 bytes per stream per cycle. The default control result is `None`. The first `SigHup`, `SigInt`, `SigQuit`, or `SigTerm` result closes both reads and sends matching SIGHUP, SIGINT, SIGQUIT, or SIGTERM to both the captured group and direct pid, retrying `EINTR` for each; an accepted send starts a fixed 250-ms monotonic grace, `ESRCH` skips directly to final pinned-group cleanup and reap, and another error records exact `child group cleanup: MESSAGE` and enters immediate SIGKILL cleanup. Later control results are not queried. Every path then performs mandatory group-SIGKILL/direct-reap cleanup. Absent an earlier retained error, the public function returns exact `child stopped by SIGHUP`, `child stopped by SIGINT`, `child stopped by SIGQUIT`, or `child stopped by SIGTERM`; the watch caller's already-stored W9 signal outranks both that sentinel and any cleanup error and emits only `stop`. Group-check/status/poll/read `EINTR` retries and `EAGAIN` returns to poll. A direct-child group mismatch records exact `child group changed`; another permanent group-check failure records exact `child group check: MESSAGE`, closes both reads, and enters cleanup. Each control query and nonempty read invokes the corresponding sink method inside `catch_unwind(AssertUnwindSafe(...))`. Both callbacks are synchronous and may block for an unbounded caller-controlled duration; the at-most-50-ms poll bounds only time spent in `poll`, not end-to-end stop detection. A nonempty read passes the matching stream and borrowed bytes; the sink cannot retain that borrow, and the trait need not implement `UnwindSafe`. A returned write `Err` records the first sink error. A panic from either method retains its first opaque payload, stops all later callbacks, closes both parent read ends, and enters mandatory group-signal/direct-child cleanup immediately; the process-global panic hook is neither replaced nor suppressed. Per-stream order is fixed; cross-stream order is stdout-before-stderr poll order and has no semantic meaning. The watch sink emits one W2 `child-stdout` or `child-stderr` `end` record per callback. | The pump retains two 4,096-byte read buffers, one fixed direct-child status record, and the watch sink borrows W2's common framed-record writer; none retains whole output. A returned sink error leaves both readable pipes open and drains/discards later chunks. A retained sink panic has already closed them and skips ordinary status/output completion. An unexpected permanent status failure after `EINTR`, including `ECHILD` after the admitted setup, records exact `child wait: MESSAGE`, closes both reads, and enters the same mandatory group-signal/direct-child cleanup path as a pump failure instead of returning. A permanent poll/read failure while the non-reaped direct child is live records the first error, closes both parent read ends immediately, sends SIGTERM to the private process group, and waits without reaping until a fixed 250-ms monotonic deadline. Every ordinary, child-failure, sink-error, sink-panic, status-failure, and pump-failure outcome keeps the direct group leader unreaped while sending SIGKILL to both the captured group and direct pid, retrying `EINTR` until each send is accepted or returns `ESRCH`. A non-`ESRCH` kill error is recorded once as exact `child group cleanup: MESSAGE` and retried every fixed 10 ms; it does not release the stage, lease, or caller. Only after accepted/`ESRCH` group and direct-pid SIGKILL does the parent reap the direct child through `EINTR` when it remains waitable, and it never uses the numeric PGID again. The unreaped leader pins that PID/PGID through the final group signal, eliminating post-reap reuse. Accepted/`ESRCH` direct-pid SIGKILL followed by reap is the no-further-user-execution boundary only for the direct child. An accepted group send proves delivery was queued, not that each group member has stopped, and W13 does not wait for or claim quiescence of descendants. Successful publication therefore requires W1's writer-joined handoff; group cleanup may leave only descendants that hold no writable descriptor or pathname access to the tool output. After completing its group/direct-pid signal sends and direct-child reap, W13 releases the child lease; on child success it then performs the retained-inode isolation and publication sequence before returning. SIGKILL to the alignc process is the sole force-stop escape from an uncooperative or no-longer-signalable group. After ordinary direct-child exit is observed but before this cleanup, the pump performs one `FIONREAD` query per still-open pipe, stdout then stderr, for the exact queued byte count. Counts through 1,048,576 are accepted; a larger count records `child stdout read: buffered output exceeds 1048576 bytes` or the stderr sibling, and a negative count uses `invalid buffered-byte count`. It reads at most each accepted snapshot count in 4,096-byte chunks, so later descendant writes cannot extend the quota, then closes both read ends without waiting for EOF. Query/read failure closes both ends immediately. Without a panic, the first sink/group-check/status/poll/read/group-cleanup error wins over direct-child status or a stop sentinel; direct-child status otherwise retains ordinary build meaning. With a retained panic, cleanup errors cannot replace its payload: after final group/direct-pid SIGKILL/`ESRCH`, waitable-child reap, and lease release, `resume_unwind` resumes that same payload on the calling thread without invoking the panic hook again. No caller return can occur before the final group/direct-pid SIGKILL/`ESRCH`, direct-child reap when waitable, lease release, and either complete isolated publication or identity-aware stage cleanup. Exact export/trait inventory and an injectable pump/process owner cover both legacy inherited functions, both new functions, ordinary/instrumented/strip routes, external sink implementation, callback/control order/borrow/default-stop/blocking-delay behavior, blocking-child/nonblocking-parent flags, empty/arbitrary/all-byte/marker-shaped output, simultaneous streams, capacity backpressure, `EINTR`, `EAGAIN`, child/forwarded-stop/sink-return/sink-panic/group-check/status/poll/read/query/early-EOF/group-cleanup failure, unchanged panic-hook/resumed-payload behavior, accepted/rejected `SIGCHLD` states, overlap and partial-setup rollback, armed-guard Drop at every post-spawn barrier, post-exit limits, descriptor inheritance, direct group change and in-group descendants after every direct-child outcome, normal drain/close/pinned-group-and-pid-KILL/reap, forwarded-stop/grace/pinned-group-and-pid-KILL/reap, permanent-error TERM/grace/pinned-group-and-pid-KILL/reap, direct and internally spawning production-tool writer-joined handoff, explicit no-guarantee contract negative for a deliberately detached writer, and decoded one-shot parity under equivalent pipe-backed stdio. |
+
+| W14 | Absent-slot collation proof | After W3's stable final semantic/graph snapshot and existing lexical/identity alias checks, but before link, every absent W6 input graph node is considered, including the first missing intermediate component as well as a missing logical leaf. A node whose resolved immediate parent and the missing output's resolved parent have the same `(device,inode)`, whose output lookup is one component, and whose raw component differs from the output leaf receives a collation probe. W3 opens and identity-checks the output parent as part of its final graph snapshot; through that retained common-parent descriptor, W14 exclusively creates `concat(OUTPUT_LEAF, SUFFIX)`, then nofollow-looks up `concat(INPUT_COMPONENT, SUFFIX)`. The same inode proves that the two absent public slots are one filesystem-folded entry and returns W3's existing alias rejection naming the owning logical input. `ENOENT` proves the names distinct for that snapshot. Components below a first missing parent have no existing parent slot and cannot denote the output entry; exact raw path/node equality remains W3's earlier check. | `SUFFIX` is exact ASCII `.aw-` plus 32 lowercase hex digits from 128 bits of OS randomness. Each pair gets at most 16 exclusive-create attempts. The retained parent supplies `NAME_MAX`; `LIMIT` is `min(NAME_MAX, 1023)`. Before allocating a probe value or performing probe-entry I/O, both suffixed components must be at most `LIMIT` bytes; otherwise exact `collation probe 'ENCODED_OUT'/'ENCODED_INPUT': suffixed component too long (maximum LIMIT; got LEN)` fails closed, where `LEN` is the larger rejected length. An unavailable/invalid `NAME_MAX`, randomness, create, nofollow lookup, identity, cleanup, and retry failure use exact `collation probe 'ENCODED_OUT'/'ENCODED_INPUT': MESSAGE`. `ENCODED_INPUT` is the logical input owning the absent node. One retained close-on-exec directory descriptor, one close-on-exec regular-file descriptor, and two fixed 1,024-byte component buffers are live at a time. | The probe touches neither public slot and reserves `.aw-` plus 32-lowercase-hex component names for cooperative Align processes while active. Immediately before cleanup unlink, it nofollow-compares the current name with the retained opened inode. Missing or unequal identity closes the retained fd, preserves the current name, and uses `probe ownership lost` as `MESSAGE` in W9's exact cleanup payload; equal identity permits unlink, followed by required `fstat` link count zero before close. Cleanup failure is a watcher error and link never starts. Concurrent Align processes never replace a claimed name and collision retries never unlink a name this process did not create; post-check replacement by a non-Align process is outside the explicit pathname-only concurrency contract. Injectable directory operations own parent open/identity, case-sensitive, ASCII-case-folded, Unicode-normalized, both-absent leaf and intermediate nodes, parent aliases, exact/raw-equal, deeper unresolved suffixes, 16-collision, randomness/`NAME_MAX`/create/lookup/identity/pre-unlink-replacement/unlink/fstat/close failure, cooperative collision, exact/rejected-next `LIMIT`/`LEN`, public-slot nonmutation, foreign-entry preservation, and no-residue cells; native macOS smoke proves the host's actual folded lookup. |
+
+| W15 | Registration churn | A W6 transition distinguishes one stable baseline generation from at most one retained tentative generation. From a stable baseline it keeps every old handle until one complete add/post-add-snapshot pass is stable. Desired additions are raw-path-sorted and each successful new handle is recorded in insertion order. If the prior pass retained a tentative old-plus-new union, the next transition performs no addition until a fresh graph/semantic snapshot matches installed state. A difference schedules one revision while retaining that same union. Equality forms desired registration keys from raw path plus W6 native identity, retains at most the newest installed matching handle for each key, removes every nonmatching or older duplicate in raw-path/generation order, marks that at-most-65,536 remainder as the new baseline, and only then may add a next generation. Expected removal loss is idempotent; another compaction failure follows W9. Compaction deliberately trades native-event coverage of obsolete paths for the universal W7 audit and pre/post total snapshots, but keeps every currently desired handle already present. The complete post-transition snapshot runs after compaction even when no addition is needed. Synchronous add `ENOENT`/`PathLost` is expected topology churn: remove only that pass's new handles in reverse order, treating removal `PathLost`/`WatchLost` as idempotent success, set `uncertain`, and rebuild graph plus total semantic state. A difference from the installed logical/repair state schedules one revision immediately; an unchanged rebuild retries the pass at most eight times. After the eighth unchanged path-loss race, old handles remain installed, obsolete removal does not start, and the shared poll arms one fixed 50-ms transition-retry deadline. The next timer/event comparison starts a fresh eight-attempt budget. There is no spin and the two-second audit remains armed after a completed no-change comparison. | A post-add snapshot that observes change retains that bounded old-plus-new superset as the sole tentative generation and schedules the revision; only a stable post-add snapshot permits ordinary obsolete removal. Because each desired generation has at most 65,536 registrations, compaction reduces a retained union to at most 65,536 before at most 65,536 additions, so repeated changed snapshots never exceed W8's 131,072 simultaneous-registration ceiling. Nofollow `ENOENT` forms a W6 `Missing` node, while removal `ENOENT`/`PathLost`/`WatchLost` means already absent. Other metadata/add/remove errors, rollback failure other than those idempotent classes, capacity/resource exhaustion, and backend-wide failure remain W9 errors. W7 callback `PathLost` and `WatchLost` likewise set `uncertain` and wake the shared pipe instead of setting the control word's fatal field. | One injectable registration owner covers disappearance/reappearance before each add, after every successful prefix, during rollback, at post-add snapshot, and before each obsolete removal; unchanged eight-attempt exhaustion, 50-ms retry, callback path/watch loss, alias repair removal, event-dropped audit recovery, stable eventual add-before-remove, three-or-more consecutive changed post-add snapshots with pre-add compaction and fixed peak count, compaction-race audit recovery, partial-handle Drop, unexpected rollback/remove failure, resource failure, signal/fatal precedence, and exact no-exit/no-spin behavior. |
+
+Unless a line is explicitly a W2 terminal marker, every exact output string in
+W1–W15 names decoded record payload. W3 instability/alias text uses `notice`,
+W9 watcher failures use `watcher-error`, and graceful-stop text uses `stop`.
+
+After W3 completes input and output-alias validation, the selected W13
+`_with_output` function exclusively precreates the randomized tool stage,
+retaining its open close-on-exec descriptor and identity while external tools
+receive only the pathname and must preserve that inode. After W13 releases its
+child lease, that same function first nofollow-verifies retained ownership;
+only then does it create the distinct publication stage through the same
+same-directory exclusive allocator.
+External tools receive neither the publication name nor its descriptor.
+Isolation order after the initial tool-path ownership check is retained-source
+`fstat`, identity/length/permission-mode snapshot, 8-GiB length check, first
+streaming source hash, exclusive publication-stage creation, exact-length copy,
+permission-mode application, second source
+`fstat`/hash, destination `fstat`/hash, and identity/length/mode/hash equality
+decision. Permission mode in W13 isolation is exactly `st_mode & 0o777`; no
+set-id or other inode metadata is copied. W13 then nofollow-compares the
+tool-stage name with its still-open descriptor: a matching entry is unlinked,
+a missing entry needs no cleanup,
+and an unequal entry is preserved and returns exact `tool stage ownership lost`
+without publication. It next nofollow-compares the publication-stage name with
+its still-open descriptor, closes, then atomically renames. Missing or unequal
+pre-rename identity preserves the foreign entry and returns exact `publication
+stage ownership lost`. `EINTR` retries and a
+premature source EOF or extra byte is `link output changed during isolation`.
+The first operational error is retained; cleanup keeps each descriptor open
+while it nofollow-compares the pathname, removes only a matching identity,
+treats a missing path as already cleaned, preserves an unequal current entry,
+and then closes the descriptor. A reportable ownership or cleanup error
+replaces the result only when it is the first error. An unexpected unwind runs the same
+identity-aware stage guards without publishing or deleting a replacement. A
+same-uid process that mutates a publication name after the final identity check
+or discovers it by scanning/guessing is the explicit W12 external-writer case,
+not a child-containment guarantee.
+
+The complete additive export inventory is the union of W5's
+input/finalization/repair surface and W13's link-output surface. W5's
+"complete new exports" statement is scoped to its record surface; its
+field/constructor privacy rule does not apply to W13's externally implementable
+sink. `LinkOutputSink::write` is synchronous on the calling driver thread, the
+borrowed byte slice is valid only for that call, and the trait requires neither
+`Send` nor `Sync`. W13's five symbols are its complete new exports and complete
+the item 5 inventory beyond W5. A sink refusal records exact
+`child stdout output: MESSAGE`
+or `child stderr output: MESSAGE`, continues draining both pipes, and is
+returned after the final pinned-group signal, direct-child reap when waitable,
+and lease release. The watch sink retains its first W2
+transcript error before returning the refusal sentinel, so W2's more specific
+`transcript write: MESSAGE` or `transcript flush: MESSAGE` wins over that
+derived output error. Concatenating successful callbacks separately by stream
+reconstructs the direct child's bytes through the accepted post-exit/pre-reap bound;
+the watch framing means no child byte can become an unframed marker or another
+record kind. A permanent live-child poll/read error selects W13's bounded
+TERM/grace/KILL/direct-child-reap path; an unexpected `ECHILD` status failure is
+exact `child wait: MESSAGE` and enters that same cleanup path. A
+failed post-exit/pre-reap queued-byte query, read, or EOF
+before the snapshotted count records exact `child stdout read: MESSAGE` or the
+stderr sibling. The pump owner retains the 50-ms no-output child-exit case,
+output larger than one buffer, exact/over-limit/negative counts, the child
+descriptor table, and the complete wait/snapshot/drain/close sequence.
+
+W13's captured-child lease owns one process-global `AtomicBool`; it serializes
+only the two `_with_output` functions and is released on every pre-spawn
+failure. The inherited-stdio functions do not acquire it. The `SIGCHLD`
+disposition is checked after lease acquisition and before the first pipe
+allocation. Safe callers cannot obtain the private pid, while mutation of the
+process disposition or native reaping during the call is an explicit unsafe
+caller violation rather than an `ECHILD` success path. Even then, an observed
+`ECHILD` enters mandatory group-signal/direct-child cleanup and cannot release
+the stage or lease early.
+`catch_unwind` applies only around the externally implemented sink callback;
+the pump itself has no panic-to-error conversion. The armed guard's explicit
+and `Drop` cleanup paths are no-panic, retain the original payload through
+child/group cleanup, and call
+`resume_unwind` only after releasing the lease. The existing process panic hook
+runs for the original panic exactly as Rust normally specifies and is never
+temporarily replaced; resumed unwind does not run it again.
+
+The private watch sink's `stop_signal` performs only an Acquire load of the
+shared control word's first-signal field and maps
+SIGHUP/SIGINT/SIGQUIT/SIGTERM to
+`SigHup`/`SigInt`/`SigQuit`/`SigTerm`; it never locks, formats, allocates, or
+writes a record. `None` is the only result for ordinary external sinks unless
+they explicitly opt into the same stop contract. The 50-ms value bounds only
+one pump poll; synchronous `write` and `stop_signal` callbacks may block and
+there is no end-to-end graceful-stop latency bound. A pending signal is
+observed at the next control checkpoint after the callback returns; callers
+that require prompt graceful stop must keep both methods prompt, while SIGKILL
+remains the force-stop escape. Forwarded stop is not
+a watcher error or `failed` attempt: mandatory child cleanup returns its exact
+internal sentinel, then W9's already-stored signal wins the post-return
+snapshot and emits the sole `stop` record.
+
+The matching group signal retries `EINTR`. An accepted send starts the 250-ms
+grace; `ESRCH` skips directly to the pinned-leader final group signal and reap,
+while another error records exact `child group cleanup: MESSAGE` and enters
+immediate SIGKILL cleanup. For an external sink without W9's pending signal,
+that first cleanup error outranks the stop sentinel; under watch, W9's
+already-stored signal outranks both. Every stop path sends final SIGKILL to
+both the captured group and direct pid while the unreaped leader pins both
+identities, and reaps that child when waitable before the stage, lease, or
+caller can proceed.
+
+W2's statement that revision 1 starts immediately is conditional on the final
+startup snapshot selecting continuation. Before that linearization point there
+is no revision to mark, so a selected stop or initialization error follows the
+startup rule below and emits no `started` record.
+
+W7 has no user-configurable audit interval or event-only mode. Its semantic
+`stat` failure means `fstat` of an already opened candidate leaf; W6 nofollow
+`ENOENT` follows W15, while other metadata and graph traversal failures remain
+fail-closed topology errors. The
+W7 owner retains already-full-pipe coalescing, multi-level target-side missing
+creation, two-fatal-error first-wins ordering, and idle signal/fatal
+simultaneity in addition to the complete state product.
+
+W9's watcher-transition failure category excludes every W15 expected
+`ENOENT`/`PathLost`/`WatchLost` case. Those cases produce no diagnostic or exit;
+only an unexpected operation class, exhausted resource, or backend-wide fatal
+field in the shared control word can select `watcher-error`.
+
+W8's rejected logical-path identity is the bounded owner key of the operation:
+the observed input for input/evidence limits and traversal, or the fixed repair
+output for repair-graph traversal. It is never an unbounded intermediate path.
+W14's pre-unlink identity check reuses the retained parent/probe descriptors and
+allocates no additional path.
+
+After CLI validation creates the private W2 transcript, W9 publishes the
+signal owner and restores the startup mask. The CLI then takes one Acquire load
+of the control word before native-watcher construction. It then takes W7's
+single-load signal/fatal snapshot plus any synchronous error after every
+initialization operation and once more immediately before the first `started`
+record. A
+selected signal stops and drops any initialized backend, emits only the exact
+W9 stop line, and exits 129/130/131/143 without a `started`, revision, or `ready`/
+`failed` marker. A fatal or synchronous initialization error likewise emits no
+`started`. The final pre-`started` snapshot is the startup-to-active
+linearization point; a signal stored later belongs to the active first revision
+and follows W9's ordinary active-stop rule.
+
+In W14, a nofollow lookup that finds a distinct inode at the alternate random
+name is a collision: the process cleans its own probe and retries with fresh
+randomness. Only the same inode proves folding; `ENOENT` proves distinct names;
+sixteen collisions select the bounded two-path error. Supported Linux/macOS
+component comparison is congruent under appending the same ASCII suffix;
+injectable casefold/normalization owners and native macOS smoke pin that
+platform premise.
+
+W14 visits W5 input rows in their public raw-byte order and each row's absent
+graph nodes in W4/W6 encounter order. The first probe/resource failure stops
+finalization; otherwise the first row with any folded node supplies W5's
+`alias_index`, preserving the lowest-row alias rule independently of native
+directory enumeration.
+
+Within one W14 pair the deterministic order is parent `NAME_MAX`, checked
+decimal `LIMIT`/`LEN`, OS randomness, exclusive create, alternate nofollow
+lookup, then owned-probe cleanup. A cleanup error wins the tentative
+same-inode/`ENOENT`/distinct-inode result; only successful cleanup may return an
+alias, distinct-name result, or collision retry.
+
+Every W14 path before cleanup, including collision, randomness, `NAME_MAX`,
+create, and lookup failure, either created nothing or removes its own probe.
+`unlink` retries `EINTR`; another unlink or link-count failure closes the
+retained fd, emits exact `collation cleanup 'ENCODED_COMPONENT' for
+'ENCODED_OUT'/'ENCODED_INPUT': MESSAGE`, and may leave only that random private
+component. The diagnostic therefore identifies the recoverable residue; no
+cleanup path touches a public input/output slot or a collision name.
+
+The `.aw-` plus 32-lowercase-hex component space is reserved for active Align
+W14 probes in a probed output parent. Cooperative Align processes exclusively
+create their own random component and never remove or replace another process's
+component. Immediately before unlink, cleanup nofollow-looks up that component
+through the retained parent and compares its identity with the retained probe
+fd. Missing or unequal identity means ownership was lost: cleanup closes its
+fd, does not unlink the current component, and emits exact `collation cleanup
+'ENCODED_COMPONENT' for 'ENCODED_OUT'/'ENCODED_INPUT': probe ownership lost`.
+A non-Align process that removes or replaces a reserved component after this
+identity check violates the explicit probe-namespace concurrency contract; no
+safe pathname-only Unix primitive can atomically compare identity and unlink.
+The barrier owner covers replacement before the check and concurrent Align
+collisions; neither path removes the foreign component.
+
+W9's active-revision ordinary-completion rule excludes W2/W13 transcript/pump
+and W14 probe infrastructure failures. W14 always finishes probe cleanup and
+W13 always finishes its mandatory child cleanup before terminal selection. If
+either operation succeeds, a pending signal remains deferred until after that
+revision's ordinary marker. If it fails, the post-return Acquire snapshot
+selects signal, then the fatal backend slot, then the synchronous probe/pump
+error; a selected signal emits `stop` without inventing `failed`, while a
+selected infrastructure error emits `watcher-error` without `ready`/`failed`.
+An unavailable W2 transcript can emit neither and retains its exit-1 rule.
+
+A retained external W13 sink panic is not a W9 synchronous error and never
+reaches terminal selection: W13 completes cleanup and resumes the original
+payload. The private watch sink has a no-panic owner over every callback/error
+result, so ordinary watch execution never exposes the process panic hook on its
+protocol stream. An external sink's unchanged hook output belongs to that
+library caller, not to a W2 watch transcript.
+
+During W13's permanent-error grace, direct-child exit is observed without
+reaping, so its pid/process-group id cannot be reused. At the 250-ms deadline
+the parent sends the same final SIGKILL to the captured group and direct pid as
+every other outcome while that leader remains unreaped. Accepted/`ESRCH`
+direct-pid SIGKILL followed by reap closes further user execution only for the
+direct child; the parent then never consults the numeric PGID again. W13 does
+not prove descendant quiescence. Successful publication instead depends on
+W1's supported-tool handoff: any surviving in-group or detached descendant has
+already released every writable descriptor and pathname access to the tool
+output before isolation begins.
+
+`build_path_pipelined_observed` is additive. The existing
+`build_package_pipelined` remains shape- and behavior-identical and calls the
+same private implementation with observation disabled. Observation never
+changes a diagnostic, cache decision, read order, static-input lock, codegen
+schedule, link argument, or published byte. The exact signature is:
+
+```text
+pub fn build_path_pipelined_observed(
+    source_map: &mut SourceMap,
+    path: &Path,
+    cache: CacheContext,
+    reuse: UnitReuse,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+) -> ObservedBuildAttempt
+```
+
+The ThinLTO sibling is likewise additive and shares the exact observer and
+entry reader:
+
+```text
+pub fn build_path_per_unit_observed(
+    source_map: &mut SourceMap,
+    path: &Path,
+) -> ObservedPerUnitBuild
+```
+
+`--thin-lto` selects this sibling, reports/returns frontend diagnostics exactly
+as the existing `walk_or_report` path does, rejects an empty successful walk,
+and creates the existing unique object stage. For two or more units it calls
+`build_thin_lto`; for exactly one unit it preserves the current
+`codegen_units_parallel` fallback because there is no cross-unit boundary and
+`build_thin_lto` requires at least two units. Both arms retain their existing
+cache-stat report, deterministic library union, link, and atomic publication.
+ThinLTO cannot combine with PGO by the existing CLI contract, so this sibling
+has no target/profile/cache/PGO argument: those affect only the post-walk
+codegen and existing keys, not observed project inputs. It does not consult the
+persistent frontend cache, matching the current all-MIR ThinLTO front half.
+
+The wrapper resolves `path` against the startup cwd, opens it nonblocking,
+proves it regular with `fstat`, reads it once, records the W5 content state,
+validates UTF-8, then calls the shared pipeline. Import and
+static-input producers record their outcome at the read that already owns those
+bytes. `PgoMode::Use` records the snapshotted profile bytes used for all keys
+and LLVM consumers. No second discovery walk, directory scan, path guessing,
+or ambient project configuration is allowed. `SourceFailed` prints the same
+`alignc: cannot read 'PATH': ...` prefix as the one-shot helper, followed by
+`revision N failed`; `Pipeline` uses the existing diagnostic rendering and
+retry rules.
+
+On the ordinary stale-cache shape, the CLI renders the first attempt while its
+`SourceMap` is alive, performs the sole reuse-forbidden observed call with a
+fresh `SourceMap`, then passes both sets to `merge_observed_build_inputs`.
+The merged set is the only value that may be finalized, used for publication,
+or installed. A second `ObservationFailed` or merge error consumes/drops the
+first evidence and exits through W9; a second ordinary failure merges and then
+uses `finalize_watch_inputs(..., None)`. This preserves the existing diagnostic
+echo and retry count without exporting constructors or moving retry policy into
+the library.
+
+`BuildInputTopologyError` is opaque and manually implements `Debug` and
+`Display`; it never derives through an internal path or `Hash128`. Its complete
+`Display` set is `path too long (maximum 1023 bytes; got LEN; hash HEX)`,
+`path 'ENCODED_PATH' contains NUL byte at offset OFFSET`,
+`path 'ENCODED_PATH' is not absolute`,
+`too many inputs (maximum 16384; next 'ENCODED_PATH')`,
+`too many merged inputs (maximum 32768; next 'ENCODED_PATH')`,
+`too many read-time path components while reading 'ENCODED_PATH' (maximum 131072)`,
+`too many path components while resolving 'ENCODED_PATH' (maximum 65536)`,
+`too many symlink traversals for 'ENCODED_PATH' (maximum 40)`, or one of W9's bounded
+phase/path/message forms without the outer watcher-error prefix. The path-too-
+long variant computes `LEN` and lowercase 32-digit `HEX` through the caller's
+borrowed bytes before cloning or issuing a filesystem call; it retains only
+those fixed-width values. Every other path-specific variant retains the
+admitted logical input or public output/repair `WatchPath`; a global rejected-
+next limit retains the admitted path whose insertion would cross the bound.
+Other variants retain only admitted `WatchText` and fixed counters.
+`finalize_watch_inputs` consumes its input even on `Err`, so read-time evidence
+cannot escape or be reused.
+
+Input classification is total and precedes parsing or any cache/native side
+effect for that input:
+
+```text
+1  missing path                    BuildInputState::Missing + BuildSourceError::Missing for entry
+2  opened target is not regular   BuildInputState::NonRegular + BuildSourceError::NonRegular for entry
+3  open/stat/read failure         BuildInputState::Unreadable + BuildSourceError::Io for entry
+4  complete regular bytes         BuildInputState::Regular(Hash128::of(bytes), len)
+5  invalid UTF-8 regular bytes     the same Regular state + BuildSourceError::InvalidUtf8 for entry
+```
+
+Imported-source and static/metadata failures retain their existing diagnostic
+types after recording the matching W5 state. A path that is missing and whose
+parent is also missing is still `Missing`; the watcher separately locates its
+nearest existing lexical or resolved-target ancestor through W6. A complete
+read that observes a different state for the same logical path sets
+`changed_during_attempt`; W5 retains the highest producer-ordinal state while
+forcing a following revision instead of treating that state as stable.
+
+### Validation and event order
+
+One revision has this logical order:
+
+```text
+started marker
+bounded path validation, entry read, and read-time identity observation
+complete frontend/static-input observation
+existing cache/rehydration/codegen validation and one retry
+merge first/retry observations when retry occurred
+finalize_watch_inputs(Some(output)): current topology/resource,
+  final semantic re-read, read-time stability, and output-alias validation
+existing link and atomic publication
+fallible success-line write on the protocol stream and flush
+ready or failed marker
+control checkpoint: graceful signal, then fatal backend slot
+add new watches
+post-registration snapshots
+remove obsolete watches
+drain/coalesce queued events
+state comparison
+next revision or wait
+```
+
+An ordinary failure does not skip observation or the terminal marker. The one
+stale-cache retry belongs to the same revision: its inputs are unioned with the
+first attempt, it prints no second `started`, and it produces one terminal
+marker. Retry observations are consuming-merged before either outcome. A failed
+candidate calls `finalize_watch_inputs(inputs, None)` after
+ordinary processing and before the terminal marker; this consumes its read-time
+evidence without resolving an output or authorizing publication. If the two
+attempts observe different semantic or topology state, W3 rejects publication
+and W6 schedules the next revision. The existing diagnostic echo rule remains
+first-attempt `All`, retry `ErrorsOnly`.
+
+Validation precedence within an attempt remains item 3's order. Watch-only
+failures occur outside it:
+
+```text
+1  invalid CLI / unsupported flag combination
+2  private transcript construction, then signal-handler and shared wake-pipe
+   installation
+3  post-signal-owner-publication atomic control-word snapshot
+4  initial native-watcher construction, with one atomic control-word snapshot
+   plus the synchronous error after each operation
+5  final pre-started atomic control-word snapshot; this linearizes startup
+   versus the active first revision
+6  per-path length, first-NUL, absolute-public-path, per-producer logical-input, and
+   read-time-evidence limits during observation
+7  first/retry observation merge and its 32,768-row/evidence limits, when retried
+8  ordinary source/frontend/cache/codegen result
+9  finalize_watch_inputs(None): evidence consumption for a failed candidate;
+   or finalize_watch_inputs(Some): current topology/resource,
+   final semantic state, read-time stability, existing output alias, then W14
+   absent-slot collation proof and cleanup
+10 W13 captured-child lease and `SIGCHLD` disposition, pipe/group/spawn setup,
+   child-output stop/write return/panic or group-check/status/poll/read result,
+   forwarded stop/grace when selected, pinned-group SIGKILL, child reap when
+   waitable, lease release, resumed sink panic or link; then W3 tool-output
+   identity/hash/length snapshot, isolated copy, resnapshot/destination hash,
+   tool-stage unlink, and publication-stage rename
+11 successful-build protocol-line write
+12 single protocol-stream flush, terminal-marker write
+13 one atomic control-word snapshot: graceful signal field, then fatal field
+14 65,536-row retained-watch merge, then combined-input-repair-topology limit
+15 W15 tentative-generation state comparison and compaction when present,
+   then watch/repair-handle addition with at most eight immediate expected-loss
+   replans; unchanged exhaustion arms the 50-ms retry without an error
+16 stable post-registration input/repair topology and semantic snapshot
+17 obsolete-handle removal, with already-lost handles as idempotent success
+18 event/debounce/transition-retry/audit timer delivery
+```
+
+The step-13 control snapshot is repeated before and after every step 14–17
+operation. W7's single Acquire load is the post-return linearization point and
+selects its signal field, then its fatal field, then any synchronous failure;
+that snapshot is final. A signal or fatal class stored after that load belongs
+to the following control checkpoint.
+
+For every other multi-invalid watch transition, the lowest numbered failure
+wins. An overflow is not an error and cannot outrank a build failure; it
+requests the post-attempt state comparison. A watcher error after `ready` does
+not retract the published executable, but the process exits nonzero because it
+cannot promise another revision.
+
+A pending graceful stop is control flow, not a watcher/build error. Signal and
+fatal state are checked immediately after an active revision's terminal marker
+and before/after each W6 transition operation in W7 order. The active revision's
+ordinary result therefore precedes the stop line unless W13 observes the signal
+while a captured child is live; an idle signal has no invented revision. In that
+child case the private sink reports the parent's first signal at the next
+control checkpoint. One pump poll lasts at most 50 ms, but synchronous sink
+callbacks are explicit unbounded backpressure and may delay that checkpoint.
+W13 then forwards the signal to the private child group and direct pid,
+escalates after 250 ms, sends final SIGKILL to both while the direct leader
+still pins their identities, and returns without a
+`failed` marker before the parent drops stages and emits `stop`.
+Terminal-generated and parent-only SIGHUP/SIGINT/SIGQUIT/SIGTERM therefore have
+the same bounded child-cleanup path.
+
+Decoded `watcher-error` record payloads identify the failing phase and path
+when one exists:
+`initialize: MESSAGE`, `transcript write: MESSAGE`,
+`transcript flush: MESSAGE`,
+`child wait setup: MESSAGE`,
+`child stdout read: MESSAGE`, `child stderr read: MESSAGE`,
+`child output poll: MESSAGE`, `child wait: MESSAGE`,
+`child group changed`, `child group check: MESSAGE`,
+`child group cleanup: MESSAGE`,
+`child stdout output: MESSAGE`, `child stderr output: MESSAGE`,
+`wake read: MESSAGE`,
+`add 'ENCODED_PATH': MESSAGE`, `snapshot 'ENCODED_PATH': MESSAGE`,
+`remove 'ENCODED_PATH': MESSAGE`, the W8 exact resource messages,
+`collation probe 'ENCODED_OUT'/'ENCODED_INPUT': MESSAGE`,
+`collation cleanup 'ENCODED_COMPONENT' for 'ENCODED_OUT'/'ENCODED_INPUT': MESSAGE`,
+`backend: disconnected`, `backend: io`, `backend: capacity`,
+`backend: invalid config`,
+`backend: other`, or `revision counter exhausted`, each behind the single
+decoded `alignc: watch: watcher error: ` prefix. `ENCODED_PATH` is always W2
+`WatchPath`; `ENCODED_OUT` and `ENCODED_INPUT` are its absolute-path form, and
+`ENCODED_COMPONENT` applies the same byte codec to one raw component without a
+separator. Dynamic `MESSAGE` is `WatchText`; the underlying OS message is
+informational and has no control-flow meaning. Asynchronous backend failures
+use only the static class strings above; callback-owned dependency messages and
+paths are never retained. Failure to write this line is the W2 unavailable-
+transcript exit, not a recursive watcher error.
+
+The native adapter's classification is exhaustive and ordered: refusal because
+one watched lookup no longer exists is nonfatal `PathLost`; explicit per-handle
+invalidation/removal is nonfatal `WatchLost`; callback-stream termination or
+transport disconnect is fatal `Disconnected`; an attached backend-wide OS I/O
+error is fatal `Io`; descriptor or backend watch exhaustion is fatal
+`Capacity`; an unsupported backend option/state is fatal `InvalidConfig`; and
+every remaining dependency variant is fatal `Other`. Overflow is the third
+nonfatal uncertain-bit case with path/watch loss. The adapter owner pins every
+dependency variant to nonfatal uncertainty or one fatal class so an update
+cannot silently change or omit the mapping.
+
+### Implementation closure matrix
+
+This is one implementation capability. Input observation without the
+foreground consumer is a dormant producer, while a watcher without exact
+producer-owned inputs either misses changes or scans unrelated state. The
+expected hand-written diff may exceed 1,000 lines because keeping these halves
+together avoids a second path-discovery algorithm and one unreviewable gap
+between read identity and event registration.
+
+| Cell | Required closure | Planned implementation and owner |
+|---|---|---|
+| D1 CLI parity | Every existing build flag/default/error composes with W1; every other verb rejects `--watch`. Startup configuration and both external-resource/runtime-freshness trigger boundaries are resolved/described once. | `main.rs` parser/help table and `watch_build` real-binary matrix, including exact help and no revision for an external replacement or workspace runtime-source edit alone. |
+| D2 input formation | Formation; length/NUL/absolute validation with offending identity; private construction/read-only access; exact producer, duplicate, and retry order; move/return; merge; observation-to-final typestate transition; repair-token formation/consumption; success replacement; and failure merge cover every W5 state and ordinary/ThinLTO/PGO path. The complete additive surface is W5 plus W13. | One observer plus exact exported-surface negative/trait inventory; parameterized owners cover entry-then-PGO-then-walk producer order, row/alias ordinals, merge state/evidence limits, finalization modes, final-to-observed conversion/merge/refinalization compile-fail negatives, repair snapshot/equality, every rejected path boundary and identity, external link-sink implementation, and Drop on every result. |
+| D3 read/register/publication race | A semantic/topology change around original/final reads or W15 registration cannot publish stale/torn bytes, replace a supplying resource, expose a child-writable publication inode, wait on the wrong bytes, or exit on expected path loss. Existing, exact-missing, and filesystem-folded both-missing output/input slots are rejected before link. Rejected output aliases remain repair dependencies until their topology changes and a recovery revision revalidates them. | One semantic/graph authority serves observation, finalization, repair token, existing alias validation, W14 common-parent collation proof, and W15 bounded add-snapshot-remove; barriers cover writes/replacements/folding/hard links, both-absent parent/leaf combinations, probe identity loss before unlink, concurrent Align collisions, every registration path-loss position, alias-time-to-install removal, tool-output mutation after the first isolation snapshot and during copy, W1 writer-joined handoff for direct and internally spawning production tools, permission-mode drift, identity-aware tool/publication-stage cleanup, and dropped-event audit recovery. |
+| D4 event lifecycle | Startup-before-init, initialization, pre-`started`, normal/identical/burst/max-debounce/full-pipe/overflow/path-loss/watch-loss events, event during compile, W15 immediate/timed retry and tentative-generation compaction, the complete prior/current 4x4 W5 state product including readability recovery, every fatal class/first-error order, periodic audit, 16,384/32,768/65,536-row failed-set and repair-output merge bounds, refreshed failure baselines, identical-content inode replacement with and without repair-output role, idle/active four-signal shared-pipe wake, signal/fatal/synchronous-transition precedence, and terminal cleanup wake/stop exactly once. | Injectable event/timer/error source, one shared pipe, dirty/uncertain atomics plus the exact shared signal/fatal `AtomicU16` control word, startup and every before/after-transition control snapshot, W15 retry budget/deadline/generation state and repeated-churn peak bound, total semantic classifier, logical/repair merge owner including last-success-only mutation hidden by entry failure, bounded-read poll owner, backend shutdown, and process teardown; native adapters stay thin. |
+| D5 build control paths | Initial/repeated success; ordinary/ThinLTO cardinalities; semantic/alias rejection and repair including W14's both-absent folded slot; retry/PGO/cache combinations; child output/success/failure/abort/detachment; edit/revert/malformed input; and both W1 trigger-excluded boundaries preserve ordinary pre-link/link/publication semantics. Both W13 `_with_output` entry points cover ordinary, PGO-use, PGO-instrument, ELF strip, and macOS strip without changing the legacy entry points. | Existing owners plus `watch_build` revision, retry, finalization, collation/repair recovery, exact five-symbol W13 inventory, external sink default/four-state forwarded stop and return/panic with resumed payload, accepted/rejected `SIGCHLD`, captured-child overlap, pump/pinned-process-group-and-pid cleanup, supported-tool inode preservation and two-stage output isolation, last-good publication, external/resource-freshness trigger, and route/cardinality parity owners. |
+| D6 concurrency and cleanup | Worker panic cleanup remains; watcher callbacks and signal handlers do not block, while W13 sink callbacks have explicit unbounded caller-controlled duration; atomics select overflow/fatal/signal; evidence, repair tokens, W14 random probes, W15 partial handle sets, pump buffers/fds/process groups, captured-child lease, workers, stages, handles, control fds, and direct children do not outlive owners. Signal setup is singleton and rollback-complete before publication; afterward the still-installed handlers and shared pipe remain process-lifetime with no close/reuse race. Every watcher/control/probe fd is close-on-exec. Descendant-retained, continuously written, or permanently unreadable child-output pipes cannot extend the fixed queued-byte quota or introduce an EOF wait; synchronous sink callbacks remain the explicit source of unbounded wall-clock delay before descriptor close, final group/direct-pid SIGKILL sends, and direct-child reap. W13 claims no descendant quiescence after an accepted group signal; W1 separately requires every supported tool to join output writers before successful return, and W12 gives a violating detached writer no artifact guarantee. | Existing panic owner plus finalization/repair Drop, W14 create/lookup/pre-unlink-identity/unlink/link-count/fd cleanup and cooperative-collision barrier, W15 reverse rollback/idempotent loss/tentative-generation compaction/unexpected failure, watcher atomics, every startup/signal barrier, backend shutdown while the process-lifetime pipe remains live, terminal `process::exit`, exec descriptor-table negative, W13 lease/disposition/partial-setup rollback, armed-child-guard Drop at every barrier, and unwind-safe sink cleanup/resumed unwind, blocking-write/nonblocking-read, every-outcome drain/pinned-group-and-pid-KILL/reap, forwarded stop at the next control checkpoint, one at-most-50-ms poll for prompt sinks, explicit blocking-callback delay, then matching signal/250-ms grace/pinned-group-and-pid-KILL/reap, permanent-error TERM/grace/pinned-group-and-pid-KILL/reap, direct-group-change detection, production-tool writer joining, explicit detached-writer contract negative, two-publisher barrier, and bounded child owners. |
+| D7 identity and authorization | Memo, persistent frontend, packaged fallback, object, ThinLTO, PGO, compiler/LLVM, target, and runtime identities are unchanged. Rejected frontend keys remain rejected across every revision and process. | Existing cache codec/rejection owners plus multi-revision exact-key test. |
+| D8 resource bound | Exact/rejected-next length/NUL/absolute-path/per-producer/retry-merge input, exact retained-watch-input maximum, combined-input-repair-graph/evidence/finalization/symlink/encoding/message/frame/post-exit limits and each bounded offending identity; W14 descriptor `NAME_MAX`, 1,023-byte effective component limit, 36-byte suffix, 16 attempts, one directory fd plus one probe fd and two fixed 1,024-byte buffers; W15 eight immediate attempts, 50-ms deadline, one tentative generation, and pre-next-generation compaction within existing handle maxima; W13 one lease bit, one armed guard record, one caller-owned panic payload, fixed status record, existing at-most-50-ms pump poll interval without an end-to-end stop bound across synchronous callbacks, and 250-ms abort grace; W13 exact/rejected-next 8-GiB tool output, at most 16 GiB across two output stages, one 64-KiB buffer, and fixed identity/length/mode/hash isolation snapshots; shared wake pipe/control word; non-overlapping scan; 64 KiB hash and fixed transcript/pump buffers; nonblocking special-file rejection; checked counters; and memo refusal are reachable. | Parameterized limit/merge/repair/encoding/frame/pump/snapshot/isolation/overflow/fatal/FIFO/sparse/RSS/timer/probe/registration-generation owners assert the encoded logical path or path pair, or fixed length/hash for the overlong case, on every refusal. |
+| D9 observable transcript | The single stderr protocol stream fixes startup-without-`started`, marker/prerequisite order, marker atomicity, write/flush/wait-setup/sink/group-check/status/poll/read/group-cleanup failure, no-stdout behavior, reversible frames for every nonterminal record, instability/alias/collation/resource/backend/wake/pump errors with offending identity, non-diagnostic W15 expected path/watch loss, decoded in-process/child logical channels, object/link order, behavior, and exits for success/failure/recovery/watcher error. Active-child SIGHUP/SIGINT/SIGQUIT/SIGTERM forwards the same signal and emits only the terminal `stopped` line after cleanup, never `failed` or watcher error. Linked executables are not byte-compared on macOS. | One-pipe golden transcript and no-panic private-watch-sink owner with every startup checkpoint, kind/state/chunk boundary, all-byte and marker-shaped diagnostic/cache/message/path/child injection, decoded bounded parity, short marker writes, full/partial/flush/wait-setup/sink/group-check/status/poll/read/group-cleanup errors, terminal-generated and parent-only SIGHUP/SIGINT/SIGQUIT/SIGTERM during every child phase with prompt and blocking callbacks, pipe-backed one-shot child-stream parity, tool-output isolation, stage-path replacement, permission-mode drift, supported-tool writer joining, mutation/repair/collation/registration-compaction, exact limits/classes/identities, and one-shot object/link/program comparison. |
+| D10 non-impact | One-shot build/run/size, both legacy inherited-stdio link entry points, `align-repl`, inspection verbs, release layout, and public input/output slots remain unchanged except for the additive flag/help text, W5 records, W13 `LinkStopSignal`/sink/link entry points and their explicit default-control/blocking-callback semantics, internal two-stage publication and `SIGCHLD` caller contracts, W14's reserved private probe namespace, and the external-resource/runtime-freshness trigger boundaries. | Existing bounded gate, W14 public-slot nonmutation plus cooperative-concurrency, clean-path no-residue, and cleanup-failure residue-identity owners, legacy/new link-route parity under equivalent pipe-backed stdio, external-sink default/opt-in four-signal stop and internal publication-isolation owners, REPL owners, release workflow structural test, usage/help snapshot, and parameterized external-resource/runtime-source mutation owner. |
+
+The author-side matrix-to-diff pass must bind every applicable cell to an
+implementation site and a discriminating owner before the implementation
+review. A review finding about a missed input, registration window, event
+overflow, cache authorization, or cleanup reopens that entire class across D2,
+D3, D4, D6, and D7 rather than patching one path.
+
+### Design review closure
+
+This is chronological review evidence. When a later reopened matrix changes a
+mechanism named by an earlier row, the later closure and W1–W15 ledger
+supersede that mechanism; the earlier row remains the record of what triggered
+the redesign.
+
+The first independent review of the item 5 ledger found four valid gaps. The
+fix is class-wide and ledger-first:
+
+| Finding | Closure |
+|---|---|
+| P1: the observed wrapper had no ThinLTO route | W4/W5 now define the ordinary pipelined and all-MIR per-unit observed siblings separately; D2/D5 require identical input observation and preserve the existing ThinLTO codegen/cache/link route. |
+| P1: `Missing` content state could hide newly created ancestors or an intermediate-symlink replacement | W6/W7 now make lexical component topology an independently compared state, refresh/install it on every wake before content comparison, and own multi-level creation plus symlink replacement. W8 bounds the new dimension. |
+| P2: default SIGINT/SIGTERM termination cannot run stage/child cleanup | W9 replaces default termination with one binary-owned async-signal-safe stop request and self-pipe. An active revision and its children finish/reap before conventional 130/143 exit; D4/D6 and acceptance cover every phase. SIGKILL is the explicit no-cleanup escape. |
+| P3: 20 warmed units were all called first-party package units | The item 4 row now distinguishes 19 source package modules from the generated warm entry. |
+
+Because the first two findings add a public observed route and change watcher
+strategy, the revised design receives a fresh complete review before
+implementation. A further P1/correctness finding reopens D2–D8 rather than
+starting a third local patch round.
+
+That fresh review found two more P1 gaps and two protocol/portability gaps, so
+the local patch loop stopped and the matrix was reopened on
+`symlink-resolution-and-event-loss`. The replacement boundary makes resolved
+filesystem topology and periodic semantic verification independent correctness
+owners; native delivery is only the low-latency accelerator:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: a one-unit `--thin-lto` walk would call the two-or-more-unit backend | The exact ThinLTO route now branches on cardinality after observation, preserving `codegen_units_parallel` for one unit and `build_thin_lto` for two or more; D5 owns both. |
+| P1: a dangling symlink could resolve outside the lexical input tree | W6 now follows bounded absolute and relative target chains, retains both lexical and target-side nodes, and watches the target-side deepest existing ancestor; D3/D8 own dangling, nested, cycle, and repair cells. |
+| P2: a stderr `ready` marker could overtake block-buffered stdout | W2 requires successful stdout flush after publication and before `ready`; flush failure is an exact W9 protocol error, and D9 uses a pipe-backed owner. |
+| P2: inotify may omit writable-`mmap` or remote-filesystem changes | W7 now performs a fixed two-second full semantic audit after each no-change comparison. Event and timer paths share the same non-overlapping comparison, and D4/D8 own dropped-event, no-event, and scan-lifetime cells. |
+
+This is a boundary redesign rather than a second line-level correction. D2–D8
+are reopened together: observation feeds resolved topology; resolved topology
+and semantic bytes feed both event and audit wakes; cardinality selects the
+existing ThinLTO backend; and one resource/cleanup model owns all paths. The
+redesigned full diff requires a fresh independent review before implementation.
+
+The review of that redesigned boundary exposed a separate same-resource axis
+and one state-merge ambiguity, including another P1. The patch loop stopped
+again and D2–D8 were reopened on `same-resource-and-failure-state`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: publication could replace a file-backed input that aliases the output | This revision put W6's resolved-slot authority after complete observation and before link/publication, covering lexical, parent-alias, and resolved-target matches. The later filesystem-identity review below supersedes its attempted distinct-hard-link allowance. |
+| P1: `last_successful ∪ current_attempt` did not define an overlapping path's state | W5 assigns exact producer ordinals within an attempt/retry and W6 defines failure merge as all current records plus only absent last-success records. D2/D4 own overlap, absence, and no-spin behavior. |
+| P2: W12 denied process-global mutation while W9 installed signal handlers | W9 now owns a process-global singleton with side-effect-free second-install rejection and exact partial-setup rollback; W12 named that then-sole mutation and limited concurrency claims to separate OS processes/output publication. The later W13 lease revision extends the inventory explicitly. D6 owns setup, overlap, rollback, and successful process-exit lifetime. |
+
+The resulting capability still has one consumer boundary: the observed input
+set, its resolved topology/slots, failed-state merge, event/audit loop, and
+publication decision are mutually dependent. The newly redesigned full diff
+receives another fresh independent review before implementation.
+
+That review found two more P1 aliases plus four implementability/protocol gaps.
+The matrix was reopened on `filesystem-slot-and-protocol-atomicity`; the
+replacement boundary treats the entire input access path as publication safety
+state and makes all long-lived transcript/setup operations explicitly fallible:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: output could replace an intermediate symlink/directory used to reach an input | W3 compares output against every W6 traversed directory-entry node, not only lexical/final input slots; D3 owns an output-named intermediate symlink and directory. |
+| P1: raw component bytes miss case-/Unicode-folded aliases | W3 uses native nofollow identity after filesystem lookup. It deliberately rejects distinct hard links too, avoiding a portable directory-entry-equivalence guess; D3/D8 own folded and hard-link cells on supported filesystems. |
+| P2: arbitrary path bytes could inject a false protocol line | W2 defines reversible percent-encoding over raw Unix bytes and W4/W9 route every watch-mode path field through it; D8/D9 own capacity, round-trip, newline, non-UTF-8, and marker-shaped cases. |
+| P2: a signal between handler registrations could retain default termination | W9 blocks both signals across pipe/handler setup, activation, and rollback, restoring the saved mask only after a complete owner or cleanup; D6 owns every barrier and pending delivery. |
+| P2: the ordinary success-line write could fail before explicit flush | W2 moves both locked stdout write and flush under one fallible boundary with distinct watcher errors and no false `ready`; D9 owns full, partial, and flush failures. |
+| P2: public `BuildInput` fields contradicted private construction/mutation | W5 makes both fields private, adds read-only accessors, fixes derives, and adds an external-construction negative in D2. |
+
+D2–D9 are reopened together because public input encapsulation feeds topology,
+every topology node feeds publication safety, path encoding spans all errors,
+and signal/stdout setup owns whether the transcript can be promised. The full
+redesigned diff receives a fresh independent review before implementation.
+
+That review found one remaining publication race and two bounded-state gaps.
+The matrix was reopened on `read-time-identity-and-async-errors`; the redesign
+retains the identities that actually supplied bytes and makes every callback-
+owned failure a fixed-size control value:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: final alias resolution could forget a symlink/hard-link node removed or retargeted after its bytes were read | W4 retains bounded pre-open, opened-leaf, and post-read identities until W5 finalization. W3 compares that evidence with current topology, rejects any instability before link, and includes both sets in output-alias validation. D2/D3 own every removal/retarget barrier and evidence consumption. |
+| P2: dirty/uncertain bits could not carry an asynchronous backend failure or deterministic first message | W7 mapped callbacks to the then-seven static classes in one `AtomicU8`; compare-exchange preserves the first class and the one-slot channel is only a wake hint. W15 later reclassifies per-handle path/watch loss as uncertainty, leaving five fatal classes. W9 fixes signal precedence and the exact lines; D4/D6/D9 own every class, two-error ordering, and a full wake channel. |
+| P2: retained/encoded paths had no platform-independent byte ceiling | W4/W8 admit 1,023 raw bytes and reject 1,024 before retaining, using, or encoding the path with an exact length/hash error. W8 separately bounds read-time, current, and combined nodes; D2/D8/D9 own accepted/rejected-next allocation and transcript behavior. |
+
+D2–D9 are reopened together: observation now produces a linear read-identity
+owner consumed by publication finalization, while event callbacks publish only
+bounded atomic state consumed in the same signal/error/event order. This full
+redesigned diff requires a fresh independent review before implementation.
+
+The next review found a new P1 semantic-publication race plus two completeness
+gaps, so line-level patching stopped and the matrix was reopened on
+`semantic-stability-and-complete-input-union`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: same-inode content writes after observation could publish stale or torn bytes | W3/W5 finalization now streams every logical input into a new total semantic snapshot after codegen and before alias/link, with graph and opened-leaf identity around that read. Any semantic or topology difference rejects publication and schedules another revision. D3/D8/D9 own every in-place and topology barrier. |
+| P2: private sets had no reviewed operation that could preserve both stale-cache attempts | W5 adds one exact consuming `merge_observed_build_inputs` export. It defines ordinal/state precedence, evidence union, the combined limit, and cleanup on `Err`; D2/D5 own success, second failure, and merge failure without exposing construction. |
+| P2: project-supplied `-l` archives were absent from both observation and the restart boundary | This revision attempted to make every capability/user linked library restart-only even under `LIBRARY_PATH`. The following review showed that a later ordinary link could consume a replacement, so the trigger-excluded boundary below supersedes this wording. |
+
+D1–D10 are reopened together because the retry merge is the sole owner of the
+evidence later consumed by semantic finalization, the final snapshot authorizes
+publication, and the help/non-impact contract must expose the only intentionally
+unwatched input class added by user code. This full redesigned diff requires a
+fresh independent review before implementation.
+
+The review of that boundary found that its `restart-only` wording was stronger
+than the ordinary per-revision linker mechanics. The matrix was reopened on
+`external-link-trigger-semantics` rather than adding hidden pinning or a second
+link-resolution path:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: a later source edit could make the fresh linker consume a replaced archive despite the restart-only promise | W1/W4/W10 now define external link-time resources as trigger-excluded: replacement alone starts no revision, while the next observed change or restart runs the ordinary resolver and may consume it. D1/D5/D10 and acceptance cover each resource class, including replacement followed by a watched edit. |
+
+This narrows the public promise to the exact existing linker semantics while
+keeping every unobserved input visible. The changed W1 strategy receives a
+fresh full review before implementation.
+
+That review found three lifecycle gaps and reopened the matrix on
+`subprocess-framing-and-alias-repair`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: inherited child stderr could inject a false terminal marker | W2/W13 pipe both child streams through bounded raw-byte framing and flush them before one atomic terminal-marker write. D5/D8/D9 own arbitrary bytes, both streams, pump errors, descendants, and decoded one-shot parity. |
+| P2: removing a distinct-hard-linked rejected output did not change any installed input | W5 returns the alias-time output graph as an opaque repair dependency; W6 installs and compares it until removal/replacement triggers recovery or success clears it. D2–D5 own alias-time-to-registration races and event-dropped audit repair. |
+| P2: signal-pipe descriptors could leak through `cc`/linker/strip exec | W8/W9 require nonblocking plus close-on-exec on both signal-pipe ends before handler publication, extend that rule to every watcher/control descriptor, and roll back each flag failure. D6 and acceptance inspect the exec child descriptor table. |
+
+Child framing, repair topology, and descriptor lifetime meet at the same
+revision/child transition, so they remain one implementation boundary. The
+changed W2/W5/W6 strategy receives a fresh full review before implementation.
+
+That review found five determinism and liveness gaps and reopened the matrix
+on `ordered-input-and-shared-wake-liveness`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: producer ordinals did not fix public row, duplicate, or retry order | W4 enumerates each producer in encounter order; W5 raw-byte-sorts rows and fixes latest state, retry overlap, evidence union, and `alias_index`. D2 owns the complete order. |
+| P2: public path arguments had no embedded-NUL contract | W5/W8 reject length, then first NUL, then relative shape before allocation, graph lookup, or filesystem side effect. D2/D8 own every boundary and precedence combination. |
+| P2: the complete topology-error inventory omitted the logical-input limit | W8 and the complete `BuildInputTopologyError` list both name `too many inputs (maximum 16384; next 'ENCODED_PATH')`; validation order and the rejected-next owner include it. |
+| P2: the signal pipe and event channel gave the idle loop no single wait | W7/W9 replace the channel with one nonblocking shared wake pipe whose bytes are hints and whose atomics retain event/error/signal state. D4/D6 own poll, coalescing, precedence, and backend-before-pipe cleanup. |
+| P2: post-reap draining could follow a continuously writing descendant forever | W13 snapshots each queued byte count once, enforces a 1,048,576-byte bound, drains only that quota, and closes. D6/D8/D9 own accepted/rejected counts, continuous writers, and decoded parity. |
+
+These fixes define public ordering plus the two blocking wait boundaries, so
+they remain one implementation strategy and receive a fresh full review.
+
+That review found three remaining stream and teardown gaps and reopened the
+matrix on `single-transcript-and-process-lifetime-signal`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: a stderr readiness marker could be dequeued before prerequisite stdout | W2 moves every watch-mode record to one stderr protocol stream and leaves stdout unused. Same-descriptor order now places diagnostics, child frames, cache/success lines, and flush before the atomic marker; D9 owns one-pipe observation. |
+| P2: nonblocking pre-dup child write ends exposed `EAGAIN` to tools | W13 leaves each write end blocking and applies `O_NONBLOCK` only to the distinct parent read open-file descriptions. D6/D9 own pipe-capacity backpressure and decoded one-shot parity. |
+| P2: a live handler could write through a closed/reused wake descriptor | W9 permits rollback only before publication. Published handlers and pipe descriptors have process lifetime and no `Drop`; after explicit compiler/backend cleanup, `std::process::exit` gives them directly to kernel teardown without a reuse window. D4/D6 own signals at every terminal barrier. |
+
+The transcript descriptor, child pipe flags, and signal descriptor lifetime are
+one subprocess I/O strategy and receive a fresh full review.
+
+That review found three final protocol/input-order gaps and reopened the matrix
+on `framed-record-and-post-revision-precedence`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: ordinary in-process text could spoof an unframed terminal marker | W2 frames every nonterminal logical record with fixed kind/state, bounded raw chunks, and reversible byte encoding; terminal lines are the only unframed bytes. W8/D9 own the maximum frame and marker-shaped diagnostic/cache payloads at every chunk boundary. |
+| P2: W7 and the validation table disagreed on fatal-versus-transition failure | W7 plus the numbered order use one Acquire snapshot before and after each transition: signal, fatal class, then operation error. D4/D9 own the Cartesian multi-invalid order and selected transcript. |
+| P2: workspace runtime-source freshness reads were absent from the trigger inventory | W1/W4/W10 classify the baked tree separately as trigger-excluded. Mutation alone is quiet; the next observed edit or restart matches one-shot stale-runtime checking, and installed absent/unreadable trees remain no-op. D1/D5/D10 and acceptance own edit/restore. |
+
+Record framing, terminal-result selection, and the complete pre-link input union
+are one externally observable watch protocol and receive a fresh full review.
+
+That review found three remaining public-seam and input-identity gaps and
+reopened the matrix on
+`link-seam-state-reclassification-and-error-identity`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: watch could reach linker and strip children only through inherited-stdio public functions | W13 adds the exact externally implementable sink plus ordinary and instrumented `_with_output` functions, covers every linker/strip route, and leaves both legacy functions unchanged. D2/D5/D10 own the complete export and route inventory. |
+| P2: an unchanged regular inode could recover from `Unreadable` without a topology change | W7 reclassifies every logical input on both event and audit comparisons and compares the complete 4x4 W5 state product. D4 owns explicit permission/read recovery and dropped-event witnesses. |
+| P2: path-specific topology errors omitted the path that must be repaired | W8 and `BuildInputTopologyError` retain and display the admitted encoded logical path for every path-specific or rejected-next refusal; only an overlong path uses its bounded length/hash identity. D2/D8/D9 own every exact payload. |
+
+The exported link seam, total semantic state comparison, and bounded error
+identity are implementation-defining contracts and receive a fresh full
+review.
+
+That review found a publication-safety P1 plus two startup/child liveness gaps
+and reopened the matrix on `absent-slot-startup-and-pump-abort`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: two absent names that fold to one filesystem slot had no identity to compare | W14 adds a retained-parent, random-suffix collation proof before link. It detects ASCII-case and Unicode-normalized equivalence without touching either public slot, and W3/D3 keep the resulting alias as a repair dependency. |
+| P2: a stop delivered after signal publication could wait through revision 1 | The startup-to-active boundary now has an Acquire snapshot before backend construction, after every initialization operation, and immediately before `started`. D4/D9 own every pending signal/error product and the no-invented-revision transcript. |
+| P2: a permanent live-child read error could leave the child blocked on its full pipe | W13 gives each captured child a private process group and closes both reads plus performs bounded TERM/grace/KILL/direct-reap on a permanent poll/read failure. D5/D6/D8/D9 own normal sink drain separately from mandatory abort. |
+
+The P1 changes the publication proof and the two P2 findings share its
+pre-publication/early-exit lifetime boundary. W3/W14 collation, W9 startup, and
+W13 process-group cleanup therefore remain one revised implementation boundary
+and receive a fresh full review before implementation.
+
+That review found one registration-liveness P1 and one child-quiescence gap,
+so the patch loop stopped and the matrix was reopened on
+`registration-churn-and-descendant-quiescence`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: a watched path disappearing during handle addition was treated as a fatal transition error | W15 makes synchronous add loss a bounded replan over a fresh W6 graph and total semantic state, keeps old coverage until a stable add-snapshot pass, and moves asynchronous per-handle loss into W7's nonfatal uncertainty path. Changed state schedules a revision; eight unchanged races defer one retry for 50 ms without spinning. D3/D4/D6/D8/D9 own every loss position, rollback, deadline, fatal-class distinction, and transcript. |
+| P2: the direct child could exit while an in-group descendant retained a pipe or modified the stage | W13 observes direct exit without reaping, drains only one bounded queued-byte snapshot, closes both reads, then sends SIGKILL to the still-pinned private group before reaping the leader. The same order now covers success, child failure, and sink failure as well as the existing live-child pump-abort path. D5/D6/D8/D9 own every direct-child outcome, group-cleanup failure, and post-return stage/pipe quiescence. |
+
+The P1 changes which native registration failures are recoverable, while the
+P2 changes the successful child-lifetime boundary rather than only an error
+path. W6/W7/W15 transition state and W13 process-group cleanup therefore form
+one newly reviewed implementation strategy. This full redesigned diff requires
+a fresh independent review before implementation.
+
+That review found another child-lifetime P1 and a probe-ownership race, so the
+matrix was reopened on `sigchld-and-probe-namespace-ownership`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: inherited `SIGCHLD` auto-reap state or an unproved group-kill failure could release the stage while a child remained live | W13 acquires one process-wide captured-child lease before allocation, rejects every disposition except `SIG_DFL` without `SA_NOCLDWAIT`, and makes unsafe disposition mutation/native reaping an explicit public caller violation. Every direct-child outcome retains the stage and lease through SIGKILL, waitable-child reap, and a 10-ms group-existence loop until `ESRCH`; neither `ECHILD` nor a kill/check error is an early return. D5/D6/D8/D9 own disposition, overlap, rollback, error precedence, and group-absence proof. |
+| P2: pathname cleanup could unlink a replacement installed under the random W14 name | W14 reserves its high-entropy component namespace for cooperative Align probes, performs a nofollow retained-fd identity check immediately before unlink, and preserves an unequal or missing current entry with exact ownership-lost cleanup failure. Concurrent Align instances never replace a claimed name; mutation by a non-Align process after the final identity check is explicitly outside that pathname-only concurrency contract. D3/D6/D10 and the probe barrier owner cover replacement before the check plus concurrent collisions. |
+
+The P1 changes process-global admission and the return boundary for every
+captured tool, while the P2 changes the filesystem-concurrency contract used by
+the publication proof. W13 child ownership and W14 probe ownership therefore
+require one fresh full-diff review before implementation.
+
+That review found an unwind P1 plus two phase/resource ownership gaps, so the
+matrix was reopened on `unwind-phase-state-and-generation-bounds`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: an external sink panic could unwind past captured-child cleanup and permanently retain the lease | W13 arms a private captured-child guard immediately after spawn and catches only the sink callback with `AssertUnwindSafe`. It retains the original opaque payload, closes both reads without further callbacks, completes immediate KILL/reap/group-absence cleanup, disarms/releases the guard and lease, and then calls `resume_unwind`; any other unexpected unwind invokes the same no-panic guard `Drop`. It never replaces the process panic hook or turns the panic into an ordered diagnostic. D5/D6/D8 own panic before/after output, every post-spawn guard barrier, hook count, payload identity, child/stage absence, and immediate lease reuse. |
+| P2: `into_parts` returned evidence-consumed state as the same type accepted by merge/finalize | W5 introduces the distinct `FinalBuildInputSet` phase returned by `FinalizedWatchInputs`; no constructor or conversion recreates `BuildInputSet`, and both merge and finalize continue to accept only the evidence-bearing observed type. D2 owns external compile-fail negatives for conversion, merge, and refinalization. |
+| P2: consecutive changed post-add snapshots could accumulate unbounded handle generations | W15 permits only a stable baseline plus one tentative generation. Before another add, an unchanged total snapshot compacts the retained union to currently desired handles; a changed snapshot schedules a revision without adding. W8 proves at most 65,536 retained desired plus 65,536 new handles, and D4/D6/D8 own three-or-more changed generations, compaction races, and the fixed peak. |
+
+All three findings concern a value that crossed its owning phase without a
+closed transition: unwind skipped cleanup, finalization erased evidence without
+changing type, and a retained handle generation became the next baseline.
+W5/W13/W15 now make each transition explicit and bounded. The resulting full
+diff requires a fresh independent review before implementation.
+
+That review found two consistency and liveness gaps and reopened the matrix on
+`foreground-child-stop-and-read-order`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P2: moving each captured tool into a private process group prevented a terminal-generated Ctrl-C from reaching that tool while W9 waited for it | W13 adds `LinkStopSignal` and a default-`None` `stop_signal` control method. The private watch sink maps W9's first signal without allocation or output; the pump observes it within the existing 50-ms poll bound, closes reads, forwards the matching signal, allows 250 ms, then performs mandatory KILL/reap/group-absence cleanup. W9's signal outranks the internal stop sentinel and cleanup error, so terminal-generated and parent-only SIGINT/SIGTERM emit only the terminal `stopped` line after quiescence. D5/D6/D8/D9/D10 own the public seam, callback/control ordering, error precedence, both delivery modes, and every child phase. |
+| P2: W4 listed PGO observation after the importer even though the shared pipeline reads it before walking imports | W4 now fixes the actual temporal order as entry, ordinary `--pgo-use` snapshot, then breadth-first imports and static/metadata reads. D2 and the stale-retry owner assert that exact producer order independently of the public raw-byte sort. |
+
+The first finding changes the public sink seam and foreground-stop strategy,
+not merely one owner assertion. The full redesigned diff therefore requires
+one fresh independent review before implementation.
+
+That review found two child-lifetime P1s plus three resource/protocol gaps. The
+matrix was reopened on `tool-output-isolation-and-pinned-group-cleanup`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: a descendant could leave the captured process group and later mutate the stage | W13 now declares ownership only of the direct child and descendants that preserve its assigned group, verifies the direct child's PGID at every pump barrier, and requires external callers to keep the output private unless their tools honor that contract. Watch does not rely on cooperation for publication: W3 gives tools one random stage, copies a stable identity/hash/length snapshot into a second random stage that external code never sees, unlinks the tool inode, and publishes only the isolated inode. A detached helper can outlive W13 by its own tool owner but cannot mutate the published candidate. D3/D5/D6/D8/D9/D10 own direct detachment, a detached writer at every copy barrier, isolation failure, and post-publication mutation attempts. |
+| P1: SIGHUP or terminal SIGQUIT could take the default exit while a private-group tool survived | W9's complete graceful-control set is now SIGHUP/SIGINT/SIGQUIT/SIGTERM with conventional 129/130/131/143 exits, and W13 forwards the matching four-state `LinkStopSignal`. Every other default-fatal signal remains an explicit no-cleanup process failure, but W3's unexposed publication stage means such an exit cannot publish or leave a child able to mutate a public candidate. D4/D6/D9 own all four setup, idle, active-child, cleanup-barrier, terminal-generated, and parent-only cases. |
+| P2: current-attempt plus last-success inputs could exceed the nominal installed limit | W8 distinguishes the 16,384-row producer limit and 32,768-row first/retry merge with exact rejected-next errors. W6's failure retention is a checked union of current and absent last-success rows, so its two admitted operands structurally cap it at 65,536 before graph construction without an unreachable extra refusal. W5/W6 and D2/D4/D8 own overlap, disjoint maxima, error precedence, Drop, and the resulting graph/registration ceilings. |
+| P2: reaping the leader before probing its numeric PGID allowed unrelated reuse | W13 keeps the observed direct leader unreaped through final SIGKILL to both the captured group and direct pid. Accepted/`ESRCH` results prevent further user execution by the direct child and group-preserving owner set; only then does it reap the leader and it never consults either numeric identity again. D5/D6 own every outcome, kill error/retry, the pinned identities, and an immediate unrelated PID/PGID reuse attempt after reap. |
+| P2: child-stream byte parity was impossible when legacy one-shot stdio was a TTY | W2/D9 scope byte parity to a one-shot invocation whose stdout and stderr are separate pipes, matching W13's non-TTY descriptor mode. Terminal-backed legacy behavior remains unchanged and is a non-impact check, not a byte-equality oracle. |
+
+The P1 response changes the artifact-publication boundary and the child owner,
+while the signal and PGID changes alter every captured-tool exit. W3/W9/W13
+therefore form one redesigned containment strategy and require a fresh
+full-diff review before implementation.
+
+That review found a remaining child-lifetime P1 and one error-inventory gap, so
+the matrix was reopened on
+`mandatory-publication-isolation-and-topology-error-completeness`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: an accepted process-group SIGKILL did not prove descendants had stopped, yet an external caller could publish the same inode when tools preserved the group | W13 now claims a no-further-execution boundary only for the reaped direct child. Every `_with_output` caller, without exception for tool behavior or group membership, passes a private tool path and after successful return copies and verifies it into a distinct unexposed inode before making an executable path reachable; error and unwind paths drop it unpublished. Watch uses W3 as the sole implementation: group-preserving and detached descendants may continue briefly but can reach only the tool inode. D3/D5/D6/D8/D9/D10 own the external-caller negative, both descendant classes, mutation after accepted group signal, and isolated-byte/mode publication. |
+| P2: the complete topology-error inventory omitted retry-merge overflow | The complete `BuildInputTopologyError::Display` set now includes exact `too many merged inputs (maximum 32768; next 'ENCODED_PATH')`, matching W5/W8 validation order and the reachable 32,769th-row refusal. D2/D8/D9 own the exact message, offending identity, pre-retention failure, and evidence Drop. |
+
+The P1 removes tool cooperation as a publication precondition and changes the
+public `_with_output` caller contract across every route. This latest W13/W3
+boundary and the synchronized W5/W8 error inventory require one fresh
+full-diff review before implementation.
+
+That review found two ownership/liveness P1s and two consistency gaps, so the
+matrix was reopened on
+`stage-path-ownership-mode-and-callback-liveness`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: a surviving descendant could replace the child-visible tool-stage pathname and make cleanup unlink the replacement | W3 exclusively precreates the tool inode, retains its close-on-exec descriptor and identity before spawn, and requires every supported tool route to preserve that inode. It verifies pathname ownership after W13 and again immediately before unlink: matching is removed, missing is already clean at final cleanup, and unequal is preserved with exact `tool stage ownership lost` and no publication. Ordinary error cleanup and no-panic unwind guards apply the same identity-aware rule to both stages. The unavoidable same-uid mutation after the final comparison remains W12's explicit external-writer boundary. D3/D5/D6/D9 own supported-tool inode preservation plus success/error/unwind replacement at every cleanup barrier and preservation of the foreign inode. |
+| P1: a synchronous sink callback could block past the claimed 50-ms graceful-stop bound | W13 keeps synchronous non-`Send` callbacks and removes the false end-to-end latency promise. Fifty milliseconds bounds one pump poll only; a blocking `write` or `stop_signal` delays the next control checkpoint without a deadline, and SIGKILL remains the force-stop escape. Prompt sinks retain one-poll detection. D5/D6/D8/D9/D10 own prompt, blocked-then-returned, permanently blocked/force-stopped, sink-error, and signal-precedence cases. |
+| P2: output isolation did not revalidate executable mode | W3 snapshots permission mode with source identity/length before copy, reapplies it to the destination, then requires equal source-before/source-after/destination length/mode/hash plus stable source and publication-stage identities. Mode-only drift selects exact `link output changed during isolation`; D3/D8/D9 own source and destination drift at both barriers and stable mode parity. |
+| P2: current prose still claimed accepted group SIGKILL stopped in-group descendants | W13's live normative prose now limits the no-further-execution boundary to direct-pid SIGKILL plus reap and explicitly permits either descendant class to continue briefly against only the private tool inode. D6 and acceptance use that same boundary. |
+
+These findings change stage Drop ownership, isolation validation, and the public
+sink's graceful-stop contract. The latest W3/W13 boundary requires one fresh
+full-diff review before implementation.
+
+That review found one remaining public-ownership P1 plus control and status
+consistency gaps, so the matrix was reopened on
+`sealed-publication-and-atomic-control-arbitration`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: an external `_with_output` caller could open a descendant replacement after return and publish bytes not owned by the original tool result | The two `_with_output` functions now own the complete artifact transition. Their existing `exe` argument is the final output, while W13 internally precreates and pins the tool inode, performs child cleanup, verifies/copies into an unexposed publication inode, and atomically renames only the isolated inode before returning. No stage path, descriptor, or token crosses the public seam, so every caller gets the same retained-identity proof and cannot publish child-visible bytes. W3 supplies the validated final path and classifies W13's result. D3/D5/D6/D8/D9/D10 own external calls, every tool route, replacement barriers, publication, error, and unwind. |
+| P2: separate signal and fatal loads could select fatal when a signal arrived between them | W7/W9 replace the two atomics with one `AtomicU16`: bits 0..=2 retain the first signal and bits 3..=5 retain the first fatal class. Signal and backend compare-exchange loops preserve the sibling field; one Acquire load is each control checkpoint's linearization point, and its decoded signal field precedes its fatal field and synchronous error. D4/D6/D8/D9 own stores on both sides of the load, both CAS orders, first-within-field retention, full-pipe wake coalescing, and the exact selected transcript. |
+| P2: item 4 was marked shipped while the release-distribution owner still called it unimplemented | `docs/impl/11-release-distribution.md` now records PR #893's shipped archive tree, immutable fallback, native package verification, and v4 LLVM identity in present tense. The item 4 ledger, release owner, and HANDOFF status agree. |
+
+The P1 moves artifact ownership across the public W13 boundary, while the
+control word changes signal/fatal arbitration at every watcher checkpoint.
+This latest W7/W9/W13 strategy requires one fresh full-diff review before
+implementation.
+
+That review found two remaining P1s and one topology-rule inconsistency, so the
+matrix was reopened on
+`trusted-tool-handoff-and-refreshed-failure-baseline`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: a surviving output writer could replace the tool inode before W13's first isolation snapshot, making both snapshots agree on bytes the direct child did not hand off | W1 now classifies configured `cc`/linker/strip executables as trusted code-generation inputs and requires successful direct-child return to join every output writer and release every descendant's writable descriptor/path access. W3/W13 make that precondition explicit and no longer claim that pathname secrecy, process-group signaling, or two-stage copying certifies an arbitrary detached writer's quiescence. W12 assigns violating configurations no artifact guarantee. Production-route owners cover direct and internally spawning tools; the deliberate detached-writer fixture is a contract negative, not an isolation proof. |
+| P1: a failed attempt could reinstall stale state for a last-success-only dependency and rebuild forever | W6 forms the bounded logical-path union as before, then W15 rebuilds every union graph and W5 total semantic state before installing the failed baseline or waiting. A dependency changed while entry failure prevents rediscovery therefore contributes its current classification once; D4 and acceptance own one revision followed by stable wait rather than a stale-state loop. |
+| P2: W7 said every topology change rebuilds while W6 exempted identical-content regular inode replacement | W7 now carries W6's exact exception: an inode-only change with identical regular state and no repair-output role re-arms without a revision, while every repair-output identity/topology change rebuilds. D4 and acceptance own both sides. |
+
+The first P1 narrows the external-tool trust boundary, and the second changes
+failed-baseline installation. This latest W1/W3/W6/W7/W12/W13 strategy
+requires one fresh full-diff review before implementation.
+
+### Acceptance and measurement
+
+No build-completion latency is a public promise, so no benchmark is a
+correctness gate. W7's two-second value schedules the next audit only; scan and
+revision duration are not bounded by it. Acceptance proves the mechanism
+directly:
+
+- one process performs at least three revisions while its PID and memo stats
+  remain continuous;
+- an entry edit rebuilds only the content identities the existing pipeline
+  reports as changed, and exact revert obtains producer-owned memo/cache hits;
+- each unaffected imported unit's frontend and object outcome is measured from
+  the real pipeline result, never inferred from corpus size;
+- one-shot and watch revision object bytes, link-input order, decoded
+  diagnostics, and program output are identical for the same inputs; child
+  streams are byte-compared only when the one-shot child's stdout and stderr
+  are likewise separate pipes, so both routes present non-TTY descriptors;
+- external code implements `LinkOutputSink`; both `_with_output` functions
+  preserve per-stream bytes and child result across ordinary, PGO-use,
+  PGO-instrument, ELF in-link strip, and macOS external-strip routes, while the
+  two legacy link functions retain inherited stdio and existing behavior; an
+  implementation that omits `stop_signal` observes the default `None`, while
+  injected `SigHup`, `SigInt`, `SigQuit`, and `SigTerm` return their exact stop
+  sentinels only after final group/direct-pid SIGKILL/`ESRCH` and direct-child
+  reap when waitable; every external caller passes only the final output path,
+  while the `_with_output` function internally retains the tool inode, isolates
+  it into a distinct unexposed inode, and returns only after atomic publication
+  or identity-aware cleanup;
+- one-unit and multi-unit `--thin-lto` watch revisions take their existing
+  respective backend paths and match one-shot results without panic;
+- changes to an imported source, file-backed static source, checked metadata,
+  and `--pgo-use` snapshot each trigger one revision;
+- creation behind relative and absolute dangling symlinks, nested-symlink
+  replacement, and symlink-cycle repair each trigger one revision;
+- direct output/input slot identity, a parent-directory alias, and an input
+  symlink resolving to the output all fail before link/publication;
+- an output-named intermediate directory/symlink, case- or Unicode-equivalent
+  lookup, and a distinct hard-link name all conservatively fail before link;
+- on a case-sensitive parent, two absent unequal output/input leaf names pass
+  W14 without touching either slot; on ASCII-case-folding and Unicode-
+  normalizing parents the matching both-absent names select the existing alias
+  error before link. Exact/raw-equal nodes are rejected earlier, while a
+  multi-component missing input probes its first absent intermediate slot and
+  no component below that nonexistent parent; every success, collision,
+  descriptor `NAME_MAX`, exact/rejected-next `min(NAME_MAX, 1023)` suffixed
+  length, randomness, and lookup result leaves no `.aw-` residue, two
+  concurrent Align processes cannot remove each other's probe, and an
+  injected cleanup failure names only its retained recoverable component;
+  native events caused by the
+  private create/unlink are an irrelevant wake whose comparison starts no
+  revision. Replacement before the pre-unlink identity check preserves the
+  foreign component and selects the exact `probe ownership lost` cleanup
+  message; concurrent Align
+  instances obey the reserved `.aw-` namespace, while post-check mutation by a
+  non-Align process is the explicitly excluded concurrency case;
+- removing or replacing any rejected direct/folded/distinct-hard-link output
+  after alias-time and before/during repair registration triggers exactly one
+  recovery revision; dropping its native event is repaired by the next audit,
+  while an unchanged alias waits without spinning;
+- disappearance or atomic replacement before each W15 add, after every added
+  prefix, during reverse rollback, at the post-add snapshot, and before
+  obsolete removal never exits on `ENOENT`/`PathLost`/`WatchLost`; changed
+  topology schedules one revision, unchanged churn consumes exactly eight
+  attempts then one 50-ms retry, old coverage remains, and eventual stability
+  completes add-before-remove without leaked partial handles or spin;
+- three or more consecutive changed post-add snapshots retain at most one
+  tentative generation: a changed pre-add snapshot schedules without adding,
+  while an equal snapshot compacts to at most 65,536 desired handles before
+  the next at-most-65,536 additions. The injected peak remains exactly 131,072,
+  and a mutation during the deliberate compaction gap is recovered by the
+  mandatory post-transition snapshot or next audit, including zero-add passes;
+- removing or retargeting an input symlink or hard link at each pre-open,
+  opened-leaf, post-read, and pre-finalization barrier cannot erase the
+  read-time identity: instability or aliasing fails before link, consumes the
+  evidence, and a stable following scan may rebuild;
+- rewriting, truncating, extending, or restoring a regular input in place at
+  each original-read/final-read barrier is rehashed before publication; a
+  differing snapshot emits `inputs changed during revision`, publishes
+  nothing, and schedules a stable rebuild;
+- the child sees only a randomized tool-output stage. After successful child
+  cleanup and W1's writer-joined tool handoff, W13 copies it into a distinct
+  unexposed publication stage and accepts
+  only a stable source identity, a stable publication-stage identity, and
+  matching source-before/source-after/destination length, permission mode, and
+  hash. Mutation after the first source snapshot or during the copy either
+  selects exact `link
+  output changed during isolation` with no publication; mutation before that
+  first snapshot is excluded by W1's successful-return handoff. Injected
+  open/copy/mode/hash/close/unlink/rename failures,
+  permission-mode drift at either snapshot, and tool-stage pre-unlink or
+  publication-stage pre-rename replacement preserve the last-good output.
+  Neither replacement is removed; the exact `tool stage ownership lost` or
+  `publication stage ownership lost` is selected by its barrier, while a stable
+  copy preserves exact executable bytes and mode.
+  The injectable length/copy owner admits 8,589,934,592 bytes
+  with bounded memory, while the next byte selects the exact limit error before
+  creating the publication stage; a small real sparse fixture covers the OS
+  path without making the gate stream 8 GiB;
+- after a failed edit, the current state wins every overlapping last-success
+  path, last-success contributes only paths not reached by the failed attempt,
+  and W15 refreshes every union path before installing the failed baseline. If
+  entry failure prevents rediscovery of a last-success-only dependency that
+  changed during the attempt, one revision records its current state and then
+  waits instead of repeatedly rebuilding against the stale successful state;
+- a stable content change with its native event deliberately dropped, plus a
+  Linux writable-`mmap` change, is discovered by the next completed periodic
+  semantic audit without overlapping scans;
+- every prior/current pair across `Missing`, `NonRegular`, `Unreadable`, and
+  `Regular` is compared by both event and audit paths; in particular a
+  permission/read failure followed by `Unreadable` to `Regular` recovery on
+  the same inode triggers exactly one revision even when its native event is
+  dropped;
+- an unrelated event and a regular input's identical-content inode replacement
+  trigger none after state comparison; the same identity change on the retained
+  repair output triggers exactly one revision;
+- one stderr-pipe reader decodes every `KIND`/`STATE` combination and observes
+  each complete diagnostic, child stream, cache message, and ordinary success
+  record before the matching unframed `ready`; watch-mode stdout is empty, and
+  injected protocol full/partial write or flush failure emits no false `ready`
+  and exits 1 without recursion;
+- arbitrary/all-byte and exact marker-shaped `cc`/linker/strip stdout/stderr is
+  reconstructible only inside W2 child records and precedes the terminal marker;
+  simultaneous >4,096-byte streams cannot deadlock with a prompt sink, a
+  descendant retaining a writer cannot extend the fixed post-exit/pre-reap
+  byte quota or introduce an EOF wait, and exact/over-limit queued counts are
+  deterministic. Child-visible writes remain blocking under pipe-capacity
+  backpressure, parent reads remain nonblocking, a synchronous sink may delay
+  wall-clock cleanup as declared, and pump failures emit no marker;
+- explicit `SIG_IGN`, `SA_NOCLDWAIT`, another `SIGCHLD` handler, and a second
+  captured-child call fail before pipe allocation/spawn with the exact wait-
+  setup error and release the lease; an injected post-admission `ECHILD`
+  closes both reads and enters group cleanup. A permanent group-check/poll/read failure
+  after live status while `cc`, its linker, or `strip` is live
+  closes both reads, terminates the private group, escalates after exactly
+  250 ms when required, sends final SIGKILL to group and direct pid while the
+  leader still pins both identities, reaps the direct child when waitable,
+  releases the lease, and emits the first pump error;
+  a sink failure instead drains/discards normally; descendants may retain their
+  inherited stream descriptors briefly after return but cannot extend the
+  bounded parent drain. On success, every supported production tool joins all
+  output writers before its direct child returns; a deliberately detached
+  writer violates W1 and has no artifact-integrity guarantee;
+- ordinary success, child failure, and sink failure observe direct exit without
+  reaping, drain only the fixed queued snapshot, close both reads, kill the
+  pinned process group and direct pid, and reap only after both SIGKILL sends
+  are accepted or return `ESRCH`; neither identity is used after reap. A direct
+  child that changes group selects exact `child group changed`; injected
+  group-preserving helpers may continue briefly after an accepted group signal
+  only when they hold no writable descriptor or pathname access to the tool
+  output. A production route that internally spawns a writer joins it before
+  successful direct-child return.
+  Group-kill failure selects exact `child group cleanup` ahead of child status
+  and retains the stage/lease while retrying with the leader still unreaped;
+- an external sink panic on either stream after zero or several callbacks runs
+  the existing panic hook once, receives no later callback, closes both reads,
+  immediately sends pinned-group/direct-pid SIGKILL, reaps the direct child,
+  releases the lease, and resumes the identical payload on the calling thread
+  without a second hook; the caller's resumed
+  unwind then drops the private tool stage;
+- an injected unexpected unwind at every post-spawn pump barrier runs the armed
+  guard's no-panic cleanup before crossing the public seam; the direct child is
+  reaped when waitable, the lease is absent, the caller's private stage then
+  drops without publication, and a following captured call acquires the lease;
+- every raw path byte round-trips through `WatchPath`, and newline,
+  non-UTF-8, quote, percent, and marker-shaped paths/messages remain inner
+  encoded values after record decoding; arbitrary diagnostic/cache bytes and
+  exact terminal lines at empty, 4,095/4,096/4,097, and multi-chunk boundaries
+  can appear only as framed payload; 16,384 message bytes are accepted and the
+  next byte selects the exact static replacement;
+- an absolute lexical or expanded graph path of 1,023 raw bytes is accepted;
+  1,024 bytes fail before retention/I/O with the exact length and lowercase
+  `Hash128`; every first embedded-NUL offset and relative public output/repair
+  path fails in W8 order before allocation/I/O with its encoded path;
+  16,384/16,385 per-producer inputs and 32,768/32,769 retry-merged inputs prove
+  their exact rejected-next errors; two disjoint admitted 32,768-row operands
+  form the exact 65,536-row retained-watch maximum before graph construction.
+  Separately, 65,536/65,537 graph nodes, 131,072/131,073 read-time nodes, and
+  40/41 symlink traversals prove each ceiling, exact error, and rejected
+  logical-path identity;
+- each asynchronous backend class produces its exact static line; two errors
+  retain the first class even when the shared pipe is already full, while an
+  idle simultaneously pending graceful signal wakes the same poll, wins, and
+  performs backend cleanup while the process-lifetime pipe remains live. Both
+  signal-first and fatal-first compare-exchange orders preserve both fields;
+  stores immediately before the single Acquire snapshot participate, while
+  stores immediately after it belong to the following checkpoint;
+  EOF/error on the pipe fails closed; every transition failure paired with a
+  pending signal/fatal class follows W7's single-load post-return snapshot
+  exactly, including every store immediately before or after that atomic
+  linearization point;
+- asynchronous `PathLost` and `WatchLost` set uncertainty and wake the same
+  pipe without a diagnostic or exit; `Disconnected`, backend-wide `Io`,
+  `Capacity`, `InvalidConfig`, and `Other` remain the exhaustive fatal classes;
+- a stale-cache retry consuming-merges first and retry semantic/evidence sets;
+  entry then the ordinary PGO snapshot then import/static/metadata producers
+  follow W4 encounter order, public rows remain raw-byte-sorted, retry state
+  wins duplicates, retry-only paths join that sorted union, any difference
+  stays unstable, merge overflow drops both, and neither first-attempt evidence
+  nor diagnostics are lost;
+- `build --help` names the external-resource trigger boundary; replacing a
+  runtime/profile archive, linker/tool executable, system-library fixture, or
+  project archive selected through fixed `LIBRARY_PATH` starts no revision by
+  itself, while the next source edit and a restart each consume the replacement
+  exactly as the matching one-shot build; editing only the baked workspace
+  runtime-source tree likewise starts no revision, while the next source edit
+  and restart each produce the same stale-runtime result as one-shot and a
+  restore removes it; absent/unreadable installed trees retain the no-op;
+- external code can read but cannot construct or mutate `BuildInput` fields;
+  `FinalBuildInputSet` likewise has no external constructor or conversion to
+  `BuildInputSet`, and compile-fail owners reject passing it to merge or
+  finalization;
+- a failed second signal installation changes nothing, each partial setup
+  or nonblock/close-on-exec failure unregisters/closes/clears/restores in W9
+  order, signals delivered at every setup barrier are handled only after
+  activation, an exec helper sees no watcher/control descriptor, and a later
+  clean child can install successfully;
+- SIGHUP/SIGINT/SIGQUIT/SIGTERM pending immediately after signal publication,
+  after every
+  native-watcher initialization operation, or at the final pre-`started`
+  checkpoint cleans initialized state and emits only `stopped`; no first
+  revision or `started`/`ready`/`failed` record is invented, while a signal
+  linearized after that final checkpoint belongs to revision 1; and
+- idle and active SIGHUP/SIGINT/SIGQUIT/SIGTERM return 129/130/131/143 only
+  after every owned child,
+  stage, watcher handle, and native callback owner have been cleaned up; at
+  every captured-child barrier, terminal-generated and parent-only signals are
+  observed at the next control checkpoint, forwarded unchanged, allowed 250 ms,
+  and escalated when required before pinned-group/direct-pid SIGKILL and direct
+  reap. A prompt-return sink reaches that checkpoint after at most one 50-ms
+  poll; an injected blocking sink proves the pending signal is handled only
+  after callback return and carries no end-to-end latency promise. They
+  emit only the matching `stopped` line, never `failed` or watcher error.
+  Signals at every terminal barrier still target the unreused process-lifetime
+  pipe, and the kernel closes that pipe with the process.
+
+A local `bench/watch_build` harness may report initial, edit, and revert wall
+times plus the producer-owned stage counts. Those numbers guide later work but
+do not gate this item or justify function-level incremental compilation.
+
+### Documents and prerequisites
+
+Prerequisites are items 1, 3, and 4 plus the already-shipped `align-repl`
+residency consumer. Implementation updates this section's status,
+`docs/impl/01-pipeline.md`, the CLI help/README command inventory, and
+`docs/impl/16-test-policy.md`. It changes no language syntax or semantics, so
+`draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, and
+`docs/open-questions.md` do not change. Function-level invalidation remains
+item 6 and is not smuggled into this boundary.
 
 ## Item 2a: required DB owner build-once/run-many
 

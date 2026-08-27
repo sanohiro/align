@@ -155,6 +155,19 @@ The M6 builtin arc surfaced a whole class of sema bugs around type variables and
 
 - **Diagnostics**: reusing an error helper in a new context — re-read its hardcoded message and generalize it (#26/#31 "Option payload" reused for arrays); point the span at the offending sub-node; emit one error per root cause, then return a sentinel (no cascade). (#74, #105, #117, #189, #206)
 - **Perf** (mostly medium — one glance, don't chase every nit): don't clone a `Copy` type (`Ty`, small structs); `&str` over `String`; `with_capacity` for known sizes; hoist invariant work out of hot loops (#94 re-lowered captures in an inner sort loop). For a performance acceptance condition, measure actual work counts from producer-owned outcomes for both revisions; an expected corpus/unit count is not evidence that either path did that work exactly once (#884). The bot posts one comment per line — treat fifteen near-identical clone nits as *one* lesson.
+- **Producer identity**: bind a cache/toolchain identity to producer-owned evidence
+  for the resource actually in use. A filesystem pathname is not the identity of
+  a loaded dynamic library: the entry may be replaced after mapping. Resolve the
+  loader-owned image and derive bounded metadata from that image before admitting
+  a cache hit (#893).
+- **Memoized-key authorization**: when checked rehydration proves that a key omits
+  a semantic input, install the rejection before invalidating artifacts and make
+  both lookup and publication perform a final authorization check after value
+  validation. Never republish under a key the process has disproved (#893).
+- **Shared cache artifacts**: linearize rejection with both readers and writers.
+  A reader that began before rejection must not return its now-unauthorized value,
+  and a writer that began before rejection must not leave a publishable action or
+  blob afterward. Use barrier-controlled owners for both interleavings (#893).
 - **Concurrency** (`task_group` / `par_map` / compiler workers): on a worker panic, an unwind-safe guard must still decrement the shared counter, set cancellation when applicable, and notify the condvar before thread exit; join every worker before returning or resuming the panic, and never `unwrap_or(0)` a `join()` (swallows the failure). `catch_unwind` does **not** suppress Rust's process-global panic hook: do not temporarily replace that hook without an explicit overlap/exhaustion/restoration contract; prefer cleanup followed by `resume_unwind`. Justify any `unsafe impl Send/Sync`. (#114, #117, #179, #883)
 - **Parser/lexer**: on invalid UTF-8 advance `pos` by exactly the bytes consumed, not `'\u{FFFD}'.len_utf8()` (#22, #231); lookahead must survive a newline token (#21); `//` is a comment, not a `/` line-continuation (#18); a saved/restored flag (e.g. `no_struct_literal`) must be restored on *every* exit — a `?` early-return leaks the mutated state and corrupts the rest of the parse (#272). Don't `diags.error` for something a helper you call already reports (`parse_path`→`parse_ident`) — return `None`/sentinel (#272).
 - **SQL/protocol scanners**: parameterize every lexical mode (ordinary and
