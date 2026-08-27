@@ -52,6 +52,7 @@ fn base_key() -> CodegenKey {
         reloc_model: "pic".to_string(),
         code_model: "default".to_string(),
         llvm_version: "22.1.8".to_string(),
+        llvm_build_id: hh(4),
         rt_lto: false,
         rt_lto_digest: None,
         pgo_mode: PgoKey::Off,

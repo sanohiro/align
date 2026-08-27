@@ -1923,8 +1923,67 @@ release_driver_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dis
   echo "release.yml no longer builds the runtime and compiler separately in both PGO phases" >&2
   exit 1
 }
+grep -Fq 'scripts/build-prebuilt-cache.sh' "$release_workflow" || {
+  echo "release.yml no longer warms the final release compiler's adjacent cache" >&2
+  exit 1
+}
+grep -Fq 'scripts/verify-prebuilt-cache-layout.sh package' "$release_workflow" || {
+  echo "release.yml no longer verifies the staged native cache layout" >&2
+  exit 1
+}
+grep -Fq 'ARCHIVE_MEMBERS+=(share)' "$release_workflow" || {
+  echo "release.yml no longer includes the cache tree in native archives" >&2
+  exit 1
+}
+grep -Fq 'tar -C package -czf "$ARTIFACT.tar.gz" "${ARCHIVE_MEMBERS[@]}"' \
+  "$release_workflow" || {
+  echo "release.yml no longer archives its exact selected artifact graph" >&2
+  exit 1
+}
+grep -Fq "grep -q '^share/'" "$release_workflow" || {
+  echo "release.yml no longer detects cache-bearing archives for Debian packaging" >&2
+  exit 1
+}
+grep -Fq -- '-C "$ROOT/usr/lib/align" "${ARCHIVE_MEMBERS[@]}"' "$release_workflow" || {
+  echo "release.yml no longer preserves the adjacent cache in Debian packages" >&2
+  exit 1
+}
+historical_guards="$(grep -Fc 'historical tag:' "$release_workflow")"
+if [[ "$historical_guards" -ne 3 ]]; then
+  echo "release.yml no longer preserves historical workflow_dispatch tags" >&2
+  exit 1
+fi
+grep -Fq 'libpq-dev, libssl-dev' "$release_workflow" || {
+  echo "the Debian compiler package cannot link the cached pkg.db corpus" >&2
+  exit 1
+}
+grep -Fq 'brew install --formula --build-from-source' "$release_workflow" || {
+  echo "release.yml no longer tests Homebrew's real install/cleanup path" >&2
+  exit 1
+}
+grep -Fq 'bench/prebuilt_cache/run.sh package' "$release_workflow" || {
+  echo "release.yml no longer records prebuilt-cache release evidence" >&2
+  exit 1
+}
+
+formula_template="$repo_root/.github/align.rb.template"
+grep -Fq 'depends_on "libpq"' "$formula_template" || {
+  echo "the Homebrew compiler package cannot link the cached pkg.db corpus" >&2
+  exit 1
+}
+grep -Fq 'skip_clean "libexec/alignc"' "$formula_template" || {
+  echo "the Homebrew formula may rewrite the compiler after its cache is keyed" >&2
+  exit 1
+}
+grep -Fq 'libexec.install "alignc", "align-repl", "libalign_runtime.a", "share"' \
+  "$formula_template" || {
+  echo "the Homebrew formula no longer installs the adjacent cache tree" >&2
+  exit 1
+}
 
 for script in \
+  bench/prebuilt_cache/run.sh \
+  scripts/build-prebuilt-cache.sh \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
   scripts/ci-apt-llvm.sh \
@@ -1939,7 +1998,8 @@ for script in \
   scripts/test-apt-llvm.sh \
   scripts/test-binaries-lib.sh \
   scripts/test-pr-workflow.sh \
-  scripts/test-pr.sh
+  scripts/test-pr.sh \
+  scripts/verify-prebuilt-cache-layout.sh
 do
   bash -n "$repo_root/$script"
 done

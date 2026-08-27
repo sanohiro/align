@@ -23,7 +23,10 @@ pub mod thinlto_spike;
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
 mod drop_codegen;
+mod llvm_build_id;
 mod runtime_abi;
+
+pub use llvm_build_id::loaded_llvm_build_id;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{

@@ -7,14 +7,15 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-26._ align-llm Request 21's borrowed projection view repair is implemented
+_Last updated: 2026-08-27._ align-llm Request 21's borrowed projection view repair is merged in
+Align PR #892
 against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
 an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
 checking, then LLVM validation rejected the same field path because it compared the view type with
 the owning array type. Codegen now admits only the existing exact scalar/AoS array-to-slice layout
 retypes with canonical element identity and rejects forged mismatched elements. The focused owner
 covers Some/None, sibling and repeated access, scalar/AoS arrays, whole/per-unit execution, and
-malformed MIR. Review, merge, and align-llm pin adoption remain. Request 19's shared recursive-Drop
+malformed MIR. The align-llm pin adoption remains. Request 19's shared recursive-Drop
 codegen is merged and real-client adopted through Align `4b515f8d37de2e9a9ba06170c5842fd12dc1cba2`.
 Request 18's retained-root regular-file constructors are implemented
 against the accepted design in `docs/impl/29-fs-retained-root-plan.md` and real-client verified by
@@ -352,14 +353,14 @@ facts must live in this repository.
   to direct DB/gate/dedicated-production paths or changed mixed-source hunks
   that name the boundary, so an unrelated function in a monolithic source no
   longer inherits dormant DB markers elsewhere in that file. Item 4's
-  prebuilt-cache distribution contract is settled: exact native release
+  prebuilt-cache distribution is implemented: exact native release
   compilers may read an adjacent immutable cache of byte-identical first-party
   `pkg` units behind the writable XDG cache; `core`/`std` have no file-backed
   unit to distribute, package source resolution is unchanged, and ThinLTO keeps
-  its all-MIR path. Implementation first bumps codegen-family keys to include
-  the loaded LLVM build id and release-gates the actual installed Homebrew
-  binary, and remains pending. Residency and function-level incrementality
-  remain items 5-6.
+  its all-MIR path. Codegen-family keys include the loaded LLVM build id, the
+  release inventory is checked in both directions, and native packaging verifies
+  the actual installed Homebrew binary before publication. Residency and
+  function-level incrementality remain items 5-6.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

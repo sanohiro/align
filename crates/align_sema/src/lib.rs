@@ -8927,6 +8927,52 @@ fn borrowed_match_projection_path(
     Some(path)
 }
 
+/// Compare the source-level shape of a match payload and its local binding. Effect inference gives
+/// every concrete function-value local a fresh `FnTy` record, so function type-table ordinals are
+/// not source type identity. The checked-HIR boundary must independently accept the same
+/// structural function signature while still rejecting a forged parameter mode, parameter type,
+/// return type, or malformed ordinal. Keep the walk iterative because function signatures may
+/// contain a deep finite chain of nested function types.
+fn match_binding_ty_is_valid(actual: Ty, expected: Ty, program: &hir::Program) -> bool {
+    let mut work = vec![(actual, expected)];
+    let mut seen = HashSet::new();
+    while let Some((actual, expected)) = work.pop() {
+        if actual == expected || !seen.insert((actual, expected)) {
+            continue;
+        }
+        let (Ty::Fn(actual_id), Ty::Fn(expected_id)) = (actual, expected) else {
+            return false;
+        };
+        let Some((actual_fn, expected_fn)) = program
+            .fn_types
+            .get(actual_id as usize)
+            .zip(program.fn_types.get(expected_id as usize))
+        else {
+            return false;
+        };
+        if actual_fn.params.len() != expected_fn.params.len()
+            || actual_fn
+                .params
+                .iter()
+                .zip(&expected_fn.params)
+                .any(|((actual_mode, _), (expected_mode, _))| actual_mode != expected_mode)
+        {
+            return false;
+        }
+        work.extend(
+            actual_fn
+                .params
+                .iter()
+                .zip(&expected_fn.params)
+                .map(|((_, actual), (_, expected))| {
+                    (scalar_to_ty(*actual), scalar_to_ty(*expected))
+                }),
+        );
+        work.push((actual_fn.ret, expected_fn.ret));
+    }
+    true
+}
+
 /// Validate the producer-owned borrowed-sum records independently of replayed body facts. This is
 /// deliberately kept at the checked-HIR boundary: MIR/codegen may trust the record only after the
 /// exact parameter root, field path, payload grammar, ordinals, and projection-only cleanup
@@ -8983,14 +9029,13 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
                         let Some(&scalar) = payloads.get(ordinal) else { return false };
                         let static_ty = scalar_to_ty(scalar);
                         let resolved_static_ty = expand_tagged_ty(static_ty, &program.tagged_types);
-                        if function
-                            .locals
-                            .get(binding as usize)
-                            .is_none_or(|local| {
-                                expand_tagged_ty(local.ty, &program.tagged_types)
-                                    != resolved_static_ty
-                            })
-                        {
+                        if function.locals.get(binding as usize).is_none_or(|local| {
+                            !match_binding_ty_is_valid(
+                                expand_tagged_ty(local.ty, &program.tagged_types),
+                                resolved_static_ty,
+                                program,
+                            )
+                        }) {
                             return false;
                         }
                         let is_move = ty_is_move(
@@ -68502,6 +68547,51 @@ fn exit_branch(flag: bool) -> i64 {
         let owning = "fn inspect(value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n";
         let (_program, diagnostics) = check(&format!("{owning}fn main() -> i32 = 0\n"));
         assert!(!diagnostics.has_errors(), "owning match behavior must remain valid");
+    }
+
+    #[test]
+    fn checked_hir_match_accepts_fresh_structurally_equal_function_payload_type() {
+        let source = "Handler { Apply(fn(i64) -> i64), Empty }\nfn use(handler: Handler) -> i64 = match handler {\n  Apply(call) => call(1)\n  Empty => 0\n}\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) = check(source);
+        assert!(
+            !diagnostics.has_errors(),
+            "function-payload fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let ExprKind::Match { arms, .. } = &function.body.value.as_ref().expect("use result").kind
+        else {
+            panic!("use result must be a match");
+        };
+        let binding = arms[0].bindings[0];
+        let Ty::Fn(local_type) = function.locals[binding as usize].ty else {
+            panic!("function-payload binding must retain a function type");
+        };
+        let Scalar::Fn(payload_type) = program.enums[0].variants[0].payload[0] else {
+            panic!("enum payload must retain its declared function type");
+        };
+        assert_ne!(
+            local_type, payload_type,
+            "effect inference must give the concrete local an independent type record"
+        );
+        assert!(
+            checked_hir_body_facts_are_valid(&program),
+            "different internal FnTy ids with one source signature must pass the boundary"
+        );
+
+        let mut forged = program.clone();
+        forged.fn_types[local_type as usize].ret = Ty::Bool;
+        assert!(
+            !checked_hir_body_facts_are_valid(&forged),
+            "a different function return type must remain a checked-HIR rejection"
+        );
     }
 
     #[test]

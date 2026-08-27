@@ -25,6 +25,7 @@ dependencies = [
  "align_ast",
  "align_diag",
  "align_hash",
+ "align_interface",
  "align_lexer",
  "align_mir",
  "align_parser",

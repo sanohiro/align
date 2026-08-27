@@ -2753,8 +2753,8 @@ fn walk_inner(
 
         // ---- persistent lookup -------------------------------------------------------------
         let mut frontend_reason: Option<FirstDiff> = None;
-        if let (Some(root), Some(key)) = (reuse_root.as_ref(), unit_key.as_ref()) {
-            match unit_cache::lookup(root, key, u.src.len()) {
+        if let (Some(_root), Some(key)) = (reuse_root.as_ref(), unit_key.as_ref()) {
+            match cache.lookup_unit(key, u.src.len()) {
                 unit_cache::UnitLookup::Hit(hit) => {
                     let hit = *hit;
                     // Replay the unit's diagnostics FIRST, in the position a recomputed unit would
@@ -3724,17 +3724,17 @@ impl PackageBuild {
         let recomputed = self.rehydrate.recompute(&unit_name)?;
         let stored = &self.units[index];
         if recomputed.summary.impl_hash != stored.summary.impl_hash {
-            return self.reject(index, RehydrateFailure::ImplHash);
+            return self.reject(index, RehydrateFailure::ImplHash, &recomputed);
         }
         if align_interface::serialize(&recomputed.summary) != align_interface::serialize(&stored.summary) {
-            return self.reject(index, RehydrateFailure::Summary);
+            return self.reject(index, RehydrateFailure::Summary, &recomputed);
         }
         if recomputed.mir.link_libs != stored.link_libs {
-            return self.reject(index, RehydrateFailure::LinkLibs);
+            return self.reject(index, RehydrateFailure::LinkLibs, &recomputed);
         }
         let replayed = self.rehydrate.replayed.get(&unit_name);
         if Some(&recomputed.diagnostics) != replayed {
-            return self.reject(index, RehydrateFailure::Diagnostics);
+            return self.reject(index, RehydrateFailure::Diagnostics, &recomputed);
         }
         // Verified. Promote the complete result into the in-process memo before adopting it: this
         // walk consulted the DISK stage first (the digest path is cheaper than rendering), so
@@ -3769,10 +3769,27 @@ impl PackageBuild {
     }
 
     /// Unlink the offending entry and report. Split out so every rejection path unlinks exactly once.
-    fn reject(&mut self, index: usize, failure: RehydrateFailure) -> Result<&MirProgram, RehydrateFailure> {
+    fn reject(
+        &mut self,
+        index: usize,
+        failure: RehydrateFailure,
+        recomputed: &Recomputed,
+    ) -> Result<&MirProgram, RehydrateFailure> {
         let unit = &self.units[index].unit;
         if let (Some(root), Some(key)) = (self.rehydrate.root.as_ref(), self.rehydrate.keys.get(unit)) {
             unit_cache::invalidate(root, key);
+            // A stale immutable fallback must remain untouched. Publish the independently
+            // recomputed value to the writable primary immediately, so this process's fail-closed
+            // retry stays uncached while subsequent processes are shadowed by the repaired entry.
+            unit_cache::publish(
+                root,
+                key,
+                &unit_cache::UnitEntry {
+                    summary_bytes: align_interface::serialize(&recomputed.summary),
+                    diagnostics: recomputed.diagnostics.clone(),
+                    link_libs: recomputed.mir.link_libs.clone(),
+                },
+            );
         }
         eprintln!("{}", cache::CORRUPT_NOTE);
         Err(failure)
@@ -4282,6 +4299,8 @@ pub fn build_codegen_key(
     exp.sort();
     exp.dedup();
     let rt_lto_digest = rt_lto.then(|| Hash128::of(rt_lto_bitcode()));
+    let llvm_build_id = align_codegen_llvm::loaded_llvm_build_id()
+        .ok_or_else(|| "cannot identify loaded LLVM build for codegen cache".to_string())?;
     Ok(CodegenKey {
         cache_format_version: cache::CACHE_KEY_FORMAT_VERSION,
         compiler_build_id: cache::compiler_build_id(),
@@ -4300,6 +4319,7 @@ pub fn build_codegen_key(
         reloc_model: rt.reloc_model.to_string(),
         code_model: rt.code_model.to_string(),
         llvm_version: align_codegen_llvm::llvm_version(),
+        llvm_build_id,
         rt_lto,
         rt_lto_digest,
         pgo_mode: pgo,
@@ -4358,7 +4378,7 @@ pub fn emit_object_cached(
     // inputs (`compiler_build_id`'s one-time `alignc`-binary hash, `resolve_target_identity`,
     // `llvm_version`, `target_object_format`) are pure cache overhead a cache-off build must not pay.
     // This is the byte-identical, no-extra-I/O pre-S3a path (the same disabled miss `codegen` returns).
-    if !cache.is_enabled() {
+    if !cache.codegen_is_enabled() {
         emit_object_file(mir, obj, target, profile, exports, rt_lto)?;
         return Ok(cache::CacheOutcome {
             stage: cache::CacheStage::Codegen,
@@ -4817,7 +4837,7 @@ pub fn build_package_pipelined(
                 .and_then(|result| result.as_ref().ok())
                 .map(|staged| staged.key)
                 .unwrap_or(cache::PgoKey::Off);
-            let key = if cache.is_enabled() {
+            let key = if cache.codegen_is_enabled() {
                 match build_codegen_key(
                     unit,
                     pending.summary.impl_hash,
@@ -5380,7 +5400,7 @@ fn codegen_lookup_phase(
     let mut keys: Vec<Option<CodegenKey>> = (0..n).map(|_| None).collect();
     let mut outcomes: Vec<Option<CacheOutcome>> = (0..n).map(|_| None).collect();
     let mut misses: Vec<usize> = Vec::new();
-    let enabled = cache.is_enabled();
+    let enabled = cache.codegen_is_enabled();
     for (i, input) in inputs.iter().enumerate() {
         if enabled {
             let key = build_codegen_key(
@@ -5756,6 +5776,7 @@ struct ThinTargetIdentity {
     rt: align_codegen_llvm::ResolvedTarget,
     object_format: u8,
     llvm_version: String,
+    llvm_build_id: Hash128,
 }
 
 fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, String> {
@@ -5764,7 +5785,14 @@ fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, Str
         ObjectFormat::Elf => 0u8,
         ObjectFormat::MachO => 1u8,
     };
-    Ok(ThinTargetIdentity { rt, object_format, llvm_version: align_codegen_llvm::llvm_version() })
+    let llvm_build_id = align_codegen_llvm::loaded_llvm_build_id()
+        .ok_or_else(|| "cannot identify loaded LLVM build for codegen cache".to_string())?;
+    Ok(ThinTargetIdentity {
+        rt,
+        object_format,
+        llvm_version: align_codegen_llvm::llvm_version(),
+        llvm_build_id,
+    })
 }
 
 /// Build the phase-1 **prelink** cache key: today's codegen key minus the pure backend/target knobs
@@ -5796,6 +5824,7 @@ fn build_prelink_key(
         profile_name: profile.name().to_string(),
         pipeline: profile.pipeline().to_string(),
         llvm_version: id.llvm_version.clone(),
+        llvm_build_id: id.llvm_build_id,
         rt_lto,
         rt_lto_digest: rt_lto.then(|| Hash128::of(rt_lto_bitcode())),
         unit: unit.to_string(),
@@ -5832,6 +5861,7 @@ fn build_backend_key(
         cache_format_version: cache::CACHE_KEY_FORMAT_VERSION,
         compiler_build_id: cache::compiler_build_id(),
         llvm_version: id.llvm_version.clone(),
+        llvm_build_id: id.llvm_build_id,
         target_triple: id.rt.triple.clone(),
         object_format: id.object_format,
         resolved_cpu: id.rt.cpu.clone(),
@@ -5909,7 +5939,7 @@ pub fn build_thin_lto(
     assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
 
-    let enabled = cache.is_enabled();
+    let enabled = cache.codegen_is_enabled();
     let identity = if enabled { Some(resolve_thin_identity(target)?) } else { None };
     let n = units.len();
     let ids: Vec<String> = units.iter().map(|u| u.unit.clone()).collect();

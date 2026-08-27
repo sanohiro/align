@@ -536,6 +536,27 @@ pub enum UnitLookup {
 /// an out-of-range offset here is damage, not skew (a corrupted manifest is not bound by the key).
 /// Rejecting it is what keeps a later `format_diagnostics` from slicing past end-of-file.
 pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
+    lookup_with_policy(root, key, source_len, ReadPolicy::Writable)
+}
+
+/// Immutable packaged-cache lookup. It uses the identical decoder and validation order as the
+/// writable store, but never mutates installer-owned bytes on corruption.
+pub(crate) fn lookup_packaged(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
+    lookup_with_policy(root, key, source_len, ReadPolicy::Packaged)
+}
+
+#[derive(Clone, Copy)]
+enum ReadPolicy {
+    Writable,
+    Packaged,
+}
+
+fn lookup_with_policy(
+    root: &Path,
+    key: &UnitKey,
+    source_len: usize,
+    policy: ReadPolicy,
+) -> UnitLookup {
     let path = action_path(root, key.full_digest());
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -546,7 +567,7 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
         Err(CacheDecodeError::UnknownVersion(_)) | Ok(None) => {
             UnitLookup::Miss { reason: Some(diff_against_slot(root, key)) }
         }
-        Err(_) => corrupt(&path),
+        Err(_) => corrupt(&path, policy),
         Ok(Some((_, entry))) => {
             // Steps 8 then 9, in that order: decode the summary before range-checking the spans, so
             // a manifest that fails both reports the earlier cause. Both are past the key
@@ -554,7 +575,7 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             let object_format = match key.object_format {
                 0 => align_interface::OwnedJsonObjectFormat::Elf,
                 1 => align_interface::OwnedJsonObjectFormat::MachO,
-                _ => return corrupt(&path),
+                _ => return corrupt(&path, policy),
             };
             let target = align_interface::OwnedJsonTarget {
                 triple: key.target_triple.clone(),
@@ -563,14 +584,14 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             let Ok(summary) =
                 align_interface::deserialize_for_target(&entry.summary_bytes, &target)
             else {
-                return corrupt(&path);
+                return corrupt(&path, policy);
             };
             if entry
                 .diagnostics
                 .iter()
                 .any(|d| d.lo > d.hi || d.hi as usize > source_len)
             {
-                return corrupt(&path);
+                return corrupt(&path, policy);
             }
             UnitLookup::Hit(Box::new(UnitHit { entry, summary }))
         }
@@ -585,9 +606,14 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
 /// slot pointer is deliberately left alone: it is observability only (it names the first differing
 /// component of a later miss) and removing it would cost that diagnosis with no safety gain, since
 /// a hit always requires the full-key manifest this just removed.
-fn corrupt(path: &Path) -> UnitLookup {
-    let _ = std::fs::remove_file(path);
-    eprintln!("{}", cache::CORRUPT_NOTE);
+fn corrupt(path: &Path, policy: ReadPolicy) -> UnitLookup {
+    match policy {
+        ReadPolicy::Writable => {
+            let _ = std::fs::remove_file(path);
+            eprintln!("{}", cache::CORRUPT_NOTE);
+        }
+        ReadPolicy::Packaged => cache::note_packaged_corrupt(),
+    }
     UnitLookup::Miss { reason: Some(FirstDiff::CorruptEntry) }
 }
 
