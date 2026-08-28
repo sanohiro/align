@@ -1,0 +1,10 @@
+[package]
+name = "align_watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+align_interface = { path = "../align_interface" }
+libc = "0.2"

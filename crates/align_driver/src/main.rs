@@ -45,10 +45,16 @@ use align_driver::{
 use align_span::SourceMap;
 
 mod size;
+mod watch;
+mod watch_native;
 
 fn main() -> ExitCode {
     let raw_os = std::env::args_os().collect::<Vec<_>>();
     if raw_os.get(1).is_some_and(|value| value == "db") {
+        if raw_os.iter().skip(2).any(|value| value == "--watch") {
+            eprintln!("alignc: --watch is only valid for `build` (got `db`)");
+            return ExitCode::FAILURE;
+        }
         return match raw_os.get(2).and_then(|value| value.to_str()) {
             Some("prepare") => run_db_prepare(&raw_os[3..]),
             Some("migrate") => run_db_migration(DbMigrationCommand::Migrate, &raw_os[3..]),
@@ -82,6 +88,13 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(e) => {
             eprintln!("alignc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (watch, args) = match parse_watch(&args) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("alignc: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -127,6 +140,15 @@ fn main() -> ExitCode {
     };
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    if watch && cmd != Some("build") {
+        eprintln!("alignc: --watch is only valid for `build` (got `{}`)", cmd.unwrap_or("<none>"));
+        return ExitCode::FAILURE;
+    }
+    if cmd == Some("build") && path.is_some_and(|path| path == "--help") {
+        build_usage();
+        return ExitCode::SUCCESS;
+    }
 
     // `--cache-stats` / `-j` only mean something on the build-producing per-unit path.
     let build_verb = matches!(cmd, Some("build") | Some("run") | Some("size"));
@@ -271,6 +293,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
+        (Some("build"), Some(p)) if watch => {
+            watch::run_watch_build(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats)
+        }
         (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
@@ -279,6 +304,21 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn parse_watch(args: &[String]) -> Result<(bool, Vec<String>), &'static str> {
+    let mut watch = false;
+    let mut rest = Vec::with_capacity(args.len());
+    for argument in args {
+        if argument == "--watch" {
+            watch = true;
+        } else if argument.starts_with("--watch=") {
+            return Err("--watch does not take a value");
+        } else {
+            rest.push(argument.clone());
+        }
+    }
+    Ok((watch, rest))
 }
 
 /// Pull every `--export <name>` / `--export=<name>` out of `args` (repeatable — each occurrence
@@ -1195,6 +1235,8 @@ fn usage() {
          --pgo-use F   (build/run/size; release/fast only) rebuild using merged profile data F\n  \
                        (.profdata); exclusive with --pgo-instrument; not combinable with --thin-lto\n  \
          --cache-stats (build/run/size) print a per-unit codegen-cache hit/miss report\n  \
+         --watch       (build only) rebuild on compiler-observed file changes; other toolchain/library\n  \
+                       changes need another observed change or restart\n  \
          -j, --jobs N  (build/run/size) codegen worker threads (default: available parallelism;\n  \
                        overrides ALIGNC_JOBS)\n  \
          \n\
@@ -1203,6 +1245,14 @@ fn usage() {
          ALIGNC_LINKER system | lld — pin the linker (default: lld on ELF when the LLVM\n  \
                        toolchain ships one, otherwise the system linker; macOS always uses the\n  \
                        system linker). Only link speed changes, never the optimization applied."
+    );
+}
+
+fn build_usage() {
+    eprintln!(
+        "usage: alignc build <file.align> [build options] [--watch]\n\
+         \n\
+         --watch  rebuild on compiler-observed file changes; other toolchain/library changes need another observed change or restart"
     );
 }
 

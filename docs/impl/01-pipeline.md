@@ -112,7 +112,14 @@ executable
   consumer interfaces.
 - Shipped subcommands: `check`, `check-per-unit`, `emit-interface`, `emit-mir`, `emit-llvm`,
   `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
-  profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, and instrumented PGO.
+  profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, instrumented PGO, and the explicit
+  foreground `--watch` loop.
+- Watch builds route every consumed source, import, PGO profile, file-backed static input, and
+  checked metadata read through `align_watch`. That internal crate retains bounded semantic and
+  filesystem-topology evidence for final publication checks and periodic native-event-backed
+  audits. `align_driver` owns revision execution, captured linker/strip output, last-good atomic
+  publication, signals, and the stderr protocol; external toolchain and runtime inputs remain
+  restart-triggered rather than watched.
 
 ## Cross-cutting Crates
 
@@ -122,6 +129,8 @@ executable
 - `align_interface`: canonical public type/function/effect summaries and fail-closed decoding.
 - `align_hash`: one deterministic hash implementation for language operations and artifact identity.
 - `align_fmt`: formatting over source tokens with AST assistance; it preserves deliberate line layout.
+- `align_watch`: bounded compiler-input observation, final semantic/topology revalidation, alias
+  repair dependencies, and native registration identities for foreground watch builds.
 
 ## The Path Driven First by the Skeleton (walking skeleton)
 

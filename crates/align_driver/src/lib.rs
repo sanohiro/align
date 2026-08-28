@@ -5,7 +5,9 @@
 //! integration tests call this.
 
 use align_diag::{Diagnostics, Severity};
+use align_watch as watch_inputs;
 use align_span::SourceMap;
+use std::io::Read as _;
 pub use align_codegen_llvm::{
     target_object_format, BuildTarget, DebugInfo, ObjectFormat, Profile,
 };
@@ -30,6 +32,17 @@ pub mod memo;
 mod query_meta_codegen;
 pub mod static_artifacts;
 pub mod static_inputs;
+mod watch_link;
+
+pub use align_watch::{
+    BuildInput, BuildInputSet, BuildInputState, BuildInputTopologyError, BuildSourceError,
+    FinalBuildInputSet, FinalizedWatchInputs, WatchRepairDependency, finalize_watch_inputs,
+    merge_observed_build_inputs, snapshot_watch_repair,
+};
+pub use watch_link::{
+    LinkOutputSink, LinkOutputStream, LinkStopSignal, link_objects_instrumented_with_output,
+    link_objects_with_output,
+};
 pub mod static_runtime;
 pub mod unit_cache;
 
@@ -2141,6 +2154,9 @@ struct LoadedUnit {
     /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own
     /// `DebugInfo` (its basename is what LLVM's remark strings — and thus the report — attribute to).
     file: String,
+    /// Lossless filesystem spelling used by static-input resolution. `file` remains the diagnostic
+    /// display name because `SourceMap` stores text, while this path preserves arbitrary Unix bytes.
+    access_path: std::path::PathBuf,
     /// The unit source's id in the walk's `SourceMap`. The per-unit memo reattaches it to a replayed
     /// diagnostic, whose stored form deliberately drops the id (it is walk-local).
     fid: align_span::FileId,
@@ -2196,8 +2212,18 @@ fn check_pkg_import_edge(importer: &str, imported: &[&str], span: align_span::Sp
 /// lexer -> parser for the entry file plus its transitively-imported **user** modules, plus the
 /// cyclic-import (DAG) check. The shared front half of [`check`] and [`build_interface_summaries`];
 /// behavior-identical to the former inline loader.
-fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Diagnostics) -> Vec<LoadedUnit> {
-    let entry_dir = std::path::Path::new(name).parent().map(|p| p.to_path_buf());
+fn load_units(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    diags: &mut Diagnostics,
+    entry_access_path: Option<&std::path::Path>,
+) -> Vec<LoadedUnit> {
+    let observed = entry_access_path.is_some();
+    let entry_path_on_disk = entry_access_path
+        .unwrap_or_else(|| std::path::Path::new(name))
+        .to_path_buf();
+    let entry_dir = entry_path_on_disk.parent().map(|path| path.to_path_buf());
 
     // The entry module's own name is its `module` decl, or `main` by default.
     let entry_fid = source_map.add_file(name, src);
@@ -2216,6 +2242,7 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
         is_entry: true,
         src: src.to_string(),
         file: name.to_string(),
+        access_path: entry_path_on_disk,
         fid: entry_fid,
     }];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
@@ -2257,21 +2284,39 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
                 file_path.push(&seg.name);
             }
             file_path.set_extension("align");
-            let msrc = match std::fs::read_to_string(&file_path) {
+            let source_name = if observed {
+                observed_source_name(&file_path)
+            } else {
+                file_path.display().to_string()
+            };
+            let msrc = match watch_inputs::observe_consumed_read(
+                &file_path,
+                |file| {
+                    let mut file = file?;
+                    let mut source = String::new();
+                    file.read_to_string(&mut source)?;
+                    Ok(source)
+                },
+                |result| result.as_ref().ok().map(String::as_bytes),
+                || Err(std::io::Error::other("watch observation rejected path")),
+            ) {
                 Ok(s) => s,
                 Err(e) => {
-                    diags.error(format!("cannot find module `{modpath}` (expected {}): {e}", file_path.display()), imp.span);
+                    diags.error(
+                        format!("cannot find module `{modpath}` (expected {source_name}): {e}"),
+                        imp.span,
+                    );
                     continue;
                 }
             };
-            let fid = source_map.add_file(file_path.display().to_string(), msrc.clone());
+            let fid = source_map.add_file(source_name.clone(), msrc.clone());
             let toks = align_lexer::tokenize(fid, &msrc, diags);
             let mast = align_parser::parse_file(toks, diags);
             // The file must declare the full `module util.math` (path ↔ filename agreement).
             let declared = mast.module.as_ref().map(|m| m.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."));
             if declared.as_deref() != Some(modpath.as_str()) {
                 diags.error(
-                    format!("module file `{}` must declare `module {modpath}` (found {})", file_path.display(),
+                    format!("module file `{source_name}` must declare `module {modpath}` (found {})",
                         declared.map(|d| format!("`module {d}`")).unwrap_or_else(|| "no module declaration".to_string())),
                     imp.span,
                 );
@@ -2281,7 +2326,8 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
                 ast: mast,
                 is_entry: false,
                 src: msrc,
-                file: file_path.display().to_string(),
+                file: source_name,
+                access_path: file_path,
                 fid,
             });
         }
@@ -2372,7 +2418,7 @@ fn check_program_memoized(
 
 pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let mut diags = Diagnostics::new();
-    let loaded = load_units(source_map, name, src, &mut diags);
+    let loaded = load_units(source_map, name, src, &mut diags, None);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
@@ -2402,7 +2448,7 @@ pub fn build_interface_summaries(
     src: &str,
 ) -> (Vec<align_interface::InterfaceSummary>, Diagnostics) {
     let mut diags = Diagnostics::new();
-    let loaded = load_units(source_map, name, src, &mut diags);
+    let loaded = load_units(source_map, name, src, &mut diags, None);
     let modules: Vec<align_sema::Module> = loaded
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
@@ -2570,6 +2616,16 @@ fn closure_of(
 }
 
 fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: bool) -> PerUnitWalk {
+    walk_per_unit_at(source_map, name, src, located, None)
+}
+
+fn walk_per_unit_at(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    located: bool,
+    entry_access_path: Option<&std::path::Path>,
+) -> PerUnitWalk {
     // `UnitReuse::Forbidden` makes the persistent unit cache inert, so this is byte-for-byte the
     // pre-cache walk: every unit is computed and every body is `Lowered`.
     let walk = walk_inner(
@@ -2580,6 +2636,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         &CacheContext::Disabled,
         UnitReuse::Forbidden,
         None,
+        entry_access_path,
     );
     walk.into_per_unit()
 }
@@ -2590,6 +2647,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
 /// `cache` and `reuse` are the ONLY behavioral difference between the two. With
 /// `UnitReuse::Forbidden` no unit-cache lookup or publish happens and no key is even built, so the
 /// existing entry points keep their exact semantics and cost.
+#[allow(clippy::too_many_arguments)]
 fn walk_inner(
     source_map: &mut SourceMap,
     name: &str,
@@ -2598,11 +2656,13 @@ fn walk_inner(
     cache: &CacheContext,
     reuse: UnitReuse,
     mut on_ready: Option<&mut ReadyUnitHook<'_>>,
+    entry_access_path: Option<&std::path::Path>,
 ) -> PackageWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
-    let loaded = load_units(source_map, name, src, &mut diags);
-    let lexical_project_root = std::path::Path::new(name)
+    let loaded = load_units(source_map, name, src, &mut diags, entry_access_path);
+    let lexical_project_root = entry_access_path
+        .unwrap_or_else(|| std::path::Path::new(name))
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -2618,6 +2678,10 @@ fn walk_inner(
     };
 
     let by_path: HashMap<&str, &LoadedUnit> = loaded.iter().map(|l| (l.path.as_str(), l)).collect();
+    let defining_paths: HashMap<align_span::FileId, std::path::PathBuf> = loaded
+        .iter()
+        .map(|unit| (unit.fid, unit.access_path.clone()))
+        .collect();
     // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
     let direct_deps: HashMap<String, Vec<String>> = loaded
         .iter()
@@ -3094,8 +3158,13 @@ fn walk_inner(
                     match lock_metadata_publication_shared(&project_root) {
                         Ok(lock) => publication_lock = Some(lock),
                         Err(error) => {
+                            let message = if entry_access_path.is_some() {
+                                error.watch_message()
+                            } else {
+                                error.to_string()
+                            };
                             diags.error(
-                                error.to_string(),
+                                message,
                                 publication_lock_span
                                     .unwrap_or_else(|| align_span::Span::new(0, 0, 0)),
                             );
@@ -3103,15 +3172,21 @@ fn walk_inner(
                         }
                     }
                 }
-                let resolved = match resolve_static_descriptors(
+                let resolved = match static_inputs::resolve_static_descriptors_at(
                     &project_root,
                     source_map,
                     &static_descriptors,
                     resolution_digest,
+                    &defining_paths,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
-                        diags.error(error.to_string(), error.span);
+                        let message = if entry_access_path.is_some() {
+                            error.watch_message()
+                        } else {
+                            error.to_string()
+                        };
+                        diags.error(message, error.span);
                         continue;
                     }
                 };
@@ -3646,6 +3721,20 @@ pub enum PipelinedPackageBuild {
     Complete(PipelinedPackageComplete),
 }
 
+/// One producer-observed ordinary package attempt for foreground compilation.
+pub enum ObservedBuildAttempt {
+    ObservationFailed { error: BuildInputTopologyError },
+    SourceFailed { error: BuildSourceError, inputs: BuildInputSet },
+    Pipeline { build: PipelinedPackageBuild, inputs: BuildInputSet },
+}
+
+/// The producer-observed ThinLTO front half for foreground compilation.
+pub enum ObservedPerUnitBuild {
+    ObservationFailed { error: BuildInputTopologyError },
+    SourceFailed { error: BuildSourceError, inputs: BuildInputSet },
+    Walk { walk: PerUnitWalk, inputs: BuildInputSet },
+}
+
 /// A complete pipelined package. The private stage owns every object lent by [`PipelinedBuiltUnit`]
 /// and keeps it alive until the caller has finished linking.
 pub struct PipelinedPackageComplete {
@@ -3974,6 +4063,121 @@ pub fn build_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
     walk_per_unit(source_map, name, src, false)
 }
 
+fn observed_source(path: &std::path::Path) -> Result<String, BuildSourceError> {
+    let bytes = watch_inputs::observe_consumed_read(
+        path,
+        |file| {
+            let mut file = file?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        },
+        |result| result.as_ref().ok().map(Vec::as_slice),
+        || Err(std::io::Error::other("watch observation rejected path")),
+    ).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BuildSourceError::Missing
+        } else if error.kind() == std::io::ErrorKind::InvalidInput
+            || std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+        {
+            BuildSourceError::NonRegular
+        } else {
+            BuildSourceError::Io { message: error.to_string() }
+        }
+    })?;
+    String::from_utf8(bytes).map_err(|error| BuildSourceError::InvalidUtf8 {
+        offset: u64::try_from(error.utf8_error().valid_up_to()).unwrap_or(u64::MAX),
+    })
+}
+
+pub(crate) fn observed_source_name(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut encoded = String::with_capacity(path.as_os_str().as_bytes().len());
+        for byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-') {
+                encoded.push(char::from(*byte));
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+        encoded
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// Build one ordinary package while recording every compiler-observed input.
+#[allow(clippy::too_many_arguments)]
+pub fn build_path_pipelined_observed(
+    source_map: &mut SourceMap,
+    path: &std::path::Path,
+    cache: CacheContext,
+    reuse: UnitReuse,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+) -> ObservedBuildAttempt {
+    let (result, inputs) = watch_inputs::collect_observations(|| {
+        let source = observed_source(path)?;
+        let name = observed_source_name(path);
+        Ok::<_, BuildSourceError>(build_package_pipelined_at(
+            source_map,
+            &name,
+            &source,
+            cache,
+            reuse,
+            target,
+            profile,
+            rt_lto,
+            jobs,
+            pgo,
+            Some(path),
+        ))
+    });
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => return ObservedBuildAttempt::ObservationFailed { error },
+    };
+    match result {
+        Ok(build) => ObservedBuildAttempt::Pipeline { build, inputs },
+        Err(error) => ObservedBuildAttempt::SourceFailed { error, inputs },
+    }
+}
+
+/// Run the existing per-unit front half while recording every observed input.
+pub fn build_path_per_unit_observed(
+    source_map: &mut SourceMap,
+    path: &std::path::Path,
+) -> ObservedPerUnitBuild {
+    let (result, inputs) = watch_inputs::collect_observations(|| {
+        let source = observed_source(path)?;
+        let name = observed_source_name(path);
+        Ok::<_, BuildSourceError>(walk_per_unit_at(
+            source_map,
+            &name,
+            &source,
+            false,
+            Some(path),
+        ))
+    });
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => return ObservedPerUnitBuild::ObservationFailed { error },
+    };
+    match result {
+        Ok(walk) => ObservedPerUnitBuild::Walk { walk, inputs },
+        Err(error) => ObservedPerUnitBuild::SourceFailed { error, inputs },
+    }
+}
+
 /// The `build`/`run`/`size` package build: the same bottom-up walk, but a unit whose frontend
 /// result is already in the persistent cache is served from there and carries no MIR
 /// (`docs/impl/10-cache-first-optimization.md` §6.7).
@@ -3989,7 +4193,7 @@ pub fn build_package(
     cache: &CacheContext,
     reuse: UnitReuse,
 ) -> PackageBuild {
-    walk_inner(source_map, name, src, false, cache, reuse, None).into_package()
+    walk_inner(source_map, name, src, false, cache, reuse, None, None).into_package()
 }
 
 /// M15 S2b per-unit build with **source locations** — like [`build_per_unit`], but each unit's MIR is
@@ -4767,6 +4971,25 @@ pub fn build_package_pipelined(
     jobs: usize,
     pgo: &PgoMode,
 ) -> PipelinedPackageBuild {
+    build_package_pipelined_at(
+        source_map, name, src, cache, reuse, target, profile, rt_lto, jobs, pgo, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_package_pipelined_at(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    cache: CacheContext,
+    reuse: UnitReuse,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+    entry_access_path: Option<&std::path::Path>,
+) -> PipelinedPackageBuild {
     let jobs = jobs.max(1);
 
     // Setup may execute before the walk to enable overlap, but its failure is retained until the
@@ -4904,7 +5127,16 @@ pub fn build_package_pipelined(
                 }
             }
         };
-        walk_inner(source_map, name, src, false, &cache, reuse, Some(&mut on_ready))
+        walk_inner(
+            source_map,
+            name,
+            src,
+            false,
+            &cache,
+            reuse,
+            Some(&mut on_ready),
+            entry_access_path,
+        )
     };
     let mut build = walk.into_package();
 
@@ -5233,6 +5465,7 @@ mod pipeline_tests {
             &CacheContext::Disabled,
             UnitReuse::Forbidden,
             Some(&mut noop),
+            None,
         )
         .into_per_unit();
         assert_eq!(
@@ -5299,6 +5532,7 @@ mod pipeline_tests {
             &CacheContext::Disabled,
             UnitReuse::Forbidden,
             Some(&mut noop),
+            None,
         )
         .into_package();
         assert_eq!(
@@ -5337,12 +5571,27 @@ fn stage_pgo(pgo: &PgoMode) -> Result<StagedPgo, String> {
             _guard: None,
         }),
         PgoMode::Use(path) => {
-            let bytes = std::fs::read(path).map_err(|error| {
-                format!(
-                    "--pgo-use: cannot read profile data file '{}': {error}",
-                    path.display()
-                )
-            })?;
+            let bytes = watch_inputs::observe_consumed_read(
+                path,
+                |file| {
+                    let mut file = file.map_err(|error| {
+                        format!(
+                            "--pgo-use: cannot read profile data file '{}': {error}",
+                            path.display()
+                        )
+                    })?;
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).map_err(|error| {
+                        format!(
+                            "--pgo-use: cannot read profile data file '{}': {error}",
+                            path.display()
+                        )
+                    })?;
+                    Ok(bytes)
+                },
+                |result| result.as_ref().ok().map(Vec::as_slice),
+                || Err("--pgo-use: watch observation rejected path".to_string()),
+            )?;
             let digest = Hash128::of(&bytes);
             let staged = StagedProfdata::new(&bytes)?;
             let staged_path = staged.path().to_path_buf();
@@ -5664,8 +5913,24 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
 /// Read a profile exactly once after the public path-shape checks and validate only the indexed
 /// profile header. Deeper format/version validation remains libLLVM's job on a cache miss.
 fn read_and_validate_profdata(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
+    watch_inputs::observe_consumed_read(
+        path,
+        |file| read_and_validate_profdata_inner(path, file),
+        |result| result.as_ref().ok().map(Vec::as_slice),
+        || Err("--pgo-use: watch observation rejected path".to_string()),
+    )
+}
+
+fn read_and_validate_profdata_inner(
+    path: &std::path::Path,
+    file: std::io::Result<std::fs::File>,
+) -> Result<Vec<u8>, String> {
+    let mut file = file.map_err(|error| {
+        format!(
+            "--pgo-use: cannot read profile data file '{}': {error}",
+            path.display()
+        )
+    })?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("--pgo-use: cannot inspect profile data file '{}': {error}", path.display()))?;
@@ -7353,7 +7618,13 @@ mod walk_tests {
 
         let mut source_map = SourceMap::new();
         let mut diags = Diagnostics::new();
-        let loaded = load_units(&mut source_map, &entry.display().to_string(), entry_src, &mut diags);
+        let loaded = load_units(
+            &mut source_map,
+            &entry.display().to_string(),
+            entry_src,
+            &mut diags,
+            None,
+        );
         assert!(!diags.has_errors());
         let n = loaded.len();
         assert_eq!(n, 3);
@@ -7410,6 +7681,7 @@ static ARTIFACT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// skipped, and Drop removes only the directory this invocation successfully created.
 pub struct ArtifactStage {
     dir: std::path::PathBuf,
+    owned: bool,
 }
 
 impl ArtifactStage {
@@ -7423,7 +7695,7 @@ impl ArtifactStage {
                 .as_nanos();
             let dir = parent.join(format!(".{label}-{}-{stamp}-{nonce}", std::process::id()));
             match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(Self { dir }),
+                Ok(()) => return Ok(Self { dir, owned: true }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
@@ -7441,11 +7713,18 @@ impl ArtifactStage {
     pub fn path(&self) -> &std::path::Path {
         &self.dir
     }
+
+    pub(crate) fn into_owned_dir(mut self) -> std::path::PathBuf {
+        self.owned = false;
+        std::mem::take(&mut self.dir)
+    }
 }
 
 impl Drop for ArtifactStage {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
