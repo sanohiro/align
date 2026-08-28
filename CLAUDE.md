@@ -585,7 +585,10 @@ accepts any path entirely outside the repository.
   coherent fix against the finding ledger and changed slice; do not launch a
   second complete-diff discovery pass. `scripts/review-bounded.sh` records
   every started review under the worktree Git directory and refuses a
-  descendant full-diff review when an ancestor record exists. Only a
+  descendant full-diff review when an ancestor record exists. Continue an
+  ordinary fix with `--changed-since <reviewed-head>`; the command accepts only
+  the nearest reviewed ancestor, inspects that exact slice, and binds the
+  composed verdict to final `HEAD` and the original merge base. Only a
   high-risk redesign may override this with `--reopen-axis <axis>`, and only
   when a commit after the reviewed head changes `CLAUDE.md` or an authoritative
   `docs/impl` plan and carries the exact

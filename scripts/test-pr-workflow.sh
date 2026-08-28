@@ -336,6 +336,7 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean-readonly) echo "Read-only inspection found no actionable soundness or regression risks in the diff." ;;\n'
   printf '  native-clean-inspected) echo "No actionable soundness or regression issues were found in the inspected diff." ;;\n'
   printf '  native-clean-risks) echo "No actionable soundness or regression risks were found in the inspected diff." ;;\n'
+  printf '  native-clean-inline) echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN"; echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
   printf '  native-clean-introducing) echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
   printf '  native-clean-mixed) echo "Actionable issue: the review is not clean."; echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
   printf '  native-findings) echo "- [P1] broken workflow — scripts/example.sh:1" ;;\n'
@@ -445,6 +446,10 @@ native_inspected_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_risks_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-inline ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_inline_status=$?
 ( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-introducing ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
@@ -483,7 +488,7 @@ set -e
 }
 [[ $native_clean_status -eq 0 && $native_readonly_status -eq 0 &&
   $native_inspected_status -eq 0 && $native_risks_status -eq 0 &&
-  $native_introducing_status -eq 0 && $native_mixed_status -eq 3 &&
+  $native_inline_status -eq 0 && $native_introducing_status -eq 0 && $native_mixed_status -eq 3 &&
   $native_findings_status -eq 2 ]] || {
   echo "native review output was classified incorrectly" >&2
   exit 1
@@ -495,6 +500,7 @@ set -e
 printf '\ndescendant review fix\n' >>"$docs_repo/docs/notes.md"
 git -C "$docs_repo" add docs/notes.md
 git -C "$docs_repo" commit -qm 'docs: close review findings'
+descendant_review_head="$(git -C "$docs_repo" rev-parse HEAD)"
 set +e
 ( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
   ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
@@ -503,6 +509,17 @@ descendant_review_status=$?
 set -e
 [[ $descendant_review_status -eq 1 ]] || {
   echo "descendant full-diff review was not blocked" >&2
+  exit 1
+}
+changed_slice_args="$tmp_dir/codex-changed-slice-args"
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  FAKE_CODEX_ARGS_FILE="$changed_slice_args" ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main \
+    --changed-since "$review_head_sha" ) >/dev/null
+grep -Fq "git diff $review_head_sha..$descendant_review_head" "$changed_slice_args" || {
+  echo "changed-slice review did not bind the nearest reviewed ancestor:" >&2
+  cat "$changed_slice_args" >&2
   exit 1
 }
 mkdir -p "$docs_repo/docs/impl"
