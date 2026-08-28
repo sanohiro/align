@@ -74,6 +74,16 @@ Run it with:
 ./target/release/alignc run hello.align
 ```
 
+For an editor or agent loop, keep one foreground compiler resident and rebuild whenever a file the
+compiler actually consumed changes:
+
+```sh
+./target/release/alignc build hello.align --watch
+```
+
+The process keeps the last successful executable in place. Toolchain and library replacements are
+picked up by the next observed source/input change, or immediately after restarting the command.
+
 Or try Align without a file at all. `align-repl` is an AOT REPL: every entry recompiles one growing
 program with the real compiler and runs the real binary, so nothing is interpreted.
 

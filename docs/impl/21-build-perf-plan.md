@@ -23,7 +23,7 @@ Order is priority.
 | 3 | Pipelined compilation | Shipped as #884. A dependent unit's frontend starts as soon as each dependency interface summary exists while already-ready codegen runs within the same `-j` budget; validation, publication, and retry follow the ledger below |
 | 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
 | 4 | Prebuilt optimized cache distribution | Shipped as #893 — exact native releases carry an adjacent immutable cache warmed from 19 first-party `pkg` modules plus one generated entry unit (20 total); compiler-provided `core`/`std` imports have no cacheable source unit |
-| 5 | Foreground watch builds | Design settled below; implementation pending. `align-repl` (`docs/impl/22-repl-plan.md`) already realizes memo residency for interactive sessions; `alignc build FILE --watch` extends the same explicit long-lived-process model to editor and AI-agent loops without a detached daemon |
+| 5 | Foreground watch builds | Implemented — `alignc build FILE --watch` keeps one foreground compiler resident, observes the exact files consumed by ordinary and ThinLTO builds, revalidates their semantic/topology state, captures child output, and atomically preserves the last-good executable without a daemon or socket |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
 
 ## Background

@@ -180,6 +180,15 @@ work runs the corresponding real-resource target in an unrestricted
 environment. A test should be added to an existing owner target when possible;
 do not create another cross-cutting integration matrix for a unit-level rule.
 
+Foreground watch builds are owned by `align_watch`'s library tests,
+`align_driver`'s `watch_link` library tests, and the real-binary
+`crates/align_driver/tests/watch_build.rs` target. Together they cover input/evidence ordering,
+alias repair and collation cleanup, semantic/topology rearming, ordinary and ThinLTO revisions,
+import disappearance/recovery, native registration generations, child framing and cleanup,
+last-good publication, CLI exclusion, and graceful stop. Run those focused owners before the
+bounded code gate when watch observation, publication, native events, or captured tool execution
+changes.
+
 Request 14's exclusive filesystem publication implementation keeps its owner
 evidence in the existing filesystem boundary. `crates/align_driver/tests/m9_fs.rs`
 owns source formation, imports, execution, writer ownership, control flow, and

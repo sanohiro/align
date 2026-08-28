@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-27._ align-llm Request 21's borrowed projection view repair is merged in
+_Last updated: 2026-08-28._ align-llm Request 21's borrowed projection view repair is merged in
 Align PR #892
 against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
 an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
@@ -359,11 +359,12 @@ facts must live in this repository.
   unit to distribute, package source resolution is unchanged, and ThinLTO keeps
   its all-MIR path. Codegen-family keys include the loaded LLVM build id, the
   release inventory is checked in both directions, and native packaging verifies
-  the actual installed Homebrew binary before publication. `align-repl` already
-  realizes item 5 residency for interactive sessions; the foreground
-  `alignc build FILE --watch` contract, exact input-observation surface, race
-  closure, and resource limits are settled in the same plan, with implementation
-  next. Function-level incrementality remains item 6 and requires its own ledger.
+  the actual installed Homebrew binary before publication. Item 5 foreground
+  watch builds are implemented: `alignc build FILE --watch` keeps one compiler
+  resident, observes and revalidates exact compiler-consumed inputs, uses native
+  events plus a semantic audit, captures tool output, and preserves the last-good
+  executable through bounded atomic publication. Function-level incrementality
+  remains item 6 and requires its own ledger.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

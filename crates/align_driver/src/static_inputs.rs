@@ -1163,7 +1163,21 @@ fn snapshot_checked_metadata_record(
     let logical = metadata_logical_path(descriptor_id, driver)?;
     let root = canonical_root(project_root)?;
     let path = root.join(logical.replace('/', std::path::MAIN_SEPARATOR_STR));
-    match fs::symlink_metadata(&path) {
+    let metadata = align_watch::observe_consumed_classification(
+        &path,
+        || fs::symlink_metadata(&path),
+        |result| match result {
+            Ok(metadata) if metadata.is_file() => None,
+            Ok(_) => Some(align_watch::BuildInputState::NonRegular),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(align_watch::BuildInputState::Missing)
+            }
+            Err(_) => Some(align_watch::BuildInputState::Unreadable),
+        },
+        |result| result.as_ref().ok(),
+        || Err(std::io::Error::other("watch observation rejected metadata path")),
+    );
+    match metadata {
         Ok(metadata) if metadata.is_file() => {
             let bytes = read_metadata_bytes(&root, &path, &logical)?;
             let record = parse_checked_metadata(&bytes, &logical, descriptor_id, driver)?;
@@ -2094,7 +2108,24 @@ fn read_bounded_file(
     path: &Path,
     too_large: impl Fn() -> StaticInputError,
 ) -> Result<Vec<u8>, StaticInputError> {
-    let file = fs::File::open(path).map_err(|e| StaticInputError::Io {
+    align_watch::observe_consumed_read(
+        path,
+        |file| read_bounded_file_inner(path, file, &too_large),
+        |result| result.as_ref().ok().map(Vec::as_slice),
+        || {
+            Err(StaticInputError::InvalidPath(
+                "watch observation rejected static path".to_string(),
+            ))
+        },
+    )
+}
+
+fn read_bounded_file_inner(
+    path: &Path,
+    file: std::io::Result<fs::File>,
+    too_large: &impl Fn() -> StaticInputError,
+) -> Result<Vec<u8>, StaticInputError> {
+    let file = file.map_err(|e| StaticInputError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
