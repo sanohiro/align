@@ -1471,10 +1471,15 @@ printf "test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
 exit 139')"
 
 suite_artifact() {
-  printf '{"reason":"compiler-artifact","manifest_path":"%s/pkg/Cargo.toml",' "$suite_dir"
-  printf '"target":{"kind":["lib"],"name":"x","test":true},'
+  local executable="$1" package="${2:-pkg}" kind="${3:-test}" name="${4:-}"
+  if [ -z "$name" ]; then
+    name="$(basename "$executable")"
+    name="${name%-*}"
+  fi
+  printf '{"reason":"compiler-artifact","manifest_path":"%s/%s/Cargo.toml",' "$suite_dir" "$package"
+  printf '"target":{"kind":["%s"],"crate_types":["bin"],"name":"%s","test":true},' "$kind" "$name"
   printf '"profile":{"opt_level":"0","test":true},"features":[],'
-  printf '"filenames":["x"],"executable":"%s","fresh":true}\n' "$1"
+  printf '"filenames":["x"],"executable":"%s","fresh":true}\n' "$executable"
 }
 suite_stream() {
   local out="$1" executable
@@ -1496,7 +1501,12 @@ suite_manifest() {
 }
 # The fixture manifest is written with real tabs, exactly as the shipped one is.
 suite_line() {
-  printf '%s\t%s' "$1" "$2"
+  local target="$1"
+  case "$target" in
+    *::*::*) ;;
+    *) target="pkg::test::$target" ;;
+  esac
+  printf '%s\t%s' "$target" "$2"
   [ $# -lt 3 ] || printf '\t%s' "$3"
   printf '\n'
 }
@@ -1528,7 +1538,8 @@ grep -Fq 'matches' "$suite_match_out" || {
 }
 # A known-failing binary is not silently trusted: its own result line is still
 # in the report, and a passing binary is summarised rather than dumped.
-for expected_line in '--- suite_red (exit 101' '--- suite_green (exit 0' 'test result: ok.'; do
+for expected_line in '--- pkg::test::suite_red (exit 101' \
+  '--- pkg::test::suite_green (exit 0' 'test result: ok.'; do
   grep -Fq -e "$expected_line" "$suite_match_out" || {
     echo "the suite report lacks '$expected_line':" >&2
     cat "$suite_match_out" >&2
@@ -1545,7 +1556,7 @@ grep -Fq 'NEW failures' "$suite_new_out" || {
   cat "$suite_new_out" >&2
   exit 1
 }
-grep -Eq '^  suite_red[[:space:]]+beta$' "$suite_new_out" || {
+grep -Eq '^  pkg::test::suite_red[[:space:]]+beta$' "$suite_new_out" || {
   echo "the new failure was not named target-and-test:" >&2
   cat "$suite_new_out" >&2
   exit 1
@@ -1565,7 +1576,7 @@ grep -Fq 'did NOT fail' "$suite_fixed_out" || {
   cat "$suite_fixed_out" >&2
   exit 1
 }
-grep -Eq '^  suite_green[[:space:]]+alpha \(passed\)$' "$suite_fixed_out" || {
+grep -Eq '^  pkg::test::suite_green[[:space:]]+alpha \(passed\)$' "$suite_fixed_out" || {
   echo "the repaired test was not named:" >&2
   cat "$suite_fixed_out" >&2
   exit 1
@@ -1594,7 +1605,7 @@ grep -Fq '0 known, 2 environment-dependent' "$suite_env_out" || {
 # with a strict line.
 env_gone_manifest="$(suite_manifest env-gone "$(suite_line suite_gone needs_network env)")"
 suite_env_gone_out="$(suite_case env-gone "$env_gone_manifest" 1 "$suite_green")"
-grep -Eq '^  suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
+grep -Eq '^  pkg::test::suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
   "$suite_env_gone_out" || {
   echo "an env line for a deleted target was not reported:" >&2
   cat "$suite_env_gone_out" >&2
@@ -1614,18 +1625,18 @@ grep -Fq 'both as a known failure and as' "$suite_both_out" || {
 # 5. A binary that exits non-zero without naming a test, and one that never
 # reaches libtest's summary at all, both fail closed.
 suite_harness_out="$(suite_case harness "$empty_manifest" 1 "$suite_harness")"
-grep -Eq '^  suite_harness[[:space:]]+<binary-exit-4>$' "$suite_harness_out" || {
+grep -Eq '^  pkg::test::suite_harness[[:space:]]+<binary-exit-4>$' "$suite_harness_out" || {
   echo "a harness-level non-zero exit was not reported:" >&2
   cat "$suite_harness_out" >&2
   exit 1
 }
 suite_hang_out="$(suite_case hang "$empty_manifest" 1 "$suite_hang")"
-grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" || {
+grep -Eq '^  pkg::test::suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" || {
   echo "a binary killed by the per-binary cap was not reported:" >&2
   cat "$suite_hang_out" >&2
   exit 1
 }
-grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
+grep -Fq -- '--- pkg::test::suite_hang (exit timeout' "$suite_hang_out" || {
   echo "the capped binary was not reported as a timeout:" >&2
   cat "$suite_hang_out" >&2
   exit 1
@@ -1635,7 +1646,7 @@ grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
 # hung binary never got to run its known-failing test.
 hang_known_manifest="$(suite_manifest hang-known "$(suite_line suite_hang alpha)")"
 suite_hang_known_out="$(suite_case hang-known "$hang_known_manifest" 1 "$suite_hang")"
-grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
+grep -Eq '^  pkg::test::suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
   echo "a hung binary with a manifest entry was not reported as did-not-report:" >&2
   cat "$suite_hang_known_out" >&2
   exit 1
@@ -1649,7 +1660,7 @@ grep -Fq 'did NOT fail' "$suite_hang_known_out" && {
 # manifest, so only the exit code distinguishes this run from a clean baseline.
 crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
 suite_crash_out="$(suite_case crash "$crash_manifest" 1 "$suite_crash")"
-grep -Eq '^  suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
+grep -Eq '^  pkg::test::suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
   echo "a crash after libtest's summary was absorbed by the known failure:" >&2
   cat "$suite_crash_out" >&2
   exit 1
@@ -1704,7 +1715,7 @@ exit 101')"
 splice_manifest="$(suite_manifest splice \
   "$(suite_line suite_splice alpha)" "$(suite_line suite_splice beta)")"
 suite_splice_out="$(suite_case splice "$splice_manifest" 1 "$suite_splice")"
-grep -Eq '^  suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
+grep -Eq '^  pkg::test::suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
   echo "a spliced failures list was not reported as unparsed:" >&2
   cat "$suite_splice_out" >&2
   exit 1
@@ -1720,15 +1731,72 @@ space_manifest="$(suite_manifest spaces 'suite_red beta')"
 suite_case spaces "$space_manifest" 2 "$suite_red" >/dev/null
 kind_manifest="$(suite_manifest kind "$(suite_line suite_red beta flaky)")"
 suite_case kind "$kind_manifest" 2 "$suite_red" >/dev/null
+legacy_manifest="$(suite_manifest legacy "$(printf 'suite_red\tbeta')")"
+legacy_out="$(suite_case legacy "$legacy_manifest" 2 "$suite_red")"
+grep -Fq 'target must be package-dir::kind::target' "$legacy_out" || {
+  echo "an unqualified manifest key was rejected for the wrong reason:" >&2
+  cat "$legacy_out" >&2
+  exit 1
+}
 
-# 7. Two same-named targets would make a manifest line ambiguous, so the run
-# refuses rather than binding the line to whichever ran first.
+# 7. Two identical Cargo target identities would make a manifest line
+# ambiguous, so the run refuses rather than binding the line arbitrarily.
 suite_dup_out="$(suite_case duplicate "$empty_manifest" 1 "$suite_green" "$suite_green")"
-grep -Fq 'share a name' "$suite_dup_out" || {
-  echo "duplicate target names were not rejected:" >&2
+grep -Fq 'share a package/kind/name identity' "$suite_dup_out" || {
+  echo "duplicate Cargo target identities were not rejected:" >&2
   cat "$suite_dup_out" >&2
   exit 1
 }
+
+# Executable basenames, conversely, are not identities. Own every qualifier:
+# the current workspace has a same-package `align-repl` bin and `align_repl`
+# lib that Cargo emits as two `align_repl-<hash>` files; separate packages may
+# reuse one integration-test target name; and one package may reuse a target
+# name across kinds. All six binaries must run under distinct stable keys.
+mkdir -p "$suite_dir/repl" "$suite_dir/alpha" "$suite_dir/beta" \
+  "$suite_dir/kinds" "$suite_dir/bin/identity"
+suite_identity_binary() {
+  local directory="$1" name="$2" path
+  path="$suite_dir/bin/identity/$directory/$name-0123456789abcdef"
+  mkdir -p "$(dirname "$path")"
+  printf '#!/usr/bin/env bash\nprintf "test result: ok. 0 passed; 0 failed; 0 ignored\\n"\n' >"$path"
+  chmod +x "$path"
+  printf '%s\n' "$path"
+}
+identity_repl_bin="$(suite_identity_binary repl-bin align_repl)"
+identity_repl_lib="$(suite_identity_binary repl-lib align_repl)"
+identity_alpha="$(suite_identity_binary alpha shared)"
+identity_beta="$(suite_identity_binary beta shared)"
+identity_kind_lib="$(suite_identity_binary kind-lib shared_kind)"
+identity_kind_bin="$(suite_identity_binary kind-bin shared_kind)"
+identity_stream="$tmp_dir/suite-qualified-identities.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$identity_repl_bin" repl bin align-repl
+  suite_artifact "$identity_repl_lib" repl lib align_repl
+  suite_artifact "$identity_alpha" alpha test shared
+  suite_artifact "$identity_beta" beta test shared
+  suite_artifact "$identity_kind_lib" kinds lib shared-kind
+  suite_artifact "$identity_kind_bin" kinds bin shared-kind
+} >"$identity_stream"
+identity_out="$tmp_dir/suite-qualified-identities-out"
+ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$identity_stream" >"$identity_out" 2>&1 || {
+  echo "qualified Cargo target identities still collided:" >&2
+  cat "$identity_out" >&2
+  exit 1
+}
+for identity in \
+  'repl::bin::align-repl' 'repl::lib::align_repl' \
+  'alpha::test::shared' 'beta::test::shared' \
+  'kinds::lib::shared-kind' 'kinds::bin::shared-kind'; do
+  grep -Fq -- "--- $identity (exit 0" "$identity_out" || {
+    echo "the suite omitted qualified identity $identity:" >&2
+    cat "$identity_out" >&2
+    exit 1
+  }
+done
 
 # 8. The self-build branch (no artifact argument) must build the workspace
 # before the test-binary build — `cargo test --no-run` alone does not produce
