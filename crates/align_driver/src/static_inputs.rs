@@ -470,6 +470,24 @@ pub fn resolve_static_descriptors(
         descriptors,
         resolution_digest,
         true,
+        None,
+    )
+}
+
+pub(crate) fn resolve_static_descriptors_at(
+    project_root: &Path,
+    source_map: &mut SourceMap,
+    descriptors: &[StaticDescriptor],
+    resolution_digest: Hash128,
+    defining_paths: &HashMap<align_span::FileId, PathBuf>,
+) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
+    resolve_static_descriptors_inner(
+        project_root,
+        source_map,
+        descriptors,
+        resolution_digest,
+        true,
+        Some(defining_paths),
     )
 }
 
@@ -486,6 +504,7 @@ pub(crate) fn resolve_static_descriptors_for_regeneration(
         descriptors,
         resolution_digest,
         false,
+        None,
     )
 }
 
@@ -495,6 +514,7 @@ fn resolve_static_descriptors_inner(
     descriptors: &[StaticDescriptor],
     resolution_digest: Hash128,
     load_checked_metadata: bool,
+    defining_paths: Option<&HashMap<align_span::FileId, PathBuf>>,
 ) -> Result<ResolvedStaticInputs, StaticDescriptorInputError> {
     let mut descriptor_ids = HashSet::with_capacity(descriptors.len());
     for descriptor in descriptors {
@@ -542,6 +562,10 @@ fn resolve_static_descriptors_inner(
                 )
             })?;
         let (defining_file, defining_source_text) = defining_source;
+        let defining_path = defining_paths
+            .and_then(|paths| paths.get(&descriptor.constructor_span.file))
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(&defining_file));
         let consumer = descriptor_consumer(descriptor.consumer);
         let restriction = descriptor_driver(descriptor.driver);
         let inline_mapping = match &descriptor.source {
@@ -574,7 +598,7 @@ fn resolve_static_descriptors_inner(
         let mut input = match &descriptor.source {
             StaticDescriptorSource::File { path_literal, .. } => resolve_static_file(
                 project_root,
-                Path::new(&defining_file),
+                &defining_path,
                 path_literal.as_deref(),
                 descriptor.descriptor_id.clone(),
                 consumer,
@@ -959,6 +983,24 @@ fn read_static_bytes(
     candidate: &Path,
     logical: &str,
 ) -> Result<Vec<u8>, StaticInputError> {
+    align_watch::observe_consumed_classification(
+        candidate,
+        || read_static_bytes_inner(root, candidate, logical),
+        |result| Some(static_observation_state(result)),
+        |_| None,
+        || {
+            Err(StaticInputError::InvalidPath(
+                "watch observation rejected static path".to_string(),
+            ))
+        },
+    )
+}
+
+fn read_static_bytes_inner(
+    root: &Path,
+    candidate: &Path,
+    logical: &str,
+) -> Result<Vec<u8>, StaticInputError> {
     let canonical = fs::canonicalize(candidate).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             StaticInputError::MissingFile(candidate.to_path_buf())
@@ -973,7 +1015,7 @@ fn read_static_bytes(
     if !canonical.is_file() {
         return Err(StaticInputError::NotRegularFile(canonical));
     }
-    let bytes = read_bounded_file(&canonical, || {
+    let bytes = read_bounded_file_inner(&canonical, fs::File::open(&canonical), &|| {
         StaticInputError::NonCanonical(format!("static input exceeds the field limit: {logical}"))
     })?;
     if std::str::from_utf8(&bytes).is_err() {
@@ -992,6 +1034,20 @@ fn read_static_bytes(
         });
     }
     Ok(bytes)
+}
+
+fn static_observation_state(
+    result: &Result<Vec<u8>, StaticInputError>,
+) -> align_watch::BuildInputState {
+    match result {
+        Ok(bytes) => align_watch::BuildInputState::Regular {
+            content_hash: Hash128::of(bytes),
+            len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        },
+        Err(StaticInputError::MissingFile(_)) => align_watch::BuildInputState::Missing,
+        Err(StaticInputError::NotRegularFile(_)) => align_watch::BuildInputState::NonRegular,
+        Err(_) => align_watch::BuildInputState::Unreadable,
+    }
 }
 
 fn make_input(
@@ -2104,22 +2160,6 @@ fn hex_value(byte: u8) -> Option<u32> {
     }
 }
 
-fn read_bounded_file(
-    path: &Path,
-    too_large: impl Fn() -> StaticInputError,
-) -> Result<Vec<u8>, StaticInputError> {
-    align_watch::observe_consumed_read(
-        path,
-        |file| read_bounded_file_inner(path, file, &too_large),
-        |result| result.as_ref().ok().map(Vec::as_slice),
-        || {
-            Err(StaticInputError::InvalidPath(
-                "watch observation rejected static path".to_string(),
-            ))
-        },
-    )
-}
-
 fn read_bounded_file_inner(
     path: &Path,
     file: std::io::Result<fs::File>,
@@ -2157,13 +2197,33 @@ fn read_metadata_bytes(
     path: &Path,
     logical_path: &str,
 ) -> Result<Vec<u8>, StaticInputError> {
+    align_watch::observe_consumed_classification(
+        path,
+        || read_metadata_bytes_inner(root, path, logical_path),
+        |result| Some(static_observation_state(result)),
+        |_| None,
+        || {
+            Err(StaticInputError::InvalidPath(
+                "watch observation rejected metadata path".to_string(),
+            ))
+        },
+    )
+}
+
+fn read_metadata_bytes_inner(
+    root: &Path,
+    path: &Path,
+    logical_path: &str,
+) -> Result<Vec<u8>, StaticInputError> {
     let canonical = fs::canonicalize(path).map_err(|e| StaticInputError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
     ensure_inside(root, &canonical)?;
-    read_bounded_file(&canonical, || StaticInputError::MetadataMalformed {
-        logical_path: logical_path.to_string(),
+    read_bounded_file_inner(&canonical, fs::File::open(&canonical), &|| {
+        StaticInputError::MetadataMalformed {
+            logical_path: logical_path.to_string(),
+        }
     })
 }
 
@@ -3078,6 +3138,67 @@ mod tests {
                 logical_path: "q.sql".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn missing_static_source_retains_its_lexical_watch_identity() {
+        let root = temp_root("missing-static-observation");
+        let defining = root.join("q.align");
+        write(&defining, "module q\n").expect("defining source");
+        let candidate = root.join("q.sql");
+        let (result, inputs) = align_watch::collect_observations(|| {
+            resolve_static_file(
+                &root,
+                &defining,
+                None,
+                "q.missing",
+                StaticConsumerKind::Query,
+                DriverRestriction::SQLiteOnly,
+                None,
+            )
+        });
+        assert!(matches!(result, Err(StaticInputError::MissingFile(_))));
+        let inputs = inputs.expect("watch observations");
+        assert_eq!(inputs.inputs().len(), 1);
+        assert_eq!(inputs.inputs()[0].path(), candidate);
+        assert!(matches!(
+            inputs.inputs()[0].state(),
+            align_watch::BuildInputState::Missing
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_defining_path_resolves_static_siblings_without_lossy_source_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let outer = temp_root("raw-defining-path");
+        let root = outer.join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        create_dir_all(&root).expect("raw project root");
+        let defining = root.join("q.align");
+        write(&defining, "module q\n").expect("defining source");
+        write(root.join("q.sql"), "select 1\n").expect("static sibling");
+        let mut source_map = SourceMap::new();
+        let file = source_map.add_file(defining.to_string_lossy(), "module q\n".to_string());
+        let descriptors = [descriptor(
+            file,
+            "q.raw",
+            StaticDescriptorSource::File {
+                path_literal: None,
+                path_span: None,
+            },
+            StaticDescriptorDriver::SQLiteOnly,
+        )];
+        let defining_paths = HashMap::from([(file, defining)]);
+        let resolved = resolve_static_descriptors_at(
+            &root,
+            &mut source_map,
+            &descriptors,
+            Hash128 { lo: 1, hi: 2 },
+            &defining_paths,
+        )
+        .expect("resolve through raw defining path");
+        assert_eq!(resolved.inputs[0].bytes, b"select 1\n");
     }
 
     #[test]

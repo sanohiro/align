@@ -19,6 +19,9 @@ const POLL_MILLIS: i32 = 50;
 const STOP_GRACE: Duration = Duration::from_millis(250);
 
 static CAPTURED_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_POLL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 struct CapturedChildGuard {
     child: Child,
@@ -341,16 +344,26 @@ fn run_captured(
         }
         let mut fds = [
             libc::pollfd {
-                fd: child.stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                fd: if stdout_open {
+                    child.stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+                } else {
+                    -1
+                },
                 events: libc::POLLIN,
                 revents: 0,
             },
             libc::pollfd {
-                fd: child.stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                fd: if stderr_open {
+                    child.stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+                } else {
+                    -1
+                },
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
+        #[cfg(test)]
+        TEST_POLL_COUNT.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `fds` is a live two-element array for the duration of poll.
         let polled = unsafe { libc::poll(fds.as_mut_ptr(), 2, POLL_MILLIS) };
         if polled < 0 {
@@ -416,12 +429,20 @@ fn run_captured(
                 pump_failed = true;
                 break;
             };
-            if let Err(error) =
-                read_one(readable, stream, sink, &mut panic_payload, &mut first_error)
-            {
-                first_error.get_or_insert(error);
-                *open = false;
-                pump_failed = true;
+            match read_one(readable, stream, sink, &mut panic_payload, &mut first_error) {
+                Ok(true) => {
+                    *open = false;
+                    match stream {
+                        LinkOutputStream::Stdout => child.stdout.take(),
+                        LinkOutputStream::Stderr => child.stderr.take(),
+                    };
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    *open = false;
+                    pump_failed = true;
+                }
             }
         }
     }
@@ -480,31 +501,31 @@ fn read_one(
     sink: &mut dyn LinkOutputSink,
     panic_payload: &mut Option<Box<dyn std::any::Any + Send>>,
     first_error: &mut Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut buffer = [0u8; PUMP_BYTES];
     match reader.read(&mut buffer) {
-        Ok(0) => Ok(()),
+        Ok(0) => Ok(true),
         Ok(count) => {
             if first_error.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 sink.write(stream, &buffer[..count])
             })) {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => Ok(false),
                 Ok(Err(error)) => {
                     let name = stream_name(stream);
                     first_error.get_or_insert(format!("child {name} output: {error}"));
-                    Ok(())
+                    Ok(false)
                 }
                 Err(payload) => {
                     *panic_payload = Some(payload);
-                    Ok(())
+                    Ok(false)
                 }
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
         Err(error) => Err(format!("child {} read: {error}", stream_name(stream))),
     }
 }
@@ -875,9 +896,10 @@ fn signal_name(signal: LinkStopSignal) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static CAPTURE_TEST: Mutex<()> = Mutex::new(());
 
     struct TempDir(PathBuf);
 
@@ -935,6 +957,7 @@ mod tests {
 
     #[test]
     fn captured_link_publishes_only_the_isolated_inode() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
         let temp = TempDir::new();
         let source = temp.0.join("main.c");
         let object = temp.0.join("main.o");
@@ -980,6 +1003,7 @@ mod tests {
 
     #[test]
     fn sink_panic_resumes_only_after_child_cleanup() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
         let mut sink = PanicSink;
         let args = [
             std::ffi::OsString::from("-c"),
@@ -996,6 +1020,7 @@ mod tests {
 
     #[test]
     fn stop_control_forwards_then_kills_and_reaps() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
         let mut sink = StopSink;
         let args = [
             std::ffi::OsString::from("-c"),
@@ -1009,6 +1034,7 @@ mod tests {
 
     #[test]
     fn direct_exit_does_not_wait_for_descendant_pipe_eof() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
         let mut sink = Sink::default();
         let args = [
             std::ffi::OsString::from("-c"),
@@ -1019,5 +1045,24 @@ mod tests {
         assert!(status.success());
         assert_eq!(sink.stdout, b"done");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn closed_child_streams_are_removed_from_the_poll_set() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
+        TEST_POLL_COUNT.store(0, Ordering::Relaxed);
+        let mut sink = Sink::default();
+        let args = [
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("exec 1>&- 2>&-; sleep 1"),
+        ];
+        let status = run_captured("sh", &args, &mut sink).expect("capture child");
+        assert!(status.success());
+        assert!(sink.stdout.is_empty());
+        assert!(sink.stderr.is_empty());
+        assert!(
+            TEST_POLL_COUNT.load(Ordering::Relaxed) < 100,
+            "closed streams must leave poll sleeping instead of spinning"
+        );
     }
 }

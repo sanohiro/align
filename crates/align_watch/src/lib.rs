@@ -212,20 +212,21 @@ pub fn refresh_monitor_baseline(
 ) -> Result<MonitorRefresh, BuildInputTopologyError> {
     let mut refreshed = Vec::with_capacity(baseline.rows.len());
     for row in &baseline.rows {
-        let before = snapshot_graph(&row.input.path)?;
-        let (state, opened_identity) = classify(&row.input.path);
-        let graph = snapshot_graph(&row.input.path)?;
-        let regular_rearm = only_regular_leaf_identity_changed(&before, &graph, state);
-        if (before != graph
-            || opened_identity.is_some_and(|identity| !graph_has_identity(&graph, identity)))
-            && !regular_rearm
-        {
-            return Ok(MonitorRefresh::Changed);
+        let mut stable_sample = None;
+        for _ in 0..8 {
+            let before = snapshot_graph(&row.input.path)?;
+            let (state, opened_identity) = classify(&row.input.path);
+            let graph = snapshot_graph(&row.input.path)?;
+            if opened_identity.is_some_and(|identity| !graph_has_identity(&graph, identity)) {
+                continue;
+            }
+            stable_sample = Some((before, state, opened_identity, graph));
+            break;
         }
-        if state != row.input.state
-            || (graph != row.graph
-                && !only_regular_leaf_identity_changed(&row.graph, &graph, state))
-        {
+        let Some((before, state, opened_identity, graph)) = stable_sample else {
+            return Ok(MonitorRefresh::Changed);
+        };
+        if monitor_row_changed(row, &before, state, opened_identity, &graph) {
             return Ok(MonitorRefresh::Changed);
         }
         refreshed.push(MonitorRow {
@@ -238,6 +239,25 @@ pub fn refresh_monitor_baseline(
     }
     baseline.rows = refreshed;
     Ok(MonitorRefresh::Stable)
+}
+
+fn monitor_row_changed(
+    row: &MonitorRow,
+    before: &PathGraph,
+    state: BuildInputState,
+    opened_identity: Option<(u64, u64)>,
+    graph: &PathGraph,
+) -> bool {
+    let opened_belongs_to_graph =
+        opened_identity.is_none_or(|identity| graph_has_identity(graph, identity));
+    let regular_rearm = only_regular_leaf_identity_changed(before, graph, state)
+        && opened_belongs_to_graph;
+    if (before != graph || !opened_belongs_to_graph) && !regular_rearm {
+        return true;
+    }
+    state != row.input.state
+        || (graph != &row.graph
+            && !only_regular_leaf_identity_changed(&row.graph, graph, state))
 }
 
 pub fn monitor_watch_registrations(
@@ -1807,6 +1827,35 @@ mod tests {
             refresh_monitor_baseline(&mut baseline).expect("second refresh")
                 == MonitorRefresh::Stable
         );
+    }
+
+    #[test]
+    fn monitor_rejects_a_hash_opened_from_the_pre_replacement_inode() {
+        let temp = TempDir::new();
+        let logical = temp.0.join("main.align");
+        let replacement = temp.0.join("replacement.align");
+        fs::write(&logical, b"old").expect("write logical input");
+        let mut collector = ObservationCollector::new();
+        collector
+            .observe_path(&logical)
+            .expect("observe logical input");
+        let finalized =
+            finalize_watch_inputs(collector.finish().expect("set"), None).expect("finalize input");
+        let baseline = monitor_baseline(finalized.inputs(), &[]).expect("monitor baseline");
+
+        let before = snapshot_graph(&logical).expect("pre-open graph");
+        let (state, opened_identity) = classify(&logical);
+        fs::write(&replacement, b"new").expect("write replacement");
+        fs::rename(&replacement, &logical).expect("replace after open");
+        let graph = snapshot_graph(&logical).expect("post-open graph");
+
+        assert!(monitor_row_changed(
+            &baseline.rows[0],
+            &before,
+            state,
+            opened_identity,
+            &graph,
+        ));
     }
 
     #[test]

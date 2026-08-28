@@ -2154,6 +2154,9 @@ struct LoadedUnit {
     /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own
     /// `DebugInfo` (its basename is what LLVM's remark strings — and thus the report — attribute to).
     file: String,
+    /// Lossless filesystem spelling used by static-input resolution. `file` remains the diagnostic
+    /// display name because `SourceMap` stores text, while this path preserves arbitrary Unix bytes.
+    access_path: std::path::PathBuf,
     /// The unit source's id in the walk's `SourceMap`. The per-unit memo reattaches it to a replayed
     /// diagnostic, whose stored form deliberately drops the id (it is walk-local).
     fid: align_span::FileId,
@@ -2216,10 +2219,11 @@ fn load_units(
     diags: &mut Diagnostics,
     entry_access_path: Option<&std::path::Path>,
 ) -> Vec<LoadedUnit> {
-    let entry_dir = entry_access_path
+    let observed = entry_access_path.is_some();
+    let entry_path_on_disk = entry_access_path
         .unwrap_or_else(|| std::path::Path::new(name))
-        .parent()
-        .map(|path| path.to_path_buf());
+        .to_path_buf();
+    let entry_dir = entry_path_on_disk.parent().map(|path| path.to_path_buf());
 
     // The entry module's own name is its `module` decl, or `main` by default.
     let entry_fid = source_map.add_file(name, src);
@@ -2238,6 +2242,7 @@ fn load_units(
         is_entry: true,
         src: src.to_string(),
         file: name.to_string(),
+        access_path: entry_path_on_disk,
         fid: entry_fid,
     }];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
@@ -2313,7 +2318,12 @@ fn load_units(
                 ast: mast,
                 is_entry: false,
                 src: msrc,
-                file: file_path.display().to_string(),
+                file: if observed {
+                    observed_source_name(&file_path)
+                } else {
+                    file_path.display().to_string()
+                },
+                access_path: file_path,
                 fid,
             });
         }
@@ -2647,7 +2657,8 @@ fn walk_inner(
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags, entry_access_path);
-    let lexical_project_root = std::path::Path::new(name)
+    let lexical_project_root = entry_access_path
+        .unwrap_or_else(|| std::path::Path::new(name))
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -2663,6 +2674,10 @@ fn walk_inner(
     };
 
     let by_path: HashMap<&str, &LoadedUnit> = loaded.iter().map(|l| (l.path.as_str(), l)).collect();
+    let defining_paths: HashMap<align_span::FileId, std::path::PathBuf> = loaded
+        .iter()
+        .map(|unit| (unit.fid, unit.access_path.clone()))
+        .collect();
     // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
     let direct_deps: HashMap<String, Vec<String>> = loaded
         .iter()
@@ -3148,11 +3163,12 @@ fn walk_inner(
                         }
                     }
                 }
-                let resolved = match resolve_static_descriptors(
+                let resolved = match static_inputs::resolve_static_descriptors_at(
                     &project_root,
                     source_map,
                     &static_descriptors,
                     resolution_digest,
+                    &defining_paths,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -4060,6 +4076,28 @@ fn observed_source(path: &std::path::Path) -> Result<String, BuildSourceError> {
     })
 }
 
+fn observed_source_name(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut encoded = String::with_capacity(path.as_os_str().as_bytes().len());
+        for byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-') {
+                encoded.push(char::from(*byte));
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+        encoded
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 /// Build one ordinary package while recording every compiler-observed input.
 #[allow(clippy::too_many_arguments)]
 pub fn build_path_pipelined_observed(
@@ -4075,7 +4113,7 @@ pub fn build_path_pipelined_observed(
 ) -> ObservedBuildAttempt {
     let (result, inputs) = watch_inputs::collect_observations(|| {
         let source = observed_source(path)?;
-        let name = path.to_string_lossy();
+        let name = observed_source_name(path);
         Ok::<_, BuildSourceError>(build_package_pipelined_at(
             source_map,
             &name,
@@ -4107,7 +4145,7 @@ pub fn build_path_per_unit_observed(
 ) -> ObservedPerUnitBuild {
     let (result, inputs) = watch_inputs::collect_observations(|| {
         let source = observed_source(path)?;
-        let name = path.to_string_lossy();
+        let name = observed_source_name(path);
         Ok::<_, BuildSourceError>(walk_per_unit_at(
             source_map,
             &name,
