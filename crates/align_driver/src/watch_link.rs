@@ -20,8 +20,7 @@ const STOP_GRACE: Duration = Duration::from_millis(250);
 
 static CAPTURED_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static TEST_POLL_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static TEST_POLL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct CapturedChildGuard {
     child: Child,
@@ -133,38 +132,12 @@ impl Drop for ChildLease {
     }
 }
 
-struct OwnedStage {
+struct StageIdentity {
     path: PathBuf,
-    file: File,
     identity: (u64, u64),
 }
 
-impl OwnedStage {
-    fn create(parent: &Path, kind: &str) -> Result<Self, String> {
-        let stage = ArtifactStage::in_dir(parent, kind)
-            .map_err(|error| format!("cannot create executable staging directory: {error}"))?;
-        let path = stage.path().join("output");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| format!("cannot create link output stage: {error}"))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("cannot inspect link output stage: {error}"))?;
-        let identity = (metadata.dev(), metadata.ino());
-        // Transfer directory cleanup to this identity-aware owner. `ArtifactStage`'s recursive
-        // cleanup cannot be used here because a foreign replacement must be preserved.
-        let _directory = stage.into_owned_dir();
-        Ok(Self {
-            path,
-            file,
-            identity,
-        })
-    }
-
+impl StageIdentity {
     fn verify_name(&self, message: &'static str) -> Result<(), String> {
         let metadata = fs::symlink_metadata(&self.path).map_err(|_| message.to_string())?;
         if metadata.file_type().is_symlink() || (metadata.dev(), metadata.ino()) != self.identity {
@@ -187,11 +160,98 @@ impl OwnedStage {
     }
 }
 
-impl Drop for OwnedStage {
+impl Drop for StageIdentity {
     fn drop(&mut self) {
         let _ = self.remove_name("stage ownership lost");
         if let Some(parent) = self.path.parent() {
             let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+struct OwnedStage {
+    name: StageIdentity,
+    file: File,
+}
+
+impl OwnedStage {
+    fn create(parent: &Path, kind: &str) -> Result<Self, String> {
+        let stage = ArtifactStage::in_dir(parent, kind)
+            .map_err(|error| format!("cannot create executable staging directory: {error}"))?;
+        let path = stage.path().join("output");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("cannot create link output stage: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect link output stage: {error}"))?;
+        let name = StageIdentity {
+            path,
+            identity: (metadata.dev(), metadata.ino()),
+        };
+        // Transfer directory cleanup to this identity-aware owner. `ArtifactStage`'s recursive
+        // cleanup cannot be used here because a foreign replacement must be preserved.
+        let _directory = stage.into_owned_dir();
+        Ok(Self { name, file })
+    }
+
+    fn release_for_tool(self) -> ToolStage {
+        // LLVM 22 lld replaces its output inode. Keep the exclusively reserved private name, but
+        // make descriptor release a type-state transition; after the trusted tool's writer-joined
+        // handoff, `reclaim` establishes the identity of the regular inode it actually produced.
+        let Self { name, file } = self;
+        drop(file);
+        ToolStage { name }
+    }
+
+    fn path(&self) -> &Path {
+        &self.name.path
+    }
+
+    fn verify_name(&self, message: &'static str) -> Result<(), String> {
+        self.name.verify_name(message)
+    }
+
+    fn remove_name(&self, message: &'static str) -> Result<(), String> {
+        self.name.remove_name(message)
+    }
+}
+
+struct ToolStage {
+    name: StageIdentity,
+}
+
+impl ToolStage {
+    fn path(&self) -> &Path {
+        &self.name.path
+    }
+
+    fn reclaim(mut self, message: &'static str) -> Result<OwnedStage, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.name.path)
+            .map_err(|_| message.to_string())?;
+        let metadata = file.metadata().map_err(|_| message.to_string())?;
+        if !metadata.is_file() {
+            return Err(message.to_string());
+        }
+        self.name.identity = (metadata.dev(), metadata.ino());
+        self.name.verify_name(message)?;
+        Ok(OwnedStage {
+            name: self.name,
+            file,
+        })
+    }
+
+    fn discard_after_tool(self) {
+        if let Ok(stage) = self.reclaim("tool stage ownership lost") {
+            drop(stage);
         }
     }
 }
@@ -234,10 +294,10 @@ fn link_captured(
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut tool = OwnedStage::create(parent, "align-watch-tool")?;
+    let tool = OwnedStage::create(parent, "align-watch-tool")?.release_for_tool();
     let args = crate::link_command_args(&LinkPlan {
         objs,
-        exe: &tool.path,
+        exe: tool.path(),
         runtime: &runtime,
         ordered_link_libs: &ordered_link_libs,
         format,
@@ -245,8 +305,17 @@ fn link_captured(
         profile_rt,
         linker: &linker,
     });
-    let status = run_captured("cc", &args, sink)?;
+    let status = match run_captured("cc", &args, sink) {
+        Ok(status) => status,
+        Err(error) => {
+            drop(lease);
+            tool.discard_after_tool();
+            return Err(error);
+        }
+    };
     if !status.success() {
+        drop(lease);
+        tool.discard_after_tool();
         return Err(crate::link_failure_message(
             status.code(),
             &ordered_link_libs,
@@ -254,13 +323,23 @@ fn link_captured(
         ));
     }
     if profile.strip() && format == ObjectFormat::MachO {
-        let strip_args = [tool.path.as_os_str().to_os_string()];
-        let status = run_captured("strip", &strip_args, sink)?;
+        let strip_args = [tool.path().as_os_str().to_os_string()];
+        let status = match run_captured("strip", &strip_args, sink) {
+            Ok(status) => status,
+            Err(error) => {
+                drop(lease);
+                tool.discard_after_tool();
+                return Err(error);
+            }
+        };
         if !status.success() {
+            drop(lease);
+            tool.discard_after_tool();
             return Err(format!("strip failed (exit code {:?})", status.code()));
         }
     }
     drop(lease);
+    let mut tool = tool.reclaim("tool stage ownership lost")?;
     isolate_and_publish(&mut tool, exe)
 }
 
@@ -793,7 +872,7 @@ fn isolate_and_publish(tool: &mut OwnedStage, exe: &Path) -> Result<(), String> 
         .file
         .flush()
         .map_err(|error| format!("cannot flush publication stage: {error}"))?;
-    fs::set_permissions(&publication.path, fs::Permissions::from_mode(mode))
+    fs::set_permissions(publication.path(), fs::Permissions::from_mode(mode))
         .map_err(|error| format!("cannot set publication mode: {error}"))?;
     let after = tool
         .file
@@ -827,7 +906,7 @@ fn isolate_and_publish(tool: &mut OwnedStage, exe: &Path) -> Result<(), String> 
     }
     tool.remove_name("tool stage ownership lost")?;
     publication.verify_name("publication stage ownership lost")?;
-    fs::rename(&publication.path, exe)
+    fs::rename(publication.path(), exe)
         .map_err(|error| format!("cannot publish executable {}: {error}", exe.display()))?;
     Ok(())
 }
@@ -896,7 +975,10 @@ fn signal_name(signal: LinkStopSignal) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     static CAPTURE_TEST: Mutex<()> = Mutex::new(());
@@ -933,6 +1015,100 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn tool_stage_reclaims_the_exclusively_created_inode_after_tool_write() {
+        let temp = TempDir::new();
+        let stage = OwnedStage::create(&temp.0, "align-watch-tool-test")
+            .expect("create tool stage")
+            .release_for_tool();
+        let path = stage.path().to_path_buf();
+        let before = fs::symlink_metadata(&path).expect("inspect reserved tool inode");
+        fs::write(&path, b"tool output").expect("simulate tool write");
+
+        let stage = stage
+            .reclaim("tool stage ownership lost")
+            .expect("reclaim original tool inode");
+        let after = stage.file.metadata().expect("inspect reclaimed tool inode");
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        drop(stage);
+        assert!(!path.exists(), "owned tool stage must be cleaned");
+    }
+
+    #[test]
+    fn tool_stage_reclaims_the_regular_inode_replaced_by_a_supported_tool() {
+        let temp = TempDir::new();
+        let stage = OwnedStage::create(&temp.0, "align-watch-tool-test")
+            .expect("create tool stage")
+            .release_for_tool();
+        let path = stage.path().to_path_buf();
+        let original = File::open(&path).expect("pin original tool inode");
+        let original_identity = original
+            .metadata()
+            .expect("inspect original tool inode")
+            .ino();
+        fs::remove_file(&path).expect("remove reserved tool inode");
+        fs::write(&path, b"tool replacement").expect("install tool replacement");
+
+        let stage = stage
+            .reclaim("tool stage ownership lost")
+            .expect("reclaim supported tool replacement");
+        assert_ne!(
+            stage.file.metadata().expect("inspect replacement").ino(),
+            original_identity
+        );
+        assert_eq!(
+            fs::read(&path).expect("read tool replacement"),
+            b"tool replacement"
+        );
+        drop(stage);
+        drop(original);
+        assert!(!path.exists(), "reclaimed tool replacement must be cleaned");
+    }
+
+    #[test]
+    fn tool_stage_reclamation_rejects_and_preserves_a_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let outside = temp.0.join("outside");
+        fs::write(&outside, b"outside").expect("write symlink target");
+        let stage = OwnedStage::create(&temp.0, "align-watch-tool-test")
+            .expect("create tool stage")
+            .release_for_tool();
+        let path = stage.path().to_path_buf();
+        fs::remove_file(&path).expect("remove reserved tool inode");
+        symlink(&outside, &path).expect("install symlink replacement");
+
+        let error = match stage.reclaim("tool stage ownership lost") {
+            Ok(_) => panic!("symlink replacement must not be reclaimed"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "tool stage ownership lost");
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("inspect replacement")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).expect("read symlink target"), b"outside");
+    }
+
+    #[test]
+    fn failed_tool_cleanup_removes_its_regular_replacement() {
+        let temp = TempDir::new();
+        let stage = OwnedStage::create(&temp.0, "align-watch-tool-test")
+            .expect("create tool stage")
+            .release_for_tool();
+        let path = stage.path().to_path_buf();
+        let original = File::open(&path).expect("pin original tool inode");
+        fs::remove_file(&path).expect("remove reserved tool inode");
+        fs::write(&path, b"failed tool output").expect("install failed tool output");
+
+        stage.discard_after_tool();
+        drop(original);
+        assert!(!path.exists(), "failed tool output must be cleaned");
     }
 
     struct PanicSink;
