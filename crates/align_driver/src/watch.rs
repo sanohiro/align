@@ -503,16 +503,17 @@ fn build_ordinary_revision(
             }
             ObservedBuildAttempt::Pipeline { build, inputs } => (build, inputs),
         };
+        let errors_only = reuse == UnitReuse::Forbidden;
         match build {
             align_driver::PipelinedPackageBuild::FrontendFailed { diags } => {
-                record_diags(transcript, &source_map, &diags)?;
+                record_diags(transcript, &source_map, &diags, errors_only)?;
                 return failed_inputs(merge_if_retry(first_inputs.take(), inputs)?);
             }
             align_driver::PipelinedPackageBuild::CodegenFailed {
                 diags,
                 error: align_driver::PackageCodegenError::StaleCacheEntry { unit, failure },
             } if reuse == UnitReuse::Allowed => {
-                record_diags(transcript, &source_map, &diags)?;
+                record_diags(transcript, &source_map, &diags, false)?;
                 transcript.text_record(
                     "cache",
                     format!("alignc: cached unit `{unit}`: {failure}; rebuilding this package without cache reuse").as_bytes(),
@@ -520,14 +521,14 @@ fn build_ordinary_revision(
                 first_inputs = Some(inputs);
             }
             align_driver::PipelinedPackageBuild::CodegenFailed { diags, error } => {
-                record_diags(transcript, &source_map, &diags)?;
+                record_diags(transcript, &source_map, &diags, errors_only)?;
                 transcript
                     .text_record("diagnostic", format!("alignc: {error}").as_bytes())
                     .map_err(io_text)?;
                 return failed_inputs(merge_if_retry(first_inputs.take(), inputs)?);
             }
             align_driver::PipelinedPackageBuild::Complete(build) => {
-                record_diags(transcript, &source_map, &build.diags)?;
+                record_diags(transcript, &source_map, &build.diags, errors_only)?;
                 let inputs = merge_if_retry(first_inputs.take(), inputs)?;
                 if cache_stats {
                     record_cache_stats(
@@ -599,7 +600,7 @@ fn build_thin_revision(
         }
         ObservedPerUnitBuild::Walk { walk, inputs } => (walk, inputs),
     };
-    record_diags(transcript, &source_map, &walk.diags)?;
+    record_diags(transcript, &source_map, &walk.diags, false)?;
     if walk.diags.has_errors() || walk.units.is_empty() {
         return failed_inputs(inputs);
     }
@@ -652,7 +653,11 @@ fn build_thin_revision(
         }
     };
     if cache_stats {
-        record_plain_outcomes(transcript, &outcomes, cache.codegen_is_enabled())?;
+        if walk.units.len() >= 2 {
+            record_thin_cache_stats(transcript, &outcomes, cache.codegen_is_enabled())?;
+        } else {
+            record_plain_outcomes(transcript, &outcomes, cache.codegen_is_enabled())?;
+        }
     }
     let link_libs = link_lib_union(walk.units.iter().map(|unit| unit.mir.link_libs.as_slice()));
     let objects: Vec<&Path> = object_paths.iter().map(PathBuf::as_path).collect();
@@ -720,14 +725,27 @@ fn finalize_and_link(
     };
     let link = if matches!(pgo, PgoMode::Instrument) {
         match align_driver::profile_runtime_archive(target) {
-            Ok(profile_rt) => align_driver::link_objects_instrumented_with_output(
-                objects,
-                output,
-                link_libs,
-                profile,
-                &profile_rt,
-                &mut sink,
-            ),
+            Ok(profile_rt) => {
+                let destination = std::env::var("LLVM_PROFILE_FILE")
+                    .unwrap_or_else(|_| "default.profraw".to_string());
+                sink.transcript
+                    .text_record(
+                        "notice",
+                        format!(
+                            "alignc: --pgo-instrument: instrumented binary will write its profile to `{destination}` when run (set LLVM_PROFILE_FILE to redirect); then `llvm-profdata-22 merge` it and rebuild with `--pgo-use <file.profdata>`"
+                        )
+                        .as_bytes(),
+                    )
+                    .map_err(io_text)?;
+                align_driver::link_objects_instrumented_with_output(
+                    objects,
+                    output,
+                    link_libs,
+                    profile,
+                    &profile_rt,
+                    &mut sink,
+                )
+            }
             Err(error) => Err(error),
         }
     } else {
@@ -792,12 +810,30 @@ fn record_diags(
     transcript: &mut Transcript,
     source_map: &SourceMap,
     diagnostics: &align_diag::Diagnostics,
+    errors_only: bool,
 ) -> Result<(), String> {
     if diagnostics.is_empty() {
         return Ok(());
     }
+    let rendered = render_diags(source_map, diagnostics, errors_only);
+    if rendered.is_empty() {
+        return Ok(());
+    }
+    transcript
+        .text_record("diagnostic", rendered.as_bytes())
+        .map_err(io_text)
+}
+
+fn render_diags(
+    source_map: &SourceMap,
+    diagnostics: &align_diag::Diagnostics,
+    errors_only: bool,
+) -> String {
     let mut rendered = String::new();
-    for diagnostic in diagnostics.iter() {
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|diagnostic| !errors_only || diagnostic.severity == align_diag::Severity::Error)
+    {
         let severity = match diagnostic.severity {
             align_diag::Severity::Error => "error",
             align_diag::Severity::Warning => "warning",
@@ -809,17 +845,14 @@ fn record_diags(
             let _ = writeln!(
                 rendered,
                 "{}:{line}:{column}: {severity}: {}",
-                encode_path(Path::new(&file.name)),
-                diagnostic.message
+                file.name, diagnostic.message
             );
         } else {
             use std::fmt::Write as _;
             let _ = writeln!(rendered, "{severity}: {}", diagnostic.message);
         }
     }
-    transcript
-        .text_record("diagnostic", rendered.as_bytes())
-        .map_err(io_text)
+    rendered
 }
 
 fn record_cache_stats(
@@ -828,10 +861,29 @@ fn record_cache_stats(
     outcomes: &[align_driver::CacheOutcome],
     enabled: bool,
 ) -> Result<(), String> {
+    let mut frontend_hits = 0usize;
+    let mut frontend_misses = 0usize;
     for unit in units {
         if let Some(frontend) = &unit.frontend {
-            record_outcome(transcript, frontend)?;
+            if frontend.hit {
+                frontend_hits += 1;
+            } else {
+                frontend_misses += 1;
+            }
+            record_outcome(transcript, frontend, Some("frontend"))?;
         }
+    }
+    if frontend_hits + frontend_misses > 0 {
+        transcript
+            .text_record(
+                "cache",
+                format!(
+                    "alignc: cache: {} frontend: {frontend_hits} hit, {frontend_misses} miss",
+                    frontend_hits + frontend_misses
+                )
+                .as_bytes(),
+            )
+            .map_err(io_text)?;
     }
     record_plain_outcomes(transcript, outcomes, enabled)
 }
@@ -850,14 +902,15 @@ fn record_plain_outcomes(
             .map_err(io_text);
     }
     for outcome in outcomes {
-        record_outcome(transcript, outcome)?;
+        record_outcome(transcript, outcome, None)?;
     }
     let hits = outcomes.iter().filter(|outcome| outcome.hit).count();
     transcript
         .text_record(
             "cache",
             format!(
-                "alignc: cache: {hits} hit(s), {} miss(es)",
+                "alignc: cache: {} unit(s): {hits} hit, {} miss",
+                outcomes.len(),
                 outcomes.len() - hits
             )
             .as_bytes(),
@@ -865,22 +918,67 @@ fn record_plain_outcomes(
         .map_err(io_text)
 }
 
+fn record_thin_cache_stats(
+    transcript: &mut Transcript,
+    outcomes: &[align_driver::CacheOutcome],
+    enabled: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return transcript
+            .text_record(
+                "cache",
+                b"alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)",
+            )
+            .map_err(io_text);
+    }
+    for stage in [
+        align_driver::CacheStage::ThinLtoPrelink,
+        align_driver::CacheStage::ThinLtoBackend,
+    ] {
+        let mut hits = 0usize;
+        let mut misses = 0usize;
+        for outcome in outcomes.iter().filter(|outcome| outcome.stage == stage) {
+            if outcome.hit {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+            record_outcome(transcript, outcome, Some(stage.label()))?;
+        }
+        transcript
+            .text_record(
+                "cache",
+                format!(
+                    "alignc: cache: {} {}: {hits} hit, {misses} miss",
+                    hits + misses,
+                    stage.label()
+                )
+                .as_bytes(),
+            )
+            .map_err(io_text)?;
+    }
+    Ok(())
+}
+
 fn record_outcome(
     transcript: &mut Transcript,
     outcome: &align_driver::CacheOutcome,
+    stage: Option<&str>,
 ) -> Result<(), String> {
     let state = if outcome.hit {
         "hit".to_string()
     } else {
-        outcome.miss_reason.as_ref().map_or_else(
-            || "miss".to_string(),
-            |reason| format!("miss ({})", reason.reason()),
-        )
+        let reason = outcome
+            .miss_reason
+            .as_ref()
+            .map_or("miss", |reason| reason.reason());
+        format!("miss ({reason})")
     };
+    let stage = stage.map_or_else(String::new, |stage| format!(" {stage}"));
     transcript
         .text_record(
             "cache",
-            format!("alignc: cache: {}: {state}", outcome.unit).as_bytes(),
+            format!("alignc: cache: {}{stage} {state}", outcome.unit).as_bytes(),
         )
         .map_err(io_text)
 }
@@ -1671,7 +1769,7 @@ fn encode_text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_text;
+    use super::{encode_text, render_diags};
 
     #[test]
     fn watch_text_is_reversible_and_bounded() {
@@ -1681,5 +1779,24 @@ mod tests {
             encode_text(&vec![b'x'; 16_385]),
             "message exceeds 16384-byte limit"
         );
+    }
+
+    #[test]
+    fn retry_diagnostics_keep_errors_and_do_not_encode_observed_paths_twice() {
+        let mut source_map = align_span::SourceMap::new();
+        let file = source_map.add_file("/tmp/space%20%25.align", "x");
+        let span = align_span::Span::new(file, 0, 1);
+        let mut diagnostics = align_diag::Diagnostics::new();
+        diagnostics.push(align_diag::Diagnostic::warning("warning", span));
+        diagnostics.error("error", span);
+
+        let all = render_diags(&source_map, &diagnostics, false);
+        assert!(all.contains("/tmp/space%20%25.align:1:1: warning: warning"));
+        assert!(all.contains(": error: error"));
+        assert!(!all.contains("%2520"));
+
+        let retry = render_diags(&source_map, &diagnostics, true);
+        assert!(!retry.contains("warning"));
+        assert!(retry.contains("/tmp/space%20%25.align:1:1: error: error"));
     }
 }

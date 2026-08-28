@@ -1131,6 +1131,14 @@ mod tests {
         }
     }
 
+    struct RefuseSink;
+
+    impl LinkOutputSink for RefuseSink {
+        fn write(&mut self, _stream: LinkOutputStream, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("refused"))
+        }
+    }
+
     #[test]
     fn captured_link_publishes_only_the_isolated_inode() {
         let _serial = CAPTURE_TEST.lock().expect("capture test lock");
@@ -1220,6 +1228,20 @@ mod tests {
         let status = run_captured("sh", &args, &mut sink).expect("capture child");
         assert!(status.success());
         assert_eq!(sink.stdout, b"done");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sink_error_drains_later_output_before_child_cleanup() {
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
+        let mut sink = RefuseSink;
+        let args = [
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("head -c 524288 /dev/zero"),
+        ];
+        let started = Instant::now();
+        let error = run_captured("sh", &args, &mut sink).expect_err("sink must refuse output");
+        assert_eq!(error, "child stdout output: refused");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

@@ -263,6 +263,84 @@ fn failed_revision_keeps_watching_and_recovers() {
 }
 
 #[test]
+fn diagnostic_paths_are_encoded_once_inside_the_record_protocol() {
+    let temp = TempDir::new();
+    let root = temp.0.join("space %");
+    std::fs::create_dir(&root).expect("create special path");
+    std::fs::write(root.join("main.align"), "fn main( {\n").expect("write malformed source");
+    let (child, lines) = spawn_watch(&root);
+    let failed = wait_for(&lines, "revision 1 failed");
+    assert!(
+        failed
+            .iter()
+            .any(|line| line.contains("space%252520%252525/main.align")),
+        "single-encoded diagnostic path absent: {failed:#?}"
+    );
+    assert!(
+        failed.iter().all(|line| !line.contains("space%25252520")),
+        "diagnostic path was encoded twice: {failed:#?}"
+    );
+    let (status, stdout) = stop(child);
+    assert_eq!(status.code(), Some(143));
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn watch_cache_stats_preserve_frontend_labels_and_stage_summaries() {
+    let temp = TempDir::new();
+    std::fs::write(temp.0.join("main.align"), source(0)).expect("write source");
+    let (child, lines) = spawn_watch_args(&temp.0, "main.align", None, &["--cache-stats"]);
+    let ready = wait_for(&lines, "revision 1 ready");
+    assert!(
+        ready.iter().any(|line| line.contains("main frontend ")),
+        "frontend outcome label absent: {ready:#?}"
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|line| line.contains("frontend:") && line.contains(" hit,")),
+        "frontend summary absent: {ready:#?}"
+    );
+    assert!(
+        ready
+            .iter()
+            .any(|line| line.contains("unit(s):") && line.contains(" hit,")),
+        "codegen summary drifted from one-shot output: {ready:#?}"
+    );
+    let (status, stdout) = stop(child);
+    assert_eq!(status.code(), Some(143));
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn pgo_instrument_watch_names_the_profile_destination_before_ready() {
+    let target = align_driver::BuildTarget::Native;
+    if align_driver::profile_runtime_archive(&target).is_err() {
+        return;
+    }
+    let temp = TempDir::new();
+    std::fs::write(temp.0.join("main.align"), source(0)).expect("write source");
+    let (child, lines) = spawn_watch_args(
+        &temp.0,
+        "main.align",
+        None,
+        &["--profile", "release", "--pgo-instrument"],
+    );
+    let ready = wait_for(&lines, "revision 1 ready");
+    assert!(
+        ready.iter().any(|line| {
+            line.contains("record notice")
+                && line.contains("--pgo-instrument:")
+                && line.contains("default.profraw")
+        }),
+        "PGO destination notice absent: {ready:#?}"
+    );
+    let (status, stdout) = stop(child);
+    assert_eq!(status.code(), Some(143));
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn watch_is_build_only_and_help_names_trigger_boundary() {
     for args in [
         vec!["--watch", "check", "missing.align"],
@@ -528,10 +606,24 @@ fn imported_source_disappearance_and_recovery_are_observed() {
 fn thin_lto_watch_reuses_the_observed_per_unit_route() {
     let temp = TempDir::new();
     let entry = temp.0.join("main.align");
-    std::fs::write(&entry, source(1)).expect("write source");
-    let (child, lines) = spawn_watch_args(&temp.0, "main.align", None, &["--thin-lto"]);
-    wait_for(&lines, "revision 1 ready");
-    std::fs::write(&entry, source(5)).expect("edit source");
+    let dependency = temp.0.join("dep.align");
+    std::fs::write(&entry, "import dep\nfn main() -> i32 = dep.value()\n").expect("write source");
+    std::fs::write(&dependency, "module dep\npub fn value() -> i32 = 1\n")
+        .expect("write dependency");
+    let (child, lines) = spawn_watch_args(
+        &temp.0,
+        "main.align",
+        None,
+        &["--thin-lto", "--cache-stats"],
+    );
+    let ready = wait_for(&lines, "revision 1 ready");
+    assert!(
+        ready.iter().any(|line| line.contains("prelink:"))
+            && ready.iter().any(|line| line.contains("backend:")),
+        "ThinLTO cache stage summaries absent: {ready:#?}"
+    );
+    std::fs::write(&dependency, "module dep\npub fn value() -> i32 = 5\n")
+        .expect("edit dependency");
     wait_for(&lines, "revision 2 ready");
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));

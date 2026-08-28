@@ -190,8 +190,12 @@ pub fn monitor_baseline(
         .zip(inputs.graphs.iter().cloned())
         .map(|(input, graph)| MonitorRow { input, graph })
         .collect::<Vec<_>>();
+    let mut seen = rows
+        .iter()
+        .map(|row| row.input.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     for path in retained {
-        if rows.iter().any(|row| row.input.path == *path) {
+        if !seen.insert(path.clone()) {
             continue;
         }
         rows.push(MonitorRow {
@@ -647,27 +651,28 @@ pub fn observe_consumed_classification<T>(
             }
         };
         let value = operation();
-        let state = classification(&value);
+        // `None` means the operation's semantic result does not itself describe the filesystem
+        // class. Reclassify the consumed path so a stable semantic rejection remains a stable
+        // failed baseline instead of being mistaken for a concurrent input change.
+        let state = classification(&value).unwrap_or_else(|| classify(&absolute).0);
         let opened_identity = observed_metadata(&value).map(identity);
         let after = snapshot_graph(&absolute);
-        if let Some(state) = state {
-            match after {
-                Ok(after) => {
-                    if let Err(error) = observer.record(
-                        &absolute,
-                        state,
-                        ReadEvidence {
-                            before,
-                            opened_identity,
-                            after,
-                        },
-                    ) {
-                        observer.error.get_or_insert(error);
-                    }
-                }
-                Err(error) => {
+        match after {
+            Ok(after) => {
+                if let Err(error) = observer.record(
+                    &absolute,
+                    state,
+                    ReadEvidence {
+                        before,
+                        opened_identity,
+                        after,
+                    },
+                ) {
                     observer.error.get_or_insert(error);
                 }
+            }
+            Err(error) => {
+                observer.error.get_or_insert(error);
             }
         }
         value
@@ -1290,10 +1295,36 @@ fn absent_slots_alias(
         }
         // SAFETY: successful `openat` returned a uniquely owned descriptor.
         let probe = unsafe { File::from_raw_fd(probe_fd) };
-        let probe_id =
-            identity(&probe.metadata().map_err(|error| {
-                collation_error(left, logical, format!("probe identity: {error}"))
-            })?);
+        let probe_id = match probe.metadata() {
+            Ok(metadata) => identity(&metadata),
+            Err(error) => {
+                // The descriptor still owns the exclusive create. A transient first fstat failure
+                // must not strand the pathname: establish its identity once more solely for the
+                // ordinary identity-aware cleanup, then retain the original phase error.
+                let cleanup_metadata = probe.metadata().map_err(|cleanup_error| {
+                    collation_cleanup_error(
+                        &left_probe,
+                        output,
+                        logical,
+                        &format!("probe identity: {cleanup_error}"),
+                    )
+                })?;
+                cleanup_probe_at(
+                    &left_directory,
+                    &left_c,
+                    &left_probe,
+                    probe,
+                    identity(&cleanup_metadata),
+                    output,
+                    logical,
+                )?;
+                return Err(collation_error(
+                    left,
+                    logical,
+                    format!("probe identity: {error}"),
+                ));
+            }
+        };
         let mut found = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `found` is writable, `right_c` is a NUL-terminated relative component, and the
         // retained descriptor names the same common parent.
@@ -1706,6 +1737,30 @@ mod tests {
         let finalized = finalize_watch_inputs(merged, None).expect("finalize");
         assert!(finalized.inputs().changed_during_attempt());
         assert!(finalized.alias_index().is_none());
+    }
+
+    #[test]
+    fn failed_baseline_union_deduplicates_retained_paths_with_a_keyed_set() {
+        let temp = TempDir::new();
+        let current = temp.0.join("current.align");
+        let retained = temp.0.join("retained.align");
+        fs::write(&current, b"current").expect("current input");
+        fs::write(&retained, b"retained").expect("retained input");
+        let mut collector = ObservationCollector::new();
+        collector
+            .observe_path(&current)
+            .expect("observe current input");
+        let finalized = finalize_watch_inputs(collector.finish().expect("set"), None)
+            .expect("finalize current input");
+
+        let baseline = monitor_baseline(
+            finalized.inputs(),
+            &[current.clone(), retained.clone(), retained.clone()],
+        )
+        .expect("failed baseline union");
+        assert_eq!(baseline.rows.len(), 2);
+        assert_eq!(baseline.rows[0].input.path, current);
+        assert_eq!(baseline.rows[1].input.path, retained);
     }
 
     #[test]

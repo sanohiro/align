@@ -986,7 +986,7 @@ fn read_static_bytes(
     align_watch::observe_consumed_classification(
         candidate,
         || read_static_bytes_inner(root, candidate, logical),
-        |result| Some(static_observation_state(result)),
+        static_observation_state,
         |_| None,
         || {
             Err(StaticInputError::InvalidPath(
@@ -1038,15 +1038,18 @@ fn read_static_bytes_inner(
 
 fn static_observation_state(
     result: &Result<Vec<u8>, StaticInputError>,
-) -> align_watch::BuildInputState {
+) -> Option<align_watch::BuildInputState> {
     match result {
-        Ok(bytes) => align_watch::BuildInputState::Regular {
+        Ok(bytes) => Some(align_watch::BuildInputState::Regular {
             content_hash: Hash128::of(bytes),
             len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        },
-        Err(StaticInputError::MissingFile(_)) => align_watch::BuildInputState::Missing,
-        Err(StaticInputError::NotRegularFile(_)) => align_watch::BuildInputState::NonRegular,
-        Err(_) => align_watch::BuildInputState::Unreadable,
+        }),
+        Err(StaticInputError::MissingFile(_)) => Some(align_watch::BuildInputState::Missing),
+        Err(StaticInputError::NotRegularFile(_)) => Some(align_watch::BuildInputState::NonRegular),
+        Err(StaticInputError::Io { .. }) => Some(align_watch::BuildInputState::Unreadable),
+        // Semantic rejection does not change the filesystem state. The observation owner hashes
+        // the current regular file so finalization and the failed baseline agree until an edit.
+        Err(_) => None,
     }
 }
 
@@ -1224,6 +1227,7 @@ fn snapshot_checked_metadata_record(
         || fs::symlink_metadata(&path),
         |result| match result {
             Ok(metadata) if metadata.is_file() => None,
+            Ok(metadata) if metadata.file_type().is_symlink() => None,
             Ok(_) => Some(align_watch::BuildInputState::NonRegular),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Some(align_watch::BuildInputState::Missing)
@@ -2200,7 +2204,7 @@ fn read_metadata_bytes(
     align_watch::observe_consumed_classification(
         path,
         || read_metadata_bytes_inner(root, path, logical_path),
-        |result| Some(static_observation_state(result)),
+        static_observation_state,
         |_| None,
         || {
             Err(StaticInputError::InvalidPath(
@@ -3609,6 +3613,95 @@ mod tests {
             Err(StaticInputError::InvalidDescriptorId)
         ));
         assert!(source_map.files().is_empty());
+    }
+
+    #[test]
+    fn unchanged_regular_static_semantic_errors_form_a_stable_failed_baseline() {
+        let root = temp_root("semantic-observation");
+        let module = root.join("q.align");
+        let sql = root.join("q.sql");
+        write(&module, "module q\n").expect("Align source");
+
+        for bytes in [vec![0xff, 0xfe], b"ok\0bad".to_vec()] {
+            write(&sql, bytes).expect("invalid static source");
+            let (result, inputs) = align_watch::collect_observations(|| {
+                resolve_static_file(
+                    &root,
+                    &module,
+                    None,
+                    "q.query",
+                    StaticConsumerKind::Query,
+                    DriverRestriction::AnySupportedDriver,
+                    None,
+                )
+            });
+            assert!(result.is_err());
+            let finalized = align_watch::finalize_watch_inputs(
+                inputs.expect("observed invalid static source"),
+                None,
+            )
+            .expect("finalize invalid static source");
+            assert!(
+                !finalized.inputs().changed_during_attempt(),
+                "unchanged semantic rejection must wait for an edit"
+            );
+        }
+
+        let file = File::create(&sql).expect("oversized static source");
+        file.set_len((MAX_FIELD_BYTES as u64) + 1)
+            .expect("oversized length");
+        drop(file);
+        let (result, inputs) = align_watch::collect_observations(|| {
+            resolve_static_file(
+                &root,
+                &module,
+                None,
+                "q.query",
+                StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
+                None,
+            )
+        });
+        assert!(result.is_err());
+        let finalized = align_watch::finalize_watch_inputs(
+            inputs.expect("observed oversized static source"),
+            None,
+        )
+        .expect("finalize oversized static source");
+        assert!(!finalized.inputs().changed_during_attempt());
+
+        assert!(
+            matches!(
+                static_observation_state(&Err(StaticInputError::Io {
+                    path: sql,
+                    message: "read refused".to_string(),
+                })),
+                Some(align_watch::BuildInputState::Unreadable)
+            ),
+            "filesystem I/O rejection must remain a recoverable W5 state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_metadata_symlink_keeps_its_followed_filesystem_state() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("metadata-symlink-observation");
+        let path = metadata_path(&root, "q.query", Driver::SQLite).expect("metadata path");
+        create_dir_all(path.parent().expect("metadata parent")).expect("metadata parent");
+        let target = root.join("metadata-target");
+        write(&target, b"malformed\n").expect("metadata target");
+        symlink(&target, &path).expect("metadata symlink");
+
+        let (result, inputs) = align_watch::collect_observations(|| {
+            snapshot_checked_metadata(&root, "q.query", Driver::SQLite)
+        });
+        assert!(matches!(result, Err(StaticInputError::NotRegularFile(_))));
+        let finalized =
+            align_watch::finalize_watch_inputs(inputs.expect("observed metadata symlink"), None)
+                .expect("finalize metadata symlink");
+        assert!(!finalized.inputs().changed_during_attempt());
     }
 
     #[test]
