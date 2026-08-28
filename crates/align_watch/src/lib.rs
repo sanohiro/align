@@ -1318,11 +1318,7 @@ fn absent_slots_alias(
                     output,
                     logical,
                 )?;
-                return Err(collation_error(
-                    left,
-                    logical,
-                    format!("probe identity: {error}"),
-                ));
+                return Err(probe_identity_error(output, logical, &error));
             }
         };
         let mut found = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -1503,13 +1499,21 @@ fn cleanup_probe_at(
             "probe ownership lost",
         ));
     }
-    // SAFETY: ownership was checked against the retained descriptor immediately above.
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), component.as_ptr(), 0) } == -1 {
+    let unlink = retry_interrupted(|| {
+        // SAFETY: ownership was checked against the retained descriptor immediately above.
+        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), component.as_ptr(), 0) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = unlink {
         return Err(collation_cleanup_error(
             display_component,
             output,
             logical,
-            &io::Error::last_os_error().to_string(),
+            &error.to_string(),
         ));
     }
     let metadata = probe.metadata().map_err(|error| {
@@ -1528,6 +1532,16 @@ fn cleanup_probe_at(
 }
 
 #[cfg(unix)]
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+#[cfg(unix)]
 #[allow(clippy::useless_conversion)] // `dev_t` is signed on macOS and `u64` on Linux.
 fn stat_identity(value: &libc::stat) -> Option<(u64, u64)> {
     Some((
@@ -1543,6 +1557,15 @@ fn collation_error(output: &Path, logical: &Path, message: String) -> BuildInput
         encode_watch_path(output),
         encode_watch_path(logical)
     ))
+}
+
+#[cfg(unix)]
+fn probe_identity_error(
+    output: &Path,
+    logical: &Path,
+    error: &io::Error,
+) -> BuildInputTopologyError {
+    collation_error(output, logical, format!("probe identity: {error}"))
 }
 
 #[cfg(unix)]
@@ -1565,13 +1588,15 @@ fn graph_compatible(original: &PathGraph, current: &PathGraph) -> bool {
 }
 
 fn graph_has_identity(graph: &PathGraph, identity: (u64, u64)) -> bool {
-    graph.nodes.iter().any(|node| match node.state {
-        NodeState::Directory { device, inode }
-        | NodeState::Regular { device, inode }
-        | NodeState::Symlink { device, inode, .. }
-        | NodeState::Other { device, inode } => (device, inode) == identity,
-        NodeState::Missing => false,
-    })
+    std::iter::once(&graph.root)
+        .chain(&graph.nodes)
+        .any(|node| match node.state {
+            NodeState::Directory { device, inode }
+            | NodeState::Regular { device, inode }
+            | NodeState::Symlink { device, inode, .. }
+            | NodeState::Other { device, inode } => (device, inode) == identity,
+            NodeState::Missing => false,
+        })
 }
 
 #[cfg(unix)]
@@ -1713,6 +1738,71 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_probe_cleanup_operation_retries() {
+        let mut calls = 0;
+        let value = retry_interrupted(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(7)
+            }
+        })
+        .expect("retry interrupted operation");
+        assert_eq!(value, 7);
+        assert_eq!(calls, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_graph_identity_is_part_of_opened_descriptor_validation() {
+        use std::os::unix::fs::symlink;
+
+        let graph = snapshot_graph(Path::new("/")).expect("snapshot root");
+        let metadata = fs::metadata("/").expect("root metadata");
+        assert!(graph_has_identity(&graph, identity(&metadata)));
+
+        let temp = TempDir::new();
+        let target_to_root = temp.0.join("root-link");
+        symlink("/", &target_to_root).expect("symlink to root");
+        let graph = snapshot_graph(&target_to_root).expect("snapshot symlink to root");
+        assert!(graph_has_identity(&graph, identity(&metadata)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_identity_errors_name_the_requested_output() {
+        let output = Path::new("/requested output");
+        let logical = Path::new("logical input");
+        let missing_prefix = Path::new("/missing prefix");
+        let private_component = OsStr::new("private component");
+        let cause = io::Error::from(io::ErrorKind::PermissionDenied);
+        let error = probe_identity_error(
+            output,
+            logical,
+            &cause,
+        );
+        let message = error.to_string();
+        assert!(message.contains("/requested%20output"));
+        assert!(message.contains("logical%20input"));
+        assert!(!message.contains("missing%20prefix"));
+        assert!(!message.contains("private%20component"));
+
+        let cleanup = collation_cleanup_error(
+            private_component,
+            output,
+            logical,
+            "ownership lost",
+        )
+        .to_string();
+        assert!(cleanup.contains("private%20component"));
+        assert!(cleanup.contains("/requested%20output"));
+        assert!(cleanup.contains("logical%20input"));
+        assert!(!cleanup.contains(&encode_watch_path(missing_prefix)));
     }
 
     #[test]

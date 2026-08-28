@@ -299,6 +299,23 @@ impl std::fmt::Display for StaticDescriptorInputError {
     }
 }
 
+impl StaticDescriptorInputError {
+    pub(crate) fn watch_message(&self) -> String {
+        let prefix = format!(
+            "cannot resolve static descriptor `{}`: ",
+            self.descriptor_id
+        );
+        match &self.cause {
+            StaticDescriptorInputErrorCause::InvalidDefiningFile => {
+                format!("{prefix}its defining source file is not present in SourceMap")
+            }
+            StaticDescriptorInputErrorCause::Input(error) => {
+                format!("{prefix}{}", error.watch_message())
+            }
+        }
+    }
+}
+
 impl std::error::Error for StaticDescriptorInputError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
@@ -398,6 +415,34 @@ impl std::fmt::Display for StaticInputError {
 }
 
 impl std::error::Error for StaticInputError {}
+
+impl StaticInputError {
+    pub(crate) fn watch_message(&self) -> String {
+        match self {
+            Self::RootNotDirectory(path) => format!(
+                "project root is not a directory: {}",
+                crate::observed_source_name(path)
+            ),
+            Self::OutsideProjectRoot(path) => format!(
+                "static input escapes the project root: {}",
+                crate::observed_source_name(path)
+            ),
+            Self::MissingFile(path) => format!(
+                "static input file does not exist: {}",
+                crate::observed_source_name(path)
+            ),
+            Self::NotRegularFile(path) => format!(
+                "static input is not a regular file: {}",
+                crate::observed_source_name(path)
+            ),
+            Self::Io { path, message } => format!(
+                "cannot read static input {}: {message}",
+                crate::observed_source_name(path)
+            ),
+            _ => self.to_string(),
+        }
+    }
+}
 
 fn descriptor_input_error(
     descriptor: &StaticDescriptor,
@@ -1222,24 +1267,8 @@ fn snapshot_checked_metadata_record(
     let logical = metadata_logical_path(descriptor_id, driver)?;
     let root = canonical_root(project_root)?;
     let path = root.join(logical.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let metadata = align_watch::observe_consumed_classification(
-        &path,
-        || fs::symlink_metadata(&path),
-        |result| match result {
-            Ok(metadata) if metadata.is_file() => None,
-            Ok(metadata) if metadata.file_type().is_symlink() => None,
-            Ok(_) => Some(align_watch::BuildInputState::NonRegular),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(align_watch::BuildInputState::Missing)
-            }
-            Err(_) => Some(align_watch::BuildInputState::Unreadable),
-        },
-        |result| result.as_ref().ok(),
-        || Err(std::io::Error::other("watch observation rejected metadata path")),
-    );
-    match metadata {
-        Ok(metadata) if metadata.is_file() => {
-            let bytes = read_metadata_bytes(&root, &path, &logical)?;
+    match read_metadata_bytes(&root, &path, &logical) {
+        Ok(bytes) => {
             let record = parse_checked_metadata(&bytes, &logical, descriptor_id, driver)?;
             Ok((CheckedMetadataInput {
                 driver,
@@ -1250,8 +1279,7 @@ fn snapshot_checked_metadata_record(
                 },
             }, Some(record)))
         }
-        Ok(_) => Err(StaticInputError::NotRegularFile(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(StaticInputError::MissingFile(_)) => {
             ensure_metadata_parent_inside(&root, &path)?;
             Ok((CheckedMetadataInput {
                 driver,
@@ -1259,10 +1287,7 @@ fn snapshot_checked_metadata_record(
                 state: MetadataState::Missing,
             }, None))
         }
-        Err(error) => Err(StaticInputError::Io {
-            path,
-            message: error.to_string(),
-        }),
+        Err(error) => Err(error),
     }
 }
 
@@ -2204,31 +2229,129 @@ fn read_metadata_bytes(
     align_watch::observe_consumed_classification(
         path,
         || read_metadata_bytes_inner(root, path, logical_path),
-        static_observation_state,
-        |_| None,
+        |observed| observed.state,
+        |observed| observed.metadata.as_ref(),
         || {
-            Err(StaticInputError::InvalidPath(
-                "watch observation rejected metadata path".to_string(),
-            ))
+            ObservedMetadataRead {
+                result: Err(StaticInputError::InvalidPath(
+                    "watch observation rejected metadata path".to_string(),
+                )),
+                metadata: None,
+                state: None,
+            }
         },
     )
+    .result
+}
+
+struct ObservedMetadataRead {
+    result: Result<Vec<u8>, StaticInputError>,
+    metadata: Option<fs::Metadata>,
+    state: Option<align_watch::BuildInputState>,
 }
 
 fn read_metadata_bytes_inner(
     root: &Path,
     path: &Path,
     logical_path: &str,
-) -> Result<Vec<u8>, StaticInputError> {
-    let canonical = fs::canonicalize(path).map_err(|e| StaticInputError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    ensure_inside(root, &canonical)?;
-    read_bounded_file_inner(&canonical, fs::File::open(&canonical), &|| {
-        StaticInputError::MetadataMalformed {
-            logical_path: logical_path.to_string(),
+) -> ObservedMetadataRead {
+    let lexical_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let result = if error.kind() == std::io::ErrorKind::NotFound {
+                Err(StaticInputError::MissingFile(path.to_path_buf()))
+            } else {
+                Err(StaticInputError::Io {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                })
+            };
+            return ObservedMetadataRead {
+                state: static_observation_state(&result),
+                result,
+                metadata: None,
+            };
         }
-    })
+    };
+    if lexical_metadata.file_type().is_symlink() {
+        return ObservedMetadataRead {
+            result: Err(StaticInputError::NotRegularFile(path.to_path_buf())),
+            metadata: Some(lexical_metadata),
+            // The watched filesystem class follows the symlink even though checked metadata
+            // rejects it lexically. This keeps the rejected semantic baseline stable until either
+            // the link or its target changes.
+            state: None,
+        };
+    }
+    if !lexical_metadata.is_file() {
+        return ObservedMetadataRead {
+            result: Err(StaticInputError::NotRegularFile(path.to_path_buf())),
+            metadata: Some(lexical_metadata),
+            state: Some(align_watch::BuildInputState::NonRegular),
+        };
+    }
+
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return ObservedMetadataRead {
+                result: Err(StaticInputError::Io {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                }),
+                metadata: None,
+                state: Some(align_watch::BuildInputState::Unreadable),
+            };
+        }
+    };
+    if let Err(error) = ensure_inside(root, &canonical) {
+        return ObservedMetadataRead {
+            result: Err(error),
+            metadata: None,
+            state: None,
+        };
+    }
+    let file = match fs::File::open(&canonical) {
+        Ok(file) => file,
+        Err(error) => {
+            return ObservedMetadataRead {
+                result: Err(StaticInputError::Io {
+                    path: canonical,
+                    message: error.to_string(),
+                }),
+                metadata: None,
+                state: Some(align_watch::BuildInputState::Unreadable),
+            };
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return ObservedMetadataRead {
+                result: Err(StaticInputError::Io {
+                    path: canonical,
+                    message: error.to_string(),
+                }),
+                metadata: None,
+                state: Some(align_watch::BuildInputState::Unreadable),
+            };
+        }
+    };
+    let result = if metadata.is_file() {
+        read_bounded_file_inner(&canonical, Ok(file), &|| {
+            StaticInputError::MetadataMalformed {
+                logical_path: logical_path.to_string(),
+            }
+        })
+    } else {
+        Err(StaticInputError::NotRegularFile(path.to_path_buf()))
+    };
+    let state = static_observation_state(&result);
+    ObservedMetadataRead {
+        result,
+        metadata: Some(metadata),
+        state,
+    }
 }
 
 fn ensure_metadata_parent_inside(root: &Path, path: &Path) -> Result<(), StaticInputError> {
@@ -3679,6 +3802,74 @@ mod tests {
                 Some(align_watch::BuildInputState::Unreadable)
             ),
             "filesystem I/O rejection must remain a recoverable W5 state"
+        );
+    }
+
+    #[test]
+    fn checked_metadata_records_one_stable_observation_per_attempt() {
+        let root = temp_root("metadata-single-observation");
+        let id = "q.query";
+        let path = metadata_path(&root, id, Driver::SQLite).expect("metadata path");
+        create_dir_all(path.parent().expect("metadata parent")).expect("metadata parent");
+
+        for bytes in [
+            metadata_json(1, "00000000000000000000000000000000"),
+            b"malformed metadata".to_vec(),
+        ] {
+            write(&path, bytes).expect("metadata record");
+            let (result, inputs) = align_watch::collect_observations(|| {
+                snapshot_checked_metadata(&root, id, Driver::SQLite)
+            });
+            let finalized = align_watch::finalize_watch_inputs(
+                inputs.expect("observed checked metadata"),
+                None,
+            )
+            .expect("finalize checked metadata");
+            assert!(
+                !finalized.inputs().changed_during_attempt(),
+                "an unchanged checked-metadata record must not force a retry: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_static_diagnostics_encode_path_bytes_without_changing_display() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"static input % \xff.sql".to_vec(),
+        ));
+        let causes = [
+            StaticInputError::RootNotDirectory(path.clone()),
+            StaticInputError::OutsideProjectRoot(path.clone()),
+            StaticInputError::MissingFile(path.clone()),
+            StaticInputError::NotRegularFile(path.clone()),
+            StaticInputError::Io {
+                path: path.clone(),
+                message: "refused".to_string(),
+            },
+        ];
+        for cause in &causes {
+            assert!(
+                cause
+                    .watch_message()
+                    .contains("static%20input%20%25%20%FF.sql")
+            );
+            assert!(!cause.to_string().contains("%FF"));
+        }
+
+        let descriptor = StaticDescriptorInputError {
+            descriptor_id: "q.query".to_string(),
+            span: Span::new(0, 0, 0),
+            cause: StaticDescriptorInputErrorCause::Input(
+                StaticInputError::MissingFile(path),
+            ),
+        };
+        assert!(
+            descriptor
+                .watch_message()
+                .contains("static%20input%20%25%20%FF.sql")
         );
     }
 

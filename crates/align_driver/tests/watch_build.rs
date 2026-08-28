@@ -286,6 +286,60 @@ fn diagnostic_paths_are_encoded_once_inside_the_record_protocol() {
 }
 
 #[test]
+fn imported_diagnostic_paths_use_the_watch_path_codec() {
+    let temp = TempDir::new();
+    let root = temp.0.join("space %");
+    std::fs::create_dir(&root).expect("create special path");
+    std::fs::write(
+        root.join("main.align"),
+        "import dep\nfn main() -> i32 = dep.value()\n",
+    )
+    .expect("write entry source");
+    let (child, lines) = spawn_watch(&root);
+    let missing = wait_for(&lines, "revision 1 failed");
+    assert!(
+        missing
+            .iter()
+            .any(|line| line.contains("space%252520%252525/dep.align")),
+        "single-encoded missing-import path absent: {missing:#?}"
+    );
+
+    std::fs::write(
+        root.join("dep.align"),
+        "module wrong\npub fn value() -> i32 = 1\n",
+    )
+    .expect("write mismatched import");
+    let mismatch = wait_for(&lines, "revision 2 failed");
+    assert!(
+        mismatch
+            .iter()
+            .any(|line| line.contains("space%252520%252525/dep.align")),
+        "single-encoded module-declaration path absent: {mismatch:#?}"
+    );
+
+    std::fs::write(root.join("dep.align"), "module dep\nfn value( {\n")
+        .expect("write malformed import");
+    let malformed = wait_for(&lines, "revision 3 failed");
+    assert!(
+        malformed
+            .iter()
+            .any(|line| line.contains("space%252520%252525/dep.align")),
+        "single-encoded SourceMap path absent: {malformed:#?}"
+    );
+    assert!(
+        missing
+            .iter()
+            .chain(&mismatch)
+            .chain(&malformed)
+            .all(|line| !line.contains("space%25252520")),
+        "imported diagnostic path was encoded twice"
+    );
+    let (status, stdout) = stop(child);
+    assert_eq!(status.code(), Some(143));
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn watch_cache_stats_preserve_frontend_labels_and_stage_summaries() {
     let temp = TempDir::new();
     std::fs::write(temp.0.join("main.align"), source(0)).expect("write source");
@@ -373,6 +427,22 @@ fn watch_is_build_only_and_help_names_trigger_boundary() {
     assert!(stderr.contains("rebuild on compiler-observed file changes"));
     assert!(
         stderr.contains("other toolchain/library changes need another observed change or restart")
+    );
+
+    let temp = TempDir::new();
+    std::fs::write(temp.0.join("main.align"), source(0)).expect("write source");
+    let valued = alignc()
+        .current_dir(&temp.0)
+        .args(["build", "main.align", "--watch=true"])
+        .output()
+        .expect("valued watch flag");
+    assert!(!valued.status.success());
+    assert!(
+        String::from_utf8_lossy(&valued.stderr).contains("--watch does not take a value")
+    );
+    assert!(
+        !temp.0.join("main").exists(),
+        "rejected valued watch flag must not start a build"
     );
 }
 

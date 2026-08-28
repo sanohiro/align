@@ -582,7 +582,7 @@ fn read_one(
     first_error: &mut Option<String>,
 ) -> Result<bool, String> {
     let mut buffer = [0u8; PUMP_BYTES];
-    match reader.read(&mut buffer) {
+    match retry_interrupted(|| reader.read(&mut buffer)) {
         Ok(0) => Ok(true),
         Ok(count) => {
             if first_error.is_some() {
@@ -604,8 +604,16 @@ fn read_one(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
         Err(error) => Err(format!("child {} read: {error}", stream_name(stream))),
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
     }
 }
 
@@ -617,13 +625,17 @@ fn drain_queued(
     first_error: &mut Option<String>,
 ) {
     let mut queued: libc::c_int = 0;
-    // SAFETY: `queued` is a valid output integer and the descriptor remains owned by `reader`.
-    if unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut queued) } == -1 {
-        first_error.get_or_insert(format!(
-            "child {} read: {}",
-            stream_name(stream),
-            io::Error::last_os_error()
-        ));
+    let query = retry_interrupted(|| {
+        // SAFETY: `queued` is a valid output integer and the descriptor remains owned by `reader`.
+        let result = unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut queued) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = query {
+        first_error.get_or_insert(format!("child {} read: {error}", stream_name(stream)));
         return;
     }
     if queued < 0 {
@@ -697,17 +709,22 @@ fn child_exited_without_reap(pid: i32) -> io::Result<bool> {
     // SAFETY: `info` is writable and waitid is called with WNOWAIT so ownership stays with Child.
     let id = libc::id_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child pid exceeds id_t"))?;
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            id,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    retry_interrupted(|| {
+        // SAFETY: `info` is writable and WNOWAIT leaves process ownership with `Child`.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })?;
     // SAFETY: successful waitid initialized the fixed siginfo record.
     let info = unsafe { info.assume_init() };
     // SAFETY: a successful `waitid` initializes the SIGCHLD payload; POSIX specifies a zero pid
@@ -1015,6 +1032,47 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct InterruptedReader {
+        interrupted: bool,
+        bytes: &'static [u8],
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = buffer.len().min(self.bytes.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn interrupted_output_reads_retry_before_reporting_progress() {
+        let mut reader = InterruptedReader {
+            interrupted: false,
+            bytes: b"complete output",
+        };
+        let mut sink = Sink::default();
+        let mut panic_payload = None;
+        let mut first_error = None;
+        assert!(
+            !read_one(
+                &mut reader,
+                LinkOutputStream::Stdout,
+                &mut sink,
+                &mut panic_payload,
+                &mut first_error,
+            )
+            .expect("retry interrupted read")
+        );
+        assert_eq!(sink.stdout, b"complete output");
+        assert!(first_error.is_none());
     }
 
     #[test]

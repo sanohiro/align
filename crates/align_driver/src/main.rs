@@ -91,7 +91,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (watch, args) = parse_watch(&args);
+    let (watch, args) = match parse_watch(&args) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
     let (target, args) = parse_target(&args);
@@ -300,17 +306,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_watch(args: &[String]) -> (bool, Vec<String>) {
+fn parse_watch(args: &[String]) -> Result<(bool, Vec<String>), &'static str> {
     let mut watch = false;
     let mut rest = Vec::with_capacity(args.len());
     for argument in args {
         if argument == "--watch" {
             watch = true;
+        } else if argument.starts_with("--watch=") {
+            return Err("--watch does not take a value");
         } else {
             rest.push(argument.clone());
         }
     }
-    (watch, rest)
+    Ok((watch, rest))
 }
 
 /// Pull every `--export <name>` / `--export=<name>` out of `args` (repeatable — each occurrence

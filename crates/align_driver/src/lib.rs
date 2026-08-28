@@ -2284,6 +2284,11 @@ fn load_units(
                 file_path.push(&seg.name);
             }
             file_path.set_extension("align");
+            let source_name = if observed {
+                observed_source_name(&file_path)
+            } else {
+                file_path.display().to_string()
+            };
             let msrc = match watch_inputs::observe_consumed_read(
                 &file_path,
                 |file| {
@@ -2297,18 +2302,21 @@ fn load_units(
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    diags.error(format!("cannot find module `{modpath}` (expected {}): {e}", file_path.display()), imp.span);
+                    diags.error(
+                        format!("cannot find module `{modpath}` (expected {source_name}): {e}"),
+                        imp.span,
+                    );
                     continue;
                 }
             };
-            let fid = source_map.add_file(file_path.display().to_string(), msrc.clone());
+            let fid = source_map.add_file(source_name.clone(), msrc.clone());
             let toks = align_lexer::tokenize(fid, &msrc, diags);
             let mast = align_parser::parse_file(toks, diags);
             // The file must declare the full `module util.math` (path ↔ filename agreement).
             let declared = mast.module.as_ref().map(|m| m.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."));
             if declared.as_deref() != Some(modpath.as_str()) {
                 diags.error(
-                    format!("module file `{}` must declare `module {modpath}` (found {})", file_path.display(),
+                    format!("module file `{source_name}` must declare `module {modpath}` (found {})",
                         declared.map(|d| format!("`module {d}`")).unwrap_or_else(|| "no module declaration".to_string())),
                     imp.span,
                 );
@@ -2318,11 +2326,7 @@ fn load_units(
                 ast: mast,
                 is_entry: false,
                 src: msrc,
-                file: if observed {
-                    observed_source_name(&file_path)
-                } else {
-                    file_path.display().to_string()
-                },
+                file: source_name,
                 access_path: file_path,
                 fid,
             });
@@ -3154,8 +3158,13 @@ fn walk_inner(
                     match lock_metadata_publication_shared(&project_root) {
                         Ok(lock) => publication_lock = Some(lock),
                         Err(error) => {
+                            let message = if entry_access_path.is_some() {
+                                error.watch_message()
+                            } else {
+                                error.to_string()
+                            };
                             diags.error(
-                                error.to_string(),
+                                message,
                                 publication_lock_span
                                     .unwrap_or_else(|| align_span::Span::new(0, 0, 0)),
                             );
@@ -3172,7 +3181,12 @@ fn walk_inner(
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
-                        diags.error(error.to_string(), error.span);
+                        let message = if entry_access_path.is_some() {
+                            error.watch_message()
+                        } else {
+                            error.to_string()
+                        };
+                        diags.error(message, error.span);
                         continue;
                     }
                 };
@@ -4076,7 +4090,7 @@ fn observed_source(path: &std::path::Path) -> Result<String, BuildSourceError> {
     })
 }
 
-fn observed_source_name(path: &std::path::Path) -> String {
+pub(crate) fn observed_source_name(path: &std::path::Path) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;

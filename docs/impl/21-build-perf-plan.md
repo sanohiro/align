@@ -1471,6 +1471,27 @@ The P1 response changes failed-baseline classification and the parity audit
 touches ordinary and ThinLTO reporting. This closure therefore requires one
 fresh full-diff review before publication.
 
+That revised implementation review found a new checked-metadata liveness P1
+plus six boundary-totality gaps. The new P1 showed that the preceding matrix
+classified semantic errors correctly but did not require one logical read to
+have exactly one equivalent evidence owner. The matrix is reopened on
+`single-observation-evidence-and-boundary-totality`:
+
+| Finding | Redesigned closure |
+|---|---|
+| P1: one stable checked-metadata read produced unequal preclassification and byte-read evidence, setting `changed_during_attempt` forever | Checked-metadata lookup, nofollow kind rejection, actual regular-file open, bounded read, and opened-descriptor identity now form one `observe_consumed_classification` operation and one W4 evidence record. Missing/nonregular/I/O states remain total, while semantic parse rejection retains the regular bytes and opened identity already recorded by that same operation. No second observation of the logical path is representable. A present valid record and a stable malformed record both finalize with `changed_during_attempt == false`; edit/replacement remains changed. |
+| P2: imported and static-input diagnostic paths did not all enter the renderer as WatchPath | The observed loader assigns an encoded WatchPath to every imported `SourceMap` file and uses the same encoding for import lookup/declaration diagnostics. The observed static-descriptor route renders structured `PathBuf` error variants through WatchPath while the ordinary route retains its existing display. Entry, import, and static path owners cover space, percent, and arbitrary non-NUL Unix bytes before W2 text framing. |
+| P2: opened identity lookup omitted the W6 graph root | Identity membership covers `PathGraph.root` and every traversed node. Root-path and target-to-root owners prove a stable input cannot become a false changed attempt. |
+| P2: `--watch=value` survived stripping and became a one-shot build | The watch parser rejects every `--watch=` spelling before positional dispatch; only exact valueless `--watch` is removed. A real-binary owner proves rejection before source or output work. |
+| P2: `waitid`, post-exit queued-byte query, and pipe reads did not all retry `EINTR` | W13 routes status observation, `FIONREAD`, and read through one local retry-on-Interrupted authority. Deterministic injected operations prove interruption cannot select child-wait/read/early-EOF failure or skip queued bytes. |
+| P2: W14 probe unlink did not retry `EINTR` | Owned-probe unlink uses one retry-on-Interrupted authority before link-count verification. A deterministic injected owner proves the exact interrupted-then-success path and preserves the existing permanent-error payload. |
+| P2: first-probe identity failure substituted an unresolved prefix for `ENCODED_OUT` | Every W14 probe-phase error receives the complete fixed output path; intermediate missing-node identity remains only the logical-input context. The exact diagnostic owner distinguishes output, missing prefix, logical input, and private component fields. |
+
+The P1 redesign collapses the checked-metadata read boundary rather than adding
+another equivalence special case. Because it changes evidence ownership after a
+P1 and the sibling audit changes process and cleanup totality, the revised
+candidate requires one fresh full-diff review before publication.
+
 ### Acceptance and measurement
 
 No build-completion latency is a public promise, so no benchmark is a
