@@ -243,17 +243,10 @@ pub(super) fn run_watch_build(
             retained_states = last_success
                 .as_ref()
                 .map(|previous| {
-                    previous
-                        .inputs()
-                        .iter()
-                        .filter(|prior| {
-                            !failed_inputs
-                                .inputs()
-                                .iter()
-                                .any(|current| current.path() == prior.path())
-                        })
-                        .map(|prior| prior.path().to_path_buf())
-                        .collect::<Vec<_>>()
+                    retained_success_paths(
+                        failed_inputs.inputs().iter().map(|input| input.path()),
+                        previous.inputs().iter().map(|input| input.path()),
+                    )
                 })
                 .unwrap_or_default();
             (&failed_inputs, Some(retained_states.as_slice()))
@@ -416,6 +409,21 @@ pub(super) fn run_watch_build(
             }
         };
     }
+}
+
+fn retained_success_paths<'failed, 'previous>(
+    failed: impl IntoIterator<Item = &'failed Path>,
+    previous: impl IntoIterator<Item = &'previous Path>,
+) -> Vec<PathBuf> {
+    let failed_paths = failed
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<std::collections::BTreeSet<_>>();
+    previous
+        .into_iter()
+        .filter(|prior| !failed_paths.contains(*prior))
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 struct RevisionResult {
@@ -1769,7 +1777,28 @@ fn encode_text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_text, render_diags};
+    use super::{encode_text, render_diags, retained_success_paths};
+
+    #[test]
+    fn retained_success_union_indexes_failed_paths_at_the_exact_limit() {
+        let failed = (0..32_768)
+            .map(|index| std::path::PathBuf::from(format!("/failed/{index:05}")))
+            .collect::<Vec<_>>();
+        let previous = (0..32_768)
+            .map(|index| std::path::PathBuf::from(format!("/previous/{index:05}")))
+            .collect::<Vec<_>>();
+        let retained = retained_success_paths(
+            failed.iter().map(std::path::PathBuf::as_path),
+            previous.iter().map(std::path::PathBuf::as_path),
+        );
+        assert_eq!(retained, previous);
+
+        let overlap = retained_success_paths(
+            ["/current", "/shared"].into_iter().map(std::path::Path::new),
+            ["/shared", "/prior"].into_iter().map(std::path::Path::new),
+        );
+        assert_eq!(overlap, [std::path::PathBuf::from("/prior")]);
+    }
 
     #[test]
     fn watch_text_is_reversible_and_bounded() {

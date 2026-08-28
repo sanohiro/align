@@ -17,8 +17,11 @@ use align_span::{FileId, SourceMap, Span};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 pub const STATIC_INPUT_MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const STATIC_INPUT_MANIFEST_MAGIC: [u8; 8] = *b"ALIGNINP";
@@ -64,14 +67,21 @@ fn open_existing_publication_lock(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(StaticInputError::NotRegularFile(path.to_path_buf()));
     }
-    OpenOptions::new()
-        .read(true)
-        .write(write)
-        .open(path)
-        .map_err(|error| StaticInputError::Io {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    apply_nonblocking_nofollow(&mut options);
+    let file = options.open(path).map_err(|error| StaticInputError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let opened = file.metadata().map_err(|error| StaticInputError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if !opened.is_file() {
+        return Err(StaticInputError::NotRegularFile(path.to_path_buf()));
+    }
+    Ok(file)
 }
 
 pub(crate) fn lock_metadata_publication_shared(
@@ -1060,7 +1070,8 @@ fn read_static_bytes_inner(
     if !canonical.is_file() {
         return Err(StaticInputError::NotRegularFile(canonical));
     }
-    let bytes = read_bounded_file_inner(&canonical, fs::File::open(&canonical), &|| {
+    let file = open_static_input(&canonical);
+    let bytes = read_bounded_file_inner(&canonical, file, &|| {
         StaticInputError::NonCanonical(format!("static input exceeds the field limit: {logical}"))
     })?;
     if std::str::from_utf8(&bytes).is_err() {
@@ -2221,6 +2232,20 @@ fn read_bounded_file_inner(
     Ok(bytes)
 }
 
+fn open_static_input(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_nonblocking_nofollow(&mut options);
+    options.open(path)
+}
+
+fn apply_nonblocking_nofollow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+}
+
 fn read_metadata_bytes(
     root: &Path,
     path: &Path,
@@ -2311,7 +2336,7 @@ fn read_metadata_bytes_inner(
             state: None,
         };
     }
-    let file = match fs::File::open(&canonical) {
+    let file = match open_static_input(&canonical) {
         Ok(file) => file,
         Err(error) => {
             return ObservedMetadataRead {
@@ -2935,7 +2960,7 @@ mod tests {
     use super::*;
     use std::fs::{create_dir_all, write};
     use std::ops::Deref;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TempRoot(PathBuf);
 
@@ -3830,6 +3855,68 @@ mod tests {
                 "an unchanged checked-metadata record must not force a retry: {result:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_input_opens_do_not_block_on_fifos() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        fn make_fifo(path: &Path) {
+            let path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+            // SAFETY: `path` is NUL-terminated and names a new entry inside the test root.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        let root = temp_root("nonblocking-fifo");
+        let module = root.join("q.align");
+        write(&module, "module q\n").expect("Align source");
+        let source_fifo = root.join("q.sql");
+        make_fifo(&source_fifo);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let direct_fifo = source_fifo.clone();
+        std::thread::spawn(move || {
+            let result = open_static_input(&direct_fifo)
+                .and_then(|file| file.metadata())
+                .map(|metadata| metadata.is_file());
+            let _ = sender.send(result);
+        });
+        let regular = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("nonblocking FIFO open")
+            .expect("open FIFO for classification");
+        assert!(!regular);
+        assert!(matches!(
+            resolve_static_file(
+                &root,
+                &module,
+                None,
+                "q.query",
+                StaticConsumerKind::Query,
+                DriverRestriction::AnySupportedDriver,
+                None,
+            ),
+            Err(StaticInputError::NotRegularFile(_))
+        ));
+
+        let metadata_fifo =
+            metadata_path(&root, "m.query", Driver::SQLite).expect("metadata path");
+        create_dir_all(metadata_fifo.parent().expect("metadata parent"))
+            .expect("metadata parent");
+        make_fifo(&metadata_fifo);
+        assert!(matches!(
+            snapshot_checked_metadata(&root, "m.query", Driver::SQLite),
+            Err(StaticInputError::NotRegularFile(_))
+        ));
+
+        let publication_fifo = root.join(METADATA_PUBLICATION_LOCK);
+        make_fifo(&publication_fifo);
+        assert!(matches!(
+            lock_metadata_publication_shared(&root),
+            Err(StaticInputError::NotRegularFile(_))
+        ));
     }
 
     #[cfg(unix)]
