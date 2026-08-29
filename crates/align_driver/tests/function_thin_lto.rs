@@ -262,6 +262,42 @@ fn whole_unit_and_unknown_export_are_fail_closed() {
 }
 
 #[test]
+fn wrapped_and_direct_main_symbols_conflict_during_formation() -> Result<(), String> {
+    let proj = Proj::new(
+        "function-duplicate-main",
+        &[
+            ("dep.align", "module dep\npub fn helper() {}\n"),
+            (
+                "main.align",
+                "module main\nimport dep\nfn main() -> i32 { return 0 }\n",
+            ),
+        ],
+        "main.align",
+    );
+    let mut built = walk(&proj);
+    let dependency = built
+        .units
+        .iter_mut()
+        .find(|unit| !unit.is_entry)
+        .ok_or_else(|| "dependency fixture unit missing".to_owned())?;
+    let helper = dependency
+        .mir
+        .fns
+        .first_mut()
+        .ok_or_else(|| "dependency fixture function missing".to_owned())?;
+    helper.name = align_mir::ProgramCall::try_from_logical("main")
+        .map_err(|error| format!("cannot form main fixture identity: {error:?}"))?;
+    helper.exportable = false;
+
+    let error = match function_partitions(&built.units, &[]) {
+        Ok(_) => return Err("duplicate C main symbols formed partitions".to_owned()),
+        Err(error) => error,
+    };
+    assert_eq!(error, "duplicate ThinLTO root symbol:4:6d61696e");
+    Ok(())
+}
+
+#[test]
 fn size_verb_uses_function_partitions() {
     if !backend_available() {
         return;

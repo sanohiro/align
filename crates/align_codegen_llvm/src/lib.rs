@@ -618,6 +618,10 @@ fn resource_drop_hook_abi() -> Result<CanonicalFnAbi, CodegenError> {
 
 fn validate_support_partition(thunks: &[SupportThunkRecord]) -> Result<(), CodegenError> {
     let expected_hook_abi = resource_drop_hook_abi()?;
+    let thunk_symbols = thunks
+        .iter()
+        .map(|record| record.drop_thunk.as_str())
+        .collect::<HashSet<_>>();
     let mut previous = None::<&[u8]>;
     let mut has_owned = false;
     let mut hooks = HashMap::<&ProgramCall, &ThinPeerDeclaration>::new();
@@ -637,7 +641,10 @@ fn validate_support_partition(thunks: &[SupportThunkRecord]) -> Result<(), Codeg
         previous = Some(symbol);
         if let SupportThunkOwner::Owned { hook } = &record.owner {
             has_owned = true;
-            if !valid_thin_symbol(&hook.symbol) || hook.abi != expected_hook_abi {
+            if !valid_thin_symbol(&hook.symbol)
+                || hook.abi != expected_hook_abi
+                || thunk_symbols.contains(hook.symbol.as_str())
+            {
                 return Err(CodegenError::Lowering(
                     "ThinLTO support partition has a disagreeing hook ABI".to_owned(),
                 ));
@@ -2482,6 +2489,7 @@ impl<'a> PartitionSharedCodegenView<'a> {
 /// The complete borrowed module input for one function/support partition. `peer_functions` is the
 /// physical source needed by the existing LLVM ABI lowering, paired one-for-one with `peers`; the
 /// manual `Debug` implementation deliberately fingerprints only the canonical peer records.
+#[allow(clippy::large_enum_variant)] // Keep the sealed borrowed shared view allocation-free.
 pub enum PartitionCodegenView<'a> {
     Function {
         selected: &'a Function,
@@ -2574,6 +2582,7 @@ impl ModuleScope<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The explicit module inputs and partition scope are separate axes.
 fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -20808,6 +20817,16 @@ mod tests {
         hook.logical = program_call("different.resource.drop");
         aliased_symbol.owner = SupportThunkOwner::Owned { hook };
         assert!(validate_support_partition(&[valid, aliased_symbol]).is_err());
+
+        let mut hook_aliases_thunk = support_thunk("__align_resource_drop$test$0")?;
+        let thunk_symbol = hook_aliases_thunk.drop_thunk.clone();
+        let SupportThunkOwner::Owned { hook } = &mut hook_aliases_thunk.owner else {
+            return Err(CodegenError::Lowering(
+                "support fixture owner is imported".to_owned(),
+            ));
+        };
+        hook.symbol = thunk_symbol;
+        assert!(validate_support_partition(&[hook_aliases_thunk]).is_err());
         Ok(())
     }
 

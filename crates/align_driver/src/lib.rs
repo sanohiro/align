@@ -6057,6 +6057,7 @@ fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, Str
 
 /// Build the phase-1 **prelink** cache key: today's codegen key minus the pure backend/target knobs
 /// (cpu/features/reloc/code-model/machine-opt) — see [`cache::PrelinkKey`].
+#[allow(clippy::too_many_arguments)] // Every cache-key axis stays explicit at the construction seam.
 fn build_prelink_key(
     unit: &str,
     partition: cache::PartitionKey,
@@ -6494,13 +6495,22 @@ pub fn function_partitions<'a>(
         let shared = PartitionSharedCodegenView::from_program(&unit.mir);
         for selected in functions {
             let definition = thin_peer(&unit.unit, &unit.mir, selected, unit_exports)?;
-            if definition.linkage == ThinFunctionLinkage::Root
-                && !root_symbols.insert(definition.symbol.clone())
-            {
-                return Err(thin_identity_error(
-                    "duplicate ThinLTO root symbol",
-                    definition.symbol.as_bytes(),
-                ));
+            let mut emitted_roots = Vec::with_capacity(2);
+            if selected.name.as_str() == "main" {
+                emitted_roots.push("main".to_owned());
+            }
+            if definition.linkage == ThinFunctionLinkage::Root {
+                emitted_roots.push(definition.symbol.clone());
+            }
+            emitted_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            emitted_roots.dedup();
+            for symbol in emitted_roots {
+                if !root_symbols.insert(symbol.clone()) {
+                    return Err(thin_identity_error(
+                        "duplicate ThinLTO root symbol",
+                        symbol.as_bytes(),
+                    ));
+                }
             }
             let mut targets = referenced_program_calls(selected);
             targets.extend(unit.mir.sqlite_callback_effects.keys().cloned());
@@ -6960,22 +6970,30 @@ fn thin_link_lib_union(units: &[PerUnitArtifact]) -> Vec<String> {
     libraries
 }
 
-fn validate_thin_stage_parent() -> Result<(), String> {
+fn validate_thin_stage_parent_at(parent: &std::path::Path) -> Result<std::path::PathBuf, String> {
     use std::os::unix::ffi::OsStrExt as _;
-    let temp = std::env::temp_dir();
-    let bytes = temp.as_os_str().as_bytes();
+    let canonical = std::fs::canonicalize(parent)
+        .map_err(|error| format!("cannot create object staging directory: {error}"))?;
+    let bytes = canonical.as_os_str().as_bytes();
     if bytes.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r')) {
         return Err(thin_identity_error(
             "cannot encode ThinLTO object path",
             bytes,
         ));
     }
-    Ok(())
+    Ok(canonical)
+}
+
+fn validate_thin_stage_parent() -> Result<std::path::PathBuf, String> {
+    validate_thin_stage_parent_at(&std::env::temp_dir())
 }
 
 #[cfg(test)]
 mod function_thin_unit_tests {
-    use super::{ArtifactStage, Profile, encode_thin_response_records, link_objects};
+    use super::{
+        ArtifactStage, Profile, encode_thin_response_records, link_objects, thin_identity_error,
+        validate_thin_stage_parent_at,
+    };
     use std::io::Write as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::ffi::OsStringExt as _;
@@ -7009,6 +7027,34 @@ mod function_thin_unit_tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn canonical_stage_parent_is_validated_before_artifact_creation() -> Result<(), String> {
+        let root = ArtifactStage::temp("align-canonical-stage-parent")
+            .map_err(|error| format!("create stage-parent fixture: {error}"))?;
+        for (index, name) in ["line\nbreak", "carriage\rreturn"].into_iter().enumerate() {
+            let target = root.path().join(name);
+            std::fs::create_dir(&target)
+                .map_err(|error| format!("create invalid canonical target: {error}"))?;
+            let alias = root.path().join(format!("alias{index}"));
+            std::os::unix::fs::symlink(&target, &alias)
+                .map_err(|error| format!("create stage-parent symlink: {error}"))?;
+            let canonical = std::fs::canonicalize(&alias)
+                .map_err(|error| format!("canonicalize stage-parent fixture: {error}"))?;
+            let error = match validate_thin_stage_parent_at(&alias) {
+                Ok(_) => return Err("invalid canonical stage parent was accepted".to_owned()),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                thin_identity_error(
+                    "cannot encode ThinLTO object path",
+                    canonical.as_os_str().as_bytes()
+                )
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -7098,7 +7144,6 @@ pub fn build_function_thin_lto(
     if partitions.is_empty() {
         return Err("ThinLTO partition inventory is empty".to_owned());
     }
-    validate_thin_stage_parent()?;
     for partition in &partitions {
         let id = partition.stable_id();
         if id.as_bytes().contains(&0) {
@@ -7108,7 +7153,8 @@ pub fn build_function_thin_lto(
             ));
         }
     }
-    let object_stage = ArtifactStage::temp("align-function-thin")
+    let stage_parent = validate_thin_stage_parent()?;
+    let object_stage = ArtifactStage::in_canonical_dir(&stage_parent, "align-function-thin")
         .map_err(|error| format!("cannot create object staging directory: {error}"))?;
     let link_libs = thin_link_lib_union(units);
 
@@ -8767,6 +8813,10 @@ pub struct ArtifactStage {
 impl ArtifactStage {
     pub fn in_dir(parent: &std::path::Path, label: &str) -> std::io::Result<Self> {
         let parent = std::fs::canonicalize(parent)?;
+        Self::in_canonical_dir(&parent, label)
+    }
+
+    fn in_canonical_dir(parent: &std::path::Path, label: &str) -> std::io::Result<Self> {
         for _ in 0..1024 {
             let nonce = ARTIFACT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stamp = std::time::SystemTime::now()
