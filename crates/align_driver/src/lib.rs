@@ -5574,12 +5574,7 @@ fn stage_pgo(pgo: &PgoMode) -> Result<StagedPgo, String> {
             let bytes = watch_inputs::observe_consumed_read(
                 path,
                 |file| {
-                    let mut file = file.map_err(|error| {
-                        format!(
-                            "--pgo-use: cannot read profile data file '{}': {error}",
-                            path.display()
-                        )
-                    })?;
+                    let mut file = file.map_err(|error| profdata_open_error(path, error))?;
                     let mut bytes = Vec::new();
                     file.read_to_end(&mut bytes).map_err(|error| {
                         format!(
@@ -5901,8 +5896,7 @@ pub fn validate_profdata(path: &std::path::Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
     }
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("--pgo-use: cannot read profile data file '{}': {error}", path.display()))?;
+    let mut file = std::fs::File::open(path).map_err(|error| profdata_open_error(path, error))?;
     let mut head = [0u8; 8];
     let read = file
         .read(&mut head)
@@ -5925,12 +5919,7 @@ fn read_and_validate_profdata_inner(
     path: &std::path::Path,
     file: std::io::Result<std::fs::File>,
 ) -> Result<Vec<u8>, String> {
-    let mut file = file.map_err(|error| {
-        format!(
-            "--pgo-use: cannot read profile data file '{}': {error}",
-            path.display()
-        )
-    })?;
+    let mut file = file.map_err(|error| profdata_open_error(path, error))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("--pgo-use: cannot inspect profile data file '{}': {error}", path.display()))?;
@@ -5938,6 +5927,17 @@ fn read_and_validate_profdata_inner(
         return Err(format!("--pgo-use: profile data path '{}' is not a regular file", path.display()));
     }
     read_validated_profdata_bytes(path, &mut file, metadata.len())
+}
+
+fn profdata_open_error(path: &std::path::Path, error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("--pgo-use: profile data file '{}' does not exist", path.display())
+    } else {
+        format!(
+            "--pgo-use: cannot read profile data file '{}': {error}",
+            path.display()
+        )
+    }
 }
 
 /// Validate the bounded header before allocating or reading the remaining snapshot. Kept as a
