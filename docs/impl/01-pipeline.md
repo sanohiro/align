@@ -114,6 +114,13 @@ executable
   `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
   profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, instrumented PGO, and the explicit
   foreground `--watch` loop.
+- Build-performance item 6 has a settled, implementation-pending refinement for the explicit
+  `--thin-lto` path: one support partition for producer-owned resource thunks plus one LLVM module
+  per MIR function, followed by the same fresh global thin-link and cached import-sensitive
+  backends. Non-root functions use unit-qualified hidden composition symbols, so duplicate
+  consumer-side monomorphs remain distinct rather than becoming conflicting prevailing definitions.
+  This does not change the current flag-off, PGO, frontend-cache, `emit-llvm`, or `explain-opt`
+  pipeline. The exact boundary is `21-build-perf-plan.md` item 6.
 - Watch builds route every consumed source, import, PGO profile, file-backed static input, and
   checked metadata read through `align_watch`. That internal crate retains bounded semantic and
   filesystem-topology evidence for final publication checks and periodic native-event-backed
