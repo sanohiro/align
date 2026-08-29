@@ -2995,11 +2995,12 @@ monomorphs in different units remain distinct copies under the shipped model rat
 ODR candidates. Only one source unit with one function partition and no support partition takes
 the byte-identical `WholeUnit` shortcut; multi-unit/type-only graphs stay partitioned. Prelink and
 backend cache identity gains a nominal partition record, while a structural partition digest omits
-unrelated local bodies and includes peer ABI declarations plus complete shared codegen tables; the
-support digest is formed from the exact emitted thunk records, including ownership and local hook
-ABI/symbol identity. Public cache observations bind that same partition identity directly to its
-digest and phase outcomes. A fresh global thin-link still determines the exact import-sensitive
-backend invalidation frontier.
+unrelated local bodies and combines peer ABI declarations with one sealed fingerprint of the
+complete shared codegen tables computed once per source unit; the support digest is formed from the
+exact emitted thunk records, including ownership and local hook ABI/symbol identity. Private shared
+view fields keep that nested digest inseparable from the tables consumed by codegen. Public cache
+observations bind the same partition identity directly to its digest and phase outcomes. A fresh
+global thin-link still determines the exact import-sensitive backend invalidation frontier.
 Ordinary flag-off builds, PGO, `dev`/`small`/`tiny` profiles, and diagnostic lenses remain
 unit-granular; accepted `size --thin-lto` follows the same partition path as `build`/`run`. The exact
 ledger, validation order, cache wire change, resource bounds, and implementation matrix are
