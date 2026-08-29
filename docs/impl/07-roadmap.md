@@ -2635,13 +2635,13 @@ gates stay green untouched (fresh temp roots); clippy `-D warnings` clean in bot
 workspace 2219 pass. SV runway remains (explicit compile-time-regression bound; stale-summary
 mutation deepening).
 
-> **Build-performance item 6 supersession note (design settled 2026-08-29; implementation
-> pending):** this S2 record remains the historical shipped unit-granular boundary. Item 6 will
-> refine the explicit `--thin-lto` input to support/function partitions and will narrow the `N=1`
+> **Build-performance item 6 supersession note (SHIPPED 2026-08-29):** this S2 record remains the
+> historical shipped unit-granular boundary. Item 6 refines the explicit `--thin-lto` input to
+> support/function partitions and narrows the `N=1`
 > shortcut to exactly one source unit that forms one function partition and no support partition.
-> A multi-unit graph stays on ThinLTO even when type-only units leave one function partition. Until
-> that implementation merges, the shipped per-unit behavior and every gate described here remain
-> current. The authoritative new ledger is `docs/impl/21-build-perf-plan.md` item 6.
+> A multi-unit graph stays on ThinLTO even when type-only units leave one function partition. The
+> authoritative superseding ledger is `docs/impl/21-build-perf-plan.md` item 6; this historical
+> section remains the record for the earlier unit-granular implementation.
 
 **ThinLTO SV SHIPPED (2026-07-17): the verification bundle — the ThinLTO arc is CLOSED.** SV pins
 the four things S1/S2 left open, in `crates/align_driver/tests/thin_lto_sv.rs` (11 gates). It also

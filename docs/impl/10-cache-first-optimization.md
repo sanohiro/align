@@ -884,11 +884,11 @@ this fallback, the v4 codegen identity, rejection-marker authorization, bounded
 immutable reads, and native release-layout verification; the complete closure
 matrix remains in `docs/impl/21-build-perf-plan.md` item 4.
 
-### 6.9 SETTLED DESIGN 2026-08-29 — function partitions under `--thin-lto`
+### 6.9 IMPLEMENTED 2026-08-29 — function partitions under `--thin-lto`
 
 Build-performance item 6 refines only the existing explicit `--thin-lto`
 path. Its public-contract ledger and implementation closure matrix are
-authoritative in `docs/impl/21-build-perf-plan.md`; implementation is pending.
+authoritative in `docs/impl/21-build-perf-plan.md`; the hard cutover is complete.
 One source unit becomes one borrowed support partition when it owns resource
 Drop thunks plus one borrowed partition per MIR function. The ordinary object
 cache, persistent frontend cache, PGO path, diagnostic lenses, and flag-off

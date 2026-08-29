@@ -186,9 +186,9 @@ fn gate_wide_tuple_sret_vanishes_when_inlined() {
     assert_eq!(String::from_utf8_lossy(&thin_out.stdout), "46\n188\n");
 }
 
-// ---- Gate 3: N=1 byte-identity (CLI, exercises the real driver branch) ---------------------------
+// ---- Gate 3: one-source/one-function byte identity (CLI, real WholeUnit route) ------------------
 
-const SINGLE: &str = "pub fn helper(x: i64) -> i64 = x + 1\nfn main() {\n  print(helper(41))\n}\n";
+const SINGLE: &str = "fn main() {\n  print(42)\n}\n";
 
 #[test]
 fn gate_n1_exe_byte_identical() {
@@ -228,7 +228,7 @@ fn gate_n1_exe_byte_identical() {
     let thin = build("s_thin", true);
     assert_eq!(
         noflag, thin,
-        "N=1 --thin-lto must produce a byte-identical executable to the no-flag build (N=1 skips ThinLTO)"
+        "one-source/one-function --thin-lto must use the byte-identical WholeUnit route"
     );
 }
 

@@ -2985,7 +2985,7 @@ codegen-key field was removed outright rather than populated. The genuinely-open
 stay findable as a slim "Separate compilation / ThinLTO — remaining deferrals" entry in the Open
 section, alongside the parallel/pipeline/cache companion-audit records.
 
-**Function-partition refinement — design SETTLED 2026-08-29, implementation pending.**
+**Function-partition refinement — SHIPPED 2026-08-29.**
 Build-performance item 6 uses no second optimizer or visibility model. Under the existing explicit
 `--thin-lto` selector, the thin-link input becomes one support partition for producer-owned resource
 Drop thunks plus one partition per MIR function. Synthetic private boundaries use hidden external

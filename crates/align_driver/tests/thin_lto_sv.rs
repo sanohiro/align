@@ -133,8 +133,8 @@ fn gate_sv1_subprocess_build_twice_byte_identical() {
             .expect("spawn alignc");
         assert!(out.status.success(), "--thin-lto build failed: {}", String::from_utf8_lossy(&out.stderr));
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("prelink: 0 hit, 4 miss"), "the build must be cold (all prelink miss):\n{err}");
-        assert!(err.contains("backend: 0 hit, 4 miss"), "the build must be cold (all backend miss):\n{err}");
+        assert!(err.contains("prelink: 0 hit, 5 miss"), "the build must be cold (all function partitions prelink-miss):\n{err}");
+        assert!(err.contains("backend: 0 hit, 5 miss"), "the build must be cold (all function partitions backend-miss):\n{err}");
         assert!(exe_path.exists(), "the build produced the exe");
         std::fs::read(&exe_path).expect("read built exe")
     };
@@ -314,6 +314,7 @@ fn base_prelink_key() -> PrelinkKey {
         rt_lto: false,
         rt_lto_digest: None,
         unit: "b".to_string(),
+        partition: PartitionKey::WholeUnit,
     }
 }
 
@@ -333,11 +334,25 @@ fn base_backend_key() -> BackendKey {
         pipeline: "default<O2>".to_string(),
         codegen_opt: "O2".to_string(),
         own_prelink_digest: hh(10),
-        inbound_imports: vec![("c".to_string(), 42u64, true)],
+        inbound_imports: vec![InboundImport {
+            source: ThinPartitionSource {
+                unit: "c".to_string(),
+                partition: PartitionKey::WholeUnit,
+            },
+            guid: 42,
+            is_definition: true,
+        }],
         outbound_exports: vec![7u64],
-        import_source_digests: vec![("c".to_string(), hh(11))],
+        import_source_digests: vec![ImportSourceDigest {
+            source: ThinPartitionSource {
+                unit: "c".to_string(),
+                partition: PartitionKey::WholeUnit,
+            },
+            prelink_digest: hh(11),
+        }],
         exports: vec![],
         unit: "b".to_string(),
+        partition: PartitionKey::WholeUnit,
     }
 }
 
@@ -467,7 +482,13 @@ fn gate_sv4_backend_key_components_disjoint() {
 
     // Cross-unit inputs (import edges / import-source digests / outbound exports) also split it.
     let mut xunit = base.clone();
-    xunit.import_source_digests = vec![("c".to_string(), hh(888))];
+    xunit.import_source_digests = vec![ImportSourceDigest {
+        source: ThinPartitionSource {
+            unit: "c".to_string(),
+            partition: PartitionKey::WholeUnit,
+        },
+        prelink_digest: hh(888),
+    }];
     assert_ne!(base.full_digest(), xunit.full_digest(), "a changed import-source digest must split the backend key");
 }
 

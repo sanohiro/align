@@ -1607,71 +1607,30 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Allowed);
     }
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
-    let object_stage = align_driver::ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
-        eprintln!("alignc: cannot create object staging directory: {e}");
-        ExitCode::FAILURE
-    })?;
-    // One object path per unit (DAG-index-named, not the `.`-containing module path).
-    let obj_paths: Vec<PathBuf> = (0..walk.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
     // Opt-in codegen cache (ALIGNC_CACHE), default-ON; disabled ⇒ each unit emits verbatim.
     let cache = CacheContext::from_env();
-    if thin_lto && walk.units.len() >= 2 {
-        // ThinLTO S2: cross-unit-optimizing build with two cacheable phases per unit (prelink bitcode
-        // + backend object) and a serial thin-link between them; misses run in parallel (`jobs`
-        // workers). Fail-closed on any shim failure — NEVER a silent fallback to the non-ThinLTO path
-        // (the user asked for --thin-lto). N=1 skips ThinLTO and falls through to the ordinary object
-        // cache below (byte-identical to today's whole-program object, one shared key namespace).
-        let outcomes = match align_driver::build_thin_lto(
-            &walk.units, &obj_paths, &cache, &target, profile, &[], rt_lto, object_stage.path(), jobs,
-        ) {
-            Ok(build) => build.outcomes,
-            Err(e) => {
-                eprintln!("alignc: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        };
-        if cache_stats {
-            render_thin_cache_stats(&outcomes, cache.codegen_is_enabled());
-        }
-        let link_libs = link_lib_union(walk.units.iter().map(|u| u.mir.link_libs.as_slice()));
-        return finish_link(&link_libs, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
-    }
-    // Instrument-PGO (`--pgo-instrument` / `--pgo-use`, S2) now flows through the NORMAL cached +
-    // parallel per-unit path below — the object cache composes it via the `PgoKey` key component
-    // (instrumented / profile-use / ordinary objects are structurally isolated and never share a CAS
-    // blob). Only two PGO-specific bits remain: the per-unit emit swaps in the PGO pipeline
-    // (`codegen_units_parallel` → `emit_object_pgo`), and the link pulls the profile runtime
-    // (`finish_link` under `--pgo-instrument`). Fail-loud profdata validation runs HERE, before codegen,
-    // so a missing/corrupt profile is a clean CLI error rather than a libLLVM diagnose-and-exit (the S1
-    // caveat) — even on an all-hit build where no LLVM would otherwise run.
-    if let align_driver::PgoMode::Use(p) = pgo
-        && let Err(e) = align_driver::validate_profdata(p)
-    {
-        eprintln!("alignc: {e}");
-        return Err(ExitCode::FAILURE);
-    }
-    // Codegen runs in parallel over cache MISSES (`jobs` workers); lookups are serial and results stay
-    // DAG-ordered. This is also the N=1 `--thin-lto` path (a single unit has no cross-unit boundary).
-    let build = match align_driver::codegen_units_parallel(&walk.units, &obj_paths, &cache, &target, profile, rt_lto, jobs, pgo) {
-        Ok(b) => b,
+    let build = match align_driver::build_function_thin_lto(
+        &walk.units,
+        &cache,
+        &target,
+        profile,
+        &[],
+        rt_lto,
+        jobs,
+    ) {
+        Ok(build) => build,
         Err(e) => {
             eprintln!("alignc: {e}");
             return Err(ExitCode::FAILURE);
         }
     };
     if cache_stats {
-        render_cache_stats(&build.outcomes, cache.codegen_is_enabled());
+        render_function_thin_cache_stats(&build, cache.codegen_is_enabled());
     }
-    // One aggregated Align-voice `--pgo-use` report over the units that actually ran (cache MISSES), then
-    // proceed — a mismatched profile is a PERFORMANCE concern, never a correctness one (clang parity), so
-    // it is a WARNING, never an abort. A `matched == 0` build (the profile applied to NOTHING) gets a
-    // prominent "is this the right profile?" line; a partial match rides the per-unit staleness warnings.
-    // Hard fails stay at the reliable layer (missing/bad-magic profdata; an Error-severity libLLVM
-    // diagnostic), handled before/inside codegen. An all-hit build ran no LLVM, so has a `0/0` tally and no
-    // warnings: any staleness was reported when each object was first built and is intrinsic to the bytes.
-    report_pgo_use(pgo, &build);
-    let link_libs = link_lib_union(walk.units.iter().map(|u| u.mir.link_libs.as_slice()));
-    finish_link(&link_libs, &obj_paths, exe, profile, &target, pgo)
+    build.link_and_publish(exe).map_err(|error| {
+        eprintln!("alignc: {error}");
+        ExitCode::FAILURE
+    })
 }
 
 /// The aggregated `--pgo-use` report over the units that actually ran (cache MISSES). A mismatched
@@ -1888,24 +1847,53 @@ fn render_frontend_cache_stats(units: &[align_driver::PipelinedBuiltUnit]) {
     eprintln!("alignc: cache: {} frontend: {hits} hit, {misses} miss", outcomes.len());
 }
 
-/// Render the `--cache-stats` report for a `--thin-lto` build: one `<unit> <phase> hit`/`miss (<r>)`
-/// line per phase per unit (`prelink` then `backend`), then a per-phase summary. A disabled cache
-/// prints the single disabled note (there are no per-unit lookups to report).
-fn render_thin_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
+fn thin_source_label(source: &align_driver::ThinPartitionSource) -> String {
+    match &source.partition {
+        align_driver::PartitionKey::WholeUnit => source.unit.clone(),
+        align_driver::PartitionKey::Support => format!("{}::support", source.unit),
+        align_driver::PartitionKey::Function(function) => {
+            format!("{}::{function}", source.unit)
+        }
+    }
+}
+
+/// Render function-ThinLTO cache observations without exposing private artifact topology.
+fn render_function_thin_cache_stats(build: &align_driver::FunctionThinLtoBuild, enabled: bool) {
+    if let [align_driver::FunctionThinLtoObservation::WholeUnit { codegen, .. }] =
+        build.observations()
+    {
+        render_cache_stats(std::slice::from_ref(codegen), enabled);
+        return;
+    }
     if !enabled {
         eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");
         return;
     }
     for stage in [align_driver::CacheStage::ThinLtoPrelink, align_driver::CacheStage::ThinLtoBackend] {
         let (mut hits, mut misses) = (0usize, 0usize);
-        for o in outcomes.iter().filter(|o| o.stage == stage) {
-            if o.hit {
+        for observation in build.observations() {
+            let align_driver::FunctionThinLtoObservation::Partitioned {
+                source,
+                prelink,
+                backend,
+                ..
+            } = observation
+            else {
+                continue;
+            };
+            let outcome = if stage == align_driver::CacheStage::ThinLtoPrelink {
+                prelink
+            } else {
+                backend
+            };
+            let label = thin_source_label(source);
+            if outcome.hit {
                 hits += 1;
-                eprintln!("alignc: cache: {} {} hit", o.unit, stage.label());
+                eprintln!("alignc: cache: {label} {} hit", stage.label());
             } else {
                 misses += 1;
-                let reason = o.miss_reason.map(|r| r.reason()).unwrap_or("miss");
-                eprintln!("alignc: cache: {} {} miss ({reason})", o.unit, stage.label());
+                let reason = outcome.miss_reason.map(|r| r.reason()).unwrap_or("miss");
+                eprintln!("alignc: cache: {label} {} miss ({reason})", stage.label());
             }
         }
         eprintln!("alignc: cache: {} {}: {hits} hit, {misses} miss", hits + misses, stage.label());

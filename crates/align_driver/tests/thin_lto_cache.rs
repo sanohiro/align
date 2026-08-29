@@ -246,8 +246,8 @@ fn gate7_cross_process_second_build_all_hit() {
     let hot = run();
     assert!(hot.status.success(), "hot --thin-lto build failed: {}", String::from_utf8_lossy(&hot.stderr));
     let hot_err = String::from_utf8_lossy(&hot.stderr);
-    assert!(hot_err.contains("prelink: 4 hit, 0 miss"), "second build: all prelink hit:\n{hot_err}");
-    assert!(hot_err.contains("backend: 4 hit, 0 miss"), "second build: all backend hit:\n{hot_err}");
+    assert!(hot_err.contains("prelink: 5 hit, 0 miss"), "second build: all function partitions prelink-hit:\n{hot_err}");
+    assert!(hot_err.contains("backend: 5 hit, 0 miss"), "second build: all function partitions backend-hit:\n{hot_err}");
     let exe2 = std::fs::read(proj.dir.join("main")).expect("read exe 2");
     assert_eq!(exe1, exe2, "the cross-process all-hit --thin-lto exe is byte-identical");
     assert_eq!(Command::new(proj.dir.join("main")).output().unwrap().stdout, DAG_OUT_V1.as_bytes());

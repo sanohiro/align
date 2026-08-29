@@ -29,6 +29,7 @@ mod runtime_abi;
 pub use llvm_build_id::loaded_llvm_build_id;
 
 use align_ast::{BinOp, UnOp};
+use align_interface::Hash128;
 use align_mir::{
     Block, CanonicalFnAbi, CanonicalTy, ColumnBatchInput, Const, ConstElem, DirectCall, Function, GeneratedId,
     Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode,
@@ -411,12 +412,22 @@ fn build_program_module<'c>(
     profile: Profile,
     exports: &[String],
     rt_lto: Option<&[u8]>,
+    scope: ModuleScope<'_>,
 ) -> Result<(Module<'c>, TargetMachine), CodegenError> {
     let module = ctx.create_module("align");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
     // Probe the baked bitcode before deciding whether to skip curating the guarded declares.
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(ctx, bc));
-    let runtime = build_module(ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    let runtime = build_module(
+        ctx,
+        &module,
+        program,
+        &tm,
+        None,
+        exports,
+        rt_module.is_some(),
+        scope,
+    )?;
     if let Some(rt) = rt_module {
         // On a datalayout mismatch `link_in_rt_lto` falls back on its own (loud diagnostic, guarded
         // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
@@ -430,7 +441,15 @@ fn build_program_module<'c>(
 
 pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String], rt_lto: Option<&[u8]>) -> Result<(), CodegenError> {
     let ctx = Context::create();
-    let (module, tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
+    let (module, tm) = build_program_module(
+        &ctx,
+        program,
+        target,
+        profile,
+        exports,
+        rt_lto,
+        ModuleScope::Whole,
+    )?;
     write_object(&module, out, &tm, profile.pipeline())
 }
 
@@ -457,7 +476,15 @@ pub fn emit_object_pgo(
     action: pgo::PgoAction<'_>,
 ) -> Result<pgo::PgoRunReport, CodegenError> {
     let ctx = Context::create();
-    let (module, tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
+    let (module, tm) = build_program_module(
+        &ctx,
+        program,
+        target,
+        profile,
+        exports,
+        rt_lto,
+        ModuleScope::Whole,
+    )?;
     // The per-module default pipeline opt level matches a normal build (release = O2,
     // fast = O3) — reusing the ThinLTO opt-level mapping (both are middle-end levels).
     let opt = thinlto::ir_opt_level(profile);
@@ -491,13 +518,333 @@ pub fn emit_prelink_bc(
     let ctx = Context::create();
     // `_tm` is unused past construction (the ThinLTO prelink shim takes no TargetMachine) but is kept
     // named so it outlives the shim call alongside `ctx`/`module`.
-    let (module, _tm) = build_program_module(&ctx, program, target, profile, exports, rt_lto)?;
+    let (module, _tm) = build_program_module(
+        &ctx,
+        program,
+        target,
+        profile,
+        exports,
+        rt_lto,
+        ModuleScope::Whole,
+    )?;
     // The module (and its `ctx`) must outlive the shim call; `write_prelink_bc` writes the
     // bitcode synchronously and returns before `module`/`ctx`/`tm` drop here.
     // SAFETY: `module.as_mut_ptr()` is a live LLVMModuleRef in the process LLVM with a
     // datalayout set by `build_module`.
     unsafe {
         thinlto::write_prelink_bc(module.as_mut_ptr(), stable_id, thinlto::ir_opt_level(profile), out_bc)
+    }
+}
+
+/// Run every target-independent MIR/type/callable validation required before function-partition
+/// staging begins. The later emitter repeats these checks on its exact borrowed view, but callers
+/// use this seam to keep malformed MIR ahead of cache, artifact, and LLVM side effects.
+pub fn validate_thin_partition_program(
+    program: &Program,
+    exports: &[String],
+) -> Result<(), CodegenError> {
+    runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
+    validate_tagged_program(program)?;
+    validate_resource_program(program)?;
+    validate_resource_rvalues(program)?;
+    let declarations = callable_declarations(program)?;
+    callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
+    Ok(())
+}
+
+fn partition_function_abi(
+    function: &Function,
+    program: &Program,
+) -> Result<CanonicalFnAbi, CodegenError> {
+    if function.params.len() != function.param_modes.len() {
+        return Err(CodegenError::Lowering(
+            "function ThinLTO view has an invalid parameter-mode record".to_owned(),
+        ));
+    }
+    let params = function
+        .params
+        .iter()
+        .zip(&function.param_modes)
+        .map(|(&slot, &mode)| {
+            function
+                .slots
+                .get(slot as usize)
+                .copied()
+                .map(|ty| (mode, ty))
+                .ok_or_else(|| {
+                    CodegenError::Lowering(
+                        "function ThinLTO view has an invalid parameter slot".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical_metadata(CanonicalFnAbi::from_parts(
+        &params,
+        function.ret,
+        &function.return_borrow,
+        &function.return_region,
+        function.return_cleanup,
+        program,
+    ))
+}
+
+fn valid_thin_symbol(value: &str) -> bool {
+    !value.is_empty() && !value.as_bytes().contains(&0)
+}
+
+fn resource_drop_hook_abi() -> Result<CanonicalFnAbi, CodegenError> {
+    let program = Program {
+        fns: Vec::new(),
+        sqlite_callback_effects: std::collections::BTreeMap::new(),
+        externs: Vec::new(),
+        imported_fns: Vec::new(),
+        link_libs: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        resources: Vec::new(),
+        tagged_types: Vec::new(),
+        fn_types: Vec::new(),
+        tuples: Vec::new(),
+    };
+    canonical_metadata(CanonicalFnAbi::from_parts(
+        &[(align_ast::ParamMode::ByValue, Ty::Raw)],
+        Ty::Unit,
+        &hir::ReturnBorrowSummary::None,
+        &hir::ReturnRegionSummary::None,
+        hir::ReturnCleanupAbi::None,
+        &program,
+    ))
+}
+
+fn validate_support_partition(thunks: &[SupportThunkRecord]) -> Result<(), CodegenError> {
+    let expected_hook_abi = resource_drop_hook_abi()?;
+    let mut previous = None::<&[u8]>;
+    let mut has_owned = false;
+    let mut hooks = HashMap::<&ProgramCall, &ThinPeerDeclaration>::new();
+    let mut hook_symbols = HashMap::<&str, &ProgramCall>::new();
+    for record in thunks {
+        let symbol = record.drop_thunk.as_bytes();
+        if !valid_thin_symbol(&record.drop_thunk)
+            || !record.drop_thunk.starts_with("__align_resource_drop$")
+            || previous.is_some_and(|prior| prior >= symbol)
+            || record.representation_version != 1
+            || record.drop_abi_fingerprint != *b"align-res-drop-1"
+        {
+            return Err(CodegenError::Lowering(
+                "ThinLTO support partition has malformed thunk metadata".to_owned(),
+            ));
+        }
+        previous = Some(symbol);
+        if let SupportThunkOwner::Owned { hook } = &record.owner {
+            has_owned = true;
+            if !valid_thin_symbol(&hook.symbol) || hook.abi != expected_hook_abi {
+                return Err(CodegenError::Lowering(
+                    "ThinLTO support partition has a disagreeing hook ABI".to_owned(),
+                ));
+            }
+            if hooks
+                .insert(&hook.logical, hook)
+                .is_some_and(|previous| previous != hook)
+                || hook_symbols
+                    .insert(&hook.symbol, &hook.logical)
+                    .is_some_and(|previous| previous != &hook.logical)
+            {
+                return Err(CodegenError::Lowering(
+                    "ThinLTO support partition has conflicting hook declarations".to_owned(),
+                ));
+            }
+        }
+    }
+    if !has_owned {
+        return Err(CodegenError::Lowering(
+            "ThinLTO support partition has no owned resource Drop thunk".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Emit one selected MIR function as a summary-bearing ThinLTO partition. The validated view is
+/// both the structural-fingerprint input and the complete MIR/codegen input: emission never
+/// rediscovers a peer, symbol, or support owner from the source [`Program`].
+pub fn emit_function_prelink_bc(
+    view: &PartitionCodegenView<'_>,
+    out_bc: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: Option<&[u8]>,
+    stable_id: &str,
+) -> Result<(), CodegenError> {
+    let PartitionCodegenView::Function {
+        selected,
+        definition,
+        peers,
+        peer_functions,
+        shared,
+    } = view
+    else {
+        return Err(CodegenError::Lowering(
+            "function ThinLTO emitter received a support view".to_owned(),
+        ));
+    };
+    if peers.len() != peer_functions.len() || definition.logical != selected.name {
+        return Err(CodegenError::Lowering(
+            "function ThinLTO view has a disagreeing peer source".to_owned(),
+        ));
+    }
+    if !valid_thin_symbol(stable_id)
+        || !valid_thin_symbol(&definition.symbol)
+        || peers.iter().any(|peer| !valid_thin_symbol(&peer.symbol))
+    {
+        return Err(CodegenError::Lowering(
+            "function ThinLTO view has an invalid symbol".to_owned(),
+        ));
+    }
+    let mut previous_peer = None::<&[u8]>;
+    let mut symbols = HashMap::<&str, &ProgramCall>::new();
+    symbols.insert(&definition.symbol, &definition.logical);
+    for (peer, function) in peers.iter().zip(peer_functions) {
+        let logical = peer.logical.as_bytes();
+        if peer.logical != function.name
+            || peer.logical == selected.name
+            || previous_peer.is_some_and(|previous| previous >= logical)
+            || symbols
+                .insert(&peer.symbol, &peer.logical)
+                .is_some_and(|previous| previous != &peer.logical)
+        {
+            return Err(CodegenError::Lowering(
+                "function ThinLTO view has a disagreeing peer source".to_owned(),
+            ));
+        }
+        previous_peer = Some(logical);
+    }
+    let mut functions = Vec::with_capacity(1 + peer_functions.len());
+    functions.push((*selected).clone());
+    functions.extend(peer_functions.iter().map(|function| (*function).clone()));
+    let program = Program {
+        fns: functions,
+        sqlite_callback_effects: shared.callback_effects.clone(),
+        externs: shared.externs.to_vec(),
+        imported_fns: shared.imported_fns.to_vec(),
+        link_libs: Vec::new(),
+        structs: shared.structs.to_vec(),
+        enums: shared.enums.to_vec(),
+        resources: shared.resources.to_vec(),
+        tagged_types: shared.tagged_types.to_vec(),
+        fn_types: shared.fn_types.to_vec(),
+        tuples: shared.tuples.to_vec(),
+    };
+    if partition_function_abi(selected, &program)? != definition.abi
+        || peers
+            .iter()
+            .zip(peer_functions)
+            .any(|(peer, function)| {
+                partition_function_abi(function, &program)
+                    .map_or(true, |abi| abi != peer.abi)
+            })
+    {
+        return Err(CodegenError::Lowering(
+            "function ThinLTO view has a disagreeing peer ABI".to_owned(),
+        ));
+    }
+    let ctx = Context::create();
+    let (module, _tm) = build_program_module(
+        &ctx,
+        &program,
+        target,
+        profile,
+        &[],
+        rt_lto,
+        ModuleScope::Function {
+            selected: &selected.name,
+            definition,
+            peers,
+        },
+    )?;
+    unsafe {
+        thinlto::write_prelink_bc(
+            module.as_mut_ptr(),
+            stable_id,
+            thinlto::ir_opt_level(profile),
+            out_bc,
+        )
+    }
+}
+
+/// Emit one validated resource support view. The module contains only its exact Drop-thunk records
+/// and owned-hook declarations; it does not inspect a MIR [`Program`].
+pub fn emit_support_prelink_bc(
+    view: &PartitionCodegenView<'_>,
+    out_bc: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    stable_id: &str,
+) -> Result<(), CodegenError> {
+    let PartitionCodegenView::Support { thunks } = view else {
+        return Err(CodegenError::Lowering(
+            "support ThinLTO emitter received a function view".to_owned(),
+        ));
+    };
+    if !valid_thin_symbol(stable_id) {
+        return Err(CodegenError::Lowering(
+            "support ThinLTO module identity is invalid".to_owned(),
+        ));
+    }
+    validate_support_partition(thunks)?;
+
+    let ctx = Context::create();
+    let module = ctx.create_module("align-support");
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
+    let target_data = tm.get_target_data();
+    module.set_data_layout(&target_data.get_data_layout());
+    module.set_triple(&tm.get_triple());
+    let thunk_ty = ctx
+        .void_type()
+        .fn_type(&[ctx.ptr_type(AddressSpace::default()).into()], false);
+    let mut hooks = HashMap::<ProgramCall, FunctionValue<'_>>::new();
+
+    for record in thunks {
+        let thunk = module.add_function(&record.drop_thunk, thunk_ty, None);
+        thunk
+            .as_global_value()
+            .set_visibility(GlobalVisibility::Hidden);
+        mark_nounwind(&ctx, thunk);
+        let SupportThunkOwner::Owned { hook } = &record.owner else {
+            continue;
+        };
+        let hook_value = if let Some(existing) = hooks.get(&hook.logical).copied() {
+            existing
+        } else {
+            let declaration = module.add_function(&hook.symbol, thunk_ty, None);
+            mark_nounwind(&ctx, declaration);
+            if hook.linkage == ThinFunctionLinkage::UnitLocal {
+                declaration
+                    .as_global_value()
+                    .set_visibility(GlobalVisibility::Hidden);
+            }
+            hooks.insert(hook.logical.clone(), declaration);
+            declaration
+        };
+        let block = ctx.append_basic_block(thunk, "entry");
+        let builder = ctx.create_builder();
+        builder.position_at_end(block);
+        let handle = thunk.get_nth_param(0).ok_or_else(|| {
+            CodegenError::Lowering("resource drop thunk lost its handle parameter".into())
+        })?;
+        builder
+            .build_call(hook_value, &[handle.into()], "")
+            .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+        builder
+            .build_return(None)
+            .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+    }
+    verify_generated_module(&module)?;
+    unsafe {
+        thinlto::write_prelink_bc(
+            module.as_mut_ptr(),
+            stable_id,
+            thinlto::ir_opt_level(profile),
+            out_bc,
+        )
     }
 }
 
@@ -550,7 +897,16 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     // Probe-then-annotate mirrors `emit_object`. Linked into the raw module (before any opt run) so
     // `--stage raw --rt-lto` exposes the pre-opt merged shape for the attr-xor gate.
     let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
-    let runtime = build_module(&ctx, &module, program, &tm, None, exports, rt_module.is_some())?;
+    let runtime = build_module(
+        &ctx,
+        &module,
+        program,
+        &tm,
+        None,
+        exports,
+        rt_module.is_some(),
+        ModuleScope::Whole,
+    )?;
     if let Some(rt) = rt_module {
         link_in_rt_lto(&ctx, &module, rt, &runtime)?;
     }
@@ -606,7 +962,16 @@ pub fn collect_opt_remarks(
     let _detach_guard = DiagnosticHandlerGuard { ctx: ctx.raw() };
 
     // `explain-opt` never auto-enables `--rt-lto` (the default lens stays curated-declare shape).
-    let built = build_module(&ctx, &module, program, &tm, Some(debug), &[], false);
+    let built = build_module(
+        &ctx,
+        &module,
+        program,
+        &tm,
+        Some(debug),
+        &[],
+        false,
+        ModuleScope::Whole,
+    );
     let ran = built.and_then(|_| run_opt_pipeline(&module, &tm, "default<O2>"));
 
     drop(_detach_guard);
@@ -2027,6 +2392,188 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThinFunctionLinkage {
+    Root,
+    UnitLocal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThinPeerDeclaration {
+    pub logical: ProgramCall,
+    pub abi: CanonicalFnAbi,
+    pub symbol: String,
+    pub linkage: ThinFunctionLinkage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SupportThunkOwner {
+    Owned { hook: ThinPeerDeclaration },
+    Imported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportThunkRecord {
+    pub drop_thunk: String,
+    pub representation_version: u32,
+    pub drop_abi_fingerprint: [u8; 16],
+    pub owner: SupportThunkOwner,
+}
+
+#[derive(Debug)]
+struct PartitionSharedCodegenTables<'a> {
+    structs: &'a [hir::StructDef],
+    enums: &'a [hir::EnumDef],
+    resources: &'a [hir::ResourceDef],
+    tagged_types: &'a [hir::TaggedType],
+    fn_types: &'a [align_mir::FunctionTypeDef],
+    tuples: &'a [hir::TupleDef],
+    externs: &'a [align_mir::ProgramExtern],
+    imported_fns: &'a [align_mir::ImportedFn],
+    callback_effects: &'a std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
+}
+
+/// Sealed shared codegen input for every function partition in one source unit. The exact shared
+/// tables are formatted and hashed once by [`Self::from_program`]; private fields prevent callers
+/// from pairing that fingerprint with different emitter inputs.
+#[derive(Clone)]
+pub struct PartitionSharedCodegenView<'a> {
+    structs: &'a [hir::StructDef],
+    enums: &'a [hir::EnumDef],
+    resources: &'a [hir::ResourceDef],
+    tagged_types: &'a [hir::TaggedType],
+    fn_types: &'a [align_mir::FunctionTypeDef],
+    tuples: &'a [hir::TupleDef],
+    externs: &'a [align_mir::ProgramExtern],
+    imported_fns: &'a [align_mir::ImportedFn],
+    callback_effects: &'a std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
+    fingerprint: Hash128,
+}
+
+impl<'a> PartitionSharedCodegenView<'a> {
+    pub fn from_program(program: &'a Program) -> Self {
+        let tables = PartitionSharedCodegenTables {
+            structs: &program.structs,
+            enums: &program.enums,
+            resources: &program.resources,
+            tagged_types: &program.tagged_types,
+            fn_types: &program.fn_types,
+            tuples: &program.tuples,
+            externs: &program.externs,
+            imported_fns: &program.imported_fns,
+            callback_effects: &program.sqlite_callback_effects,
+        };
+        let rendered = format!("align-thin-partition-shared-v1\n{tables:?}");
+        Self {
+            structs: tables.structs,
+            enums: tables.enums,
+            resources: tables.resources,
+            tagged_types: tables.tagged_types,
+            fn_types: tables.fn_types,
+            tuples: tables.tuples,
+            externs: tables.externs,
+            imported_fns: tables.imported_fns,
+            callback_effects: tables.callback_effects,
+            fingerprint: Hash128::of(rendered.as_bytes()),
+        }
+    }
+}
+
+/// The complete borrowed module input for one function/support partition. `peer_functions` is the
+/// physical source needed by the existing LLVM ABI lowering, paired one-for-one with `peers`; the
+/// manual `Debug` implementation deliberately fingerprints only the canonical peer records.
+pub enum PartitionCodegenView<'a> {
+    Function {
+        selected: &'a Function,
+        definition: ThinPeerDeclaration,
+        peers: Vec<ThinPeerDeclaration>,
+        peer_functions: Vec<&'a Function>,
+        shared: PartitionSharedCodegenView<'a>,
+    },
+    Support {
+        thunks: Vec<SupportThunkRecord>,
+    },
+}
+
+impl std::fmt::Debug for PartitionCodegenView<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Function {
+                selected,
+                definition,
+                peers,
+                shared,
+                ..
+            } => formatter
+                .debug_struct("Function")
+                .field("selected", selected)
+                .field("definition", definition)
+                .field("peers", peers)
+                .field("shared_fingerprint", &shared.fingerprint)
+                .finish(),
+            Self::Support { thunks } => formatter.debug_struct("Support").field("thunks", thunks).finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ModuleScope<'a> {
+    Whole,
+    Function {
+        selected: &'a ProgramCall,
+        definition: &'a ThinPeerDeclaration,
+        peers: &'a [ThinPeerDeclaration],
+    },
+}
+
+impl ModuleScope<'_> {
+    fn defines(self, function: &Function) -> bool {
+        match self {
+            ModuleScope::Whole => true,
+            ModuleScope::Function { selected, .. } => &function.name == selected,
+        }
+    }
+
+    fn declares(self, function: &Function) -> bool {
+        match self {
+            ModuleScope::Whole => true,
+            ModuleScope::Function {
+                selected, peers, ..
+            } => {
+                &function.name == selected
+                    || peers.iter().any(|peer| peer.logical == function.name)
+            }
+        }
+    }
+
+    fn symbol(
+        self,
+        function: &Function,
+        exports: &[String],
+    ) -> Result<(String, Option<ThinFunctionLinkage>), CodegenError> {
+        match self {
+            ModuleScope::Whole => Ok((symbol_name(function, exports), None)),
+            ModuleScope::Function {
+                selected,
+                definition,
+                peers,
+            } => {
+                let record = if &function.name == selected {
+                    Some(definition)
+                } else {
+                    peers.iter().find(|peer| peer.logical == function.name)
+                }
+                .ok_or_else(|| callable_target_error(&function.name))?;
+                Ok((record.symbol.clone(), Some(record.linkage)))
+            }
+        }
+    }
+
+    fn emits_resource_thunks(self) -> bool {
+        matches!(self, ModuleScope::Whole)
+    }
+}
+
 fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -2035,9 +2582,13 @@ fn build_module<'c>(
     debug: Option<&DebugInfo>,
     exports: &[String],
     rt_lto_skip_guarded: bool,
+    scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
-    validate_tagged_program(program)?;
+    match scope {
+        ModuleScope::Whole => validate_tagged_program(program)?,
+        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
+    }
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     let callable_declarations = callable_declarations(program)?;
@@ -2308,14 +2859,14 @@ fn build_module<'c>(
         }
         extern_fn_types.insert(ext.name.as_str().to_owned(), fn_ty);
     }
-    let callable_preflight = callable_preflight(program, exports, callable_declarations)?;
+    let callable_preflight = callable_preflight(program, exports, callable_declarations, scope)?;
 
     // Pass 1: declare all functions so calls resolve regardless of order. A wrapped `main` body
     // uses its ordinary encoded Align identity; the external C `main` wrapper is emitted later.
     let mut program_funcs: HashMap<ProgramCall, FunctionValue<'c>> = HashMap::new();
     let mut generated_funcs: HashMap<GeneratedId, FunctionValue<'c>> = HashMap::new();
-    for f in &program.fns {
-        let symbol = symbol_name(f, exports);
+    for f in program.fns.iter().filter(|function| scope.declares(function)) {
+        let (symbol, partition_linkage) = scope.symbol(f, exports)?;
         let fv = declare_fn(
             ctx,
             module,
@@ -2327,6 +2878,7 @@ fn build_module<'c>(
             &tuple_types,
             program,
             exports,
+            partition_linkage,
         );
         program_funcs.insert(f.name.clone(), fv);
     }
@@ -2449,7 +3001,7 @@ fn build_module<'c>(
     // is null and ignored). Capturing closures (a later slice) instead point at an env-reading fn.
     let mut thunk_names: std::collections::BTreeSet<ProgramCall> =
         std::collections::BTreeSet::new();
-    for f in &program.fns {
+    for f in program.fns.iter().filter(|function| scope.defines(function)) {
         for b in &f.blocks {
             for s in &b.stmts {
                 if let Stmt::Let(_, Rvalue::FnAddr { target, .. }) = s {
@@ -2510,7 +3062,7 @@ fn build_module<'c>(
     // as the lifted function's trailing capture parameters: `lifted(explicit…, env.0, env.1, …)`.
     let mut closure_thunks: std::collections::BTreeMap<ProgramCall, Vec<Ty>> =
         std::collections::BTreeMap::new();
-    for f in &program.fns {
+    for f in program.fns.iter().filter(|function| scope.defines(function)) {
         for b in &f.blocks {
             for s in &b.stmts {
                 if let Stmt::Let(_, Rvalue::Closure { lifted, capture_tys, .. }) = s {
@@ -2627,7 +3179,7 @@ fn build_module<'c>(
     let i32t = ctx.i32_type();
     let mut tramp_keys: std::collections::BTreeMap<Box<[u8]>, (GeneratedId, Ty, bool)> =
         std::collections::BTreeMap::new();
-    for f in &program.fns {
+    for f in program.fns.iter().filter(|function| scope.defines(function)) {
         for b in &f.blocks {
             for s in &b.stmts {
                 if let Stmt::Let(_, Rvalue::SpawnTask { r, fallible, .. }) = s {
@@ -2720,7 +3272,7 @@ fn build_module<'c>(
     // value bridge is emitted here (rather than as an ordinary Align closure) so SQLite retains no
     // source environment and the callback has a stable `void(context, argc, argv)` ABI.
     let mut sqlite_callbacks = std::collections::BTreeMap::<Box<[u8]>, GeneratedId>::new();
-    for function in &program.fns {
+    for function in program.fns.iter().filter(|function| scope.defines(function)) {
         for block in &function.blocks {
             for statement in &block.stmts {
                 let Stmt::Let(_, Rvalue::SqliteCallbackDescriptor(descriptor)) = statement else {
@@ -2791,7 +3343,8 @@ fn build_module<'c>(
             .as_global_value()
             .set_visibility(GlobalVisibility::Hidden);
         mark_nounwind(ctx, thunk);
-        if let Some(hook) = program_funcs
+        if scope.emits_resource_thunks()
+            && let Some(hook) = program_funcs
             .iter()
             .find_map(|(name, function)| (name.as_str() == resource.drop_hook).then_some(*function))
         {
@@ -2814,7 +3367,7 @@ fn build_module<'c>(
     // emitted, but the authoritative handles are module-wide: every function that drops the same
     // nominal struct must call the one helper rather than cloning its recursive cleanup CFG.
     let drop_helpers = std::cell::RefCell::new(HashMap::new());
-    for f in &program.fns {
+    for f in program.fns.iter().filter(|function| scope.defines(function)) {
         let builder = ctx.create_builder();
         let stack_headers = stack_header_plan(f);
         let borrowed_element_validation = BorrowedElementValidationIndex::new(f);
@@ -2825,10 +3378,11 @@ fn build_module<'c>(
         // Under debug info, give each function a DISubprogram (anchored to its first source line)
         // and attach it to the LLVM function, so its instructions can carry DILocations.
         let fn_line = debug_ctx.as_ref().map_or(0, |_| first_fn_line(f));
+        let debug_symbol = scope.symbol(f, exports)?.0;
         let subprogram = debug_ctx.as_ref().map(|dc| {
             let sp = dc.dib.create_function(
                 dc.scope,
-                &symbol_name(f, exports),
+                &debug_symbol,
                 None,
                 dc.file,
                 fn_line,
@@ -2899,7 +3453,7 @@ fn build_module<'c>(
     // left the C ABI's i32 return register undefined; see `docs/open-questions.md` "Unit-returning
     // `fn main()` yields a nondeterministic exit code").
     if let Some(f) =
-        program.fns.iter().find(|f| {
+        program.fns.iter().filter(|function| scope.defines(function)).find(|f| {
             f.name.as_str() == "main"
                 && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit)
         })
@@ -3378,6 +3932,17 @@ fn validate_resource_program(program: &Program) -> Result<(), CodegenError> {
 /// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
 /// `CodegenError`, never an out-of-bounds panic or the scalar `i32` fallback.
 fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
+    validate_tagged_program_inner(program, true)
+}
+
+fn validate_partition_tagged_program(program: &Program) -> Result<(), CodegenError> {
+    validate_tagged_program_inner(program, false)
+}
+
+fn validate_tagged_program_inner(
+    program: &Program,
+    require_compact_tables: bool,
+) -> Result<(), CodegenError> {
     struct SignatureFacts<'a> {
         owner: &'a str,
         modes: &'a [align_ast::ParamMode],
@@ -4707,12 +5272,12 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
             check_ty(ty, &mut type_graph)?;
         }
     }
-    if !align_mir::tagged_types_are_canonical(program) {
+    if require_compact_tables && !align_mir::tagged_types_are_canonical(program) {
         return Err(CodegenError::Lowering(
             "nested tagged type table is not compact, unique, and canonical".to_string(),
         ));
     }
-    if !align_mir::function_types_are_canonical(program) {
+    if require_compact_tables && !align_mir::function_types_are_canonical(program) {
         return Err(CodegenError::Lowering(
             "function type table is not compact, unique, and canonical".to_string(),
         ));
@@ -4739,6 +5304,12 @@ fn encoded_program_symbol(name: &ProgramCall) -> String {
     format!("align_fn${}${hex}", name.as_bytes().len())
 }
 
+/// Canonical LLVM symbol for an imported public Align function. Function-partition support
+/// records use the same producer as ordinary imported declarations.
+pub fn imported_program_symbol(name: &ProgramCall) -> String {
+    encoded_program_symbol(name)
+}
+
 fn symbol_name(f: &Function, exports: &[String]) -> String {
     let direct_main = f.name.as_str() == "main"
         && !matches!(f.ret, Ty::Result(..))
@@ -4750,6 +5321,44 @@ fn symbol_name(f: &Function, exports: &[String]) -> String {
     } else {
         encoded_program_symbol(&f.name)
     }
+}
+
+/// One collision-free raw LLVM symbol for a function partition boundary. True roots retain the
+/// ordinary codegen symbol. Every other stored function is external only for ThinLTO/native-link
+/// composition and carries the source-unit bytes in its hidden symbol, preserving consumer-local
+/// generic copies without adopting ODR linkage.
+pub fn partition_function_symbol(
+    unit: &str,
+    function: &Function,
+    exports: &[String],
+) -> Result<(String, ThinFunctionLinkage), String> {
+    if unit.is_empty() || unit.as_bytes().contains(&0) {
+        return Err(format!(
+            "ThinLTO unit identity invalid:{}:{}",
+            unit.len(),
+            lowercase_hex(unit.as_bytes())
+        ));
+    }
+    let direct_main = function.name.as_str() == "main"
+        && !matches!(function.ret, Ty::Result(..))
+        && function.ret != Ty::Unit;
+    let explicit_export = function.name.as_str() != "main"
+        && exports
+            .iter()
+            .any(|export| export == function.name.as_str());
+    if direct_main || explicit_export || function.exportable {
+        return Ok((symbol_name(function, exports), ThinFunctionLinkage::Root));
+    }
+    let unit_hex = lowercase_hex(unit.as_bytes());
+    let function_hex = lowercase_hex(function.name.as_bytes());
+    Ok((
+        format!(
+            "align_shard$v1$u${}${unit_hex}$f${}${function_hex}",
+            unit.len(),
+            function.name.as_bytes().len(),
+        ),
+        ThinFunctionLinkage::UnitLocal,
+    ))
 }
 
 fn callable_hex(name: &ProgramCall) -> String {
@@ -5532,9 +6141,10 @@ fn callable_preflight(
     program: &Program,
     exports: &[String],
     declarations: HashMap<ProgramCall, ProgramDeclaration>,
+    scope: ModuleScope<'_>,
 ) -> Result<CallablePreflight, CodegenError> {
     let mut generated = Vec::new();
-    for function in &program.fns {
+    for function in program.fns.iter().filter(|function| scope.defines(function)) {
         for block in &function.blocks {
             for statement in &block.stmts {
                 let Stmt::Let(value, rvalue) = statement else {
@@ -5916,8 +6526,12 @@ fn callable_preflight(
             format!("runtime:{:?}", abi.key),
         )?;
     }
-    for function in &program.fns {
-        let identity = symbol_name(function, exports);
+    for function in program
+        .fns
+        .iter()
+        .filter(|function| scope.declares(function))
+    {
+        let identity = scope.symbol(function, exports)?.0;
         let claimant = if identity == "main" {
             "entry:main".to_owned()
         } else {
@@ -5946,7 +6560,11 @@ fn callable_preflight(
             format!("extern:{}", callable_hex(&function.name)),
         )?;
     }
-    if program.fns.iter().any(|function| function.name.as_str() == "main") {
+    if program
+        .fns
+        .iter()
+        .any(|function| scope.defines(function) && function.name.as_str() == "main")
+    {
         reserve_external_identity(&mut reserved, "main".to_owned(), "entry:main".to_owned())?;
     }
 
@@ -7792,6 +8410,7 @@ fn declare_fn<'c>(
     tuple_types: &[StructType<'c>],
     program: &Program,
     exports: &[String],
+    partition_linkage: Option<ThinFunctionLinkage>,
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
@@ -7846,8 +8465,13 @@ fn declare_fn<'c>(
         && f.ret != Ty::Unit;
     let explicit_export = f.name.as_str() != "main"
         && exports.iter().any(|export| export == f.name.as_str());
-    if !direct_main && !explicit_export && !f.exportable {
-        mark_internal(fv);
+    match partition_linkage {
+        Some(ThinFunctionLinkage::Root) => {}
+        Some(ThinFunctionLinkage::UnitLocal) => {
+            fv.as_global_value().set_visibility(GlobalVisibility::Hidden);
+        }
+        None if !direct_main && !explicit_export && !f.exportable => mark_internal(fv),
+        None => {}
     }
     fv
 }
@@ -20087,6 +20711,208 @@ mod tests {
         }
     }
 
+    fn support_thunk(drop_thunk: &str) -> Result<SupportThunkRecord, CodegenError> {
+        Ok(SupportThunkRecord {
+            drop_thunk: drop_thunk.to_owned(),
+            representation_version: 1,
+            drop_abi_fingerprint: *b"align-res-drop-1",
+            owner: SupportThunkOwner::Owned {
+                hook: ThinPeerDeclaration {
+                    logical: program_call("test.resource.drop"),
+                    abi: resource_drop_hook_abi()?,
+                    symbol: "test_resource_drop".to_owned(),
+                    linkage: ThinFunctionLinkage::UnitLocal,
+                },
+            },
+        })
+    }
+
+    fn unit_abi() -> Result<CanonicalFnAbi, CodegenError> {
+        canonical_metadata(CanonicalFnAbi::from_parts(
+            &[],
+            Ty::Unit,
+            &hir::ReturnBorrowSummary::None,
+            &hir::ReturnRegionSummary::None,
+            hir::ReturnCleanupAbi::None,
+            &mir("fn main() -> i32 = 0\n"),
+        ))
+    }
+
+    #[test]
+    fn support_partition_rejects_every_malformed_metadata_class() -> Result<(), CodegenError> {
+        let valid = support_thunk("__align_resource_drop$test$0")?;
+        validate_support_partition(std::slice::from_ref(&valid))?;
+        let valid_hook = match &valid.owner {
+            SupportThunkOwner::Owned { hook } => hook.clone(),
+            SupportThunkOwner::Imported => {
+                return Err(CodegenError::Lowering(
+                    "support fixture owner is imported".to_owned(),
+                ));
+            }
+        };
+
+        let mut malformed = valid.clone();
+        malformed.drop_thunk.clear();
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut malformed = valid.clone();
+        malformed.drop_thunk = "not_a_drop_thunk".to_owned();
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut malformed = valid.clone();
+        malformed.drop_thunk.push('\0');
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut malformed = valid.clone();
+        malformed.representation_version = 2;
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut malformed = valid.clone();
+        malformed.drop_abi_fingerprint[0] ^= 1;
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut imported = valid.clone();
+        imported.owner = SupportThunkOwner::Imported;
+        assert!(validate_support_partition(&[imported]).is_err());
+
+        let mut malformed = valid.clone();
+        let mut hook = valid_hook.clone();
+        hook.symbol.push('\0');
+        malformed.owner = SupportThunkOwner::Owned { hook };
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let mut malformed = valid.clone();
+        let mut hook = valid_hook.clone();
+        hook.abi = unit_abi()?;
+        malformed.owner = SupportThunkOwner::Owned { hook };
+        assert!(validate_support_partition(&[malformed]).is_err());
+
+        let duplicate = valid.clone();
+        assert!(validate_support_partition(&[valid.clone(), duplicate]).is_err());
+
+        let earlier = support_thunk("__align_resource_drop$test$1")?;
+        assert!(validate_support_partition(&[earlier, valid.clone()]).is_err());
+
+        let mut same_hook = support_thunk("__align_resource_drop$test$1")?;
+        same_hook.owner = valid.owner.clone();
+        validate_support_partition(&[valid.clone(), same_hook])?;
+
+        let mut conflicting_hook = support_thunk("__align_resource_drop$test$1")?;
+        let mut hook = valid_hook.clone();
+        hook.symbol = "different_resource_drop".to_owned();
+        conflicting_hook.owner = SupportThunkOwner::Owned { hook };
+        assert!(validate_support_partition(&[valid.clone(), conflicting_hook]).is_err());
+
+        let mut aliased_symbol = support_thunk("__align_resource_drop$test$1")?;
+        let mut hook = valid_hook;
+        hook.logical = program_call("different.resource.drop");
+        aliased_symbol.owner = SupportThunkOwner::Owned { hook };
+        assert!(validate_support_partition(&[valid, aliased_symbol]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn function_partition_rejects_forged_peer_sources_before_llvm() -> Result<(), CodegenError> {
+        let program = mir(
+            "fn leaf(n: i64) -> i64 = n + 1\nfn main() -> i32 { print(leaf(1)); return 0 }\n",
+        );
+        let selected = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == "main")
+            .ok_or_else(|| CodegenError::Lowering("main fixture function missing".to_owned()))?;
+        let peer_function = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == "leaf")
+            .ok_or_else(|| CodegenError::Lowering("leaf fixture function missing".to_owned()))?;
+        assert_eq!(
+            partition_function_symbol("bad\0unit", selected, &[]),
+            Err("ThinLTO unit identity invalid:8:62616400756e6974".to_owned())
+        );
+        let definition = ThinPeerDeclaration {
+            logical: selected.name.clone(),
+            abi: partition_function_abi(selected, &program)?,
+            symbol: "main".to_owned(),
+            linkage: ThinFunctionLinkage::Root,
+        };
+        let peer = ThinPeerDeclaration {
+            logical: peer_function.name.clone(),
+            abi: partition_function_abi(peer_function, &program)?,
+            symbol: "__align_unit$leaf".to_owned(),
+            linkage: ThinFunctionLinkage::UnitLocal,
+        };
+        let shared = PartitionSharedCodegenView::from_program(&program);
+        let reject = |definition: ThinPeerDeclaration,
+                      peers: Vec<ThinPeerDeclaration>,
+                      peer_functions: Vec<&Function>,
+                      expected: &str|
+         -> Result<(), CodegenError> {
+            let view = PartitionCodegenView::Function {
+                selected,
+                definition,
+                peers,
+                peer_functions,
+                shared: shared.clone(),
+            };
+            let error = match emit_function_prelink_bc(
+                    &view,
+                    Path::new("forged-peer-must-not-write.bc"),
+                    &BuildTarget::Baseline,
+                    Profile::Release,
+                    None,
+                    "test-module",
+                ) {
+                Err(error) => error,
+                Ok(()) => {
+                    return Err(CodegenError::Lowering(
+                        "forged peer view reached LLVM".to_owned(),
+                    ));
+                }
+            };
+            assert_lowering(error, expected);
+            Ok(())
+        };
+
+        reject(
+            definition.clone(),
+            vec![peer.clone()],
+            Vec::new(),
+            "function ThinLTO view has a disagreeing peer source",
+        )?;
+        let mut wrong_logical = peer.clone();
+        wrong_logical.logical = program_call("other");
+        reject(
+            definition.clone(),
+            vec![wrong_logical],
+            vec![peer_function],
+            "function ThinLTO view has a disagreeing peer source",
+        )?;
+        let mut duplicate_symbol = peer.clone();
+        duplicate_symbol.symbol = definition.symbol.clone();
+        reject(
+            definition.clone(),
+            vec![duplicate_symbol],
+            vec![peer_function],
+            "function ThinLTO view has a disagreeing peer source",
+        )?;
+        reject(
+            definition.clone(),
+            vec![peer.clone(), peer.clone()],
+            vec![peer_function, peer_function],
+            "function ThinLTO view has a disagreeing peer source",
+        )?;
+        let mut wrong_abi = peer;
+        wrong_abi.abi = unit_abi()?;
+        reject(
+            definition,
+            vec![wrong_abi],
+            vec![peer_function],
+            "function ThinLTO view has a disagreeing peer ABI",
+        )?;
+        Ok(())
+    }
+
     fn mir(src: &str) -> Program {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
@@ -20942,7 +21768,16 @@ fn main() -> i32 = 0
             .unwrap();
         let ctx = Context::create();
         let module = ctx.create_module("args_build_layout_c");
-        let error = match build_module(&ctx, &module, &layout_c, &tm, None, &[], false) {
+        let error = match build_module(
+            &ctx,
+            &module,
+            &layout_c,
+            &tm,
+            None,
+            &[],
+            false,
+            ModuleScope::Whole,
+        ) {
             Ok(_) => panic!("the closest source-valid aggregate matched ArgsBuild's view ABI"),
             Err(error) => error,
         };
@@ -21179,7 +22014,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("returned_borrow_direct");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &direct, &tm, None, &[], false).unwrap();
+        build_module(&ctx, &module, &direct, &tm, None, &[], false, ModuleScope::Whole).unwrap();
         assert_contracts(&module);
         let ptr = ctx.ptr_type(AddressSpace::default());
         let thunk = module.add_function(
@@ -21226,7 +22061,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("returned_borrow_imported");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &imported, &tm, None, &[], false).unwrap();
+        build_module(&ctx, &module, &imported, &tm, None, &[], false, ModuleScope::Whole).unwrap();
         assert_contracts(&module);
     }
 
@@ -21243,7 +22078,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
         let function = |key| {
             let physical = &runtime.physical_names[&key];
             assert_eq!(physical, runtime_abi::runtime_abi(key).symbol);
@@ -21357,7 +22192,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
         let runtime_symbol = &runtime.physical_names[&RuntimeKey::Hash64];
         assert_eq!(runtime_symbol, "align_rt_hash64");
         let program_symbol = encoded_program_symbol(&program_call("align_rt_hash64"));
@@ -21387,7 +22222,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+        let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true, ModuleScope::Whole).unwrap();
         let physical = runtime.physical_names[&RuntimeKey::StrEq].clone();
         assert_eq!(physical, "align_rt_str_eq");
         let program_symbol = encoded_program_symbol(&program_call("align_rt_str_eq"));
@@ -21433,7 +22268,7 @@ fn main() -> i32 = 0
             let module = ctx.create_module("align");
             let tm =
                 create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true, ModuleScope::Whole).unwrap();
 
             let rt = ctx.create_module("align_rt_malformed_fixture");
             let layout = module.get_data_layout();
@@ -21508,7 +22343,7 @@ fn main() -> i32 = 0
             let module = ctx.create_module("align");
             let tm =
                 create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true).unwrap();
+            let runtime = build_module(&ctx, &module, &program, &tm, None, &[], true, ModuleScope::Whole).unwrap();
             let function = module
                 .get_function(&runtime.physical_names[&RuntimeKey::StrEndsWith])
                 .unwrap();
@@ -21784,7 +22619,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
         apply_size_attrs(&ctx, &module, profile);
 
         let optsize = inkwell::attributes::Attribute::get_named_enum_kind_id("optsize");
@@ -26143,7 +26978,7 @@ fn main() -> i32 = 0
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &program, &tm, None, &[], false).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
 
         let captures = inkwell::attributes::Attribute::get_named_enum_kind_id("captures");
         let readonly = inkwell::attributes::Attribute::get_named_enum_kind_id("readonly");
@@ -26462,7 +27297,7 @@ fn main() -> i32 = 0
              fn main() -> i32 {\n  values := [1, 2].where(keep).par_map(twice)\n  return values[0] as i32\n}\n",
         );
         let declarations = callable_declarations(&filtered_program).unwrap();
-        let preflight = callable_preflight(&filtered_program, &[], declarations).unwrap();
+        let preflight = callable_preflight(&filtered_program, &[], declarations, ModuleScope::Whole).unwrap();
         let mut filter_ids = preflight
             .generated_names
             .keys()

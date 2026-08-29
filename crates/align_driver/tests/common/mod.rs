@@ -7,11 +7,13 @@
 
 pub use align_driver::{
     BackendKey, BuildTarget, CACHE_KEY_FORMAT_VERSION, CacheContext, CacheOutcome, CacheStage,
-    FirstDiff, Hash128, InboundImport, InterfaceSummary, ObjectFormat, PerUnitArtifact,
-    PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, backend_available, build_per_unit,
-    build_thin_lto, cas_blob_path, check, check_per_unit, emit_llvm_ir, emit_object_file,
-    link_executable, link_objects, lower_to_mir, lower_to_mir_per_unit,
-    lower_to_mir_with_static_descriptors, order_link_libs,
+    FirstDiff, FunctionThinLtoMode, FunctionThinLtoObservation, Hash128, ImportSourceDigest,
+    InboundImport, InterfaceSummary, ObjectFormat, PartitionCodegenView, PartitionKey,
+    PerUnitArtifact, PerUnitCheck, PerUnitWalk, PrelinkKey, Profile, ThinPartitionSource,
+    backend_available, build_function_thin_lto, build_per_unit, build_thin_lto, cas_blob_path,
+    check, check_per_unit, emit_llvm_ir, emit_object_file, function_partitions, link_executable,
+    link_objects, lower_to_mir, lower_to_mir_per_unit, lower_to_mir_with_static_descriptors,
+    order_link_libs,
 };
 pub use align_span::SourceMap;
 
