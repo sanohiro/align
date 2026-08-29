@@ -4,12 +4,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/review-bounded.sh [--base REF] [--output FILE] [--reopen-axis AXIS]" >&2
+  echo "usage: scripts/review-bounded.sh [--base REF] [--output FILE] [--changed-since REF] [--reopen-axis AXIS]" >&2
   exit 2
 }
 
 base="origin/main"
 output=""
+changed_since=""
 reopen_axis=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,6 +22,11 @@ while [[ $# -gt 0 ]]; do
     --output)
       [[ $# -ge 2 ]] || usage
       output="$2"
+      shift 2
+      ;;
+    --changed-since)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      changed_since="$2"
       shift 2
       ;;
     --reopen-axis)
@@ -152,6 +158,28 @@ for prior_log in "$git_dir"/align-review-*.log "$git_dir"/align-review-cycle-*; 
   fi
 done
 
+prior_review_complete=false
+if [[ -n "$prior_review_head" ]]; then
+  # Only the wrapper-owned cycle record proves completion. The review process
+  # can print a verdict and then hang or be killed; its raw output may therefore
+  # end in a plausible marker even though the wrapper never validated the
+  # process exit, clean worktree, marker count, or trailing output.
+  for prior_log in "$git_dir"/align-review-cycle-*; do
+    [[ -f "$prior_log" ]] || continue
+    [[ "$(sed -n 's/^ALIGN_REVIEW_KIND=//p' "$prior_log" | head -1)" == "HOST" ]] || continue
+    candidate_base="$(sed -n 's/^ALIGN_REVIEW_BASE=//p' "$prior_log" | head -1)"
+    candidate_head="$(sed -n 's/^ALIGN_REVIEW_HEAD=//p' "$prior_log" | head -1)"
+    [[ "$candidate_base" == "$base_sha" && "$candidate_head" == "$prior_review_head" ]] || continue
+    candidate_verdict="$(awk 'NF { line = $0 } END { print line }' "$prior_log")"
+    if [[ "$candidate_verdict" =~ ^ALIGN_REVIEW_VERDICT=(CLEAN|FINDINGS)$ ]]; then
+      prior_review_complete=true
+      break
+    fi
+  done
+fi
+
+review_range="${base_sha}...${head_sha}"
+review_scope="FULL"
 if [[ -n "$prior_review_head" ]]; then
   matrix_reopened=false
   if [[ -n "$reopen_axis" ]]; then
@@ -166,25 +194,52 @@ if [[ -n "$prior_review_head" ]]; then
       done < <(git show --no-renames --name-only --format= "$commit")
     done < <(git rev-list --reverse "$prior_review_head".."$head_sha")
   fi
-  [[ "$matrix_reopened" == true ]] || {
+  if [[ "$matrix_reopened" == true ]]; then
+    [[ -z "$changed_since" ]] || {
+      echo "--changed-since and --reopen-axis are mutually exclusive" >&2
+      exit 2
+    }
+  elif [[ -n "$changed_since" ]]; then
+    [[ "$prior_review_complete" == true ]] || {
+      echo "nearest review ancestor $prior_review_head is incomplete" >&2
+      echo "resume its unfinished scope before narrowing to a changed slice" >&2
+      exit 1
+    }
+    changed_since_sha="$(git rev-parse "${changed_since}^{commit}" 2>/dev/null || true)"
+    [[ "$changed_since_sha" == "$prior_review_head" ]] || {
+      echo "--changed-since must name the nearest reviewed ancestor $prior_review_head" >&2
+      exit 1
+    }
+    review_range="${prior_review_head}..${head_sha}"
+    review_scope="CHANGED_SLICE"
+  else
     echo "full-diff review already exists for ancestor $prior_review_head" >&2
-    echo "continue only with the changed slice; do not restart discovery on the complete diff" >&2
+    echo "continue with --changed-since $prior_review_head; do not restart complete-diff discovery" >&2
     echo "a high-risk redesign requires --reopen-axis AXIS and a matching" >&2
     echo "'Closure-Matrix-Reopened: AXIS' commit that changes CLAUDE.md or docs/impl" >&2
     exit 1
-  }
+  fi
+elif [[ -n "$changed_since" ]]; then
+  echo "--changed-since requires an existing reviewed ancestor" >&2
+  exit 1
 fi
 cycle_record="$git_dir/align-review-cycle-$head_sha"
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
   printf 'ALIGN_REVIEW_BASE=%s\n' "$base_sha"
+  printf 'ALIGN_REVIEW_SCOPE=%s\n' "$review_scope"
 } >"$cycle_record"
-prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
+if [[ "$review_scope" == "CHANGED_SLICE" ]]; then
+  prompt="An ancestor full-diff review already covered ${base_sha}...${prior_review_head}. Review only the changed slice git diff ${review_range} and compose its result with that checkpoint. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
+else
+  prompt="Review git diff ${review_range} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
+fi
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'
   printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
   printf 'ALIGN_REVIEW_BASE=%s\n' "$base_sha"
+  printf 'ALIGN_REVIEW_SCOPE=%s\n' "$review_scope"
 } >"$output"
 
 # Job control gives the review its own process group, so the stall guard
@@ -310,6 +365,7 @@ if [[ "$marker_count" -eq 0 ]]; then
     $0 == "No findings." ||
     $0 == "Read-only inspection found no actionable soundness or regression risks in the diff." ||
     $0 ~ /^No actionable soundness or regression (issues|risks) were found in the inspected diff[.]$/ ||
+    $0 ~ /^No actionable soundness or regression (issues|risks) were found( in the inspected diff)?[.] ALIGN_REVIEW_VERDICT=CLEAN$/ ||
     $0 == "No actionable issues were found in the changed files." ||
     $0 ~ /^[A-Z][[:print:]]* without introducing an actionable (soundness or regression )?(risk|risks|issue|issues|regression)[.]$/ {
       accepted = 1
@@ -332,6 +388,7 @@ if [[ "$marker_count" -ne 1 || ! "$last_nonempty" =~ ^ALIGN_REVIEW_VERDICT=(CLEA
   exit 3
 fi
 verdict="${last_nonempty#ALIGN_REVIEW_VERDICT=}"
+printf 'ALIGN_REVIEW_VERDICT=%s\n' "$verdict" >>"$cycle_record"
 case "$verdict" in
   CLEAN) exit 0 ;;
   FINDINGS) exit 2 ;;

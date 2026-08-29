@@ -336,6 +336,7 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean-readonly) echo "Read-only inspection found no actionable soundness or regression risks in the diff." ;;\n'
   printf '  native-clean-inspected) echo "No actionable soundness or regression issues were found in the inspected diff." ;;\n'
   printf '  native-clean-risks) echo "No actionable soundness or regression risks were found in the inspected diff." ;;\n'
+  printf '  native-clean-inline) echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN"; echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
   printf '  native-clean-introducing) echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
   printf '  native-clean-mixed) echo "Actionable issue: the review is not clean."; echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
   printf '  native-findings) echo "- [P1] broken workflow — scripts/example.sh:1" ;;\n'
@@ -445,6 +446,10 @@ native_inspected_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_risks_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-inline ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_inline_status=$?
 ( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-introducing ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
@@ -483,11 +488,18 @@ set -e
 }
 [[ $native_clean_status -eq 0 && $native_readonly_status -eq 0 &&
   $native_inspected_status -eq 0 && $native_risks_status -eq 0 &&
-  $native_introducing_status -eq 0 && $native_mixed_status -eq 3 &&
+  $native_inline_status -eq 0 && $native_introducing_status -eq 0 && $native_mixed_status -eq 3 &&
   $native_findings_status -eq 2 ]] || {
   echo "native review output was classified incorrectly" >&2
   exit 1
 }
+
+# The malformed-output fixtures above deliberately overwrite this same-HEAD
+# cycle record. Restore one completed checkpoint before exercising descendant
+# review policy.
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null
 
 # A completed full-diff review on an ancestor blocks another complete review
 # after an ordinary fix. Re-opening is explicit and requires both the owning
@@ -495,6 +507,7 @@ set -e
 printf '\ndescendant review fix\n' >>"$docs_repo/docs/notes.md"
 git -C "$docs_repo" add docs/notes.md
 git -C "$docs_repo" commit -qm 'docs: close review findings'
+descendant_review_head="$(git -C "$docs_repo" rev-parse HEAD)"
 set +e
 ( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
   ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
@@ -503,6 +516,56 @@ descendant_review_status=$?
 set -e
 [[ $descendant_review_status -eq 1 ]] || {
   echo "descendant full-diff review was not blocked" >&2
+  exit 1
+}
+changed_slice_args="$tmp_dir/codex-changed-slice-args"
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  FAKE_CODEX_ARGS_FILE="$changed_slice_args" ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main \
+    --changed-since "$review_head_sha" ) >/dev/null
+grep -Fq "git diff $review_head_sha..$descendant_review_head" "$changed_slice_args" || {
+  echo "changed-slice review did not bind the nearest reviewed ancestor:" >&2
+  cat "$changed_slice_args" >&2
+  exit 1
+}
+
+# A nearer STARTED review is not a completed checkpoint. A stall, kill, or
+# malformed native result leaves the cycle record without a verdict; a later
+# HEAD must resume that unfinished scope rather than skipping over it with a
+# changed-slice review.
+printf '\nincomplete review ancestor\n' >>"$docs_repo/docs/notes.md"
+git -C "$docs_repo" add docs/notes.md
+git -C "$docs_repo" commit -qm 'docs: create incomplete review ancestor'
+incomplete_review_head="$(git -C "$docs_repo" rev-parse HEAD)"
+incomplete_cycle="$(git -C "$docs_repo" rev-parse --absolute-git-dir)/align-review-cycle-$incomplete_review_head"
+{
+  printf 'ALIGN_REVIEW_KIND=HOST\n'
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$incomplete_review_head"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$review_base_sha"
+  printf 'ALIGN_REVIEW_SCOPE=CHANGED_SLICE\n'
+} >"$incomplete_cycle"
+# Raw output is not completion evidence: a process can print this marker and
+# then stall before the wrapper validates its exit and appends to the cycle.
+incomplete_raw="$(dirname "$incomplete_cycle")/align-review-$incomplete_review_head.log"
+{
+  printf 'ALIGN_REVIEW_KIND=HOST\n'
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$incomplete_review_head"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$review_base_sha"
+  printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
+} >"$incomplete_raw"
+printf '\nlater unreviewed change\n' >>"$docs_repo/docs/notes.md"
+git -C "$docs_repo" add docs/notes.md
+git -C "$docs_repo" commit -qm 'docs: advance past incomplete review'
+set +e
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main \
+    --changed-since "$incomplete_review_head" ) >/dev/null 2>&1
+incomplete_slice_status=$?
+set -e
+[[ $incomplete_slice_status -eq 1 ]] || {
+  echo "an incomplete ancestor authorized a changed-slice review" >&2
   exit 1
 }
 mkdir -p "$docs_repo/docs/impl"
@@ -1471,10 +1534,15 @@ printf "test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
 exit 139')"
 
 suite_artifact() {
-  printf '{"reason":"compiler-artifact","manifest_path":"%s/pkg/Cargo.toml",' "$suite_dir"
-  printf '"target":{"kind":["lib"],"name":"x","test":true},'
+  local executable="$1" package="${2:-pkg}" kind="${3:-test}" name="${4:-}"
+  if [ -z "$name" ]; then
+    name="$(basename "$executable")"
+    name="${name%-*}"
+  fi
+  printf '{"reason":"compiler-artifact","manifest_path":"%s/%s/Cargo.toml",' "$suite_dir" "$package"
+  printf '"target":{"kind":["%s"],"crate_types":["bin"],"name":"%s","test":true},' "$kind" "$name"
   printf '"profile":{"opt_level":"0","test":true},"features":[],'
-  printf '"filenames":["x"],"executable":"%s","fresh":true}\n' "$1"
+  printf '"filenames":["x"],"executable":"%s","fresh":true}\n' "$executable"
 }
 suite_stream() {
   local out="$1" executable
@@ -1496,7 +1564,12 @@ suite_manifest() {
 }
 # The fixture manifest is written with real tabs, exactly as the shipped one is.
 suite_line() {
-  printf '%s\t%s' "$1" "$2"
+  local target="$1"
+  case "$target" in
+    *::*::*) ;;
+    *) target="pkg::test::$target" ;;
+  esac
+  printf '%s\t%s' "$target" "$2"
   [ $# -lt 3 ] || printf '\t%s' "$3"
   printf '\n'
 }
@@ -1528,7 +1601,8 @@ grep -Fq 'matches' "$suite_match_out" || {
 }
 # A known-failing binary is not silently trusted: its own result line is still
 # in the report, and a passing binary is summarised rather than dumped.
-for expected_line in '--- suite_red (exit 101' '--- suite_green (exit 0' 'test result: ok.'; do
+for expected_line in '--- pkg::test::suite_red (exit 101' \
+  '--- pkg::test::suite_green (exit 0' 'test result: ok.'; do
   grep -Fq -e "$expected_line" "$suite_match_out" || {
     echo "the suite report lacks '$expected_line':" >&2
     cat "$suite_match_out" >&2
@@ -1545,7 +1619,7 @@ grep -Fq 'NEW failures' "$suite_new_out" || {
   cat "$suite_new_out" >&2
   exit 1
 }
-grep -Eq '^  suite_red[[:space:]]+beta$' "$suite_new_out" || {
+grep -Eq '^  pkg::test::suite_red[[:space:]]+beta$' "$suite_new_out" || {
   echo "the new failure was not named target-and-test:" >&2
   cat "$suite_new_out" >&2
   exit 1
@@ -1565,7 +1639,7 @@ grep -Fq 'did NOT fail' "$suite_fixed_out" || {
   cat "$suite_fixed_out" >&2
   exit 1
 }
-grep -Eq '^  suite_green[[:space:]]+alpha \(passed\)$' "$suite_fixed_out" || {
+grep -Eq '^  pkg::test::suite_green[[:space:]]+alpha \(passed\)$' "$suite_fixed_out" || {
   echo "the repaired test was not named:" >&2
   cat "$suite_fixed_out" >&2
   exit 1
@@ -1594,7 +1668,7 @@ grep -Fq '0 known, 2 environment-dependent' "$suite_env_out" || {
 # with a strict line.
 env_gone_manifest="$(suite_manifest env-gone "$(suite_line suite_gone needs_network env)")"
 suite_env_gone_out="$(suite_case env-gone "$env_gone_manifest" 1 "$suite_green")"
-grep -Eq '^  suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
+grep -Eq '^  pkg::test::suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
   "$suite_env_gone_out" || {
   echo "an env line for a deleted target was not reported:" >&2
   cat "$suite_env_gone_out" >&2
@@ -1614,18 +1688,18 @@ grep -Fq 'both as a known failure and as' "$suite_both_out" || {
 # 5. A binary that exits non-zero without naming a test, and one that never
 # reaches libtest's summary at all, both fail closed.
 suite_harness_out="$(suite_case harness "$empty_manifest" 1 "$suite_harness")"
-grep -Eq '^  suite_harness[[:space:]]+<binary-exit-4>$' "$suite_harness_out" || {
+grep -Eq '^  pkg::test::suite_harness[[:space:]]+<binary-exit-4>$' "$suite_harness_out" || {
   echo "a harness-level non-zero exit was not reported:" >&2
   cat "$suite_harness_out" >&2
   exit 1
 }
 suite_hang_out="$(suite_case hang "$empty_manifest" 1 "$suite_hang")"
-grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" || {
+grep -Eq '^  pkg::test::suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" || {
   echo "a binary killed by the per-binary cap was not reported:" >&2
   cat "$suite_hang_out" >&2
   exit 1
 }
-grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
+grep -Fq -- '--- pkg::test::suite_hang (exit timeout' "$suite_hang_out" || {
   echo "the capped binary was not reported as a timeout:" >&2
   cat "$suite_hang_out" >&2
   exit 1
@@ -1635,7 +1709,7 @@ grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
 # hung binary never got to run its known-failing test.
 hang_known_manifest="$(suite_manifest hang-known "$(suite_line suite_hang alpha)")"
 suite_hang_known_out="$(suite_case hang-known "$hang_known_manifest" 1 "$suite_hang")"
-grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
+grep -Eq '^  pkg::test::suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
   echo "a hung binary with a manifest entry was not reported as did-not-report:" >&2
   cat "$suite_hang_known_out" >&2
   exit 1
@@ -1649,7 +1723,7 @@ grep -Fq 'did NOT fail' "$suite_hang_known_out" && {
 # manifest, so only the exit code distinguishes this run from a clean baseline.
 crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
 suite_crash_out="$(suite_case crash "$crash_manifest" 1 "$suite_crash")"
-grep -Eq '^  suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
+grep -Eq '^  pkg::test::suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
   echo "a crash after libtest's summary was absorbed by the known failure:" >&2
   cat "$suite_crash_out" >&2
   exit 1
@@ -1704,7 +1778,7 @@ exit 101')"
 splice_manifest="$(suite_manifest splice \
   "$(suite_line suite_splice alpha)" "$(suite_line suite_splice beta)")"
 suite_splice_out="$(suite_case splice "$splice_manifest" 1 "$suite_splice")"
-grep -Eq '^  suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
+grep -Eq '^  pkg::test::suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
   echo "a spliced failures list was not reported as unparsed:" >&2
   cat "$suite_splice_out" >&2
   exit 1
@@ -1720,15 +1794,72 @@ space_manifest="$(suite_manifest spaces 'suite_red beta')"
 suite_case spaces "$space_manifest" 2 "$suite_red" >/dev/null
 kind_manifest="$(suite_manifest kind "$(suite_line suite_red beta flaky)")"
 suite_case kind "$kind_manifest" 2 "$suite_red" >/dev/null
+legacy_manifest="$(suite_manifest legacy "$(printf 'suite_red\tbeta')")"
+legacy_out="$(suite_case legacy "$legacy_manifest" 2 "$suite_red")"
+grep -Fq 'target must be package-dir::kind::target' "$legacy_out" || {
+  echo "an unqualified manifest key was rejected for the wrong reason:" >&2
+  cat "$legacy_out" >&2
+  exit 1
+}
 
-# 7. Two same-named targets would make a manifest line ambiguous, so the run
-# refuses rather than binding the line to whichever ran first.
+# 7. Two identical Cargo target identities would make a manifest line
+# ambiguous, so the run refuses rather than binding the line arbitrarily.
 suite_dup_out="$(suite_case duplicate "$empty_manifest" 1 "$suite_green" "$suite_green")"
-grep -Fq 'share a name' "$suite_dup_out" || {
-  echo "duplicate target names were not rejected:" >&2
+grep -Fq 'share a package/kind/name identity' "$suite_dup_out" || {
+  echo "duplicate Cargo target identities were not rejected:" >&2
   cat "$suite_dup_out" >&2
   exit 1
 }
+
+# Executable basenames, conversely, are not identities. Own every qualifier:
+# the current workspace has a same-package `align-repl` bin and `align_repl`
+# lib that Cargo emits as two `align_repl-<hash>` files; separate packages may
+# reuse one integration-test target name; and one package may reuse a target
+# name across kinds. All six binaries must run under distinct stable keys.
+mkdir -p "$suite_dir/repl" "$suite_dir/alpha" "$suite_dir/beta" \
+  "$suite_dir/kinds" "$suite_dir/bin/identity"
+suite_identity_binary() {
+  local directory="$1" name="$2" path
+  path="$suite_dir/bin/identity/$directory/$name-0123456789abcdef"
+  mkdir -p "$(dirname "$path")"
+  printf '#!/usr/bin/env bash\nprintf "test result: ok. 0 passed; 0 failed; 0 ignored\\n"\n' >"$path"
+  chmod +x "$path"
+  printf '%s\n' "$path"
+}
+identity_repl_bin="$(suite_identity_binary repl-bin align_repl)"
+identity_repl_lib="$(suite_identity_binary repl-lib align_repl)"
+identity_alpha="$(suite_identity_binary alpha shared)"
+identity_beta="$(suite_identity_binary beta shared)"
+identity_kind_lib="$(suite_identity_binary kind-lib shared_kind)"
+identity_kind_bin="$(suite_identity_binary kind-bin shared_kind)"
+identity_stream="$tmp_dir/suite-qualified-identities.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$identity_repl_bin" repl bin align-repl
+  suite_artifact "$identity_repl_lib" repl lib align_repl
+  suite_artifact "$identity_alpha" alpha test shared
+  suite_artifact "$identity_beta" beta test shared
+  suite_artifact "$identity_kind_lib" kinds lib shared-kind
+  suite_artifact "$identity_kind_bin" kinds bin shared-kind
+} >"$identity_stream"
+identity_out="$tmp_dir/suite-qualified-identities-out"
+ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$identity_stream" >"$identity_out" 2>&1 || {
+  echo "qualified Cargo target identities still collided:" >&2
+  cat "$identity_out" >&2
+  exit 1
+}
+for identity in \
+  'repl::bin::align-repl' 'repl::lib::align_repl' \
+  'alpha::test::shared' 'beta::test::shared' \
+  'kinds::lib::shared-kind' 'kinds::bin::shared-kind'; do
+  grep -Fq -- "--- $identity (exit 0" "$identity_out" || {
+    echo "the suite omitted qualified identity $identity:" >&2
+    cat "$identity_out" >&2
+    exit 1
+  }
+done
 
 # 8. The self-build branch (no artifact argument) must build the workspace
 # before the test-binary build — `cargo test --no-run` alone does not produce

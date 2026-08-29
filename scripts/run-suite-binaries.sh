@@ -75,11 +75,11 @@ tab="$align_tb_tab"
 # manifest outcome is a configuration error (exit 2) either way, and it should
 # cost seconds, not a workspace build.
 #
-# Manifest lines are "<target><TAB><test>" with an optional third field. The
-# only third field is "env": a test whose outcome depends on an environment
-# variable, a network, or a service that the nightly runner does not provide.
-# Those run, and pass or fail without changing the verdict. Everything else is
-# strict in both directions.
+# Manifest lines are "<package-dir>::<kind>::<target><TAB><test>" with an optional
+# third field. The only third field is "env": a test whose outcome depends on
+# an environment variable, a network, or a service that the nightly runner
+# does not provide. Those run, and pass or fail without changing the verdict.
+# Everything else is strict in both directions.
 expected="$work/expected"
 env_dependent="$work/env"
 : >"$expected"
@@ -100,6 +100,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   target="${line%%"$tab"*}"
   rest="${line#*"$tab"}"
   test_name="${rest%%"$tab"*}"
+  case "$target" in
+    ?*::?*::?*) ;;
+    *)
+      echo "$manifest:$line_number: target must be package-dir::kind::target: $target" >&2
+      exit 2
+      ;;
+  esac
   if [ "$rest" = "$test_name" ]; then
     kind=fail
   else
@@ -174,16 +181,17 @@ align_tb_discover "$artifacts" || {
   exit 1
 }
 
-# The manifest keys failures by target name, so two packages holding a
-# same-named target would make a manifest line ambiguous. Cargo's own -<hash>
-# disambiguation is not stable across runs, so reject the collision instead of
-# silently binding the line to whichever one ran first.
-found_names="$(align_tb_names | LC_ALL=C sort)"
+# Cargo's executable basenames are not identities: `align-repl` and
+# `align_repl` normalize to the same `align_repl-<hash>`, and separate packages
+# may reuse a target name. Key the manifest by package directory, target kind,
+# and Cargo target name. None contains Cargo's unstable artifact hash.
+ALIGN_TB_QUALIFIED_NAMES=1
+found_names="$(align_tb_qualified_names | LC_ALL=C sort)"
 duplicates="$(printf '%s\n' "$found_names" | LC_ALL=C uniq -d)"
 [ -z "$duplicates" ] || {
-  echo "two workspace test targets share a name, so the manifest cannot key on it:" >&2
+  echo "two workspace test targets share a package/kind/name identity:" >&2
   printf '  %s\n' $duplicates >&2
-  echo "  rename one of them, or teach the manifest a package-qualified key" >&2
+  echo "  give the targets distinct Cargo identities" >&2
   exit 1
 }
 
@@ -213,7 +221,7 @@ suite_started="$(date +%s)"
 align_tb_run suite
 suite_elapsed="$(($(date +%s) - suite_started))"
 
-# One "<target><TAB><test>" line per observed failure. A binary that never
+# One "<package-dir>::<kind>::<target><TAB><test>" line per observed failure. A binary that never
 # printed libtest's own summary (it crashed, aborted, or hit the per-binary
 # cap) contributes a synthetic entry instead of silently looking clean, and so
 # does one whose exit code cannot be explained by the tests it named.

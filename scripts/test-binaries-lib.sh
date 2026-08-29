@@ -37,11 +37,13 @@ ALIGN_TB_TIMEOUT="${ALIGN_TB_TIMEOUT:-0}"
 # artifact whose *profile* carries "test":true — the target-level flag of the
 # same name is true for an ordinary library too, and the alignc binary the
 # driver tests depend on is an executable with "test":false — and whose
-# `executable` is not null. `manifest_path` gives the package directory, the
-# working directory cargo runs a test binary in.
+# `executable` is not null. Each discovered row retains the manifest, target
+# kind, Cargo target name, and executable. The first gives the package working
+# directory; the middle pair lets the nightly form a stable identity even when
+# Cargo normalizes two distinct target names to the same executable basename.
 align_tb_discover() {
   local artifacts="$1" extract
-  extract='s/.*"manifest_path":"\([^"]*\)".*"profile":{[^}]*"test":true}.*"executable":"\([^"]*\)".*/\1'"$align_tb_tab"'\2/p'
+  extract='s/.*"manifest_path":"\([^"]*\)".*"target":{"kind":\["\([^"]*\)"[^]]*][^}]*"name":"\([^"]*\)".*"profile":{[^}]*"test":true}.*"executable":"\([^"]*\)".*/\1'"$align_tb_tab"'\2'"$align_tb_tab"'\3'"$align_tb_tab"'\4/p'
   ALIGN_TB_BINARIES="$(sed -n "$extract" "$artifacts")"
   [ -n "$ALIGN_TB_BINARIES" ]
 }
@@ -49,11 +51,25 @@ align_tb_discover() {
 # Cargo's own name for a test binary, which is its file name without the
 # disambiguating -<hash> suffix.
 align_tb_names() {
-  local manifest executable name
-  printf '%s\n' "$ALIGN_TB_BINARIES" | while IFS="$align_tb_tab" read -r manifest executable; do
+  local manifest target_kind target_name executable name
+  printf '%s\n' "$ALIGN_TB_BINARIES" | while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
     [ -n "$executable" ] || continue
     name="$(basename "$executable")"
     printf '%s\n' "${name%-*}"
+  done
+}
+
+# Stable full-suite identity. Package directory, target kind, and Cargo target
+# name are all required: separate packages commonly reuse integration-test
+# names, and one package may have a same-named lib/bin pair. Package directory
+# names are unique in this workspace; if that ever stops being true, the suite
+# collision check fails closed instead of binding a manifest line ambiguously.
+align_tb_qualified_names() {
+  local manifest target_kind target_name executable package
+  printf '%s\n' "$ALIGN_TB_BINARIES" | while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
+    [ -n "$executable" ] || continue
+    package="$(basename "$(dirname "$manifest")")"
+    printf '%s::%s::%s\n' "$package" "$target_kind" "$target_name"
   done
 }
 
@@ -63,7 +79,7 @@ align_tb_names() {
 # depend on anything actually recompiling.
 align_tb_export_dylib_path() {
   local artifacts="$1" deps_dir dylib_path
-  deps_dir="$(dirname "$(printf '%s\n' "$ALIGN_TB_BINARIES" | sed -n "1s/^[^$align_tb_tab]*$align_tb_tab//p")")"
+  deps_dir="$(dirname "$(printf '%s\n' "$ALIGN_TB_BINARIES" | sed -n "1s/.*$align_tb_tab//p")")"
   dylib_path="$(
     {
       sed -n 's/.*"linked_paths":\[\([^]]*\)\].*/\1/p' "$artifacts" |
@@ -176,11 +192,15 @@ align_tb_watchdog() {
 # Launch every discovered binary, at most ALIGN_TB_JOBS at a time, and return
 # once all of them have recorded a result. $1 labels the progress lines.
 align_tb_run() {
-  local label="$1" manifest executable name slot suffix
-  while IFS="$align_tb_tab" read -r manifest executable; do
+  local label="$1" manifest target_kind target_name executable name slot suffix
+  while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
     [ -n "$executable" ] || continue
-    name="$(basename "$executable")"
-    name="${name%-*}"
+    if [ "${ALIGN_TB_QUALIFIED_NAMES:-0}" = 1 ]; then
+      name="$(basename "$(dirname "$manifest")")::$target_kind::$target_name"
+    else
+      name="$(basename "$executable")"
+      name="${name%-*}"
+    fi
     # Claim the log slot in the parent so a collision cannot silently drop a
     # binary's result. Which of two same-named binaries takes the "-2" label
     # follows cargo's artifact order and is therefore not stable across runs —

@@ -463,6 +463,12 @@ a manifest failure that now passes      red ("delete the line")
 exactly the manifest                    green
 ```
 
+Each manifest key is `<package-dir>::<kind>::<target><TAB><test>`. This stable
+workspace target identity is required because executable basenames are not unique:
+hyphens normalize to underscores, and separate packages may reuse a target
+name. Cargo's artifact hash is deliberately excluded because it is not stable
+across builds.
+
 The second direction is the point — a fixed test may not sit in the manifest
 quietly re-earning its exemption, so the line goes away in the same change that
 fixes the test. A third field of `env` marks genuine environment dependence: the

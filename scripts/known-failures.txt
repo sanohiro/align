@@ -1,7 +1,7 @@
 # Known-failing workspace tests, the baseline scripts/run-suite-binaries.sh
 # judges the nightly run against.
 #
-#   <target><TAB><test name>[<TAB>env]
+#   <package-dir>::<kind>::<target><TAB><test name>[<TAB>env]
 #
 # A plain line is a STRICT expectation in both directions: that test must fail,
 # and the moment it passes the nightly turns red so the line gets deleted in
