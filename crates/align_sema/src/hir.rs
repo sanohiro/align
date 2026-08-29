@@ -1627,6 +1627,16 @@ pub enum ExprKind {
     /// `Result<response, Error>`. `cl` is a bound local (borrowed); `req` is a
     /// [`crate::Ty::HttpRequest`] **consumed** (moved into the call — the runtime frees it). **Impure**.
     HttpClientRequest { client: Box<Expr>, req: Box<Expr> },
+    /// `cl.request_stream(req)` — consume the request, complete and validate the final response
+    /// head, and return a dependent raw body stream tied to `client`. Impure network I/O.
+    HttpClientRequestStream { client: Box<Expr>, req: Box<Expr> },
+    /// `stream.status()` — final response status retained by the stream. Pure.
+    HttpReadStreamStatus { stream: Box<Expr> },
+    /// `stream.header(name)` — final response header view tied to the stream. Pure.
+    HttpReadStreamHeader { stream: Box<Expr>, name: Box<Expr> },
+    /// `stream.read(out)` — de-frame one caller-buffered body window. The stream and output buffer
+    /// are both mutably borrowed; the result is a byte count or transport/framing error. Impure.
+    HttpReadStreamRead { stream: Box<Expr>, buffer: Box<Expr> },
     /// `cl.get_many(urls, max_concurrency)` — perform a batch of GETs over bounded concurrency,
     /// yielding `Result<array<response>, Error>` (the `ty` — an owned [`crate::Ty::DynResponseArray`]
     /// Ok payload; results in input order, all-or-Err). `cl` is a bound [`crate::Ty::HttpClient`] local

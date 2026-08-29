@@ -1265,6 +1265,23 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             client: boxed!(client),
             req: boxed!(req),
         },
+        ExprKind::HttpClientRequestStream { client, req } => {
+            ExprKind::HttpClientRequestStream {
+                client: boxed!(client),
+                req: boxed!(req),
+            }
+        }
+        ExprKind::HttpReadStreamStatus { stream } => ExprKind::HttpReadStreamStatus {
+            stream: boxed!(stream),
+        },
+        ExprKind::HttpReadStreamHeader { stream, name } => ExprKind::HttpReadStreamHeader {
+            stream: boxed!(stream),
+            name: boxed!(name),
+        },
+        ExprKind::HttpReadStreamRead { stream, buffer } => ExprKind::HttpReadStreamRead {
+            stream: boxed!(stream),
+            buffer: boxed!(buffer),
+        },
         ExprKind::HttpGetMany {
             client,
             urls,
@@ -2086,6 +2103,18 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             client: lhs,
             req: rhs,
         }
+        | ExprKind::HttpClientRequestStream {
+            client: lhs,
+            req: rhs,
+        }
+        | ExprKind::HttpReadStreamHeader {
+            stream: lhs,
+            name: rhs,
+        }
+        | ExprKind::HttpReadStreamRead {
+            stream: lhs,
+            buffer: rhs,
+        }
         | ExprKind::HttpCtxHeader {
             headers: lhs,
             name: rhs,
@@ -2281,6 +2310,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::HttpParse { data: recv }
         | ExprKind::HttpRespStatus { resp: recv }
         | ExprKind::HttpRespBody { resp: recv }
+        | ExprKind::HttpReadStreamStatus { stream: recv }
         | ExprKind::HttpAccept { server: recv }
         | ExprKind::HttpCtxMethod { ctx: recv }
         | ExprKind::HttpCtxPath { ctx: recv }

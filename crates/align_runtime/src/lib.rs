@@ -10131,6 +10131,20 @@ pub unsafe extern "C" fn align_rt_buffer_len(b: *mut Buffer) -> i64 {
     unsafe { (*b).len as i64 }
 }
 
+/// `buffer`'s fixed caller-selected read window. This differs from `buffer.len()`: a newly created
+/// or freshly cleared buffer has length zero while retaining the capacity future reads may fill.
+/// Null-safe so checked lowering can use the same zero test as the direct ABI validation path.
+///
+/// # Safety
+/// `b` must be null or a valid [`Buffer`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_capacity(b: *mut Buffer) -> i64 {
+    if b.is_null() {
+        return 0;
+    }
+    i64::try_from(unsafe { (*b).cap }).unwrap_or(i64::MAX)
+}
+
 /// Free a `buffer` (its heap storage). Null-safe.
 ///
 /// # Safety
@@ -17413,10 +17427,10 @@ impl HttpResponseAccumulator {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HttpDecodeState {
     Head,
-    Fixed { remaining: usize },
+    Fixed { remaining: u64 },
     CloseDelimited,
     ChunkSize,
-    ChunkData { remaining: usize },
+    ChunkData { remaining: u64 },
     ChunkDataCrLf { seen: u8 },
     Trailers,
     Complete,
@@ -17451,10 +17465,13 @@ struct HttpResponseDecoder {
     acc: HttpResponseAccumulator,
     bounded_body: Option<HttpResponseAccumulator>,
     explicit_body_limit: Option<usize>,
+    streaming: bool,
+    streamed_body_len: u64,
     state: HttpDecodeState,
     final_head: Option<HttpHead>,
     method_is_head: bool,
     keep_alive: bool,
+    self_delimited: bool,
     cumulative_head_bytes: usize,
     head_line_start: usize,
     head_header_count: usize,
@@ -17465,7 +17482,7 @@ struct HttpResponseDecoder {
     chunk_line_state: HttpChunkLineState,
     chunk_line_len: usize,
     chunk_line_has_digit: bool,
-    chunk_size: usize,
+    chunk_size: u64,
     chunk_magnitude_ok: bool,
     chunk_framing_bytes: usize,
     trailer_state: HttpTrailerState,
@@ -17482,16 +17499,33 @@ impl HttpResponseDecoder {
     }
 
     fn new_with_limit(method_is_head: bool, explicit_body_limit: Option<usize>) -> Self {
+        Self::new_mode(method_is_head, explicit_body_limit, false)
+    }
+
+    fn new_streaming(method_is_head: bool, explicit_body_limit: Option<usize>) -> Self {
+        Self::new_mode(method_is_head, explicit_body_limit, true)
+    }
+
+    fn new_mode(
+        method_is_head: bool,
+        explicit_body_limit: Option<usize>,
+        streaming: bool,
+    ) -> Self {
         Self {
-            acc: explicit_body_limit.map_or_else(HttpResponseAccumulator::new, |_| {
+            acc: if streaming || explicit_body_limit.is_some() {
                 HttpResponseAccumulator::new_fixed(HTTP_MAX_HEADER_BLOCK)
-            }),
+            } else {
+                HttpResponseAccumulator::new()
+            },
             bounded_body: None,
             explicit_body_limit,
+            streaming,
+            streamed_body_len: 0,
             state: HttpDecodeState::Head,
             final_head: None,
             method_is_head,
             keep_alive: false,
+            self_delimited: false,
             cumulative_head_bytes: 0,
             head_line_start: 0,
             head_header_count: 0,
@@ -17519,6 +17553,9 @@ impl HttpResponseDecoder {
     }
 
     fn body_len(&self) -> Result<usize, HttpParseErr> {
+        if self.streaming {
+            return usize::try_from(self.streamed_body_len).map_err(|_| HttpParseErr::Invalid);
+        }
         if let Some(body) = &self.bounded_body {
             return Ok(body.len());
         }
@@ -17533,6 +17570,9 @@ impl HttpResponseDecoder {
     }
 
     fn prepare_body(&mut self) {
+        if self.streaming {
+            return;
+        }
         if let Some(limit) = self.explicit_body_limit
             && self.bounded_body.is_none()
         {
@@ -17561,9 +17601,9 @@ impl HttpResponseDecoder {
             HttpDecodeState::ChunkSize => HTTP_MAX_CHUNK_LINE
                 .saturating_sub(self.chunk_line_len)
                 .min(HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)),
-            HttpDecodeState::ChunkData { remaining } => remaining.saturating_add(
-                HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes),
-            ),
+            HttpDecodeState::ChunkData { remaining } => usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .saturating_add(HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)),
             HttpDecodeState::ChunkDataCrLf { .. } => {
                 HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)
             }
@@ -17572,13 +17612,15 @@ impl HttpResponseDecoder {
             // so an immediately available overshoot is observed and makes the conn non-reusable.
             // A full-sized read at an exact 32 KiB multiple would otherwise consume the framing
             // boundary exactly, so leave one byte for that final probe-sized read.
-            HttpDecodeState::Fixed { remaining } if remaining > HTTP_CLIENT_READ_CHUNK => {
+            HttpDecodeState::Fixed { remaining } if remaining > HTTP_CLIENT_READ_CHUNK as u64 => {
                 HTTP_CLIENT_READ_CHUNK
             }
-            HttpDecodeState::Fixed { remaining } if remaining == HTTP_CLIENT_READ_CHUNK => {
+            HttpDecodeState::Fixed { remaining } if remaining == HTTP_CLIENT_READ_CHUNK as u64 => {
                 HTTP_CLIENT_READ_CHUNK - 1
             }
-            HttpDecodeState::Fixed { remaining } => remaining.saturating_add(1),
+            HttpDecodeState::Fixed { remaining } => usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
             HttpDecodeState::CloseDelimited => self
                 .explicit_body_limit
                 .unwrap_or(HTTP_MAX_BODY)
@@ -17589,12 +17631,16 @@ impl HttpResponseDecoder {
         remaining.min(HTTP_CLIENT_READ_CHUNK)
     }
 
-    fn decimal_body_len(&self, span: HttpDecimalSpan) -> Result<usize, HttpParseErr> {
+    fn decimal_body_len(&self, span: HttpDecimalSpan) -> Result<u64, HttpParseErr> {
         let digits = &self.acc.as_slice()[span.start..span.start + span.len];
-        let mut n = 0usize;
+        let mut n = 0u64;
         for &digit in digits {
-            let d = usize::from(digit - b'0');
-            let ceiling = self.explicit_body_limit.unwrap_or(HTTP_MAX_BODY);
+            let d = u64::from(digit - b'0');
+            let ceiling = if self.streaming {
+                self.explicit_body_limit.map_or(u64::MAX, |limit| limit as u64)
+            } else {
+                self.explicit_body_limit.map_or(HTTP_MAX_BODY as u64, |limit| limit as u64)
+            };
             if d > ceiling || n > (ceiling - d) / 10 {
                 return Err(if self.explicit_body_limit.is_some() {
                     HttpParseErr::BodyLimit
@@ -17636,17 +17682,20 @@ impl HttpResponseDecoder {
         let bodyless = self.method_is_head || head.status == 204 || head.status == 304;
         if bodyless {
             self.final_head = Some(head);
+            self.self_delimited = true;
             self.state = HttpDecodeState::Complete;
             return Ok(());
         }
         if head.chunked {
             self.final_head = Some(head);
+            self.self_delimited = true;
             self.state = HttpDecodeState::ChunkSize;
             return Ok(());
         }
         if let Some(span) = head.content_length {
             let remaining = self.decimal_body_len(span)?;
             self.final_head = Some(head);
+            self.self_delimited = true;
             self.prepare_body();
             self.state = if remaining == 0 {
                 HttpDecodeState::Complete
@@ -17656,6 +17705,7 @@ impl HttpResponseDecoder {
             return Ok(());
         }
         self.final_head = Some(head);
+        self.self_delimited = false;
         self.prepare_body();
         self.state = HttpDecodeState::CloseDelimited;
         Ok(())
@@ -17678,8 +17728,16 @@ impl HttpResponseDecoder {
             });
         }
         let size = self.chunk_size;
-        let body_len = self.body_len()?;
-        let cap = self.explicit_body_limit.unwrap_or(HTTP_MAX_BODY);
+        let body_len = if self.streaming {
+            self.streamed_body_len
+        } else {
+            self.body_len()? as u64
+        };
+        let cap = if self.streaming {
+            self.explicit_body_limit.map_or(u64::MAX, |limit| limit as u64)
+        } else {
+            self.explicit_body_limit.map_or(HTTP_MAX_BODY as u64, |limit| limit as u64)
+        };
         if body_len.checked_add(size).is_none_or(|n| n > cap) {
             return Err(if self.explicit_body_limit.is_some() {
                 HttpParseErr::BodyLimit
@@ -17760,13 +17818,18 @@ impl HttpResponseDecoder {
                             b'A'..=b'F' => usize::from(byte - b'A' + 10),
                             _ => return Err(HttpParseErr::Invalid),
                         };
-                        if self.chunk_size > (HTTP_MAX_BODY - digit) / 16 {
-                            if self.explicit_body_limit.is_none() {
+                        let ceiling = if self.streaming {
+                            u64::MAX
+                        } else {
+                            HTTP_MAX_BODY as u64
+                        };
+                        if self.chunk_size > (ceiling - digit as u64) / 16 {
+                            if !self.streaming && self.explicit_body_limit.is_none() {
                                 return Err(HttpParseErr::Invalid);
                             }
                             self.chunk_magnitude_ok = false;
                         } else {
-                            self.chunk_size = self.chunk_size * 16 + digit;
+                            self.chunk_size = self.chunk_size * 16 + digit as u64;
                         }
                     }
                     HttpChunkLineState::Size
@@ -17945,6 +18008,211 @@ impl HttpResponseDecoder {
         Ok(())
     }
 
+    /// Advance only the response-head grammar, stopping at the first byte after the final head.
+    /// Interim heads are discarded by [`Self::select_head`]. The constructor retains any body
+    /// bytes co-read with the completing head in its fixed transport scratch instead of letting
+    /// them enter response-owned body storage.
+    fn feed_head(&mut self, input: &[u8]) -> Result<(usize, bool), HttpParseErr> {
+        let mut pos = 0usize;
+        while pos < input.len() && self.state == HttpDecodeState::Head {
+            let rest = &input[pos..];
+            if let Some(nl) = memchr::memchr(b'\n', rest) {
+                let take = nl + 1;
+                self.append_head(&rest[..take])?;
+                pos += take;
+                self.finish_head_line()?;
+            } else {
+                self.append_head(rest)?;
+                pos = input.len();
+                let partial = &self.acc.as_slice()[self.head_line_start..];
+                if let Some(cr) = memchr::memchr(b'\r', partial)
+                    && cr + 1 != partial.len()
+                {
+                    return Err(HttpParseErr::Invalid);
+                }
+                let complete_line = partial.last() == Some(&b'\r');
+                let partial = partial.strip_suffix(b"\r").unwrap_or(partial);
+                if self.head_line_start == 0 && complete_line {
+                    http_validate_status_line(partial)?;
+                } else if self.head_line_start == 0 {
+                    http_validate_status_prefix(partial)?;
+                } else if complete_line && !partial.is_empty() {
+                    http_validate_header_line(partial)?;
+                } else {
+                    http_validate_header_prefix(partial)?;
+                }
+                if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
+                    return Err(HttpParseErr::Invalid);
+                }
+            }
+        }
+        Ok((pos, self.state != HttpDecodeState::Head))
+    }
+
+    fn reset_stream_framing_allowance(&mut self) {
+        debug_assert!(self.streaming);
+        self.chunk_framing_bytes = 0;
+    }
+
+    /// Maximum wire bytes the next streaming transport read may place in the fixed scratch.
+    /// Payload is bounded by the caller window, while framing is bounded by this call's fresh
+    /// allowance. The extra fixed-length byte observes residual data at exact completion.
+    fn stream_read_limit(&self, output_remaining: usize) -> usize {
+        debug_assert!(self.streaming);
+        let limit = match self.state {
+            HttpDecodeState::Head | HttpDecodeState::Complete => 0,
+            HttpDecodeState::Fixed { remaining } => usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(output_remaining)
+                .saturating_add((remaining <= output_remaining as u64) as usize),
+            HttpDecodeState::CloseDelimited => output_remaining,
+            HttpDecodeState::ChunkSize => HTTP_MAX_CHUNK_LINE
+                .saturating_sub(self.chunk_line_len)
+                .min(HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)),
+            HttpDecodeState::ChunkData { remaining } => usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(output_remaining)
+                .saturating_add(HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)),
+            HttpDecodeState::ChunkDataCrLf { .. } => {
+                HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)
+            }
+            HttpDecodeState::Trailers => HTTP_MAX_TRAILER_BLOCK.saturating_sub(self.trailer_bytes),
+        };
+        limit.min(HTTP_CLIENT_READ_CHUNK)
+    }
+
+    fn stream_charge_payload(&mut self, count: usize) -> Result<(), HttpParseErr> {
+        let next = self
+            .streamed_body_len
+            .checked_add(count as u64)
+            .ok_or(HttpParseErr::Invalid)?;
+        if self
+            .explicit_body_limit
+            .is_some_and(|limit| next > limit as u64)
+        {
+            return Err(HttpParseErr::BodyLimit);
+        }
+        self.streamed_body_len = next;
+        Ok(())
+    }
+
+    /// Consume already-received wire bytes into a caller-owned unpublished output window. Returns
+    /// the wire byte count consumed. Payload bytes are copied de-framed; syntax/cap failure may
+    /// leave bytes in the unpublished window, but the ABI keeps `buffer.len == 0` on that path.
+    fn feed_stream(&mut self, input: &[u8], output: &mut [u8], written: &mut usize) -> Result<usize, HttpParseErr> {
+        debug_assert!(self.streaming);
+        let mut pos = 0usize;
+        while pos < input.len() && !self.complete() {
+            match self.state {
+                HttpDecodeState::Head => return Err(HttpParseErr::Invalid),
+                HttpDecodeState::Fixed { remaining } => {
+                    if *written == output.len() {
+                        break;
+                    }
+                    let take = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(input.len() - pos)
+                        .min(output.len() - *written);
+                    self.stream_charge_payload(take)?;
+                    output[*written..*written + take]
+                        .copy_from_slice(&input[pos..pos + take]);
+                    *written += take;
+                    pos += take;
+                    let left = remaining - take as u64;
+                    self.state = if left == 0 {
+                        HttpDecodeState::Complete
+                    } else {
+                        HttpDecodeState::Fixed { remaining: left }
+                    };
+                }
+                HttpDecodeState::CloseDelimited => {
+                    if *written == output.len() {
+                        break;
+                    }
+                    let take = (input.len() - pos).min(output.len() - *written);
+                    self.stream_charge_payload(take)?;
+                    output[*written..*written + take]
+                        .copy_from_slice(&input[pos..pos + take]);
+                    *written += take;
+                    pos += take;
+                }
+                HttpDecodeState::ChunkSize => {
+                    let allowance = HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes);
+                    if allowance == 0 {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    let rest = &input[pos..];
+                    let line = memchr::memchr(b'\n', rest).map_or(rest.len(), |nl| nl + 1);
+                    let take = line.min(allowance);
+                    self.feed_chunk_line(&rest[..take])?;
+                    pos += take;
+                    if take < line
+                        || (self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING
+                            && matches!(self.state, HttpDecodeState::ChunkSize | HttpDecodeState::ChunkDataCrLf { .. }))
+                    {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                HttpDecodeState::ChunkData { remaining } => {
+                    if *written == output.len() {
+                        break;
+                    }
+                    let take = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(input.len() - pos)
+                        .min(output.len() - *written);
+                    self.stream_charge_payload(take)?;
+                    output[*written..*written + take]
+                        .copy_from_slice(&input[pos..pos + take]);
+                    *written += take;
+                    pos += take;
+                    let left = remaining - take as u64;
+                    self.state = if left == 0 {
+                        HttpDecodeState::ChunkDataCrLf { seen: 0 }
+                    } else {
+                        HttpDecodeState::ChunkData { remaining: left }
+                    };
+                }
+                HttpDecodeState::ChunkDataCrLf { seen } => {
+                    if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING {
+                        if *written > 0 {
+                            break;
+                        }
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    let b = input[pos];
+                    pos += 1;
+                    self.chunk_framing_bytes += 1;
+                    if (seen == 0 && b != b'\r') || (seen == 1 && b != b'\n') {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    self.state = if seen == 1 {
+                        self.reset_chunk_line();
+                        HttpDecodeState::ChunkSize
+                    } else {
+                        HttpDecodeState::ChunkDataCrLf { seen: 1 }
+                    };
+                    if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING {
+                        // Landing exactly on either payload-CRLF byte may end a call which already
+                        // has bytes to publish. Preserve the partial framing state and leave the
+                        // next byte for the next call's fresh allowance. With no payload result the
+                        // current call cannot return zero before completion, so exhaustion fails.
+                        if *written > 0 {
+                            break;
+                        }
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                HttpDecodeState::Trailers => {
+                    self.feed_trailer_byte(input[pos])?;
+                    pos += 1;
+                }
+                HttpDecodeState::Complete => break,
+            }
+        }
+        Ok(pos)
+    }
+
     fn reset_trailer_name(&mut self, first: u8) {
         self.trailer_name_len = 1;
         self.trailer_is_content_length = first.eq_ignore_ascii_case(&b'c');
@@ -18061,10 +18329,12 @@ impl HttpResponseDecoder {
                     }
                 }
                 HttpDecodeState::Fixed { remaining } => {
-                    let take = remaining.min(input.len() - pos);
+                    let take = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(input.len() - pos);
                     self.append_body(&input[pos..pos + take])?;
                     pos += take;
-                    let left = remaining - take;
+                    let left = remaining - take as u64;
                     self.state = if left == 0 {
                         HttpDecodeState::Complete
                     } else {
@@ -18099,10 +18369,12 @@ impl HttpResponseDecoder {
                     }
                 }
                 HttpDecodeState::ChunkData { remaining } => {
-                    let take = remaining.min(input.len() - pos);
+                    let take = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(input.len() - pos);
                     self.append_body(&input[pos..pos + take])?;
                     pos += take;
-                    let left = remaining - take;
+                    let left = remaining - take as u64;
                     self.state = if left == 0 {
                         HttpDecodeState::ChunkDataCrLf { seen: 0 }
                     } else {
@@ -19328,6 +19600,443 @@ enum HttpExchange {
 }
 
 const HTTP_CLIENT_READ_CHUNK: usize = 32 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpReadStreamState {
+    Active,
+    Complete,
+    Failed(i32),
+}
+
+/// A checked-out HTTP response body cursor. The fixed head allocation remains in `decoder`; the
+/// fixed scratch retains only transport bytes co-read past the head or not yet handed to the
+/// caller's output window. `client` is a language-checked shared borrow and is therefore valid until
+/// this handle is consumed or dropped.
+pub struct HttpReadStream {
+    client: *mut HttpClient,
+    scheme: HttpScheme,
+    host: String,
+    port: i64,
+    conn: Option<Conn>,
+    decoder: HttpResponseDecoder,
+    scratch: Box<[u8; HTTP_CLIENT_READ_CHUNK]>,
+    scratch_start: usize,
+    scratch_end: usize,
+    has_deadline: bool,
+    state: HttpReadStreamState,
+}
+
+impl HttpReadStream {
+    fn close_connection(&mut self, allow_pool: bool) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let reusable = allow_pool
+            && self.decoder.keep_alive
+            && self.decoder.self_delimited
+            && self.scratch_start == self.scratch_end
+            && !conn.has_pending();
+        let client = unsafe { self.client.as_ref() };
+        let (fd, ssl) = conn.into_parts();
+        if reusable {
+            if let Some(client) = client {
+                client.put_idle(self.scheme, &self.host, self.port, fd, ssl);
+                return;
+            }
+        }
+        unsafe { close_tls(ssl, fd) };
+        if let Some(client) = client {
+            client.remove_empty(self.scheme, &self.host, self.port);
+        }
+    }
+
+    fn finish_success(&mut self) {
+        self.close_connection(true);
+        self.state = HttpReadStreamState::Complete;
+    }
+
+    fn fail(&mut self, status: i32) -> i32 {
+        self.close_connection(false);
+        self.state = HttpReadStreamState::Failed(status);
+        status
+    }
+
+    fn read_into(&mut self, output: &mut [u8]) -> Result<usize, i32> {
+        match self.state {
+            HttpReadStreamState::Complete => return Ok(0),
+            HttpReadStreamState::Failed(status) => return Err(status),
+            HttpReadStreamState::Active => {}
+        }
+        self.decoder.reset_stream_framing_allowance();
+        let mut written = 0usize;
+        loop {
+            if self.scratch_start < self.scratch_end {
+                let consumed = match self.decoder.feed_stream(
+                    &self.scratch[self.scratch_start..self.scratch_end],
+                    output,
+                    &mut written,
+                ) {
+                    Ok(consumed) => consumed,
+                    Err(HttpParseErr::BodyLimit) => return Err(self.fail(AL_HTTP_BODY_LIMIT)),
+                    Err(_) => return Err(self.fail(AL_INVALID)),
+                };
+                self.scratch_start += consumed;
+                if self.scratch_start == self.scratch_end {
+                    self.scratch_start = 0;
+                    self.scratch_end = 0;
+                }
+                if self.decoder.complete() {
+                    self.finish_success();
+                    return Ok(written);
+                }
+                if written == output.len() {
+                    return Ok(written);
+                }
+                if consumed == 0 && self.scratch_start < self.scratch_end {
+                    return Err(self.fail(AL_INVALID));
+                }
+                if self.scratch_start < self.scratch_end {
+                    continue;
+                }
+            }
+
+            // A positive payload result ends the call before another transport read. Already-co-read
+            // framing above may still have been consumed after the first payload byte.
+            if written > 0 {
+                return Ok(written);
+            }
+            let limit = self.decoder.stream_read_limit(output.len());
+            if limit == 0 {
+                return Err(self.fail(AL_INVALID));
+            }
+            let Some(conn) = self.conn.as_mut() else {
+                return Err(self.fail(AL_INVALID));
+            };
+            match unsafe { conn.read(&mut self.scratch[..limit], self.has_deadline) } {
+                ConnRead::Data(count) => {
+                    self.scratch_start = 0;
+                    self.scratch_end = count;
+                }
+                ConnRead::Err(status) => return Err(self.fail(status)),
+                ConnRead::Eof => {
+                    if self.decoder.finish_eof().is_err() {
+                        return Err(self.fail(AL_INVALID));
+                    }
+                    self.finish_success();
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for HttpReadStream {
+    fn drop(&mut self) {
+        self.close_connection(false);
+    }
+}
+
+fn http_selected_stream_body_limit(
+    client_limit: i64,
+    request_limit: i64,
+) -> Result<Option<usize>, i32> {
+    if !(0..=HTTP_MAX_BODY as i64).contains(&client_limit)
+        || !(0..=HTTP_MAX_BODY as i64).contains(&request_limit)
+    {
+        return Err(AL_INVALID);
+    }
+    if client_limit == 0 && request_limit == 0 {
+        return Ok(None);
+    }
+    let client = if client_limit == 0 {
+        HTTP_MAX_BODY
+    } else {
+        usize::try_from(client_limit).map_err(|_| AL_INVALID)?
+    };
+    let request = if request_limit == 0 {
+        HTTP_MAX_BODY
+    } else {
+        usize::try_from(request_limit).map_err(|_| AL_INVALID)?
+    };
+    Ok(Some(client.min(request)))
+}
+
+/// Build a streaming response through the final validated head. Body bytes co-read with that head
+/// remain in the stream's fixed scratch. A reused idle connection that fails before any response
+/// byte is retried once fresh, matching the whole-body client.
+unsafe fn http_client_perform_stream(
+    client: *mut HttpClient,
+    req: HttpRequestView<'_>,
+) -> Result<HttpReadStream, i32> {
+    if req.method == "CONNECT" {
+        return Err(AL_INVALID);
+    }
+    let Some((scheme, authority, _)) = http_split_url(req.url) else {
+        return Err(AL_INVALID);
+    };
+    let default_port = match scheme {
+        HttpScheme::Http => 80,
+        HttpScheme::Https => 443,
+    };
+    let Some((host, port)) = http_split_authority(authority, default_port) else {
+        return Err(AL_INVALID);
+    };
+    let client_ref = unsafe { client.as_ref() }.ok_or(AL_INVALID)?;
+    let client_timeout = client_ref.timeout_ns.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_timeout = if req.timeout_ns > 0 {
+        req.timeout_ns
+    } else {
+        client_timeout
+    };
+    let has_deadline = effective_timeout > 0;
+    let client_limit = client_ref
+        .max_response_body_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let selected_body_limit =
+        http_selected_stream_body_limit(client_limit, req.max_response_body_bytes)?;
+    let mut request_bytes = client_ref.request_buffer();
+    http_serialize_into(req, request_bytes.bytes_mut())?;
+    let _sigpipe = matches!(scheme, HttpScheme::Https).then(SigpipeBlock::new);
+
+    let mut attempt = 0u32;
+    loop {
+        let pooled = if attempt == 0 {
+            client_ref.take_idle(scheme, host, port)
+        } else {
+            None
+        };
+        let (mut conn, reused) = match pooled {
+            Some((fd, ssl)) => (Conn::from_parts(fd, ssl), true),
+            None => {
+                let fresh = match scheme {
+                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout) },
+                    HttpScheme::Http => unsafe { http_connect_fd(host, port, effective_timeout) }
+                        .map(|fd| Conn::Plain { fd }),
+                };
+                match fresh {
+                    Ok(conn) => (conn, false),
+                    Err(status) => {
+                        client_ref.remove_empty(scheme, host, port);
+                        return Err(status);
+                    }
+                }
+            }
+        };
+        if has_deadline || reused {
+            unsafe { http_arm_conn_timeout(conn.fd(), effective_timeout) };
+        }
+        let write_status = unsafe { conn.write_all(request_bytes.as_slice(), has_deadline) };
+        if write_status != 0 {
+            unsafe { conn.close() };
+            if reused && attempt == 0 {
+                attempt += 1;
+                continue;
+            }
+            client_ref.remove_empty(scheme, host, port);
+            return Err(write_status);
+        }
+
+        let mut decoder = HttpResponseDecoder::new_streaming(
+            req.method == "HEAD",
+            selected_body_limit,
+        );
+        let mut scratch = Box::new([0u8; HTTP_CLIENT_READ_CHUNK]);
+        let mut received_any = false;
+        loop {
+            let limit = decoder.next_read_limit();
+            if limit == 0 {
+                unsafe { conn.close() };
+                client_ref.remove_empty(scheme, host, port);
+                return Err(AL_INVALID);
+            }
+            let count = match unsafe { conn.read(&mut scratch[..limit], has_deadline) } {
+                ConnRead::Data(count) => {
+                    received_any = true;
+                    count
+                }
+                ConnRead::Err(status) => {
+                    unsafe { conn.close() };
+                    if reused && !received_any && attempt == 0 {
+                        attempt += 1;
+                        break;
+                    }
+                    client_ref.remove_empty(scheme, host, port);
+                    return Err(status);
+                }
+                ConnRead::Eof => {
+                    unsafe { conn.close() };
+                    if reused && !received_any && attempt == 0 {
+                        attempt += 1;
+                        break;
+                    }
+                    client_ref.remove_empty(scheme, host, port);
+                    return Err(AL_INVALID);
+                }
+            };
+            let (consumed, final_head) = match decoder.feed_head(&scratch[..count]) {
+                Ok(result) => result,
+                Err(HttpParseErr::BodyLimit) => {
+                    unsafe { conn.close() };
+                    client_ref.remove_empty(scheme, host, port);
+                    return Err(AL_HTTP_BODY_LIMIT);
+                }
+                Err(_) => {
+                    unsafe { conn.close() };
+                    client_ref.remove_empty(scheme, host, port);
+                    return Err(AL_INVALID);
+                }
+            };
+            if !final_head {
+                continue;
+            }
+            let mut stream = HttpReadStream {
+                client,
+                scheme,
+                host: host.to_owned(),
+                port,
+                conn: Some(conn),
+                decoder,
+                scratch,
+                scratch_start: consumed,
+                scratch_end: count,
+                has_deadline,
+                state: HttpReadStreamState::Active,
+            };
+            if stream.decoder.complete() {
+                stream.finish_success();
+            }
+            return Ok(stream);
+        }
+    }
+}
+
+/// `cl.request_stream(req)` — consume a request only after all three handles/outputs validate, then
+/// return a dependent raw response stream through `out`.
+///
+/// # Safety
+/// Non-null handles must be live values of their declared types; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_client_request_stream(
+    client: *mut HttpClient,
+    req: *mut HttpRequest,
+    out: *mut *mut HttpReadStream,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if client.is_null() || req.is_null() {
+        return AL_INVALID;
+    }
+    let owned = unsafe { Box::from_raw(req) };
+    match unsafe { http_client_perform_stream(client, owned.as_view()) } {
+        Ok(stream) => {
+            unsafe { *out = Box::into_raw(Box::new(stream)) };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Shared final-head status getter for raw/SSE stream handles. `status(null) == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_read_stream_status(stream: *const HttpReadStream) -> i64 {
+    let Some(stream) = (unsafe { stream.as_ref() }) else {
+        return 0;
+    };
+    stream.decoder.final_head.as_ref().map_or(0, |head| head.status)
+}
+
+/// Shared final-head header getter. A valid output is zeroed before any input validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_read_stream_header(
+    stream: *const HttpReadStream,
+    name_ptr: *const u8,
+    name_len: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    let Some(stream) = (unsafe { stream.as_ref() }) else {
+        return 0;
+    };
+    let Ok(length) = safe_len(name_len) else {
+        return 0;
+    };
+    if length != 0 && name_ptr.is_null() {
+        return 0;
+    }
+    let name = if length == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(name_ptr, length) }
+    };
+    let Some(head) = stream.decoder.final_head.as_ref() else {
+        return 0;
+    };
+    let bytes = stream.decoder.acc.as_slice();
+    for header in head.headers.as_slice() {
+        if bytes[header.name_start..header.name_start + header.name_len]
+            .eq_ignore_ascii_case(name)
+        {
+            unsafe {
+                *out = AlignStr {
+                    ptr: bytes.as_ptr().add(header.value_start),
+                    len: header.value_len as i64,
+                }
+            };
+            return 1;
+        }
+    }
+    0
+}
+
+/// De-frame one caller-bounded body window. `count` and `buffer.len` are cleared before the stream
+/// handle is inspected; every terminal stream error is stable and performs no later I/O.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_read_stream_read(
+    stream: *mut HttpReadStream,
+    buffer: *mut Buffer,
+    count: *mut i64,
+) -> i32 {
+    if count.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *count = 0 };
+    let Some(buffer) = (unsafe { buffer.as_mut() }) else {
+        return AL_INVALID;
+    };
+    buffer.len = 0;
+    let Some(stream) = (unsafe { stream.as_mut() }) else {
+        return AL_INVALID;
+    };
+    if buffer.cap == 0 || buffer.data.capacity() < buffer.cap {
+        return AL_INVALID;
+    }
+    buffer.data.clear();
+    let output = unsafe {
+        core::slice::from_raw_parts_mut(buffer.data.spare_capacity_mut().as_mut_ptr().cast(), buffer.cap)
+    };
+    match stream.read_into(output) {
+        Ok(written) => {
+            unsafe { buffer.data.set_len(written) };
+            buffer.len = written;
+            unsafe { *count = written as i64 };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Free a raw/SSE-compatible stream handle. Null-safe; an incomplete body closes without draining.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_read_stream_free(stream: *mut HttpReadStream) {
+    if !stream.is_null() {
+        drop(unsafe { Box::from_raw(stream) });
+    }
+}
 
 /// Send `request` (the serialized bytes, one write — http.md R4) over `conn` (plaintext or TLS —
 /// the [`Conn`] abstraction keeps this loop single-sourced), then stream the response into one
@@ -21994,6 +22703,8 @@ mod tests {
         let mut r: *mut Reader = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_io_reader_open(path_bytes.as_ptr(), path_bytes.len() as i64, &mut r) }, 0);
         let b = align_rt_buffer_new(3);
+        assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 3);
+        assert_eq!(unsafe { align_rt_buffer_capacity(core::ptr::null_mut()) }, 0);
         // First read: up to 3 bytes ("hel").
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 3);
         assert_eq!(unsafe { align_rt_buffer_len(b) }, 3);
@@ -22006,6 +22717,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0);
         assert_eq!(unsafe { &*b }.data.len(), 0, "EOF publishes no initialized bytes");
         assert_eq!(unsafe { &*b }.data.capacity(), 3, "the caller's read window is retained");
+        assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 3);
 
         unsafe { align_rt_buffer_free(b) };
         unsafe { align_rt_io_reader_free(r) };
@@ -33243,6 +33955,15 @@ mod tests {
         decoder.into_response()
     }
 
+    fn streaming_decoder_for_test(head: &[u8]) -> Result<HttpResponseDecoder, HttpParseErr> {
+        let mut decoder = HttpResponseDecoder::new_streaming(false, None);
+        let (consumed, final_head) = decoder.feed_head(head)?;
+        if consumed != head.len() || !final_head {
+            return Err(HttpParseErr::Incomplete);
+        }
+        Ok(decoder)
+    }
+
     fn http_response_body(response: &HttpResponse) -> &[u8] {
         response.bounded_body.as_deref().unwrap_or_else(|| {
             &response.buf[response.body_start..response.body_start + response.body_len]
@@ -33685,13 +34406,137 @@ mod tests {
         exact_body
             .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40000000\r\n")
             .unwrap();
-        assert!(matches!(exact_body.state, HttpDecodeState::ChunkData { remaining } if remaining == HTTP_MAX_BODY));
+        assert!(matches!(exact_body.state, HttpDecodeState::ChunkData { remaining } if remaining == HTTP_MAX_BODY as u64));
         let mut oversized_body = HttpResponseDecoder::new(false);
         assert!(
             oversized_body
                 .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40000001\r\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn http_streaming_content_length_is_u64_bounded_without_body_allocation() {
+        for length in [
+            (HTTP_MAX_BODY as u64) + 1,
+            u64::MAX,
+        ] {
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+            let decoder = streaming_decoder_for_test(head.as_bytes()).unwrap();
+            assert!(
+                matches!(decoder.state, HttpDecodeState::Fixed { remaining } if remaining == length)
+            );
+            assert!(decoder.bounded_body.is_none());
+            assert_eq!(decoder.acc.capacity(), HTTP_MAX_HEADER_BLOCK);
+        }
+
+        let above_u64 = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n";
+        assert!(matches!(
+            streaming_decoder_for_test(above_u64),
+            Err(HttpParseErr::Invalid)
+        ));
+
+        let mut bounded = HttpResponseDecoder::new_streaming(false, Some(5));
+        assert!(matches!(
+            bounded.feed_head(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n"
+            ),
+            Err(HttpParseErr::BodyLimit)
+        ));
+    }
+
+    #[test]
+    fn http_streaming_chunk_framing_allowance_is_operation_local_and_exact() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut decoder = streaming_decoder_for_test(head).unwrap();
+        decoder.reset_stream_framing_allowance();
+
+        // 52,427 ordinary one-byte chunks contribute five framing bytes each. The final extended
+        // size line contributes seven plus its two-byte payload CRLF: exactly 262,144 framing bytes.
+        const ORDINARY: usize = 52_427;
+        let mut wire = Vec::with_capacity(ORDINARY * 6 + 10);
+        for _ in 0..ORDINARY {
+            wire.extend_from_slice(b"1\r\nx\r\n");
+        }
+        wire.extend_from_slice(b"1;x=y\r\ny\r\n");
+        let mut output = vec![0u8; ORDINARY + 2];
+        let mut written = 0usize;
+        let consumed = decoder
+            .feed_stream(&wire, &mut output, &mut written)
+            .unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(written, ORDINARY + 1);
+        assert_eq!(decoder.chunk_framing_bytes, HTTP_MAX_CHUNK_FRAMING);
+        assert!(matches!(decoder.state, HttpDecodeState::ChunkSize));
+
+        // A successful call replenishes the allowance, so the terminal chunk/trailer completes.
+        decoder.reset_stream_framing_allowance();
+        written = 0;
+        assert_eq!(
+            decoder
+                .feed_stream(b"0\r\n\r\n", &mut output[..1], &mut written)
+                .unwrap(),
+            5
+        );
+        assert_eq!(written, 0);
+        assert!(decoder.complete());
+
+        // The exact byte may also be the last byte of a nonzero size line. Payload already present
+        // in the same scratch is publishable without consuming its following CRLF; that framing is
+        // carried into the next operation and charged only there.
+        let mut size_boundary = streaming_decoder_for_test(head).unwrap();
+        size_boundary.chunk_framing_bytes = HTTP_MAX_CHUNK_FRAMING - 3;
+        written = 0;
+        assert_eq!(
+            size_boundary
+                .feed_stream(b"1\r\nx\r\n", &mut output[..2], &mut written)
+                .unwrap(),
+            4,
+        );
+        assert_eq!(written, 1);
+        assert!(matches!(
+            size_boundary.state,
+            HttpDecodeState::ChunkDataCrLf { seen: 0 }
+        ));
+        size_boundary.reset_stream_framing_allowance();
+        written = 0;
+        assert_eq!(
+            size_boundary
+                .feed_stream(b"\r\n0\r\n\r\n", &mut output[..1], &mut written)
+                .unwrap(),
+            7,
+        );
+        assert!(size_boundary.complete());
+
+        // The exact byte may be either byte of payload CRLF. A prior payload byte makes the call a
+        // successful publication boundary; the unconsumed suffix resumes under a fresh allowance.
+        for (seen, input, expected_consumed) in [(0, b"\r\n".as_slice(), 1), (1, b"\n", 1)] {
+            let mut crlf_boundary = streaming_decoder_for_test(head).unwrap();
+            crlf_boundary.state = HttpDecodeState::ChunkDataCrLf { seen };
+            crlf_boundary.chunk_framing_bytes = HTTP_MAX_CHUNK_FRAMING - 1;
+            written = 1;
+            assert_eq!(
+                crlf_boundary
+                    .feed_stream(input, &mut output[..2], &mut written)
+                    .unwrap(),
+                expected_consumed,
+            );
+            assert_eq!(written, 1);
+        }
+
+        // Exact exhaustion at a complete CRLF cannot continue when the operation has no payload to
+        // publish. It rejects before requesting or consuming the next chunk-line byte.
+        let mut exhausted = streaming_decoder_for_test(head).unwrap();
+        exhausted.state = HttpDecodeState::ChunkDataCrLf { seen: 1 };
+        exhausted.chunk_framing_bytes = HTTP_MAX_CHUNK_FRAMING - 1;
+        written = 0;
+        assert_eq!(
+            exhausted.feed_stream(b"\n", &mut output[..1], &mut written),
+            Err(HttpParseErr::Invalid)
+        );
+        assert_eq!(written, 0);
+        assert!(matches!(exhausted.state, HttpDecodeState::ChunkSize));
+        assert_eq!(exhausted.stream_read_limit(1), 0);
     }
 
     #[test]
@@ -33929,6 +34774,497 @@ mod tests {
         let req = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
         assert!(req.starts_with("GET /path HTTP/1.1\r\n"), "request line: {req:?}");
         assert!(req.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "auto Host header missing: {req:?}");
+    }
+
+    fn open_http_read_stream(client: *mut HttpClient, url: &str) -> *mut HttpReadStream {
+        let method = b"GET";
+        let request = unsafe {
+            align_rt_http_request_new(
+                method.as_ptr(),
+                method.len() as i64,
+                url.as_ptr(),
+                url.len() as i64,
+            )
+        };
+        let mut stream = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_request_stream(client, request, &mut stream) },
+            0
+        );
+        assert!(!stream.is_null());
+        stream
+    }
+
+    fn read_http_stream_all(stream: *mut HttpReadStream, capacity: i64) -> Vec<u8> {
+        let buffer = align_rt_buffer_new(capacity);
+        let mut body = Vec::new();
+        loop {
+            let mut count = -1;
+            let status = unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) };
+            assert_eq!(status, 0);
+            assert!(count >= 0 && count <= capacity);
+            if count == 0 {
+                break;
+            }
+            let mut view = AlignStr { ptr: core::ptr::null(), len: 0 };
+            unsafe { align_rt_buffer_bytes(buffer, &mut view) };
+            body.extend_from_slice(unsafe { safe_slice(view.ptr, view.len) });
+        }
+        unsafe { align_rt_buffer_free(buffer) };
+        body
+    }
+
+    #[test]
+    fn http_read_stream_fixed_head_views_and_caller_windows() {
+        let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 11\r\nX-Mode: raw\r\n\r\nhello world".to_vec();
+        let (port, server) = http_serve_once(response);
+        let url = format!("http://127.0.0.1:{port}/download");
+        let client = align_rt_http_client_new();
+        let stream = open_http_read_stream(client, &url);
+
+        assert_eq!(unsafe { align_rt_http_read_stream_status(stream) }, 206);
+        let mut value = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(
+            unsafe {
+                align_rt_http_read_stream_header(
+                    stream,
+                    b"x-mode".as_ptr(),
+                    b"x-mode".len() as i64,
+                    &mut value,
+                )
+            },
+            1
+        );
+        assert_eq!(unsafe { safe_slice(value.ptr, value.len) }, b"raw");
+        assert_eq!(read_http_stream_all(stream, 3), b"hello world");
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"GET /download HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn http_read_stream_dechunks_and_close_delimited_completes_at_eof() {
+        for (response, expected) in [
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3; x=y\r\nllo\r\n0\r\nX-Done: yes\r\n\r\n".to_vec(),
+                b"hello".as_slice(),
+            ),
+            (
+                b"HTTP/1.0 200 OK\r\n\r\nclose body".to_vec(),
+                b"close body".as_slice(),
+            ),
+        ] {
+            let (port, server) = http_serve_once(response);
+            let url = format!("http://127.0.0.1:{port}/");
+            let client = align_rt_http_client_new();
+            let stream = open_http_read_stream(client, &url);
+            assert_eq!(read_http_stream_all(stream, 2), expected);
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_read_stream_error_is_stable_and_never_publishes_partial_bytes() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiXX".to_vec();
+        let (port, server) = http_serve_once(response);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        let stream = open_http_read_stream(client, &url);
+        let buffer = align_rt_buffer_new(8);
+        for _ in 0..2 {
+            let mut count = 99;
+            assert_eq!(
+                unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+                AL_INVALID
+            );
+            assert_eq!(count, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+        }
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_read_stream_ffi_validation_precedes_request_consumption_and_stream_work() {
+        let client = align_rt_http_client_new();
+        let request = unsafe {
+            align_rt_http_request_new(
+                b"GET".as_ptr(),
+                3,
+                b"http://127.0.0.1/".as_ptr(),
+                17,
+            )
+        };
+        assert_eq!(
+            unsafe {
+                align_rt_http_client_request_stream(
+                    client,
+                    request,
+                    core::ptr::null_mut(),
+                )
+            },
+            AL_INVALID
+        );
+        // A missing output leaves the nonnull request caller-owned.
+        unsafe { align_rt_http_request_free(request) };
+
+        let request = unsafe {
+            align_rt_http_request_new(
+                b"GET".as_ptr(),
+                3,
+                b"http://127.0.0.1/".as_ptr(),
+                17,
+            )
+        };
+        let mut untouched = 1usize as *mut HttpReadStream;
+        assert_eq!(
+            unsafe {
+                align_rt_http_client_request_stream(
+                    core::ptr::null_mut(),
+                    request,
+                    &mut untouched,
+                )
+            },
+            AL_INVALID
+        );
+        assert!(untouched.is_null(), "a valid stream output is cleared first");
+        // A missing client likewise leaves the nonnull request caller-owned.
+        unsafe { align_rt_http_request_free(request) };
+
+        let mut header = AlignStr {
+            ptr: 1usize as *const u8,
+            len: 7,
+        };
+        assert_eq!(
+            unsafe {
+                align_rt_http_read_stream_header(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    1,
+                    &mut header,
+                )
+            },
+            0
+        );
+        assert!(header.ptr.is_null());
+        assert_eq!(header.len, 0);
+
+        let zero = align_rt_buffer_new(0);
+        let mut count = 7;
+        assert_eq!(
+            unsafe {
+                align_rt_http_read_stream_read(core::ptr::null_mut(), zero, &mut count)
+            },
+            AL_INVALID
+        );
+        assert_eq!(count, 0);
+        unsafe { align_rt_buffer_free(zero) };
+
+        let buffer = align_rt_buffer_new(4);
+        unsafe { align_rt_buffer_put(buffer, u64::from(b'x'), 1, 0) };
+        assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 1);
+        assert_eq!(
+            unsafe {
+                align_rt_http_read_stream_read(
+                    core::ptr::null_mut(),
+                    buffer,
+                    core::ptr::null_mut(),
+                )
+            },
+            AL_INVALID
+        );
+        assert_eq!(
+            unsafe { align_rt_buffer_len(buffer) },
+            1,
+            "a missing count output is rejected before touching the buffer",
+        );
+        let mut count = 9;
+        assert_eq!(
+            unsafe { align_rt_http_read_stream_read(core::ptr::null_mut(), buffer, &mut count) },
+            AL_INVALID
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            unsafe { align_rt_buffer_len(buffer) },
+            0,
+            "a valid buffer is cleared before the stream handle is inspected",
+        );
+        unsafe { align_rt_buffer_free(buffer) };
+
+        let (port, server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx".to_vec(),
+        );
+        let url = format!("http://127.0.0.1:{port}/zero-state");
+        let live_client = align_rt_http_client_new();
+        let stream = open_http_read_stream(live_client, &url);
+        let zero = align_rt_buffer_new(0);
+        let mut count = 9;
+        assert_eq!(
+            unsafe { align_rt_http_read_stream_read(stream, zero, &mut count) },
+            AL_INVALID
+        );
+        assert_eq!(count, 0);
+        unsafe { align_rt_buffer_free(zero) };
+        assert_eq!(
+            read_http_stream_all(stream, 1),
+            b"x",
+            "the zero-capacity precondition fails before advancing a live stream",
+        );
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(live_client) };
+        server.join().unwrap();
+
+        unsafe { align_rt_http_read_stream_free(core::ptr::null_mut()) };
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    #[test]
+    fn http_read_stream_exact_completion_pools_and_incomplete_drop_closes() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata".to_vec();
+
+        // Exact completion returns the checked-out connection to the creating client. Two
+        // streaming requests therefore need only one accepted socket.
+        let (port, server) = http_serve_pool(response.clone(), 1, false);
+        let url = format!("http://127.0.0.1:{port}/complete");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_read_stream(client, &url);
+            assert_eq!(read_http_stream_all(stream, 2), b"data");
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "exact completion reuses one connection");
+
+        // Dropping with an unread body closes immediately instead of draining or pooling. The next
+        // request must therefore arrive on a fresh accepted socket.
+        let (port, server) = http_serve_pool(response, 2, false);
+        let url = format!("http://127.0.0.1:{port}/drop");
+        let client = align_rt_http_client_new();
+        let incomplete = open_http_read_stream(client, &url);
+        unsafe { align_rt_http_read_stream_free(incomplete) };
+        let complete = open_http_read_stream(client, &url);
+        assert_eq!(read_http_stream_all(complete, 2), b"data");
+        unsafe { align_rt_http_read_stream_free(complete) };
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "incomplete Drop closes without pooling");
+    }
+
+    #[test]
+    fn http_read_stream_pool_residual_and_stale_retry_matrix() {
+        for (label, response, expected) in [
+            (
+                "bodyless",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                b"".as_slice(),
+            ),
+            (
+                "chunked",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Done: yes\r\n\r\n".to_vec(),
+                b"hi".as_slice(),
+            ),
+        ] {
+            let (port, server) = http_serve_pool(response, 1, false);
+            let url = format!("http://127.0.0.1:{port}/{label}");
+            let client = align_rt_http_client_new();
+            for _ in 0..2 {
+                let stream = open_http_read_stream(client, &url);
+                assert_eq!(read_http_stream_all(stream, 2), expected, "{label}");
+                unsafe { align_rt_http_read_stream_free(stream) };
+            }
+            unsafe { align_rt_http_client_free(client) };
+            assert_eq!(server.join().unwrap(), 1, "{label} exact completion pools");
+        }
+
+        // Residual bytes past a fixed body are never mistaken for the next response.
+        let residual = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhiEXTRA".to_vec();
+        let (port, server) = http_serve_pool(residual, 2, false);
+        let url = format!("http://127.0.0.1:{port}/residual");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_read_stream(client, &url);
+            assert_eq!(read_http_stream_all(stream, 2), b"hi");
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "residual scratch closes the connection");
+
+        // A pooled connection which the peer closed is retried once on a fresh connection only
+        // while no byte of the new response has arrived.
+        let stale = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(stale, 2, true);
+        let url = format!("http://127.0.0.1:{port}/stale");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_read_stream(client, &url);
+            assert_eq!(read_http_stream_all(stream, 2), b"hi");
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "stale pooled stream retries fresh once");
+    }
+
+    #[test]
+    fn http_read_stream_explicit_body_limit_is_exact_and_stable() {
+        let exact = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let (port, server) = http_serve_once(exact);
+        let url = format!("http://127.0.0.1:{port}/exact");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
+        let stream = open_http_read_stream(client, &url);
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 1) };
+        assert_eq!(read_http_stream_all(stream, 2), b"hello");
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+
+        // A declared excess is known from the final head and fails construction before a body read.
+        let excess = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello!".to_vec();
+        let (port, server) = http_serve_once(excess);
+        let url = format!("http://127.0.0.1:{port}/declared-excess");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
+        let request = unsafe {
+            align_rt_http_request_new(
+                b"GET".as_ptr(),
+                3,
+                url.as_ptr(),
+                url.len() as i64,
+            )
+        };
+        let mut stream = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_request_stream(client, request, &mut stream) },
+            AL_HTTP_BODY_LIMIT,
+        );
+        assert!(stream.is_null());
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+
+        for (label, body, expected) in [
+            ("close-exact", b"hello".as_slice(), 0),
+            ("close-excess", b"hello!".as_slice(), AL_HTTP_BODY_LIMIT),
+        ] {
+            let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+            response.extend_from_slice(body);
+            let (port, server) = http_serve_once(response);
+            let url = format!("http://127.0.0.1:{port}/{label}");
+            let client = align_rt_http_client_new();
+            unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
+            let stream = open_http_read_stream(client, &url);
+            let buffer = align_rt_buffer_new(8);
+            let mut count = -1;
+            assert_eq!(
+                unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+                expected,
+                "{label}",
+            );
+            if expected == 0 {
+                assert_eq!(count, 5);
+                count = -1;
+                assert_eq!(
+                    unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+                    0,
+                    "{label} EOF",
+                );
+                assert_eq!(count, 0);
+            } else {
+                assert_eq!(count, 0);
+                assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+            }
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            server.join().unwrap();
+        }
+
+        // A chunked excess is recognized later. Bytes from earlier calls stay published, while the
+        // failing call publishes neither its within-limit prefix nor a count; the terminal result is
+        // then stable and performs no more I/O.
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n".to_vec();
+        let (port, server) = http_serve_once(chunked);
+        let url = format!("http://127.0.0.1:{port}/chunked-excess");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
+        let stream = open_http_read_stream(client, &url);
+        let buffer = align_rt_buffer_new(2);
+        let mut count = -1;
+        assert_eq!(
+            unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+            0,
+        );
+        assert_eq!(count, 2);
+        let mut bytes = AlignStr { ptr: core::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(buffer, &mut bytes) };
+        assert_eq!(unsafe { safe_slice(bytes.ptr, bytes.len) }, b"ab");
+        for _ in 0..2 {
+            count = 99;
+            assert_eq!(
+                unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+                AL_HTTP_BODY_LIMIT,
+            );
+            assert_eq!(count, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+        }
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_read_stream_timeout_is_stable_after_the_connection_closes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stream timeout");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept stream timeout");
+            let mut request = [0u8; 512];
+            assert!(socket.read(&mut request).unwrap_or(0) > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        let url = format!("http://127.0.0.1:{port}/timeout");
+        let client = align_rt_http_client_new();
+        let request = unsafe {
+            align_rt_http_request_new(
+                b"GET".as_ptr(),
+                3,
+                url.as_ptr(),
+                url.len() as i64,
+            )
+        };
+        unsafe { align_rt_http_timeout(request, 50_000_000) };
+        let mut stream = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_request_stream(client, request, &mut stream) },
+            0,
+        );
+        // The request override was snapshotted by construction; a later client setter cannot
+        // lengthen this stream's receive deadline.
+        unsafe { align_rt_http_client_timeout(client, 1_000_000_000) };
+        let buffer = align_rt_buffer_new(2);
+        for _ in 0..2 {
+            let mut count = 99;
+            assert_eq!(
+                unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
+                AL_TIMEOUT,
+            );
+            assert_eq!(count, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+        }
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
     }
 
     /// All public whole-body client calls share the chunk decoder. Chunk metadata/trailers never
@@ -35351,6 +36687,27 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         }
         unsafe { align_rt_http_client_free(client) };
         assert_eq!(server.join().unwrap(), 1, "terminal trailers permit reuse of one TLS connection");
+    }
+
+    #[test]
+    fn https_read_stream_dechunks_and_reuses_the_live_tls_connection() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Done: yes\r\n\r\n".to_vec();
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response, 1, false);
+        let url = format!("https://127.0.0.1:{port}/stream");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_read_stream(client, &url);
+            assert_eq!(read_http_stream_all(stream, 1), b"hi");
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "two completed streams reuse one live TLS connection",
+        );
     }
 
     #[test]

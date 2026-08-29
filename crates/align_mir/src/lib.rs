@@ -1503,6 +1503,8 @@ pub enum Rvalue {
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
     BufferLen(Operand),
+    /// The fixed caller-selected read window, independent of the buffer's current published len.
+    BufferCapacity(Operand),
     /// `bytes.<scalar>_<le|be>(off)` — a binary scalar read from the `slice<u8>` operand at byte
     /// offset `off`. `scalar` is the result type (its width sets how many bytes are loaded); `be`
     /// selects big-endian. Bounds are checked (`emit_range_bounds_check`) **before** this rvalue, so
@@ -2188,6 +2190,29 @@ pub enum Rvalue {
         req: Operand,
         out: Slot,
     },
+    /// Streaming sibling of [`Rvalue::HttpClientRequest`]. The request is consumed and the runtime
+    /// writes one dependent `http_read_stream` owner into `out` on success.
+    HttpClientRequestStream {
+        client: Operand,
+        req: Operand,
+        out: Slot,
+    },
+    /// Final response status retained by a receive stream. Pure.
+    HttpReadStreamStatus {
+        stream: Operand,
+    },
+    /// Final response header view retained by a receive stream. Pure and stream-bound.
+    HttpReadStreamHeader {
+        stream: Operand,
+        name: Operand,
+        out: Slot,
+    },
+    /// De-framed body read. The runtime writes the byte count to `out` and returns an i32 status.
+    HttpReadStreamRead {
+        stream: Operand,
+        buffer: Operand,
+        out: Slot,
+    },
     /// `cl.get_many(urls, max_concurrency)` — batched concurrent GET: the runtime writes an owned
     /// `array<response>` `{ptr,len}` header (a buffer of `response` handles, input order) to `out` and
     /// returns an `i32` status (0 = ok; else the lowest-index transport/parse error). `client` is
@@ -2549,18 +2574,29 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
         Rvalue::HttpClientGet { .. }
         | Rvalue::HttpClientPost { .. }
         | Rvalue::HttpClientRequest { .. }
+        | Rvalue::HttpClientRequestStream { .. }
+        | Rvalue::HttpReadStreamStatus { .. }
+        | Rvalue::HttpReadStreamHeader { .. }
+        | Rvalue::HttpReadStreamRead { .. }
         | Rvalue::HttpGetMany { .. } => Some(Capability::Tls),
         _ => None,
     }
 }
 
-/// The capabilities a single function's body requires — the gated external libraries its builtins
-/// call into (`libz`/`libzstd`/`libcrypto`/`libssl`). The per-function granularity that the M15
-/// per-unit interface summary unions over a unit's functions; the classification source of truth is
-/// [`rvalue_capability`], shared with [`collect_capability_libs`], so the two never drift. Emitted in
-/// first-seen order (deduped); an empty vec for a function with no gated feature.
+/// The capabilities a single function requires — the gated external libraries its builtins or
+/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A receive-stream Drop can close a
+/// TLS connection even when the function never reads it, so the slot types are part of this answer
+/// alongside [`rvalue_capability`]. The per-function granularity is what the M15 per-unit interface
+/// summary unions over a unit's functions. Emitted in first-seen order (deduped); an empty vec for a
+/// function with no gated feature.
 #[inline(never)]
-pub fn function_capabilities(f: &Function) -> Vec<Capability> {
+pub fn function_capabilities(
+    f: &Function,
+    structs: &[hir::StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Vec<Capability> {
     let mut caps: Vec<Capability> = Vec::new();
     for blk in &f.blocks {
         for s in &blk.stmts {
@@ -2572,6 +2608,19 @@ pub fn function_capabilities(f: &Function) -> Vec<Capability> {
             }
         }
     }
+    if !caps.contains(&Capability::Tls)
+        && f.slots.iter().copied().any(|ty| {
+            align_sema::http_stream_carrier_class(
+                ty,
+                structs,
+                tuples,
+                enums,
+                tagged_types,
+            ) != align_sema::HttpStreamCarrierClass::None
+        })
+    {
+        caps.push(Capability::Tls);
+    }
     caps
 }
 
@@ -2579,10 +2628,16 @@ pub fn function_capabilities(f: &Function) -> Vec<Capability> {
 /// deduplicated, in a deterministic order. Appended to `Program.link_libs` by [`lower_program`] so
 /// the driver links only what is used. A pure program (no gated feature) yields an empty list.
 #[inline(never)]
-fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
+fn collect_capability_libs(
+    fns: &[Function],
+    structs: &[hir::StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Vec<String> {
     let mut caps: Vec<Capability> = Vec::new();
     for f in fns {
-        for cap in function_capabilities(f) {
+        for cap in function_capabilities(f, structs, tuples, enums, tagged_types) {
             if !caps.contains(&cap) {
                 caps.push(cap);
             }
@@ -2955,7 +3010,13 @@ fn lower_program_unchecked(
     // User-declared `extern "C" link("name")` libraries come first (validated in sema); then the
     // libraries the used builtins require. Both feed the driver's single `-l<name>` loop.
     let mut link_libs = program.link_libs.clone();
-    for l in collect_capability_libs(&fns) {
+    for l in collect_capability_libs(
+        &fns,
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
+    ) {
         if !link_libs.contains(&l) {
             link_libs.push(l);
         }
@@ -6164,6 +6225,10 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpClientRequestStream { .. }
+            | hir::ExprKind::HttpReadStreamStatus { .. }
+            | hir::ExprKind::HttpReadStreamHeader { .. }
+            | hir::ExprKind::HttpReadStreamRead { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -6333,6 +6398,10 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpClientGet { .. }
         | hir::ExprKind::HttpClientPost { .. }
         | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpClientRequestStream { .. }
+        | hir::ExprKind::HttpReadStreamStatus { .. }
+        | hir::ExprKind::HttpReadStreamHeader { .. }
+        | hir::ExprKind::HttpReadStreamRead { .. }
         | hir::ExprKind::HttpGetMany { .. }
         | hir::ExprKind::HttpServe { .. }
         | hir::ExprKind::HttpAccept { .. }
@@ -7408,6 +7477,10 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpClientRequestStream { .. }
+            | hir::ExprKind::HttpReadStreamStatus { .. }
+            | hir::ExprKind::HttpReadStreamHeader { .. }
+            | hir::ExprKind::HttpReadStreamRead { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -14228,6 +14301,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpReadStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn(_) => KeyOrder::PartialFloat,
@@ -17258,6 +17332,36 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                 true,
             )
         }
+        hir::ExprKind::HttpClientRequestStream { client, req } => {
+            let out = b.new_slot(Ty::HttpReadStream);
+            let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
+            null_moved_source(b, req);
+            lower_http_response_result(
+                b,
+                Rvalue::HttpClientRequestStream {
+                    client: c,
+                    req: rq,
+                    out,
+                },
+                out,
+                Ty::HttpReadStream,
+                e.ty,
+                true,
+            )
+        }
+        hir::ExprKind::HttpReadStreamStatus { stream } => {
+            let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::HttpReadStreamStatus { stream }));
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpReadStreamHeader { stream, name } => {
+            lower_http_read_stream_header(b, stream, name, e.ty)
+        }
+        hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
+            lower_http_read_stream_read(b, stream, buffer, e.ty)
+        }
         // `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an
         // owned `array<response>` into an out slot + returns an i32 status; branch Ok(array)/Err — the
         // owned-array-from-runtime shape of `fs.read_dir`, not the single-handle `lower_http_response_result`.
@@ -17928,6 +18032,137 @@ fn lower_http_resp_header(
     let r = b.fresh_value(result_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+#[inline(never)]
+fn lower_http_read_stream_header(
+    b: &mut Builder,
+    stream: &hir::Expr,
+    name: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+    let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        flag,
+        Rvalue::HttpReadStreamHeader { stream, name, out },
+    ));
+
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    b.cur = some_bb;
+    let view = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(view, Rvalue::Load(out)));
+    let some = b.fresh_value(result_ty);
+    b.push(Stmt::Let(some, Rvalue::OptionSome(Operand::Value(view))));
+    b.push(Stmt::Store(result, Operand::Value(some)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let none = b.fresh_value(result_ty);
+    b.push(Stmt::Let(none, Rvalue::OptionNone));
+    b.push(Stmt::Store(result, Operand::Value(none)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn lower_http_read_stream_read(
+    b: &mut Builder,
+    stream: &hir::Expr,
+    buffer: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+    let buffer = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+
+    let capacity = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(capacity, Rvalue::BufferCapacity(buffer.clone())));
+    let positive = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        positive,
+        Rvalue::Bin(
+            BinOp::Gt,
+            Operand::Value(capacity),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
+    let call_bb = b.new_block();
+    let abort_bb = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(positive), call_bb, abort_bb));
+
+    b.cur = abort_bb;
+    let aborted = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        aborted,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = call_bb;
+    let count_out = b.new_slot(i64_ty());
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        code,
+        Rvalue::HttpReadStreamRead {
+            stream,
+            buffer,
+            out: count_out,
+        },
+    ));
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
+
+    b.cur = ok_bb;
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(count, Rvalue::Load(count_out)));
+    let ok = b.fresh_value(result_ty);
+    b.push(Stmt::Let(ok, Rvalue::ResultOk(Operand::Value(count))));
+    b.push(Stmt::Store(result, Operand::Value(ok)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = err_bb;
+    let error = make_http_client_error_from_status(b, code, result_ty);
+    let err = b.fresh_value(result_ty);
+    b.push(Stmt::Let(err, Rvalue::ResultErr(error)));
+    b.push(Stmt::Store(result, Operand::Value(err)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
 }
 
 /// `hs.get(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns an
@@ -19294,6 +19529,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Captures => "captures".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::HttpReadStream => "http_read_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
         Ty::JsonScanner(id) => format!("json.scanner<struct#{id}>"),
         Ty::Struct(id) => format!("struct#{id}"),

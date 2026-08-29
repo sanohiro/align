@@ -5580,6 +5580,79 @@ fn malformed_hir_global_type_metadata_fails_closed() {
 
 #[test]
 fn malformed_hir_type_placement_fails_closed() {
+    let mut stream_field = baseline_program();
+    stream_field.structs[0].fields[0].ty = Ty::HttpReadStream;
+    assert_placement_rejected("HTTP read stream struct field", &stream_field);
+
+    let mut nested_stream_field = baseline_program();
+    let stream_option = nested_stream_field.tagged_types.len() as u32;
+    nested_stream_field
+        .tagged_types
+        .push(TaggedType::Option(Scalar::HttpReadStream));
+    nested_stream_field.structs[0].fields[0].ty = Ty::Tagged(stream_option);
+    assert_placement_rejected(
+        "nested HTTP read stream struct field",
+        &nested_stream_field,
+    );
+
+    let mut stream_enum = baseline_program();
+    stream_enum.enums[0].variants[1].payload = vec![Scalar::HttpReadStream];
+    assert_placement_rejected("HTTP read stream enum payload", &stream_enum);
+
+    let mut stream_tuple = baseline_program();
+    stream_tuple.tuples[0].elems = vec![Scalar::HttpReadStream];
+    assert_placement_rejected("HTTP read stream tuple element", &stream_tuple);
+
+    assert_placement_rejected(
+        "HTTP read stream collection element",
+        &with_return(Ty::DynArray(Scalar::HttpReadStream)),
+    );
+
+    let mut stream_out = baseline_program();
+    let mut out = imported_fn("dep$stream_out", vec![Ty::HttpReadStream], Ty::Unit);
+    out.param_modes[0] = align_ast::ParamMode::Out;
+    stream_out.imported_fns.push(out);
+    assert_placement_rejected("HTTP read stream out parameter", &stream_out);
+
+    let mut stream_capture = baseline_program();
+    let mut lifted = body_test_parameter_function(
+        "stream_capture",
+        Ty::HttpReadStream,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    );
+    lifted.origin = hir::FnOrigin::Lifted { capture_count: 1 };
+    lifted.locals[0].is_param = false;
+    stream_capture.fns.push(lifted);
+    assert_placement_rejected("HTTP read stream closure capture", &stream_capture);
+
+    let mut stream_headers = baseline_program();
+    let nested_stream = stream_headers.tagged_types.len() as u32;
+    stream_headers
+        .tagged_types
+        .push(TaggedType::Option(Scalar::HttpReadStream));
+    stream_headers.imported_fns.push(imported_fn(
+        "dep$stream_carrier",
+        vec![Ty::HttpReadStream, Ty::Tagged(nested_stream)],
+        Ty::Tagged(nested_stream),
+    ));
+    stream_headers.fn_types[0].params = vec![(
+        align_ast::ParamMode::ByValue,
+        Scalar::HttpReadStream,
+    )];
+    stream_headers.fn_types[0].ret = Ty::HttpReadStream;
+    assert!(
+        validate_hir::global_type_metadata_is_valid(&stream_headers),
+        "HTTP read stream carrier headers are graph-valid"
+    );
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(&stream_headers),
+        "direct and builtin tagged HTTP read stream carriers are valid headers"
+    );
+
     let mut field_box = baseline_program();
     field_box.structs[0].fields[0].ty = Ty::Box(scalar_int(64));
     assert_placement_rejected("box in struct field", &field_box);
@@ -10814,6 +10887,7 @@ fn hir_body_validator_native() {
     let result_unit = native_result(Ty::Unit, error);
     let result_buffer = native_result(Ty::Buffer, error);
     let result_response = native_result(Ty::HttpResponse, error);
+    let result_read_stream = native_result(Ty::HttpReadStream, error);
     let result_u8_array = Ty::DynArray(u8_scalar);
 
     macro_rules! add {
@@ -12453,6 +12527,71 @@ fn hir_body_validator_native() {
         result_response
     );
     add!(
+        "native_http_client_request_stream",
+        body_test_expr(
+            hir::ExprKind::HttpClientRequestStream {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                req: Box::new(native_local(1, Ty::HttpRequest)),
+            },
+            result_read_stream,
+        ),
+        vec![
+            body_test_local(0, "client", Ty::HttpClient, false, false),
+            body_test_local(1, "request", Ty::HttpRequest, false, false),
+        ],
+        result_read_stream
+    );
+    add!(
+        "native_http_read_stream_status",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamStatus {
+                stream: Box::new(native_local(0, Ty::HttpReadStream)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(
+            0,
+            "stream",
+            Ty::HttpReadStream,
+            false,
+            false,
+        )],
+        i64_ty
+    );
+    add!(
+        "native_http_read_stream_header",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamHeader {
+                stream: Box::new(native_local(0, Ty::HttpReadStream)),
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Str),
+        ),
+        vec![body_test_local(
+            0,
+            "stream",
+            Ty::HttpReadStream,
+            false,
+            false,
+        )],
+        Ty::Option(Scalar::Str)
+    );
+    add!(
+        "native_http_read_stream_read",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamRead {
+                stream: Box::new(native_local(0, Ty::HttpReadStream)),
+                buffer: Box::new(native_local(1, Ty::Buffer)),
+            },
+            result_i64,
+        ),
+        vec![
+            body_test_local(0, "stream", Ty::HttpReadStream, false, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+        ],
+        result_i64
+    );
+    add!(
         "native_http_get_many",
         body_test_expr(
             hir::ExprKind::HttpGetMany {
@@ -12788,6 +12927,105 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    for name in [
+        "native_http_client_request_stream",
+        "native_http_read_stream_read",
+    ] {
+        let mut reject = program.clone();
+        body_value_expression_mut(&mut reject, name).ty = Ty::Bool;
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: malformed result type"
+        );
+    }
+    for name in [
+        "native_http_read_stream_status",
+        "native_http_read_stream_header",
+    ] {
+        let mut reject = program.clone();
+        body_statement_expression_mut(&mut reject, name).ty = Ty::Bool;
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: malformed result type"
+        );
+    }
+
+    let mut reject = program.clone();
+    let expression =
+        body_value_expression_mut(&mut reject, "native_http_client_request_stream");
+    let hir::ExprKind::HttpClientRequestStream { client, req: _ } = &mut expression.kind else {
+        panic!("stream request fixture lost its discriminator")
+    };
+    client.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression =
+        body_value_expression_mut(&mut reject, "native_http_client_request_stream");
+    let hir::ExprKind::HttpClientRequestStream { req, .. } = &mut expression.kind else {
+        panic!("stream request fixture lost its discriminator")
+    };
+    req.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    for name in ["native_http_read_stream_status", "native_http_read_stream_header"] {
+        let mut reject = program.clone();
+        let expression = body_statement_expression_mut(&mut reject, name);
+        let stream = match &mut expression.kind {
+            hir::ExprKind::HttpReadStreamStatus { stream }
+            | hir::ExprKind::HttpReadStreamHeader { stream, .. } => stream,
+            _ => panic!("{name}: stream fixture lost its discriminator"),
+        };
+        *stream = Box::new(body_test_expr(
+            hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(native_local(0, Ty::HttpReadStream))),
+            }),
+            Ty::HttpReadStream,
+        ));
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: temporary stream receiver"
+        );
+    }
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_http_read_stream_read");
+    let hir::ExprKind::HttpReadStreamRead { stream, .. } = &mut expression.kind else {
+        panic!("stream read fixture lost its discriminator")
+    };
+    *stream = Box::new(body_test_expr(
+        hir::ExprKind::Block(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(native_local(0, Ty::HttpReadStream))),
+        }),
+        Ty::HttpReadStream,
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "native_http_read_stream_read: temporary stream receiver"
+    );
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(&mut reject, "native_http_read_stream_header");
+    let hir::ExprKind::HttpReadStreamHeader { name, .. } = &mut expression.kind else {
+        panic!("stream header fixture lost its discriminator")
+    };
+    name.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let function = reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_read_stream_read")
+        .expect("stream read fixture is present");
+    function.locals[1].is_mut = false;
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "stream read buffer must be mutable"
+    );
 
     for name in [
         "native_reader_open_beneath",
@@ -14297,6 +14535,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpReadStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn { .. }
@@ -14358,6 +14597,7 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::HttpRequestCtx,
         Scalar::ResponseBuilder,
         Scalar::HttpStream,
+        Scalar::HttpReadStream,
         Scalar::RunOutput,
         Scalar::Fn(0),
         Scalar::Resource(0),

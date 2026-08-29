@@ -16,9 +16,10 @@ trust store + hostname binding), dynamically linked alongside crypto's libcrypto
 stays deferred (client-first). HTTP/3, routing, middleware = pkg, not std.
 
 **Module status: v1 COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). The first
-post-`pkg.db` convergence item, client streaming receive, is **DESIGNED 2026-08-29 and not yet
-implemented**. Server-side TLS, client certs, custom CA, session resumption, and revocation remain
-separate backlog items.
+post-`pkg.db` convergence item, client streaming receive, is **DESIGNED 2026-08-29**; its dependent
+raw `http_read_stream` boundary is **IMPLEMENTED 2026-08-30**, while the consuming SSE transition
+remains the next capability. Server-side TLS, client certs, custom CA, session resumption, and
+revocation remain separate backlog items.
 
 ## Signatures
 
@@ -1261,7 +1262,7 @@ No benchmark is required: this contract makes a resource ceiling, not a throughp
 instrumentation measures the ceiling directly. Changing the code, allocation strategy, public
 method, framing precedence, or layer ownership reopens this ledger before implementation.
 
-## Client streaming receive (post-`pkg.db` convergence item 1 — DESIGNED 2026-08-29)
+## Client streaming receive (post-`pkg.db` convergence item 1 — DESIGNED 2026-08-29; raw stream IMPLEMENTED 2026-08-30)
 
 The whole-body API is the right terminal when a caller needs one owned `response`; it is the wrong
 terminal for an indefinite provider stream or a large download. This capability exposes the already

@@ -10,7 +10,8 @@ generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
-owned JSON, exclusive filesystem publication, and retained-root regular-file access, there are 298 `RuntimeKey`
+owned JSON, exclusive filesystem publication, retained-root regular-file access, and raw HTTP client
+receive streaming, there are 304 `RuntimeKey`
 variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
@@ -23,7 +24,7 @@ runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 311 records. Request 12 adds the keyed bounded-builder stack
+therefore has 317 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -34,10 +35,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 311 base records.
+The compiler-visible native registry is always exactly the 317 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 319.
+records extend only the verification-time maximum runtime-export table to 325.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -48,9 +49,30 @@ spelling.
 
 Request 11 added six regular `RuntimeKey` rows for bounded process capture. Request 5 subsequently
 added the two bounded-HTTP setters, and Request 9 then added `BuilderWriteUint`.
-Their runtime definitions and registry entries activated atomically: the current
-exact counts are 298 keyed records, 311 base records, and 319 records in the
+The raw HTTP receive-stream capability subsequently added six keyed rows for buffer-capacity
+inspection, stream construction/access/read, and Drop. Their runtime definitions and registry
+entries activated atomically: the current exact counts are 304 keyed records, 317 base records, and
+325 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
+
+## HTTP client raw receive-stream substrate (implemented)
+
+The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `BufferCapacity` | `align_rt_buffer_capacity` | A29: `i64 @SYM(ptr)` |
+| `HttpClientRequestStream` | `align_rt_http_client_request_stream` | A24: `i32 @SYM(ptr, ptr, ptr)` |
+| `HttpReadStreamFree` | `align_rt_http_read_stream_free` | A62: `void @SYM(ptr)` |
+| `HttpReadStreamHeader` | `align_rt_http_read_stream_header` | A22: `i32 @SYM(ptr, ptr, i64, ptr)` |
+| `HttpReadStreamRead` | `align_rt_http_read_stream_read` | A24: `i32 @SYM(ptr, ptr, ptr)` |
+| `HttpReadStreamStatus` | `align_rt_http_read_stream_status` | A29: `i64 @SYM(ptr)` |
+
+`HttpClientRequestStream` consumes the request and publishes a dependent stream handle only on
+success. Header lookup publishes a borrowed view into the retained head block. Read writes an exact
+byte count to its out slot and mutates only the caller buffer; a source-visible zero-capacity buffer
+is rejected before this ABI is called. `HttpReadStreamFree` is null-safe and closes rather than
+draining an incomplete response.
 
 ## Request 9 owned JSON extension
 
@@ -206,14 +228,14 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A19 | `i32 @SYM(ptr, ptr)` | `align_rt_builder_finish_bounded_stack`, `align_rt_tcp_accept`, `align_rt_command_run`, `align_rt_io_writer_write_builder`, `align_rt_http_accept`, `align_rt_http_respond`, `align_rt_http_stream_reject` |
 | A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event` |
 | A21 | `i32 @SYM(ptr, ptr, i64, i64, ptr)` | `align_rt_http_get_many`, `align_rt_regex_find` |
-| A22 | `i32 @SYM(ptr, ptr, i64, ptr)` | `align_rt_cli_parse`, `align_rt_http_resp_header`, `align_rt_http_client_get`, `align_rt_regex_find_all`, `align_rt_regex_split`, `align_rt_regex_captures`, `align_rt_http_ctx_header` |
+| A22 | `i32 @SYM(ptr, ptr, i64, ptr)` | `align_rt_cli_parse`, `align_rt_http_resp_header`, `align_rt_http_client_get`, `align_rt_regex_find_all`, `align_rt_regex_split`, `align_rt_regex_captures`, `align_rt_http_ctx_header`, `align_rt_http_read_stream_header` |
 | A23 | `i32 @SYM(ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_http_client_post` |
-| A24 | `i32 @SYM(ptr, ptr, ptr)` | `align_rt_http_client_request`, `align_rt_http_respond_stream` |
+| A24 | `i32 @SYM(ptr, ptr, ptr)` | `align_rt_http_client_request`, `align_rt_http_client_request_stream`, `align_rt_http_read_stream_read`, `align_rt_http_respond_stream` |
 | A25 | `i64 @SYM()` | `align_rt_time_now`, `align_rt_time_instant`, `align_rt_process_cpu_count` |
 | A26 | `i64 @SYM(ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_hash64` |
 | A27 | `i64 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_find`, `align_rt_str_rfind` |
 | A28 | `i64 @SYM(ptr readonly captures(none), ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_finder_find` |
-| A29 | `i64 @SYM(ptr)` | `align_rt_child_wait`, `align_rt_run_output_code`, `align_rt_io_file_len`, `align_rt_buffer_len`, `align_rt_rng_next`, `align_rt_http_resp_status`, `align_rt_regex_group_count` |
+| A29 | `i64 @SYM(ptr)` | `align_rt_child_wait`, `align_rt_run_output_code`, `align_rt_io_file_len`, `align_rt_buffer_len`, `align_rt_buffer_capacity`, `align_rt_rng_next`, `align_rt_http_resp_status`, `align_rt_http_read_stream_status`, `align_rt_regex_group_count` |
 | A30 | `i64 @SYM(ptr, i64)` | `align_rt_json_doc_len` |
 | A31 | `i64 @SYM(ptr, i64, i64)` | `align_rt_rng_range` |
 | A32 | `i64 @SYM(ptr, i64, i64, i64, i64, ptr, ptr, i64)` | `align_rt_group_sum_str`, `align_rt_group_min_str`, `align_rt_group_max_str`, `align_rt_group_count_str` |
@@ -246,7 +268,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A59 | `void @SYM(i64) {noreturn}` | `align_rt_process_exit` |
 | A60 | `void @SYM(i64, i64) {noreturn}` | `align_rt_bounds_fail`, `align_rt_len_mismatch_fail`, `align_rt_utf8_boundary_fail` |
 | A61 | `void @SYM(i64, i64, i64) {noreturn}` | `align_rt_range_fail` |
-| A62 | `void @SYM(ptr)` | `align_rt_arena_end`, `align_rt_tg_end`, `align_rt_free`, `align_rt_str_finder_free`, `align_rt_builder_pop_comma`, `align_rt_tcp_conn_free`, `align_rt_tcp_listener_free`, `align_rt_udp_socket_free`, `align_rt_child_free`, `align_rt_command_env_clear`, `align_rt_command_free`, `align_rt_run_output_free`, `align_rt_io_reader_free`, `align_rt_io_writer_free`, `align_rt_io_file_free`, `align_rt_buffer_free`, `align_rt_array_builder_free`, `align_rt_array_builder_free_stack`, `align_rt_array_builder_free_strings`, `align_rt_array_builder_free_strings_stack`, `align_rt_crypto_random`, `align_rt_rng_seed_os`, `align_rt_cli_command_free`, `align_rt_cli_parsed_free`, `align_rt_http_request_free`, `align_rt_http_resp_free`, `align_rt_http_client_free`, `align_rt_http_server_free`, `align_rt_regex_captures_free`, `align_rt_regex_free`, `align_rt_http_ctx_free`, `align_rt_http_response_free`, `align_rt_http_stream_free`, `align_rt_builder_free`, `align_rt_builder_free_stack` |
+| A62 | `void @SYM(ptr)` | `align_rt_arena_end`, `align_rt_tg_end`, `align_rt_free`, `align_rt_str_finder_free`, `align_rt_builder_pop_comma`, `align_rt_tcp_conn_free`, `align_rt_tcp_listener_free`, `align_rt_udp_socket_free`, `align_rt_child_free`, `align_rt_command_env_clear`, `align_rt_command_free`, `align_rt_run_output_free`, `align_rt_io_reader_free`, `align_rt_io_writer_free`, `align_rt_io_file_free`, `align_rt_buffer_free`, `align_rt_array_builder_free`, `align_rt_array_builder_free_stack`, `align_rt_array_builder_free_strings`, `align_rt_array_builder_free_strings_stack`, `align_rt_crypto_random`, `align_rt_rng_seed_os`, `align_rt_cli_command_free`, `align_rt_cli_parsed_free`, `align_rt_http_request_free`, `align_rt_http_read_stream_free`, `align_rt_http_resp_free`, `align_rt_http_client_free`, `align_rt_http_server_free`, `align_rt_regex_captures_free`, `align_rt_regex_free`, `align_rt_http_ctx_free`, `align_rt_http_response_free`, `align_rt_http_stream_free`, `align_rt_builder_free`, `align_rt_builder_free_stack` |
 | A63 | `void @SYM(ptr, double)` | `align_rt_builder_write_f64` |
 | A64 | `void @SYM(ptr, float)` | `align_rt_builder_write_f32` |
 | A65 | `void @SYM(ptr, i32)` | `align_rt_builder_write_bool`, `align_rt_builder_write_char` |
@@ -393,24 +415,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 298 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 304 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 311 base native symbols against default-feature `align_runtime` exports,
+- the 317 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 315 `alloc-count` and 315 `par-map-probe` native symbols against
+- the 321 `alloc-count` and 321 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 319 maximum native symbols against `align_runtime` built with
+- the 325 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 311 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  311 exact registry function types through the production compatibility
+- all 317 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  317 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

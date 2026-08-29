@@ -921,6 +921,16 @@ impl<'a> PlacementValidator<'a> {
         self.abstract_nodes.contains(&node)
     }
 
+    fn stream_carrier_class(&self, ty: Ty) -> align_sema::HttpStreamCarrierClass {
+        align_sema::http_stream_carrier_class(
+            ty,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        )
+    }
+
     fn struct_fields_valid(&self) -> bool {
         for (id, definition) in self.program.structs.iter().enumerate() {
             if definition.name.starts_with("pkg.db$query$")
@@ -939,7 +949,8 @@ impl<'a> PlacementValidator<'a> {
             }
             let abstract_node = self.is_abstract(Node::Struct(id as u32));
             for field in &definition.fields {
-                if !self.field_type_ok(field.ty, abstract_node)
+                if self.stream_carrier_class(field.ty) != align_sema::HttpStreamCarrierClass::None
+                    || !self.field_type_ok(field.ty, abstract_node)
                     || (definition.c_repr && !matches!(field.ty, Ty::Int(_) | Ty::Float(_)))
                     || !self.inline_structs_unaligned(field.ty)
                 {
@@ -955,7 +966,10 @@ impl<'a> PlacementValidator<'a> {
             let abstract_node = self.is_abstract(Node::Enum(id as u32));
             for variant in &definition.variants {
                 for &payload in &variant.payload {
-                    if self.scalar_contains_run_bytes(payload) {
+                    if self.scalar_contains_run_bytes(payload)
+                        || self.stream_carrier_class(align_sema::scalar_to_ty(payload))
+                            != align_sema::HttpStreamCarrierClass::None
+                    {
                         return false;
                     }
                     let valid = if abstract_node {
@@ -975,7 +989,9 @@ impl<'a> PlacementValidator<'a> {
     fn tuples_valid(&self) -> bool {
         for (id, tuple) in self.program.tuples.iter().enumerate() {
             for &element in &tuple.elems {
-                if !self.tuple_element_ok(element)
+                if self.stream_carrier_class(align_sema::scalar_to_ty(element))
+                    != align_sema::HttpStreamCarrierClass::None
+                    || !self.tuple_element_ok(element)
                     || (self.is_abstract(Node::Tuple(id as u32))
                         && matches!(element, Scalar::Param(_)))
                 {
@@ -1014,9 +1030,14 @@ impl<'a> PlacementValidator<'a> {
     fn function_types_valid(&self) -> bool {
         for (id, function) in self.program.fn_types.iter().enumerate() {
             let allow_param = self.is_abstract(Node::Fn(id as u32));
-            if !function.params.iter().all(|(_, parameter)| {
-                self.scalar_ok(*parameter, ScalarPlacement::FnParameter { allow_param })
+            if !function.params.iter().all(|(mode, parameter)| {
+                let class = self.stream_carrier_class(align_sema::scalar_to_ty(*parameter));
+                class != align_sema::HttpStreamCarrierClass::Forbidden
+                    && !(mode.is_out() && class == align_sema::HttpStreamCarrierClass::Carrier)
+                    && self.scalar_ok(*parameter, ScalarPlacement::FnParameter { allow_param })
             }) || !self.resolve_type_ok(function.ret, allow_param)
+                || self.stream_carrier_class(function.ret)
+                    == align_sema::HttpStreamCarrierClass::Forbidden
             {
                 return false;
             }
@@ -1031,9 +1052,15 @@ impl<'a> PlacementValidator<'a> {
                     .locals
                     .get(local as usize)
                     .is_some_and(|local| {
-                        self.stored_function_parameter_ok(function, index, local.ty)
+                        let class = self.stream_carrier_class(local.ty);
+                        class != align_sema::HttpStreamCarrierClass::Forbidden
+                            && !(function.param_modes.get(index).is_some_and(|mode| mode.is_out())
+                                && class == align_sema::HttpStreamCarrierClass::Carrier)
+                            && self.stored_function_parameter_ok(function, index, local.ty)
                     })
-            }) || !self.source_function_type_ok(function.ret, false, true)
+            }) || self.stream_carrier_class(function.ret)
+                    == align_sema::HttpStreamCarrierClass::Forbidden
+                || !self.source_function_type_ok(function.ret, false, true)
             {
                 return false;
             }
@@ -1046,7 +1073,16 @@ impl<'a> PlacementValidator<'a> {
             if !function
                 .params
                 .iter()
-                .all(|&parameter| self.source_function_type_ok(parameter, true, false))
+                .enumerate()
+                .all(|(index, &parameter)| {
+                    let class = self.stream_carrier_class(parameter);
+                    class != align_sema::HttpStreamCarrierClass::Forbidden
+                        && !(function.param_modes.get(index).is_some_and(|mode| mode.is_out())
+                            && class == align_sema::HttpStreamCarrierClass::Carrier)
+                        && self.source_function_type_ok(parameter, true, false)
+                })
+                || self.stream_carrier_class(function.ret)
+                    == align_sema::HttpStreamCarrierClass::Forbidden
                 || !self.source_function_type_ok(function.ret, false, true)
             {
                 return false;
@@ -1071,7 +1107,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn field_type_ok(&self, ty: Ty, allow_param: bool) -> bool {
         match ty {
-            Ty::RunBytes => false,
+            Ty::RunBytes | Ty::HttpReadStream => false,
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
@@ -1300,6 +1336,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
             | Scalar::HttpStream
+            | Scalar::HttpReadStream
             | Scalar::ResponseBuilder
             | Scalar::RunOutput => !matches!(mode, ScalarPlacement::Collection),
             Scalar::RunBytes => !matches!(mode, ScalarPlacement::Collection),
@@ -1340,6 +1377,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::ResponseBuilder => true,
+            Scalar::HttpReadStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
             Scalar::DynArray(_) => true,
             Scalar::DynStructArray(id) => {
@@ -1445,6 +1483,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream => true,
+            Ty::HttpReadStream => true,
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
             Ty::CliParsed
@@ -1543,6 +1582,9 @@ impl<'a> PlacementValidator<'a> {
         };
         if index < capture_start {
             return self.source_function_type_ok(ty, true, false);
+        }
+        if self.stream_carrier_class(ty) != align_sema::HttpStreamCarrierClass::None {
+            return false;
         }
         match ty {
             Ty::Array(element, length) => {
@@ -1935,6 +1977,7 @@ impl<'a> Validator<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Unit => true,
@@ -1987,6 +2030,7 @@ impl<'a> Validator<'a> {
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpReadStream
             | Scalar::RunOutput => true,
             Scalar::RunBytes => true,
         }
@@ -2955,6 +2999,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::JsonDoc => true,
             Ty::Param(_)
             | Ty::SoaParam(_)
@@ -3254,6 +3299,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpReadStream
             | Scalar::RunOutput => true,
             Scalar::RunBytes => true,
             Scalar::Param(_) | Scalar::SoaParam(_) => false,
@@ -4009,6 +4055,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpClientRequestStream { .. }
+            | hir::ExprKind::HttpReadStreamStatus { .. }
+            | hir::ExprKind::HttpReadStreamHeader { .. }
+            | hir::ExprKind::HttpReadStreamRead { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -4318,6 +4368,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
+            | hir::ExprKind::HttpClientRequestStream { .. }
+            | hir::ExprKind::HttpReadStreamStatus { .. }
+            | hir::ExprKind::HttpReadStreamHeader { .. }
+            | hir::ExprKind::HttpReadStreamRead { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
@@ -8260,6 +8314,29 @@ impl<'a> BodyValidator<'a> {
                     && req.ty == Ty::HttpRequest)
                     .then(|| result(Ty::HttpResponse, &[client, req]))?
             }
+            hir::ExprKind::HttpClientRequestStream { client, req } => {
+                (local(client, Ty::HttpClient)
+                    && client.ty == Ty::HttpClient
+                    && req.ty == Ty::HttpRequest)
+                    .then(|| result(Ty::HttpReadStream, &[client, req]))?
+            }
+            hir::ExprKind::HttpReadStreamStatus { stream } => {
+                (local(stream, Ty::HttpReadStream) && stream.ty == Ty::HttpReadStream)
+                    .then(|| strict(i64, &[stream]))?
+            }
+            hir::ExprKind::HttpReadStreamHeader { stream, name } => {
+                (local(stream, Ty::HttpReadStream)
+                    && stream.ty == Ty::HttpReadStream
+                    && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Option(Scalar::Str), &[stream, name]))?
+            }
+            hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
+                (local(stream, Ty::HttpReadStream)
+                    && stream.ty == Ty::HttpReadStream
+                    && mutable_local(buffer, Ty::Buffer)
+                    && buffer.ty == Ty::Buffer)
+                    .then(|| result(i64, &[stream, buffer]))?
+            }
             hir::ExprKind::HttpGetMany {
                 client,
                 urls,
@@ -8471,6 +8548,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::Param(_)
             | Ty::SoaParam(_)
             | Ty::IntVar(_)

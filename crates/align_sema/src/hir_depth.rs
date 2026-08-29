@@ -624,6 +624,18 @@ fn walk_body_records<'a>(
                     client: lhs,
                     req: rhs,
                 }
+                | ExprKind::HttpClientRequestStream {
+                    client: lhs,
+                    req: rhs,
+                }
+                | ExprKind::HttpReadStreamHeader {
+                    stream: lhs,
+                    name: rhs,
+                }
+                | ExprKind::HttpReadStreamRead {
+                    stream: lhs,
+                    buffer: rhs,
+                }
                 | ExprKind::HttpCtxHeader {
                     headers: lhs,
                     name: rhs,
@@ -796,6 +808,7 @@ fn walk_body_records<'a>(
                 | ExprKind::HttpParse { data: recv }
                 | ExprKind::HttpRespStatus { resp: recv }
                 | ExprKind::HttpRespBody { resp: recv }
+                | ExprKind::HttpReadStreamStatus { stream: recv }
                 | ExprKind::HttpAccept { server: recv }
                 | ExprKind::HttpCtxMethod { ctx: recv }
                 | ExprKind::HttpCtxPath { ctx: recv }

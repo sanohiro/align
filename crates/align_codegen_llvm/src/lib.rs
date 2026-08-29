@@ -4476,6 +4476,7 @@ fn validate_tagged_program_inner(
                 | Scalar::HttpRequestCtx
                 | Scalar::ResponseBuilder
                 | Scalar::HttpStream
+                | Scalar::HttpReadStream
                 | Scalar::RunOutput
                 | Scalar::RunBytes
                 // MIR carries no function-type table; the embedded signature facts are validated
@@ -4613,6 +4614,7 @@ fn validate_tagged_program_inner(
                         | Ty::HttpRequestCtx
                         | Ty::ResponseBuilder
                         | Ty::HttpStream
+                        | Ty::HttpReadStream
                         | Ty::HttpHeaders
                         | Ty::JsonDoc
                         | Ty::Fn(_)
@@ -7590,6 +7592,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpReadStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn(_)
@@ -8148,6 +8151,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
         Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
+        Scalar::HttpReadStream => unreachable!("an http_read_stream handle is not a box/array payload"),
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
@@ -8252,6 +8256,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::HttpRequestCtx => RuntimeKey::HttpCtxFree,
         Ty::ResponseBuilder => RuntimeKey::HttpResponseFree,
         Ty::HttpStream => RuntimeKey::HttpStreamFree,
+        Ty::HttpReadStream => RuntimeKey::HttpReadStreamFree,
         // Unreachable while every `align_sema::MOVE_HANDLE_TYPES` entry has a row above, which is
         // what the sweep test asserts. Kept fail-closed rather than panicking in a compiler.
         _ => return None,
@@ -14901,6 +14906,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_len returns i64")
             }
+            Rvalue::BufferCapacity(buf) => {
+                let bp = self.operand(buf)?.into();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::BufferCapacity), &[bp], "bufcap")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("buffer_capacity returns i64")
+            }
             // `bytes.<scalar>_<le|be>(off)` — inline binary scalar read. The byte address is a plain
             // (non-`inbounds`) GEP into the bounds-checked `slice<u8>` view; the load is alignment-1
             // (the offset is arbitrary). A `be` read byte-swaps into host order (single-byte reads
@@ -15935,6 +15947,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::HttpClientRequest), &[c.into(), r.into(), out_ptr.into()], "httpreqcall")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_client_request returns i32 status")
+            }
+            Rvalue::HttpClientRequestStream { client, req, out } => {
+                let c = self.operand(client)?.into_pointer_value();
+                let r = self.operand(req)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::HttpClientRequestStream), &[c.into(), r.into(), out_ptr.into()], "httpreqstream")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_client_request_stream returns i32 status")
+            }
+            Rvalue::HttpReadStreamStatus { stream } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::HttpReadStreamStatus), &[stream.into()], "httpreadstatus")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_read_stream_status returns i64")
+            }
+            Rvalue::HttpReadStreamHeader { stream, name, out } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::HttpReadStreamHeader), &[stream.into(), np.into(), nl.into(), out_ptr.into()], "httpreadheader")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_read_stream_header returns i32 present flag")
+            }
+            Rvalue::HttpReadStreamRead { stream, buffer, out } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                let buffer = self.operand(buffer)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.i64_type().const_zero()).map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::HttpReadStreamRead), &[stream.into(), buffer.into(), out_ptr.into()], "httpread")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_read_stream_read returns i32 status")
             }
             // cl.get_many — the runtime writes an owned `array<response>` `{ptr,len}` header into `out`
             // and returns an i32 status (0 = ok; else the lowest-index error). Zero the out slot first
