@@ -181,6 +181,63 @@ align_tb_discover "$artifacts" || {
   exit 1
 }
 
+# The four-core nightly runner has enough aggregate CPU for the full suite but
+# can still miss its 30-minute budget when Cargo's artifact order leaves large
+# generated-program owners at the tail. Give the measured long runners a
+# coarse longest-first rank before admission. This is only a scheduling hint:
+# every discovered binary still runs exactly once, unknown targets retain
+# their Cargo order, and verdict identity remains package/kind/target below.
+#
+# Ranks come from the 2026-08-29 four-core constrained full-suite run. Only
+# their relative order matters; refresh the list when the nightly report shows
+# a different tail rather than raising either timeout.
+align_suite_priority_score() {
+  case "$1" in
+    align_driver::test::pkg_db_a1) echo 100 ;;
+    align_driver::test::pkg_db_q4b) echo 99 ;;
+    align_driver::test::pkg_db_q5b2) echo 95 ;;
+    align_driver::test::pkg_db_q3) echo 94 ;;
+    align_driver::test::pkg_db_q1) echo 93 ;;
+    align_driver::test::deep_type_graphs) echo 92 ;;
+    align_driver::test::pkg_db_q4a) echo 85 ;;
+    align_driver::test::pkg_db_q2) echo 80 ;;
+    align_driver::test::pkg_db_callbacks) echo 75 ;;
+    align_driver::test::pkg_db_pool) echo 72 ;;
+    align_driver::test::apps_web_validate) echo 70 ;;
+    align_driver::test::pkg_db_a2) echo 60 ;;
+    align_driver::test::pkg_db_q6) echo 59 ;;
+    align_driver::test::pkg_db_q5b1) echo 55 ;;
+    align_driver::test::fuzz_differential) echo 52 ;;
+    align_mir::lib::align_mir) echo 50 ;;
+    align_driver::test::inprocess_memo) echo 45 ;;
+    align_driver::test::apps_web_router) echo 43 ;;
+    align_driver::test::apps_web_multipart) echo 40 ;;
+    align_codegen_llvm::lib::align_codegen_llvm) echo 38 ;;
+    align_driver::test::m5) echo 35 ;;
+    *) echo 0 ;;
+  esac
+}
+
+align_suite_order_binaries() {
+  local manifest target_kind target_name executable package identity score ordinal=0
+  printf '%s\n' "$ALIGN_TB_BINARIES" |
+    while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
+      [ -n "$executable" ] || continue
+      ordinal=$((ordinal + 1))
+      package="$(basename "$(dirname "$manifest")")"
+      identity="$package::$target_kind::$target_name"
+      score="$(align_suite_priority_score "$identity")"
+      printf '%03d%s%06d%s%s%s%s%s%s%s%s\n' \
+        "$score" "$align_tb_tab" "$ordinal" "$align_tb_tab" \
+        "$manifest" "$align_tb_tab" "$target_kind" "$align_tb_tab" \
+        "$target_name" "$align_tb_tab" "$executable"
+    done |
+    LC_ALL=C sort -t "$align_tb_tab" -k1,1nr -k2,2n |
+    cut -f3-
+}
+
+ALIGN_TB_BINARIES="$(align_suite_order_binaries)"
+
 # Cargo's executable basenames are not identities: `align-repl` and
 # `align_repl` normalize to the same `align_repl-<hash>`, and separate packages
 # may reuse a target name. Key the manifest by package directory, target kind,
