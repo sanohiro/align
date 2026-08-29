@@ -57,6 +57,10 @@ jobs:
       # Fail closed on the linker: a missing lld-22 must be a red build, not a
       # silent fallback to the slow system linker (build-perf item 2).
       ALIGNC_LINKER: lld
+      # Six binary processes keep the four runner cores fed while generated
+      # compilers block in link and subprocess work. Longest-first admission
+      # and shared-MIR deep-graph coverage remove the tail from run 33225158075.
+      ALIGN_GATE_JOBS: 6
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

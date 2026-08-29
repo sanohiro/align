@@ -24,6 +24,63 @@ fn deep_types(module: Option<&str>, depth: usize) -> String {
     source
 }
 
+struct DeepArtifacts {
+    object: std::path::PathBuf,
+    executable: std::path::PathBuf,
+}
+
+impl Drop for DeepArtifacts {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.object);
+        let _ = std::fs::remove_file(&self.executable);
+    }
+}
+
+fn emit_llvm_raw_optimized_and_run(
+    name: &str,
+    source: &str,
+) -> (String, String, std::process::Output) {
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, name, source);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let raw =
+        emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("emit raw llvm ir");
+    let optimized = emit_llvm_ir(&mir, BuildTarget::Baseline, true, &[], false)
+        .expect("emit optimized llvm ir");
+
+    let directory = std::env::temp_dir();
+    let pid = std::process::id();
+    let object = directory.join(format!("align-test-{pid}-{name}.o"));
+    let executable = directory.join(format!(
+        "align-test-{pid}-{name}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let _artifacts = DeepArtifacts {
+        object: object.clone(),
+        executable: executable.clone(),
+    };
+    emit_object_file(
+        &mir,
+        &object,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &[],
+        false,
+    )
+    .expect("emit object file");
+    link_executable(&object, &executable, &mir.link_libs, Profile::Release)
+        .expect("link executable");
+    let output = std::process::Command::new(&executable)
+        .output()
+        .expect("run executable");
+    (raw, optimized, output)
+}
+
 #[test]
 fn deep_nominal_graph_reaches_raw_optimized_and_executable() {
     if !backend_available() {
@@ -36,15 +93,12 @@ fn deep_nominal_graph_reaches_raw_optimized_and_executable() {
             let mut source = deep_types(None, 4_096);
             source.push_str("fn main() -> i32 = 7\n");
 
-            let raw = emit_llvm(&source);
+            let (raw, optimized, output) =
+                emit_llvm_raw_optimized_and_run("deep-type-graph", &source);
             assert!(raw.contains("define i32 @main()"));
-            let optimized = emit_llvm_optimized(&source, &[]);
             assert!(optimized.contains("@main()"));
             assert!(optimized.contains("ret i32 7"));
-            assert_eq!(
-                build_and_run("deep-type-graph", &source).status.code(),
-                Some(7)
-            );
+            assert_eq!(output.status.code(), Some(7));
         })
         .expect("spawn deep type driver owner")
         .join()

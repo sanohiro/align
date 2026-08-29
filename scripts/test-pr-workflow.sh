@@ -1861,7 +1861,43 @@ for identity in \
   }
 done
 
-# 8. The self-build branch (no artifact argument) must build the workspace
+# 8. The nightly admits measured long runners first. Priority changes only
+# launch order: every qualified target still runs once, and unranked targets
+# retain Cargo's artifact order.
+mkdir -p "$suite_dir/align_driver"
+schedule_stream="$tmp_dir/suite-priority-order.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_green" align_driver test m0
+  suite_artifact "$suite_green" align_driver test pkg_db_q3
+  suite_artifact "$suite_green" align_driver test constants
+  suite_artifact "$suite_green" align_driver test pkg_db_a1
+  suite_artifact "$suite_green" align_driver test deep_type_graphs
+  suite_artifact "$suite_green" align_driver test inprocess_memo
+} >"$schedule_stream"
+schedule_out="$tmp_dir/suite-priority-order-out"
+ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$schedule_stream" >"$schedule_out" 2>&1 || {
+  echo "the prioritized suite fixture failed:" >&2
+  cat "$schedule_out" >&2
+  exit 1
+}
+schedule_starts="$(sed -n 's/^suite: start //p' "$schedule_out")"
+expected_schedule="$(printf '%s\n' \
+  'align_driver::test::pkg_db_a1' \
+  'align_driver::test::pkg_db_q3' \
+  'align_driver::test::deep_type_graphs' \
+  'align_driver::test::inprocess_memo' \
+  'align_driver::test::m0' \
+  'align_driver::test::constants')"
+[[ "$schedule_starts" == "$expected_schedule" ]] || {
+  echo "the suite did not admit long runners first while retaining the unranked order:" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "$expected_schedule" "$schedule_starts" >&2
+  exit 1
+}
+
+# 9. The self-build branch (no artifact argument) must build the workspace
 # before the test-binary build — `cargo test --no-run` alone does not produce
 # libalign_runtime.a, the hole that invalidated the first nightly baseline —
 # and must fail closed as a configuration error (exit 2) when the build still
@@ -1992,6 +2028,10 @@ grep -Fq 'timeout-minutes: 30' "$nightly_workflow" || {
 }
 grep -Fq 'scripts/run-suite-binaries.sh' "$nightly_workflow" || {
   echo "nightly.yml no longer runs the suite runner" >&2
+  exit 1
+}
+grep -Eq '^      ALIGN_GATE_JOBS: 6$' "$nightly_workflow" || {
+  echo "nightly.yml no longer pins the measured six-process suite schedule" >&2
   exit 1
 }
 if grep -Eq 'cargo\.sh test --workspace' "$nightly_workflow"; then

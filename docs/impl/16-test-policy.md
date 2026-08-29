@@ -481,9 +481,21 @@ test) and `<binary-did-not-report>` (crash, or the per-binary cap).
 The budget is 30 minutes, hard. The job carries `timeout-minutes: 30`, the
 runner caps each individual binary at 15 minutes
 (`ALIGN_SUITE_BINARY_TIMEOUT`) so one hang cannot cost the report on everything
-else, and `ALIGN_GATE_JOBS` raises concurrency. A run that needs more than the
-budget is worthless as a detector: exceeding it is itself the red signal, not a
-number to raise, and no suite may be added whose cost only fits by extending it.
+else, and `ALIGN_GATE_JOBS` raises concurrency. The four-core nightly pins six
+binary processes so subprocess and linker waits do not leave cores idle, and
+admits measured long-running generated-program owners in longest-first order;
+unknown targets retain Cargo's artifact order and still run exactly once. The
+4,096-node whole-program type-DAG owner checks and lowers once, then exercises
+raw LLVM, optimized LLVM, and native execution from the same MIR; the three
+backend consumers remain distinct without repeating an identical frontend
+pass. Its per-unit twin retains all 4,096 public roots and the recursively
+Move/string leaf. Interface-summary construction computes string reachability
+once for the complete record graph before selecting owned-JSON roots instead
+of walking every suffix from scratch; descriptor eligibility and bytes stay
+unchanged. This keeps both the whole-job and per-binary bounds meaningful. A
+run that needs more than the budget is worthless as a detector: exceeding it
+is itself the red signal, not a number to raise, and no suite may be added
+whose cost only fits by extending it.
 
 Running `scripts/run-suite-binaries.sh` with no arguments reproduces the
 nightly's judgement locally. The nightly is a detector, not a second PR gate: a

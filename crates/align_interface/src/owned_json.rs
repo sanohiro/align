@@ -129,6 +129,45 @@ fn node_has_string(node: &Node, structs: &[IStructDef], seen: &mut HashSet<usize
     false
 }
 
+fn records_reaching_string(structs: &[IStructDef]) -> HashSet<usize> {
+    let names = structs
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut reverse_edges = vec![Vec::new(); structs.len()];
+    let mut reaching = HashSet::new();
+
+    for (owner, definition) in structs.iter().enumerate() {
+        for (_, ty) in &definition.fields {
+            let Ok(node) = parse_node(ty, &names) else {
+                continue;
+            };
+            let mut work = vec![node];
+            while let Some(node) = work.pop() {
+                match node {
+                    Node::String => {
+                        reaching.insert(owner);
+                    }
+                    Node::Record(id) => reverse_edges[id].push(owner),
+                    Node::Option(payload) | Node::Array(payload) => work.push(*payload),
+                    Node::Int { .. } | Node::Bool => {}
+                }
+            }
+        }
+    }
+
+    let mut work = reaching.iter().copied().collect::<Vec<_>>();
+    while let Some(id) = work.pop() {
+        for &owner in &reverse_edges[id] {
+            if reaching.insert(owner) {
+                work.push(owner);
+            }
+        }
+    }
+    reaching
+}
+
 fn align_up(value: u32, align: u32) -> Option<u32> {
     value
         .checked_add(align.checked_sub(1)?)
@@ -184,25 +223,36 @@ fn node_record_edges(node: &Node, depth: u16, out: &mut Vec<(usize, u16)>) -> Re
     Ok(())
 }
 
-fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()> {
-    let names = structs
-        .iter()
-        .enumerate()
-        .map(|(index, definition)| (definition.name.as_str(), index))
-        .collect::<HashMap<_, _>>();
+fn build_graph_with_reachability(
+    structs: &[IStructDef],
+    root: usize,
+    reaching_string: Option<&HashSet<usize>>,
+) -> Result<Option<Graph>, ()> {
     let root_definition = structs.get(root).ok_or(())?;
     if !root_definition.type_params.is_empty() {
         return Ok(None);
     }
 
-    let mut has_string = false;
-    for (_, ty) in &root_definition.fields {
-        if let Ok(node) = parse_node(ty, &names) {
-            has_string |= node_has_string(&node, structs, &mut HashSet::new());
-        }
-    }
-    if !has_string {
+    if reaching_string.is_some_and(|reaching| !reaching.contains(&root)) {
         return Ok(None);
+    }
+
+    let names = structs
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+
+    if reaching_string.is_none() {
+        let mut has_string = false;
+        for (_, ty) in &root_definition.fields {
+            if let Ok(node) = parse_node(ty, &names) {
+                has_string |= node_has_string(&node, structs, &mut HashSet::new());
+            }
+        }
+        if !has_string {
+            return Ok(None);
+        }
     }
 
     enum Work {
@@ -336,6 +386,10 @@ fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()>
     }))
 }
 
+fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()> {
+    build_graph_with_reachability(structs, root, None)
+}
+
 fn encode_node(bytes: &mut Vec<u8>, node: &Node, graph: &Graph) -> Option<()> {
     let layout = node_storage_layout(
         node,
@@ -459,8 +513,10 @@ pub(crate) fn entries_for_structs(
     target: &OwnedJsonTarget,
 ) -> Option<Vec<OwnedJsonGraphInterfaceEntry>> {
     let mut entries = Vec::new();
+    let reaching_string = records_reaching_string(structs);
     for (root, definition) in structs.iter().enumerate() {
-        let Ok(Some(_)) = build_graph(structs, root) else {
+        let Ok(Some(_)) = build_graph_with_reachability(structs, root, Some(&reaching_string))
+        else {
             continue;
         };
         let descriptor = encode_owned_json_graph_descriptor(structs, &definition.name)?;
@@ -479,8 +535,10 @@ pub(crate) fn entries_for_resolved_structs(
     target: &OwnedJsonTarget,
 ) -> Option<Vec<OwnedJsonGraphInterfaceEntry>> {
     let mut entries = Vec::new();
+    let reaching_string = records_reaching_string(structs);
     for (type_name, root) in roots {
-        let Ok(Some(_)) = build_graph(structs, *root) else {
+        let Ok(Some(_)) = build_graph_with_reachability(structs, *root, Some(&reaching_string))
+        else {
             continue;
         };
         let descriptor = encode_owned_json_graph_descriptor_at(structs, *root)?;
@@ -1049,6 +1107,41 @@ mod tests {
                 vec![("ok", ty("bool")), ("text", ty("string"))],
             ),
         ]
+    }
+
+    #[test]
+    fn shared_string_reachability_matches_individual_root_selection() {
+        fn outcome(result: Result<Option<Graph>, ()>) -> i8 {
+            match result {
+                Ok(Some(_)) => 1,
+                Ok(None) => 0,
+                Err(()) => -1,
+            }
+        }
+
+        let mut structs = graph();
+        structs.extend([
+            definition("Plain", vec![("value", ty("i64"))]),
+            definition("CycleA", vec![("next", ty("CycleB"))]),
+            definition("CycleB", vec![("next", ty("CycleA"))]),
+        ]);
+        let mut rejected = definition("CRepr", vec![("text", ty("string"))]);
+        rejected.c_repr = true;
+        structs.push(rejected);
+        let reaching = records_reaching_string(&structs);
+
+        for root in 0..structs.len() {
+            assert_eq!(
+                outcome(build_graph_with_reachability(
+                    &structs,
+                    root,
+                    Some(&reaching),
+                )),
+                outcome(build_graph(&structs, root)),
+                "cached string reachability changed root {}",
+                structs[root].name
+            );
+        }
     }
 
     fn hex(text: &str) -> Vec<u8> {
