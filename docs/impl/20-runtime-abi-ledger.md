@@ -213,7 +213,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A26 | `i64 @SYM(ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_hash64` |
 | A27 | `i64 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_find`, `align_rt_str_rfind` |
 | A28 | `i64 @SYM(ptr readonly captures(none), ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_finder_find` |
-| A29 | `i64 @SYM(ptr)` | `align_rt_child_wait`, `align_rt_run_output_code`, `align_rt_io_file_len`, `align_rt_buffer_len`, `align_rt_buffer_capacity`, `align_rt_rng_next`, `align_rt_http_resp_status`, `align_rt_regex_group_count`, `align_rt_http_read_stream_status`, `align_rt_http_sse_stream_retry_ms` |
+| A29 | `i64 @SYM(ptr)` | `align_rt_child_wait`, `align_rt_run_output_code`, `align_rt_io_file_len`, `align_rt_buffer_len`, `align_rt_rng_next`, `align_rt_http_resp_status`, `align_rt_regex_group_count` |
 | A30 | `i64 @SYM(ptr, i64)` | `align_rt_json_doc_len` |
 | A31 | `i64 @SYM(ptr, i64, i64)` | `align_rt_rng_range` |
 | A32 | `i64 @SYM(ptr, i64, i64, i64, i64, ptr, ptr, i64)` | `align_rt_group_sum_str`, `align_rt_group_min_str`, `align_rt_group_max_str`, `align_rt_group_count_str` |
