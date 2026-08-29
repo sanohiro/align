@@ -1117,6 +1117,32 @@ region. This makes the resource promise mechanically testable: body cap plus cum
 allowance plus scratch. The default path keeps its existing one-buffer layout, while a caller asking
 for a hard bound accepts the explicit two-region response allocation needed to avoid transient growth.
 
+## Why HTTP streaming is a dependent reader with a consuming SSE transition
+
+A response stream has two owners that cannot be separated: the checked-out connection and the
+client pool to which an exactly completed connection may return. Making the stream retain an
+inferred shared borrow of its client expresses that relationship without a hidden reference-counted
+pool or visible lifetime syntax. Other shared client requests remain legal; moving or dropping the
+pool before the stream does not. Drop before exact completion closes immediately and never drains in
+the background, so both side effects and latency stay visible.
+
+Raw receive follows the settled I/O rule: a read fills a caller-owned fixed-capacity `buffer`.
+De-chunking is protocol mechanism and stays inside `std.http`; body allocation is policy and stays at
+the call site. An unset streaming request has no cumulative total cap because it never materializes
+the complete body, while a positive `max_response_body_bytes` remains enforceable and is never
+silently ignored. This is what allows both large downloads and indefinite event streams without a
+second client or a magic larger default.
+
+SSE is a consuming type transition rather than a boolean mode. After `sse()`, raw reads are absent
+from the type, so framing bytes and event state cannot be interleaved accidentally. `next` also fills
+caller storage and returns Copy views into its fresh generation; it does not allocate one owned
+string per token. WHATWG decoding and dispatch are mechanism. Redirects, media-type/status policy,
+reconnect timing, sleep, and `Last-Event-ID` request construction remain caller policy, because an
+automatic `EventSource` loop would hide network work and control flow; explicit stream accessors
+still expose the latest id/retry state when a control-only block precedes EOF. The same explicit-bound
+outcome, `Error.Code(-1)`, covers either a configured cumulative body bound or the selected event
+buffer capacity, always without partial publication.
+
 ---
 
 ## Why trusted filesystem access returns a file handle, not a path or directory handle

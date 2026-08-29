@@ -3843,7 +3843,7 @@ the plan so the sequencing survives; it does not lock any surface.
 ### Convergence — a few foundations unlock many exits
 
 ```text
-1. HTTP client streaming receive (de-chunk + incremental read + SSE)
+1. HTTP client streaming receive (de-chunk + incremental read + SSE) — DESIGNED 2026-08-29
      highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
 2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + PKCS#8 PEM)
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
@@ -3895,9 +3895,14 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   non-goal). Plus `encoding.percent_encode_path`.
 - **std.crypto asymmetric** — RS256 / ES256 / Ed25519 sign+verify + PKCS#8 PEM load; per-alg
   function names (alg-confusion closed by shape); ES256 raw r||s 64B; all Impure (FFI).
-- **std.http client streaming** — `http_read_stream` (distinct type from the shipped server-side
-  `http_stream`); de-chunk also completes the one-shot API; SSE receive per WHATWG; mid-body Drop
-  closes rather than pool-returns.
+- **std.http client streaming — DESIGNED 2026-08-29, implementation pending** — the sole constructor
+  is `cl.request_stream(req) -> Result<http_read_stream, Error>` (distinct from the shipped
+  server-side `http_stream`). Caller-buffer `read` exposes incremental de-chunked bytes. A consuming
+  transition yields `http_sse_stream`; caller-buffer `next` returns WHATWG-decoded
+  `http_sse_event` data/type/id/retry without automatic reconnect policy. Both dependent Move
+  resources borrow their client; exact completion may pool, while mid-body Drop closes without
+  draining. The authoritative ledger and two-PR raw/SSE implementation boundary are
+  `impl/std-design/http.md` “Client streaming receive.”
 - **std.fs.watch** — non-recursive directory watch; Move + blocking `next()` →
   `{path, Created|Modified|Removed}`; kqueue/inotify; consumers: `--watch` tooling, cert reload.
 

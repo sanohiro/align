@@ -1112,6 +1112,20 @@ response, and closes the connection. Bodyless `HEAD`/`204`/`304` metadata is val
 compared with the payload cap. With a 262,144-byte cap, live Align-owned response storage is bounded
 to 557,056 bytes. The exact framing/error/allocation matrix is in
 `docs/impl/std-design/http.md`.
+The designed post-`pkg.db` client streaming surface adds only
+`cl.request_stream(req) -> Result<http_read_stream, Error>`: the Move result borrows its client,
+retains the final status/header views, and fills a caller-owned fixed-capacity `buffer` with
+de-framed body bytes through `read` (`0` = complete). Exact self-delimited completion may return the
+connection to that client's pool; mid-body Drop closes without hidden drain. An explicit selected
+body cap remains cumulative, while an unset stream has no total cap because it does not materialize
+the body. Consuming `sse()` yields an `http_sse_stream`; `next(buffer)` returns
+`Result<Option<http_sse_event>, Error>` with WHATWG-decoded `event`, `data`, persistent
+`last_event_id`, and `retry_ms` views into the fresh output-buffer generation. It adds no automatic
+status/media-type policy, redirect, reconnect, sleep, or `Last-Event-ID` request; stream accessors
+still expose control-only id/retry updates after `next` returns `None`. Either explicit
+body or event-output bound uses `Error.Code(-1)` with no partial publication and a closed
+connection. The exact contract is the client-streaming ledger in `docs/impl/std-design/http.md`;
+the surface is designed but not yet implemented.
 `std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`

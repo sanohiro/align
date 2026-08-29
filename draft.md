@@ -3185,6 +3185,44 @@ bytes: body cap + 262,144-byte cumulative head allowance + one 32,768-byte read 
 framing, allocation, cleanup, batch, TLS, and error-precedence contract is the Request 5 ledger in
 `docs/impl/std-design/http.md`.
 
+The designed post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
+
+```text
+cl.request_stream(req: request) -> Result<http_read_stream, Error>
+stream.status() -> i64
+stream.header(name: str) -> Option<str>
+stream.read(out: mut buffer) -> Result<i64, Error>  // de-framed bytes; 0 = complete
+events := stream.sse()                              // consumes stream
+events.status() -> i64
+events.header(name: str) -> Option<str>
+events.last_event_id() -> str
+events.retry_ms() -> Option<i64>
+events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>
+
+http_sse_event { event: str, data: str, last_event_id: str, retry_ms: Option<i64> }
+```
+
+Both streams are dependent Move resources: they own the checked-out connection and decoder state,
+retain a shared borrow of the creating client, and return an exactly completed self-delimited
+connection to that client's pool. Mid-body Drop closes without draining. Raw reads overwrite a
+caller-owned fixed-capacity buffer and expose no HTTP chunk/trailer framing. A positive selected
+`max_response_body_bytes` remains a cumulative decoded-byte cap; when both scopes are unset, a
+stream has no cumulative total cap because it never materializes the whole body. The per-operation
+timeout snapshot remains active on every later receive.
+
+`sse()` consumes the raw reader at its current logical body position and prevents later raw/SSE
+mixing. `next` applies the WHATWG UTF-8, BOM, CRLF/LF/CR, comment, field, blank-line dispatch, data
+join, persistent last-event-id, and retry rules. It interprets only the event stream: HTTP status,
+media-type validation, redirects, reconnects, waits, and `Last-Event-ID` request construction remain
+explicit caller policy. Stream accessors expose the latest id/retry state even when a control-only
+block precedes completion. Event bytes are written into the supplied buffer in
+`event || data || last_event_id` order; record fields are zero-copy views tied to that fresh buffer
+generation. Exact capacity succeeds. A cumulative body-cap or event-output-cap excess is the stable
+explicit HTTP receive-bound result `Error.Code(-1)`, with no partial publication and a closed
+connection. The exact ownership, parsing, ABI, allocation, validation-order, and acceptance ledger
+is `docs/impl/std-design/http.md` “Client streaming receive.” This surface is designed but not yet
+implemented.
+
 ```text
 request
 response
