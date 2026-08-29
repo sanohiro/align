@@ -16822,6 +16822,99 @@ impl<'a> EscapeCheck<'a> {
         )
     }
 
+    fn indexed_result_borrows_collection_storage(
+        &self,
+        recv_ty: Ty,
+        fields: &[u32],
+        result_ty: Ty,
+    ) -> bool {
+        let recv_ty = expand_tagged_ty(recv_ty, self.tagged_types);
+        if let Ty::Soa(struct_id) = recv_ty {
+            return self.struct_has_str(struct_id) && self.region_bearing(result_ty);
+        }
+        let selected_ty = match recv_ty {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                fields.is_empty().then_some(scalar_to_ty(element))
+            }
+            Ty::StructArray(struct_id, _)
+            | Ty::DynStructArray(struct_id, Layout::Aos) => {
+                struct_path_type(Ty::Struct(struct_id), fields, self.structs)
+            }
+            Ty::DynStructArray(_, Layout::Soa)
+            | Ty::Soa(_)
+            | Ty::SoaParam(_)
+            | Ty::Param(_)
+            | Ty::Int(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Str
+            | Ty::String
+            | Ty::Vec(..)
+            | Ty::Mask(..)
+            | Ty::Raw
+            | Ty::Builder
+            | Ty::Buffer
+            | Ty::Box(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Option(_)
+            | Ty::Result(..)
+            | Ty::Enum(_)
+            | Ty::Tagged(_)
+            | Ty::Fn(_)
+            | Ty::Task(_)
+            | Ty::ArenaHandle
+            | Ty::ArrayBuilder(_)
+            | Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::DictEncoded(..)
+            | Ty::JsonDoc
+            | Ty::JsonScanner(_)
+            | Ty::HttpHeaders
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::StrFinder
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Reader
+            | Ty::Writer
+            | Ty::Child
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::RunBytes
+            | Ty::Error
+            | Ty::Unit => None,
+        };
+        selected_ty.is_some_and(|ty| {
+            expand_tagged_ty(ty, self.tagged_types) == Ty::String && result_ty == Ty::Str
+        })
+    }
+
     fn select_indexed_escape_content(
         &self,
         recv_value: EscapeValueFact,
@@ -16868,7 +16961,15 @@ impl<'a> EscapeCheck<'a> {
                     &content_path,
                     &mut Vec::new(),
                 );
-                let non_storage = resolved.content.regions;
+                let mut non_storage = resolved.content.regions;
+                if self.indexed_result_borrows_collection_storage(
+                    recv_ty,
+                    fields,
+                    result_ty,
+                ) && let Some(region) = resolved.storage_region
+                {
+                    non_storage = non_storage.join(&EscapeRegionFact::from_direct(region));
+                }
                 let mut content_ended = resolved.content.ended;
                 if let Some(ended) = resolved.ended {
                     content_ended
@@ -17382,6 +17483,7 @@ impl<'a> EscapeCheck<'a> {
         &mut self,
         expression: &Expr,
         initializer: StorageContentInitializer,
+        result_path: &[BorrowProjection],
         depth: u32,
         storage_provenance: &EscapeStorageProvenance<'_>,
     ) -> EscapeValueFact {
@@ -17417,7 +17519,9 @@ impl<'a> EscapeCheck<'a> {
                 Self::join_escape_value_facts(facts)
             }
             StorageContentInitializer::SoaColumns => match &expression.kind {
-                ExprKind::ArrayToSoa { source, .. } => self.completed_escape_value(source),
+                ExprKind::ArrayToSoa { source, .. } => {
+                    self.pipeline_escape_element_value(source, &[])
+                }
                 ExprKind::JsonDecodeSoa { input, .. } => self.completed_escape_value(input),
                 _ => EscapeValueFact::default(),
             },
@@ -17442,16 +17546,45 @@ impl<'a> EscapeCheck<'a> {
                 ExprKind::JsonDocElems { doc } => self.completed_escape_value(doc),
                 _ => EscapeValueFact::default(),
             },
-            StorageContentInitializer::GroupAggregation => match &expression.kind {
-                ExprKind::ArrayGroupAgg { base, .. }
-                | ExprKind::ArrayGroupAggMulti { base, .. } => self
-                    .state
-                    .storage_values
-                    .get(base)
-                    .cloned()
-                    .unwrap_or_default(),
-                _ => EscapeValueFact::default(),
-            },
+            StorageContentInitializer::GroupAggregation => {
+                let key_result = result_path == [BorrowProjection::TupleElement(0)];
+                let (base, key_field, source) = match &expression.kind {
+                    ExprKind::ArrayGroupAgg {
+                        base,
+                        key_field,
+                        source,
+                        ..
+                    }
+                    | ExprKind::ArrayGroupAggMulti {
+                        base,
+                        key_field,
+                        source,
+                        ..
+                    } => (*base, *key_field, *source),
+                    _ => return EscapeValueFact::default(),
+                };
+                if !key_result || matches!(source, hir::GroupSource::SoaI64) {
+                    return EscapeValueFact::default();
+                }
+                let Some(base_value) = self.state.storage_values.get(&base).cloned() else {
+                    return self.fail_closed_escape_value(Ty::Str, depth);
+                };
+                if matches!(source, hir::GroupSource::Encoded) {
+                    base_value
+                } else {
+                    let Some(base_ty) = self.f.locals.get(base as usize).map(|local| local.ty)
+                    else {
+                        return self.fail_closed_escape_value(expression.ty, depth);
+                    };
+                    self.select_indexed_escape_content(
+                        base_value,
+                        base_ty,
+                        None,
+                        &[key_field],
+                        Ty::Str,
+                    )
+                }
+            }
             StorageContentInitializer::CarrierSource => match &expression.kind {
                 ExprKind::ArrayChunks { source, .. } => self.completed_escape_value(source),
                 ExprKind::ArrayDictEncode { base, .. } => self
@@ -17956,6 +18089,7 @@ impl<'a> EscapeCheck<'a> {
                         self.escape_initializer_value(
                             expression,
                             result.initializer,
+                            &result.path,
                             depth,
                             storage_provenance,
                         );
@@ -18007,6 +18141,7 @@ impl<'a> EscapeCheck<'a> {
                         self.escape_initializer_value(
                             expression,
                             result.initializer,
+                            &result.path,
                             depth,
                             storage_provenance,
                         );
@@ -18026,6 +18161,7 @@ impl<'a> EscapeCheck<'a> {
                         value = value.join(&self.escape_initializer_value(
                             expression,
                             result.initializer,
+                            &result.path,
                             depth,
                             storage_provenance,
                         ));
@@ -18164,8 +18300,14 @@ impl<'a> EscapeCheck<'a> {
                 value_depth,
                 target,
             } => {
+                let value_region = self.region_of(value, value_depth);
+                // A caller-derived view can cross the task-group boundary back into this frame:
+                // the group owns only task storage, not its caller's source. Keep Frame provenance
+                // strict, because it may name an ordinary local declared inside the group and
+                // dropped at this boundary (for example a reduce result borrowing a local string).
                 if self.region_bearing(value.ty)
-                    && !self.region_of(value, value_depth).outlives(target)
+                    && !matches!(value_region, Region::Caller(_))
+                    && !value_region.outlives(target)
                 {
                     self.diags.error(
                         "a value from this task_group cannot escape as the block's value"
@@ -18905,6 +19047,12 @@ impl<'a> EscapeCheck<'a> {
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
         if matches!(expression.kind, ExprKind::JsonOwnedDecode { .. }) {
+            return Some(true);
+        }
+        if matches!(
+            expression.kind,
+            ExprKind::ArrayGroupAgg { .. } | ExprKind::ArrayGroupAggMulti { .. }
+        ) {
             return Some(true);
         }
         if matches!(
@@ -32083,13 +32231,14 @@ impl<'a> MoveCheck<'a> {
                 operand: ordinal as u32,
                 path: result.path.clone(),
             };
-            let individual = self.loop_iter_drops.last().map_or(staging.clone(), |_| {
+            let iteration = self.loop_iter_drops.last().map(|_| {
                 MoveReleasePlace::IterTemp {
                     depth: self.loop_iter_drops.len() as u32,
                     expression: Self::expr_key(expression),
                     path: result.path.clone(),
                 }
             });
+            let individual = iteration.clone().unwrap_or_else(|| staging.clone());
             let active_arena = self.active_arena_scope();
             let explicit_clone_region = match &expression.kind {
                 ExprKind::CloneIn { region, .. } => match region.kind {
@@ -32099,7 +32248,13 @@ impl<'a> MoveCheck<'a> {
                 _ => None,
             };
             let releases = if result.header_kind == Some(StorageHeaderKind::InlineFixed) {
-                [individual].into_iter().collect()
+                // MIR materializes an unbound fixed literal in a function slot. Outside a loop
+                // that slot remains live until function cleanup, so a carrier/view local may keep
+                // borrowing it after the construction statement without a staging release ending
+                // the generation. Inside a loop the same slot is overwritten on the next
+                // iteration. Move-bearing literals also attach their hidden owner to that loop's
+                // iteration drops, so retain the exact IterTemp boundary there.
+                iteration.into_iter().collect()
             } else if result.header_kind == Some(StorageHeaderKind::View)
                 && result.initializer == StorageContentInitializer::FixedLiteral
             {
@@ -71195,6 +71350,94 @@ fn exit_branch(flag: bool) -> i64 {
             "fn main() -> i32 {\n  xs := [1, 2, 3, 4]\n  cs := xs.chunks(2)\n  print(cs.len())\n  return 0\n}\n",
         );
         assert!(!d.has_errors(), "same-scope chunks use must still type-check");
+    }
+
+    #[test]
+    fn pre_generation_lifetime_consumer_closure_matrix() {
+        // These cells are intentionally one bounded-gate owner. They are the pre-generation
+        // lifetime consumers that regressed together when projected storage generations became
+        // authoritative: projected reads/stores, free Copy results, carrier temporaries, and
+        // lexical cleanup. The out-of-gate runtime owners retain the exact lowering witnesses.
+        let cases = [
+            (
+                "chunks literal carrier",
+                "fn main() -> i32 {\n  cs := [1, 2, 3, 4, 5].chunks(2)\n  print(cs[0].len())\n  return 0\n}\n",
+                false,
+            ),
+            (
+                "chunks literal carrier dies at loop edge",
+                "fn main() -> i32 {\n  mut keep := [0].chunks(1)\n  mut n := 0\n  loop {\n    keep = [1, 2, 3].chunks(1)\n    n = n + 1\n    if n > 1 { break }\n  }\n  return keep[0][0] as i32\n}\n",
+                true,
+            ),
+            (
+                "shuffle bound fixed backing",
+                "import std.rand\nfn main() -> i32 {\n  mut r := rand.seed_with(123)\n  mut xs := [10, 20, 30][0..3]\n  r.shuffle(xs)\n  return xs[0] as i32\n}\n",
+                false,
+            ),
+            (
+                "owned array string projection escape",
+                "User { name: string }\nfn bad() -> str {\n  us := [User { name: \"x\".clone() }]\n  return us[0].name\n}\nfn main() -> i32 = 0\n",
+                true,
+            ),
+            (
+                "primitive soa gather escapes",
+                "Rec { a: i64, b: i64 }\nfn pick() -> Rec {\n  arena {\n    rows := [Rec { a: 1, b: 10 }, Rec { a: 2, b: 20 }]\n    s := rows.to_soa()\n    return s[1]\n  }\n}\nfn main() -> i32 = 0\n",
+                false,
+            ),
+            (
+                "soa str field read escape",
+                "import core.json\nUser { name: str, age: i64 }\nfn get(data: str) -> Result<i64, Error> {\n  mut out: str := \"\"\n  arena {\n    s: soa<User> := json.decode(data)?\n    out = s[0].name\n  }\n  return Ok(out.len())\n}\n",
+                true,
+            ),
+            (
+                "soa str record gather escape",
+                "import core.json\nUser { name: str, age: i64 }\nfn get(data: str) -> Result<i64, Error> {\n  mut out: User := User { name: \"\", age: 0 }\n  arena {\n    s: soa<User> := json.decode(data)?\n    out = s[0]\n  }\n  return Ok(out.age)\n}\n",
+                true,
+            ),
+            (
+                "soa str field store from inner arena",
+                "import core.json\nUser { name: str, age: i64 }\nfn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0].name = t[0].name\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+                true,
+            ),
+            (
+                "soa str record store from inner arena",
+                "import core.json\nUser { name: str, age: i64 }\nfn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0] = t[0]\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+                true,
+            ),
+            (
+                "soa str literal store from inner arena",
+                "import core.json\nUser { name: str, age: i64 }\nfn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0] = User { name: t[0].name, age: 9 }\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+                true,
+            ),
+            (
+                "soa str group key escape",
+                "import core.json\nRec { name: str, pay: i64 }\nfn keys(data: str) -> Result<array<str>, Error> {\n  arena {\n    s: soa<Rec> := json.decode(data)?\n    g := s.group_by(.name).sum(.pay)\n    return Ok(g.0)\n  }\n}\n",
+                true,
+            ),
+            (
+                "soa integer group key escapes",
+                "import core.json\nRec { id: i64, pay: i64 }\nfn keys(data: str) -> Result<array<i64>, Error> {\n  arena {\n    s: soa<Rec> := json.decode(data)?\n    g := s.group_by(.id).sum(.pay)\n    return Ok(g.0)\n  }\n}\n",
+                false,
+            ),
+            (
+                "task group owned tail",
+                "fn make() -> string {\n  return task_group {\n    s := \"hello\".clone()\n    s\n  }\n}\nfn main() -> i32 {\n  s := make()\n  return s.len() as i32\n}\n",
+                false,
+            ),
+        ];
+
+        for (name, source, expect_errors) in cases {
+            let (_, diagnostics) = check(source);
+            assert_eq!(
+                diagnostics.has_errors(),
+                expect_errors,
+                "{name}: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

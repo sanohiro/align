@@ -21,18 +21,8 @@
 #
 # Comments and blank lines are ignored. Keep entries sorted by target.
 #
-# baseline refreshed by the 2026-08-29 four-core run at 9c0cf23f; each entry
-# reproduced in its owner binary after the detector completed all 216 targets
-align_driver::test::chunks	chunks_each_chunk_len
-align_driver::test::m10_rand	shuffle_is_a_deterministic_permutation
+# baseline refreshed by the 2026-08-29 four-core run at 9c0cf23f; each original
+# entry reproduced in its owner binary after the detector completed all 216
+# targets. The projected-storage consumer closure removed its eleven rows.
 align_driver::test::m5_json_bounded	json_encode_bounded_surface_and_schema_fail_closed
-align_driver::test::owned_structs_arrays	string_field_view_of_element_cannot_escape_the_array
 align_driver::test::pgo	fail_loud_profdata_errors
-align_driver::test::soa	a_gathered_struct_is_a_free_copy_returnable_from_its_arena
-align_driver::test::soa	soa_str_key_group_by_result_cannot_escape_the_arena
-align_driver::test::soa	str_column_field_write_cannot_store_shorter_lived
-align_driver::test::soa	str_column_view_cannot_escape_the_arena
-align_driver::test::soa	str_column_whole_elem_write_cannot_store_shorter_lived
-align_driver::test::soa	str_column_whole_elem_write_via_literal_cannot_store_shorter_lived
-align_driver::test::soa	str_struct_gather_cannot_escape_the_arena
-align_driver::test::task_group	owned_tail_moves_out_exactly_once
