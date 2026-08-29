@@ -905,10 +905,14 @@ unit with one function and no support partition takes the byte-identical
 The two existing ThinLTO cache phases remain the mechanism. `PrelinkKey` and
 `BackendKey` gain a nominal `PartitionKey` (`WholeUnit`, `Support`, or
 `Function(ProgramCall)`), and their full/slot digests distinguish partitions.
-The structural prelink input excludes unrelated local bodies but includes the
-selected body, every local peer ABI declaration, complete canonical type and
-resource tables, extern/import declarations, callback-effect facts, and the
-partition role. Thin-link still reruns globally on every build. Its fresh
+The structural prelink input is the same typed view consumed by emission. A
+function view excludes unrelated local bodies but includes the selected body,
+every local peer ABI/symbol declaration, complete canonical type and resource
+tables, extern/import declarations, callback-effect facts, and the partition
+role. A support view is the exact deduplicated Drop-thunk sequence, including
+each thunk's ABI/ownership and every owned local hook's canonical ABI and raw
+symbol. Thus support codegen cannot rediscover a cleanup target outside the
+fingerprinted view. Thin-link still reruns globally on every build. Its fresh
 import/export frontier identifies every edge by source unit plus source
 `PartitionKey`; each imported digest carries that same pair. This prevents two
 function partitions in one source unit from collapsing into one backend-key
@@ -922,6 +926,9 @@ therefore miss one function prelink while exact repeat/revert reuses the same
 immutable blobs; a peer ABI or shared table change invalidates every partition
 whose exact module input changed. The validation matrix below applies at the
 partition boundary in addition to the existing unit-boundary owners.
+Public build observability likewise binds each `ThinPartitionSource` directly
+to one typed digest/prelink/backend observation instead of relying on parallel
+vectors whose `CacheOutcome.unit` values cannot distinguish sibling partitions.
 
 ---
 

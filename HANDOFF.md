@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-28._ align-llm Request 21's borrowed projection view repair is merged in
+_Last updated: 2026-08-29._ align-llm Request 21's borrowed projection view repair is merged in
 Align PR #892
 against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
 an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
