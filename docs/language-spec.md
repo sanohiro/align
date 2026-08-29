@@ -1112,6 +1112,32 @@ response, and closes the connection. Bodyless `HEAD`/`204`/`304` metadata is val
 compared with the payload cap. With a 262,144-byte cap, live Align-owned response storage is bounded
 to 557,056 bytes. The exact framing/error/allocation matrix is in
 `docs/impl/std-design/http.md`.
+The designed post-`pkg.db` client streaming surface adds only
+`cl.request_stream(req) -> Result<http_read_stream, Error>`: the Move result borrows its client,
+retains the final status/header views, and fills a caller-owned fixed-capacity `buffer` with
+de-framed body bytes through `read` (`0` = complete). Exact self-delimited completion may return the
+connection to that client's pool; mid-body Drop closes without hidden drain. An explicit selected
+body cap remains cumulative, while an unset stream has no total cap because it does not materialize
+the body. Each `read`/`next` receives a fresh 262,144-byte chunk-framing work allowance. The complete
+finite storage grammar is `C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`,
+where `N` contains no stream. Only builtin-tag edges carry the client dependency; every other
+storage edge, including anonymous tuples, fails closed under an exhaustive type-discriminator
+classifier. `C` may be a local, by-value/borrow/borrow-mut parameter, or function result;
+out/global/constant/user-native and borrowed owning-projection positions reject. Captures and
+parallel transport are rejected. `request_stream`/`read`/`next` are Impure, while the
+ownership-only `sse` transition and state/head getters are Pure. Consuming
+`sse()` yields an `http_sse_stream`; `next(buffer)` returns
+`Result<Option<http_sse_event>, Error>` with WHATWG-decoded `event`, `data`, persistent
+`last_event_id` string views into the fresh output-buffer generation and inline Copy `retry_ms`.
+Control-only ID/retry changes commit at a blank line; data-bearing changes commit only with event
+publication, and a terminal failure or incomplete EOF rolls back the pending block while preserving
+earlier commits. It adds no automatic status/media-type policy, redirect, reconnect, sleep, or
+`Last-Event-ID` request; stream accessors still expose committed control-only updates. Either explicit
+body or event-output bound uses `Error.Code(-1)` with no partial publication and a closed
+connection. Separately, one `next` may scan at most its output capacity plus 262,144 de-framed
+source bytes, including ignored and control-only fields; exceeding that structural work guard is
+`Error.Invalid`. The exact contract is the client-streaming ledger in
+`docs/impl/std-design/http.md`; the surface is designed but not yet implemented.
 `std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`

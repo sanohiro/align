@@ -3185,6 +3185,61 @@ bytes: body cap + 262,144-byte cumulative head allowance + one 32,768-byte read 
 framing, allocation, cleanup, batch, TLS, and error-precedence contract is the Request 5 ledger in
 `docs/impl/std-design/http.md`.
 
+The designed post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
+
+```text
+cl.request_stream(req: request) -> Result<http_read_stream, Error>
+stream.status() -> i64
+stream.header(name: str) -> Option<str>
+stream.read(out: mut buffer) -> Result<i64, Error>  // de-framed bytes; 0 = complete
+events := stream.sse()                              // consumes stream
+events.status() -> i64
+events.header(name: str) -> Option<str>
+events.last_event_id() -> str
+events.retry_ms() -> Option<i64>
+events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>
+
+http_sse_event { event: str, data: str, last_event_id: str, retry_ms: Option<i64> }
+```
+
+Both streams are dependent Move resources: they own the checked-out connection and decoder state,
+retain a shared borrow of the creating client, and return an exactly completed self-delimited
+connection to that client's pool. Mid-body Drop closes without draining. Raw reads overwrite a
+caller-owned fixed-capacity buffer and expose no HTTP chunk/trailer framing. A positive selected
+`max_response_body_bytes` remains a cumulative decoded-byte cap; when both scopes are unset, a
+stream has no cumulative total cap because it never materializes the whole body. The per-operation
+timeout snapshot remains active on every later receive. Each body-facing call gets a fresh 262,144
+byte chunk-framing work allowance, so indefinite chunked streams do not inherit the whole-message
+framing counter while one call remains bounded. Its complete finite storage grammar is
+`C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`, where `N` contains no stream.
+Only builtin-tag edges carry the creating-client dependency. One cycle-safe exhaustive classifier
+over every type discriminator rejects any other storage edge by default, including user
+structs/sums, anonymous tuples, collections, boxes, builders, and tasks; a future type constructor
+must be classified before the compiler builds. `C` may be a local, by-value/borrow/borrow-mut
+parameter, or function result. An out parameter, global/constant, user native/extern signature, or
+borrowed-place owning projection rejects; ordinary return and consuming match are the only transfer
+paths. Closure/task captures and parallel elements/results reject separately. `request_stream`,
+`read`, and `next` are Impure; the ownership-only `sse` transition and head/state getters are Pure.
+
+`sse()` consumes the raw reader at its current logical body position and prevents later raw/SSE
+mixing. `next` applies the WHATWG UTF-8, BOM, CRLF/LF/CR, comment, field, blank-line dispatch, data
+join, persistent last-event-id, and retry rules. It interprets only the event stream: HTTP status,
+media-type validation, redirects, reconnects, waits, and `Last-Event-ID` request construction remain
+explicit caller policy. Stream accessors expose the latest id/retry state even when a control-only
+block precedes completion. Event bytes are written into the supplied buffer in
+`event || data || last_event_id` order; the three `str` fields are zero-copy views tied to that fresh
+buffer generation, while `retry_ms` is inline Copy data. Exact capacity succeeds. ID/retry changes
+in a control-only block commit at its blank line. A data-bearing block commits them atomically with
+successful event publication; an output/body/framing/work/timeout/transport failure or incomplete
+EOF rolls back only the pending block, preserving earlier control-only commits so reconnect state
+cannot skip an undelivered event. A cumulative body-cap or event-output-cap excess is the stable
+explicit HTTP receive-bound result `Error.Code(-1)`, with no partial publication and a closed
+connection. Independently, one `next` scans at most the output capacity plus 262,144 de-framed
+source bytes; comments, unknown fields, invalid retry lines, and control-only blocks consume that
+allowance, and excess is `Error.Invalid`. The exact ownership, parsing, ABI, allocation,
+validation-order, and acceptance ledger is `docs/impl/std-design/http.md` “Client streaming
+receive.” This surface is designed but not yet implemented.
+
 ```text
 request
 response

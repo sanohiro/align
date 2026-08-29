@@ -204,16 +204,56 @@ record is the canonical "Shared prerequisite — the `Error.Timeout` variant" se
 `docs/impl/std-design/process.md`. Adding the variant makes an exhaustive `match Error` fail closed
 (missing-`Timeout` diagnostic); the three in-repo exhaustive matches were updated.
 
+### HTTP client streaming receive is one dependent reader plus an explicit SSE transition (SETTLED 2026-08-29)
+
+**Decision:** `cl.request_stream(req)` is the sole streaming request entry point. It consumes the
+ordinary request and returns a dependent Move `http_read_stream` which owns the checked-out
+plaintext/TLS connection and bounded framing state while retaining a shared borrow of the client.
+`status`/`header` expose the retained final head; `read(mut buffer)` writes de-framed bytes without
+growing or allocating a body. Exact self-delimited completion may return the connection to the same
+client pool; Drop before completion closes without draining. A selected positive
+`max_response_body_bytes` still caps cumulative decoded bytes, while an unset stream has no total
+cap because it never materializes the whole body. Each `read`/`next` instead has a replenished
+262,144-byte chunk-framing work allowance, preserving indefinite streams without allowing a single
+operation to consume unbounded framing. Its complete storage grammar is the least finite set
+`C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`, where `N` contains no stream.
+A cycle-safe exhaustive `Ty`/`Scalar` classifier admits only those builtin-tag edges and rejects
+every other current or future storage edge, including anonymous tuples; captures and parallel
+transport reject separately. `C` is legal as a local, by-value/borrow/borrow-mut parameter, or
+function result; out/global/constant/user-native and borrowed owning-projection positions reject.
+Direct/imported/indirect/generic parameter and return summaries retain the client dependency.
+Network-facing construction/read/next are Impure, while the ownership-only transition and
+retained-state getters are Pure.
+
+A consuming `sse()` transition yields `http_sse_stream`, so raw and event reads cannot mix after the
+choice. `next(mut buffer)` performs WHATWG UTF-8/BOM/line/field/dispatch interpretation and returns
+an `Option<http_sse_event>` whose three strings view the caller buffer's fresh generation and whose
+retry value is inline Copy data. Control-only ID/retry candidates commit at their blank line;
+data-bearing candidates commit only with successful event publication. A terminal failure or
+incomplete EOF rolls back the pending block while preserving earlier commits, so reconnect state
+cannot skip an event that was not delivered. It deliberately adds no browser `EventSource` policy:
+status/media-type validation, redirect, reconnect, delay, and `Last-Event-ID` request construction
+remain explicit; stream accessors expose control-only id/retry updates even when no event is
+dispatched. The caller buffer is the event allocation bound; exact fit succeeds and excess is
+the same `Error.Code(-1)` explicit HTTP receive-bound result, with no partial event and a closed
+connection. Independently, `next` counts all de-framed source bytes, including ignored/control-only
+input, against an exact output-capacity-plus-262,144 work guard; excess is `Error.Invalid`. The
+authoritative ledger, native envelope, validation precedence, connection matrix, two-PR
+implementation boundary, and acceptance matrix are in `docs/impl/std-design/http.md` “Client
+streaming receive,” with synchronized Japanese mirror. Implementation is pending.
+
 ### Bounded HTTP client receive — two scoped setters and `Error.Code(-1)` (SETTLED 2026-08-14)
 **Decision:** `http.client` and `http.request` each expose
-`max_response_body_bytes(limit: i64)`. Zero restores the fixed client default or request
-inheritance; a positive request value only narrows its client. The cap is enforced during receive
+`max_response_body_bytes(limit: i64)`. For whole-body receive, zero restores the fixed client
+default or request inheritance; a positive request value only narrows its client. The cap is enforced during receive
 across Content-Length, chunked, and close-delimited framing. An explicit-cap excess returns the
 reserved `Error.Code(-1)`, no response, and a closed connection. A new builtin Error variant is not
 justified for one library-specific resource outcome; the negative code cannot collide with the
 non-negative raw errno mapping or an HTTP status. The exact public ledger, deterministic validation
 order, 557,056-byte consumer ceiling, compiler/runtime ownership, and closure matrix are in
-`docs/impl/std-design/http.md` “Bounded client response bodies.”
+`docs/impl/std-design/http.md` “Bounded client response bodies.” The later streaming settlement
+reuses a positive selected value as a cumulative decoded-byte cap, gives unset streaming no total
+cap, and generalizes `Code(-1)` to explicit HTTP receive bounds including the SSE output buffer.
 
 ### Regular expressions — `std.regex`, explicitly compiled (SHIPPED 2026-07-23)
 **Decision: regex is a standard-library service, not syntax.** `import std.regex` exposes

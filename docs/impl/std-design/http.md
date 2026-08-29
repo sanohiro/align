@@ -15,8 +15,10 @@ response, header, method, status, client, server primitive. Connection reuse per
 trust store + hostname binding), dynamically linked alongside crypto's libcrypto. Server-side TLS
 stays deferred (client-first). HTTP/3, routing, middleware = pkg, not std.
 
-**Module status: COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). Server-side TLS,
-client certs, custom CA, session resumption, and revocation are the recorded post-v1 backlog.
+**Module status: v1 COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). The first
+post-`pkg.db` convergence item, client streaming receive, is **DESIGNED 2026-08-29 and not yet
+implemented**. Server-side TLS, client certs, custom CA, session resumption, and revocation remain
+separate backlog items.
 
 ## Signatures
 
@@ -25,10 +27,31 @@ v1 proposal, Fable's settled shapes:
 ```text
 // Client
 cl := http.client()                         // owns a connection pool (Move)
-cl.max_response_body_bytes(limit: i64)      // 0 restores the fixed default; positive limits bound receive allocation
+cl.max_response_body_bytes(limit: i64)      // 0 = whole-body fixed default / streaming no cumulative cap
 cl.get(url: str) -> Result<response, Error>
 cl.post(url: str, body: bytes) -> Result<response, Error>
 cl.request(req: request) -> Result<response, Error>
+cl.request_stream(req: request) -> Result<http_read_stream, Error>
+                                             // consumes req; returned Move stream borrows cl
+stream.status() -> i64
+stream.header(name: str) -> Option<str>       // view into stream's retained final head
+stream.read(out: mut buffer) -> Result<i64, Error>
+                                             // de-framed bytes; overwrites out; 0 = complete
+events := stream.sse()                        // consumes stream at its current body position
+events.status() -> i64
+events.header(name: str) -> Option<str>
+events.last_event_id() -> str                  // current persistent state; view into events
+events.retry_ms() -> Option<i64>               // current persistent state
+events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>
+                                             // WHATWG event; three str views borrow out's fresh generation
+                                             // retry_ms is an inline Copy value
+
+http_sse_event {
+  event: str                                 // "message" when the event field is empty
+  data: str                                  // data lines joined by one LF
+  last_event_id: str                         // persistent latest valid id, initially empty
+  retry_ms: Option<i64>                      // persistent latest representable retry, initially None
+}
 // Request/response building
 r := http.request(method: str, url: str)    // builder (Move — owns header list + body buf)
 r.max_response_body_bytes(limit: i64)       // 0 inherits the client; positive limits only narrow it
@@ -101,12 +124,36 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - `response` owns its header block + body buffer (Move); `resp.header()`/`resp.body()` return
   **views region-bound to resp** (#297-aware `region_of` arm — same as net's borrowed
   reader/writer and `json.decode`).
+- `http_read_stream` and `http_sse_stream` are dependent **Move** resources. Each owns one checked-out
+  plaintext/TLS connection plus bounded decoder state and retains a shared borrow of the creating
+  `client` so exact completion can return the connection to that client's pool. The client may serve
+  other shared-borrow request operations while a stream lives, but it cannot be moved or dropped
+  before the stream. Both types are nameable as bare locals/parameters/returns. Their only storage
+  carriers are the finite, acyclic grammar `C ::= stream | Option<C> | Result<C,N> |
+  Result<N,C> | Result<C,C>`, where `stream` is either dependent stream and `N` is any otherwise
+  valid type whose storage graph contains no stream. Only the active builtin tag owns a stream.
+  Every other storage edge is rejected by default if its descendant graph contains one: this
+  includes user structs/sums, anonymous tuples, collections, boxes/builders/tasks, closure
+  environments, and parallel elements/results. A noncapturing function-value signature may name
+  `C` as a parameter or result because the function value stores no stream; a capture may not.
+  Generic substitution is checked on the complete concrete graph. The classifier exhaustively
+  matches every `Ty`/`Scalar` variant with no wildcard, so a future constructor fails the compiler
+  tripwire until it is classified. `request_stream` produces the first stream inside `Result`;
+  `sse()` transfers the same owner and borrow into an `http_sse_stream` and nulls the source.
+- `http_sse_event` is a compiler-provided Copy record. Its three `str` fields view the fresh
+  generation written into the caller's `out` buffer by `next`; they cannot survive the next mutable
+  use, replacement, or Drop of that buffer. The record owns no allocation and has no Drop.
 - Move-rejection at the `scalar_arg` choke point except own-constructor Result Ok positions (net
   template).
 
 ## Effect classification
 
-All impure (network syscalls via net).
+HTTP operations that connect, accept, send, receive, finish, reject, or otherwise touch a socket are
+**Impure**. In-memory constructors, parsers, builder/setter operations, and getters retain their
+existing **Pure** classification. For the streaming surface specifically, `request_stream`, `read`,
+and `next` are Impure; `sse`, `status`, `header`, `last_event_id`, and `retry_ms` are Pure. The stream
+types are not legal parallel elements/results or closure/task captures, so this ownership-only
+transition and the Pure getters cannot smuggle a live connection into a Pure parallel closure.
 
 ## Error policy
 
@@ -1161,8 +1208,8 @@ ambient configuration, or package API.
 | Input and defaults | `limit == 0` clears the stored value. A cleared client means fixed `HTTP_MAX_BODY = 1,073,741,824`; a cleared request inherits its client. A positive value must be `1..=HTTP_MAX_BODY` and target-`usize` representable. A negative, larger, unrepresentable, or null-handle input aborts before changing the previous value and before network work. No ambient input participates. |
 | Selection | `get` and `post` use the client value. `request` uses `min(positive client or HTTP_MAX_BODY, positive request or HTTP_MAX_BODY)`. A bound is *explicit* when either stored value is positive, including positive `HTTP_MAX_BODY`; zero/unset is not explicit. `get_many` snapshots the client value once before workers start and passes it to every exchange. Source borrowing excludes a concurrent setter; atomic native storage makes the worker snapshot race-free. |
 | Success and ownership | Exact-limit payload succeeds and returns the existing Move `response`; `status()`, `header()`, and `body()` remain region-bound zero-copy views. An explicitly bounded response owns separate fixed header and body allocations until Drop; the opaque handle ABI and source ownership do not change. Neither setter retains an input view. |
-| Limit result | The first recognizable payload excess under an explicit bound returns stable `Error.Code(-1)`. Code `-1` is reserved for the `std.http` receive-body limit: it is outside HTTP status `100..=599` and the non-negative raw OS codes published by the common errno mapping. It is distinct from `Error.Invalid`, `Error.Timeout`, transport `Error.Code(errno)`, and a successful HTTP status such as 413. No partial response or body is returned. |
-| Native status mapping | Runtime uses HTTP-private `AL_HTTP_BODY_LIMIT = -1`. Only the client-response Result lowerers map that negative sentinel to `Error.Code(-1)` before the shared positive category/errno mapping. The sentinel cannot collide with a saturating `AL_CODE + errno`, never enters the generic errno decoder, and adds no `Error` variant or type-layout change. |
+| Limit result | The first recognizable payload excess under an explicit bound returns stable `Error.Code(-1)`. Code `-1` is reserved for an explicit `std.http` receive bound (this capability's body limit and, after the streaming settlement below, its caller-selected SSE output bound): it is outside HTTP status `100..=599` and the non-negative raw OS codes published by the common errno mapping. It is distinct from `Error.Invalid`, `Error.Timeout`, transport `Error.Code(errno)`, and a successful HTTP status such as 413. No partial response, body, or event is returned. |
+| Native status mapping | Runtime uses HTTP-private `AL_HTTP_BODY_LIMIT = -1`. Only HTTP client receive Result lowerers map that negative sentinel to `Error.Code(-1)` before the shared positive category/errno mapping. The sentinel cannot collide with a saturating `AL_CODE + errno`, never enters the generic errno decoder, and adds no `Error` variant or type-layout change. |
 | Content-Length | Parse every field as an arbitrary-precision normalized decimal magnitude. Syntax, equal-duplicate normalization, conflicting duplicates, and CL/TE conflict precede the cap. For a payload-bearing final response, a valid magnitude above an explicit selected cap is `Error.Code(-1)` even when also above `usize` or `HTTP_MAX_BODY`; without an explicit bound, target/global excess stays `Error.Invalid`. An explicit excess reserves nothing from the peer value and causes no later payload read. |
 | Method/status composition | Request 4's exact-uppercase `HEAD`/`CONNECT`, interim, `204`, and `304` rules remain authoritative. A bodyless final response validates framing metadata but does not compare its valid arbitrary CL magnitude with the cap, allocate a body, or read payload/chunk/trailer bytes. Only the returned final payload is capped. |
 | Chunked payload | Existing line/framing/trailer guards and grammar remain unchanged. Guard and complete-line syntax checks precede the cap. A valid chunk magnitude that would take cumulative decoded bytes over an explicit cap is `Error.Code(-1)` before target conversion, payload allocation, or another read; without an explicit bound, global excess remains `Error.Invalid`. A limit recognized before the terminal chunk performs no trailer read. |
@@ -1213,6 +1260,129 @@ hand-written change below roughly 1,000 lines.
 No benchmark is required: this contract makes a resource ceiling, not a throughput claim. Runtime
 instrumentation measures the ceiling directly. Changing the code, allocation strategy, public
 method, framing precedence, or layer ownership reopens this ledger before implementation.
+
+## Client streaming receive (post-`pkg.db` convergence item 1 — DESIGNED 2026-08-29)
+
+The whole-body API is the right terminal when a caller needs one owned `response`; it is the wrong
+terminal for an indefinite provider stream or a large download. This capability exposes the already
+incremental Request 4 decoder as one dependent read resource. Transfer framing remains inside
+`std.http`, while allocation and iteration stay visible at the call site through a caller-owned
+`buffer`. A consuming type transition adds WHATWG server-sent-event interpretation without a second
+socket, framing decoder, automatic reconnect loop, or provider abstraction. The normative parsing
+source is WHATWG HTML, “Interpreting an event stream”
+(`https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream`).
+
+```text
+request -> cl.request_stream(request) -> http_read_stream
+http_read_stream -> repeated read(caller_buffer) -> de-framed bytes -> completion
+```
+
+For SSE, convert the same body owner before reading raw bytes. The output buffer is reused for every
+event; its capacity is the explicit event-materialization bound.
+
+```text
+http_read_stream -> consuming sse() -> http_sse_stream
+http_sse_stream -> repeated next(caller_buffer) -> Option<http_sse_event> -> completion
+```
+
+### Public-contract ledger
+
+| Surface / state | Exact contract |
+|---|---|
+| Construction | `cl.request_stream(req: request) -> Result<http_read_stream, Error>` is the sole streaming request entry point. It requires a bound `client`, consumes and nulls the Move `request`, serializes and sends it once, advances and discards valid non-`101` informational heads, and returns only after the final head is complete and validated. It rejects exact uppercase `CONNECT` before URL, pool, DNS, connect, write, or TLS work. `get_stream` and `post_stream` aliases are not added; callers build the ordinary request explicitly. |
+| Effects | `request_stream`, `read`, and `next` are Impure because they can perform network I/O. `sse()` is a Pure ownership-only type transition with no I/O/allocation; `status`, `header`, `last_event_id`, and `retry_ms` are Pure reads of retained memory. No stream type is a parallel element/result or closure/task capture, so a Pure parallel closure cannot acquire, advance, or implicitly release a live stream. |
+| Head and status | A successful stream retains the exact final status line and header bytes. `status()` returns the final `i64`; `header(name)` performs the existing case-insensitive first-match lookup and returns an `Option<str>` view bound to the stream. HTTP status, including 4xx/5xx, remains data. `101`, malformed heads, framing conflicts, and invalid bodyless metadata remain `Error.Invalid`. The constructor performs no body transport read after the final head is recognizable, except that the one 32 KiB read which completes that head may already contain body bytes. |
+| Raw read | `stream.read(out: mut buffer) -> Result<i64, Error>` borrows the stream mutably, sets `out.len` to zero before work, writes at most the existing capacity without growing it, and returns the decoded payload count. A positive result makes exactly those fresh bytes visible through `out.bytes()`; zero means HTTP body completion, never merely “the buffer was full.” A zero-capacity buffer aborts before stream state or I/O changes. Once at least one payload byte is available, the call performs no further transport read, though it may consume already-buffered framing. On `Err`, `out.len` remains zero and no partial bytes are published. |
+| HTTP framing | The Request 4 head, interim, bodyless, Content-Length, chunk grammar, trailer, CRLF, error-precedence, and plaintext/TLS rules remain authoritative. Its whole-message cumulative chunk-framing counter does not: each body-facing `read` or `next` starts one fresh `HTTP_MAX_STREAM_CHUNK_FRAMING = 262,144` wire-byte allowance. The call charges every chunk-size line and its CRLF plus every CRLF after a nonzero payload that it processes, including bytes already co-read into scratch; a carried byte is charged by the first call which processes it and never twice. Exact allowance succeeds. Requiring another framing byte is `Error.Invalid` without an over-guard read, and any error closes the stream; a successful return replenishes the next call's allowance. `read` exposes only Content-Length bytes, de-chunked payload bytes, or close-delimited bytes; it never exposes chunk lines, payload CRLF, the terminal chunk, or trailers. Exact `HEAD`, `204`, and `304` streams are complete with an empty body and retain Request 4's arbitrary valid metadata rule. For a payload-bearing response, an unbounded stream accepts a valid Content-Length through `u64::MAX`; a larger normalized magnitude is `Error.Invalid` before return. Cumulative decoded chunked/close-delimited length overflow past `u64::MAX` is likewise `Error.Invalid`. |
+| Receive limit | A positive selected `max_response_body_bytes` remains an explicit cumulative decoded-body cap for `request_stream`; exact fit succeeds and the first recognizable excess is `Error.Code(-1)`. A declared Content-Length excess fails in the constructor before body read. Chunked and close-delimited excess may fail a later `read`/`next`. When both stored values are zero, streaming has **no cumulative body cap**: unlike a whole-body response it does not allocate in proportion to total length. The fixed head guard, per-call framing/SSE work guards, caller buffer capacity, timeouts, and `u64` accounting still apply. Thus no configured option is silently ignored, while an indefinite SSE stream is possible when the caller leaves the whole-body cap unset. |
+| Timeout snapshot | Construction resolves the request override or client default once. The same timeout is applied independently to connect, send, each constructor receive, and each later `read`/`next` transport receive. Expiry remains `Error.Timeout`; zero remains no timeout. A setter after stream creation cannot change the stream's snapshot. |
+| SSE transition | `stream.sse() -> http_sse_stream` is Pure and consumes/nulls the raw stream without I/O, copy, allocation, or connection change. Parsing begins at the raw stream's current logical body position, including any undelivered co-read bytes. Converting before `read` interprets the complete response body and strips one leading UTF-8 BOM as WHATWG requires; converting after raw reads deliberately interprets only the remaining suffix and does not treat a suffix BOM as the response-leading BOM. `http_sse_stream` exposes the same `status()`/`header()` head views and no raw `read`, so the two body interpretations cannot be mixed after conversion. |
+| SSE scope | `events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>` implements WHATWG event-stream **decoding and field interpretation**, not the browser `EventSource` networking policy. It does not validate `Content-Type`, redirect, reconnect, sleep, add `Last-Event-ID`, or classify HTTP statuses. The caller inspects status/headers, decides whether the body is SSE, and explicitly constructs any later request. |
+| UTF-8 and lines | The remaining de-framed body is decoded with the WHATWG UTF-8 decode algorithm: one response-leading BOM is removed and malformed byte sequences become U+FFFD, never an invalid Align `str`. CRLF, lone LF, and lone CR terminate lines, including across transport/chunk boundaries. Field names are compared byte-for-byte with no case folding. A first `:` splits name/value and exactly one leading U+0020 after it is removed; a line without `:` has an empty value. A leading `:` line is a comment and ignored. |
+| SSE fields and state | `data` appends its value plus one LF; `event` replaces the current block-local event type; valid `id` and `retry` lines replace block-local candidates. An `id` containing U+0000 and a `retry` that is empty, nondigit, or above `i64::MAX` are ignored. Unknown and case-mismatched fields are ignored. Data/event/candidate state resets after every blank-line dispatch attempt. Persistent last-event-id/retry start empty/`None` and change only at the atomic block commits below. `events.last_event_id()` returns a stream-bound view of the last committed ID and `events.retry_ms()` its current inline Copy value; the ID view cannot survive a later `next` that may commit a replacement. |
+| SSE work guard | `HTTP_MAX_SSE_METADATA = 262,144`. Each `next(out)` may hand at most `u64(out.capacity) + HTTP_MAX_SSE_METADATA` de-framed source bytes to the UTF-8 decoder. The checked sum counts every source byte processed by that call, including a stripped BOM, invalid UTF-8 input, line terminators, comments, unknown fields, invalid `retry` values, control-only blocks, and dispatched data; bytes already co-read are charged before another transport read. Ending or dispatching exactly at the allowance succeeds. Requiring the next source byte is `Error.Invalid` without an over-guard body read, closes the stream, zeroes `out.len`, and publishes no event. A successful `Some` or terminal `None` ends the call; the next call receives a fresh allowance. The caller-capacity term covers event material, while the fixed term bounds syntax and arbitrarily many ignored/control-only blocks, so an unset cumulative body cap cannot make one `next` perform unbounded work. |
+| Dispatch and state commit | A blank line with at least one `data` field attempts one event; a block without `data` produces no event. One trailing LF is removed from accumulated data. An empty event type becomes `"message"`; otherwise it is preserved exactly. Before parsing, `out.len` becomes zero. The caller allocation is unpublished staging until commit. For a control-only block, a valid candidate ID/retry commits atomically at its blank line, staging resets, and parsing continues; that commit survives any later block's failure in the same `next`. For a data-bearing block, output capacity is checked for exact `event || data || committed-or-candidate last_event_id` bytes first. Exact fit then commits its candidate ID/retry and publishes `Some` atomically; `retry_ms` is copied inline, while the three string fields are zero-copy spans over the fresh output generation. Any output-cap or later terminal error before that atomic step rolls back only the current block to the state committed by earlier blank lines, closes the stream, leaves `out.len == 0`, and publishes no event. Output-cap excess is `Error.Code(-1)`. |
+| Empty and terminal cases | `data`, `data:`, and `data:` followed by one optional space can dispatch an event whose `data` is empty; two empty data lines dispatch one LF. Comments and empty/control-only blocks do not produce `Some`. HTTP completion without a final blank line discards the complete pending block, including its staged ID/retry, returns `None`, and applies the normal connection verdict; control-only blocks committed at earlier blank lines remain observable. Every later `next` returns `None` without I/O. |
+| SSE storage | The caller allocation is the only block-staging/event allocation: while `out.len == 0`, it holds current data, event type, and candidate ID bytes, then is rearranged in place into the published order or reset after a control-only commit. `next` never grows it and performs no per-event body allocation. The stream retains only the committed last-event-id in one exact-capacity allocation plus inline committed/candidate retry scalars. Let old ID capacity be `K`, a committing candidate ID length be `N`, and current output capacity be `C`. `N > C` is `Error.Code(-1)` before mutation. When `N > K`, allocate exactly `K' = max(N, min(C, saturating_mul(K, 2)))`, initialize it, then free the still-live old allocation; zero grows directly to `N`. Let `M` be the largest output capacity supplied so far: retained ID capacity is at most `M`, and a growth step has old + new ID capacity strictly below `2 * M`. Smaller later buffers do not shrink it; a dispatched event must fit its current call's capacity. UTF-8 carry is at most three bytes and all line/parser counters are fixed-size. The response-leading 32 KiB transport scratch and fixed head allocation are shared with raw mode. |
+| Errors and precedence | Request/setter validation precedes network work. Received head/framing syntax and the current call's framing guard precede body-cap checks; a complete valid magnitude precedes conversion/accounting. For a newly available payload byte, the selected cumulative body cap is charged before the SSE source-work guard, then UTF-8 replacement and line/field interpretation precede caller output-cap comparison. Thus a same-byte body-cap excess is `Error.Code(-1)` before an SSE-work excess; a framing byte that exceeds its own allowance is `Error.Invalid` before any payload exists. A caller output-cap excess wins before event/state commit. Framing/truncation/stream-work/`u64` excess is `Error.Invalid`, deadline is `Error.Timeout`, transport/TLS keeps its existing category, and either explicit cap is `Error.Code(-1)`. Any terminal error rolls back the current incomplete/unpublished block, preserves earlier blank-line commits, poisons/closes the connection, and makes every later body call return the same stored error without I/O; Pure state getters still expose the last committed values. |
+| Allocation | Construction owns one fixed `HTTP_MAX_HEADER_BLOCK = 262,144` final-head allocation, one fixed `HTTP_CLIENT_READ_CHUNK = 32,768` scratch, the header-span table, and the checked-out connection; body bytes never allocate inside a raw stream. Request serialization scratch returns to the client immediately after construction. SSE adds only the committed-ID allocation bounded above; event/block bytes live in caller storage and retry state is inline. Its steady capacity is at most `M`, and the only growth transition has simultaneously live old/new capacities strictly below `2 * M`; these figures exclude the caller-owned output buffer, fixed handle/table metadata, allocator bookkeeping, and opaque kernel/libssl storage. No peer Content-Length, chunk magnitude, cumulative body length, or SSE field length can produce capacity beyond its fixed or caller-selected bound. OOM remains fatal/no-unwind. |
+| Ownership and cleanup | Both stream types are Move, borrow-mutated cursors and retain a shared client borrow. The client pool remains usable by other shared calls but cannot be moved/dropped before them. `sse()` transfers every connection/scratch/head/control owner and cleanup bit exactly once. Bare and admitted builtin-tag construction, success, `?`, `else`, `match`, `map_err`, replacement, return, and ordinary Drop preserve one owner plus its client provenance; all other storage/capture/parallel carriers are rejected. A stream cannot escape its creating client and an event string cannot escape its output-buffer generation. |
+| Carrier formation and provenance | Let `C ::= http_read_stream | http_sse_stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`, where the graph is finite/acyclic and `N` is any otherwise valid type whose storage graph contains no stream. This least set is the complete carrier admission rule: each active tag contains zero or one stream, and moving or pattern-unwrapping it initializes the destination before clearing the complete source tag/handle. Replacement and Drop inspect every nested active tag and release exactly one stream, if present. `C` may occupy a local, a by-value/shared-borrow/mutable-borrow parameter, or a function result. An `out C`, constant/global, user native/extern signature, borrowed-place owning projection/match, and every other placement reject; ordinary return and consuming match are the one transfer paths. Direct, imported, and indirect function parameter/return summaries preserve its client dependency; a noncapturing function signature may mention `C` but the function value itself is not a carrier. A control-flow join unions possible creating clients, so none can die before the joined carrier is consumed or dropped. One cycle-safe positive classifier checks the fully substituted storage graph and exhaustively matches every `Ty` and `Scalar` discriminator without `_`: an edge through builtin `Option`/`Result` recurses, while every other enclosing storage edge returns forbidden. Thus user structs/sums, anonymous tuples, fixed/dynamic/specialized collections, slices, boxes, builders, tasks, closure environments, parallel elements/results, malformed HIR, and future unclassified constructors fail closed rather than relying on an exclusion list. |
+| Connection fate | A keep-alive-eligible Content-Length body or valid terminal chunk/trailers is returned to the creating client's pool exactly when complete and only with no residual scratch or TLS-pending bytes. Bodyless completion may pool before the constructor returns. Close-delimited success closes. Drop before exact completion, caller/body limit, malformed/truncated framing, timeout, transport/TLS error, `101`, and residual bytes close and never pool; Drop performs no hidden drain. A reused stale connection is retried once fresh only if it fails before any response byte, exactly as whole-body receive. |
+| Plaintext / TLS | One framing/read/SSE state machine consumes `Conn::Plain` and `Conn::Tls`. TLS verification, hostname binding, ALPN, timeout mapping, `SSL_pending`/`SSL_has_pending` reuse exclusion, SIGPIPE suppression, and teardown remain below that common owner. Plaintext and TLS expose identical body partitions and SSE events for identical application bytes. |
+| Compiler/runtime owner | Sema owns the exact methods/types/effects, admitted carrier grammar, bound receiver/output checks, Move transfer, client/output provenance, parallel exclusion, and event-field types. Checked HIR independently validates every new envelope plus effect/type/region/carrier facts. MIR owns stream construction, head access, read, conversion, next, transactional state commit, status mapping, source nulling, and Drop. LLVM owns ABI declarations/calls and Result/Option/event reconstruction. Runtime owns URL/request work, pool/TLS connection, framing state, cap/timeout accounting, SSE decoding/staging/commit, buffer writes, and cleanup. Package code owns none. |
+| Native ABI and identity | Add `i32 @align_rt_http_client_request_stream(ptr, ptr, ptr)`, `i64 @align_rt_http_read_stream_status(ptr)`, `i32 @align_rt_http_read_stream_header(ptr, ptr, i64, ptr)`, `i32 @align_rt_http_read_stream_read(ptr, ptr, ptr)`, `ptr @align_rt_http_read_stream_sse(ptr)`, `{ptr,i64} @align_rt_http_sse_stream_last_event_id(ptr)`, `i64 @align_rt_http_sse_stream_retry_ms(ptr)`, `i32 @align_rt_http_sse_stream_next(ptr, ptr, ptr)`, and `void @align_rt_http_read_stream_free(ptr)`. The retry getter returns `-1` for `None` and the stored non-negative value otherwise. `read` returns status separately and writes its `i64` count so private negative `AL_HTTP_BODY_LIMIT` cannot collide with a positive byte count. `next` writes one canonical 64-byte/8-aligned envelope: `u8 present`, `u8 retry_present`, six zero reserved bytes, `i64 retry_ms`, then `{ptr,i64}` for event, data, and last-event-id in that order; error/None zero the complete envelope. Both Move types share the head getters and free ABI. New type/method/HIR/MIR records enter interface and cache identity once; exact edit/revert restores the prior hashes. |
+| Native input validation | Runtime entrypoints validate writable outputs before consuming a Move source or doing I/O. `request_stream` first rejects a null output slot, then zeroes it; a null client or request returns `AL_INVALID` with the nonnull request still caller-owned. Once all three are valid it takes the request, and every later success/error path consumes it exactly once. `read` first requires a count slot and writes zero, then requires a nonnull buffer, zeroes its length, and requires a nonnull stream; `next` first requires and zeroes its envelope, then requires a nonnull buffer, zeroes its length, and requires a nonnull stream. Invalid handles, a zero-capacity direct-ABI buffer, or missing outputs return `AL_INVALID` without changing stream state or performing I/O; checked source lowers the zero-capacity case to the specified abort before the ABI call. `header` zeroes a valid output view and returns absent for a null stream, negative or non-`usize` name length, or a positive length with null data; zero length never forms a null slice. `status(null) = 0`, `last_event_id(null) = {null,0}`, `retry_ms(null) = -1`, and `sse(null) = null` without an ownership transition. `sse(nonnull)` takes the raw owner only after that check. The shared free is null-safe. These checks precede slice construction, dereference, allocation, ownership take, and network/pool effects in that order. |
+| Prerequisite and acceptance | Request 4 framing, Request 5 explicit cap, client TLS/pool/timeouts, caller-owned `buffer`, nested `Result<Option<Record>, Error>`, and dependent-resource provenance are shipped prerequisites. Raw acceptance streams fixed/chunked/close/bodyless/interim bodies across every split boundary over plaintext/TLS, proves bounded memory and pool/Drop fate, downloads beyond 1 GiB with no explicit cap, and accepts exactly 262,144 per-call framing bytes while rejecting the next before a read and replenishing the following successful call. Compiler acceptance covers every `C` grammar production including stream-bearing `Result` Ok/Err/both arms, nested tags, two-client provenance joins, direct/imported/indirect/generic forwarding, by-value/borrow/borrow-mut parameter and return placement, exact active Drop, rejected out/global/const/native/borrowed-projection placement, one negative descendant case for every current non-builtin `Ty`/`Scalar` storage edge including anonymous tuples, malformed-HIR twins, and the future-variant tripwire. Pure/Impure direct/imported/generic/parallel twins close effect transport separately. SSE acceptance uses the WHATWG examples plus BOM/invalid UTF-8, every line ending/split, empty/multiline/control-only events, id NUL/reset/inheritance, retry valid/invalid/overflow, unknown/case fields, exact output cap/cap+1, exact/rejected-next source-work allowance for every ignored class, incomplete EOF, cumulative body cap, and reconnect-policy absence. Output/body/work/framing/timeout/transport failure is injected after every staged ID/retry/data position to prove current-block rollback, prior control-only commit preservation, and no skipped reconnect ID. |
+
+`Error.Code(-1)` is therefore the stable **explicit HTTP receive-bound** result, not only a
+whole-body allocation result: it covers the already-shipped configured cumulative body cap and the
+new caller-selected SSE output-buffer cap. Both reject partial publication and close the connection.
+
+### Framing, read, and connection matrix
+
+| Final response/body state | Observable read/event result | Connection after exact completion |
+|---|---|---|
+| exact `HEAD`, `204`, or `304` | first `read` = 0 / first `next` = None; no payload/framing read | pool iff existing bodyless keep-alive/residual rules allow |
+| Content-Length | exact de-framed bytes, then 0/None; declared explicit-cap excess fails constructor | pool after exact length and no residual/pending bytes |
+| HTTP/1.1 chunked | payload only across arbitrary chunk/read boundaries; terminal/trailers never surface | pool only after valid zero chunk + trailers and no residual/pending bytes |
+| close-delimited | payload until transport EOF, then 0/None | close, never pool |
+| valid body with caller Drop before exact completion | already published bytes/events remain valid until their output owner changes | close immediately; no drain |
+| malformed/truncated/cap/timeout/transport/TLS failure | no partial current read/event; stable `Err` thereafter | close; never retry after response bytes |
+
+### Implementation closure matrix
+
+This is a cross-cutting ownership/framing capability, so the following matrix is authoritative for
+implementation. A public shape, lifetime, allocation strategy, validation order, framing/reuse
+verdict, SSE projection, or ABI change reopens it and requires fresh design review.
+
+| Closure axis | Required implementation evidence | Owner |
+|---|---|---|
+| Formation and type classes | Exact method/arity/receiver/output types; bound client/request/buffer; the complete finite `C` grammar accepted for each stream, including `Result` Ok/Err/both stream-bearing alternatives; locals, by-value/borrow/borrow-mut parameters, and returns admitted while out/global/const/native/borrowed-owning-projection positions reject; one cycle-safe exhaustive no-wildcard `Ty`/`Scalar` classifier admits only builtin-tag storage edges and rejects every other current/future edge, with explicit source and malformed-HIR tuple twins; captures/parallel transport and forbidden concrete generic substitutions reject; both streams are non-Copy/non-clone/non-printable/non-comparable; event nested Option record has three views plus inline Copy retry. | sema + checked-HIR parameterized placement/discriminator/reachable-type sweep + compile-time variant tripwire |
+| Effects and parallel exclusion | `request_stream`/`read`/`next` Impure; ownership-only `sse` and all head/state getters Pure; effect replay agrees for direct/imported/generic calls; no capture or parallel element/result can transport a stream into `par_map`. | effect-inference owner + direct/indirect/parallel negatives |
+| Construction and move-in | request validation, consume/null/free on every result, shared client retention, request scratch return, final head/interim/bodyless selection, same-read body carry, stale retry boundary. | compiler move owners + runtime constructor matrix |
+| Raw move-out | zero/exact/short/full-cap reads, split at every framing boundary, buffer generation/len, no grow/allocation, terminating and error expressions, later stable terminal result. | runtime decoder owner + driver E2E |
+| Explicit/unset limits | whole-body unchanged; streaming unset beyond 1 GiB; positive CL constructor exact/excess; chunked/close later exact/excess; per-call chunk framing exact 262,144 / rejected-next-byte / replenished-next-call; SSE output capacity exact/excess; private negative status never aliases byte counts. | runtime cap table + MIR/LLVM discriminant owner |
+| SSE interpretation and commit | Official examples and full BOM/UTF-8/line/field/blank/EOF Cartesian cases; current-block staging versus prior blank-line commits; raw-prefix transition; output concatenation/spans/inline retry; invalid-byte replacement expansion and cap; per-`next` source-work exact `capacity + 262,144` and rejected-next-byte cases for comments, unknown fields, invalid retry, control-only blocks, and split chunked input. Successful event atomically commits ID/retry with publication; output/body/work/framing/timeout/transport failure and incomplete EOF roll back only the pending block; prior control-only commits survive later failure. | parameterized runtime parser/state oracle + driver event/reconnect consumer |
+| Control-state allocation | unpublished data/event/candidate-ID staging in caller storage with `out.len == 0`; latest committed ID overwrite, NUL/invalid retry ignore, repeated control-only commits, one exact persistent-ID allocation, checked candidate length, exact geometric capacity growth/reuse, old+new transient high water, smaller later output, rollback/error/Drop free, no event allocation, fixed carry/counters. | allocation/failpoint/high-water instrumentation |
+| Carrier provenance, move, and Drop | direct and nested `Option`/`Result` Some/None/Ok/Err including stream-bearing Ok/Err/both alternatives, two-client joins, direct/imported/indirect/generic parameter/return, move-in/out, pattern unwrap, `?`/`else`/`match`/`map_err`, replacement, branch/loop/early return, and active-tag Drop retain the client dependency, initialize destination before source clear, and close/pool once. A table generated from every current `Ty`/`Scalar` discriminator proves all non-builtin storage edges forbidden, including user record/sum, anonymous tuple, collection/builder/box/task, capture, and parallel shapes. | sema provenance + checked-HIR mutation/discriminator sweep + MIR cleanup + runtime live counters |
+| Ownership, replacement, and return | raw→SSE transfer nulls source; client Drop/move rejected while any admitted `C` survives; other shared client requests accepted; output string view rejected after next/replacement/Drop and on escape while inline retry survives normally; all allowed exits drop once. | sema provenance owners + MIR cleanup + runtime live counters |
+| Pool and failure exits | CL/chunk/bodyless reusable twins, close-delimited, residual scratch, TLS pending, mid-body Drop, every parse/cap/timeout/I/O failure, completed Drop, stale zero-byte retry exactly once, no post-error I/O. | plaintext/TLS pool matrix + fd/SSL counters |
+| Generic/imported/per-unit | direct/imported/indirect helpers and noncapturing function-value signatures preserve dependency summaries for admitted `C`; unresolved higher-order calls conservatively retain every compatible client root; generic forwarding checks the fully substituted graph and rejects any non-builtin storage edge; whole/per-unit interface transport, cache edit/revert, and malformed effect/carrier/interface/checked-HIR reject before LLVM. | interface/cache/validation owners |
+| ABI and layout | Nine declared symbols, shared free/head ABI, SSE state getters, 64-byte envelope offsets/reserved zeroes, null/malformed-input sentinels and validation order, output clearing, pre-consumption rejection, null-safe free, signed private status mapping, cross-target pointer/`i64` layout. | ABI ledger tripwire + malformed direct-call matrix + MIR/LLVM structural assertions |
+| Resource parity | Fixed 262,144 head + 32,768 scratch, no raw body allocation, operation-local framing and SSE-work counters, SSE control storage tied only to explicit output capacities with old/new growth counted, no peer-derived transport/parser allocation, one connection owner throughout. | runtime high-water/allocation instrumentation |
+| Consumer acceptance | Streaming download hashes byte-identically to whole-body under its cap; two provider-style SSE events arrive before connection close; caller-driven reconnect reuses surfaced id/retry but no hidden request/sleep occurs. | driver E2E; later `pkg.llm`/cloud consumer adoption |
+
+### Delivery boundary
+
+Implementation lands as two independently useful capability PRs against this one reviewed ledger:
+
+1. The parameterized dependent-stream carrier owner plus `http_read_stream`
+   construction/head/raw read, explicit-cap composition, ownership, TLS, and pool closure. The first
+   PR closes the positive `C` grammar, exhaustive storage-edge tripwire, active-tag Move/Drop,
+   dependency/effect summaries, and interface/cache transport for the raw type instead of leaving them for SSE. This is
+   immediately useful for large downloads and any incremental protocol consumer.
+2. The consuming `http_sse_stream` transition, WHATWG parser, transactional control-state commit,
+   event projection, and caller-buffer cap. Adding the sibling type must extend the same
+   parameterized carrier/effect/provenance tripwire from one member to two; an ad-hoc second set of
+   matches cannot land. It reuses the first PR's only transport/framing owner and introduces no
+   dormant second decoder.
+
+The raw boundary is a stable consumer surface and a distinct failure domain; combining both would
+cross every compiler layer plus the HTTP/TLS decoder and the independent Unicode/event parser in one
+review. Splitting earlier would leave an unusable producer, while splitting SSE field families would
+duplicate state and cleanup proof. Neither PR makes a throughput claim, so benchmarks are diagnostic
+only; allocation/high-water instrumentation and owner tests are correctness gates.
+
+The carrier/state axis was reopened after the revised-design review: admitting a dependent handle
+without closing every reachable aggregate would make client lifetime conditional on an unchecked
+container, while mutating reconnect state before event publication could skip an undelivered event.
+A later audit found that enumerating forbidden containers had itself omitted the anonymous-tuple
+formation/Drop path. The closure is therefore the positive `C` grammar plus one exhaustive
+no-wildcard storage-graph classifier: every non-builtin-tag edge is forbidden without needing its
+name on a prose blacklist, and a new `Ty`/`Scalar` discriminator reopens the compile-time tripwire.
+The boundary above makes that carrier-provenance substrate a first-PR capability and makes SSE block
+state transactional in the second, rather than distributing either proof across later fixups.
 
 ## Pitfalls
 

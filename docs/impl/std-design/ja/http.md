@@ -15,8 +15,9 @@ HTTP/1.1 のプリミティブであり、フレームワークではない(draf
 対する必須の検証 + ホスト名バインディングを伴って)crypto の libcrypto と並んで動的リンクされる。サーバ側
 TLS はクライアント優先で先送り。HTTP/3、ルーティング、ミドルウェアは std ではなく pkg である。
 
-**モジュール状態: COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。サーバ側 TLS、
-クライアント証明書、カスタム CA、セッション再開、失効確認は記録済みの v1 後バックログ。
+**モジュール状態: v1 COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。最初の
+post-`pkg.db` convergence item である client streaming receive は **2026-08-29 設計済み、未実装**。
+サーバ側 TLS、クライアント証明書、カスタム CA、セッション再開、失効確認は別のバックログ項目である。
 
 ## Signatures
 
@@ -25,10 +26,31 @@ v1 案として、Fable が確定させた形式:
 ```text
 // Client
 cl := http.client()                         // コネクションプールを所有する (Move)
-cl.max_response_body_bytes(limit: i64)      // 0 は固定既定値へ戻し、正値は受信 allocation を制限する
+cl.max_response_body_bytes(limit: i64)      // 0 = whole-body 固定既定値 / streaming は累積 cap なし
 cl.get(url: str) -> Result<response, Error>
 cl.post(url: str, body: bytes) -> Result<response, Error>
 cl.request(req: request) -> Result<response, Error>
+cl.request_stream(req: request) -> Result<http_read_stream, Error>
+                                             // req を consume。返る Move stream は cl を borrow
+stream.status() -> i64
+stream.header(name: str) -> Option<str>       // stream が保持する final head への view
+stream.read(out: mut buffer) -> Result<i64, Error>
+                                             // de-frame 済み byte。out を上書き。0 = complete
+events := stream.sse()                        // current body position で stream を consume
+events.status() -> i64
+events.header(name: str) -> Option<str>
+events.last_event_id() -> str                  // current persistent state。events への view
+events.retry_ms() -> Option<i64>               // current persistent state
+events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>
+                                             // WHATWG event。三つの str view は out の fresh generation を borrow
+                                             // retry_ms は inline Copy value
+
+http_sse_event {
+  event: str                                 // event field が空なら "message"
+  data: str                                  // data line を一つの LF で join
+  last_event_id: str                         // persistent latest valid id。初期値は空
+  retry_ms: Option<i64>                      // latest representable retry。初期値は None
+}
 // Request/response building
 r := http.request(method: str, url: str)    // builder (Move — header list と body buf を所有する)
 r.max_response_body_bytes(limit: i64)       // 0 は client を継承し、正値は上限を狭めるだけ
@@ -101,12 +123,33 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - `response` は自身のヘッダーブロックとボディバッファを所有する(Move)。`resp.header()`/`resp.body()` は
   **resp にリージョン束縛されたビュー** を返す(#297 を意識した `region_of` 分岐 — net の借用した
   reader/writer や `json.decode` と同じ)。
+- `http_read_stream` と `http_sse_stream` は dependent **Move** resource である。それぞれ一つの checked-out
+  plaintext/TLS connection と bounded decoder state を所有し、生成元 `client` の shared borrow を保持する。
+  これにより exact completion で connection をその client の pool に戻せる。stream が生きている間も client
+  は他の shared-borrow request operation に使えるが、stream より先に move/drop はできない。両 type は bare
+  local/parameter/return として nameable である。storage carrier は有限かつ acyclic な grammar
+  `C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>` だけとする。ここで `stream` はいずれかの
+  dependent stream、`N` は storage graph に stream を含まない otherwise-valid type で、active builtin tag だけが
+  stream を所有する。stream への descendant path にそれ以外の storage edge があれば default で拒否する。現在の
+  user struct/sum、anonymous tuple、collection、box/builder/task、closure environment、parallel element/result は
+  すべて該当する。noncapturing function-value signature は stream を格納しないため parameter/result に `C` を
+  name できるが、capture はできない。generic substitution は complete concrete graph で検査する。classifier は
+  全 `Ty`/`Scalar` variant を wildcard 無しで exhaustive match するため、future constructor は classify されるまで
+  compiler tripwire を失敗させる。`request_stream` は最初の stream を `Result` 内に作り、`sse()` は同じ
+  owner/borrow を `http_sse_stream` へ移し、source を null にする。
+- `http_sse_event` は compiler-provided Copy record である。三つの `str` field は `next` が caller の `out`
+  buffer に書いた fresh generation を view し、その buffer の次の mutable use、replacement、Drop を越えられ
+  ない。record 自体は allocation を所有せず、Drop も無い。
 - Move の拒否は `scalar_arg` のチョークポイントで行うが、自分のコンストラクタが返す Result の Ok 位置だけ
   は例外とする(net のテンプレート)。
 
 ## Effect classification
 
-すべて impure である(net 経由のネットワーク syscall)。
+connect/accept/send/receive/finish/reject など socket に触れる HTTP operation は **Impure**。in-memory
+constructor/parser/builder/setter/getter は既存の **Pure** classification を維持する。streaming surface では
+`request_stream`/`read`/`next` が Impure、`sse`/`status`/`header`/`last_event_id`/`retry_ms` が Pure。
+stream type は parallel element/result または closure/task capture にできないため、この ownership-only transition
+や Pure getter から live connection を Pure parallel closure に持ち込めない。
 
 ## Error policy
 
@@ -1130,8 +1173,8 @@ API は加えない。
 | Input and defaults | `limit == 0` は stored value を clear する。clear client は fixed `HTTP_MAX_BODY = 1,073,741,824`、clear request は client を inherit する。positive は `1..=HTTP_MAX_BODY` かつ target-`usize` representable。negative/larger/unrepresentable/null handle は previous value と network work より前に abort。ambient input は無い。 |
 | Selection | `get`/`post` は client value、`request` は `min(positive client or HTTP_MAX_BODY, positive request or HTTP_MAX_BODY)`。どちらかが positive なら positive `HTTP_MAX_BODY` 自体も *explicit*、zero/unset は non-explicit。`get_many` は worker start 前に client value を一度 snapshot。source borrow が concurrent setter を除外し、native atomic storage が race-free snapshot を保つ。 |
 | Success and ownership | exact-limit payload は既存 Move `response` を返し、`status()`/`header()`/`body()` は region-bound zero-copy view のまま。explicitly bounded response は fixed header/body allocation を別々に Drop まで所有するが opaque handle ABI/source ownership は不変。setter は input view を保持しない。 |
-| Limit result | explicit bound を超える payload を最初に認識した時点で stable `Error.Code(-1)` を返す。explicit bound が無い場合の target/global excess は従来どおり `Error.Invalid` である。`-1` は `std.http` receive-body limit 専用で、HTTP status `100..=599` と common errno mapping が公開する non-negative raw OS code の外にある。`Error.Timeout`、transport `Error.Code(errno)`、successful HTTP 413 とも異なり、partial response/body は返さない。 |
-| Native status mapping | runtime は HTTP-private `AL_HTTP_BODY_LIMIT = -1` を使う。client-response Result lowerer だけが positive な common category/errno mapping 前にこれを `Error.Code(-1)` へ写す。この sentinel は saturating `AL_CODE + errno` と衝突せず、generic errno decoder には入らず、`Error` variant/layout を増やさない。 |
+| Limit result | explicit bound を超える payload を最初に認識した時点で stable `Error.Code(-1)` を返す。explicit bound が無い場合の target/global excess は従来どおり `Error.Invalid` である。`-1` は explicit `std.http` receive bound（この capability の body limit と、下の streaming settlement 後は caller-selected SSE output bound）専用で、HTTP status `100..=599` と common errno mapping が公開する non-negative raw OS code の外にある。`Error.Timeout`、transport `Error.Code(errno)`、successful HTTP 413 とも異なり、partial response/body/event は返さない。 |
+| Native status mapping | runtime は HTTP-private `AL_HTTP_BODY_LIMIT = -1` を使う。HTTP client receive Result lowerer だけが positive な common category/errno mapping 前にこれを `Error.Code(-1)` へ写す。この sentinel は saturating `AL_CODE + errno` と衝突せず、generic errno decoder には入らず、`Error` variant/layout を増やさない。 |
 | Content-Length | 各 field を arbitrary-precision normalized decimal magnitude として parse。syntax、equal duplicate normalization、conflicting duplicate、CL/TE conflict が cap より先。payload-bearing final response の valid magnitude が explicit cap 超なら `usize`/`HTTP_MAX_BODY` 超でも `Error.Code(-1)`。explicit でなければ target/global excess は `Error.Invalid`。peer value から reserve せず、excess 後に payload read しない。 |
 | Method/status composition | Request 4 の exact-uppercase `HEAD`/`CONNECT`、interim、`204`、`304` rule を維持。bodyless final は metadata を validate するが cap compare、body allocate、payload/chunk/trailer read をしない。cap は returned final payload だけ。 |
 | Chunked payload | line/framing/trailer guard と grammar は不変。guard と complete-line syntax が cap より先。valid chunk magnitude で cumulative decoded bytes が explicit cap を超えるなら target conversion/payload allocation/next read 前に `Error.Code(-1)`。non-explicit global excess は `Error.Invalid`。terminal chunk 前の limit 後は trailer を読まない。 |
@@ -1179,6 +1222,125 @@ Request 4 state machine/owner を再利用し expected hand-written change は�
 benchmark は不要。この contract は throughput ではなく resource ceiling を claim し、runtime instrumentation
 が直接測る。code/allocation/public method/framing precedence/layer ownership の変更は implementation 前に ledger
 を reopen する。
+
+## Client streaming receive（post-`pkg.db` convergence item 1 — 2026-08-29 設計済み）
+
+whole-body API は一つの owned `response` が必要な terminal には正しいが、終端のない provider stream や
+大きな download には正しくない。この capability は Request 4 の incremental decoder を一つの dependent
+read resource として公開する。transfer framing は `std.http` 内に保ち、allocation と iteration は caller-owned
+`buffer` により call site で可視にする。consuming type transition が、第二の socket/framing decoder、automatic
+reconnect loop、provider abstraction を増やさず WHATWG server-sent-event interpretation を加える。
+normative parsing source は WHATWG HTML “Interpreting an event stream”
+(`https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream`) である。
+
+```text
+request -> cl.request_stream(request) -> http_read_stream
+http_read_stream -> repeated read(caller_buffer) -> de-framed bytes -> completion
+```
+
+SSE では raw byte を読む前に同じ body owner を変換する。output buffer は event ごとに再利用し、その capacity
+が explicit event-materialization bound になる。
+
+```text
+http_read_stream -> consuming sse() -> http_sse_stream
+http_sse_stream -> repeated next(caller_buffer) -> Option<http_sse_event> -> completion
+```
+
+### 公開契約台帳
+
+| Surface / state | 厳密な契約 |
+|---|---|
+| Construction | `cl.request_stream(req: request) -> Result<http_read_stream, Error>` が唯一の streaming request entry point である。bound `client` を要求し、Move `request` を consume/null 化し、一度だけ serialize/send し、valid non-`101` informational head を discard しながら進み、final head の complete validation 後にだけ返る。exact uppercase `CONNECT` は URL/pool/DNS/connect/write/TLS work より前に拒否する。`get_stream`/`post_stream` alias は加えず、caller は ordinary request を明示的に build する。 |
+| Effects | `request_stream`/`read`/`next` は network I/O を行い得るため Impure。`sse()` は I/O/allocation の無い Pure ownership-only type transition、`status`/`header`/`last_event_id`/`retry_ms` は retained memory の Pure read。stream type は parallel element/result または closure/task capture にできないため、Pure parallel closure は live stream を取得・advance・implicit release できない。 |
+| Head and status | success stream は exact final status line/header bytes を保持する。`status()` は final `i64`、`header(name)` は既存の case-insensitive first-match lookup による stream-bound `Option<str>` view を返す。4xx/5xx を含む HTTP status は data のまま。`101`、malformed head、framing conflict、invalid bodyless metadata は `Error.Invalid`。constructor は final head を認識した後に body transport read を行わない。ただし head を完成させた一回の 32 KiB read が body byte も co-read している場合を除く。 |
+| Raw read | `stream.read(out: mut buffer) -> Result<i64, Error>` は stream を mutably borrow し、work 前に `out.len` を zero にし、既存 capacity 以下を書いて grow せず、decoded payload count を返す。positive result では exact fresh bytes が `out.bytes()` から見え、zero は HTTP body completion だけを意味する。zero-capacity buffer は stream state/I/O 変更前に abort。一つでも payload byte が得られた後は transport read を追加しないが、already-buffered framing は消費してよい。`Err` では `out.len` は zero のままで partial byte を公開しない。 |
+| HTTP framing | Request 4 の head/interim/bodyless/Content-Length/chunk grammar/trailer/CRLF/error-precedence/plaintext-TLS rule を authoritative とする。ただし whole-message cumulative chunk-framing counter は継承しない。body-facing な各 `read`/`next` は fresh な `HTTP_MAX_STREAM_CHUNK_FRAMING = 262,144` wire-byte allowance を持つ。その call が process するすべての chunk-size line と CRLF、および nonzero payload 後の各 CRLF を charge し、scratch に co-read 済みの byte も含む。call をまたぐ byte は最初に process する call だけが charge し、二重計上しない。exact allowance は成功する。さらに framing byte が必要なら over-guard read 無しに `Error.Invalid` となり、error は stream を close する。successful return 後の次の call は allowance を補充する。`read` が公開するのは Content-Length byte、de-chunked payload、close-delimited byte だけで、chunk line、payload CRLF、terminal chunk、trailer は公開しない。exact `HEAD`/`204`/`304` stream は empty body で complete し、Request 4 の arbitrary valid metadata rule を維持する。payload-bearing response では unbounded stream は `u64::MAX` までの valid Content-Length を受理し、それより大きい normalized magnitude は return 前に `Error.Invalid`。chunked/close-delimited の cumulative decoded length が `u64::MAX` を越える場合も `Error.Invalid`。 |
+| Receive limit | positive に select された `max_response_body_bytes` は `request_stream` でも explicit cumulative decoded-body cap である。exact fit は成功し、最初に認識できる excess は `Error.Code(-1)`。declared Content-Length excess は body read 前に constructor が fail する。chunked/close-delimited excess は後の `read`/`next` で fail し得る。stored value が両方 zero の streaming には **cumulative body cap が無い**。whole-body と異なり total length 比例の allocation をしないためである。fixed head guard、per-call framing/SSE work guard、caller buffer capacity、timeout、`u64` accounting は残る。したがって configured option を黙って無視せず、whole-body cap を unset にすれば indefinite SSE stream を表現できる。 |
+| Timeout snapshot | construction は request override または client default を一度 resolve する。同じ timeout を connect、send、各 constructor receive、後続の各 `read`/`next` transport receive に独立して適用する。expiry は `Error.Timeout`、zero は no timeout のまま。stream 作成後の setter は snapshot を変えない。 |
+| SSE transition | `stream.sse() -> http_sse_stream` は Pure で、I/O/copy/allocation/connection change 無しに raw stream を consume/null 化する。parse は undelivered co-read byte を含む current logical body position から始まる。`read` 前の変換は complete response body を解釈し、WHATWG の一つの leading UTF-8 BOM を strip する。raw read 後の変換は意図的に remaining suffix だけを解釈し、suffix BOM を response-leading BOM と扱わない。`http_sse_stream` は同じ `status()`/`header()` head view を持つが raw `read` を持たないので、変換後に二つの body interpretation を混在できない。 |
+| SSE scope | `events.next(out: mut buffer) -> Result<Option<http_sse_event>, Error>` が実装するのは WHATWG event-stream **decoding/field interpretation** であり、browser `EventSource` networking policy ではない。`Content-Type` validation、redirect、reconnect、sleep、`Last-Event-ID` 追加、HTTP status classification は行わない。caller が status/header を検査し、body を SSE として扱うか決め、後続 request も明示的に構築する。 |
+| UTF-8 and lines | remaining de-framed body は WHATWG UTF-8 decode algorithm で decode する。一つの response-leading BOM を除き、malformed byte sequence は U+FFFD となるため invalid Align `str` は生じない。CRLF、lone LF、lone CR は transport/chunk boundary をまたいでも line terminator。field name は case folding 無しに byte-exact compare。最初の `:` で name/value を split し、その直後の U+0020 をちょうど一つだけ除く。`:` が無い line は empty value。leading `:` line は comment として ignore。 |
+| SSE fields and state | `data` は value と一つの LF を append、`event` は current block-local event type を replace、valid `id`/`retry` line は block-local candidate を replace する。U+0000 を含む `id`、empty/nondigit/`i64::MAX` 超の `retry` は ignore。unknown/case-mismatched field も ignore。data/event/candidate state は各 blank-line dispatch attempt 後に reset。persistent last-event-id/retry の初期値は empty/`None` で、下記 atomic block commit の時だけ変更する。`events.last_event_id()` は last committed ID の stream-bound view、`events.retry_ms()` は current inline Copy value を返す。ID view は replacement を commit し得る後続 `next` を越えられない。 |
+| SSE work guard | `HTTP_MAX_SSE_METADATA = 262,144`。各 `next(out)` が UTF-8 decoder に渡してよい de-framed source byte は最大 `u64(out.capacity) + HTTP_MAX_SSE_METADATA`。checked sum は、その call が process する全 source byte を数え、strip された BOM、invalid UTF-8 input、line terminator、comment、unknown field、invalid `retry` value、control-only block、dispatch される data を含む。co-read 済み byte は次の transport read より前に charge する。allowance exactly で終了/dispatch する場合は成功する。次の source byte が必要なら over-guard body read 無しに `Error.Invalid`、stream close、`out.len = 0`、event 非公開となる。successful `Some` または terminal `None` で call は終わり、次の call は fresh allowance を得る。caller-capacity 項が event material を、fixed 項が syntax と任意個数の ignored/control-only block を bound するため、unset cumulative body cap でも一回の `next` は unbounded work を行わない。 |
+| Dispatch and state commit | 少なくとも一つ `data` field がある blank line は一つの event を attempt し、`data` の無い block は event を作らない。accumulated data 末尾の LF を一つ除く。empty event type は `"message"`、それ以外は exact preserve。parse 前に `out.len = 0`。caller allocation は commit 前の unpublished staging。control-only block では valid candidate ID/retry を blank line で atomically commit し、staging を reset して同じ call の parse を続ける。この commit は同じ `next` 内の後続 block failure を越えて残る。data-bearing block では exact `event || data || committed-or-candidate last_event_id` byte が output capacity に収まるか先に検査する。exact fit のとき candidate ID/retry commit と `Some` publication を atomic に行う。`retry_ms` は inline copy、三つの string field は fresh output generation の zero-copy span。atomic step 前の output-cap または後続 terminal error は current block だけを earlier blank-line committed state へ rollback し、stream close、`out.len == 0`、event 非公開。output-cap excess は `Error.Code(-1)`。 |
+| Empty and terminal cases | `data`、`data:`、一つの optional space が続く `data:` は empty `data` event を dispatch でき、二つの empty data line は一つの LF を dispatch する。comment と empty/control-only block は `Some` を作らない。final blank line 無しの HTTP completion は staged ID/retry を含む pending block 全体を discard して `None` を返し、normal connection verdict を適用する。以前の blank line で commit 済みの control-only block は観測可能なまま。以後の `next` は I/O 無しで常に `None`。 |
+| SSE storage | caller allocation が唯一の block-staging/event allocation。`out.len == 0` の間に current data/event type/candidate ID byte を置き、published order へ in-place rearrange するか control-only commit 後に reset する。`next` は grow せず per-event body allocation を行わない。stream が retain するのは一つの exact-capacity allocation 内の committed last-event-id と inline committed/candidate retry scalar だけ。old ID capacity を `K`、commit candidate ID length を `N`、current output capacity を `C` とする。`N > C` は mutation 前に `Error.Code(-1)`。`N > K` なら exact に `K' = max(N, min(C, saturating_mul(K, 2)))` を allocate/initialize してから、まだ live な old allocation を free する。zero からは直接 `N` へ grow する。`M` をこれまで供給された最大 output capacity とすると、retained ID capacity は最大 `M`、growth step の old + new ID capacity は厳密に `2 * M` 未満。後の小さい buffer では shrink せず、dispatch event はその call の capacity に収まらなければならない。UTF-8 carry は最大三 byte、line/parser counter は fixed-size。response-leading 32 KiB transport scratch と fixed head allocation は raw mode と共有する。 |
+| Errors and precedence | request/setter validation が network work より先。received head/framing syntax と current call の framing guard が body-cap check より先で、complete valid magnitude が conversion/accounting より先。newly available payload byte では selected cumulative body cap を SSE source-work guard より先に charge し、その後 UTF-8 replacement/line/field interpretation を caller output-cap comparison より先に行う。したがって同じ byte で body-cap excess と SSE-work excess が成立すれば `Error.Code(-1)` が先で、framing byte 自体が allowance を越える場合は payload が存在する前に `Error.Invalid`。caller output-cap excess は event/state commit より先に勝つ。framing/truncation/stream-work/`u64` excess は `Error.Invalid`、deadline は `Error.Timeout`、transport/TLS は既存 category、どちらの explicit cap も `Error.Code(-1)`。terminal error は current incomplete/unpublished block を rollback し、以前の blank-line commit を保持し、connection を poison/close する。以後の body call は I/O 無しで同じ stored error、Pure state getter は last committed value を公開する。 |
+| Allocation | construction は一つの fixed `HTTP_MAX_HEADER_BLOCK = 262,144` final-head allocation、一つの fixed `HTTP_CLIENT_READ_CHUNK = 32,768` scratch、header-span table、checked-out connection を所有し、raw stream 内で body byte allocation は無い。request serialization scratch は construction 直後に client へ戻る。SSE は bounded な committed-ID allocation だけを追加し、event/block byte は caller storage、retry state は inline。steady capacity は最大 `M`、同時に live な old/new capacity を持つ唯一の growth transition は厳密に `2 * M` 未満。これらの数値は caller-owned output buffer、fixed handle/table metadata、allocator bookkeeping、opaque kernel/libssl storage を除く。peer Content-Length/chunk magnitude/cumulative body length/SSE field length は fixed または caller-selected bound を越える capacity を生じさせない。OOM は fatal/no-unwind。 |
+| Ownership and cleanup | 両 stream type は Move の borrow-mutated cursor で shared client borrow を保持する。client pool は他の shared call に利用できるが stream より先に move/drop できない。`sse()` は全 connection/scratch/head/control owner と cleanup bit を一度だけ transfer。bare および admitted builtin-tag construction、success、`?`、`else`、`match`、`map_err`、replacement、return、ordinary Drop は一つの owner と client provenance を保つ。他の storage/capture/parallel carrier はすべて拒否する。stream は creating client、event string は output-buffer generation を越えて escape できない。 |
+| Carrier formation and provenance | `C ::= http_read_stream | http_sse_stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>` とする。graph は finite/acyclic、`N` は storage graph に stream を含まない otherwise-valid type。この最小集合が complete carrier admission rule であり、各 active tag は zero または one stream を持つ。active payload の move/pattern unwrap は destination 初期化後に complete source tag/handle を clear し、replacement/Drop は全 nested active tag を検査して存在する stream を exactly once release する。`C` は local、by-value/shared-borrow/mutable-borrow parameter、function result に置ける。`out C`、constant/global、user native/extern signature、borrowed-place owning projection/match、その他の placement は拒否し、ordinary return と consuming match を唯一の transfer path とする。direct/imported/indirect function parameter/return summary は client dependency を保つ。noncapturing function signature は `C` を name できるが function value 自体は carrier ではない。control-flow join は可能な creating client を union するため、joined carrier の consume/drop より前にいずれも死ねない。一つの cycle-safe positive classifier が fully substituted storage graph を検査し、全 `Ty`/`Scalar` discriminator を `_` 無しで exhaustive match する。builtin `Option`/`Result` edge だけ recurse し、他の enclosing storage edge は forbidden を返す。したがって user struct/sum、anonymous tuple、fixed/dynamic/specialized collection、slice、box、builder、task、closure environment、parallel element/result、malformed HIR、future unclassified constructor は exclusion list に依存せず fail closed となる。 |
+| Connection fate | keep-alive eligible な Content-Length body または valid terminal chunk/trailer は complete と判定した時だけ、residual scratch/TLS-pending byte が無ければ creating client pool に戻る。bodyless completion は constructor return 前に pool してよい。close-delimited success は close。exact completion 前の Drop、caller/body limit、malformed/truncated framing、timeout、transport/TLS error、`101`、residual byte は close して pool せず、Drop は hidden drain を行わない。reused stale connection は response byte 前の failure に限り fresh connection で一度だけ retry する。 |
+| Plaintext / TLS | 一つの framing/read/SSE state machine が `Conn::Plain`/`Conn::Tls` を consume する。TLS verification、hostname binding、ALPN、timeout mapping、`SSL_pending`/`SSL_has_pending` reuse exclusion、SIGPIPE suppression、teardown は common owner より下に保つ。同一 application byte から plaintext/TLS は同一 body partition/SSE event を公開する。 |
+| Compiler/runtime owner | Sema は exact method/type/effect、admitted carrier grammar、bound receiver/output check、Move transfer、client/output provenance、parallel exclusion、event field type を所有。checked HIR は全 new envelope と effect/type/region/carrier fact を独立検証。MIR は construction/head access/read/conversion/next/transactional state commit/status mapping/source nulling/Drop。LLVM は ABI declaration/call と Result/Option/event reconstruction。runtime は URL/request work、pool/TLS connection、framing state、cap/timeout accounting、SSE decoding/staging/commit、buffer write、cleanup。package owner は無い。 |
+| Native ABI and identity | `i32 @align_rt_http_client_request_stream(ptr, ptr, ptr)`、`i64 @align_rt_http_read_stream_status(ptr)`、`i32 @align_rt_http_read_stream_header(ptr, ptr, i64, ptr)`、`i32 @align_rt_http_read_stream_read(ptr, ptr, ptr)`、`ptr @align_rt_http_read_stream_sse(ptr)`、`{ptr,i64} @align_rt_http_sse_stream_last_event_id(ptr)`、`i64 @align_rt_http_sse_stream_retry_ms(ptr)`、`i32 @align_rt_http_sse_stream_next(ptr, ptr, ptr)`、`void @align_rt_http_read_stream_free(ptr)` を追加する。retry getter は `None` を `-1`、stored non-negative value をそのまま返す。`read` は status と `i64` count output を分離し、private negative `AL_HTTP_BODY_LIMIT` が positive byte count と衝突しない。`next` は canonical 64-byte/8-aligned envelope を書く: `u8 present`、`u8 retry_present`、six zero reserved bytes、`i64 retry_ms`、続いて event/data/last-event-id 順の `{ptr,i64}`。error/None は envelope 全体を zero。両 Move type は head getter/free ABI を共有。new type/method/HIR/MIR record は interface/cache identity に一度入り、exact edit/revert で prior hash を復元する。 |
+| Native input validation | runtime entrypoint は writable output を Move source consume/I/O より前に validate する。`request_stream` はまず null output slot を拒否し、valid なら zero 化する。null client/request は `AL_INVALID` を返し、nonnull request は caller-owned のまま。三つが valid になってから request を take し、以後の success/error path は一度だけ consume する。`read` は最初に count slot を要求して zero を書き、次に nonnull buffer を要求して length を zero 化し、最後に nonnull stream を要求する。`next` は最初に envelope を要求して全体を zero 化し、次に nonnull buffer を要求して length を zero 化し、最後に nonnull stream を要求する。invalid handle、zero-capacity direct-ABI buffer、missing output は stream state/I/O を変えず `AL_INVALID`。checked source の zero-capacity case は ABI call 前に既定の abort に lower する。`header` は valid output view を zero 化し、null stream、negative/non-`usize` name length、positive length かつ null data では absent を返す。zero length から null slice は作らない。`status(null) = 0`、`last_event_id(null) = {null,0}`、`retry_ms(null) = -1`、`sse(null) = null` で ownership transition は無い。`sse(nonnull)` は check 後にだけ raw owner を take する。shared free は null-safe。これらの check は slice construction、dereference、allocation、ownership take、network/pool effect よりこの順で先行する。 |
+| Prerequisite and acceptance | Request 4 framing、Request 5 explicit cap、client TLS/pool/timeout、caller-owned `buffer`、nested `Result<Option<Record>, Error>`、dependent-resource provenance が shipped prerequisite。raw acceptance は fixed/chunked/close/bodyless/interim body を plaintext/TLS の every split boundary で stream し、bounded memory と pool/Drop fate、explicit cap 無しの 1 GiB 超 download を証明し、per-call framing byte が exactly 262,144 なら受理、次 byte は read 前に拒否、後続 successful call では allowance 補充を証明する。compiler acceptance は stream-bearing `Result` Ok/Err/both arm を含む全 `C` grammar production、nested tag、two-client provenance join、direct/imported/indirect/generic forwarding、by-value/borrow/borrow-mut parameter と return placement、exact active Drop、rejected out/global/const/native/borrowed-projection placement、anonymous tuple を含む現行全 non-builtin `Ty`/`Scalar` storage edge ごとの negative descendant case、malformed-HIR twin、future-variant tripwire を cover する。Pure/Impure direct/imported/generic/parallel twin は effect transport を別に閉じる。SSE acceptance は WHATWG example に加え BOM/invalid UTF-8、全 line ending/split、empty/multiline/control-only event、id NUL/reset/inheritance、retry valid/invalid/overflow、unknown/case field、exact output cap/cap+1、全 ignored class の source-work exact/rejected-next allowance、incomplete EOF、cumulative body cap、reconnect-policy absence を持つ。全 staged ID/retry/data position 後に output/body/work/framing/timeout/transport failure を inject し、current-block rollback、prior control-only commit preservation、no skipped reconnect ID を証明する。 |
+
+したがって `Error.Code(-1)` は whole-body allocation だけでなく stable な **explicit HTTP receive-bound**
+result である。既存の configured cumulative body cap と新しい caller-selected SSE output-buffer cap の両方を
+表し、どちらも partial publication を拒否して connection を close する。
+
+### Framing、read、connection matrix
+
+| Final response/body state | Observable read/event result | Exact completion 後の connection |
+|---|---|---|
+| exact `HEAD`、`204`、`304` | first `read` = 0 / first `next` = None。payload/framing read 無し | existing bodyless keep-alive/residual rule が許す場合だけ pool |
+| Content-Length | exact de-framed bytes の後 0/None。declared explicit-cap excess は constructor failure | exact length + no residual/pending 後 pool |
+| HTTP/1.1 chunked | arbitrary chunk/read boundary をまたぐ payload のみ。terminal/trailer は非公開 | valid zero chunk + trailer + no residual/pending 後だけ pool |
+| close-delimited | transport EOF まで payload、その後 0/None | close。pool しない |
+| valid body で exact completion 前に caller Drop | already published byte/event は output owner が変わるまで valid | 即 close。drain 無し |
+| malformed/truncated/cap/timeout/transport/TLS failure | current read/event の partial publication 無し。以後 stable `Err` | close。response byte 後は retry 無し |
+
+### 実装 closure matrix
+
+これは cross-cutting ownership/framing capability なので次の matrix を implementation の authoritative record と
+する。public shape、lifetime、allocation strategy、validation order、framing/reuse verdict、SSE projection、ABI を
+変える場合は実装前に reopen し、fresh design review を要する。
+
+| Closure axis | 必須 implementation evidence | Owner |
+|---|---|---|
+| Formation and type classes | exact method/arity/receiver/output type、bound client/request/buffer、`Result` の Ok/Err/both stream-bearing alternative を含む各 stream の complete finite `C` grammar acceptance。local/by-value/borrow/borrow-mut parameter/return は admit、out/global/const/native/borrowed-owning-projection position は reject。一つの cycle-safe/exhaustive/no-wildcard `Ty`/`Scalar` classifier が builtin-tag storage edge だけを admit して他の current/future edge を全拒否し、source と malformed-HIR の explicit tuple twin を持つ。capture/parallel transport と forbidden concrete generic substitution は reject。両 stream は non-Copy/non-clone/non-printable/non-comparable。event nested Option record は三 view + inline Copy retry。 | sema + checked-HIR parameterized placement/discriminator/reachable-type sweep + compile-time variant tripwire |
+| Effects and parallel exclusion | `request_stream`/`read`/`next` Impure、ownership-only `sse` と全 head/state getter Pure、direct/imported/generic call の effect replay 一致、capture/parallel element-result から `par_map` へ stream を運べない。 | effect-inference owner + direct/indirect/parallel negative |
+| Construction and move-in | request validation、全 result で consume/null/free、shared client retention、request scratch return、final head/interim/bodyless selection、same-read body carry、stale retry boundary。 | compiler move owner + runtime constructor matrix |
+| Raw move-out | zero/exact/short/full-cap read、全 framing boundary split、buffer generation/len、no grow/allocation、terminating/error expression、later stable terminal result。 | runtime decoder owner + driver E2E |
+| Explicit/unset limits | whole-body unchanged、streaming unset で 1 GiB 超、positive CL constructor exact/excess、chunked/close later exact/excess、per-call chunk framing の exact 262,144/rejected-next-byte/replenished-next-call、SSE output capacity exact/excess、private negative status と byte count の non-alias。 | runtime cap table + MIR/LLVM discriminant owner |
+| SSE interpretation and commit | official example と complete BOM/UTF-8/line/field/blank/EOF Cartesian case、current-block staging と prior blank-line commit、raw-prefix transition、output concatenation/span/inline retry、invalid-byte replacement expansion/cap、comment/unknown field/invalid retry/control-only block/split chunked input に対する per-`next` source-work exact `capacity + 262,144` と rejected-next-byte case。successful event は ID/retry を publication と atomic commit。output/body/work/framing/timeout/transport failure と incomplete EOF は pending block だけ rollback、prior control-only commit は後続 failure を越えて残る。 | parameterized runtime parser/state oracle + driver event/reconnect consumer |
+| Control-state allocation | `out.len == 0` の caller storage に unpublished data/event/candidate-ID staging、latest committed ID overwrite、NUL/invalid retry ignore、repeated control-only commit、一つの exact persistent-ID allocation、checked candidate length、exact geometric capacity growth/reuse、old+new transient high water、smaller later output、rollback/error/Drop free、event allocation 無し、fixed carry/counter。 | allocation/failpoint/high-water instrumentation |
+| Carrier provenance, move, and Drop | stream-bearing Ok/Err/both alternative を含む direct/nested `Option`/`Result` Some/None/Ok/Err、two-client join、direct/imported/indirect/generic parameter/return、move-in/out、pattern unwrap、`?`/`else`/`match`/`map_err`、replacement、branch/loop/early return、active-tag Drop が client dependency を保持し、destination 初期化後 source clear、close/pool once。現行全 `Ty`/`Scalar` discriminator から生成する table が user record/sum、anonymous tuple、collection/builder/box/task、capture、parallel shape を含む全 non-builtin storage edge の forbidden を証明する。 | sema provenance + checked-HIR mutation/discriminator sweep + MIR cleanup + runtime live counter |
+| Ownership, replacement, and return | raw→SSE transfer source null、admitted `C` が生存中の client Drop/move rejection、other shared client request acceptance、next/replacement/Drop/escape 後の output string view rejection と inline retry の ordinary survival、全 allowed exit の exact-once Drop。 | sema provenance owner + MIR cleanup + runtime live counter |
+| Pool and failure exits | CL/chunk/bodyless reusable twin、close-delimited、residual scratch、TLS pending、mid-body Drop、全 parse/cap/timeout/I/O failure、completed Drop、stale zero-byte retry exactly once、no post-error I/O。 | plaintext/TLS pool matrix + fd/SSL counter |
+| Generic/imported/per-unit | direct/imported/indirect helper と noncapturing function-value signature は admitted `C` の dependency summary を保持する。unresolved higher-order call は全 compatible client root を conservatively retain。generic forwarding は fully substituted graph を検査し non-builtin storage edge を拒否する。whole/per-unit interface transport、cache edit/revert、malformed effect/carrier/interface/checked-HIR は LLVM 前に reject。 | interface/cache/validation owner |
+| ABI and layout | nine declared symbol、shared free/head ABI、SSE state getter、64-byte envelope offset/reserved zero、null/malformed-input sentinel と validation order、output clearing、pre-consumption rejection、null-safe free、signed private status mapping、cross-target pointer/`i64` layout。 | ABI ledger tripwire + malformed direct-call matrix + MIR/LLVM structural assertion |
+| Resource parity | fixed 262,144 head + 32,768 scratch、raw body allocation 無し、operation-local framing/SSE-work counter、old/new growth を数え explicit output capacity だけに結びつく SSE control storage、peer-derived transport/parser allocation 無し、全期間一つの connection owner。 | runtime high-water/allocation instrumentation |
+| Consumer acceptance | streaming download は whole-body cap 内で hash byte-identical。二つの provider-style SSE event が connection close 前に届く。caller-driven reconnect は surfaced id/retry を使えるが hidden request/sleep は無い。 | driver E2E。後続 `pkg.llm`/cloud consumer adoption |
+
+### Delivery boundary
+
+implementation は、この一つの reviewed ledger に対して独立に有用な二つの capability PR として着地する。
+
+1. parameterized dependent-stream carrier owner と `http_read_stream`
+   construction/head/raw read、explicit-cap composition、ownership、TLS、pool closure。first PR は raw type に
+   対する positive `C` grammar、exhaustive storage-edge tripwire、active-tag Move/Drop、dependency/effect summary、
+   interface/cache transport を閉じ、SSE へ先送りしない。large download と任意の incremental protocol
+   consumer に直ちに有用である。
+2. consuming `http_sse_stream` transition、WHATWG parser、transactional control-state commit、event
+   projection、caller-buffer cap。sibling type 追加時は同じ parameterized carrier/effect/provenance tripwire を
+   one member から two へ拡張し、ad-hoc な第二 match 集合を許さない。first PR の唯一の transport/framing owner
+   を再利用し、dormant な第二 decoder を増やさない。
+
+raw boundary は stable consumer surface かつ distinct failure domain である。両方を一つにすると全 compiler layer、
+HTTP/TLS decoder、独立した Unicode/event parser を一 review でまたぐ。それより前で切ると unusable producer が
+残り、SSE field family ごとの分割は state/cleanup proof を重複させる。どちらも throughput claim を行わないので
+benchmark は diagnostic のみであり、allocation/high-water instrumentation と owner test が correctness gate となる。
+
+revised-design review 後に carrier/state axis を reopen した。dependent handle を全 reachable aggregate の closure
+無しに admit すると client lifetime が unchecked container に依存し、event publication 前の reconnect-state mutation
+は caller が受け取らなかった event を skip し得る。後続 audit では forbidden container の列挙自体が anonymous
+tuple の formation/Drop path を漏らしていた。そこで closure を positive `C` grammar と一つの exhaustive
+no-wildcard storage-graph classifier に変える。全 non-builtin-tag edge は prose blacklist に名前が無くても forbidden
+で、新しい `Ty`/`Scalar` discriminator は compile-time tripwire を reopen する。したがって上記 boundary はこの
+carrier-provenance substrate を first-PR capability、SSE block state を second-PR transaction とし、どちらの proof も
+後続 fixup に分散させない。
 
 ## Pitfalls
 
