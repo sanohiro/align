@@ -62,6 +62,7 @@ invented exact counts here.
 | `infallible-entrypoint-contract` | 1 | 1 | Watch; an inspection entry point documented as infallible must stay fail-closed on input no producer emits (unchecked or hand-overridden HIR). Only the explicitly fallible boundary may reject, and every production path must use that boundary. |
 | `historical-workflow-source-boundary` | 1 | 1 | Watch; a workflow that checks out an older tag must not assume newly added helper scripts exist in that historical source tree. |
 | `workflow-trust-provenance` | 1 | 1 | Watch; PR-controlled workflow code must execute classifiers from the trusted base, with an explicit bootstrap arm when the trusted base predates the classifier. |
+| `review-checkpoint-completeness` | 1 | 1 | Watch; only a wrapper-owned cycle verdict recorded after successful reviewer exit and result validation may authorize changed-slice continuation. |
 | `hot-path-scan-regression` | 1 | 1 | Watch; incremental boundary discovery must retain the established bulk-search primitive rather than regress to a byte-at-a-time scan. |
 
 ## Event log
@@ -229,6 +230,7 @@ invented exact counts here.
 | #895 | `1f3d8a46` | P2 | `error-contract-identity` | Report the complete output path in probe identity errors. |
 | #895 | `0262a877` | P2 | `validation-phase-completeness` | Open supported static inputs nonblocking before descriptor-level file-type validation. |
 | #895 | `0262a877` | P2 | `resource-bound-completeness` | Index failed-input paths before retaining a disjoint prior baseline. |
+| #896 | `879b33cb` | P1 | `review-checkpoint-completeness` | Require a wrapper-completed ancestor cycle before narrowing a continuation review to changed slices. |
 
 The rows above are the reviews whose logs are reachable from this checkout's
 `.git/`. Capabilities produced in agent worktrees (#777 and later, other than

@@ -9777,8 +9777,10 @@ fn summary_from_roots(roots: &BorrowRoots, explicit_params: u32) -> hir::ReturnB
                 captures.push(index - explicit_params)
             }
             BorrowRoot::Local(_)
+            | BorrowRoot::StorageLocal(..)
             | BorrowRoot::IterTemp(_)
             | BorrowRoot::EndedLocal(_, _)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(_, _)
             | BorrowRoot::EndedParam(_, _)
             | BorrowRoot::EndedParamStorage(_, _) => {}
@@ -15078,6 +15080,11 @@ impl EscapeState {
             BorrowRoot::EndedLocal(local, ended) => {
                 (BorrowRoot::Local(local), Some(ended), true)
             }
+            BorrowRoot::EndedStorageLocal(generation, local, path, ended) => (
+                BorrowRoot::StorageLocal(generation, local, path),
+                Some(ended),
+                true,
+            ),
             BorrowRoot::EndedIterTemp(depth, ended) => {
                 (BorrowRoot::IterTemp(depth), Some(ended), true)
             }
@@ -15089,7 +15096,7 @@ impl EscapeState {
             }
             live => (live, None, false),
         };
-        let local_fallback = matches!(live, BorrowRoot::Local(_));
+        let local_fallback = matches!(live, BorrowRoot::Local(_) | BorrowRoot::StorageLocal(..));
         let mut resolved = match live {
             BorrowRoot::Param(parameter) => {
                 let mut resolved = EscapeResolvedStorage::empty(false);
@@ -15102,12 +15109,16 @@ impl EscapeState {
                 resolved
             }
             BorrowRoot::Local(local) => self.resolve_local_fallback(local, expected, visiting),
+            BorrowRoot::StorageLocal(_, local, _) => {
+                self.resolve_local_fallback(local, expected, visiting)
+            }
             BorrowRoot::IterTemp(_) => {
                 let mut resolved = EscapeResolvedStorage::empty(false);
                 resolved.content = EscapeResolvedContent::unknown_root();
                 resolved
             }
             BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => unreachable!(),
@@ -15170,8 +15181,9 @@ impl EscapeState {
                 if !leaf.known {
                     resolved.content.unknown.insert(path.clone());
                 }
-                for &root in &leaf.fallback_roots {
-                    let fallback = self.resolve_fallback_root(root, leaf.descriptor, visiting);
+                for root in &leaf.fallback_roots {
+                    let fallback =
+                        self.resolve_fallback_root(root.clone(), leaf.descriptor, visiting);
                     Self::add_nested_content(&mut resolved.content, path, &fallback);
                 }
                 for dependency in &leaf.generations {
@@ -15198,8 +15210,12 @@ impl EscapeState {
         for reference in &leaf.generations {
             resolved = resolved.join(&self.resolve_storage_reference(reference, visiting));
         }
-        for &root in &leaf.fallback_roots {
-            resolved = resolved.join(&self.resolve_fallback_root(root, leaf.descriptor, visiting));
+        for root in &leaf.fallback_roots {
+            resolved = resolved.join(&self.resolve_fallback_root(
+                root.clone(),
+                leaf.descriptor,
+                visiting,
+            ));
         }
         if !leaf.known || leaf.generations.is_empty() {
             resolved.identity_known = false;
@@ -15228,8 +15244,9 @@ impl EscapeState {
                 selected.select_content_path(content_path.iter().copied());
             resolved = resolved.join(&self.resolve_storage_reference(&selected, visiting));
         }
-        for &root in &leaf.fallback_roots {
-            let mut fallback = self.resolve_fallback_root(root, leaf.descriptor, visiting);
+        for root in &leaf.fallback_roots {
+            let mut fallback =
+                self.resolve_fallback_root(root.clone(), leaf.descriptor, visiting);
             fallback.content = fallback.content.project_path(content_path);
             fallback.dependencies = fallback.dependencies.project_path(content_path);
             resolved = resolved.join(&fallback);
@@ -17604,7 +17621,7 @@ impl<'a> EscapeCheck<'a> {
                     matched_projected_candidate |= !path.is_empty();
                     matched_exactly &= leaf.known && !leaf.generations.is_empty();
                     generations.extend(leaf.generations.iter().cloned());
-                    fallback_roots.extend(leaf.fallback_roots.iter().copied());
+                    fallback_roots.extend(leaf.fallback_roots.iter().cloned());
                 }
             }
         }
@@ -22375,7 +22392,7 @@ impl<'a> EscapeCheck<'a> {
                     .headers
                     .leaves
                     .values()
-                    .flat_map(|leaf| leaf.fallback_roots.iter().copied())
+                    .flat_map(|leaf| leaf.fallback_roots.iter().cloned())
                     .collect();
                 let headers = ProjectedHeaderFact {
                     leaves: typed
@@ -25125,10 +25142,18 @@ enum BorrowEnd {
 /// Move temporary** a hidden owner slot (`new_synthetic_owner`) whose cleanup joins the innermost
 /// active loop, so `keep = "…".clone()` inside a `loop` borrows storage that the back-edge frees
 /// even though no local ever held it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum BorrowRoot {
     /// A named local's storage. Ordered first so a diagnostic prefers the root it can name.
     Local(LocalId),
+    /// One exact release place for one stable storage generation. Generation identity prevents an
+    /// old moved allocation from poisoning a fresh value rebound to the same local; the complete
+    /// path prevents ending one owned aggregate leaf from poisoning a live sibling.
+    StorageLocal(
+        StorageGeneration,
+        LocalId,
+        std::sync::Arc<[BorrowProjection]>,
+    ),
     /// The hidden owner of a Move temporary materialized at loop depth `d` (1 = the outermost
     /// loop's body). Depth is all the identity needed: every temporary at a given depth is freed by
     /// the same two edges — that loop's back-edge and its `break`s.
@@ -25143,6 +25168,12 @@ enum BorrowRoot {
     /// the fact lets projection and named-summary selection transport the invalidation without
     /// widening it to an unselected sibling.
     EndedLocal(LocalId, BorrowEnd),
+    EndedStorageLocal(
+        StorageGeneration,
+        LocalId,
+        std::sync::Arc<[BorrowProjection]>,
+        BorrowEnd,
+    ),
     EndedIterTemp(u32, BorrowEnd),
     EndedParam(u32, BorrowEnd),
     EndedParamStorage(u32, BorrowEnd),
@@ -25222,36 +25253,85 @@ struct MoveCheckResult {
 }
 
 impl BorrowRoot {
-    fn ended(self, how: BorrowEnd) -> Self {
-        match self {
-            Self::Local(local) => Self::EndedLocal(local, how),
-            Self::IterTemp(depth) => Self::EndedIterTemp(depth, how),
-            Self::Param(param) => Self::EndedParam(param, how),
-            Self::ParamStorage(param) => Self::EndedParamStorage(param, how),
-            already @ (Self::EndedLocal(..)
-            | Self::EndedIterTemp(..)
-            | Self::EndedParam(..)
-            | Self::EndedParamStorage(..)) => already,
+    fn release(generation: &StorageGeneration, release: &MoveReleasePlace) -> Option<Self> {
+        match release {
+            MoveReleasePlace::Local { local, path } => {
+                Some(Self::StorageLocal(
+                    generation.clone(),
+                    *local,
+                    path.as_slice().into(),
+                ))
+            }
+            MoveReleasePlace::IterTemp { depth, .. } => Some(Self::IterTemp(*depth)),
+            MoveReleasePlace::Staging { .. }
+            | MoveReleasePlace::ArenaScope { .. }
+            | MoveReleasePlace::LoopResult { .. }
+            | MoveReleasePlace::Returned { .. } => None,
         }
     }
 
-    fn live(self) -> Option<Self> {
+    fn belongs_to_local(&self, local: LocalId) -> bool {
+        matches!(self, Self::Local(owner) | Self::StorageLocal(_, owner, _) if *owner == local)
+    }
+
+    fn ended(&self, how: BorrowEnd) -> Self {
         match self {
-            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) | Self::ParamStorage(_) => Some(self),
+            Self::Local(local) => Self::EndedLocal(*local, how),
+            Self::StorageLocal(generation, local, path) => {
+                Self::EndedStorageLocal(generation.clone(), *local, path.clone(), how)
+            }
+            Self::IterTemp(depth) => Self::EndedIterTemp(*depth, how),
+            Self::Param(param) => Self::EndedParam(*param, how),
+            Self::ParamStorage(param) => Self::EndedParamStorage(*param, how),
+            already @ (Self::EndedLocal(..)
+            | Self::EndedStorageLocal(..)
+            | Self::EndedIterTemp(..)
+            | Self::EndedParam(..)
+            | Self::EndedParamStorage(..)) => already.clone(),
+        }
+    }
+
+    fn live(&self) -> Option<Self> {
+        match self {
+            Self::Local(_)
+            | Self::StorageLocal(..)
+            | Self::IterTemp(_)
+            | Self::Param(_)
+            | Self::ParamStorage(_) => Some(self.clone()),
             Self::EndedLocal(..)
+            | Self::EndedStorageLocal(..)
             | Self::EndedIterTemp(..)
             | Self::EndedParam(..)
             | Self::EndedParamStorage(..) => None,
         }
     }
 
-    fn ended_source(self) -> Option<(Self, BorrowEnd)> {
+    fn ended_source(&self) -> Option<(Self, BorrowEnd)> {
         match self {
-            Self::EndedLocal(local, how) => Some((Self::Local(local), how)),
-            Self::EndedIterTemp(depth, how) => Some((Self::IterTemp(depth), how)),
-            Self::EndedParam(param, how) => Some((Self::Param(param), how)),
-            Self::EndedParamStorage(param, how) => Some((Self::ParamStorage(param), how)),
-            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) | Self::ParamStorage(_) => None,
+            Self::EndedLocal(local, how) => Some((Self::Local(*local), *how)),
+            Self::EndedStorageLocal(generation, local, path, how) => {
+                Some((Self::StorageLocal(generation.clone(), *local, path.clone()), *how))
+            }
+            Self::EndedIterTemp(depth, how) => Some((Self::IterTemp(*depth), *how)),
+            Self::EndedParam(param, how) => Some((Self::Param(*param), *how)),
+            Self::EndedParamStorage(param, how) => Some((Self::ParamStorage(*param), *how)),
+            Self::Local(_)
+            | Self::StorageLocal(..)
+            | Self::IterTemp(_)
+            | Self::Param(_)
+            | Self::ParamStorage(_) => None,
+        }
+    }
+
+    fn rename_generation(self, renames: &StorageGenerationRenames) -> Self {
+        match self {
+            Self::StorageLocal(generation, local, path) => {
+                Self::StorageLocal(renames.apply(&generation), local, path)
+            }
+            Self::EndedStorageLocal(generation, local, path, how) => {
+                Self::EndedStorageLocal(renames.apply(&generation), local, path, how)
+            }
+            other => other,
         }
     }
 }
@@ -25565,7 +25645,7 @@ impl StorageHeaderLeaf {
         let mut generations = self.generations.clone();
         generations.extend(other.generations.iter().cloned());
         let mut fallback_roots = self.fallback_roots.clone();
-        fallback_roots.extend(&other.fallback_roots);
+        fallback_roots.extend(other.fallback_roots.iter().cloned());
         Self {
             generations,
             descriptor: (self.descriptor == other.descriptor)
@@ -25581,6 +25661,7 @@ impl StorageHeaderLeaf {
             .into_iter()
             .map(|generation| generation.rename_generation(renames))
             .collect();
+        rename_borrow_roots(&mut self.fallback_roots, renames);
     }
 }
 
@@ -26831,7 +26912,32 @@ struct BorrowFact {
     projected: std::collections::BTreeMap<Vec<BorrowProjection>, BorrowRoots>,
 }
 
+fn rename_borrow_roots(roots: &mut BorrowRoots, renames: &StorageGenerationRenames) {
+    *roots = std::mem::take(roots)
+        .into_iter()
+        .map(|root| root.rename_generation(renames))
+        .collect();
+}
+
+fn rename_ended_roots(roots: &mut EndedRoots, renames: &StorageGenerationRenames) {
+    let mut renamed = EndedRoots::new();
+    for (root, how) in std::mem::take(roots) {
+        let current = renamed
+            .entry(root.rename_generation(renames))
+            .or_insert(how);
+        *current = (*current).min(how);
+    }
+    *roots = renamed;
+}
+
 impl BorrowFact {
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        rename_borrow_roots(&mut self.direct, renames);
+        for roots in self.projected.values_mut() {
+            rename_borrow_roots(roots, renames);
+        }
+    }
+
     fn project_path(&self, path: &[BorrowProjection]) -> Self {
         path.iter()
             .copied()
@@ -26852,19 +26958,19 @@ impl BorrowFact {
     fn flatten(&self) -> BorrowRoots {
         let mut roots = self.direct.clone();
         for projected in self.projected.values() {
-            roots.extend(projected);
+            roots.extend(projected.iter().cloned());
         }
         roots
     }
 
     fn join(&self, other: &Self) -> Self {
         let mut out = self.clone();
-        out.direct.extend(&other.direct);
+        out.direct.extend(other.direct.iter().cloned());
         for (path, roots) in &other.projected {
             out.projected
                 .entry(path.clone())
                 .or_default()
-                .extend(roots);
+                .extend(roots.iter().cloned());
         }
         out
     }
@@ -26888,19 +26994,19 @@ impl BorrowFact {
         let mut out = Self::from_direct(self.direct.clone());
         for (path, roots) in &self.projected {
             let Some((first, rest)) = path.split_first() else {
-                out.direct.extend(roots);
+                out.direct.extend(roots.iter().cloned());
                 continue;
             };
             if *first != projection {
                 continue;
             }
             if rest.is_empty() {
-                out.direct.extend(roots);
+                out.direct.extend(roots.iter().cloned());
             } else {
                 out.projected
                     .entry(rest.to_vec())
                     .or_default()
-                    .extend(roots);
+                    .extend(roots.iter().cloned());
             }
         }
         out
@@ -26913,12 +27019,12 @@ impl BorrowFact {
                 continue;
             };
             if rest.is_empty() {
-                out.direct.extend(roots);
+                out.direct.extend(roots.iter().cloned());
             } else {
                 out.projected
                     .entry(rest.to_vec())
                     .or_default()
-                    .extend(roots);
+                    .extend(roots.iter().cloned());
             }
         }
         out
@@ -26947,12 +27053,15 @@ impl BorrowFact {
             self.projected
                 .entry(path.to_vec())
                 .or_default()
-                .extend(&incoming.direct);
+                .extend(incoming.direct.iter().cloned());
         }
         for (suffix, roots) in &incoming.projected {
             let mut destination = path.to_vec();
             destination.extend(suffix);
-            self.projected.entry(destination).or_default().extend(roots);
+            self.projected
+                .entry(destination)
+                .or_default()
+                .extend(roots.iter().cloned());
         }
     }
 
@@ -26960,7 +27069,11 @@ impl BorrowFact {
         let mark = |roots: &mut BorrowRoots| {
             *roots = std::mem::take(roots)
                 .into_iter()
-                .map(|root| invalid.get(&root).map_or(root, |&how| root.ended(how)))
+                .map(|root| {
+                    invalid
+                        .get(&root)
+                        .map_or_else(|| root.clone(), |&how| root.ended(how))
+                })
                 .collect();
         };
         mark(&mut self.direct);
@@ -26972,7 +27085,7 @@ impl BorrowFact {
     fn live_roots(&self) -> BorrowRoots {
         self.flatten()
             .into_iter()
-            .filter_map(BorrowRoot::live)
+            .filter_map(|root| root.live())
             .collect()
     }
 
@@ -27067,6 +27180,7 @@ impl MoveValueFact {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.non_storage.rename_generations(renames);
         self.headers.rename_generations(renames);
     }
 }
@@ -27113,24 +27227,52 @@ struct MoveGenerationEntry {
     /// incompatible descriptors; consumers must then avoid selecting the generation by type.
     descriptor: Option<StorageHeaderDescriptor>,
     releases: std::collections::BTreeSet<MoveReleasePlace>,
+    /// Every source-visible root that has released this stable generation. A local-to-local Move
+    /// changes `releases` but scalar views completed before that action retain the old root; a
+    /// generation end must therefore retire the complete, projection-preserving history.
+    historical_release_roots: BorrowRoots,
     ended: Option<BorrowEnd>,
 }
 
 impl MoveGenerationEntry {
+    fn new(
+        generation: &StorageGeneration,
+        descriptor: Option<StorageHeaderDescriptor>,
+        releases: std::collections::BTreeSet<MoveReleasePlace>,
+    ) -> Self {
+        let historical_release_roots = releases
+            .iter()
+            .filter_map(|release| BorrowRoot::release(generation, release))
+            .collect();
+        Self {
+            descriptor,
+            releases,
+            historical_release_roots,
+            ended: None,
+        }
+    }
+
     fn join(&self, other: &Self) -> Self {
         let mut releases = self.releases.clone();
         releases.extend(other.releases.iter().cloned());
+        let mut historical_release_roots = self.historical_release_roots.clone();
+        historical_release_roots.extend(other.historical_release_roots.iter().cloned());
         Self {
             descriptor: (self.descriptor == other.descriptor)
                 .then_some(self.descriptor)
                 .flatten(),
             releases,
+            historical_release_roots,
             ended: match (self.ended, other.ended) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (Some(ended), None) | (None, Some(ended)) => Some(ended),
                 (None, None) => None,
             },
         }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        rename_borrow_roots(&mut self.historical_release_roots, renames);
     }
 }
 
@@ -27201,11 +27343,15 @@ impl MutableBackingFact {
 
     fn join(&self, other: &Self) -> Self {
         let mut roots = self.roots.clone();
-        roots.extend(&other.roots);
+        roots.extend(other.roots.iter().cloned());
         Self {
             roots,
             unknown: self.unknown || other.unknown,
         }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        rename_borrow_roots(&mut self.roots, renames);
     }
 }
 
@@ -27344,10 +27490,41 @@ impl BorrowState {
         }
     }
 
+    fn rename_root_state(&mut self, renames: &StorageGenerationRenames) {
+        for roots in self.sources.values_mut() {
+            rename_borrow_roots(roots, renames);
+        }
+        for fact in self.facts.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for backing in self.mutable_backing.values_mut() {
+            backing.rename_generations(renames);
+        }
+        for invalid in self.invalid.values_mut() {
+            rename_ended_roots(invalid, renames);
+        }
+        for roots in self.pipeline_sources.values_mut() {
+            rename_borrow_roots(roots, renames);
+        }
+        for invalid in self.invalid_pipeline_sources.values_mut() {
+            rename_ended_roots(invalid, renames);
+        }
+        for roots in self.value_sources.values_mut() {
+            rename_borrow_roots(roots, renames);
+        }
+        for invalid in self.invalid_value_sources.values_mut() {
+            rename_ended_roots(invalid, renames);
+        }
+    }
+
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
         self.rename_header_state(renames);
+        self.rename_root_state(renames);
         for content in self.storage.contents.entries.values_mut() {
             content.rename_generations(renames);
+        }
+        for entry in self.storage.directory.entries.values_mut() {
+            entry.rename_generations(renames);
         }
         self.storage
             .directory
@@ -27414,17 +27591,6 @@ impl BorrowState {
     }
 
     fn resolve_headers(&self, headers: &ProjectedHeaderFact) -> MoveValueFact {
-        fn release_root(release: &MoveReleasePlace) -> Option<BorrowRoot> {
-            match release {
-                MoveReleasePlace::Local { local, .. } => Some(BorrowRoot::Local(*local)),
-                MoveReleasePlace::IterTemp { depth, .. } => Some(BorrowRoot::IterTemp(*depth)),
-                MoveReleasePlace::Staging { .. }
-                | MoveReleasePlace::ArenaScope { .. }
-                | MoveReleasePlace::LoopResult { .. }
-                | MoveReleasePlace::Returned { .. } => None,
-            }
-        }
-
         fn resolve(
             state: &BorrowState,
             headers: &ProjectedHeaderFact,
@@ -27461,7 +27627,12 @@ impl BorrowState {
                         | StorageGeneration::ParameterValue { .. } => BorrowRoots::new(),
                     };
                     if let Some(entry) = state.storage.directory.entries.get(generation) {
-                        owners.extend(entry.releases.iter().filter_map(release_root));
+                        owners.extend(
+                            entry
+                                .releases
+                                .iter()
+                                .filter_map(|release| BorrowRoot::release(generation, release)),
+                        );
                         if let Some(how) = entry.ended {
                             owners = if owners.is_empty() {
                                 // Staging/arena/loop-result/returned releases have no user-facing
@@ -27509,17 +27680,8 @@ impl BorrowState {
                 continue;
             };
             for release in &entry.releases {
-                match release {
-                    MoveReleasePlace::Local { local, .. } => {
-                        roots.insert(BorrowRoot::Local(*local));
-                    }
-                    MoveReleasePlace::IterTemp { depth, .. } => {
-                        roots.insert(BorrowRoot::IterTemp(*depth));
-                    }
-                    MoveReleasePlace::Staging { .. }
-                    | MoveReleasePlace::ArenaScope { .. }
-                    | MoveReleasePlace::LoopResult { .. }
-                    | MoveReleasePlace::Returned { .. } => {}
+                if let Some(root) = BorrowRoot::release(generation, release) {
+                    roots.insert(root);
                 }
             }
         }
@@ -27570,34 +27732,69 @@ impl BorrowState {
                     continue;
                 }
                 for release in displaced {
+                    if let Some(root) = BorrowRoot::release(generation, &release) {
+                        entry.historical_release_roots.insert(root);
+                    }
                     entry.releases.remove(&release);
                 }
                 let mut path = destination_prefix.to_vec();
                 path.extend(&header.path);
-                entry.releases.insert(MoveReleasePlace::Local {
+                let destination = MoveReleasePlace::Local {
                     local: destination,
                     path,
-                });
+                };
+                if let Some(root) = BorrowRoot::release(generation, &destination) {
+                    entry.historical_release_roots.insert(root);
+                }
+                entry.releases.insert(destination);
             }
         }
+    }
+
+    fn end_generations(
+        &mut self,
+        generations: impl IntoIterator<Item = StorageGeneration>,
+        how: BorrowEnd,
+    ) {
+        let mut historical_roots = BorrowRoots::new();
+        for generation in generations
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let Some(entry) = self.storage.directory.entries.get_mut(&generation) else {
+                continue;
+            };
+            historical_roots.extend(entry.historical_release_roots.iter().cloned());
+            entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+        }
+        self.mark_matching_roots_ended(how, |root| historical_roots.contains(root));
+        self.invalidate_roots(&historical_roots, how);
+    }
+
+    fn end_matching_releases(
+        &mut self,
+        how: BorrowEnd,
+        matches: impl std::ops::Fn(&MoveReleasePlace) -> bool,
+    ) {
+        let generations = self
+            .storage
+            .directory
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.releases.iter().any(&matches))
+            .map(|(generation, _)| generation.clone())
+            .collect::<Vec<_>>();
+        self.end_generations(generations, how);
     }
 
     fn end_local_releases(&mut self, local: LocalId, how: BorrowEnd) {
-        for entry in self.storage.directory.entries.values_mut() {
-            if entry.releases.iter().any(
-                |release| matches!(release, MoveReleasePlace::Local { local: owner, .. } if *owner == local),
-            ) {
-                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
-            }
-        }
+        self.end_matching_releases(how, |release| {
+            matches!(release, MoveReleasePlace::Local { local: owner, .. } if *owner == local)
+        });
     }
 
     fn end_release(&mut self, release: &MoveReleasePlace, how: BorrowEnd) {
-        for entry in self.storage.directory.entries.values_mut() {
-            if entry.releases.contains(release) {
-                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
-            }
-        }
+        self.end_matching_releases(how, |candidate| candidate == release);
     }
 
     fn reachable_header_generations(
@@ -27647,6 +27844,7 @@ impl BorrowState {
             .map(|reference| reference.generation.clone())
             .collect::<Vec<_>>();
         let mut visited = std::collections::BTreeSet::new();
+        let mut ended = Vec::new();
         while let Some(generation) = pending.pop() {
             if !visited.insert(generation.clone()) || retained.contains(&generation) {
                 continue;
@@ -27661,7 +27859,7 @@ impl BorrowState {
                         .map(|reference| reference.generation.clone()),
                 );
             }
-            let Some(entry) = self.storage.directory.entries.get_mut(&generation) else {
+            let Some(entry) = self.storage.directory.entries.get(&generation) else {
                 continue;
             };
             if entry
@@ -27669,9 +27867,10 @@ impl BorrowState {
                 .iter()
                 .any(|release| matches!(release, MoveReleasePlace::Staging { .. }))
             {
-                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+                ended.push(generation);
             }
         }
+        self.end_generations(ended, how);
     }
 
     fn end_referenced_staging_releases(&mut self, headers: &ProjectedHeaderFact, how: BorrowEnd) {
@@ -27681,25 +27880,15 @@ impl BorrowState {
     /// Function-wide cleanup only. Nested actions and loop edges must use
     /// [`Self::end_referenced_staging_releases`] with their exact completed-value frontier.
     fn end_all_staging_releases(&mut self, how: BorrowEnd) {
-        for entry in self.storage.directory.entries.values_mut() {
-            if entry
-                .releases
-                .iter()
-                .any(|release| matches!(release, MoveReleasePlace::Staging { .. }))
-            {
-                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
-            }
-        }
+        self.end_matching_releases(how, |release| {
+            matches!(release, MoveReleasePlace::Staging { .. })
+        });
     }
 
     fn end_iteration_releases(&mut self, depth: u32, how: BorrowEnd) {
-        for entry in self.storage.directory.entries.values_mut() {
-            if entry.releases.iter().any(|release| {
-                matches!(release, MoveReleasePlace::IterTemp { depth: owner, .. } if *owner >= depth)
-            }) {
-                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
-            }
-        }
+        self.end_matching_releases(how, |release| {
+            matches!(release, MoveReleasePlace::IterTemp { depth: owner, .. } if *owner >= depth)
+        });
     }
 
     fn assign(&mut self, local: LocalId, fact: BorrowFact) {
@@ -27711,7 +27900,6 @@ impl BorrowState {
         let flattened = fact.flatten();
         let roots = flattened
             .iter()
-            .copied()
             .filter_map(BorrowRoot::live)
             .collect::<BorrowRoots>();
         for root in flattened {
@@ -27809,14 +27997,14 @@ impl BorrowState {
     fn mark_matching_roots_ended(
         &mut self,
         how: BorrowEnd,
-        ended: impl std::ops::Fn(BorrowRoot) -> bool,
+        ended: impl std::ops::Fn(&BorrowRoot) -> bool,
     ) {
         let state = &mut *self.0;
         let mark_headers = |headers: &mut ProjectedHeaderFact| {
             for leaf in headers.leaves.values_mut() {
                 leaf.fallback_roots = std::mem::take(&mut leaf.fallback_roots)
                     .into_iter()
-                    .map(|root| if ended(root) { root.ended(how) } else { root })
+                    .map(|root| if ended(&root) { root.ended(how) } else { root })
                     .collect();
             }
         };
@@ -27835,44 +28023,48 @@ impl BorrowState {
                 .non_storage
                 .live_roots()
                 .into_iter()
-                .filter(|root| ended(*root))
-                .map(|root| (root, how))
+                .filter(|root| ended(root))
+                .map(|root| (root.clone(), how))
                 .collect();
             content.non_storage.mark_ended(&invalid);
         }
     }
 
-    fn invalidate_matching(&mut self, how: BorrowEnd, ended: impl std::ops::Fn(BorrowRoot) -> bool) {
+    fn invalidate_matching(
+        &mut self,
+        how: BorrowEnd,
+        ended: impl std::ops::Fn(&BorrowRoot) -> bool,
+    ) {
         let state = &mut *self.0;
         for (&borrower, roots) in &state.sources {
-            for &root in roots.iter().filter(|&&r| ended(r)) {
+            for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid
                     .entry(borrower)
                     .or_default()
-                    .entry(root)
+                    .entry(root.clone())
                     .or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
         for (&snapshot, roots) in &state.pipeline_sources {
-            for &root in roots.iter().filter(|&&r| ended(r)) {
+            for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid_pipeline_sources
                     .entry(snapshot)
                     .or_default()
-                    .entry(root)
+                    .entry(root.clone())
                     .or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
         for (&snapshot, roots) in &state.value_sources {
-            for &root in roots.iter().filter(|&&r| ended(r)) {
+            for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid_value_sources
                     .entry(snapshot)
                     .or_default()
-                    .entry(root)
+                    .entry(root.clone())
                     .or_insert(how);
                 *entry = (*entry).min(how);
             }
@@ -27880,12 +28072,19 @@ impl BorrowState {
     }
 
     fn invalidate_owner(&mut self, owner: LocalId, how: BorrowEnd) {
-        self.mark_matching_roots_ended(how, |r| r == BorrowRoot::Local(owner));
-        self.invalidate_matching(how, |r| r == BorrowRoot::Local(owner));
+        // Legacy roots have no storage-generation directory. Generation-backed roots are ended
+        // only by `end_release`/`end_generations`; matching them by local name would collapse
+        // sibling projections and poison a fresh value rebound to the same local.
+        self.mark_matching_roots_ended(how, |root| {
+            matches!(root, BorrowRoot::Local(local) if *local == owner)
+        });
+        self.invalidate_matching(how, |root| {
+            matches!(root, BorrowRoot::Local(local) if *local == owner)
+        });
     }
 
     fn invalidate_roots(&mut self, roots: &BorrowRoots, how: BorrowEnd) {
-        self.invalidate_matching(how, |root| roots.contains(&root));
+        self.invalidate_matching(how, |root| roots.contains(root));
     }
 
     fn invalidate_roots_except_local(
@@ -27918,7 +28117,10 @@ impl BorrowState {
             true
         });
         for (&local, roots) in &b.sources {
-            out.sources.entry(local).or_default().extend(roots);
+            out.sources
+                .entry(local)
+                .or_default()
+                .extend(roots.iter().cloned());
         }
         for (&local, fact) in &b.facts {
             out.facts
@@ -27956,8 +28158,8 @@ impl BorrowState {
         }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
-            for (&owner, &how) in roots {
-                let entry = into.entry(owner).or_insert(how);
+            for (owner, &how) in roots {
+                let entry = into.entry(owner.clone()).or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
@@ -27965,15 +28167,15 @@ impl BorrowState {
             out.pipeline_sources
                 .entry(snapshot)
                 .or_default()
-                .extend(roots);
+                .extend(roots.iter().cloned());
         }
         for (&snapshot, roots) in &b.invalid_pipeline_sources {
             let into = out
                 .invalid_pipeline_sources
                 .entry(snapshot)
                 .or_default();
-            for (&owner, &how) in roots {
-                let entry = into.entry(owner).or_insert(how);
+            for (owner, &how) in roots {
+                let entry = into.entry(owner.clone()).or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
@@ -27981,15 +28183,15 @@ impl BorrowState {
             out.value_sources
                 .entry(snapshot)
                 .or_default()
-                .extend(roots);
+                .extend(roots.iter().cloned());
         }
         for (&snapshot, roots) in &b.invalid_value_sources {
             let into = out
                 .invalid_value_sources
                 .entry(snapshot)
                 .or_default();
-            for (&owner, &how) in roots {
-                let entry = into.entry(owner).or_insert(how);
+            for (owner, &how) in roots {
+                let entry = into.entry(owner.clone()).or_insert(how);
                 *entry = (*entry).min(how);
             }
         }
@@ -28505,14 +28707,14 @@ impl<'a> MoveCheck<'a> {
             formations.push(StorageHeaderFormation {
                 path: path.clone(),
                 generation: generation.clone(),
-                directory: Some(MoveGenerationEntry {
-                    descriptor: Some(StorageHeaderDescriptor {
+                directory: Some(MoveGenerationEntry::new(
+                    generation,
+                    Some(StorageHeaderDescriptor {
                         ty: header.ty,
                         kind: header.kind,
                     }),
                     releases,
-                    ended: None,
-                }),
+                )),
                 content: Some(MoveValueFact {
                     non_storage: if content_may_borrow {
                         BorrowFact::from_direct(
@@ -28556,6 +28758,7 @@ impl<'a> MoveCheck<'a> {
             |existing, incoming| *existing = existing.join(&incoming),
         ) {
             self.borrows.rename_header_state(&commit.renames);
+            self.borrows.rename_root_state(&commit.renames);
             self.record_storage_advances(&commit.renames);
             self.borrows.storage = next;
             self.borrows.headers.insert(local, commit.headers);
@@ -29351,7 +29554,7 @@ impl<'a> MoveCheck<'a> {
                 Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
             ) && indexed_backing_compatible(result, argument.ty, self.tagged_types)
             {
-                roots.extend(&completion.backing.roots);
+                roots.extend(completion.backing.roots.iter().cloned());
             }
         }
         MutableBackingFact {
@@ -29908,18 +30111,13 @@ impl<'a> MoveCheck<'a> {
                 if header.kind == StorageHeaderKind::View {
                     continue;
                 }
-                for entry in self.borrows.storage.directory.entries.values_mut() {
-                    if entry.releases.contains(&MoveReleasePlace::Local {
+                self.borrows.end_release(
+                    &MoveReleasePlace::Local {
                         local: place.root,
                         path: destination_path.clone(),
-                    }) {
-                        entry.ended = Some(
-                            entry
-                                .ended
-                                .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
-                        );
-                    }
-                }
+                    },
+                    BorrowEnd::Consumed,
+                );
                 let generation = StorageGeneration::current(StorageOrigin::CallMutation {
                     call: action_key,
                     destination_parameter: *index as u32,
@@ -29927,19 +30125,19 @@ impl<'a> MoveCheck<'a> {
                 });
                 self.borrows.storage.directory.entries.insert(
                     generation.clone(),
-                    MoveGenerationEntry {
-                        descriptor: Some(StorageHeaderDescriptor {
+                    MoveGenerationEntry::new(
+                        &generation,
+                        Some(StorageHeaderDescriptor {
                             ty: header.ty,
                             kind: header.kind,
                         }),
-                        releases: [MoveReleasePlace::Local {
+                        [MoveReleasePlace::Local {
                             local: place.root,
                             path: destination_path,
                         }]
                         .into_iter()
                         .collect(),
-                        ended: None,
-                    },
+                    ),
                 );
                 self.borrows
                     .storage
@@ -30004,7 +30202,7 @@ impl<'a> MoveCheck<'a> {
                 // Copy views do not take this path: rebinding one header must not end its backing.
                 self.borrows.mark_matching_roots_ended(
                     BorrowEnd::Consumed,
-                    |root| roots.contains(&root),
+                    |root| roots.contains(root),
                 );
             }
             if let Some(owner) = args
@@ -30218,15 +30416,16 @@ impl<'a> MoveCheck<'a> {
         self.borrows.update_fact(local, current.join(&incoming));
     }
 
-    fn backing_root_local(&self, root: BorrowRoot) -> Option<LocalId> {
+    fn backing_root_local(&self, root: &BorrowRoot) -> Option<LocalId> {
         match root {
-            BorrowRoot::Local(local) => Some(local),
+            BorrowRoot::Local(local) | BorrowRoot::StorageLocal(_, local, _) => Some(*local),
             BorrowRoot::ParamStorage(position) => {
-                self.f.params.get(position as usize).copied()
+                self.f.params.get(*position as usize).copied()
             }
             BorrowRoot::IterTemp(_)
             | BorrowRoot::Param(_)
             | BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => None,
@@ -30346,7 +30545,7 @@ impl<'a> MoveCheck<'a> {
         observers: &std::collections::BTreeSet<LocalId>,
     ) -> std::collections::BTreeSet<LocalId> {
         let mut destinations = observers.clone();
-        for &root in &backing.roots {
+        for root in &backing.roots {
             if let Some(local) = self.backing_root_local(root)
                 && self
                     .f
@@ -30413,10 +30612,10 @@ impl<'a> MoveCheck<'a> {
             .borrows
             .invalid_value_sources
             .get(&Self::expr_key(argument));
-        completed.direct.extend(backing.roots.iter().copied().map(|root| {
+        completed.direct.extend(backing.roots.iter().map(|root| {
             invalid
-                .and_then(|ended| ended.get(&root))
-                .map_or(root, |&how| root.ended(how))
+                .and_then(|ended| ended.get(root))
+                .map_or_else(|| root.clone(), |&how| root.ended(how))
         }));
         let mut excluded = BorrowRoots::new();
         if let Some(local) = Self::mutable_actual_root(argument) {
@@ -30737,12 +30936,12 @@ impl<'a> MoveCheck<'a> {
                 let mut destination = path.clone();
                 destination.extend(suffix);
                 if destination.is_empty() {
-                    out.direct.extend(&roots);
+                    out.direct.extend(roots.iter().cloned());
                 } else {
                     out.projected
                         .entry(destination)
                         .or_default()
-                        .extend(&roots);
+                        .extend(roots.iter().cloned());
                 }
             }
         }
@@ -30818,15 +31017,36 @@ impl<'a> MoveCheck<'a> {
         }
         match &e.kind {
             ExprKind::Local(id) => roots.extend(self.local_storage_roots(*id)),
-            ExprKind::Field { root, .. }
-            | ExprKind::SoaColumn { base: root, .. }
+            ExprKind::Field { root, path } => {
+                let projection = path
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                let headers = self.local_headers(*root).project_path(&projection);
+                if headers.leaves.is_empty() {
+                    roots.extend(self.local_storage_roots(*root));
+                } else {
+                    roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
+                }
+            }
+            ExprKind::TupleIndex { recv, index } => {
+                let headers = self
+                    .completed_headers(recv)
+                    .project_path(&[BorrowProjection::TupleElement(*index)]);
+                if headers.leaves.is_empty() {
+                    roots.extend(self.storage_roots(recv));
+                } else {
+                    roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
+                }
+            }
+            ExprKind::SoaColumn { base: root, .. }
             | ExprKind::ArrayGroupAgg { base: root, .. }
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
             | ExprKind::ArrayDictEncode { base: root, .. }
             | ExprKind::IndexField { base: root, .. } => roots.extend(self.local_storage_roots(*root)),
             ExprKind::Index { recv, .. }
-            | ExprKind::ElemField { recv, .. }
-            | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
+            | ExprKind::ElemField { recv, .. } => roots.extend(self.storage_roots(recv)),
             ExprKind::BorrowedIndex { base, .. } => {
                 roots.extend(self.borrowed_element_roots(base.root_local));
             }
@@ -31665,7 +31885,7 @@ impl<'a> MoveCheck<'a> {
                             leaf.generations
                                 .extend(candidate.generations.iter().cloned());
                             leaf.fallback_roots
-                                .extend(candidate.fallback_roots.iter().copied());
+                                .extend(candidate.fallback_roots.iter().cloned());
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
@@ -31685,18 +31905,18 @@ impl<'a> MoveCheck<'a> {
                 ));
                 StorageHeaderFormation {
                     path: header.path.clone(),
-                    generation,
-                    directory: Some(MoveGenerationEntry {
-                        descriptor: Some(descriptor),
-                        releases: [MoveReleasePlace::Staging {
+                    generation: generation.clone(),
+                    directory: Some(MoveGenerationEntry::new(
+                        &generation,
+                        Some(descriptor),
+                        [MoveReleasePlace::Staging {
                             action: Self::expr_key(expression),
                             operand: operand as u32,
                             path: header.path.clone(),
                         }]
                         .into_iter()
                         .collect(),
-                        ended: None,
-                    }),
+                    )),
                     content: Some(MoveValueFact {
                         non_storage: fact.project_path(&header.path),
                         headers: self.call_generation_content_headers(
@@ -31722,6 +31942,9 @@ impl<'a> MoveCheck<'a> {
         for content in next.contents.entries.values_mut() {
             content.rename_generations(&renames);
         }
+        for entry in next.directory.entries.values_mut() {
+            entry.rename_generations(&renames);
+        }
         let Ok(commit) = next.try_form_headers(
             expression.ty,
             formations,
@@ -31732,6 +31955,7 @@ impl<'a> MoveCheck<'a> {
             return headers.join(&carried).join(&unknown);
         };
         self.borrows.rename_header_state(&commit.renames);
+        self.borrows.rename_root_state(&commit.renames);
         self.rename_external_storage_snapshots(&commit.renames);
         self.record_storage_advances(&commit.renames);
         self.borrows.storage = next;
@@ -31838,7 +32062,7 @@ impl<'a> MoveCheck<'a> {
                             leaf.generations
                                 .extend(candidate.generations.iter().cloned());
                             leaf.fallback_roots
-                                .extend(candidate.fallback_roots.iter().copied());
+                                .extend(candidate.fallback_roots.iter().cloned());
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
@@ -31906,14 +32130,14 @@ impl<'a> MoveCheck<'a> {
             };
             formations.push(StorageHeaderFormation {
                 path: result.path.clone(),
-                generation,
-                directory: Some(MoveGenerationEntry {
-                    descriptor: result.header_ty.zip(result.header_kind).map(|(ty, kind)| {
+                generation: generation.clone(),
+                directory: Some(MoveGenerationEntry::new(
+                    &generation,
+                    result.header_ty.zip(result.header_kind).map(|(ty, kind)| {
                         StorageHeaderDescriptor { ty, kind }
                     }),
                     releases,
-                    ended: None,
-                }),
+                )),
                 content: Some(MoveValueFact {
                     non_storage: fact.project_path(&result.path),
                     headers: if result.initializer
@@ -31950,6 +32174,9 @@ impl<'a> MoveCheck<'a> {
         for content in next.contents.entries.values_mut() {
             content.rename_generations(&renames);
         }
+        for entry in next.directory.entries.values_mut() {
+            entry.rename_generations(&renames);
+        }
         let Ok(commit) = next.try_form_headers(
             expression.ty,
             formations,
@@ -31960,6 +32187,7 @@ impl<'a> MoveCheck<'a> {
             return unknown;
         };
         self.borrows.rename_header_state(&commit.renames);
+        self.borrows.rename_root_state(&commit.renames);
         self.rename_external_storage_snapshots(&commit.renames);
         self.record_storage_advances(&commit.renames);
         self.borrows.storage = next;
@@ -32040,12 +32268,17 @@ impl<'a> MoveCheck<'a> {
         self.borrows
             .invalid_value_sources
             .get(&key)
-            .and_then(|invalid| invalid.iter().next().map(|(&root, &how)| (root, how)))
+            .and_then(|invalid| {
+                invalid
+                    .iter()
+                    .next()
+                    .map(|(root, &how)| (root.clone(), how))
+            })
             .or_else(|| {
                 self.walked_value_facts.get(&key).and_then(|fact| {
                     fact.flatten()
                         .into_iter()
-                        .find_map(BorrowRoot::ended_source)
+                        .find_map(|root| root.ended_source())
                 })
             })
     }
@@ -32061,7 +32294,7 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         let message = match root {
-            BorrowRoot::Local(owner) => {
+            BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => {
                 let owner = self
                     .f
                     .locals
@@ -32083,6 +32316,7 @@ impl<'a> MoveCheck<'a> {
                 "value snapshot was invalidated before the enclosing operation: its external owner ended unexpectedly".to_string()
             }
             BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => {
@@ -33147,8 +33381,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayGroupAgg { base, .. }
             | ExprKind::ArrayGroupAggMulti { base, .. }
             | ExprKind::ArrayDictEncode { base, .. }
-            | ExprKind::IndexField { base, .. }
-            | ExprKind::Field { root: base, .. } => self.local_storage_roots(*base),
+            | ExprKind::IndexField { base, .. } => self.local_storage_roots(*base),
+            ExprKind::Field { .. } => self.storage_roots(e),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
             ExprKind::BorrowedIndex { base, .. } => {
@@ -33602,25 +33836,33 @@ impl<'a> MoveCheck<'a> {
                 (!paths.is_empty()).then_some((local, paths))
             })
             .collect::<Vec<_>>();
-        let excluded = [BorrowRoot::Local(source)].into_iter().collect();
+        let mut excluded = [BorrowRoot::Local(source)].into_iter().collect::<BorrowRoots>();
+        excluded.extend(
+            generations
+                .iter()
+                .filter_map(|generation| self.borrows.storage.directory.entries.get(generation))
+                .flat_map(|entry| entry.historical_release_roots.iter())
+                .filter(|root| root.belongs_to_local(source))
+                .cloned(),
+        );
         for (local, paths) in affected {
             let mut retains_source = false;
             if let Some(fact) = self.borrows.facts.get(&local).cloned() {
                 let fact = fact.without_root_sources_at_paths(&excluded, paths);
                 retains_source = fact.flatten().iter().any(|root| {
-                    *root == BorrowRoot::Local(source)
+                    excluded.contains(root)
                         || root
                             .ended_source()
-                            .is_some_and(|(root, _)| root == BorrowRoot::Local(source))
+                            .is_some_and(|(root, _)| excluded.contains(&root))
                 });
                 self.borrows.update_fact(local, fact);
             } else if let Some(roots) = self.borrows.sources.get_mut(&local) {
-                roots.remove(&BorrowRoot::Local(source));
+                roots.retain(|root| !excluded.contains(root));
             }
             if !retains_source
                 && let Some(invalid) = self.borrows.invalid.get_mut(&local)
             {
-                invalid.remove(&BorrowRoot::Local(source));
+                invalid.retain(|root, _| !excluded.contains(root));
             }
         }
     }
@@ -33632,10 +33874,44 @@ impl<'a> MoveCheck<'a> {
         for fact in self.loop_value_facts.values_mut() {
             fact.rename_generations(renames);
         }
+        for fact in self.walked_value_facts.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for fact in self.walked_storage_facts.values_mut() {
+            fact.rename_generations(renames);
+        }
+        for backing in self.walked_backing_facts.values_mut() {
+            backing.rename_generations(renames);
+        }
+        for completion in self.pending_call_completions.values_mut() {
+            completion.value.rename_generations(renames);
+            completion.storage.rename_generations(renames);
+            completion.backing.rename_generations(renames);
+        }
         for edges in &mut self.loop_breaks {
             for edge in edges {
                 edge.value.rename_generations(renames);
                 edge.borrows.rename_generations(renames);
+            }
+        }
+        #[cfg(test)]
+        for states in &mut self.loop_borrow_breaks {
+            for state in states {
+                state.rename_generations(renames);
+            }
+        }
+        #[cfg(test)]
+        for fact in &mut self.loop_value_breaks {
+            fact.rename_generations(renames);
+        }
+        rename_borrow_roots(&mut self.return_roots, renames);
+        rename_borrow_roots(&mut self.parallel_transfer_roots, renames);
+        for roots in &mut self.borrow_mut_retention {
+            rename_borrow_roots(roots, renames);
+        }
+        if let Some(cache) = self.borrow_fact_cache.get_mut() {
+            for fact in cache.values_mut() {
+                fact.rename_generations(renames);
             }
         }
     }
@@ -33703,17 +33979,11 @@ impl<'a> MoveCheck<'a> {
                     path
                 })
                 .collect::<std::collections::BTreeSet<_>>();
-            for entry in self.borrows.storage.directory.entries.values_mut() {
-                if entry.releases.iter().any(|release| {
-                    matches!(release, MoveReleasePlace::Local { local: owner, path }
-                        if *owner == local && owned_paths.contains(path))
-                }) {
-                    entry.ended = Some(
-                        entry
-                            .ended
-                            .map_or(BorrowEnd::Consumed, |ended| ended.min(BorrowEnd::Consumed)),
-                    );
-                }
+            for path in owned_paths {
+                self.borrows.end_release(
+                    &MoveReleasePlace::Local { local, path },
+                    BorrowEnd::Consumed,
+                );
             }
         }
 
@@ -33775,19 +34045,19 @@ impl<'a> MoveCheck<'a> {
             }
             self.borrows.storage.directory.entries.insert(
                 generation.clone(),
-                MoveGenerationEntry {
-                    descriptor: Some(StorageHeaderDescriptor {
+                MoveGenerationEntry::new(
+                    &generation,
+                    Some(StorageHeaderDescriptor {
                         ty: header.ty,
                         kind: header.kind,
                     }),
-                    releases: [MoveReleasePlace::Local {
+                    [MoveReleasePlace::Local {
                         local,
                         path: destination_path,
                     }]
                     .into_iter()
                     .collect(),
-                    ended: None,
-                },
+                ),
             );
             self.borrows
                 .storage
@@ -33808,24 +34078,15 @@ impl<'a> MoveCheck<'a> {
             // Copying an inline header materializes another addressable place but leaves the source
             // live. Only an owned/Move selected payload consumes a distinct source generation.
             if owns_selected_value {
-                for source_generation in source_leaf
+                let source_generations = source_leaf
                     .iter()
                     .flat_map(|leaf| leaf.generations.iter())
                     .map(|reference| &reference.generation)
                     .filter(|source_generation| **source_generation != generation)
-                {
-                    if let Some(entry) = self
-                        .borrows
-                        .storage
-                        .directory
-                        .entries
-                        .get_mut(source_generation)
-                    {
-                        entry.ended = Some(entry.ended.map_or(BorrowEnd::Consumed, |ended| {
-                            ended.min(BorrowEnd::Consumed)
-                        }));
-                    }
-                }
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.borrows
+                    .end_generations(source_generations, BorrowEnd::Consumed);
             }
         }
 
@@ -34170,6 +34431,12 @@ impl<'a> MoveCheck<'a> {
         self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
     }
 
+    fn invalidate_collection_content_owner(&mut self, collection: LocalId) {
+        let roots = self.local_storage_roots(collection);
+        self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
+        self.invalidate_owner(collection);
+    }
+
     fn move_transfers_storage(&self, local: LocalId) -> bool {
         self.borrows
             .headers
@@ -34180,6 +34447,17 @@ impl<'a> MoveCheck<'a> {
                     .headers
                     .iter()
                     .any(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+            })
+    }
+
+    fn completed_value_transfers_storage(&self, value: &Expr) -> bool {
+        let headers = self.completed_headers(value);
+        storage_type_paths(value.ty, self.storage_type_context())
+            .headers
+            .iter()
+            .any(|header| {
+                header.kind == StorageHeaderKind::OwnedDynamic
+                    && headers.leaves.contains_key(&header.path)
             })
     }
 
@@ -34295,20 +34573,21 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) {
-        for &root in roots {
+        for root in roots {
             let owner = match root {
-                BorrowRoot::Local(owner) => Some(owner),
+                BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => Some(*owner),
                 BorrowRoot::Param(position) | BorrowRoot::ParamStorage(position) => {
-                    self.f.params.get(position as usize).copied()
+                    self.f.params.get(*position as usize).copied()
                 }
                 BorrowRoot::IterTemp(_)
                 | BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedStorageLocal(..)
                 | BorrowRoot::EndedIterTemp(..)
                 | BorrowRoot::EndedParam(..)
                 | BorrowRoot::EndedParamStorage(..) => None,
             };
             if let Some(owner) = owner
-                && self.reject_live_resource_dependents_of_root(root, owner, moved, span)
+                && self.reject_live_resource_dependents_of_root(root.clone(), owner, moved, span)
             {
                 break;
             }
@@ -34320,10 +34599,49 @@ impl<'a> MoveCheck<'a> {
     /// replaces the *named* storage, not the hidden owner, which only its loop edge frees.
     fn invalidate_storage(&mut self, storage: &Expr) {
         self.invalidate_source_mutation_target(storage);
+        let generations = self
+            .completed_headers(storage)
+            .leaves
+            .values()
+            .flat_map(|leaf| leaf.generations.iter())
+            .map(|reference| reference.generation.clone())
+            .collect::<Vec<_>>();
+        let generation_backed = !generations.is_empty();
+        self.borrows
+            .end_generations(generations, BorrowEnd::Consumed);
         for root in self.completed_storage_fact(storage).live_roots() {
-            if let BorrowRoot::Local(owner) = root {
-                self.invalidate_mutable_place(owner, &[]);
-                self.invalidate_owner(owner);
+            match root {
+                BorrowRoot::Local(owner) => {
+                    self.invalidate_mutable_place(owner, &[]);
+                    if !generation_backed {
+                        self.invalidate_owner(owner);
+                    }
+                }
+                BorrowRoot::StorageLocal(_, owner, path) => {
+                    let exact = path
+                        .iter()
+                        .map(|projection| match projection {
+                            BorrowProjection::StructField(field) => Some(*field),
+                            BorrowProjection::TupleElement(_)
+                            | BorrowProjection::ArrayElement(_)
+                            | BorrowProjection::ClosureTarget(_)
+                            | BorrowProjection::ClosureCapture(_)
+                            | BorrowProjection::EnumPayload { .. }
+                            | BorrowProjection::OptionSome
+                            | BorrowProjection::ResultOk
+                            | BorrowProjection::ResultErr => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    self.invalidate_mutable_place(owner, exact.as_deref().unwrap_or(&[]));
+                }
+                BorrowRoot::IterTemp(_)
+                | BorrowRoot::Param(_)
+                | BorrowRoot::ParamStorage(_)
+                | BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedStorageLocal(..)
+                | BorrowRoot::EndedIterTemp(..)
+                | BorrowRoot::EndedParam(..)
+                | BorrowRoot::EndedParamStorage(..) => {}
             }
         }
     }
@@ -34361,11 +34679,13 @@ impl<'a> MoveCheck<'a> {
     /// points at freed storage past this edge. Declaration order within `drops` is irrelevant: a
     /// local not yet bound on this path has no live borrower to invalidate.
     fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
-        let ended = |root| match root {
-            BorrowRoot::Local(id) => drops.contains(&id),
-            BorrowRoot::IterTemp(d) => d >= depth,
+        let ended = |root: &BorrowRoot| match root {
+            BorrowRoot::Local(id) => drops.contains(id),
+            BorrowRoot::StorageLocal(..) => false,
+            BorrowRoot::IterTemp(d) => *d >= depth,
             BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => false,
             BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => false,
@@ -34409,7 +34729,13 @@ impl<'a> MoveCheck<'a> {
         let Some(owners) = self.borrows.invalid.get(&local) else { return };
         // `BorrowRoot::Local` sorts first, so a named source is reported in preference to an
         // anonymous temporary when a borrower depends on both.
-        let Some((root, how)) = owners.iter().next().map(|(&r, &h)| (r, h)) else { return };
+        let Some((root, how)) = owners
+            .iter()
+            .next()
+            .map(|(root, &how)| (root.clone(), how))
+        else {
+            return;
+        };
         self.emit_invalid_borrow(local, root, how, span);
     }
 
@@ -34436,7 +34762,7 @@ impl<'a> MoveCheck<'a> {
             owners
                 .iter()
                 .find(|(root, _)| selected.contains(root))
-                .map(|(&root, &how)| (root, how))
+                .map(|(root, &how)| (root.clone(), how))
         });
         if let Some((root, how)) = header_ended.or(ended).or(invalid) {
             self.emit_invalid_borrow(local, root, how, span);
@@ -34456,7 +34782,7 @@ impl<'a> MoveCheck<'a> {
             .get(local as usize)
             .map_or("<borrow>", |l| l.name.as_str());
         let msg = match (root, how) {
-            (BorrowRoot::Local(owner), _) => {
+            (BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _), _) => {
                 let source = self
                     .f
                     .locals
@@ -34487,6 +34813,7 @@ impl<'a> MoveCheck<'a> {
             ),
             (
                 BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedStorageLocal(..)
                 | BorrowRoot::EndedIterTemp(..)
                 | BorrowRoot::EndedParam(..)
                 | BorrowRoot::EndedParamStorage(..),
@@ -34611,7 +34938,7 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let message = match root {
-            BorrowRoot::Local(owner) => {
+            BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => {
                 let owner = self
                     .f
                     .locals
@@ -34636,6 +34963,7 @@ impl<'a> MoveCheck<'a> {
                 "pipeline source snapshot was invalidated before terminal action: its external owner ended unexpectedly".to_string()
             }
             BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => {
@@ -34954,7 +35282,7 @@ impl<'a> MoveCheck<'a> {
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
                     if self.is_move_ty(value.ty) {
-                        self.invalidate_owner(*base);
+                        self.invalidate_collection_content_owner(*base);
                     }
                     self.update_mutable_collection_contents(*base, index, path, value);
                 }
@@ -34967,7 +35295,7 @@ impl<'a> MoveCheck<'a> {
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
                     if self.is_move_ty(value.ty) {
-                        self.invalidate_owner(*base);
+                        self.invalidate_collection_content_owner(*base);
                     }
                     self.update_mutable_collection_contents(*base, index, &[], value);
                 }
@@ -36364,6 +36692,7 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         let headers = self.completed_headers(value);
+        let mut generations = Vec::new();
         for header in typed.headers {
             if header.kind == StorageHeaderKind::View {
                 continue;
@@ -36372,17 +36701,16 @@ impl<'a> MoveCheck<'a> {
                 continue;
             };
             for reference in &leaf.generations {
-                if let Some(entry) = self
-                    .borrows
-                    .storage
-                    .directory
-                    .entries
-                    .get_mut(&reference.generation)
-                {
-                    entry.ended = Some(entry.ended.map_or(how, |ended| ended.min(how)));
-                }
+                generations.push(reference.generation.clone());
             }
         }
+        // Moving an owned argument into a call ends the caller's generation at that action. The
+        // generation directory carries this exactly for projected storage, while older scalar
+        // views and active indexed-borrow reservations still carry the release root that named the
+        // generation before the move. End that frozen root in the same action. A local-to-local
+        // move never calls this helper and continues to transfer the release without invalidating
+        // pre-existing aliases.
+        self.borrows.end_generations(generations, how);
     }
 
     /// Move individually-owned dynamic leaves into one aggregate temporary. Arena-owned leaves
@@ -36493,20 +36821,12 @@ impl<'a> MoveCheck<'a> {
                     transferred.leaves.insert(header.path, leaf.clone());
                 }
                 StorageHeaderKind::InlineFixed => {
-                    for reference in &leaf.generations {
-                        if let Some(entry) = self
-                            .borrows
-                            .storage
-                            .directory
-                            .entries
-                            .get_mut(&reference.generation)
-                        {
-                            entry.ended = Some(entry.ended.map_or(
-                                BorrowEnd::Consumed,
-                                |ended| ended.min(BorrowEnd::Consumed),
-                            ));
-                        }
-                    }
+                    self.borrows.end_generations(
+                        leaf.generations
+                            .iter()
+                            .map(|reference| reference.generation.clone()),
+                        BorrowEnd::Consumed,
+                    );
                 }
                 StorageHeaderKind::View => {}
             }
@@ -36569,20 +36889,12 @@ impl<'a> MoveCheck<'a> {
                     transferred.leaves.insert(header.path, leaf.clone());
                 }
                 StorageHeaderKind::InlineFixed => {
-                    for reference in &leaf.generations {
-                        if let Some(entry) = self
-                            .borrows
-                            .storage
-                            .directory
-                            .entries
-                            .get_mut(&reference.generation)
-                        {
-                            entry.ended = Some(entry.ended.map_or(
-                                BorrowEnd::Consumed,
-                                |ended| ended.min(BorrowEnd::Consumed),
-                            ));
-                        }
-                    }
+                    self.borrows.end_generations(
+                        leaf.generations
+                            .iter()
+                            .map(|reference| reference.generation.clone()),
+                        BorrowEnd::Consumed,
+                    );
                 }
                 StorageHeaderKind::View => {}
             }
@@ -36686,24 +36998,14 @@ impl<'a> MoveCheck<'a> {
                     let error_headers = self
                         .completed_headers(result)
                         .project_path(&[BorrowProjection::ResultErr]);
-                    for reference in error_headers
-                        .leaves
-                        .values()
-                        .flat_map(|leaf| leaf.generations.iter())
-                    {
-                        if let Some(entry) = self
-                            .borrows
-                            .storage
-                            .directory
-                            .entries
-                            .get_mut(&reference.generation)
-                        {
-                            entry.ended = Some(entry.ended.map_or(
-                                BorrowEnd::Consumed,
-                                |ended| ended.min(BorrowEnd::Consumed),
-                            ));
-                        }
-                    }
+                    self.borrows.end_generations(
+                        error_headers
+                            .leaves
+                            .values()
+                            .flat_map(|leaf| leaf.generations.iter())
+                            .map(|reference| reference.generation.clone()),
+                        BorrowEnd::Consumed,
+                    );
                 }
                 let result_fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
                 let error_ty = match expand_tagged_ty(result.ty, self.tagged_types) {
@@ -38035,7 +38337,7 @@ impl<'a> MoveCheck<'a> {
                             if invalidates_owner
                                 && self.is_move_ty(value.ty)
                             {
-                                self.invalidate_owner(base);
+                                self.invalidate_collection_content_owner(base);
                             }
                             self.update_mutable_collection_contents(
                                 base,
@@ -38072,7 +38374,7 @@ impl<'a> MoveCheck<'a> {
                         if invalidates_owner
                             && self.is_move_ty(value.ty)
                         {
-                            self.invalidate_owner(base);
+                            self.invalidate_collection_content_owner(base);
                         }
                         self.update_mutable_collection_contents(base, index, field_path, value);
                     }
@@ -39764,7 +40066,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::TupleIndex { recv, index } => {
                 match &recv.kind {
                     ExprKind::Local(t) => {
-                        self.check_borrow_use(*t, e.span);
+                        self.check_borrow_projection_use(
+                            *t,
+                            &[BorrowProjection::TupleElement(*index)],
+                            e.span,
+                        );
                         if field_moved(moved, *t, *index) {
                             let name = &self.f.locals[*t as usize].name;
                             self.diags.error(format!("use of moved field '.{index}' of '{name}'"), e.span);
@@ -39773,8 +40079,10 @@ impl<'a> MoveCheck<'a> {
                                 if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
                             if owned && consuming {
                                 self.reject_live_resource_dependents(*t, moved, e.span);
-                                self.invalidate_mutable_place(*t, &[]);
-                                self.invalidate_owner(*t);
+                                self.invalidate_mutable_place(*t, &[*index]);
+                                if !self.completed_value_transfers_storage(e) {
+                                    self.invalidate_owner(*t);
+                                }
                                 moved.insert(MovedKey::Field(*t, *index));
                             }
                         }
@@ -63390,16 +63698,16 @@ mod tests {
         let mut selector_state = BorrowState::default();
         selector_state.storage.directory.entries.insert(
             selector_generation.clone(),
-            MoveGenerationEntry {
-                descriptor: Some(underlying_descriptor),
-                releases: [MoveReleasePlace::Local {
+            MoveGenerationEntry::new(
+                &selector_generation,
+                Some(underlying_descriptor),
+                [MoveReleasePlace::Local {
                     local: 7,
                     path: Vec::new(),
                 }]
                 .into_iter()
                 .collect(),
-                ended: None,
-            },
+            ),
         );
         selector_state
             .storage
@@ -63417,7 +63725,11 @@ mod tests {
         let resolved_column = selector_state.resolve_headers(&column).non_storage.flatten();
         assert!(resolved_column.contains(&BorrowRoot::Param(0)));
         assert!(!resolved_column.contains(&BorrowRoot::Param(1)));
-        assert!(resolved_column.contains(&BorrowRoot::Local(7)));
+        assert!(resolved_column.contains(&BorrowRoot::StorageLocal(
+            selector_generation.clone(),
+            7,
+            Vec::<BorrowProjection>::new().into(),
+        )));
         let sibling = ProjectedHeaderFact::from_leaf(
             Vec::new(),
             StorageHeaderLeaf::selected_typed(
@@ -64842,16 +65154,16 @@ fn main() -> i32 = 0
                 StorageHeaderLeaf::known_typed(generation, descriptor),
             )
         };
-        let entry = |local| MoveGenerationEntry {
-            descriptor: Some(descriptor),
-            releases: [MoveReleasePlace::Local {
+        let entry = |generation: &StorageGeneration, local| MoveGenerationEntry::new(
+            generation,
+            Some(descriptor),
+            [MoveReleasePlace::Local {
                 local,
                 path: Vec::new(),
             }]
             .into_iter()
             .collect(),
-            ended: None,
-        };
+        );
         let content = |parameter| MoveValueFact {
             non_storage: BorrowFact::from_direct(
                 [BorrowRoot::Param(parameter)].into_iter().collect(),
@@ -64872,7 +65184,7 @@ fn main() -> i32 = 0
         };
         let skip = MoveControlEdge {
             moved: MovedSet::new(),
-            borrows: state(vec![(current.clone(), entry(0), content(0))]),
+            borrows: state(vec![(current.clone(), entry(&current, 0), content(0))]),
             value: MoveValueFact {
                 non_storage: BorrowFact::default(),
                 headers: header(current.clone()),
@@ -64882,8 +65194,8 @@ fn main() -> i32 = 0
         let mut executed = MoveControlEdge {
             moved: MovedSet::new(),
             borrows: state(vec![
-                (prior.clone(), entry(0), content(0)),
-                (current.clone(), entry(1), content(1)),
+                (prior.clone(), entry(&prior, 0), content(0)),
+                (current.clone(), entry(&current, 1), content(1)),
             ]),
             value: MoveValueFact {
                 non_storage: BorrowFact::default(),
@@ -64956,6 +65268,17 @@ fn main() -> i32 = 0
             "the demoted generation keeps the skipped edge's stable release owner",
         );
         assert_eq!(
+            joined.borrows.storage.directory.entries[&prior].historical_release_roots,
+            [BorrowRoot::StorageLocal(
+                prior.clone(),
+                0,
+                Vec::<BorrowProjection>::new().into(),
+            )]
+            .into_iter()
+            .collect(),
+            "the release history must be demoted atomically with its directory key",
+        );
+        assert_eq!(
             joined.borrows.storage.directory.entries[&prior].ended,
             Some(BorrowEnd::Dropped),
             "a generation ending is sticky when the peer edge still carries its old Current live",
@@ -64969,6 +65292,17 @@ fn main() -> i32 = 0
             .into_iter()
             .collect(),
             "the fresh generation keeps the executed edge's stable release owner",
+        );
+        assert_eq!(
+            joined.borrows.storage.directory.entries[&current].historical_release_roots,
+            [BorrowRoot::StorageLocal(
+                current.clone(),
+                1,
+                Vec::<BorrowProjection>::new().into(),
+            )]
+            .into_iter()
+            .collect(),
+            "the executed edge's fresh Current history must remain distinct from Prior",
         );
         assert!(
             MoveControlEdge::join_reachable([Some(skip.clone()), None]) == Some(skip),
