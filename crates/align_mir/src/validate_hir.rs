@@ -4515,6 +4515,32 @@ impl<'a> BodyValidator<'a> {
         expression.ty == ty && self.local_type(context, id) == Some(ty)
     }
 
+    /// A streamed response read mutates its transport/framing cursor. Nonparameter locals own that
+    /// cursor; a parameter may advance it only by value or through an exclusive mutable borrow.
+    /// This independently rejects handcrafted HIR that bypasses the source checker.
+    fn http_read_stream_cursor_place(
+        &self,
+        context: &BodyContext,
+        expression: &hir::Expr,
+    ) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        if !self.local_handle_place(context, expression, Ty::HttpReadStream) {
+            return false;
+        }
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+            return true;
+        };
+        matches!(
+            function.param_modes.get(position),
+            Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut)
+        )
+    }
+
     fn source_mut_local(&self, context: &BodyContext, expression: &hir::Expr, ty: Ty) -> bool {
         let hir::ExprKind::Local(id) = expression.kind else {
             return false;
@@ -8331,7 +8357,7 @@ impl<'a> BodyValidator<'a> {
                     .then(|| strict(Ty::Option(Scalar::Str), &[stream, name]))?
             }
             hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
-                (local(stream, Ty::HttpReadStream)
+                (self.http_read_stream_cursor_place(context, stream)
                     && stream.ty == Ty::HttpReadStream
                     && mutable_local(buffer, Ty::Buffer)
                     && buffer.ty == Ty::Buffer)

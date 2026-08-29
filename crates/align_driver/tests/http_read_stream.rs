@@ -207,7 +207,9 @@ fn replace(current: http_read_stream, replacement: http_read_stream) -> http_rea
   return active
 }
 fn observe(borrow value: http_read_stream) -> i64 = value.status()
+fn observe_header(borrow value: http_read_stream) -> Option<str> = value.header(\"x-test\")
 fn advance(borrow mut value: http_read_stream, borrow mut out: buffer) -> Result<i64, Error> = value.read(out)
+fn advance_owned(value: http_read_stream, borrow mut out: buffer) -> Result<i64, Error> = value.read(out)
 fn generic<T>(value: T) -> T = value
 fn through_generic(value: http_read_stream) -> http_read_stream = generic(value)
 fn indirect(value: http_read_stream) -> http_read_stream {
@@ -242,6 +244,7 @@ fn main() -> i32 = 0
         "fn bad(value: http_read_stream) -> i32 {\n  print(value)\n  return 0\n}\nfn main() -> i32 = 0\n",
         "fn bad(value: http_read_stream) -> i32 {\n  copy := value.clone()\n  return 0\n}\nfn main() -> i32 = 0\n",
         "fn bad(left: http_read_stream, right: http_read_stream) -> bool = left == right\nfn main() -> i32 = 0\n",
+        "fn bad(borrow value: http_read_stream, borrow mut out: buffer) -> Result<i64, Error> = value.read(out)\nfn main() -> i32 = 0\n",
     ];
     for (index, source) in rejected.into_iter().enumerate() {
         assert!(

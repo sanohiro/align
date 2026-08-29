@@ -10851,7 +10851,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 268,
+        variants, 272,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -13016,15 +13016,49 @@ fn hir_body_validator_native() {
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let function = reject
+    let Some(function) = reject
         .fns
         .iter_mut()
         .find(|function| function.name == "native_http_read_stream_read")
-        .expect("stream read fixture is present");
+    else {
+        panic!("stream read fixture is present");
+    };
     function.locals[1].is_mut = false;
     assert!(
         !body_core_metadata_is_valid(&reject),
         "stream read buffer must be mutable"
+    );
+
+    let mut exclusive = program.clone();
+    let Some(function) = exclusive
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_read_stream_read")
+    else {
+        panic!("stream read fixture is present");
+    };
+    function.params = vec![0];
+    function.param_modes = vec![align_ast::ParamMode::BorrowMut];
+    function.locals[0].is_param = true;
+    function.locals[0].is_mut = true;
+    assert!(
+        body_core_metadata_is_valid(&exclusive),
+        "stream read accepts an exclusive mutable cursor borrow"
+    );
+
+    let mut shared = exclusive;
+    let Some(function) = shared
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_read_stream_read")
+    else {
+        panic!("stream read fixture is present");
+    };
+    function.param_modes[0] = align_ast::ParamMode::Borrow;
+    function.locals[0].is_mut = false;
+    assert!(
+        !body_core_metadata_is_valid(&shared),
+        "stream read must reject a shared cursor borrow"
     );
 
     for name in [

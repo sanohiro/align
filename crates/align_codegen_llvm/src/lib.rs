@@ -8151,7 +8151,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
         Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
-        Scalar::HttpReadStream => unreachable!("an http_read_stream handle is not a box/array payload"),
+        // Not currently admitted as a box/array payload, but keep this size function total for
+        // malformed MIR and consistent with the handle's one-pointer ABI.
+        Scalar::HttpReadStream => 8,
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
@@ -14911,7 +14913,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_call(self.runtime(RuntimeKey::BufferCapacity), &[bp], "bufcap")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("buffer_capacity returns i64")
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("buffer_capacity returned no basic value"))?
             }
             // `bytes.<scalar>_<le|be>(off)` — inline binary scalar read. The byte address is a plain
             // (non-`inbounds`) GEP into the bounds-checked `slice<u8>` view; the load is alignment-1
@@ -15956,14 +15960,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_call(self.runtime(RuntimeKey::HttpClientRequestStream), &[c.into(), r.into(), out_ptr.into()], "httpreqstream")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("http_client_request_stream returns i32 status")
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_client_request_stream returned no status value"))?
             }
             Rvalue::HttpReadStreamStatus { stream } => {
                 let stream = self.operand(stream)?.into_pointer_value();
                 self.builder
                     .build_call(self.runtime(RuntimeKey::HttpReadStreamStatus), &[stream.into()], "httpreadstatus")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("http_read_stream_status returns i64")
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_read_stream_status returned no value"))?
             }
             Rvalue::HttpReadStreamHeader { stream, name, out } => {
                 let stream = self.operand(stream)?.into_pointer_value();
@@ -15973,7 +15981,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_call(self.runtime(RuntimeKey::HttpReadStreamHeader), &[stream.into(), np.into(), nl.into(), out_ptr.into()], "httpreadheader")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("http_read_stream_header returns i32 present flag")
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_read_stream_header returned no presence value"))?
             }
             Rvalue::HttpReadStreamRead { stream, buffer, out } => {
                 let stream = self.operand(stream)?.into_pointer_value();
@@ -15983,7 +15993,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_call(self.runtime(RuntimeKey::HttpReadStreamRead), &[stream.into(), buffer.into(), out_ptr.into()], "httpread")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("http_read_stream_read returns i32 status")
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_read_stream_read returned no status value"))?
             }
             // cl.get_many — the runtime writes an owned `array<response>` `{ptr,len}` header into `out`
             // and returns an i32 status (0 = ok; else the lowest-index error). Zero the out slot first

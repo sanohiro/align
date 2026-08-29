@@ -18061,10 +18061,14 @@ impl HttpResponseDecoder {
         debug_assert!(self.streaming);
         let limit = match self.state {
             HttpDecodeState::Head | HttpDecodeState::Complete => 0,
-            HttpDecodeState::Fixed { remaining } => usize::try_from(remaining)
-                .unwrap_or(usize::MAX)
-                .min(output_remaining)
-                .saturating_add((remaining <= output_remaining as u64) as usize),
+            HttpDecodeState::Fixed { remaining } => {
+                let completion_probe = usize::try_from(remaining)
+                    .is_ok_and(|remaining| remaining <= output_remaining);
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(output_remaining)
+                    .saturating_add(if completion_probe { 1 } else { 0 })
+            }
             HttpDecodeState::CloseDelimited => output_remaining,
             HttpDecodeState::ChunkSize => HTTP_MAX_CHUNK_LINE
                 .saturating_sub(self.chunk_line_len)
@@ -18765,8 +18769,8 @@ fn tls_client_ctx() -> *mut c_void {
 /// streaming read loop (and its Incomplete/Invalid framing split) stays single-sourced across the
 /// plaintext and TLS paths (http.md Slice 5). `Plain` is a bare socket fd (SIGPIPE suppressed via
 /// `MSG_NOSIGNAL`/`SO_NOSIGPIPE`, unchanged from Slices 2/3); `Tls` is an OpenSSL `SSL*` over its
-/// underlying socket fd (SIGPIPE handled by the caller's per-thread `pthread_sigmask` block, since
-/// an `SSL_write`'s BIO carries no `MSG_NOSIGNAL` flag).
+/// underlying socket fd. Every TLS read and teardown guards its own possible protocol write because
+/// a streaming cursor outlives the request constructor's exchange guard.
 enum Conn {
     Plain { fd: i32 },
     Tls { ssl: *mut c_void, fd: i32 },
@@ -18837,7 +18841,15 @@ impl Conn {
     unsafe fn read_raw(&mut self, dst: *mut u8, len: usize, has_deadline: bool) -> ConnRead {
         match *self {
             Conn::Plain { fd } => unsafe { plain_read(fd, dst, len) },
-            Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, dst, len, has_deadline) },
+            Conn::Tls { ssl, .. } => {
+                // SSL_read can emit alerts/handshake records through the socket BIO. Keep the guard
+                // at this I/O boundary: HttpReadStream performs later reads after the constructor's
+                // exchange guard has gone out of scope.
+                let _sigpipe = SigpipeBlock::new();
+                #[cfg(test)]
+                tls_sigpipe_guard_observed(TlsSigpipeOperation::Read);
+                unsafe { tls_read(ssl, dst, len, has_deadline) }
+            }
         }
     }
 
@@ -18872,6 +18884,14 @@ impl Conn {
 /// # Safety
 /// `fd` must be the fd `SSL_set_fd`'d into `ssl` (or `ssl` null); neither used after.
 unsafe fn close_tls(ssl: *mut c_void, fd: i32) {
+    // SSL_shutdown can write close_notify through a bare socket BIO. This function is the common
+    // teardown boundary for checked-out streams, pool eviction, client Drop, and error cleanup, so
+    // it owns suppression instead of requiring every lifetime-specific caller to remember it.
+    let _sigpipe = (!ssl.is_null()).then(SigpipeBlock::new);
+    #[cfg(test)]
+    if !ssl.is_null() {
+        tls_sigpipe_guard_observed(TlsSigpipeOperation::Close);
+    }
     unsafe {
         if !ssl.is_null() {
             SSL_shutdown(ssl); // best-effort, one-way; ignore the retry return
@@ -19158,6 +19178,35 @@ impl SigpipeBlock {
         };
         SigpipeBlock { old, active }
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TlsSigpipeOperation {
+    Read,
+    Close,
+}
+
+// Thread-local because runtime TLS fixtures run concurrently. The client exchange stays on the
+// owning test thread while each fixture's server uses another thread, so one test can prove that
+// its streamed reads and eventual pooled teardown both crossed the guarded boundaries without
+// accepting another test's traffic as evidence.
+#[cfg(test)]
+thread_local! {
+    static TLS_SIGPIPE_GUARD_COUNTS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(test)]
+fn tls_sigpipe_guard_observed(operation: TlsSigpipeOperation) {
+    TLS_SIGPIPE_GUARD_COUNTS.with(|counts| {
+        let (reads, closes) = counts.get();
+        counts.set(match operation {
+            TlsSigpipeOperation::Read => (reads + 1, closes),
+            TlsSigpipeOperation::Close => (reads, closes + 1),
+        });
+    });
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -19638,11 +19687,9 @@ impl HttpReadStream {
             && !conn.has_pending();
         let client = unsafe { self.client.as_ref() };
         let (fd, ssl) = conn.into_parts();
-        if reusable {
-            if let Some(client) = client {
-                client.put_idle(self.scheme, &self.host, self.port, fd, ssl);
-                return;
-            }
+        if reusable && let Some(client) = client {
+            client.put_idle(self.scheme, &self.host, self.port, fd, ssl);
+            return;
         }
         unsafe { close_tls(ssl, fd) };
         if let Some(client) = client {
@@ -19939,6 +19986,9 @@ pub unsafe extern "C" fn align_rt_http_client_request_stream(
 }
 
 /// Shared final-head status getter for raw/SSE stream handles. `status(null) == 0`.
+///
+/// # Safety
+/// A non-null `stream` must point to a live stream handle produced by this runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_read_stream_status(stream: *const HttpReadStream) -> i64 {
     let Some(stream) = (unsafe { stream.as_ref() }) else {
@@ -19948,6 +19998,10 @@ pub unsafe extern "C" fn align_rt_http_read_stream_status(stream: *const HttpRea
 }
 
 /// Shared final-head header getter. A valid output is zeroed before any input validation.
+///
+/// # Safety
+/// A non-null `stream` must point to a live stream handle. A non-null `out` must be writable. When
+/// `name_len` is positive, `name_ptr` must address that many readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_read_stream_header(
     stream: *const HttpReadStream,
@@ -19995,6 +20049,10 @@ pub unsafe extern "C" fn align_rt_http_read_stream_header(
 
 /// De-frame one caller-bounded body window. `count` and `buffer.len` are cleared before the stream
 /// handle is inspected; every terminal stream error is stable and performs no later I/O.
+///
+/// # Safety
+/// Non-null `stream` and `buffer` pointers must designate live, exclusively borrowed handles of
+/// their declared types. A non-null `count` must be writable. Null inputs are rejected before use.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_read_stream_read(
     stream: *mut HttpReadStream,
@@ -20031,6 +20089,9 @@ pub unsafe extern "C" fn align_rt_http_read_stream_read(
 }
 
 /// Free a raw/SSE-compatible stream handle. Null-safe; an incomplete body closes without draining.
+///
+/// # Safety
+/// A non-null `stream` must be a live handle returned by this runtime and not previously freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_read_stream_free(stream: *mut HttpReadStream) {
     if !stream.is_null() {
@@ -36693,6 +36754,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     fn https_read_stream_dechunks_and_reuses_the_live_tls_connection() {
         let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         tls_test_setup();
+        TLS_SIGPIPE_GUARD_COUNTS.with(|counts| counts.set((0, 0)));
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Done: yes\r\n\r\n".to_vec();
         let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response, 1, false);
         let url = format!("https://127.0.0.1:{port}/stream");
@@ -36703,6 +36765,11 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             unsafe { align_rt_http_read_stream_free(stream) };
         }
         unsafe { align_rt_http_client_free(client) };
+        TLS_SIGPIPE_GUARD_COUNTS.with(|counts| {
+            let (reads, closes) = counts.get();
+            assert!(reads >= 2, "each streamed TLS response reads under a SIGPIPE guard");
+            assert!(closes >= 1, "pooled TLS teardown runs under a SIGPIPE guard");
+        });
         assert_eq!(
             server.join().unwrap(),
             1,

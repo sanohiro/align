@@ -2817,7 +2817,7 @@ fn ty_contains_http_read_stream(
             | Scalar::RunBytes
             | Scalar::Fn(_)
             | Scalar::Resource(_)
-            | Scalar::ResourceRef(_) => return false,
+            | Scalar::ResourceRef(_) => false,
         }
     }
 
@@ -56713,6 +56713,9 @@ impl<'a, 't> Checker<'a, 't> {
                 if !self.require_mut_buffer_local(&args[0], ".read()") {
                     return err;
                 }
+                if !self.require_http_read_stream_cursor(&recv_expr) {
+                    return err;
+                }
                 Expr {
                     kind: ExprKind::HttpReadStreamRead {
                         stream: Box::new(recv_expr),
@@ -56735,6 +56738,34 @@ impl<'a, 't> Checker<'a, 't> {
                 err
             }
         }
+    }
+
+    /// A response-body cursor advances on every successful read. An owned/by-value local may do so
+    /// without source-level `mut` (the opaque handle remains in the same slot), but a parameter that
+    /// belongs to the caller needs the exclusive `borrow mut` mode. Status/header inspection remains
+    /// valid through a shared borrow and therefore does not use this gate.
+    fn require_http_read_stream_cursor(&mut self, receiver: &Expr) -> bool {
+        let ExprKind::Local(local) = receiver.kind else {
+            return false;
+        };
+        let Some(position) = self
+            .current_params
+            .iter()
+            .position(|parameter| *parameter == local)
+        else {
+            return true;
+        };
+        if self.current_param_modes.get(position) == Some(&ast::ParamMode::Borrow) {
+            let name = self.locals[local as usize].name.clone();
+            self.diags.error(
+                format!(
+                    "cannot advance shared-borrowed http_read_stream '{name}' in '.read()' (declare the parameter as `borrow mut`)"
+                ),
+                receiver.span,
+            );
+            return false;
+        }
+        true
     }
 
     /// `http.serve(host, port)` — bind a listening socket, yielding `Result<http_server, Error>`
