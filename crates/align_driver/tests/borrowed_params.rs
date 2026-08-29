@@ -655,23 +655,27 @@ fn records() -> array<Record> {\n\
     for (name, body) in [
         (
             "return",
-            "values := records(); view := first_text(values); consumed := values; print(consumed.len()); print(view)",
+            "values := records(); view := first_text(values); consumed := values; if consumed.len() == 1 && view.len() == 9 { return 42 }; return 0",
         ),
         (
             "retention",
-            "values := records(); mut output := View { text: \"\" }; retain_first(values, output); consumed := values; print(consumed.len()); print(output.text)",
+            "values := records(); mut output := View { text: \"\" }; retain_first(values, output); consumed := values; if consumed.len() == 1 && output.text.len() == 9 { return 42 }; return 0",
         ),
         (
             "indirect-retention",
-            "values := records(); mut output := View { text: \"\" }; retain_first_indirect(values, output); consumed := values; print(consumed.len()); print(output.text)",
+            "values := records(); mut output := View { text: \"\" }; retain_first_indirect(values, output); consumed := values; if consumed.len() == 1 && output.text.len() == 9 { return 42 }; return 0",
         ),
     ] {
-        let source = format!("{prefix}fn main() -> i32 {{ {body}; return 0 }}\n");
-        let diagnostics = check_diagnostics(&format!("borrowed-index-summary-{name}"), &source);
+        let source = format!("{prefix}fn main() -> i32 {{ {body} }}\n");
+        let owner = format!("borrowed-index-summary-{name}");
         assert!(
-            diagnostics.contains("invalidated") || diagnostics.contains("moved"),
-            "indexed {name} roots must remain tied to the array generation:\n{diagnostics}"
+            !check_errs(&owner, &source),
+            "indexed {name} roots must follow the stable array generation across owner transfer:\n{}",
+            check_diagnostics(&owner, &source)
         );
+        if backend_available() {
+            assert_eq!(build_and_run(&owner, &source).status.code(), Some(42));
+        }
     }
 }
 

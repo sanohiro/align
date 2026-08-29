@@ -36364,6 +36364,7 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         let headers = self.completed_headers(value);
+        let mut ended_headers = ProjectedHeaderFact::default();
         for header in typed.headers {
             if header.kind == StorageHeaderKind::View {
                 continue;
@@ -36371,6 +36372,9 @@ impl<'a> MoveCheck<'a> {
             let Some(leaf) = headers.leaves.get(&header.path) else {
                 continue;
             };
+            ended_headers
+                .leaves
+                .insert(header.path.clone(), leaf.clone());
             for reference in &leaf.generations {
                 if let Some(entry) = self
                     .borrows
@@ -36383,6 +36387,17 @@ impl<'a> MoveCheck<'a> {
                 }
             }
         }
+        // Moving an owned argument into a call ends the caller's generation at that action. The
+        // generation directory carries this exactly for projected storage, while older scalar
+        // views and active indexed-borrow reservations still carry the release root that named the
+        // generation before the move. End that frozen root in the same action. A local-to-local
+        // move never calls this helper and continues to transfer the release without invalidating
+        // pre-existing aliases.
+        let release_roots = self.borrows.header_release_roots(&ended_headers);
+        self.borrows.mark_matching_roots_ended(how, |root| {
+            release_roots.contains(&root)
+        });
+        self.borrows.invalidate_roots(&release_roots, how);
     }
 
     /// Move individually-owned dynamic leaves into one aggregate temporary. Arena-owned leaves
