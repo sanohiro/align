@@ -379,8 +379,9 @@ facts must live in this repository.
   `http_read_stream` with caller-buffer de-framed reads, followed by a consuming
   `http_sse_stream` transition with caller-buffer WHATWG event reads. Exact
   completion may return the connection to its borrowed client pool; mid-body
-  Drop closes without draining. Implementation remains two capability PRs:
-  raw streaming first, then SSE interpretation.
+  Drop closes without draining. Per-call framing and SSE-source work guards keep
+  each operation bounded without imposing a lifetime body cap. Implementation
+  remains two capability PRs: raw streaming first, then SSE interpretation.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

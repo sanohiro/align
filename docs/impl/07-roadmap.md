@@ -3832,13 +3832,14 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
                                 io_uring); no DB-specific frontend shortcut
 ```
 
-## Post-pkg.db library waves (planned, not yet gated)
+## Post-pkg.db library waves (planned; each item gated independently)
 
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
-Nothing here is a committed contract: each becomes a gated design under `impl/std-design/` or
-`impl/pkg-design/` at its own implementation start (broad-contract items — `core.test` syntax,
-`std.id` scalar admission — go through the design/open-questions gate first). This section records
-the plan so the sequencing survives; it does not lock any surface.
+An item without a status is not a committed contract: it becomes a gated design under
+`impl/std-design/` or `impl/pkg-design/` at its own implementation start (broad-contract items —
+`core.test` syntax, `std.id` scalar admission — go through the design/open-questions gate first).
+An item marked `DESIGNED` is locked by its named design ledger even though implementation remains
+pending. This section records their sequencing and status; it does not lock an unmarked surface.
 
 ### Convergence — a few foundations unlock many exits
 

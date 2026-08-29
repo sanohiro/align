@@ -1131,7 +1131,9 @@ De-chunking is protocol mechanism and stays inside `std.http`; body allocation i
 the call site. An unset streaming request has no cumulative total cap because it never materializes
 the complete body, while a positive `max_response_body_bytes` remains enforceable and is never
 silently ignored. This is what allows both large downloads and indefinite event streams without a
-second client or a magic larger default.
+second client or a magic larger default. Long life does not mean unbounded work in one operation:
+the whole-message chunk-framing counter becomes a replenished per-`read`/`next` allowance, so a
+stream can continue indefinitely only by returning bounded progress to its caller.
 
 SSE is a consuming type transition rather than a boolean mode. After `sse()`, raw reads are absent
 from the type, so framing bytes and event state cannot be interleaved accidentally. `next` also fills
@@ -1141,7 +1143,10 @@ reconnect timing, sleep, and `Last-Event-ID` request construction remain caller 
 automatic `EventSource` loop would hide network work and control flow; explicit stream accessors
 still expose the latest id/retry state when a control-only block precedes EOF. The same explicit-bound
 outcome, `Error.Code(-1)`, covers either a configured cumulative body bound or the selected event
-buffer capacity, always without partial publication.
+buffer capacity, always without partial publication. A separate per-`next` source-work guard counts
+comments, unknown fields, invalid retry lines, and control-only blocks as well as event input; its
+fixed slack beyond caller capacity keeps protocol syntax bounded without turning ignored input into
+hidden allocation.
 
 ---
 

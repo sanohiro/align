@@ -213,7 +213,9 @@ plaintext/TLS connection and bounded framing state while retaining a shared borr
 growing or allocating a body. Exact self-delimited completion may return the connection to the same
 client pool; Drop before completion closes without draining. A selected positive
 `max_response_body_bytes` still caps cumulative decoded bytes, while an unset stream has no total
-cap because it never materializes the whole body.
+cap because it never materializes the whole body. Each `read`/`next` instead has a replenished
+262,144-byte chunk-framing work allowance, preserving indefinite streams without allowing a single
+operation to consume unbounded framing.
 
 A consuming `sse()` transition yields `http_sse_stream`, so raw and event reads cannot mix after the
 choice. `next(mut buffer)` performs WHATWG UTF-8/BOM/line/field/dispatch interpretation and returns
@@ -223,9 +225,11 @@ status/media-type validation, redirect, reconnect, delay, and `Last-Event-ID` re
 remain explicit; stream accessors expose control-only id/retry updates even when no event is
 dispatched. The caller buffer is the event allocation bound; exact fit succeeds and excess is
 the same `Error.Code(-1)` explicit HTTP receive-bound result, with no partial event and a closed
-connection. The authoritative ledger, native envelope, validation precedence, connection matrix,
-two-PR implementation boundary, and acceptance matrix are in `docs/impl/std-design/http.md`
-“Client streaming receive,” with synchronized Japanese mirror. Implementation is pending.
+connection. Independently, `next` counts all de-framed source bytes, including ignored/control-only
+input, against an exact output-capacity-plus-262,144 work guard; excess is `Error.Invalid`. The
+authoritative ledger, native envelope, validation precedence, connection matrix, two-PR
+implementation boundary, and acceptance matrix are in `docs/impl/std-design/http.md` “Client
+streaming receive,” with synchronized Japanese mirror. Implementation is pending.
 
 ### Bounded HTTP client receive — two scoped setters and `Error.Code(-1)` (SETTLED 2026-08-14)
 **Decision:** `http.client` and `http.request` each expose

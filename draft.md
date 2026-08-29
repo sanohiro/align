@@ -3208,7 +3208,9 @@ connection to that client's pool. Mid-body Drop closes without draining. Raw rea
 caller-owned fixed-capacity buffer and expose no HTTP chunk/trailer framing. A positive selected
 `max_response_body_bytes` remains a cumulative decoded-byte cap; when both scopes are unset, a
 stream has no cumulative total cap because it never materializes the whole body. The per-operation
-timeout snapshot remains active on every later receive.
+timeout snapshot remains active on every later receive. Each body-facing call gets a fresh 262,144
+byte chunk-framing work allowance, so indefinite chunked streams do not inherit the whole-message
+framing counter while one call remains bounded.
 
 `sse()` consumes the raw reader at its current logical body position and prevents later raw/SSE
 mixing. `next` applies the WHATWG UTF-8, BOM, CRLF/LF/CR, comment, field, blank-line dispatch, data
@@ -3219,9 +3221,11 @@ block precedes completion. Event bytes are written into the supplied buffer in
 `event || data || last_event_id` order; record fields are zero-copy views tied to that fresh buffer
 generation. Exact capacity succeeds. A cumulative body-cap or event-output-cap excess is the stable
 explicit HTTP receive-bound result `Error.Code(-1)`, with no partial publication and a closed
-connection. The exact ownership, parsing, ABI, allocation, validation-order, and acceptance ledger
-is `docs/impl/std-design/http.md` “Client streaming receive.” This surface is designed but not yet
-implemented.
+connection. Independently, one `next` scans at most the output capacity plus 262,144 de-framed
+source bytes; comments, unknown fields, invalid retry lines, and control-only blocks consume that
+allowance, and excess is `Error.Invalid`. The exact ownership, parsing, ABI, allocation,
+validation-order, and acceptance ledger is `docs/impl/std-design/http.md` “Client streaming
+receive.” This surface is designed but not yet implemented.
 
 ```text
 request
