@@ -906,12 +906,16 @@ The two existing ThinLTO cache phases remain the mechanism. `PrelinkKey` and
 `BackendKey` gain a nominal `PartitionKey` (`WholeUnit`, `Support`, or
 `Function(ProgramCall)`), and their full/slot digests distinguish partitions.
 The structural prelink input is the same typed view consumed by emission. A
-function view excludes unrelated local bodies but includes the selected body,
-every local peer ABI/symbol declaration, complete canonical type and resource
-tables, extern/import declarations, callback-effect facts, and the partition
-role. A support view is the exact deduplicated Drop-thunk sequence, including
-each thunk's ABI/ownership and every owned local hook's canonical ABI and raw
-symbol. Thus support codegen cannot rediscover a cleanup target outside the
+sealed shared view borrows the complete canonical type/resource tables,
+extern/import declarations, and callback-effect facts and fingerprints that
+record once per source unit. Each function hash combines that shared
+fingerprint with its selected body, local peer ABI/symbol declarations, and
+partition role, excluding unrelated local bodies without repeatedly formatting
+the same large type graph. Private shared-view fields and its sole
+`from_program` constructor prevent a digest/table mismatch. A support view is
+the exact deduplicated Drop-thunk sequence, including each thunk's
+ABI/ownership and every owned local hook's canonical ABI and raw symbol. Thus
+neither emitter can rediscover a table or cleanup target outside the
 fingerprinted view. Thin-link still reruns globally on every build. Its fresh
 import/export frontier identifies every edge by source unit plus source
 `PartitionKey`; each imported digest carries that same pair. This prevents two

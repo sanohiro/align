@@ -119,6 +119,8 @@ executable
   per MIR function, followed by the same fresh global thin-link and cached import-sensitive
   backends. Non-root functions use unit-qualified hidden composition symbols, so duplicate
   consumer-side monomorphs remain distinct rather than becoming conflicting prevailing definitions.
+  A sealed shared view fingerprints each unit's complete codegen tables once, then every function
+  hash combines that fingerprint with its selected body and peer ABI/symbol declarations.
   This does not change the current flag-off, PGO, frontend-cache, `emit-llvm`, or `explain-opt`
   pipeline. The exact boundary is `21-build-perf-plan.md` item 6.
 - Watch builds route every consumed source, import, PGO profile, file-backed static input, and
