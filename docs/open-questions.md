@@ -2993,7 +2993,8 @@ linkage only for composition; true `{main} ∪ --export ∪ pub` remains the pre
 backend cache identity gains a nominal partition record, while a structural partition digest omits
 unrelated local bodies and includes peer ABI declarations plus complete shared codegen tables. A
 fresh global thin-link still determines the exact import-sensitive backend invalidation frontier.
-Ordinary builds, PGO, size/dev profiles, and diagnostic lenses remain unit-granular. The exact
+Ordinary flag-off builds, PGO, `dev`/`small`/`tiny` profiles, and diagnostic lenses remain
+unit-granular; accepted `size --thin-lto` follows the same partition path as `build`/`run`. The exact
 ledger, validation order, cache wire change, resource bounds, and implementation matrix are
 `impl/21-build-perf-plan.md` item 6; no language, interface, MIR-semantic, package, or runtime ABI
 decision changes.
