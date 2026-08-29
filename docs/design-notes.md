@@ -1124,7 +1124,10 @@ client pool to which an exactly completed connection may return. Making the stre
 inferred shared borrow of its client expresses that relationship without a hidden reference-counted
 pool or visible lifetime syntax. Other shared client requests remain legal; moving or dropping the
 pool before the stream does not. Drop before exact completion closes immediately and never drains in
-the background, so both side effects and latency stay visible.
+the background, so both side effects and latency stay visible. Builtin `Option`/`Result` already have
+active-tag Move/Drop and provenance machinery, so they are the only aggregate carriers admitted for
+the dependent handle. Rejecting user aggregates, collection/box elements, and captures keeps the
+client dependency from becoming an unchecked reachable-field property.
 
 Raw receive follows the settled I/O rule: a read fills a caller-owned fixed-capacity `buffer`.
 De-chunking is protocol mechanism and stays inside `std.http`; body allocation is policy and stays at
@@ -1137,8 +1140,12 @@ stream can continue indefinitely only by returning bounded progress to its calle
 
 SSE is a consuming type transition rather than a boolean mode. After `sse()`, raw reads are absent
 from the type, so framing bytes and event state cannot be interleaved accidentally. `next` also fills
-caller storage and returns Copy views into its fresh generation; it does not allocate one owned
-string per token. WHATWG decoding and dispatch are mechanism. Redirects, media-type/status policy,
+caller storage and returns three string views into its fresh generation plus one inline Copy retry
+value; it does not allocate one owned string per token. ID/retry changes are block-transactional:
+control-only blocks commit at their blank line, while a data-bearing block commits only with event
+publication. Rolling back the current block on failure preserves an earlier control commit without
+advancing the reconnect cursor past an event the caller never received. WHATWG decoding and dispatch
+are mechanism. Redirects, media-type/status policy,
 reconnect timing, sleep, and `Last-Event-ID` request construction remain caller policy, because an
 automatic `EventSource` loop would hide network work and control flow; explicit stream accessors
 still expose the latest id/retry state when a control-only block precedes EOF. The same explicit-bound

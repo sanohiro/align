@@ -215,12 +215,18 @@ client pool; Drop before completion closes without draining. A selected positive
 `max_response_body_bytes` still caps cumulative decoded bytes, while an unset stream has no total
 cap because it never materializes the whole body. Each `read`/`next` instead has a replenished
 262,144-byte chunk-framing work allowance, preserving indefinite streams without allowing a single
-operation to consume unbounded framing.
+operation to consume unbounded framing. The stream may travel bare or through finite builtin
+`Option`/`Result` nesting with its client dependency; it is rejected below user aggregates,
+collections, boxes, captures, and parallel carriers. Network-facing construction/read/next are
+Impure, while the ownership-only transition and retained-state getters are Pure.
 
 A consuming `sse()` transition yields `http_sse_stream`, so raw and event reads cannot mix after the
 choice. `next(mut buffer)` performs WHATWG UTF-8/BOM/line/field/dispatch interpretation and returns
-an `Option<http_sse_event>` whose event type, joined data, persistent last event ID, and retry value
-view the caller buffer's fresh generation. It deliberately adds no browser `EventSource` policy:
+an `Option<http_sse_event>` whose three strings view the caller buffer's fresh generation and whose
+retry value is inline Copy data. Control-only ID/retry candidates commit at their blank line;
+data-bearing candidates commit only with successful event publication. A terminal failure or
+incomplete EOF rolls back the pending block while preserving earlier commits, so reconnect state
+cannot skip an event that was not delivered. It deliberately adds no browser `EventSource` policy:
 status/media-type validation, redirect, reconnect, delay, and `Last-Event-ID` request construction
 remain explicit; stream accessors expose control-only id/retry updates even when no event is
 dispatched. The caller buffer is the event allocation bound; exact fit succeeds and excess is

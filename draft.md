@@ -3210,7 +3210,11 @@ caller-owned fixed-capacity buffer and expose no HTTP chunk/trailer framing. A p
 stream has no cumulative total cap because it never materializes the whole body. The per-operation
 timeout snapshot remains active on every later receive. Each body-facing call gets a fresh 262,144
 byte chunk-framing work allowance, so indefinite chunked streams do not inherit the whole-message
-framing counter while one call remains bounded.
+framing counter while one call remains bounded. A stream may be bare or nested in builtin
+`Option`/`Result`; it carries its creating-client dependency through those active payloads. It is
+rejected recursively from user structs/sums, arrays/slices/boxes, closure/task captures, and
+parallel elements/results. `request_stream`, `read`, and `next` are Impure; the ownership-only
+`sse` transition and head/state getters are Pure.
 
 `sse()` consumes the raw reader at its current logical body position and prevents later raw/SSE
 mixing. `next` applies the WHATWG UTF-8, BOM, CRLF/LF/CR, comment, field, blank-line dispatch, data
@@ -3218,8 +3222,12 @@ join, persistent last-event-id, and retry rules. It interprets only the event st
 media-type validation, redirects, reconnects, waits, and `Last-Event-ID` request construction remain
 explicit caller policy. Stream accessors expose the latest id/retry state even when a control-only
 block precedes completion. Event bytes are written into the supplied buffer in
-`event || data || last_event_id` order; record fields are zero-copy views tied to that fresh buffer
-generation. Exact capacity succeeds. A cumulative body-cap or event-output-cap excess is the stable
+`event || data || last_event_id` order; the three `str` fields are zero-copy views tied to that fresh
+buffer generation, while `retry_ms` is inline Copy data. Exact capacity succeeds. ID/retry changes
+in a control-only block commit at its blank line. A data-bearing block commits them atomically with
+successful event publication; an output/body/framing/work/timeout/transport failure or incomplete
+EOF rolls back only the pending block, preserving earlier control-only commits so reconnect state
+cannot skip an undelivered event. A cumulative body-cap or event-output-cap excess is the stable
 explicit HTTP receive-bound result `Error.Code(-1)`, with no partial publication and a closed
 connection. Independently, one `next` scans at most the output capacity plus 262,144 de-framed
 source bytes; comments, unknown fields, invalid retry lines, and control-only blocks consume that
