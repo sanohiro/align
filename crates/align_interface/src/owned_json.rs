@@ -455,6 +455,13 @@ fn encode_owned_json_graph_descriptor_at(
     root: usize,
 ) -> Option<Vec<u8>> {
     let graph = build_graph(structs, root).ok()??;
+    encode_owned_json_graph_descriptor_from_graph(structs, &graph)
+}
+
+fn encode_owned_json_graph_descriptor_from_graph(
+    structs: &[IStructDef],
+    graph: &Graph,
+) -> Option<Vec<u8>> {
     let names = structs
         .iter()
         .enumerate()
@@ -474,7 +481,7 @@ fn encode_owned_json_graph_descriptor_at(
         for (index, (name, ty)) in definition.fields.iter().enumerate() {
             bytes.extend_from_slice(&u32::try_from(name.len()).ok()?.to_le_bytes());
             bytes.extend_from_slice(name.as_bytes());
-            encode_node(&mut bytes, &parse_node(ty, &names).ok()?, &graph)?;
+            encode_node(&mut bytes, &parse_node(ty, &names).ok()?, graph)?;
             bytes.extend_from_slice(&graph.offsets[id].get(index)?.to_le_bytes());
         }
     }
@@ -515,11 +522,12 @@ pub(crate) fn entries_for_structs(
     let mut entries = Vec::new();
     let reaching_string = records_reaching_string(structs);
     for (root, definition) in structs.iter().enumerate() {
-        let Ok(Some(_)) = build_graph_with_reachability(structs, root, Some(&reaching_string))
+        let Ok(Some(graph)) =
+            build_graph_with_reachability(structs, root, Some(&reaching_string))
         else {
             continue;
         };
-        let descriptor = encode_owned_json_graph_descriptor(structs, &definition.name)?;
+        let descriptor = encode_owned_json_graph_descriptor_from_graph(structs, &graph)?;
         entries.push(OwnedJsonGraphInterfaceEntry {
             type_name: definition.name.clone(),
             envelope: encode_owned_json_graph_envelope(target, &descriptor)?,
@@ -537,11 +545,12 @@ pub(crate) fn entries_for_resolved_structs(
     let mut entries = Vec::new();
     let reaching_string = records_reaching_string(structs);
     for (type_name, root) in roots {
-        let Ok(Some(_)) = build_graph_with_reachability(structs, *root, Some(&reaching_string))
+        let Ok(Some(graph)) =
+            build_graph_with_reachability(structs, *root, Some(&reaching_string))
         else {
             continue;
         };
-        let descriptor = encode_owned_json_graph_descriptor_at(structs, *root)?;
+        let descriptor = encode_owned_json_graph_descriptor_from_graph(structs, &graph)?;
         entries.push(OwnedJsonGraphInterfaceEntry {
             type_name: type_name.clone(),
             envelope: encode_owned_json_graph_envelope(target, &descriptor)?,
@@ -1111,7 +1120,7 @@ mod tests {
 
     #[test]
     fn shared_string_reachability_matches_individual_root_selection() {
-        fn outcome(result: Result<Option<Graph>, ()>) -> i8 {
+        fn outcome(result: &Result<Option<Graph>, ()>) -> i8 {
             match result {
                 Ok(Some(_)) => 1,
                 Ok(None) => 0,
@@ -1131,16 +1140,23 @@ mod tests {
         let reaching = records_reaching_string(&structs);
 
         for root in 0..structs.len() {
+            let cached =
+                build_graph_with_reachability(&structs, root, Some(&reaching));
+            let individual = build_graph(&structs, root);
             assert_eq!(
-                outcome(build_graph_with_reachability(
-                    &structs,
-                    root,
-                    Some(&reaching),
-                )),
-                outcome(build_graph(&structs, root)),
+                outcome(&cached),
+                outcome(&individual),
                 "cached string reachability changed root {}",
                 structs[root].name
             );
+            if let Ok(Some(graph)) = cached {
+                assert_eq!(
+                    encode_owned_json_graph_descriptor_from_graph(&structs, &graph),
+                    encode_owned_json_graph_descriptor_at(&structs, root),
+                    "cached graph changed descriptor bytes for {}",
+                    structs[root].name
+                );
+            }
         }
     }
 
