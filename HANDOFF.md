@@ -221,19 +221,20 @@ nightly full-suite workflow, which builds once, runs every compiled test binary
 concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed
 failures against `scripts/known-failures.txt` in both directions. That manifest —
 not this file — is the live baseline: a new failure is named, and a line whose
-test starts passing is red until the fixing change deletes it. The 2026-08-13
-baseline (#782, run 31669771705) is now burned down to 0 strict and 0
-environment-dependent entries, and running
+test starts passing is red until the fixing change deletes it. The 2026-08-29
+four-core refresh completed all 216 binaries inside the 30-minute job budget
+and exposed 13 strict failures. The projected-storage lifetime consumer closure
+burned down 11 as one root-cause class; the live manifest now retains the two
+unrelated bounded-JSON and PGO-diagnostic rows. Running
 `scripts/run-suite-binaries.sh` with no arguments reproduces the same judgement
-locally. The job budget is 30 minutes and exceeding it is the signal, not
-something to raise.
+locally. Exceeding the budget is the signal, not something to raise.
 
 The nightly's own findings are closed: the Gate-3 rejected-operand sentinel
 class (#745), the open-world callback rule that had broken `apps/web` since #672
 and the silent-empty-MIR break it hid (#742), the validator's private copy of
 the mangling scheme (#744), and fixed struct-array slicing for the router
-(#743). The manifest is empty; any new red must be triaged before an entry is
-added. The retired environment-dependent row was the Request 6 implementation-time
+(#743). Any new red must be triaged before an entry is added. The retired
+environment-dependent row was the Request 6 implementation-time
 cross-compiler probe: `scripts/compare-json-scan-identity.sh` now replays its
 fixed `576e5730`/`aa5bb7d` evidence from pinned historical sources, while the
 current test graph no longer compiles that one-time owner against later interface
