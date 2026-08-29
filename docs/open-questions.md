@@ -2985,6 +2985,19 @@ codegen-key field was removed outright rather than populated. The genuinely-open
 stay findable as a slim "Separate compilation / ThinLTO — remaining deferrals" entry in the Open
 section, alongside the parallel/pipeline/cache companion-audit records.
 
+**Function-partition refinement — design SETTLED 2026-08-29, implementation pending.**
+Build-performance item 6 uses no second optimizer or visibility model. Under the existing explicit
+`--thin-lto` selector, the thin-link input becomes one support partition for producer-owned resource
+Drop thunks plus one partition per MIR function. Synthetic private boundaries use hidden external
+linkage only for composition; true `{main} ∪ --export ∪ pub` remains the preserve set. Prelink and
+backend cache identity gains a nominal partition record, while a structural partition digest omits
+unrelated local bodies and includes peer ABI declarations plus complete shared codegen tables. A
+fresh global thin-link still determines the exact import-sensitive backend invalidation frontier.
+Ordinary builds, PGO, size/dev profiles, and diagnostic lenses remain unit-granular. The exact
+ledger, validation order, cache wire change, resource bounds, and implementation matrix are
+`impl/21-build-perf-plan.md` item 6; no language, interface, MIR-semantic, package, or runtime ABI
+decision changes.
+
 ### `sort_by_key` key effects and evaluation count — SETTLED 2026-07-17
 
 `sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure and is evaluated

@@ -24,7 +24,7 @@ Order is priority.
 | 3a | Shared recursive-Drop codegen | Implemented for align-llm Request 19 — one private pointer-based destructor per Move struct reached as a Drop-site root replaces cloned recursive cleanup CFGs; merge and consumer lane restoration remain |
 | 4 | Prebuilt optimized cache distribution | Shipped as #893 — exact native releases carry an adjacent immutable cache warmed from 19 first-party `pkg` modules plus one generated entry unit (20 total); compiler-provided `core`/`std` imports have no cacheable source unit |
 | 5 | Foreground watch builds | Implemented — `alignc build FILE --watch` keeps one foreground compiler resident, observes the exact files consumed by ordinary and ThinLTO builds, revalidates their semantic/topology state, captures child output, and atomically preserves the last-good executable without a daemon or socket |
-| 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
+| 6 | Function-level incremental compilation | Design ledger below; implementation pending |
 
 ## Background
 
@@ -1742,6 +1742,135 @@ residency consumer. Implementation updates this section's status,
 `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, and
 `docs/open-questions.md` do not change. Function-level invalidation remains
 item 6 and is not smuggled into this boundary.
+
+## Item 6: function-level incremental compilation
+
+### Scope and settled boundary
+
+This item refines the existing explicit `--thin-lto` path from one LLVM module
+per source unit to one LLVM module per MIR function. It does **not** replace the
+ordinary per-unit object path. The first implementation therefore inherits the
+existing ThinLTO admission boundary exactly: only `build`/`run`/`size` under
+`release` or `fast`, with instrument-PGO still rejected in combination with
+`--thin-lto`. `dev`, `small`, `tiny`, `emit-obj`, `emit-llvm`, `explain-opt`,
+ordinary builds, and PGO builds retain their current unit-granular codegen and
+artifacts. No new CLI flag, environment variable, daemon, or ambient input is
+introduced.
+
+The granularity is a backend cache partition, not a new language visibility or
+ABI boundary. A source-private function remains source-private. Its shard uses
+hidden external linkage only while ThinLTO and the native linker compose the
+partitioned unit; the final executable must not gain a dynamic export or a
+second source visibility class. ThinLTO remains the one mechanism that restores
+cross-partition inlining and whole-program dead-code elimination, so output is
+fully optimized rather than a collection of independently optimized functions.
+
+The previous `--thin-lto` `N=1` rule narrows accordingly. One source unit that
+forms exactly one function partition and no support partition still takes the
+ordinary object path and stays byte-identical. A one-file program with two or
+more partitions now has a real ThinLTO boundary and uses it. This is the only
+intentional change to the shipped `N=1` contract.
+
+### Public-contract ledger
+
+| Surface | Exact contract | Owner and acceptance |
+| --- | --- | --- |
+| CLI selection and defaults | Existing `--thin-lto` selects function partitions for `build`/`run`/`size`; no new flag or default changes. The existing `release`/`fast` restriction, PGO mutual exclusion, target/profile/runtime-LTO inputs, `-j`, cache root, diagnostics, and exit codes remain authoritative. Without `--thin-lto`, every command and byte-identity gate stays on the current path. | `align_driver` CLI owners compare flag-off objects/executables before and after, and exercise every accepted/rejected profile, verb, PGO, cache, and runtime-LTO state. |
+| Partition record | The driver/codegen seam is `ThinPartition<'a> { unit: &'a str, kind: ThinPartitionKind<'a>, mir: &'a align_mir::Program, impl_hash: Hash128, preserve_symbols: Vec<String> }`, where `ThinPartitionKind<'a> = Support | Function(&'a ProgramCall)`. The sole constructor is `function_partitions(units: &[PerUnitArtifact], exports: &[String]) -> Result<Vec<ThinPartition<'_>>, String>`. Records borrow the validated unit MIR for the build attempt; they do not own or persist MIR. `preserve_symbols` is raw LLVM symbol identity, sorted and deduplicated. | Structural owners reject duplicate/missing function identities and prove stable ordering and hash identity without cloning the complete MIR once per function. Every `Err` is a static-prefix internal-compiler diagnostic plus lowercase length-delimited offending identity; no OS error text enters formation. |
+| Build entry | The additive driver entry is `build_function_thin_lto(units: &[PerUnitArtifact], cache: &CacheContext, target: &BuildTarget, profile: Profile, exports: &[String], rt_lto: bool, staging: &Path, jobs: usize) -> Result<FunctionThinLtoBuild, String>`. `FunctionThinLtoBuild { outcomes: Vec<CacheOutcome>, objects: Vec<PathBuf>, prelink_bc: Vec<PathBuf> }` owns no stage; every returned path names the caller-owned staging directory and is invalid after that stage drops. Object cardinality and controlled names are discovered from MIR rather than accepted from the caller. | Library owners cover zero, one, and many source units/functions, disabled and enabled caches, `jobs == 0` normalization to one, deterministic error selection, and stage Drop. Existing `build_thin_lto` remains available for unit-granular tests and non-CLI callers until the hard cutover PR updates them coherently; no dual CLI path ships. |
+| Function partition | Exactly one stored `Program::fns` body is defined. Every other local MIR function is emitted as an exact Align-ABI declaration. The selected definition uses its current public/main/export linkage when it is a real root; otherwise it uses hidden external shard linkage. The partition owns every private compiler helper, constant, relocation record, main wrapper, Drop helper, callback trampoline, and parallel/task thunk reached while lowering that selected body. It sees the complete canonical type tables, extern declarations, imported public declarations, callback-effect table, and resource declarations from the unit. | `align_codegen_llvm` partition-module owners compare declaration ABI against whole-unit codegen for every parameter/return/cleanup mode and cover direct calls, function addresses, closures, indirect calls, static relocations, callbacks, parallel kernels, Drop, main, malformed MIR, and generic monomorphs. |
+| Support partition | A source unit gets one support partition iff it owns at least one resource Drop thunk. It defines each such hidden external `void(ptr)` thunk once, declares its local Drop hook and imported resource thunks, and defines no Align function body, main wrapper, function-local helper, descriptor, or static record. Function partitions only declare those resource thunks. Runtime-LTO bitcode is not merged into support. | Resource owners prove one prevailing thunk definition, consumer-only declarations, correct hook binding, no duplicate symbol, and exactly-once Drop for ordinary, generic, imported, returned, and early-exit resources. A unit without an owned thunk gets no empty support object. |
+| Runtime LTO | `--rt-lto` keeps its current guarded definition/attribute/fallback contract. The baked bitcode is merged independently into each function partition that needs module construction, before that partition's prelink pipeline; definitions remain internal to that partition. This deliberately avoids a new cross-partition runtime ABI or a duplicate external definition against `libalign_runtime.a`. ThinLTO may inline/remove each local copy. | Existing runtime-LTO IR/executable owners plus a multi-function string-kernel owner cover guarded-attribute XOR, parse/layout fallback, no duplicate externals, deterministic bytes, and final code-size/runtime bounds below. |
+| Optimization and invalidation | Every build writes summary-bearing prelink bitcode for misses, recomputes one fresh global thin-link over all function/support partitions, and runs backend optimization only for backend misses. A body-only edit misses that function's prelink partition. An unchanged caller backend misses only when the fresh import/export decision or an imported source partition digest changes. A peer signature, canonical type/resource/function-type table, callback-effect fact, function add/remove, export root, target/profile/LLVM/compiler/runtime-LTO input, or dependency interface change invalidates every partition whose exact module input changes. No mtime participates. | The invalidation matrix below asserts structured outcomes and actual artifacts, never elapsed time. Exact revert re-hits the old CAS entries. |
+| Cross-unit policy | Without `--thin-lto`, cross-unit calls remain opaque exactly as today. With `--thin-lto`, the one combined index contains every partition from every source unit, so the existing cross-unit import and promotion policy also applies between function partitions. True `pub`, `main`, and explicit export roots form the preserve set; synthetic shard linkage does not. | Existing ThinLTO inlining, aggregate ABI, preserve-set, and private-body invalidation owners are rerun over partitioned units. A private synthetic boundary must not appear in the dynamic symbol table. |
+| Persistent identity | `PrelinkKey` and `BackendKey` gain `partition: PartitionKey` immediately after `unit`, where the canonical wire form is one `u8` tag (`0 = WholeUnit`, `1 = Support`, `2 = Function`) followed only for tag 2 by one `u32` little-endian byte length and those UTF-8 logical `ProgramCall` bytes. Key format and manifest format both bump from 4 to 5. Full and slot digests include the tag and payload; the slot is `(phase, version, compiler_build_id, unit, partition)`. Unknown tags, invalid UTF-8, truncation, length greater than the remaining bounded manifest bytes, or trailing bytes are clean misses; the reader preallocates at most the existing 1,024-element cap and never from an untrusted byte length. | Cache codec golden vectors fix every tag, field order, width, malformed-input rejection, old-v4 miss, exact-revert hit, digest verification, and primary/packaged-cache behavior. CAS remains content-addressed and schema version 1. |
+| LLVM module identity | The stable C-string identifier is the ASCII record `align-shard-v1$<unit-byte-length>$<lowercase-unit-hex>$s` for support or the same prefix plus `$f$<function-byte-length>$<lowercase-function-hex>` for a function. Decimal lengths have no leading zero except zero; hex is two lowercase digits per byte. Identity is injective and contains no ambient path, temporary path, hash collision, or embedded NUL. The human cache label is `<unit>::support` or `<unit>::<logical-function>` and is display-only. | Golden vectors independently check semantic-to-bytes and bytes-to-semantic identity, prefix/length ambiguity, non-ASCII path bytes admitted by the existing UTF-8 unit surface, embedded NUL refusal before cache or LLVM I/O, and stable IDs across staging roots and processes. |
+| Cache observability | `--cache-stats` retains the current per-record `prelink` then `backend` lines and per-phase summaries, now ordered by import-DAG unit, support first, then function logical-name bytes. Counts are partition counts. Existing miss reasons retain their meanings: selected/global/peer input change is `own code changed`/`implementation changed`; an import frontier change is `cross-unit imports changed`; a new partition is `no prior entry`. Cache disabled still prints one disabled line. | CLI owners assert the complete cold/edit/revert/hot transcripts, including a body edit whose unchanged sibling prelinks hit and whose import-dependent backends alone miss. Watch framing reuses these exact lines without a second renderer. |
+| Link input and publication | Partition objects are staged under controlled ordinal names and reach the existing linker/publication owner in deterministic partition order. To avoid `ARG_MAX` becoming a valid-program limit, the linker consumes one private response file containing only those staged object paths, encoded with the compiler-driver response-file quoting accepted by the selected system compiler/lld route. The response file is closed before spawn, never cached or published, and drops with the object stage on success, error, signal, or unwind. Final executable isolation and atomic publication are unchanged. | Linux lld/system and macOS system-linker owners cover spaces, quotes, backslashes, non-ASCII staging roots, 0/1/many objects, cyclic calls, response-file injection-shaped paths, tool failure, and byte-identical final links. |
+| Allocation and side effects | Partition inventory allocates `O(functions + declarations)` bounded records and borrowed indexes. LLVM contexts/modules, prelink files, cache materializations, objects, and the response file remain explicit per-partition/build allocations. No source/artifact read, cache write, LLVM call, or linker spawn occurs until all unit inventories and stable identities validate. Cache writes remain best-effort; compiler output and link/publication failures remain hard errors. | Allocation/failpoint owners cover each construction, lookup, publish, thin-link, backend, response-write, spawn, link, and Drop barrier with no partial public artifact. |
+| Compatibility and documents | Language syntax, type/ownership/error semantics, MIR semantics, interface/package/runtime ABI, ordinary cache entries, frontend-cache format, generated-program behavior, and `draft.md`/`docs/language-spec.md` do not change. The implementation updates this section, `docs/impl/01-pipeline.md`, `docs/impl/10-cache-first-optimization.md`, `docs/impl/16-test-policy.md`, the ThinLTO settlement/deferral text in `docs/open-questions.md`, and the shipped status in `HANDOFF.md`. `docs/impl/07-roadmap.md` remains the historical M15/ThinLTO unit-boundary record and receives only an explicit item-6 supersession note, never rewritten history. | One consistency owner checks the current CLI/help, plan, cache docs, test-policy owner map, open-question settlement, roadmap supersession note, and HANDOFF status agree. No language mirror is applicable. |
+
+`PartitionKey` is nominal compiler artifact identity, not a structural hash.
+`impl_hash` is structural: it covers the selected full `Function`, every local
+peer ABI declaration (logical name, parameter types and modes, return type,
+borrow/region/cleanup ABI, and true exportability), the complete canonical
+struct/enum/resource/tagged/function-type/tuple tables, extern and imported
+declarations, callback-effect facts, and the partition role. It excludes other
+local function bodies, source spans in normal unlocated MIR, `link_libs`, the
+temporary/staging path, cache root, job count, and wall clock. The codegen
+partition view and its structural fingerprint share one record constructor;
+there is no separately maintained list of fields that can drift.
+
+### Validation and error precedence
+
+All inputs are compiler-produced checked MIR, so a partition-formation failure
+is an internal compiler error, not a new source diagnostic. The deterministic
+pre-side-effect order is:
+
+1. validate the complete unit list and existing per-unit MIR invariants;
+2. collect raw local function identities and reject duplicates, a missing
+   selected body, more than one C `main`, or a body/declaration ABI mismatch;
+3. classify locally owned versus imported resource thunks and form the support
+   inventory;
+4. form every peer ABI record, preserve set, partition structural hash, stable
+   module identity, and controlled ordinal output name, rejecting embedded NUL
+   or representation overflow;
+5. only after every unit succeeds, create the private stage and perform cache
+   lookup/materialization;
+6. produce prelink misses, recompute thin-link, produce backend misses, write
+   the response file, link, and atomically publish in that order.
+
+Multiple invalid units report the first import-DAG unit; within one unit,
+support precedes functions and function logical-name bytes order the error.
+After side effects begin, the existing phase precedence stays authoritative:
+lowest partition-order producer error, then thin-link, then lowest backend
+partition, then response-file/link/publication error. Cache corruption is
+evicted and rebuilt, never selected over a real producer failure. A cache write
+failure remains a note and cannot replace a successful artifact.
+
+### Invalidation matrix
+
+| Edit/input | Prelink result | Backend result |
+| --- | --- | --- |
+| Exact repeat | every partition hit | every partition hit after a fresh thin-link |
+| Private body-only edit with unchanged ABI/effect/table facts | edited function miss; support and sibling functions hit | edited function misses; only callers/importers whose fresh edge or imported source digest changes also miss |
+| Exact revert | prior edited partition CAS hit; siblings remain hits | prior backend frontier CAS entries re-hit |
+| Private function signature change | every partition in that source unit whose peer declaration changes misses; consumers remain governed by interface visibility | fresh decisions; affected callers and changed definitions miss |
+| Public signature/effect/generic-template change | producer partitions and dependency-interface-keyed consumer partitions miss | fresh decisions across the changed interface frontier |
+| Function add/remove or canonical type/resource table change | every exact shard module input changed by the inventory/table misses; support presence may change | fresh decisions; removed entries become unreachable CAS blobs |
+| Runtime-LTO toggle/bitcode, target, profile, LLVM build, or compiler build change | every affected partition misses in a disjoint key | every affected partition misses |
+| `-j`, cache root, staging path, response-file path, or source mtime only | no key change | no key change; output remains byte-identical |
+| Corrupt/truncated/wrong-digest manifest or blob | only that partition cleanly misses after eviction | only that partition cleanly misses after eviction |
+
+### Implementation closure matrix
+
+| Axis | Required closure | Owner |
+| --- | --- | --- |
+| Formation and validation | Every MIR function appears in exactly one function partition; every owned resource thunk appears in exactly one support partition; imported/resource/runtime declarations have no accidental definition. Complete type and callable preflight still runs before lowering. Malformed ids, tables, descriptors, and duplicate names diagnose instead of panic. | partition inventory, codegen malformed-MIR, resource, callback, and ABI owners |
+| Construction and move-in/out | Parameter modes, cleanup pointers, slot alignment, aggregate return ABI, moves, source nulling, and replacement retain the whole-unit lowering. Peer declarations are mechanically derived from the same ABI producer as definitions. | parameter/return ABI parity sweep; ownership and replacement suites |
+| Direct/control paths | Direct and recursive calls, `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, breaks, early return, and malformed unreachable paths resolve across partitions and retain cleanup order. Mutual recursion may remain as hidden cross-object calls when not imported. | control-flow/cleanup executable corpus plus symbol/IR checks |
+| Address-taken/generated paths | `FnAddr`, closure/lifted targets, indirect/raw calls, tasks, parallel kernels, SQLite callbacks, static function relocations, and generated descriptors bind the exact peer definition even when ThinLTO declines import. Private generated helpers stay in their consuming function partition. | function-value, task, parallel, DB callback, static relocation, and descriptor owners |
+| Types, generics, and interfaces | Complete reachable canonical type tables accompany each partition; local generic monomorphs get distinct function partitions; consumer-side monomorphs stay in the consumer unit; public interfaces and their hashes do not encode partitioning. | canonical graph, generic cross-unit, interface byte-identity, and deep-type owners |
+| Drop, resources, and runtime | Function-local shared Drop helpers preserve exactly-once child order; support-owned resource thunks bind local hooks and imported declarations correctly; runtime-LTO remains internal per function partition; ordinary runtime archive capability selection is unchanged. | recursive-Drop matrix, resource lifecycle, runtime ABI, rt-lto, failpoint, and allocation-count owners |
+| Ordinary/PGO/diagnostic lanes | Flag-off, PGO, size/dev/tiny/small, `emit-obj`, `emit-llvm`, and `explain-opt` never call partition formation and retain current output. `--thin-lto` validation remains before any cache/LLVM work. | negative route/source-level guards and before/after byte fixtures |
+| Cache and deterministic build | Every key/manifest field has one codec; exact repeat/revert, corruption, packaged fallback, cache-off/on, independent roots, `-j1`/parallel, and stable module ids produce correct byte-identical artifacts. Fresh thin-link is never cached or skipped. | cache codec/golden, invalidation, ThinLTO SV, and subprocess owners |
+| Link and publication | All partition objects appear once in deterministic response order; hidden shard boundaries link on ELF and Mach-O without becoming dynamic exports; link errors, signals, and unwind remove private files and preserve the last good/watch publication contract. | linker response, symbol hygiene, build/run/size, watch, and publication owners |
+| Resource/performance promise | On the fixed `pkg.db` edit corpus, a private leaf-body edit must reduce median codegen-plus-thin-link wall time to at most 75% of the pre-item-6 unit-ThinLTO baseline over seven alternating runs, with structured counts proving the intended hit frontier. Cold `--thin-lto` wall time and peak RSS must remain at most 125% of baseline. Final executable size and the existing runtime benchmark corpus must remain within 5% unless a separately reviewed optimization explains and owns an improvement. Cache-off/on and cold/hot executables remain byte-identical within the candidate. | local `bench/function_incremental` pathological/edit/revert/cold controls, existing ThinLTO compile-time gate, runtime corpus, `/usr/bin/time` RSS, and size owner |
+
+The implementation is one capability PR even if it exceeds roughly 1,000
+hand-written lines. Partition formation, synthetic linkage, summary identity,
+cache keys, fresh thin-link decisions, object ordering, and linker input are one
+closed correctness chain: a producer-only split would expose no useful stable
+consumer, while a cache-first split could serve artifacts whose linkage owner
+does not exist yet. Keeping the chain together avoids two temporary persisted
+formats and duplicated ABI/symbol proof. The author-side matrix-to-diff pass
+must point every applicable row above to code and an owner before review.
+
+The deliberate first boundary is `--thin-lto`, not ordinary builds. Extending
+the same partition manifest to the default unit-cache/frontend-rehydration path
+is a later item-6 slice only after the explicit path meets the cold, edit, RSS,
+size, and runtime bounds. It requires its own ledger amendment because a hot
+ordinary build currently obtains its object key without materializing MIR.
 
 ## Item 2a: required DB owner build-once/run-many
 

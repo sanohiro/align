@@ -366,7 +366,9 @@ facts must live in this repository.
   resident, observes and revalidates exact compiler-consumed inputs, uses native
   events plus a semantic audit, captures tool output, and preserves the last-good
   executable through bounded atomic publication. Function-level incrementality
-  remains item 6 and requires its own ledger.
+  remains item 6; its `--thin-lto` function-partition design ledger and closure
+  matrix are now settled in `docs/impl/21-build-perf-plan.md`, with implementation
+  pending.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

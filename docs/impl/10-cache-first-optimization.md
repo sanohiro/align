@@ -884,6 +884,34 @@ this fallback, the v4 codegen identity, rejection-marker authorization, bounded
 immutable reads, and native release-layout verification; the complete closure
 matrix remains in `docs/impl/21-build-perf-plan.md` item 4.
 
+### 6.9 SETTLED DESIGN 2026-08-29 — function partitions under `--thin-lto`
+
+Build-performance item 6 refines only the existing explicit `--thin-lto`
+path. Its public-contract ledger and implementation closure matrix are
+authoritative in `docs/impl/21-build-perf-plan.md`; implementation is pending.
+One source unit becomes one borrowed support partition when it owns resource
+Drop thunks plus one borrowed partition per MIR function. The ordinary object
+cache, persistent frontend cache, PGO path, diagnostic lenses, and flag-off
+artifacts remain unit-granular and unchanged.
+
+The two existing ThinLTO cache phases remain the mechanism. `PrelinkKey` and
+`BackendKey` gain a nominal `PartitionKey` (`WholeUnit`, `Support`, or
+`Function(ProgramCall)`), and their full/slot digests distinguish partitions.
+The structural prelink input excludes unrelated local bodies but includes the
+selected body, every local peer ABI declaration, complete canonical type and
+resource tables, extern/import declarations, callback-effect facts, and the
+partition role. Thin-link still reruns globally on every build. Its fresh
+import/export frontier plus imported source-partition digests determines which
+unchanged backends must miss after a callee edit.
+
+Implementation bumps codegen key and manifest formats from v4 to v5 and pins
+the new tag/field order with semantic-to-byte and byte-to-semantic golden
+vectors. CAS schema 1 and content blobs do not change. A body-only edit can
+therefore miss one function prelink while exact repeat/revert reuses the same
+immutable blobs; a peer ABI or shared table change invalidates every partition
+whose exact module input changed. The validation matrix below applies at the
+partition boundary in addition to the existing unit-boundary owners.
+
 ---
 
 ## 7. Cache validation matrix
