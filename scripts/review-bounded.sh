@@ -158,6 +158,26 @@ for prior_log in "$git_dir"/align-review-*.log "$git_dir"/align-review-cycle-*; 
   fi
 done
 
+prior_review_complete=false
+if [[ -n "$prior_review_head" ]]; then
+  # Only the wrapper-owned cycle record proves completion. The review process
+  # can print a verdict and then hang or be killed; its raw output may therefore
+  # end in a plausible marker even though the wrapper never validated the
+  # process exit, clean worktree, marker count, or trailing output.
+  for prior_log in "$git_dir"/align-review-cycle-*; do
+    [[ -f "$prior_log" ]] || continue
+    [[ "$(sed -n 's/^ALIGN_REVIEW_KIND=//p' "$prior_log" | head -1)" == "HOST" ]] || continue
+    candidate_base="$(sed -n 's/^ALIGN_REVIEW_BASE=//p' "$prior_log" | head -1)"
+    candidate_head="$(sed -n 's/^ALIGN_REVIEW_HEAD=//p' "$prior_log" | head -1)"
+    [[ "$candidate_base" == "$base_sha" && "$candidate_head" == "$prior_review_head" ]] || continue
+    candidate_verdict="$(awk 'NF { line = $0 } END { print line }' "$prior_log")"
+    if [[ "$candidate_verdict" =~ ^ALIGN_REVIEW_VERDICT=(CLEAN|FINDINGS)$ ]]; then
+      prior_review_complete=true
+      break
+    fi
+  done
+fi
+
 review_range="${base_sha}...${head_sha}"
 review_scope="FULL"
 if [[ -n "$prior_review_head" ]]; then
@@ -180,6 +200,11 @@ if [[ -n "$prior_review_head" ]]; then
       exit 2
     }
   elif [[ -n "$changed_since" ]]; then
+    [[ "$prior_review_complete" == true ]] || {
+      echo "nearest review ancestor $prior_review_head is incomplete" >&2
+      echo "resume its unfinished scope before narrowing to a changed slice" >&2
+      exit 1
+    }
     changed_since_sha="$(git rev-parse "${changed_since}^{commit}" 2>/dev/null || true)"
     [[ "$changed_since_sha" == "$prior_review_head" ]] || {
       echo "--changed-since must name the nearest reviewed ancestor $prior_review_head" >&2
@@ -363,6 +388,7 @@ if [[ "$marker_count" -ne 1 || ! "$last_nonempty" =~ ^ALIGN_REVIEW_VERDICT=(CLEA
   exit 3
 fi
 verdict="${last_nonempty#ALIGN_REVIEW_VERDICT=}"
+printf 'ALIGN_REVIEW_VERDICT=%s\n' "$verdict" >>"$cycle_record"
 case "$verdict" in
   CLEAN) exit 0 ;;
   FINDINGS) exit 2 ;;

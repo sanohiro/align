@@ -494,6 +494,13 @@ set -e
   exit 1
 }
 
+# The malformed-output fixtures above deliberately overwrite this same-HEAD
+# cycle record. Restore one completed checkpoint before exercising descendant
+# review policy.
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null
+
 # A completed full-diff review on an ancestor blocks another complete review
 # after an ordinary fix. Re-opening is explicit and requires both the owning
 # matrix change and the exact trailer named on the command line.
@@ -520,6 +527,45 @@ changed_slice_args="$tmp_dir/codex-changed-slice-args"
 grep -Fq "git diff $review_head_sha..$descendant_review_head" "$changed_slice_args" || {
   echo "changed-slice review did not bind the nearest reviewed ancestor:" >&2
   cat "$changed_slice_args" >&2
+  exit 1
+}
+
+# A nearer STARTED review is not a completed checkpoint. A stall, kill, or
+# malformed native result leaves the cycle record without a verdict; a later
+# HEAD must resume that unfinished scope rather than skipping over it with a
+# changed-slice review.
+printf '\nincomplete review ancestor\n' >>"$docs_repo/docs/notes.md"
+git -C "$docs_repo" add docs/notes.md
+git -C "$docs_repo" commit -qm 'docs: create incomplete review ancestor'
+incomplete_review_head="$(git -C "$docs_repo" rev-parse HEAD)"
+incomplete_cycle="$(git -C "$docs_repo" rev-parse --absolute-git-dir)/align-review-cycle-$incomplete_review_head"
+{
+  printf 'ALIGN_REVIEW_KIND=HOST\n'
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$incomplete_review_head"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$review_base_sha"
+  printf 'ALIGN_REVIEW_SCOPE=CHANGED_SLICE\n'
+} >"$incomplete_cycle"
+# Raw output is not completion evidence: a process can print this marker and
+# then stall before the wrapper validates its exit and appends to the cycle.
+incomplete_raw="$(dirname "$incomplete_cycle")/align-review-$incomplete_review_head.log"
+{
+  printf 'ALIGN_REVIEW_KIND=HOST\n'
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$incomplete_review_head"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$review_base_sha"
+  printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
+} >"$incomplete_raw"
+printf '\nlater unreviewed change\n' >>"$docs_repo/docs/notes.md"
+git -C "$docs_repo" add docs/notes.md
+git -C "$docs_repo" commit -qm 'docs: advance past incomplete review'
+set +e
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main \
+    --changed-since "$incomplete_review_head" ) >/dev/null 2>&1
+incomplete_slice_status=$?
+set -e
+[[ $incomplete_slice_status -eq 1 ]] || {
+  echo "an incomplete ancestor authorized a changed-slice review" >&2
   exit 1
 }
 mkdir -p "$docs_repo/docs/impl"
