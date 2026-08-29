@@ -208,12 +208,16 @@ fn json_encode_bounded_surface_and_schema_fail_closed() {
     assert!(bounded.contains("unsupported type char"), "{bounded}");
     assert!(bounded.contains("json.encode_bounded"), "{bounded}");
 
-    for (name, field_ty) in [("owned-string", "string"), ("owned-string-array", "array<string>")] {
+    for (name, field_ty) in [
+        ("owned-string", "string"),
+        ("optional-owned-string", "Option<string>"),
+        ("owned-string-array", "array<string>"),
+    ] {
         let ordinary_source = format!(
-            "import core.json\nUnsupported {{ value: {field_ty} }}\nfn reject(value: Unsupported) -> i32 {{\n  json.encode(value)\n  return 0\n}}\nfn main() -> i32 = 0\n"
+            "import core.json\nOwned {{ value: {field_ty} }}\nfn encode(value: Owned) -> i32 {{\n  json.encode(value)\n  return 0\n}}\nfn main() -> i32 = 0\n"
         );
         let bounded_source = format!(
-            "import core.json\nUnsupported {{ value: {field_ty} }}\nfn reject(value: Unsupported) -> i32 {{\n  json.encode_bounded(value, 64)\n  return 0\n}}\nfn main() -> i32 = 0\n"
+            "import core.json\nOwned {{ value: {field_ty} }}\nfn encode(value: Owned) -> i32 {{\n  result := json.encode_bounded(value, 64)\n  return 0\n}}\nfn main() -> i32 = 0\n"
         );
         let ordinary = check_diagnostics(
             &format!("json-encode-{name}-control"),
@@ -223,9 +227,8 @@ fn json_encode_bounded_surface_and_schema_fail_closed() {
             &format!("json-encode-bounded-{name}"),
             &bounded_source,
         );
-        assert!(ordinary.contains("unsupported type"), "{ordinary}");
-        assert!(bounded.contains("unsupported type"), "{bounded}");
-        assert!(bounded.contains("json.encode_bounded"), "{bounded}");
+        assert!(ordinary.is_empty(), "{ordinary}");
+        assert!(bounded.is_empty(), "{bounded}");
     }
 }
 
