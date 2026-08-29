@@ -629,6 +629,7 @@ fn retain_text(borrow record: Record, borrow mut destination: View) { text: str 
 fn first_text(borrow records: array<Record>) -> str = element_text(records[0])\n\
 fn retain_first(borrow records: array<Record>, borrow mut destination: View) { retain_text(records[0], destination) }\n\
 fn retain_first_indirect(borrow records: array<Record>, borrow mut destination: View) { f := retain_text; f(records[0], destination) }\n\
+fn consume_records(records: array<Record>) -> i64 = records.len()\n\
 fn records() -> array<Record> {\n\
   mut builder: array_builder<Record> := array_builder()\n\
   builder.push(Record { value: \"forty-two\".clone() })\n\
@@ -676,6 +677,53 @@ fn records() -> array<Record> {\n\
         if backend_available() {
             assert_eq!(build_and_run(&owner, &source).status.code(), Some(42));
         }
+    }
+
+    let moved_then_consumed = format!(
+        "{prefix}fn main() -> i32 {{ values := records(); view := first_text(values); moved := values; _ := consume_records(moved); return view.len() as i32 }}\n"
+    );
+    let diagnostics = check_diagnostics(
+        "borrowed-index-summary-moved-then-consumed",
+        &moved_then_consumed,
+    );
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'view'"),
+        "terminal consumption must end scalar views completed before an owner transfer:\n{diagnostics}"
+    );
+
+    for (name, body) in [
+        (
+            "moved-then-replaced",
+            "mut values := records(); view := first_text(values); mut moved := values; moved = records(); return view.len() as i32",
+        ),
+        (
+            "moved-then-dropped",
+            "values := records(); view := first_text(values); loop { moved := values; _ := moved.len(); break }; return view.len() as i32",
+        ),
+    ] {
+        let source = format!("{prefix}fn main() -> i32 {{ {body} }}\n");
+        let diagnostics = check_diagnostics(&format!("borrowed-index-summary-{name}"), &source);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'view'"),
+            "{name} must end scalar views completed before the owner transfer:\n{diagnostics}"
+        );
+    }
+
+    let projected_sibling = format!(
+        "{prefix}fn main() -> i32 {{ left := records(); right := records(); pair := (left, right); view: str := pair.1[0].value; _ := consume_records(pair.0); if view.len() == 9 && pair.1.len() == 1 {{ return 42 }}; return 0 }}\n"
+    );
+    assert!(
+        !check_errs("borrowed-index-summary-projected-sibling", &projected_sibling),
+        "terminal consumption of one projected generation must preserve its sibling:\n{}",
+        check_diagnostics("borrowed-index-summary-projected-sibling", &projected_sibling)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-index-summary-projected-sibling", &projected_sibling)
+                .status
+                .code(),
+            Some(42)
+        );
     }
 }
 
