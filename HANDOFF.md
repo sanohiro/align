@@ -224,8 +224,9 @@ not this file — is the live baseline: a new failure is named, and a line whose
 test starts passing is red until the fixing change deletes it. The 2026-08-29
 four-core refresh completed all 216 binaries inside the 30-minute job budget
 and exposed 13 strict failures. The projected-storage lifetime consumer closure
-burned down 11 as one root-cause class; the live manifest now retains the two
-unrelated bounded-JSON and PGO-diagnostic rows. Running
+burned down 11 as one root-cause class, and the direct-owned JSON parity owner
+removed one stale rejection expectation; the live manifest now retains only the
+unrelated PGO-diagnostic row. Running
 `scripts/run-suite-binaries.sh` with no arguments reproduces the same judgement
 locally. Exceeding the budget is the signal, not something to raise.
 

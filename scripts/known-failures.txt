@@ -23,6 +23,6 @@
 #
 # baseline refreshed by the 2026-08-29 four-core run at 9c0cf23f; each original
 # entry reproduced in its owner binary after the detector completed all 216
-# targets. The projected-storage consumer closure removed its eleven rows.
-align_driver::test::m5_json_bounded	json_encode_bounded_surface_and_schema_fail_closed
+# targets. The projected-storage consumer closure removed eleven rows, and the
+# direct-owned JSON parity owner removed the stale bounded-schema row.
 align_driver::test::pgo	fail_loud_profdata_errors
