@@ -909,8 +909,11 @@ The structural prelink input excludes unrelated local bodies but includes the
 selected body, every local peer ABI declaration, complete canonical type and
 resource tables, extern/import declarations, callback-effect facts, and the
 partition role. Thin-link still reruns globally on every build. Its fresh
-import/export frontier plus imported source-partition digests determines which
-unchanged backends must miss after a callee edit.
+import/export frontier identifies every edge by source unit plus source
+`PartitionKey`; each imported digest carries that same pair. This prevents two
+function partitions in one source unit from collapsing into one backend-key
+source. The partition-qualified frontier plus digests determine which unchanged
+backends must miss after a callee edit.
 
 Implementation bumps codegen key and manifest formats from v4 to v5 and pins
 the new tag/field order with semantic-to-byte and byte-to-semantic golden
