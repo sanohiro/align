@@ -2638,7 +2638,8 @@ mutation deepening).
 > **Build-performance item 6 supersession note (design settled 2026-08-29; implementation
 > pending):** this S2 record remains the historical shipped unit-granular boundary. Item 6 will
 > refine the explicit `--thin-lto` input to support/function partitions and will narrow the `N=1`
-> shortcut to programs that form exactly one function partition and no support partition. Until
+> shortcut to exactly one source unit that forms one function partition and no support partition.
+> A multi-unit graph stays on ThinLTO even when type-only units leave one function partition. Until
 > that implementation merges, the shipped per-unit behavior and every gate described here remain
 > current. The authoritative new ledger is `docs/impl/21-build-perf-plan.md` item 6.
 

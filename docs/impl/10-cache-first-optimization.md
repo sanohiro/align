@@ -894,6 +894,14 @@ Drop thunks plus one borrowed partition per MIR function. The ordinary object
 cache, persistent frontend cache, PGO path, diagnostic lenses, and flag-off
 artifacts remain unit-granular and unchanged.
 
+True `main`/export/`pub` roots retain their canonical symbols. Every other
+stored function uses an injective unit-qualified hidden external symbol for
+partition composition. Equal consumer-side generic monomorphs in different
+units therefore remain distinct copies, preserving the shipped internal-linkage
+model without adopting the deferred `linkonce_odr` design. Only one source
+unit with one function and no support partition takes the byte-identical
+`WholeUnit` shortcut; a multi-unit/type-only graph remains partitioned.
+
 The two existing ThinLTO cache phases remain the mechanism. `PrelinkKey` and
 `BackendKey` gain a nominal `PartitionKey` (`WholeUnit`, `Support`, or
 `Function(ProgramCall)`), and their full/slot digests distinguish partitions.

@@ -2989,7 +2989,11 @@ section, alongside the parallel/pipeline/cache companion-audit records.
 Build-performance item 6 uses no second optimizer or visibility model. Under the existing explicit
 `--thin-lto` selector, the thin-link input becomes one support partition for producer-owned resource
 Drop thunks plus one partition per MIR function. Synthetic private boundaries use hidden external
-linkage only for composition; true `{main} ∪ --export ∪ pub` remains the preserve set. Prelink and
+linkage only for composition; true `{main} ∪ --export ∪ pub` remains the preserve set. Every
+non-root stored function has an injective unit-qualified symbol, so equal consumer-side generic
+monomorphs in different units remain distinct copies under the shipped model rather than becoming
+ODR candidates. Only one source unit with one function partition and no support partition takes
+the byte-identical `WholeUnit` shortcut; multi-unit/type-only graphs stay partitioned. Prelink and
 backend cache identity gains a nominal partition record, while a structural partition digest omits
 unrelated local bodies and includes peer ABI declarations plus complete shared codegen tables. A
 fresh global thin-link still determines the exact import-sensitive backend invalidation frontier.
