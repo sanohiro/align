@@ -215,10 +215,15 @@ client pool; Drop before completion closes without draining. A selected positive
 `max_response_body_bytes` still caps cumulative decoded bytes, while an unset stream has no total
 cap because it never materializes the whole body. Each `read`/`next` instead has a replenished
 262,144-byte chunk-framing work allowance, preserving indefinite streams without allowing a single
-operation to consume unbounded framing. The stream may travel bare or through finite builtin
-`Option`/`Result` nesting with its client dependency; it is rejected below user aggregates,
-collections, boxes, captures, and parallel carriers. Network-facing construction/read/next are
-Impure, while the ownership-only transition and retained-state getters are Pure.
+operation to consume unbounded framing. Its complete storage grammar is the least finite set
+`C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`, where `N` contains no stream.
+A cycle-safe exhaustive `Ty`/`Scalar` classifier admits only those builtin-tag edges and rejects
+every other current or future storage edge, including anonymous tuples; captures and parallel
+transport reject separately. `C` is legal as a local, by-value/borrow/borrow-mut parameter, or
+function result; out/global/constant/user-native and borrowed owning-projection positions reject.
+Direct/imported/indirect/generic parameter and return summaries retain the client dependency.
+Network-facing construction/read/next are Impure, while the ownership-only transition and
+retained-state getters are Pure.
 
 A consuming `sse()` transition yields `http_sse_stream`, so raw and event reads cannot mix after the
 choice. `next(mut buffer)` performs WHATWG UTF-8/BOM/line/field/dispatch interpretation and returns

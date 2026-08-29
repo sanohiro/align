@@ -3902,7 +3902,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   transition yields `http_sse_stream`; caller-buffer `next` returns WHATWG-decoded
   `http_sse_event` data/type/id/retry without automatic reconnect policy. Both dependent Move
   resources borrow their client; exact completion may pool, while mid-body Drop closes without
-  draining. The authoritative ledger and two-PR raw/SSE implementation boundary are
+  draining. Their only carriers are bare values and finite builtin `Option`/`Result` paths; one
+  exhaustive type-discriminator classifier rejects every other storage edge, including tuples,
+  by default. The authoritative ledger and two-PR raw/SSE implementation boundary are
   `impl/std-design/http.md` “Client streaming receive.”
 - **std.fs.watch** — non-recursive directory watch; Move + blocking `next()` →
   `{path, Created|Modified|Removed}`; kqueue/inotify; consumers: `--watch` tooling, cert reload.

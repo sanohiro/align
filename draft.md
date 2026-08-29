@@ -3210,11 +3210,16 @@ caller-owned fixed-capacity buffer and expose no HTTP chunk/trailer framing. A p
 stream has no cumulative total cap because it never materializes the whole body. The per-operation
 timeout snapshot remains active on every later receive. Each body-facing call gets a fresh 262,144
 byte chunk-framing work allowance, so indefinite chunked streams do not inherit the whole-message
-framing counter while one call remains bounded. A stream may be bare or nested in builtin
-`Option`/`Result`; it carries its creating-client dependency through those active payloads. It is
-rejected recursively from user structs/sums, arrays/slices/boxes, closure/task captures, and
-parallel elements/results. `request_stream`, `read`, and `next` are Impure; the ownership-only
-`sse` transition and head/state getters are Pure.
+framing counter while one call remains bounded. Its complete finite storage grammar is
+`C ::= stream | Option<C> | Result<C,N> | Result<N,C> | Result<C,C>`, where `N` contains no stream.
+Only builtin-tag edges carry the creating-client dependency. One cycle-safe exhaustive classifier
+over every type discriminator rejects any other storage edge by default, including user
+structs/sums, anonymous tuples, collections, boxes, builders, and tasks; a future type constructor
+must be classified before the compiler builds. `C` may be a local, by-value/borrow/borrow-mut
+parameter, or function result. An out parameter, global/constant, user native/extern signature, or
+borrowed-place owning projection rejects; ordinary return and consuming match are the only transfer
+paths. Closure/task captures and parallel elements/results reject separately. `request_stream`,
+`read`, and `next` are Impure; the ownership-only `sse` transition and head/state getters are Pure.
 
 `sse()` consumes the raw reader at its current logical body position and prevents later raw/SSE
 mixing. `next` applies the WHATWG UTF-8, BOM, CRLF/LF/CR, comment, field, blank-line dispatch, data

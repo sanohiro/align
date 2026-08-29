@@ -1125,9 +1125,12 @@ inferred shared borrow of its client expresses that relationship without a hidde
 pool or visible lifetime syntax. Other shared client requests remain legal; moving or dropping the
 pool before the stream does not. Drop before exact completion closes immediately and never drains in
 the background, so both side effects and latency stay visible. Builtin `Option`/`Result` already have
-active-tag Move/Drop and provenance machinery, so they are the only aggregate carriers admitted for
-the dependent handle. Rejecting user aggregates, collection/box elements, and captures keeps the
-client dependency from becoming an unchecked reachable-field property.
+active-tag Move/Drop and provenance machinery, so the positive carrier grammar contains only bare
+streams and finite nesting through those tags. One exhaustive no-wildcard storage-graph classifier
+rejects every other edge by default, including user records/sums, anonymous tuples, collections,
+boxes, builders, tasks, and captures. This fail-closed rule keeps the client dependency from becoming
+an unchecked reachable-field property and makes a future `Ty`/`Scalar` constructor reopen a compiler
+tripwire instead of relying on a maintained blacklist.
 
 Raw receive follows the settled I/O rule: a read fills a caller-owned fixed-capacity `buffer`.
 De-chunking is protocol mechanism and stays inside `std.http`; body allocation is policy and stays at

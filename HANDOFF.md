@@ -380,9 +380,11 @@ facts must live in this repository.
   `http_sse_stream` transition with caller-buffer WHATWG event reads. Exact
   completion may return the connection to its borrowed client pool; mid-body
   Drop closes without draining. Per-call framing and SSE-source work guards keep
-  each operation bounded without imposing a lifetime body cap. Streams travel
-  only bare or through builtin Option/Result carriers, and SSE reconnect state
-  commits atomically with its control block/event. Implementation remains two
+  each operation bounded without imposing a lifetime body cap. Streams use one
+  positive carrier grammar: bare or finite builtin Option/Result paths only;
+  an exhaustive type-discriminator classifier rejects every other storage edge,
+  including tuples, by default. SSE reconnect state commits atomically with its
+  control block/event. Implementation remains two
   capability PRs: carrier substrate plus raw streaming first, then transactional
   SSE interpretation.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
