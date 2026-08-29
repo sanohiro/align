@@ -9,7 +9,9 @@ use align_watch as watch_inputs;
 use align_span::SourceMap;
 use std::io::Read as _;
 pub use align_codegen_llvm::{
-    target_object_format, BuildTarget, DebugInfo, ObjectFormat, Profile,
+    target_object_format, BuildTarget, DebugInfo, ObjectFormat, PartitionCodegenView,
+    PartitionSharedCodegenView, Profile, SupportThunkOwner, SupportThunkRecord,
+    ThinFunctionLinkage, ThinPeerDeclaration,
 };
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
@@ -48,7 +50,8 @@ pub mod unit_cache;
 
 pub use cache::{
     cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
-    CodegenKey, FirstDiff, InboundImport, PgoKey, PrelinkKey, CACHE_KEY_FORMAT_VERSION,
+    CodegenKey, FirstDiff, ImportSourceDigest, InboundImport, PartitionKey, PgoKey, PrelinkKey,
+    ThinPartitionSource, CACHE_KEY_FORMAT_VERSION,
 };
 
 pub use static_artifacts::{BuiltStaticArtifact, StaticArtifactBuildError, build_static_artifacts};
@@ -6054,8 +6057,10 @@ fn resolve_thin_identity(target: &BuildTarget) -> Result<ThinTargetIdentity, Str
 
 /// Build the phase-1 **prelink** cache key: today's codegen key minus the pure backend/target knobs
 /// (cpu/features/reloc/code-model/machine-opt) — see [`cache::PrelinkKey`].
+#[allow(clippy::too_many_arguments)] // Every cache-key axis stays explicit at the construction seam.
 fn build_prelink_key(
     unit: &str,
+    partition: cache::PartitionKey,
     impl_hash: Hash128,
     dep_interface_hashes: &[(String, Hash128)],
     exports: &[String],
@@ -6085,6 +6090,7 @@ fn build_prelink_key(
         rt_lto,
         rt_lto_digest: rt_lto.then(|| Hash128::of(rt_lto_bitcode())),
         unit: unit.to_string(),
+        partition,
     }
 }
 
@@ -6094,13 +6100,14 @@ fn build_prelink_key(
 #[allow(clippy::too_many_arguments)]
 fn build_backend_key(
     unit: &str,
+    partition: cache::PartitionKey,
     exports: &[String],
     id: &ThinTargetIdentity,
     profile: Profile,
     own_prelink_digest: Hash128,
     inbound: Vec<cache::InboundImport>,
     outbound_exports: Vec<u64>,
-    import_source_digests: Vec<(String, Hash128)>,
+    import_source_digests: Vec<cache::ImportSourceDigest>,
 ) -> cache::BackendKey {
     let mut inbound = inbound;
     inbound.sort();
@@ -6109,8 +6116,8 @@ fn build_backend_key(
     outbound_exports.sort_unstable();
     outbound_exports.dedup();
     let mut import_source_digests = import_source_digests;
-    import_source_digests.sort_by(|a, b| a.0.cmp(&b.0));
-    import_source_digests.dedup();
+    import_source_digests.sort_by(|left, right| left.source.cmp(&right.source));
+    import_source_digests.dedup_by(|left, right| left.source == right.source);
     let mut exp = exports.to_vec();
     exp.sort();
     exp.dedup();
@@ -6134,7 +6141,414 @@ fn build_backend_key(
         import_source_digests,
         exports: exp,
         unit: unit.to_string(),
+        partition,
     }
+}
+
+/// One validated function/support module and its exact structural identity. The borrowed view is
+/// the sole input to both hashing and LLVM emission; derived strings remain owned so `exports` does
+/// not participate in this record's lifetime.
+pub struct ThinPartition<'a> {
+    pub unit: &'a str,
+    pub view: PartitionCodegenView<'a>,
+    pub impl_hash: Hash128,
+    pub preserve_symbols: Vec<String>,
+}
+
+impl ThinPartition<'_> {
+    fn key(&self) -> PartitionKey {
+        match &self.view {
+            PartitionCodegenView::Function { selected, .. } => {
+                PartitionKey::Function(selected.name.clone())
+            }
+            PartitionCodegenView::Support { .. } => PartitionKey::Support,
+        }
+    }
+
+    fn source(&self) -> ThinPartitionSource {
+        ThinPartitionSource {
+            unit: self.unit.to_owned(),
+            partition: self.key(),
+        }
+    }
+
+    fn stable_id(&self) -> String {
+        let unit_hex = thin_hex(self.unit.as_bytes());
+        let prefix = format!("align-shard-v1${}${unit_hex}", self.unit.len());
+        match &self.view {
+            PartitionCodegenView::Support { .. } => format!("{prefix}$s"),
+            PartitionCodegenView::Function { selected, .. } => {
+                let function = selected.name.as_bytes();
+                format!("{prefix}$f${}${}", function.len(), thin_hex(function))
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match &self.view {
+            PartitionCodegenView::Support { .. } => format!("{}::support", self.unit),
+            PartitionCodegenView::Function { selected, .. } => {
+                format!("{}::{}", self.unit, selected.name)
+            }
+        }
+    }
+}
+
+fn thin_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn thin_identity_error(prefix: &str, bytes: &[u8]) -> String {
+    format!("{prefix}:{}:{}", bytes.len(), thin_hex(bytes))
+}
+
+fn thin_function_abi(
+    program: &align_mir::Program,
+    function: &align_mir::Function,
+) -> Result<align_mir::CanonicalFnAbi, String> {
+    let mut params = Vec::with_capacity(function.params.len());
+    if function.params.len() != function.param_modes.len() {
+        return Err(thin_identity_error(
+            "ThinLTO function ABI invalid",
+            function.name.as_bytes(),
+        ));
+    }
+    for (&slot, &mode) in function.params.iter().zip(&function.param_modes) {
+        let ty = function.slots.get(slot as usize).copied().ok_or_else(|| {
+            thin_identity_error("ThinLTO function ABI invalid", function.name.as_bytes())
+        })?;
+        params.push((mode, ty));
+    }
+    align_mir::CanonicalFnAbi::from_parts(
+        &params,
+        function.ret,
+        &function.return_borrow,
+        &function.return_region,
+        function.return_cleanup,
+        program,
+    )
+    .map_err(|_| thin_identity_error("ThinLTO function ABI invalid", function.name.as_bytes()))
+}
+
+fn thin_peer(
+    unit: &str,
+    program: &align_mir::Program,
+    function: &align_mir::Function,
+    exports: &[String],
+) -> Result<ThinPeerDeclaration, String> {
+    let (symbol, linkage) =
+        align_codegen_llvm::partition_function_symbol(unit, function, exports)?;
+    Ok(ThinPeerDeclaration {
+        logical: function.name.clone(),
+        abi: thin_function_abi(program, function)?,
+        symbol,
+        linkage,
+    })
+}
+
+fn thin_imported_peer(
+    program: &align_mir::Program,
+    function: &align_mir::ImportedFn,
+) -> Result<ThinPeerDeclaration, String> {
+    if function.params.len() != function.param_modes.len() {
+        return Err(thin_identity_error(
+            "ThinLTO imported function ABI invalid",
+            function.name.as_bytes(),
+        ));
+    }
+    let params = function
+        .param_modes
+        .iter()
+        .copied()
+        .zip(function.params.iter().copied())
+        .collect::<Vec<_>>();
+    let abi = align_mir::CanonicalFnAbi::from_parts(
+        &params,
+        function.ret,
+        &function.return_borrow,
+        &function.return_region,
+        function.return_cleanup,
+        program,
+    )
+    .map_err(|_| {
+        thin_identity_error(
+            "ThinLTO imported function ABI invalid",
+            function.name.as_bytes(),
+        )
+    })?;
+    Ok(ThinPeerDeclaration {
+        logical: function.name.clone(),
+        abi,
+        symbol: align_codegen_llvm::imported_program_symbol(&function.name),
+        linkage: ThinFunctionLinkage::Root,
+    })
+}
+
+fn collect_static_function_targets(
+    data: &align_mir::StaticData,
+    targets: &mut std::collections::BTreeSet<align_mir::ProgramCall>,
+) {
+    for relocation in &data.relocations {
+        match &relocation.target {
+            align_mir::StaticDataTarget::Function(target) => {
+                targets.insert(target.clone());
+            }
+            align_mir::StaticDataTarget::Record(record) => {
+                collect_static_function_targets(record, targets);
+            }
+            align_mir::StaticDataTarget::Bytes { .. } => {}
+        }
+    }
+}
+
+fn referenced_program_calls(
+    function: &align_mir::Function,
+) -> std::collections::BTreeSet<align_mir::ProgramCall> {
+    use align_mir::{DirectCall, Rvalue, Stmt};
+    let mut targets = std::collections::BTreeSet::new();
+    for block in &function.blocks {
+        for statement in &block.stmts {
+            let Stmt::Let(_, value) = statement else {
+                continue;
+            };
+            match value {
+                Rvalue::Call(DirectCall::Program(target), _) => {
+                    targets.insert(target.clone());
+                }
+                Rvalue::CallWithCleanup(call) => {
+                    targets.insert(call.target.clone());
+                }
+                Rvalue::SqliteCallbackDescriptor(descriptor) => {
+                    targets.insert(descriptor.target.clone());
+                }
+                Rvalue::FnAddr { target, .. } => {
+                    targets.insert(target.clone());
+                }
+                Rvalue::Closure { lifted, .. } => {
+                    targets.insert(lifted.clone());
+                }
+                Rvalue::ParMapParallel { func, stages, .. } => {
+                    targets.insert(func.clone());
+                    targets.extend(stages.iter().filter_map(|stage| stage.func.clone()));
+                }
+                Rvalue::ParMapReduce { func, .. } => {
+                    targets.insert(func.clone());
+                }
+                Rvalue::StaticData(data) => collect_static_function_targets(data, &mut targets),
+                _ => {}
+            }
+        }
+    }
+    targets
+}
+
+fn thin_view_hash(view: &PartitionCodegenView<'_>) -> Hash128 {
+    let rendered = format!("align-thin-partition-impl-v2\n{view:?}");
+    Hash128::of(rendered.as_bytes())
+}
+
+/// Form every function/support partition in import-DAG order, validating the complete inventory
+/// before any artifact stage, cache access, LLVM operation, or linker process can begin.
+pub fn function_partitions<'a>(
+    units: &'a [PerUnitArtifact],
+    exports: &[String],
+) -> Result<Vec<ThinPartition<'a>>, String> {
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.is_entry)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        return Err(format!("ThinLTO entry unit count invalid:{}", entries.len()));
+    }
+    let entry = entries[0];
+    let mut seen_units = std::collections::BTreeSet::new();
+    let mut per_unit_functions = Vec::with_capacity(units.len());
+
+    // Function identity/ABI and complete callable validation precede export and support errors.
+    for (index, unit) in units.iter().enumerate() {
+        if unit.unit.is_empty() || unit.unit.as_bytes().contains(&0) {
+            return Err(thin_identity_error(
+                "ThinLTO unit identity invalid",
+                unit.unit.as_bytes(),
+            ));
+        }
+        if !seen_units.insert(unit.unit.as_str()) {
+            return Err(thin_identity_error(
+                "duplicate ThinLTO unit identity",
+                unit.unit.as_bytes(),
+            ));
+        }
+        let unit_exports = if index == entry { exports } else { &[] };
+        let mut functions = unit.mir.fns.iter().collect::<Vec<_>>();
+        functions.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        for pair in functions.windows(2) {
+            if pair[0].name == pair[1].name {
+                return Err(thin_identity_error(
+                    "duplicate ThinLTO function identity",
+                    pair[0].name.as_bytes(),
+                ));
+            }
+        }
+        for function in &functions {
+            let _ = thin_function_abi(&unit.mir, function)?;
+        }
+        align_codegen_llvm::validate_thin_partition_program(&unit.mir, unit_exports)
+            .map_err(|error| format!("ThinLTO program validation failed for `{}`: {error}", unit.unit))?;
+        per_unit_functions.push(functions);
+    }
+
+    let mut unknown = unknown_exports(&units[entry].mir, exports)
+        .into_iter()
+        .map(str::as_bytes)
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        let mut message = format!("unknown ThinLTO export roots:{}", unknown.len());
+        for name in unknown {
+            message.push(':');
+            message.push_str(&name.len().to_string());
+            message.push(':');
+            message.push_str(&thin_hex(name));
+        }
+        return Err(message);
+    }
+
+    let mut partitions = Vec::new();
+    let mut root_symbols = std::collections::BTreeSet::new();
+    for (index, unit) in units.iter().enumerate() {
+        let unit_exports = if index == entry { exports } else { &[] };
+        let functions = &per_unit_functions[index];
+        let local = functions
+            .iter()
+            .map(|function| (function.name.clone(), *function))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let mut support_by_symbol = std::collections::BTreeMap::new();
+        for resource in &unit.mir.resources {
+            let owner = if resource.declaring_module == unit.unit {
+                let hook = if let Some(function) = functions
+                    .iter()
+                    .copied()
+                    .find(|function| function.name.as_str() == resource.drop_hook)
+                {
+                    thin_peer(&unit.unit, &unit.mir, function, unit_exports)?
+                } else if let Some(function) = unit
+                    .mir
+                    .imported_fns
+                    .iter()
+                    .find(|function| function.name.as_str() == resource.drop_hook)
+                {
+                    thin_imported_peer(&unit.mir, function)?
+                } else {
+                    return Err(thin_identity_error(
+                        "ThinLTO resource Drop hook missing",
+                        resource.drop_hook.as_bytes(),
+                    ));
+                };
+                SupportThunkOwner::Owned { hook }
+            } else {
+                // Consumer units need only the public Drop-thunk symbol; the private hook is
+                // intentionally absent from their interface declarations.
+                SupportThunkOwner::Imported
+            };
+            let record = SupportThunkRecord {
+                drop_thunk: resource.drop_thunk.clone(),
+                representation_version: resource.representation_version,
+                drop_abi_fingerprint: resource.drop_abi_fingerprint,
+                owner,
+            };
+            if let Some(previous) = support_by_symbol.insert(record.drop_thunk.clone(), record.clone())
+                && previous != record
+            {
+                return Err(thin_identity_error(
+                    "ThinLTO support thunk conflict",
+                    record.drop_thunk.as_bytes(),
+                ));
+            }
+        }
+        let support = support_by_symbol.into_values().collect::<Vec<_>>();
+        if support
+            .iter()
+            .any(|record| matches!(record.owner, SupportThunkOwner::Owned { .. }))
+        {
+            let view = PartitionCodegenView::Support { thunks: support };
+            let impl_hash = thin_view_hash(&view);
+            partitions.push(ThinPartition {
+                unit: &unit.unit,
+                view,
+                impl_hash,
+                preserve_symbols: Vec::new(),
+            });
+        }
+
+        let shared = PartitionSharedCodegenView::from_program(&unit.mir);
+        for selected in functions {
+            let definition = thin_peer(&unit.unit, &unit.mir, selected, unit_exports)?;
+            let mut emitted_roots = Vec::with_capacity(2);
+            if selected.name.as_str() == "main" {
+                emitted_roots.push("main".to_owned());
+            }
+            if definition.linkage == ThinFunctionLinkage::Root {
+                emitted_roots.push(definition.symbol.clone());
+            }
+            emitted_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            emitted_roots.dedup();
+            for symbol in emitted_roots {
+                if !root_symbols.insert(symbol.clone()) {
+                    return Err(thin_identity_error(
+                        "duplicate ThinLTO root symbol",
+                        symbol.as_bytes(),
+                    ));
+                }
+            }
+            let mut targets = referenced_program_calls(selected);
+            targets.extend(unit.mir.sqlite_callback_effects.keys().cloned());
+            targets.remove(&selected.name);
+            let mut peers = Vec::new();
+            let mut peer_functions = Vec::new();
+            for target in targets {
+                if let Some(function) = local.get(&target) {
+                    peers.push(thin_peer(&unit.unit, &unit.mir, function, unit_exports)?);
+                    peer_functions.push(*function);
+                }
+            }
+            let mut preserve_symbols = Vec::new();
+            if definition.linkage == ThinFunctionLinkage::Root {
+                preserve_symbols.push(definition.symbol.clone());
+            }
+            if selected.name.as_str() == "main" {
+                preserve_symbols.push("main".to_owned());
+            }
+            preserve_symbols.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            preserve_symbols.dedup();
+            let view = PartitionCodegenView::Function {
+                selected,
+                definition,
+                peers,
+                peer_functions,
+                shared: shared.clone(),
+            };
+            let impl_hash = thin_view_hash(&view);
+            partitions.push(ThinPartition {
+                unit: &unit.unit,
+                view,
+                impl_hash,
+                preserve_symbols,
+            });
+        }
+    }
+    Ok(partitions)
 }
 
 /// **ThinLTO S2 (`--thin-lto`): the cache-composing, parallel cross-unit-optimizing build.** Runs the
@@ -6220,6 +6634,7 @@ pub fn build_thin_lto(
         if let Some(id) = &identity {
             let key = build_prelink_key(
                 &ids[i],
+                cache::PartitionKey::WholeUnit,
                 units[i].summary.impl_hash,
                 &units[i].dep_interface_hashes,
                 unit_exports(i),
@@ -6299,20 +6714,38 @@ pub fn build_thin_lto(
     let mut backend_misses: Vec<usize> = Vec::new();
     for i in 0..n {
         if let Some(id) = &identity {
-            let inbound_key: Vec<cache::InboundImport> =
-                inbound[i].iter().map(|e| (e.src.clone(), e.guid, e.is_definition)).collect();
+            let inbound_key: Vec<cache::InboundImport> = inbound[i]
+                .iter()
+                .map(|edge| cache::InboundImport {
+                    source: cache::ThinPartitionSource {
+                        unit: edge.src.clone(),
+                        partition: cache::PartitionKey::WholeUnit,
+                    },
+                    guid: edge.guid,
+                    is_definition: edge.is_definition,
+                })
+                .collect();
             let outbound: Vec<u64> =
                 plan.exports.iter().filter(|e| e.module == ids[i]).map(|e| e.guid).collect();
-            let src_digests: Vec<(String, Hash128)> = {
+            let src_digests: Vec<cache::ImportSourceDigest> = {
                 let mut srcs: Vec<&str> = inbound[i].iter().map(|e| e.src.as_str()).collect();
                 srcs.sort_unstable();
                 srcs.dedup();
                 srcs.iter()
-                    .filter_map(|s| unit_index.get(s).map(|&j| ((*s).to_string(), prelink_digests[j])))
+                    .filter_map(|source_unit| {
+                        unit_index.get(source_unit).map(|&j| cache::ImportSourceDigest {
+                            source: cache::ThinPartitionSource {
+                                unit: (*source_unit).to_string(),
+                                partition: cache::PartitionKey::WholeUnit,
+                            },
+                            prelink_digest: prelink_digests[j],
+                        })
+                    })
                     .collect()
             };
             let key = build_backend_key(
                 &ids[i],
+                cache::PartitionKey::WholeUnit,
                 unit_exports(i),
                 id,
                 profile,
@@ -6367,6 +6800,699 @@ pub fn build_thin_lto(
     outcomes.extend(prelink_outcomes.into_iter().map(|o| o.expect("prelink outcome per unit")));
     outcomes.extend(backend_outcomes.into_iter().map(|o| o.expect("backend outcome per unit")));
     Ok(ThinLtoBuild { outcomes, prelink_bc: bc_paths })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FunctionThinLtoMode {
+    WholeUnit,
+    Partitioned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionThinLtoObservation {
+    WholeUnit {
+        source: ThinPartitionSource,
+        codegen: CacheOutcome,
+    },
+    Partitioned {
+        source: ThinPartitionSource,
+        prelink_digest: Hash128,
+        prelink: CacheOutcome,
+        backend: CacheOutcome,
+    },
+}
+
+/// A sealed function-ThinLTO build. Artifact paths and link configuration remain private; the two
+/// completion methods consume the only owner and therefore make publication single-use.
+pub struct FunctionThinLtoBuild {
+    mode: FunctionThinLtoMode,
+    observations: Vec<FunctionThinLtoObservation>,
+    prelink_bc: Vec<std::path::PathBuf>,
+    objects: Vec<std::path::PathBuf>,
+    profile: Profile,
+    link_libs: Vec<String>,
+    object_stage: ArtifactStage,
+}
+
+impl FunctionThinLtoBuild {
+    pub fn mode(&self) -> FunctionThinLtoMode {
+        self.mode
+    }
+
+    pub fn observations(&self) -> &[FunctionThinLtoObservation] {
+        &self.observations
+    }
+
+    fn validate_topology(&self) -> Result<(), String> {
+        if self.objects.is_empty() || self.prelink_bc.len() > self.objects.len() {
+            return Err("ThinLTO result topology invalid".to_owned());
+        }
+        match self.mode {
+            FunctionThinLtoMode::WholeUnit
+                if matches!(
+                    self.observations.as_slice(),
+                    [FunctionThinLtoObservation::WholeUnit { source, codegen }]
+                        if source.partition == PartitionKey::WholeUnit
+                            && codegen.stage == CacheStage::Codegen
+                            && codegen.unit == source.unit
+                ) => {}
+            FunctionThinLtoMode::Partitioned
+                if self.observations.len() == self.objects.len()
+                    && self.observations.iter().all(|observation| matches!(
+                        observation,
+                        FunctionThinLtoObservation::Partitioned {
+                            source,
+                            prelink,
+                            backend,
+                            ..
+                        } if source.partition != PartitionKey::WholeUnit
+                            && prelink.stage == CacheStage::ThinLtoPrelink
+                            && backend.stage == CacheStage::ThinLtoBackend
+                            && prelink.unit == source.unit
+                            && backend.unit == source.unit
+                    )) => {}
+            _ => return Err("ThinLTO result topology invalid".to_owned()),
+        }
+        Ok(())
+    }
+
+    fn response_argument(&self) -> Result<std::path::PathBuf, String> {
+        use std::io::Write as _;
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        self.validate_topology()?;
+        let response = self.object_stage.path().join("objects.rsp");
+        let mut file = std::fs::File::create(&response)
+            .map_err(|error| format!("cannot create ThinLTO response file: {error}"))?;
+        let encoded = encode_thin_response_records(&self.objects)?;
+        file.write_all(&encoded)
+            .map_err(|error| format!("cannot write ThinLTO response file: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("cannot flush ThinLTO response file: {error}"))?;
+        drop(file);
+
+        let mut argument = Vec::with_capacity(1 + response.as_os_str().as_bytes().len());
+        argument.push(b'@');
+        argument.extend_from_slice(response.as_os_str().as_bytes());
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(argument)))
+    }
+
+    pub fn link_and_publish(self, exe: &std::path::Path) -> Result<(), String> {
+        let response = self.response_argument()?;
+        let parent = exe
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let publication = ArtifactStage::in_dir(parent, "align-publish")
+            .map_err(|error| format!("cannot create executable staging directory: {error}"))?;
+        let staged = publication.path().join(
+            exe.file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("program")),
+        );
+        link_objects(&[response.as_path()], &staged, &self.link_libs, self.profile)?;
+        std::fs::rename(&staged, exe)
+            .map_err(|error| format!("cannot publish executable {}: {error}", exe.display()))
+    }
+
+    pub fn link_and_publish_with_output(
+        self,
+        exe: &std::path::Path,
+        sink: &mut dyn LinkOutputSink,
+    ) -> Result<(), String> {
+        let response = self.response_argument()?;
+        link_objects_with_output(
+            &[response.as_path()],
+            exe,
+            &self.link_libs,
+            self.profile,
+            sink,
+        )
+    }
+}
+
+fn encode_thin_response_records(objects: &[std::path::PathBuf]) -> Result<Vec<u8>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let capacity = objects
+        .iter()
+        .map(|object| object.as_os_str().as_bytes().len().saturating_add(3))
+        .sum();
+    let mut encoded = Vec::with_capacity(capacity);
+    for object in objects {
+        let bytes = object.as_os_str().as_bytes();
+        if bytes.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r')) {
+            return Err(thin_identity_error(
+                "cannot encode ThinLTO object path",
+                bytes,
+            ));
+        }
+        encoded.push(b'\"');
+        for byte in bytes {
+            if matches!(*byte, b'\"' | b'\\') {
+                encoded.push(b'\\');
+            }
+            encoded.push(*byte);
+        }
+        encoded.extend_from_slice(b"\"\n");
+    }
+    Ok(encoded)
+}
+
+fn thin_link_lib_union(units: &[PerUnitArtifact]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut libraries = Vec::new();
+    for unit in units {
+        for library in &unit.mir.link_libs {
+            if seen.insert(library.as_str()) {
+                libraries.push(library.clone());
+            }
+        }
+    }
+    libraries
+}
+
+fn validate_thin_stage_parent_at(parent: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let canonical = std::fs::canonicalize(parent)
+        .map_err(|error| format!("cannot create object staging directory: {error}"))?;
+    let bytes = canonical.as_os_str().as_bytes();
+    if bytes.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r')) {
+        return Err(thin_identity_error(
+            "cannot encode ThinLTO object path",
+            bytes,
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_thin_stage_parent() -> Result<std::path::PathBuf, String> {
+    validate_thin_stage_parent_at(&std::env::temp_dir())
+}
+
+#[cfg(test)]
+mod function_thin_unit_tests {
+    use super::{
+        ArtifactStage, Profile, encode_thin_response_records, link_objects, thin_identity_error,
+        validate_thin_stage_parent_at,
+    };
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::path::PathBuf;
+
+    #[test]
+    fn response_records_preserve_native_bytes_and_escape_only_quote_and_backslash() {
+        let paths = vec![
+            PathBuf::from(std::ffi::OsString::from_vec(b"plain".to_vec())),
+            PathBuf::from(std::ffi::OsString::from_vec(
+                b"a b\t\"\\\xff".to_vec(),
+            )),
+        ];
+        assert_eq!(
+            encode_thin_response_records(&paths).unwrap(),
+            b"\"plain\"\n\"a b\t\\\"\\\\\xff\"\n"
+        );
+        assert_eq!(encode_thin_response_records(&[]).unwrap(), b"");
+    }
+
+    #[test]
+    fn response_records_reject_line_and_nul_bytes_with_exact_identity() {
+        for bytes in [b"a\nb".as_slice(), b"a\rb".as_slice(), b"a\0b".as_slice()] {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+            assert_eq!(
+                encode_thin_response_records(&[path]).unwrap_err(),
+                format!(
+                    "cannot encode ThinLTO object path:{}:{}",
+                    bytes.len(),
+                    super::thin_hex(bytes)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_stage_parent_is_validated_before_artifact_creation() -> Result<(), String> {
+        let root = ArtifactStage::temp("align-canonical-stage-parent")
+            .map_err(|error| format!("create stage-parent fixture: {error}"))?;
+        for (index, name) in ["line\nbreak", "carriage\rreturn"].into_iter().enumerate() {
+            let target = root.path().join(name);
+            std::fs::create_dir(&target)
+                .map_err(|error| format!("create invalid canonical target: {error}"))?;
+            let alias = root.path().join(format!("alias{index}"));
+            std::os::unix::fs::symlink(&target, &alias)
+                .map_err(|error| format!("create stage-parent symlink: {error}"))?;
+            let canonical = std::fs::canonicalize(&alias)
+                .map_err(|error| format!("canonicalize stage-parent fixture: {error}"))?;
+            let error = match validate_thin_stage_parent_at(&alias) {
+                Ok(_) => return Err("invalid canonical stage parent was accepted".to_owned()),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                thin_identity_error(
+                    "cannot encode ThinLTO object path",
+                    canonical.as_os_str().as_bytes()
+                )
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cc_driver_round_trips_quoted_native_response_paths() {
+        if std::process::Command::new("cc").arg("--version").output().is_err() {
+            return;
+        }
+        let stage = ArtifactStage::temp("align-response-roundtrip").expect("response stage");
+        let main_source = stage.path().join("main.c");
+        let empty_source = stage.path().join("empty.c");
+        let main_object = stage.path().join("main.o");
+        let empty_object = stage.path().join("empty.o");
+        std::fs::write(&main_source, b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(&empty_source, b"static int unused;\n").unwrap();
+        for (source, object) in [
+            (&main_source, &main_object),
+            (&empty_source, &empty_object),
+        ] {
+            let status = std::process::Command::new("cc")
+                .arg("-c")
+                .arg(source)
+                .arg("-o")
+                .arg(object)
+                .status()
+                .expect("launch cc compile");
+            assert!(status.success(), "cc failed to compile response fixture");
+        }
+
+        let odd_names = [
+            b"space name.o".as_slice(),
+            b"tab\tname.o".as_slice(),
+            b"quote\"name.o".as_slice(),
+            b"back\\slash.o".as_slice(),
+            b"invalid-\xff.o".as_slice(),
+            b"@leading-at.o".as_slice(),
+            b"-option-shaped.o".as_slice(),
+        ];
+        let mut objects = vec![main_object];
+        for name in odd_names {
+            let path = stage
+                .path()
+                .join(std::ffi::OsString::from_vec(name.to_vec()));
+            std::fs::copy(&empty_object, &path).expect("copy response fixture");
+            objects.push(path);
+        }
+        let response = stage.path().join("objects.rsp");
+        let mut response_file = std::fs::File::create(&response).unwrap();
+        response_file
+            .write_all(&encode_thin_response_records(&objects).unwrap())
+            .unwrap();
+        response_file.flush().unwrap();
+        drop(response_file);
+
+        let mut argument = vec![b'@'];
+        argument.extend_from_slice(response.as_os_str().as_bytes());
+        let response_argument = PathBuf::from(std::ffi::OsString::from_vec(argument));
+        let executable = stage.path().join("response-executable");
+        link_objects(
+            &[response_argument.as_path()],
+            &executable,
+            &[],
+            Profile::Release,
+        )
+        .expect("selected cc/linker response round trip");
+        assert!(
+            std::process::Command::new(&executable)
+                .status()
+                .expect("run response executable")
+                .success()
+        );
+    }
+}
+
+/// Build the settled function-partitioned ThinLTO path and retain sole ownership of every private
+/// artifact until one consuming link/publication method completes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_function_thin_lto(
+    units: &[PerUnitArtifact],
+    cache: &CacheContext,
+    target: &BuildTarget,
+    profile: Profile,
+    exports: &[String],
+    rt_lto: bool,
+    jobs: usize,
+) -> Result<FunctionThinLtoBuild, String> {
+    let partitions = function_partitions(units, exports)?;
+    if partitions.is_empty() {
+        return Err("ThinLTO partition inventory is empty".to_owned());
+    }
+    for partition in &partitions {
+        let id = partition.stable_id();
+        if id.as_bytes().contains(&0) {
+            return Err(thin_identity_error(
+                "ThinLTO module identity invalid",
+                id.as_bytes(),
+            ));
+        }
+    }
+    let stage_parent = validate_thin_stage_parent()?;
+    let object_stage = ArtifactStage::in_canonical_dir(&stage_parent, "align-function-thin")
+        .map_err(|error| format!("cannot create object staging directory: {error}"))?;
+    let link_libs = thin_link_lib_union(units);
+
+    if units.len() == 1
+        && partitions.len() == 1
+        && matches!(partitions[0].key(), PartitionKey::Function(_))
+    {
+        let object = object_stage.path().join("partition0.o");
+        let outcome = emit_object_cached(
+            cache,
+            &units[0].unit,
+            units[0].summary.impl_hash,
+            &units[0].dep_interface_hashes,
+            &units[0].mir,
+            &object,
+            target.clone(),
+            profile,
+            exports,
+            rt_lto,
+        )?;
+        let build = FunctionThinLtoBuild {
+            mode: FunctionThinLtoMode::WholeUnit,
+            observations: vec![FunctionThinLtoObservation::WholeUnit {
+                source: ThinPartitionSource {
+                    unit: units[0].unit.clone(),
+                    partition: PartitionKey::WholeUnit,
+                },
+                codegen: outcome,
+            }],
+            prelink_bc: Vec::new(),
+            objects: vec![object],
+            profile,
+            link_libs,
+            object_stage,
+        };
+        build.validate_topology()?;
+        return Ok(build);
+    }
+
+    align_codegen_llvm::ensure_target_initialized().map_err(|error| error.to_string())?;
+    let enabled = cache.codegen_is_enabled();
+    let identity = if enabled {
+        Some(resolve_thin_identity(target)?)
+    } else {
+        None
+    };
+    let count = partitions.len();
+    let ids = partitions
+        .iter()
+        .map(ThinPartition::stable_id)
+        .collect::<Vec<_>>();
+    let mut id_index = std::collections::BTreeMap::new();
+    for (index, id) in ids.iter().enumerate() {
+        if id_index.insert(id.as_str(), index).is_some() {
+            return Err(thin_identity_error(
+                "duplicate ThinLTO module identity",
+                id.as_bytes(),
+            ));
+        }
+    }
+    let unit_index = units
+        .iter()
+        .map(|unit| (unit.unit.as_str(), unit))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let bc_paths = (0..count)
+        .map(|index| object_stage.path().join(format!("partition{index}.prelink.bc")))
+        .collect::<Vec<_>>();
+    let objects = (0..count)
+        .map(|index| object_stage.path().join(format!("partition{index}.o")))
+        .collect::<Vec<_>>();
+
+    let mut prelink_keys = (0..count).map(|_| None).collect::<Vec<_>>();
+    let mut prelink_outcomes = (0..count).map(|_| None).collect::<Vec<_>>();
+    let mut prelink_misses = Vec::new();
+    for index in 0..count {
+        let partition = &partitions[index];
+        let unit = unit_index
+            .get(partition.unit)
+            .copied()
+            .ok_or_else(|| thin_identity_error("ThinLTO partition unit missing", partition.unit.as_bytes()))?;
+        let unit_exports = if unit.is_entry { exports } else { &[] };
+        if let Some(identity) = &identity {
+            let key = build_prelink_key(
+                partition.unit,
+                partition.key(),
+                partition.impl_hash,
+                &unit.dep_interface_hashes,
+                unit_exports,
+                identity,
+                profile,
+                rt_lto,
+            );
+            match cache.lookup_prelink(&key, &bc_paths[index]) {
+                CacheLookup::Hit(outcome) => prelink_outcomes[index] = Some(outcome),
+                CacheLookup::Miss { reason } => {
+                    prelink_outcomes[index] = Some(CacheOutcome {
+                        stage: CacheStage::ThinLtoPrelink,
+                        unit: partition.unit.to_owned(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
+                    prelink_misses.push(index);
+                }
+            }
+            prelink_keys[index] = Some(key);
+        } else {
+            prelink_outcomes[index] = Some(CacheOutcome {
+                stage: CacheStage::ThinLtoPrelink,
+                unit: partition.unit.to_owned(),
+                hit: false,
+                miss_reason: None,
+            });
+            prelink_misses.push(index);
+        }
+    }
+    run_thin_phase(&prelink_misses, jobs, |index| {
+        let partition = &partitions[index];
+        let result = match &partition.view {
+            PartitionCodegenView::Function { .. } => align_codegen_llvm::emit_function_prelink_bc(
+                &partition.view,
+                &bc_paths[index],
+                target,
+                profile,
+                rt_lto_bytes(rt_lto),
+                &ids[index],
+            ),
+            PartitionCodegenView::Support { .. } => align_codegen_llvm::emit_support_prelink_bc(
+                &partition.view,
+                &bc_paths[index],
+                target,
+                profile,
+                &ids[index],
+            ),
+        };
+        result.map_err(|error| {
+            format!("ThinLTO prelink failed for partition `{}`: {error}", partition.label())
+        })?;
+        if let Some(key) = &prelink_keys[index] {
+            cache.publish_prelink(key, &bc_paths[index]);
+        }
+        Ok(())
+    })?;
+
+    let mut prelink_digests = Vec::with_capacity(count);
+    for path in &bc_paths {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("ThinLTO: cannot read prelink bitcode: {error}"))?;
+        prelink_digests.push(Hash128::of(&bytes));
+    }
+
+    let mut preserve = partitions
+        .iter()
+        .flat_map(|partition| partition.preserve_symbols.iter().cloned())
+        .collect::<Vec<_>>();
+    preserve.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    preserve.dedup();
+    let plan = align_codegen_llvm::thinlto::thin_link(&bc_paths, &ids, &preserve)
+        .map_err(|error| format!("ThinLTO thin-link failed: {error}"))?;
+
+    let mut inbound = (0..count).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut seen_edges = std::collections::BTreeSet::new();
+    for edge in &plan.imports {
+        let Some(&destination) = id_index.get(edge.dest.as_str()) else {
+            return Err(thin_identity_error(
+                "ThinLTO edge destination unknown",
+                edge.dest.as_bytes(),
+            ));
+        };
+        if !id_index.contains_key(edge.src.as_str()) {
+            return Err(thin_identity_error(
+                "ThinLTO edge source unknown",
+                edge.src.as_bytes(),
+            ));
+        }
+        if !seen_edges.insert((
+            edge.src.as_str(),
+            edge.dest.as_str(),
+            edge.guid,
+            edge.is_definition,
+        )) {
+            return Err(format!(
+                "ThinLTO edge duplicated:{}:{}:{}:{}:{}:{}",
+                edge.src.len(),
+                thin_hex(edge.src.as_bytes()),
+                edge.dest.len(),
+                thin_hex(edge.dest.as_bytes()),
+                edge.guid,
+                u8::from(edge.is_definition),
+            ));
+        }
+        inbound[destination].push(edge.clone());
+    }
+    for export in &plan.exports {
+        if !id_index.contains_key(export.module.as_str()) {
+            return Err(thin_identity_error(
+                "ThinLTO edge source unknown",
+                export.module.as_bytes(),
+            ));
+        }
+    }
+
+    let mut backend_keys = (0..count).map(|_| None).collect::<Vec<_>>();
+    let mut backend_outcomes = (0..count).map(|_| None).collect::<Vec<_>>();
+    let mut backend_misses = Vec::new();
+    for index in 0..count {
+        let partition = &partitions[index];
+        let unit = unit_index
+            .get(partition.unit)
+            .copied()
+            .ok_or_else(|| thin_identity_error("ThinLTO partition unit missing", partition.unit.as_bytes()))?;
+        let unit_exports = if unit.is_entry { exports } else { &[] };
+        if let Some(identity) = &identity {
+            let inbound_key = inbound[index]
+                .iter()
+                .map(|edge| {
+                    let source = id_index.get(edge.src.as_str()).copied().ok_or_else(|| {
+                        thin_identity_error("ThinLTO edge source unknown", edge.src.as_bytes())
+                    })?;
+                    Ok(InboundImport {
+                        source: partitions[source].source(),
+                        guid: edge.guid,
+                        is_definition: edge.is_definition,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let outbound = plan
+                .exports
+                .iter()
+                .filter(|export| export.module == ids[index])
+                .map(|export| export.guid)
+                .collect::<Vec<_>>();
+            let mut sources = inbound[index]
+                .iter()
+                .map(|edge| edge.src.as_str())
+                .collect::<Vec<_>>();
+            sources.sort_unstable();
+            sources.dedup();
+            let source_digests = sources
+                .into_iter()
+                .map(|source| {
+                    let source_index = id_index.get(source).copied().ok_or_else(|| {
+                        thin_identity_error("ThinLTO source digest missing", source.as_bytes())
+                    })?;
+                    Ok(ImportSourceDigest {
+                        source: partitions[source_index].source(),
+                        prelink_digest: prelink_digests[source_index],
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let key = build_backend_key(
+                partition.unit,
+                partition.key(),
+                unit_exports,
+                identity,
+                profile,
+                prelink_digests[index],
+                inbound_key,
+                outbound,
+                source_digests,
+            );
+            match cache.lookup_backend(&key, &objects[index]) {
+                CacheLookup::Hit(outcome) => backend_outcomes[index] = Some(outcome),
+                CacheLookup::Miss { reason } => {
+                    backend_outcomes[index] = Some(CacheOutcome {
+                        stage: CacheStage::ThinLtoBackend,
+                        unit: partition.unit.to_owned(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
+                    backend_misses.push(index);
+                }
+            }
+            backend_keys[index] = Some(key);
+        } else {
+            backend_outcomes[index] = Some(CacheOutcome {
+                stage: CacheStage::ThinLtoBackend,
+                unit: partition.unit.to_owned(),
+                hit: false,
+                miss_reason: None,
+            });
+            backend_misses.push(index);
+        }
+    }
+    run_thin_phase(&backend_misses, jobs, |index| {
+        align_codegen_llvm::thinlto::backend(
+            &bc_paths,
+            &ids,
+            index,
+            &preserve,
+            &inbound[index],
+            &plan.exports,
+            target,
+            profile,
+            &objects[index],
+        )
+        .map_err(|error| {
+            format!(
+                "ThinLTO backend failed for partition `{}`: {error}",
+                partitions[index].label()
+            )
+        })?;
+        if let Some(key) = &backend_keys[index] {
+            cache.publish_backend(key, &objects[index]);
+        }
+        Ok(())
+    })?;
+
+    let observations = (0..count)
+        .map(|index| {
+            Ok(FunctionThinLtoObservation::Partitioned {
+                source: partitions[index].source(),
+                prelink_digest: prelink_digests[index],
+                prelink: prelink_outcomes[index].take().ok_or_else(|| {
+                    format!(
+                        "internal error: ThinLTO prelink outcome missing for partition `{}`",
+                        partitions[index].label()
+                    )
+                })?,
+                backend: backend_outcomes[index].take().ok_or_else(|| {
+                    format!(
+                        "internal error: ThinLTO backend outcome missing for partition `{}`",
+                        partitions[index].label()
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let build = FunctionThinLtoBuild {
+        mode: FunctionThinLtoMode::Partitioned,
+        observations,
+        prelink_bc: bc_paths,
+        objects,
+        profile,
+        link_libs,
+        object_stage,
+    };
+    build.validate_topology()?;
+    Ok(build)
 }
 
 /// Run a ThinLTO phase's MISSES in parallel via the shared atomic-claim pattern (mirrors
@@ -7687,6 +8813,10 @@ pub struct ArtifactStage {
 impl ArtifactStage {
     pub fn in_dir(parent: &std::path::Path, label: &str) -> std::io::Result<Self> {
         let parent = std::fs::canonicalize(parent)?;
+        Self::in_canonical_dir(&parent, label)
+    }
+
+    fn in_canonical_dir(parent: &std::path::Path, label: &str) -> std::io::Result<Self> {
         for _ in 0..1024 {
             let nonce = ARTIFACT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stamp = std::time::SystemTime::now()

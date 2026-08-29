@@ -3,7 +3,7 @@
 use super::watch_native::{NativeHandle, NativeWatchErrorKind, NativeWatcher};
 use super::{link_lib_union, stem};
 use align_driver::{
-    ArtifactStage, BuildInputSet, BuildSourceError, BuildTarget, CacheContext, FinalBuildInputSet,
+    BuildInputSet, BuildSourceError, BuildTarget, CacheContext, FinalBuildInputSet,
     LinkOutputSink, LinkOutputStream, LinkStopSignal, ObservedBuildAttempt, ObservedPerUnitBuild,
     PgoMode, Profile, UnitReuse, WatchRepairDependency, finalize_watch_inputs,
     merge_observed_build_inputs, snapshot_watch_repair,
@@ -612,47 +612,17 @@ fn build_thin_revision(
     if walk.diags.has_errors() || walk.units.is_empty() {
         return failed_inputs(inputs);
     }
-    let stage = match ArtifactStage::temp("align-watch-thin") {
-        Ok(stage) => stage,
-        Err(error) => {
-            transcript
-                .text_record("diagnostic", format!("alignc: {error}").as_bytes())
-                .map_err(io_text)?;
-            return failed_inputs(inputs);
-        }
-    };
-    let object_paths: Vec<PathBuf> = (0..walk.units.len())
-        .map(|index| stage.path().join(format!("unit{index}.o")))
-        .collect();
     let cache = CacheContext::from_env();
-    let outcomes = if walk.units.len() >= 2 {
-        align_driver::build_thin_lto(
-            &walk.units,
-            &object_paths,
-            &cache,
-            &target,
-            profile,
-            &[],
-            rt_lto,
-            stage.path(),
-            jobs,
-        )
-        .map(|build| build.outcomes)
-    } else {
-        align_driver::codegen_units_parallel(
-            &walk.units,
-            &object_paths,
-            &cache,
-            &target,
-            profile,
-            rt_lto,
-            jobs,
-            &PgoMode::Off,
-        )
-        .map(|build| build.outcomes)
-    };
-    let outcomes = match outcomes {
-        Ok(outcomes) => outcomes,
+    let build = match align_driver::build_function_thin_lto(
+        &walk.units,
+        &cache,
+        &target,
+        profile,
+        &[],
+        rt_lto,
+        jobs,
+    ) {
+        Ok(build) => build,
         Err(error) => {
             transcript
                 .text_record("diagnostic", format!("alignc: {error}").as_bytes())
@@ -661,22 +631,12 @@ fn build_thin_revision(
         }
     };
     if cache_stats {
-        if walk.units.len() >= 2 {
-            record_thin_cache_stats(transcript, &outcomes, cache.codegen_is_enabled())?;
-        } else {
-            record_plain_outcomes(transcript, &outcomes, cache.codegen_is_enabled())?;
-        }
+        record_function_thin_cache_stats(transcript, &build, cache.codegen_is_enabled())?;
     }
-    let link_libs = link_lib_union(walk.units.iter().map(|unit| unit.mir.link_libs.as_slice()));
-    let objects: Vec<&Path> = object_paths.iter().map(PathBuf::as_path).collect();
-    finalize_and_link(
+    finalize_and_link_function_thin(
         inputs,
         output,
-        &objects,
-        &link_libs,
-        profile,
-        &PgoMode::Off,
-        &target,
+        build,
         signal,
         transcript,
     )
@@ -759,6 +719,89 @@ fn finalize_and_link(
     } else {
         align_driver::link_objects_with_output(objects, output, link_libs, profile, &mut sink)
     };
+    if let Some(error) = sink.first_error.take() {
+        return Err(error);
+    }
+    let (inputs, repair) = finalized.into_parts();
+    match link {
+        Ok(()) => {
+            sink.transcript
+                .text_record(
+                    "success",
+                    format!("alignc: built executable: {}", encode_path(output)).as_bytes(),
+                )
+                .map_err(io_text)?;
+            Ok(RevisionResult {
+                success: true,
+                inputs,
+                repair,
+            })
+        }
+        Err(error)
+            if signal.control.load(Ordering::Acquire) & SIGNAL_MASK != 0
+                && error.starts_with("child stopped by ") =>
+        {
+            Err(error)
+        }
+        Err(error) if link_infrastructure_error(&error) => Err(error),
+        Err(error) => {
+            sink.transcript
+                .text_record("diagnostic", format!("alignc: {error}").as_bytes())
+                .map_err(io_text)?;
+            Ok(RevisionResult {
+                success: false,
+                inputs,
+                repair,
+            })
+        }
+    }
+}
+
+fn finalize_and_link_function_thin(
+    inputs: BuildInputSet,
+    output: &Path,
+    build: align_driver::FunctionThinLtoBuild,
+    signal: &Arc<WakeState>,
+    transcript: &mut Transcript,
+) -> Result<RevisionResult, String> {
+    let finalized =
+        finalize_watch_inputs(inputs, Some(output)).map_err(|error| error.to_string())?;
+    if finalized.inputs().changed_during_attempt() {
+        transcript
+            .text_record("notice", b"alignc: watch: inputs changed during revision")
+            .map_err(io_text)?;
+        let (inputs, repair) = finalized.into_parts();
+        return Ok(RevisionResult {
+            success: false,
+            inputs,
+            repair,
+        });
+    }
+    if let Some(index) = finalized.alias_index() {
+        transcript
+            .text_record(
+                "notice",
+                format!(
+                    "alignc: watch: output '{}' aliases observed input '{}'",
+                    encode_path(output),
+                    encode_path(finalized.inputs().inputs()[index].path())
+                )
+                .as_bytes(),
+            )
+            .map_err(io_text)?;
+        let (inputs, repair) = finalized.into_parts();
+        return Ok(RevisionResult {
+            success: false,
+            inputs,
+            repair,
+        });
+    }
+    let mut sink = TranscriptSink {
+        transcript,
+        signal,
+        first_error: None,
+    };
+    let link = build.link_and_publish_with_output(output, &mut sink);
     if let Some(error) = sink.first_error.take() {
         return Err(error);
     }
@@ -926,11 +969,16 @@ fn record_plain_outcomes(
         .map_err(io_text)
 }
 
-fn record_thin_cache_stats(
+fn record_function_thin_cache_stats(
     transcript: &mut Transcript,
-    outcomes: &[align_driver::CacheOutcome],
+    build: &align_driver::FunctionThinLtoBuild,
     enabled: bool,
 ) -> Result<(), String> {
+    if let [align_driver::FunctionThinLtoObservation::WholeUnit { codegen, .. }] =
+        build.observations()
+    {
+        return record_plain_outcomes(transcript, std::slice::from_ref(codegen), enabled);
+    }
     if !enabled {
         return transcript
             .text_record(
@@ -945,13 +993,34 @@ fn record_thin_cache_stats(
     ] {
         let mut hits = 0usize;
         let mut misses = 0usize;
-        for outcome in outcomes.iter().filter(|outcome| outcome.stage == stage) {
+        for observation in build.observations() {
+            let align_driver::FunctionThinLtoObservation::Partitioned {
+                source,
+                prelink,
+                backend,
+                ..
+            } = observation
+            else {
+                continue;
+            };
+            let outcome = if stage == align_driver::CacheStage::ThinLtoPrelink {
+                prelink
+            } else {
+                backend
+            };
             if outcome.hit {
                 hits += 1;
             } else {
                 misses += 1;
             }
-            record_outcome(transcript, outcome, Some(stage.label()))?;
+            let label = match &source.partition {
+                align_driver::PartitionKey::WholeUnit => source.unit.clone(),
+                align_driver::PartitionKey::Support => format!("{}::support", source.unit),
+                align_driver::PartitionKey::Function(function) => {
+                    format!("{}::{function}", source.unit)
+                }
+            };
+            record_labeled_outcome(transcript, &label, outcome, stage.label())?;
         }
         transcript
             .text_record(
@@ -966,6 +1035,29 @@ fn record_thin_cache_stats(
             .map_err(io_text)?;
     }
     Ok(())
+}
+
+fn record_labeled_outcome(
+    transcript: &mut Transcript,
+    label: &str,
+    outcome: &align_driver::CacheOutcome,
+    stage: &str,
+) -> Result<(), String> {
+    let state = if outcome.hit {
+        "hit".to_owned()
+    } else {
+        let reason = outcome
+            .miss_reason
+            .map(|reason| reason.reason())
+            .unwrap_or("miss");
+        format!("miss ({reason})")
+    };
+    transcript
+        .text_record(
+            "cache",
+            format!("alignc: cache: {label} {stage} {state}").as_bytes(),
+        )
+        .map_err(io_text)
 }
 
 fn record_outcome(

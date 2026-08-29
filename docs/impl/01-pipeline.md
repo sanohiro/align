@@ -114,7 +114,7 @@ executable
   `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
   profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, instrumented PGO, and the explicit
   foreground `--watch` loop.
-- Build-performance item 6 has a settled, implementation-pending refinement for the explicit
+- Build-performance item 6 implements function partitions for the explicit
   `--thin-lto` path: one support partition for producer-owned resource thunks plus one LLVM module
   per MIR function, followed by the same fresh global thin-link and cached import-sensitive
   backends. Non-root functions use unit-qualified hidden composition symbols, so duplicate

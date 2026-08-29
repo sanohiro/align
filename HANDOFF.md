@@ -365,10 +365,11 @@ facts must live in this repository.
   watch builds are implemented: `alignc build FILE --watch` keeps one compiler
   resident, observes and revalidates exact compiler-consumed inputs, uses native
   events plus a semantic audit, captures tool output, and preserves the last-good
-  executable through bounded atomic publication. Function-level incrementality
-  remains item 6; its `--thin-lto` function-partition design ledger and closure
-  matrix are now settled in `docs/impl/21-build-perf-plan.md`, with implementation
-  pending.
+  executable through bounded atomic publication. Item 6 function-level
+  incrementality is implemented for explicit `--thin-lto`: one sealed support
+  partition per resource owner plus one module per MIR function, partition-qualified
+  v5 cache identity, fresh global thin-link, and response-file linking. The exact
+  ledger and closure matrix are `docs/impl/21-build-perf-plan.md`.
 - **pkg.web:** F0-F3 and W1-W7 are complete. The current contract is
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not

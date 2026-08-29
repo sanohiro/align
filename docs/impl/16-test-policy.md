@@ -189,6 +189,13 @@ last-good publication, CLI exclusion, and graceful stop. Run those focused owner
 bounded code gate when watch observation, publication, native events, or captured tool execution
 changes.
 
+Function-partition ThinLTO is owned by
+`crates/align_driver/tests/function_thin_lto.rs` plus the existing
+`thin_lto.rs`, `thin_lto_cache.rs`, `thin_lto_sv.rs`, and watch owners. Run
+`bench/function_incremental/run.sh` locally only when partition formation,
+fingerprinting, phase caching, or completion changes the item-6 performance or
+resource path; it is not part of the bounded correctness gate.
+
 Request 14's exclusive filesystem publication implementation keeps its owner
 evidence in the existing filesystem boundary. `crates/align_driver/tests/m9_fs.rs`
 owns source formation, imports, execution, writer ownership, control flow, and

@@ -38,6 +38,7 @@ use std::sync::OnceLock;
 use std::os::unix::fs::OpenOptionsExt;
 
 use align_interface::{Hash128, Hash128Stream};
+use align_mir::ProgramCall;
 
 /// The cache **schema** version — the on-disk layout namespace. A bump changes the default-root
 /// subdirectory (`.../alignc/<schema>/`), isolating an old tree wholesale. Independent of the KEY
@@ -60,7 +61,10 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 ///
 /// **Bumped to 4 at build-performance item 4**: every codegen-family key gains the nominal build id
 /// of the dynamically loaded LLVM library immediately after its semantic version.
-pub const CACHE_KEY_FORMAT_VERSION: u32 = 4;
+///
+/// **Bumped to 5 at build-performance item 6**: ThinLTO prelink/backend keys identify the
+/// destination partition, and backend import edges/digests identify the exact source partition.
+pub const CACHE_KEY_FORMAT_VERSION: u32 = 5;
 
 /// The manifest wire-format version. Bump on ANY change to the encoded byte layout; an old manifest
 /// then fails closed on decode (treated as a miss, its bytes unreferenced). **Bumped to 2 at ThinLTO
@@ -68,7 +72,7 @@ pub const CACHE_KEY_FORMAT_VERSION: u32 = 4;
 /// separate `prelink`/`thinbackend` phase keys instead), and the two ThinLTO manifests were added.
 /// **Bumped to 3 at instrument-PGO S2**: the codegen-key manifest body gains the [`PgoKey`] `pgo_mode`
 /// field (a tag byte + an optional `Hash128` profdata digest), so the wire layout changed.
-const MANIFEST_FORMAT_VERSION: u32 = 4;
+const MANIFEST_FORMAT_VERSION: u32 = 5;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
@@ -1426,15 +1430,45 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
 
 // ================================================================================================
 // ThinLTO S2: the two cacheable phases (`docs/impl/07-roadmap.md` ThinLTO S2). A `--thin-lto` build
-// caches per-unit PRELINK bitcode (phase 1, `prelink-bitcode` part-kind) and the per-unit BACKEND
-// object (phase 3); the serial thin-link (phase 2) is never cached but always runs, so cross-unit
-// import decisions are recomputed fresh every build. Both keys reuse the CAS + manifest discipline
-// above (private staging + atomic rename, digest-verified reads, fail-closed decode).
+// caches partition PRELINK bitcode (phase 1, `prelink-bitcode` part-kind) and partition BACKEND
+// objects (phase 3); `WholeUnit` retains the original per-unit identity. The serial thin-link
+// (phase 2) is never cached but always runs, so cross-partition import decisions are recomputed
+// fresh every build. Both keys reuse the CAS + manifest discipline above (private staging + atomic
+// rename, digest-verified reads, fail-closed decode).
 // ================================================================================================
 
 // ---- phase 1: prelink key -----------------------------------------------------------------------
 
-/// The cache key for one unit's ThinLTO **prelink bitcode** (phase 1). It is today's codegen key
+/// Nominal identity of one ThinLTO cache partition. Function identity remains the validated logical
+/// MIR name; the unit lives in [`ThinPartitionSource`] so equal consumer monomorphs in different
+/// units remain distinct without changing MIR semantics.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PartitionKey {
+    WholeUnit,
+    Support,
+    Function(ProgramCall),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ThinPartitionSource {
+    pub unit: String,
+    pub partition: PartitionKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InboundImport {
+    pub source: ThinPartitionSource,
+    pub guid: u64,
+    pub is_definition: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportSourceDigest {
+    pub source: ThinPartitionSource,
+    pub prelink_digest: Hash128,
+}
+
+/// The cache key for one source partition's ThinLTO **prelink bitcode** (phase 1). It is today's codegen key
 /// MINUS the pure backend/target codegen knobs (cpu / features / reloc / code model / machine
 /// opt-level) — those cannot change the summary-bearing prelink bitcode bytes (the module's
 /// datalayout is triple-derived, kept here; the cpu string only steers backend codegen, re-derived in
@@ -1461,6 +1495,7 @@ pub struct PrelinkKey {
     pub rt_lto: bool,
     pub rt_lto_digest: Option<Hash128>,
     pub unit: String,
+    pub partition: PartitionKey,
 }
 
 impl PrelinkKey {
@@ -1477,6 +1512,7 @@ impl PrelinkKey {
         w.u32(self.cache_format_version);
         w.h128(self.compiler_build_id);
         w.str(&self.unit);
+        w.partition_key(&self.partition);
         Hash128::of(&w.buf)
     }
 }
@@ -1519,11 +1555,8 @@ fn prelink_first_diff(stored: &PrelinkKey, current: &PrelinkKey) -> FirstDiff {
 
 // ---- phase 3: backend key -----------------------------------------------------------------------
 
-/// One inbound cross-module import edge into this unit, keyed by stable unit ids: `(src, GUID, kind)`
-/// where `kind == true` is a definition import. Sorted before hashing so the key is order-independent.
-pub type InboundImport = (String, u64, bool);
-
-/// The cache key for one unit's ThinLTO **backend object** (phase 3) — the PRECISE cross-unit digest.
+/// The cache key for one source partition's ThinLTO **backend object** (phase 3) — the PRECISE
+/// cross-partition digest.
 /// A backend hit must be provably valid for the exact inputs the shim's entry-3 consumes:
 ///   * `own_prelink_digest` — this unit's prelink `.bc` content (its own code + local promotions);
 ///   * `inbound_imports` — the edges `(src, GUID, kind)` this unit imports (what gets pulled in);
@@ -1558,11 +1591,12 @@ pub struct BackendKey {
     pub inbound_imports: Vec<InboundImport>,
     /// Sorted, deduped GUIDs this unit exports cross-module (its promotion set).
     pub outbound_exports: Vec<u64>,
-    /// Sorted, deduped `(src_unit, prelink_digest)` for every import-source unit.
-    pub import_source_digests: Vec<(String, Hash128)>,
+    /// Sorted, deduped source partition/digest records for every imported partition.
+    pub import_source_digests: Vec<ImportSourceDigest>,
     /// The `--export` root set (entry unit only; sorted+deduped) — it widens the preserve set.
     pub exports: Vec<String>,
     pub unit: String,
+    pub partition: PartitionKey,
 }
 
 impl BackendKey {
@@ -1577,6 +1611,7 @@ impl BackendKey {
         w.u32(self.cache_format_version);
         w.h128(self.compiler_build_id);
         w.str(&self.unit);
+        w.partition_key(&self.partition);
         Hash128::of(&w.buf)
     }
 }
@@ -1802,13 +1837,27 @@ fn publish_phase(
 // ---- ThinLTO manifest codecs (fail-closed, versioned, length-prefixed) --------------------------
 
 impl Writer {
-    /// A sorted-inbound-import sequence `(src, guid, kind)`.
+    fn partition_key(&mut self, key: &PartitionKey) {
+        match key {
+            PartitionKey::WholeUnit => self.u8(0),
+            PartitionKey::Support => self.u8(1),
+            PartitionKey::Function(function) => {
+                self.u8(2);
+                self.str(function.as_str());
+            }
+        }
+    }
+    fn partition_source(&mut self, source: &ThinPartitionSource) {
+        self.str(&source.unit);
+        self.partition_key(&source.partition);
+    }
+    /// A sorted inbound-import sequence with exact source partition identity.
     fn inbound_imports(&mut self, v: &[InboundImport]) {
         self.u32(u32_len(v.len()));
-        for (src, guid, kind) in v {
-            self.str(src);
-            self.u64(*guid);
-            self.bool(*kind);
+        for import in v {
+            self.partition_source(&import.source);
+            self.u64(import.guid);
+            self.bool(import.is_definition);
         }
     }
     fn u64_seq(&mut self, v: &[u64]) {
@@ -1822,6 +1871,13 @@ impl Writer {
         for (name, h) in v {
             self.str(name);
             self.h128(*h);
+        }
+    }
+    fn import_source_digests(&mut self, v: &[ImportSourceDigest]) {
+        self.u32(u32_len(v.len()));
+        for digest in v {
+            self.partition_source(&digest.source);
+            self.h128(digest.prelink_digest);
         }
     }
     fn str_seq(&mut self, v: &[String]) {
@@ -1850,6 +1906,7 @@ fn write_prelink_key(w: &mut Writer, k: &PrelinkKey) {
     w.bool(k.rt_lto);
     w.opt_h128(k.rt_lto_digest);
     w.str(&k.unit);
+    w.partition_key(&k.partition);
 }
 
 fn write_backend_key(w: &mut Writer, k: &BackendKey) {
@@ -1870,9 +1927,10 @@ fn write_backend_key(w: &mut Writer, k: &BackendKey) {
     w.h128(k.own_prelink_digest);
     w.inbound_imports(&k.inbound_imports);
     w.u64_seq(&k.outbound_exports);
-    w.digest_seq(&k.import_source_digests);
+    w.import_source_digests(&k.import_source_digests);
     w.str_seq(&k.exports);
     w.str(&k.unit);
+    w.partition_key(&k.partition);
 }
 
 fn serialize_prelink_manifest(key: &PrelinkKey, blob_digest: Hash128) -> Vec<u8> {
@@ -1900,14 +1958,47 @@ impl<'a> Reader<'a> {
             Err(CacheDecodeError::BadTag { what: "phase", tag })
         }
     }
+    fn partition_key(&mut self) -> Result<PartitionKey, CacheDecodeError> {
+        match self.u8()? {
+            0 => Ok(PartitionKey::WholeUnit),
+            1 => Ok(PartitionKey::Support),
+            2 => ProgramCall::try_from_logical(&self.str()?)
+                .map(PartitionKey::Function)
+                .map_err(|_| CacheDecodeError::SemanticRange),
+            tag => Err(CacheDecodeError::BadTag {
+                what: "partition",
+                tag,
+            }),
+        }
+    }
+    fn partition_source(&mut self) -> Result<ThinPartitionSource, CacheDecodeError> {
+        Ok(ThinPartitionSource {
+            unit: self.str()?,
+            partition: self.partition_key()?,
+        })
+    }
     fn inbound_imports(&mut self) -> Result<Vec<InboundImport>, CacheDecodeError> {
-        self.seq(|r| Ok((r.str()?, r.u64()?, r.bool()?)))
+        self.seq(|r| {
+            Ok(InboundImport {
+                source: r.partition_source()?,
+                guid: r.u64()?,
+                is_definition: r.bool()?,
+            })
+        })
     }
     fn u64_seq(&mut self) -> Result<Vec<u64>, CacheDecodeError> {
         self.seq(|r| r.u64())
     }
     fn digest_seq(&mut self) -> Result<Vec<(String, Hash128)>, CacheDecodeError> {
         self.seq(|r| Ok((r.str()?, r.h128()?)))
+    }
+    fn import_source_digests(&mut self) -> Result<Vec<ImportSourceDigest>, CacheDecodeError> {
+        self.seq(|r| {
+            Ok(ImportSourceDigest {
+                source: r.partition_source()?,
+                prelink_digest: r.h128()?,
+            })
+        })
     }
     fn str_seq(&mut self) -> Result<Vec<String>, CacheDecodeError> {
         self.seq(|r| r.str())
@@ -1938,6 +2029,7 @@ fn deserialize_prelink_manifest(bytes: &[u8]) -> Result<(PrelinkKey, Hash128), C
         rt_lto: r.bool()?,
         rt_lto_digest: r.opt_h128()?,
         unit: r.str()?,
+        partition: r.partition_key()?,
     };
     let blob_digest = r.h128()?;
     r.finish()?;
@@ -1968,9 +2060,10 @@ fn deserialize_backend_manifest(bytes: &[u8]) -> Result<(BackendKey, Hash128), C
         own_prelink_digest: r.h128()?,
         inbound_imports: r.inbound_imports()?,
         outbound_exports: r.u64_seq()?,
-        import_source_digests: r.digest_seq()?,
+        import_source_digests: r.import_source_digests()?,
         exports: r.str_seq()?,
         unit: r.str()?,
+        partition: r.partition_key()?,
     };
     let blob_digest = r.h128()?;
     r.finish()?;
@@ -2018,9 +2111,9 @@ mod tests {
             .collect()
     }
 
-    const CODEGEN_V4_GOLDEN: &str = concat!(
-        "04000000",                         // manifest v4
-        "04000000",                         // key v4
+    const CODEGEN_V5_GOLDEN: &str = concat!(
+        "05000000",                         // manifest v5
+        "05000000",                         // key v5
         "01000000000000000200000000000000", // compiler build
         "01000000",
         "00",                               // frontend schema, located
@@ -2050,8 +2143,8 @@ mod tests {
     );
 
     #[test]
-    fn codegen_v4_manifest_golden_is_bidirectional() {
-        let expected = golden_bytes(CODEGEN_V4_GOLDEN);
+    fn codegen_v5_manifest_golden_is_bidirectional() {
+        let expected = golden_bytes(CODEGEN_V5_GOLDEN);
         let key = sample_key();
         let blob = Hash128 { lo: 9, hi: 10 };
         assert_eq!(serialize_manifest(&key, blob), expected);
@@ -2694,6 +2787,10 @@ mod tests {
 
     // ---- ThinLTO S2 key codecs + first-diff -----------------------------------------------------
 
+    fn program_call(name: &str) -> ProgramCall {
+        ProgramCall::try_from_logical(name).expect("valid test function identity")
+    }
+
     fn sample_prelink_key() -> PrelinkKey {
         PrelinkKey {
             cache_format_version: CACHE_KEY_FORMAT_VERSION,
@@ -2712,6 +2809,7 @@ mod tests {
             rt_lto: false,
             rt_lto_digest: None,
             unit: "main".to_string(),
+            partition: PartitionKey::Function(program_call("f")),
         }
     }
 
@@ -2731,18 +2829,32 @@ mod tests {
             pipeline: "default<O2>".to_string(),
             codegen_opt: "default".to_string(),
             own_prelink_digest: Hash128 { lo: 8, hi: 9 },
-            inbound_imports: vec![("lib".to_string(), 42, true)],
+            inbound_imports: vec![InboundImport {
+                source: ThinPartitionSource {
+                    unit: "lib".to_string(),
+                    partition: PartitionKey::Function(program_call("callee")),
+                },
+                guid: 42,
+                is_definition: true,
+            }],
             outbound_exports: vec![7, 11],
-            import_source_digests: vec![("lib".to_string(), Hash128 { lo: 10, hi: 11 })],
+            import_source_digests: vec![ImportSourceDigest {
+                source: ThinPartitionSource {
+                    unit: "lib".to_string(),
+                    partition: PartitionKey::Function(program_call("callee")),
+                },
+                prelink_digest: Hash128 { lo: 10, hi: 11 },
+            }],
             exports: Vec::new(),
             unit: "main".to_string(),
+            partition: PartitionKey::Function(program_call("caller")),
         }
     }
 
-    const PRELINK_V4_GOLDEN: &str = concat!(
-        "04000000",
+    const PRELINK_V5_GOLDEN: &str = concat!(
+        "05000000",
         "01",
-        "04000000", // manifest, phase, key
+        "05000000", // manifest, phase, key
         "01000000000000000200000000000000",
         "03000000",
         "00",                               // compiler, frontend, located
@@ -2761,13 +2873,15 @@ mod tests {
         "00",
         "00",
         "040000006d61696e",                 // rt-lto, optional, unit
+        "02",
+        "0100000066",                       // function partition `f`
         "63000000000000006400000000000000", // blob
     );
 
-    const BACKEND_V4_GOLDEN: &str = concat!(
-        "04000000",
+    const BACKEND_V5_GOLDEN: &str = concat!(
+        "05000000",
         "02",
-        "04000000",                         // manifest, phase, key
+        "05000000",                         // manifest, phase, key
         "01000000000000000200000000000000", // compiler
         "0600000032322e312e38",
         "0c000000000000000d00000000000000", // LLVM
@@ -2783,22 +2897,28 @@ mod tests {
         "08000000000000000900000000000000", // own prelink
         "01000000",
         "030000006c6962",
+        "02",
+        "0600000063616c6c6565",
         "2a00000000000000",
-        "01", // inbound
+        "01", // inbound source partition, guid, definition
         "02000000",
         "0700000000000000",
         "0b00000000000000", // outbound
         "01000000",
         "030000006c6962",
+        "02",
+        "0600000063616c6c6565",
         "0a000000000000000b00000000000000", // imports
         "00000000",
         "040000006d61696e",                 // exports, unit
+        "02",
+        "0600000063616c6c6572",             // function partition `caller`
         "05000000000000000600000000000000", // blob
     );
 
     #[test]
-    fn thin_codegen_v4_manifest_goldens_are_bidirectional() {
-        let prelink = golden_bytes(PRELINK_V4_GOLDEN);
+    fn thin_codegen_v5_manifest_goldens_are_bidirectional() {
+        let prelink = golden_bytes(PRELINK_V5_GOLDEN);
         let prelink_key = sample_prelink_key();
         let prelink_blob = Hash128 { lo: 99, hi: 100 };
         assert_eq!(
@@ -2810,7 +2930,7 @@ mod tests {
             Ok((prelink_key, prelink_blob))
         );
 
-        let backend = golden_bytes(BACKEND_V4_GOLDEN);
+        let backend = golden_bytes(BACKEND_V5_GOLDEN);
         let backend_key = sample_backend_key();
         let backend_blob = Hash128 { lo: 5, hi: 6 };
         assert_eq!(
@@ -2916,11 +3036,11 @@ mod tests {
         assert_eq!(backend_first_diff(&base, &k), FirstDiff::PrelinkInput);
         // Import-source digest changed (a dep private edit) with own prelink unchanged → CrossUnitImports.
         let mut k = base.clone();
-        k.import_source_digests[0].1 = Hash128 { lo: 0, hi: 0 };
+        k.import_source_digests[0].prelink_digest = Hash128 { lo: 0, hi: 0 };
         assert_eq!(backend_first_diff(&base, &k), FirstDiff::CrossUnitImports);
         // Inbound import edge changed → CrossUnitImports.
         let mut k = base.clone();
-        k.inbound_imports[0].2 = false;
+        k.inbound_imports[0].is_definition = false;
         assert_eq!(backend_first_diff(&base, &k), FirstDiff::CrossUnitImports);
         // Outbound export set changed → CrossUnitImports.
         let mut k = base.clone();

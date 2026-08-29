@@ -1,0 +1,11 @@
+[package]
+name = "align-function-incremental-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+align_driver = { path = "../../crates/align_driver" }
+align_span = { path = "../../crates/align_span" }
+
+[workspace]
