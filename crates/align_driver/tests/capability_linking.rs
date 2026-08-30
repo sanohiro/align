@@ -157,6 +157,29 @@ fn asymmetric_crypto_uses_the_same_capability_link_boundary() {
 }
 
 #[test]
+fn asymmetric_key_drop_paths_retain_the_crypto_link_boundary() {
+    let cases = [
+        ("direct", "fn discard(key: ed25519_public_key) {}\n"),
+        (
+            "struct",
+            "Holder { key: ed25519_public_key }\nfn discard(value: Holder) {}\n",
+        ),
+        (
+            "sum",
+            "KeyChoice { Present(ed25519_public_key), Empty }\nfn discard(value: KeyChoice) {}\n",
+        ),
+    ];
+    for (label, declaration) in cases {
+        let src = format!("import std.crypto\n{declaration}fn main() -> i32 = 0\n");
+        assert_eq!(
+            gated_link_libs(&format!("cap-crypto-key-drop-{label}"), &src),
+            vec!["crypto".to_string(), "z".to_string(), "zstd".to_string()],
+            "{label} key carrier Drop must retain libcrypto",
+        );
+    }
+}
+
+#[test]
 fn http_client_requests_the_full_tls_set() {
     // Any HTTP client use may hit the TLS path (the scheme is a runtime decision) → ssl + crypto,
     // transitively the compress libraries.

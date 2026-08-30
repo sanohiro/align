@@ -63150,17 +63150,28 @@ fn scalar_arg(
 /// (`{fn_ptr, env_ptr}`), already represented by `Scalar::Fn`; keeping them out of `ty_to_scalar`
 /// preserves the narrower Option/Result/box payload surface while allowing homogeneous callback
 /// lists such as pkg.web middleware.
+#[derive(Clone, Copy)]
+struct CollectionTypeTables<'a> {
+    structs: &'a [StructDef],
+    tuples: &'a [hir::TupleDef],
+    enums: &'a [hir::EnumDef],
+}
+
 fn collection_scalar_arg(
     ty: Ty,
     what: &str,
-    structs: &[StructDef],
-    tuples: &[hir::TupleDef],
-    enums: &[hir::EnumDef],
+    tables: CollectionTypeTables<'_>,
     tagged_types: &mut Vec<hir::TaggedType>,
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
-    if ty_contains_signature_key(ty, structs, tuples, enums, tagged_types) {
+    if ty_contains_signature_key(
+        ty,
+        tables.structs,
+        tables.tuples,
+        tables.enums,
+        tagged_types,
+    ) {
         diags.error(
             format!(
                 "{what} cannot be `{}` — a signature key is a single owner, not a collection element",
@@ -64077,9 +64088,11 @@ fn resolve_type(
             match collection_scalar_arg(
                 inner,
                 "slice element",
-                cx.structs,
-                cx.tuples,
-                cx.enums,
+                CollectionTypeTables {
+                    structs: cx.structs,
+                    tuples: cx.tuples,
+                    enums: cx.enums,
+                },
                 cx.tagged_types,
                 span,
                 diags,
@@ -64158,9 +64171,11 @@ fn resolve_type(
                         collection_scalar_arg(
                             inner,
                             "array element",
-                            cx.structs,
-                            cx.tuples,
-                            cx.enums,
+                            CollectionTypeTables {
+                                structs: cx.structs,
+                                tuples: cx.tuples,
+                                enums: cx.enums,
+                            },
                             cx.tagged_types,
                             span,
                             diags,
@@ -64207,9 +64222,11 @@ fn resolve_type(
                 _ => match collection_scalar_arg(
                     inner,
                     "array element",
-                    cx.structs,
-                    cx.tuples,
-                    cx.enums,
+                    CollectionTypeTables {
+                        structs: cx.structs,
+                        tuples: cx.tuples,
+                        enums: cx.enums,
+                    },
                     cx.tagged_types,
                     span,
                     diags,

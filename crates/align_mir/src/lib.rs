@@ -2652,11 +2652,12 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
 }
 
 /// The capabilities a single function requires — the gated external libraries its builtins or
-/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A receive-stream Drop can close a
-/// TLS connection even when the function never reads it, so the slot types are part of this answer
-/// alongside [`rvalue_capability`]. The per-function granularity is what the M15 per-unit interface
-/// summary unions over a unit's functions. Emitted in first-seen order (deduped); an empty vec for a
-/// function with no gated feature.
+/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A signature-key Drop calls
+/// libcrypto and a receive-stream Drop can close a TLS connection even when the function never uses
+/// either handle, so the slot types are part of this answer alongside [`rvalue_capability`]. The
+/// per-function granularity is what the M15 per-unit interface summary unions over a unit's
+/// functions. Emitted in first-seen order (deduped); an empty vec for a function with no gated
+/// feature.
 #[inline(never)]
 pub fn function_capabilities(
     f: &Function,
@@ -2675,6 +2676,19 @@ pub fn function_capabilities(
                 caps.push(cap);
             }
         }
+    }
+    if !caps.contains(&Capability::Crypto)
+        && f.slots.iter().copied().any(|ty| {
+            align_sema::ty_contains_signature_key(
+                ty,
+                structs,
+                tuples,
+                enums,
+                tagged_types,
+            )
+        })
+    {
+        caps.push(Capability::Crypto);
     }
     if !caps.contains(&Capability::Tls)
         && f.slots.iter().copied().any(|ty| {
@@ -17157,7 +17171,13 @@ fn lower_crypto_signature(b: &mut Builder, expression: &hir::Expr) -> Operand {
             ));
             emit_status_bool_result(b, code, out, expression.ty)
         }
-        _ => unreachable!("signature lowering receives one closed HIR variant"),
+        // The out-of-line dispatcher above admits only the five signature variants. Keep a
+        // fail-closed terminal for a future dispatcher/helper drift instead of panicking in the
+        // compiler on an unchecked or hand-overridden HIR record.
+        _ => {
+            b.terminate(Term::Unreachable);
+            terminated_operand()
+        }
     }
 }
 

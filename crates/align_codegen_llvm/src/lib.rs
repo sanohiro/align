@@ -15443,7 +15443,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("crypto key constructor returns i32 status")
+                    .ok_or_else(|| self.err("crypto key constructor returned no status"))?
             }
             Rvalue::CryptoPublicKeyFromPem { algorithm, pem, out } => {
                 let out_ptr = self.slots[out];
@@ -15461,7 +15461,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("crypto key constructor returns i32 status")
+                    .ok_or_else(|| self.err("crypto key constructor returned no status"))?
             }
             Rvalue::CryptoPublicKeyFromJwk(args) => {
                 let out_ptr = self.slots[&args.out];
@@ -15493,7 +15493,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("crypto JWK constructor returns i32 status")
+                    .ok_or_else(|| self.err("crypto JWK constructor returned no status"))?
             }
             Rvalue::CryptoSign { algorithm, key, message, out } => {
                 let out_ptr = self.slots[out];
@@ -15518,7 +15518,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("crypto sign returns i32 status")
+                    .ok_or_else(|| self.err("crypto sign returned no status"))?
             }
             Rvalue::CryptoVerify(args) => {
                 let out_ptr = self.slots[&args.out];
@@ -15546,7 +15546,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("crypto verify returns i32 status")
+                    .ok_or_else(|| self.err("crypto verify returned no status"))?
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime

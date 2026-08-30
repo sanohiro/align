@@ -378,13 +378,13 @@ impl Drop for SensitiveDer {
 }
 
 fn output_slot<T>(out: *mut T) -> Option<()> {
-    (!out.is_null() && (out as usize) % align_of::<T>() == 0).then_some(())
+    (!out.is_null() && out.addr().is_multiple_of(align_of::<T>())).then_some(())
 }
 
 fn input_view<'a>(input: *const u8, len: i64) -> Result<&'a [u8], c_int> {
     let len = usize::try_from(len)
         .ok()
-        .filter(|len| *len <= isize::MAX as usize)
+        .filter(|len| *len <= isize::MAX.unsigned_abs())
         .ok_or(AL_INVALID)?;
     if len == 0 {
         return Ok(&[]);
@@ -396,7 +396,7 @@ fn input_view<'a>(input: *const u8, len: i64) -> Result<&'a [u8], c_int> {
 }
 
 unsafe fn checked_key<'a>(key: *mut CryptoKey, expected: KeyKind) -> Result<&'a CryptoKey, c_int> {
-    if key.is_null() || (key as usize) % align_of::<CryptoKey>() != 0 {
+    if key.is_null() || !key.addr().is_multiple_of(align_of::<CryptoKey>()) {
         return Err(AL_INVALID);
     }
     let key = unsafe { &*key };
@@ -611,7 +611,7 @@ fn parse_pem(input: &[u8], private: bool) -> Result<SensitiveDer, c_int> {
     if !(4..=64).contains(&last.len()) {
         return Err(AL_INVALID);
     }
-    decode_base64(&lines)
+    decode_base64(lines)
 }
 
 struct DerCursor<'a> {
@@ -1047,18 +1047,24 @@ fn import_input_reason(lib: c_ulong, reason: c_ulong) -> bool {
     }
 }
 
-fn failed_status(errors: ErrorQueue, decoder_only: bool) -> c_int {
-    if !errors.empty
-        && if decoder_only {
-            errors.decoder_input_only
-        } else {
-            errors.import_input_only
-        }
-    {
+fn decoder_failure_status(errors: ErrorQueue) -> c_int {
+    if !errors.empty && errors.decoder_input_only {
         AL_INVALID
     } else {
         AL_CODE
     }
+}
+
+fn import_failure_status(errors: ErrorQueue) -> c_int {
+    if !errors.empty && errors.import_input_only {
+        AL_INVALID
+    } else {
+        AL_CODE
+    }
+}
+
+fn internal_failure_status(_errors: ErrorQueue) -> c_int {
+    AL_CODE
 }
 
 fn check_result_status(rc: c_int, errors: ErrorQueue) -> Result<(), c_int> {
@@ -1100,7 +1106,7 @@ unsafe fn decode_private(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(),
     let info = unsafe { d2i_PKCS8_PRIV_KEY_INFO(ptr::null_mut(), &mut cursor, length) };
     let errors = drain_errors();
     if info.is_null() {
-        return Err(failed_status(errors, true));
+        return Err(decoder_failure_status(errors));
     }
     let result: Result<(), c_int> = (|| {
         if cursor != unsafe { der.ptr.as_ptr().add(der.len) }.cast_const() {
@@ -1127,13 +1133,13 @@ unsafe fn decode_private(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(),
             || private_len <= 0
             || algorithm.is_null()
         {
-            return Err(failed_status(get_errors, false));
+            return Err(import_failure_status(get_errors));
         }
         clear_errors();
         let encoded_len = unsafe { i2d_PKCS8_PRIV_KEY_INFO(info, ptr::null_mut()) };
         let len_errors = drain_errors();
         if encoded_len <= 0 {
-            return Err(failed_status(len_errors, false));
+            return Err(internal_failure_status(len_errors));
         }
         let encoded_len = usize::try_from(encoded_len).map_err(|_| AL_CODE)?;
         let encoded = SensitiveDer::new(encoded_len)?;
@@ -1144,7 +1150,7 @@ unsafe fn decode_private(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(),
         if usize::try_from(written).ok() != Some(encoded_len)
             || encoded_cursor != unsafe { encoded.ptr.as_ptr().add(encoded_len) }
         {
-            return Err(failed_status(encode_errors, false));
+            return Err(internal_failure_status(encode_errors));
         }
         if encoded.as_slice() != der.as_slice() {
             return Err(AL_INVALID);
@@ -1155,7 +1161,7 @@ unsafe fn decode_private(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(),
         let pkey = unsafe { EVP_PKCS82PKEY_ex(info, parts.libctx, PROPQ.as_ptr()) };
         let import_errors = drain_errors();
         if pkey.is_null() {
-            return Err(failed_status(import_errors, false));
+            return Err(import_failure_status(import_errors));
         }
         parts.pkey = pkey;
         Ok(())
@@ -1183,7 +1189,7 @@ unsafe fn decode_public(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(), 
     };
     let errors = drain_errors();
     if pkey.is_null() {
-        return Err(failed_status(errors, true));
+        return Err(decoder_failure_status(errors));
     }
     parts.pkey = pkey;
     if cursor != unsafe { der.ptr.as_ptr().add(der.len) }.cast_const() {
@@ -1193,7 +1199,7 @@ unsafe fn decode_public(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(), 
     let encoded_len = unsafe { i2d_PUBKEY(pkey, ptr::null_mut()) };
     let len_errors = drain_errors();
     if encoded_len <= 0 {
-        return Err(failed_status(len_errors, false));
+        return Err(internal_failure_status(len_errors));
     }
     let encoded_len = usize::try_from(encoded_len).map_err(|_| AL_CODE)?;
     let encoded = SensitiveDer::new(encoded_len)?;
@@ -1204,7 +1210,7 @@ unsafe fn decode_public(parts: &mut KeyParts, der: &SensitiveDer) -> Result<(), 
     if usize::try_from(written).ok() != Some(encoded_len)
         || encoded_cursor != unsafe { encoded.ptr.as_ptr().add(encoded_len) }
     {
-        return Err(failed_status(encode_errors, false));
+        return Err(internal_failure_status(encode_errors));
     }
     if encoded.as_slice() != der.as_slice() {
         return Err(AL_INVALID);
@@ -1228,7 +1234,7 @@ fn get_bn(pkey: *mut c_void, name: &core::ffi::CStr) -> Result<Bn, c_int> {
     let rc = unsafe { EVP_PKEY_get_bn_param(pkey, name.as_ptr(), &mut bn) };
     let errors = drain_errors();
     if rc != 1 || bn.is_null() {
-        Err(failed_status(errors, false))
+        Err(import_failure_status(errors))
     } else {
         Ok(Bn(bn))
     }
@@ -1285,7 +1291,7 @@ fn validate_ec(pkey: *mut c_void) -> Result<(), c_int> {
     };
     let errors = drain_errors();
     if rc != 1 {
-        return Err(failed_status(errors, false));
+        return Err(import_failure_status(errors));
     }
     if group.get(..written) != Some(b"prime256v1".as_slice()) {
         return Err(AL_INVALID);
@@ -1300,7 +1306,7 @@ fn raw_ed25519_public(pkey: *mut c_void) -> Result<[u8; 32], c_int> {
     let rc = unsafe { EVP_PKEY_get_raw_public_key(pkey, public.as_mut_ptr(), &mut len) };
     let errors = drain_errors();
     if rc != 1 || len != public.len() {
-        return Err(failed_status(errors, false));
+        return Err(import_failure_status(errors));
     }
     Ok(public)
 }
@@ -1541,7 +1547,7 @@ fn validate_provider_key(
     let check = unsafe { EVP_PKEY_CTX_new_from_pkey(parts.libctx, parts.pkey, PROPQ.as_ptr()) };
     let context_errors = drain_errors();
     if check.is_null() {
-        return Err(failed_status(context_errors, false));
+        return Err(internal_failure_status(context_errors));
     }
     let result: Result<(), c_int> = (|| {
         let run = |operation: unsafe extern "C" fn(*mut c_void) -> c_int| {
@@ -1614,6 +1620,11 @@ unsafe fn key_from_pem(
 }
 
 /// Construct one algorithm-specific private key from canonical unencrypted PKCS#8 PEM.
+///
+/// # Safety
+/// `out` must be aligned, writable pointer storage that does not overlap the input. When `pem_len`
+/// is positive, `pem_ptr` must remain readable for that many bytes through the call. A successful
+/// non-null key is owned by the caller and must be used and freed on this constructing thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_private_key_from_pem(
     algorithm: c_int,
@@ -1625,6 +1636,11 @@ pub unsafe extern "C" fn align_rt_crypto_private_key_from_pem(
 }
 
 /// Construct one algorithm-specific public key from canonical SPKI PEM.
+///
+/// # Safety
+/// `out` must be aligned, writable pointer storage that does not overlap the input. When `pem_len`
+/// is positive, `pem_ptr` must remain readable for that many bytes through the call. A successful
+/// non-null key is owned by the caller and must be used and freed on this constructing thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_public_key_from_pem(
     algorithm: c_int,
@@ -1658,7 +1674,7 @@ fn validate_jwk_shape(algorithm: Algorithm, first: &[u8], second: &[u8]) -> Resu
             {
                 return Err(AL_INVALID);
             }
-            let leading = first[0].leading_zeros() as usize;
+            let leading = usize::try_from(first[0].leading_zeros()).map_err(|_| AL_CODE)?;
             let bits = first
                 .len()
                 .checked_mul(8)
@@ -1798,14 +1814,14 @@ fn import_jwk(
             OSSL_PARAM_free(params);
             OSSL_PARAM_BLD_free(builder);
         }
-        return Err(failed_status(context_errors, false));
+        return Err(internal_failure_status(context_errors));
     }
     let result = (|| {
         clear_errors();
         let init = unsafe { EVP_PKEY_fromdata_init(context) };
         let init_errors = drain_errors();
         if init != 1 {
-            return Err(failed_status(init_errors, false));
+            return Err(internal_failure_status(init_errors));
         }
         let mut pkey = ptr::null_mut();
         #[cfg(test)]
@@ -1818,7 +1834,7 @@ fn import_jwk(
         // `rc`, so the `KeyParts` unwind frees it on every mixed result/out state.
         parts.pkey = pkey;
         if rc != 1 || parts.pkey.is_null() {
-            return Err(failed_status(errors, false));
+            return Err(import_failure_status(errors));
         }
         Ok(())
     })();
@@ -1831,6 +1847,12 @@ fn import_jwk(
 }
 
 /// Construct a public key from already-base64url-decoded JWK components.
+///
+/// # Safety
+/// `out` must be aligned, writable pointer storage that does not overlap either input. Each input
+/// pointer with a positive length must remain readable for that many bytes through the call. A
+/// successful non-null key is owned by the caller and must be used and freed on this constructing
+/// thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_public_key_from_jwk(
     algorithm: c_int,
@@ -1993,7 +2015,7 @@ fn es_der_to_raw(der: &[u8]) -> Result<Vec<u8>, c_int> {
         if !signature.is_null() {
             unsafe { ECDSA_SIG_free(signature) };
         }
-        return Err(failed_status(errors, false));
+        return Err(internal_failure_status(errors));
     }
     let result = (|| {
         let mut r = ptr::null();
@@ -2068,7 +2090,7 @@ fn es_raw_to_der(raw: &[u8]) -> Result<Option<Vec<u8>>, c_int> {
     unsafe { ECDSA_SIG_free(signature) };
     if usize::try_from(written).ok() != Some(len) || cursor != unsafe { der.as_mut_ptr().add(len) }
     {
-        return Err(failed_status(errors, false));
+        return Err(internal_failure_status(errors));
     }
     Ok(Some(der))
 }
@@ -2173,6 +2195,13 @@ fn verify(
 }
 
 /// Sign the complete message with the exact algorithm selected by the private-key type.
+///
+/// # Safety
+/// `out` must be aligned, writable pointer storage that does not overlap `key` or the message. A
+/// non-null `key` must be a live private key returned by this runtime on the current thread. When
+/// `message_len` is positive, `message_ptr` must remain readable for that many bytes through the
+/// call. A successful non-null buffer is owned by the caller and must be released exactly once with
+/// `align_rt_buffer_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_sign(
     algorithm: c_int,
@@ -2209,6 +2238,11 @@ pub unsafe extern "C" fn align_rt_crypto_sign(
 }
 
 /// Verify an exact public wire signature, publishing one `i32` truth value.
+///
+/// # Safety
+/// `out` must be aligned, writable `i32` storage that does not overlap the key or either byte view.
+/// A non-null `key` must be a live public key returned by this runtime on the current thread. Each
+/// input pointer with a positive length must remain readable for that many bytes through the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_verify(
     algorithm: c_int,
@@ -2258,6 +2292,10 @@ pub unsafe extern "C" fn align_rt_crypto_verify(
 }
 
 /// Release an asymmetric key owner. Null-safe for moved-from slots.
+///
+/// # Safety
+/// A non-null `key` must be the unique live owner returned by a constructor on the current thread.
+/// It must not have been freed before, and no alias may be accessed after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_crypto_key_free(key: *mut CryptoKey) {
     if key.is_null() {
@@ -3159,12 +3197,35 @@ ffe44KuP9kQrPDMuiLeeP4rIg+vpp4gQe1BHj4tE2ODWl5rl10qvlogOCw==\n\
             import_input_only: true,
             verify_mismatch_only: true,
         };
+        let decoder_input = ErrorQueue {
+            empty: false,
+            decoder_input_only: true,
+            import_input_only: false,
+            verify_mismatch_only: false,
+        };
+        let import_input = ErrorQueue {
+            empty: false,
+            decoder_input_only: false,
+            import_input_only: true,
+            verify_mismatch_only: false,
+        };
         let code = ErrorQueue {
             empty: false,
             decoder_input_only: false,
             import_input_only: false,
             verify_mismatch_only: false,
         };
+        assert_eq!(decoder_failure_status(empty), AL_CODE);
+        assert_eq!(decoder_failure_status(decoder_input), AL_INVALID);
+        assert_eq!(decoder_failure_status(import_input), AL_CODE);
+        assert_eq!(decoder_failure_status(code), AL_CODE);
+        assert_eq!(import_failure_status(empty), AL_CODE);
+        assert_eq!(import_failure_status(decoder_input), AL_CODE);
+        assert_eq!(import_failure_status(import_input), AL_INVALID);
+        assert_eq!(import_failure_status(code), AL_CODE);
+        for queue in [empty, decoder_input, import_input, input, code] {
+            assert_eq!(internal_failure_status(queue), AL_CODE);
+        }
         for queue in [empty, input, code] {
             assert_eq!(check_result_status(1, queue), Ok(()));
             assert_eq!(verify_result_status(1, queue), Ok(true));
