@@ -1215,9 +1215,11 @@ and unique per module. Canonical ids are `<module>::<name>`, and discovery is li
 entry/import closure in deterministic dependency-first, then declaration order.
 
 With `import core.test`, `test.expect(bool)` and `test.expect_eq(left, right)` are standalone
-test-body assertions. Equality reuses the language's existing `==` rule and left-to-right eager
-evaluation. Failure reports the canonical id and one-based call location, then returns
-`Error.Invalid` through the test cleanup edge; no operand reflection or formatting is added.
+test-body assertions. Equality reuses the language's existing `==` rule, requires its result to be
+exact `bool`, and uses left-to-right eager evaluation. Vector/mask equality therefore rejects
+instead of acquiring an implicit all-lanes reduction. Failure reports the canonical id and
+one-based call location, then returns `Error.Invalid` through the test cleanup edge; no operand
+reflection or formatting is added.
 
 `alignc test` links the closure once and launches that immutable test artifact in a fresh process
 group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
@@ -1225,8 +1227,10 @@ return from exit, exec, abort, and crash. Each test has bounded time and per-str
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a
 fully passing suite always has one summary line. No user `main` is required or invoked. Production
 commands type-check tests but omit their bodies, capabilities, and names from production MIR,
-interfaces, links, and artifacts. Test compilation has a separate versioned cache domain. The
-complete grammar, bounds, wire bytes, error precedence, CLI options, ownership, reporting, and
+interfaces, links, and artifacts; `explain-opt` also omits them from located MIR/remarks, and
+`db prepare` omits test-body queries from static descriptors/native preparation. Test compilation
+has a separate versioned cache domain. The complete grammar, bounds, wire bytes, error precedence,
+CLI options, ownership, reporting, and
 acceptance matrix are in `docs/impl/core-design/test.md`.
 
 ## Packages

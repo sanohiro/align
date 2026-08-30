@@ -1302,8 +1302,10 @@ separate cache identity and links the explicit import closure once.
 Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
 unwinding to the language. A compiler-owned completion record means an early exit zero cannot
-masquerade as a returned Ok. The runner applies fixed time and output bounds, reaps the full child
-group on failure, and continues deterministically.
+masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
+from user termination. The runner applies fixed time and output bounds, signals the complete child
+group on failure, reaps only its direct child, and continues only after cleanup succeeds; descendants
+are signalled but not reaped by this parent.
 
 Passing stdout and stderr are retained only while the child is live, then discarded. A failure
 replays just that test's bounded evidence. This makes a thousand passing tests produce the same

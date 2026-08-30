@@ -393,9 +393,11 @@ facts must live in this repository.
   optimized/unoptimized lowering, and the explicit resource probe.
 - **Next language capability:** `core.test` is designed in
   `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
-  explicit test-only assertions, one linked test artifact run sequentially in a fresh process group
-  per test, a fail-closed normal-return record, bounded time/output, and failure-only output replay.
-  Production interfaces/MIR/links stay test-free. Implementation is the next code PR; `std.id`
+  explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
+  group per test, a fixed launch acknowledgement, fail-closed normal-return record, bounded
+  preallocated output/time, direct-child cleanup, and failure-only output replay. Production
+  interfaces/MIR/links, optimization remarks, and DB preparation descriptors stay test-free.
+  Implementation is the next code PR; `std.id`
   remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration

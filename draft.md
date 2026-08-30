@@ -2682,8 +2682,10 @@ Tests are Impure and are not callable or exported.
 `import core.test` admits exactly the qualified standalone assertion statements
 `test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
 ordinary nested blocks, excluding lambdas. The first requires exact bool. The second reuses the
-ordinary `==` admission/type rule and evaluates left then right once. A false assertion identifies
-the canonical test id and one-based call location, then follows the test's Err cleanup edge with
+ordinary `==` admission/type rule, additionally requires that comparison to return exact bool, and
+evaluates left then right once. Vector/mask equality returns a mask and is therefore rejected rather
+than implicitly reduced. A false assertion identifies the canonical test id and one-based call
+location, then follows the test's Err cleanup edge with
 `Error.Invalid`; operand values and source text are not formatted or reflected.
 
 `alignc test <entry.align>` checks the explicit module closure, links one private test executable,
@@ -2698,9 +2700,10 @@ count. The exact grammar, bounds, record bytes, validation order, ownership, cac
 reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
 
 Production commands parse and type-check test declarations but omit them from production MIR,
-link capabilities, interfaces, and executables. A test-only edit may miss the source-keyed frontend
-cache but leaves the production object key and executable bytes unchanged. Test compilation uses a
-separate versioned cache domain.
+link capabilities, interfaces, and executables. This includes excluding tests from `explain-opt`
+located MIR/remarks and excluding test-body queries from `db prepare` static descriptors and native
+preparation. A test-only edit may miss the source-keyed frontend cache but leaves the production
+object key and executable bytes unchanged. Test compilation uses a separate versioned cache domain.
 
 ---
 

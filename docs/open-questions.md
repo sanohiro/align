@@ -26,8 +26,8 @@ creates no callable/exported name, and is checked as a compiler-private
 `fn() -> Result<(), core.Error>` with a documented implicit successful tail. With
 `import core.test`, exactly the standalone `test.expect(bool)` and
 `test.expect_eq(left, right)` assertions may early-return `Error.Invalid` from the lexical test
-body. Equality remains the ordinary `==` family; there is no assertion reflection or second error
-model.
+body. Equality remains the ordinary `==` family and must produce exact bool, so vector/mask equality
+is rejected rather than implicitly reduced; there is no assertion reflection or second error model.
 
 `alignc test` discovers only the explicit entry/import closure, links it once in a distinct test
 cache domain, and runs the dependency-first/source-order catalog sequentially in one fresh process
@@ -35,7 +35,11 @@ group per test. A bounded compiler-private completion record proves normal Ok/Er
 exec, abort, crash, timeout, output excess, and malformed records fail closed. Time and stdout/stderr
 are bounded. Passing output is suppressed and only a failed test's bounded bytes are replayed, so
 successful suite output is one summary line independent of test count. Production commands check
-test bodies but omit them from production MIR, interfaces, capabilities, and artifacts.
+test bodies but omit them from production MIR, interfaces, capabilities, and artifacts, including
+optimization remarks and database preparation descriptors. The fixed launch/acknowledgement ABI
+separates harness setup failure from user termination; cleanup failures stop the suite after
+preserving already-selected bounded evidence, and the runner signals descendants but reaps only its
+direct child.
 
 Record: `docs/impl/core-design/test.md`, `draft.md` §18.1, `docs/language-spec.md`
 

@@ -229,10 +229,14 @@ ordinary string token and formats the block with the same block rules; the conte
 always spelled `test`. Sema supplies the compiler-private `Result<Unit, Error>` function shape and
 the documented implicit Ok tail. With `import core.test`, qualified `test.expect` and
 `test.expect_eq` remain ordinary call-shaped AST expressions; semantic context restricts them to
-standalone statements in the lexical test body and ordinary nested blocks, never a lambda.
+standalone statements in the lexical test body and ordinary nested blocks, never a lambda. The
+equality form must produce exact `bool`; an ordinary vector/mask equality result is rejected rather
+than reduced.
 
-Normal commands parse and check tests but production lowering omits them. Test lowering retains the
-canonical module/name id and source ordinal in a flagged checked-HIR record. The exact grammar,
+Normal commands parse and check tests but production lowering omits them. `explain-opt` therefore
+forms no located test MIR/remark, while `db prepare` retains test diagnostics but forms no test-body
+static descriptor. Test lowering retains the canonical module/name id and source ordinal in a
+flagged checked-HIR record. The exact grammar,
 name/catalog bounds, mode split, cache identity, and closure matrix are
 `core-design/test.md`; that document, not this representation summary, owns the public contract.
 

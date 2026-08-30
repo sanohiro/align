@@ -536,7 +536,8 @@ The HIR expression discriminator is
 `True | Equal` byte, `condition` is exact Bool, and line/column are positive `u32` coordinates of
 the source assertion call. It is valid only in a `Some(TestMeta)` root and outside every nested
 lambda function; the complete expression is Unit. `Equal` is emitted only after sema has checked
-the original two operands with the ordinary `BinOp::Eq` rule and built one left-to-right Eq child;
+the original two operands with the ordinary `BinOp::Eq` rule, proved its result is exact Bool rather
+than vector/mask, and built one left-to-right Eq child;
 the validator does not reconstruct the unavailable two source operands from a bool. MIR lowers a
 false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
 true condition to Unit fallthrough.
