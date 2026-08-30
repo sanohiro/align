@@ -24987,9 +24987,10 @@ fn main() -> i32 = 0
         let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
         let p = lower(src);
         // `Point` plus the always-registered builtin structs `argon2_params` (the std.crypto Argon2
-        // parameters type) and `regex_match` (the std.regex match span) — both present in every
-        // program's struct table, like the builtin `Error` enum.
-        assert_eq!(p.structs.len(), 3);
+        // parameters type), `http_sse_event` (the std.http SSE event view), and `regex_match` (the
+        // std.regex match span) — all present in every program's struct table, like the builtin
+        // `Error` enum.
+        assert_eq!(p.structs.len(), 4);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.

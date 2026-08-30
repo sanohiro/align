@@ -1329,6 +1329,8 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("writer", 0, BuiltinCapability::BorrowLeaf),
     ("http_read_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_sse_stream", 0, BuiltinCapability::BorrowLeaf),
+    ("http_sse_event", 0, BuiltinCapability::BorrowLeaf),
+    ("http.http_sse_event", 0, BuiltinCapability::BorrowLeaf),
     ("http_headers", 0, BuiltinCapability::BorrowLeaf),
     ("json.doc", 0, BuiltinCapability::BorrowLeaf),
     ("slice", 1, BuiltinCapability::BorrowLeaf),
@@ -2595,6 +2597,9 @@ pub fn summary_to_source(
                         "regex.regex_match" => {
                             builtin_type_imports.insert("std.regex".to_string());
                         }
+                        "http_sse_event" | "http.http_sse_event" => {
+                            builtin_type_imports.insert("std.http".to_string());
+                        }
                         _ => {}
                     }
                     work.extend(args);
@@ -2784,6 +2789,8 @@ mod builtin_spelling_tests {
             "crypto.argon2_params",
             "regex_match",
             "regex.regex_match",
+            "http_sse_event",
+            "http.http_sse_event",
             // Walked into their arguments by the ownership analysis itself.
             "Option",
             "Result",

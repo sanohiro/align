@@ -13199,11 +13199,13 @@ fn hir_body_validator_native() {
     );
 
     let mut reject = program.clone();
-    let function = reject
+    let Some(function) = reject
         .fns
         .iter_mut()
         .find(|function| function.name == "native_http_sse_stream_next")
-        .expect("SSE next fixture is present");
+    else {
+        panic!("SSE next fixture is present")
+    };
     function.locals[1].is_mut = false;
     assert!(
         !body_core_metadata_is_valid(&reject),
@@ -13211,11 +13213,13 @@ fn hir_body_validator_native() {
     );
 
     let mut exclusive = program.clone();
-    let function = exclusive
+    let Some(function) = exclusive
         .fns
         .iter_mut()
         .find(|function| function.name == "native_http_sse_stream_next")
-        .expect("SSE next fixture is present");
+    else {
+        panic!("SSE next fixture is present")
+    };
     function.params = vec![0];
     function.param_modes = vec![align_ast::ParamMode::BorrowMut];
     function.locals[0].is_param = true;
@@ -13226,11 +13230,13 @@ fn hir_body_validator_native() {
     );
 
     let mut shared = exclusive;
-    let function = shared
+    let Some(function) = shared
         .fns
         .iter_mut()
         .find(|function| function.name == "native_http_sse_stream_next")
-        .expect("SSE next fixture is present");
+    else {
+        panic!("SSE next fixture is present")
+    };
     function.param_modes[0] = align_ast::ParamMode::Borrow;
     function.locals[0].is_mut = false;
     assert!(

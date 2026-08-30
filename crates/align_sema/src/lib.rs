@@ -65421,7 +65421,7 @@ mod tests {
             }
         }
         assert_eq!(
-            variants, 272,
+            variants, 276,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

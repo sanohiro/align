@@ -751,12 +751,15 @@ fn summary_source_deduplicates_builtin_and_dependency_imports() {
             "module lib\n\
              import std.crypto\n\
              import std.regex\n\
-             pub fn builtin_value(p: crypto.argon2_params, m: regex.regex_match) -> i64 = p.parallelism + m.end\n",
+             import std.http\n\
+             pub fn builtin_value(p: crypto.argon2_params, m: regex.regex_match) -> i64 = p.parallelism + m.end\n\
+             pub fn event_bare(e: http_sse_event) -> http_sse_event = e\n\
+             pub fn event_explicit(e: http.http_sse_event) -> http.http_sse_event = e\n",
         ),
         unit("main", true, "module main\nimport lib\nfn main() -> i32 = 0\n"),
     ]);
     let summary = find(&sums, "lib");
-    let rendered = summary_to_source(summary, &["std.regex", "std.crypto"]).unwrap();
+    let rendered = summary_to_source(summary, &["std.regex", "std.crypto", "std.http"]).unwrap();
     assert_eq!(
         rendered.lines().filter(|line| *line == "import std.crypto").count(),
         1,
@@ -766,6 +769,11 @@ fn summary_source_deduplicates_builtin_and_dependency_imports() {
         rendered.lines().filter(|line| *line == "import std.regex").count(),
         1,
         "builtin capability import must not be repeated when it is also a dependency"
+    );
+    assert_eq!(
+        rendered.lines().filter(|line| *line == "import std.http").count(),
+        1,
+        "an SSE event type must emit exactly one std.http import"
     );
 }
 

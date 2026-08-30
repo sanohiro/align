@@ -14212,6 +14212,9 @@ unsafe extern "C" {
     // macOS/BSD there is no `MSG_NOSIGNAL`; `SO_NOSIGPIPE` is set on the socket instead (see the http
     // client), so `flags` is `0` there. Identical prototype on Linux and macOS/BSD.
     fn send(sockfd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32) -> isize;
+    // `recv` — the connected-socket sibling used with `MSG_PEEK` at the exact close-delimited SSE
+    // work boundary. The one-byte application payload stays queued; zero reports peer EOF.
+    fn recv(sockfd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32) -> isize;
     // `bind`/`listen`/`accept` — the BSD server-side socket calls (identical prototypes on Linux and
     // macOS/BSD). `accept` with null `addr`/`addrlen` returns the connected fd without the peer
     // address. `bind` takes the `sockaddr` `getaddrinfo` filled. On Linux the CLOEXEC-atomic `accept4`
@@ -18597,6 +18600,7 @@ const TCP_NODELAY: i32 = 1;
 // dead peer, which must fail cleanly (→ retry on a fresh conn) rather than kill the process.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const MSG_NOSIGNAL: i32 = 0x4000; // Linux
+const MSG_PEEK: i32 = 0x2; // Linux and macOS/BSD
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const SO_NOSIGPIPE: i32 = 0x1022; // macOS/BSD socket option (SOL_SOCKET)
 
@@ -18685,6 +18689,7 @@ unsafe extern "C" {
     fn SSL_set_alpn_protos(ssl: *mut c_void, protos: *const u8, protos_len: c_uint) -> c_int;
     fn SSL_connect(ssl: *mut c_void) -> c_int;
     fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
+    fn SSL_peek(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
     fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
     fn SSL_get_error(ssl: *const c_void, ret: c_int) -> c_int;
     fn SSL_get_verify_result(ssl: *const c_void) -> c_long;
@@ -18830,6 +18835,28 @@ impl Conn {
         unsafe { self.read_raw(buf.as_mut_ptr(), buf.len(), has_deadline) }
     }
 
+    /// Observe whether one application byte or EOF is available without consuming the byte. This
+    /// is used only at the exact SSE source-work boundary: close-delimited framing needs EOF to
+    /// distinguish an exact fit from a rejected next byte, while that next byte must remain unread.
+    ///
+    /// # Safety
+    /// The conn must be live.
+    unsafe fn peek_one(&mut self, has_deadline: bool) -> ConnRead {
+        let mut byte = 0u8;
+        match *self {
+            Conn::Plain { fd } => unsafe { plain_peek(fd, &mut byte) },
+            Conn::Tls { ssl, .. } => {
+                // SSL_peek can process and emit protocol records just like SSL_read. Keep the
+                // per-thread SIGPIPE guard at the I/O boundary even though application data stays
+                // queued in OpenSSL.
+                let _sigpipe = SigpipeBlock::new();
+                #[cfg(test)]
+                tls_sigpipe_guard_observed(TlsSigpipeOperation::Read);
+                unsafe { tls_receive(ssl, &mut byte, 1, has_deadline, true) }
+            }
+        }
+    }
+
     /// Read up to `len` bytes into raw writable storage. Unlike [`Conn::read`], the destination may
     /// be a `Vec`'s uninitialised spare capacity; the transport initialises exactly the bytes named
     /// by `ConnRead::Data`. `has_deadline` (a `SO_RCVTIMEO` armed for this request) is only consulted
@@ -18927,6 +18954,35 @@ unsafe fn plain_read(fd: i32, dst: *mut u8, len: usize) -> ConnRead {
     }
 }
 
+/// Observe one plaintext socket byte without removing it from the receive queue. `MSG_PEEK` has the
+/// same value and blocking/timeout semantics on Linux and macOS/BSD; a zero result is peer EOF.
+///
+/// # Safety
+/// `fd` must be a valid connected socket and `dst` writable for one byte.
+unsafe fn plain_peek(fd: i32, dst: *mut u8) -> ConnRead {
+    loop {
+        let received = unsafe {
+            recv(
+                fd,
+                dst as *mut core::ffi::c_void,
+                1,
+                MSG_PEEK,
+            )
+        };
+        if received > 0 {
+            return ConnRead::Data(1);
+        }
+        if received == 0 {
+            return ConnRead::Eof;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return ConnRead::Err(io_read_write_status(&error));
+    }
+}
+
 /// Map an `SSL_get_error` code (+ the conn's verify state) to a status per the http.md Slice 5
 /// taxonomy: a verify failure (`SSL_get_verify_result != X509_V_OK`) is always `Error.Denied`; a
 /// syscall error carries its errno as `Error.Code` (errno 0 = unclean EOF → `Error.Invalid`); any
@@ -18993,9 +19049,29 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8], has_deadline: bool) 
 /// # Safety
 /// `ssl` must be a live handshaken `SSL*`, and `dst..dst+len` must be writable.
 unsafe fn tls_read(ssl: *mut c_void, dst: *mut u8, len: usize, has_deadline: bool) -> ConnRead {
+    unsafe { tls_receive(ssl, dst, len, has_deadline, false) }
+}
+
+/// Shared TLS application receive. `peek` selects `SSL_peek`, which may process records but leaves
+/// returned application bytes queued; all EOF/timeout/error classification stays identical to
+/// `SSL_read` so the exact-boundary probe cannot drift from ordinary streaming reads.
+///
+/// # Safety
+/// `ssl` must be a live handshaken `SSL*`, and `dst..dst+len` must be writable.
+unsafe fn tls_receive(
+    ssl: *mut c_void,
+    dst: *mut u8,
+    len: usize,
+    has_deadline: bool,
+    peek: bool,
+) -> ConnRead {
     loop {
         let want = len.min(c_int::MAX as usize) as c_int;
-        let n = unsafe { SSL_read(ssl, dst as *mut c_void, want) };
+        let n = if peek {
+            unsafe { SSL_peek(ssl, dst as *mut c_void, want) }
+        } else {
+            unsafe { SSL_read(ssl, dst as *mut c_void, want) }
+        };
         if n > 0 {
             return ConnRead::Data(n as usize);
         }
@@ -19782,7 +19858,7 @@ struct HttpSseSpan {
 }
 
 impl HttpSseSpan {
-    fn bytes<'a>(self, block: &'a [u8]) -> Result<&'a [u8], i32> {
+    fn bytes(self, block: &[u8]) -> Result<&[u8], i32> {
         block
             .get(self.start..self.start.checked_add(self.len).ok_or(AL_INVALID)?)
             .ok_or(AL_INVALID)
@@ -20343,6 +20419,35 @@ impl HttpReadStream {
         }
     }
 
+    /// Drive framing at the exact SSE source-work boundary, then distinguish close-delimited EOF
+    /// from an actual next payload byte without consuming that byte. Fixed/chunked framing already
+    /// knows whether payload remains, and co-read close-delimited bytes remain visible in scratch;
+    /// only an empty scratch plus a live close-delimited conn needs the transport peek.
+    fn probe_sse_boundary(&mut self) -> Result<HttpBodyStep, i32> {
+        let step = self.read_body_step(&mut [], 1, true)?;
+        if !matches!(step, HttpBodyStep::NeedPayload)
+            || !matches!(self.decoder.state, HttpDecodeState::CloseDelimited)
+            || self.scratch_start < self.scratch_end
+        {
+            return Ok(step);
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(self.fail(AL_INVALID));
+        };
+        match unsafe { conn.peek_one(self.has_deadline) } {
+            ConnRead::Data(1) => Ok(HttpBodyStep::NeedPayload),
+            ConnRead::Data(_) => Err(self.fail(AL_INVALID)),
+            ConnRead::Err(status) => Err(self.fail(status)),
+            ConnRead::Eof => {
+                if self.decoder.finish_eof().is_err() {
+                    return Err(self.fail(AL_INVALID));
+                }
+                self.finish_success();
+                Ok(HttpBodyStep::Complete)
+            }
+        }
+    }
+
     fn next_sse(
         &mut self,
         output: &mut [u8],
@@ -20362,7 +20467,7 @@ impl HttpReadStream {
         let mut processed = 0usize;
         loop {
             if processed == allowance {
-                match self.read_body_step(&mut [], 1, true) {
+                match self.probe_sse_boundary() {
                     Ok(HttpBodyStep::Complete) => {
                         self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
                         return Ok(None);
@@ -36328,6 +36433,28 @@ event: first\nevent:\ndata: x\n\n";
             unsafe { align_rt_http_client_free(client) };
             let _ = server.join().unwrap();
         }
+
+        for (extra, expected) in [(0usize, 0), (1, AL_INVALID)] {
+            let mut close_body = vec![b'x'; allowance + extra];
+            close_body[0] = b':';
+            let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+            response.extend_from_slice(&close_body);
+            let (port, server) = http_serve_once(response);
+            let url = format!("http://127.0.0.1:{port}/close-events");
+            let client = align_rt_http_client_new();
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(capacity as i64);
+            for attempt in 0..2 {
+                let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
+                assert_eq!(status, expected, "close extra {extra} attempt {attempt}");
+                assert_eq!(event.present, 0);
+                assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+            }
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
     }
 
     #[test]
@@ -38374,6 +38501,33 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             1,
             "two completed SSE streams reuse one verified TLS connection",
         );
+    }
+
+    #[test]
+    fn https_sse_close_delimited_exact_work_boundary_is_terminal() {
+        let _net_guard = GET_MANY_SERVER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let capacity = 8usize;
+        let allowance = capacity + HTTP_MAX_SSE_METADATA;
+        let mut body = vec![b'x'; allowance];
+        body[0] = b':';
+        let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+        response.extend_from_slice(&body);
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response, 1, true);
+        let url = format!("https://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let stream = open_http_sse_stream(client, &url);
+        let buffer = align_rt_buffer_new(capacity as i64);
+        let (status, terminal, _, _, _) = http_sse_next_owned(stream, buffer);
+        assert_eq!(status, 0);
+        assert_eq!(terminal.present, 0);
+        assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1);
     }
 
     #[test]
