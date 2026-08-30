@@ -93,6 +93,11 @@ borrow-owner inheritance are unchanged. LLVM uses the result view type for the G
 no element Drop, array nulling, allocation, or runtime call. A focused IR assertion proves one
 `SliceIndex` and no `StrClone`, source null, or element cleanup.
 
+MIR validation and the codegen preflight independently recover the `SliceIndex` source collection's
+physical element type before LLVM pointer construction. They admit every existing exact
+source/result pair plus only `DynArray(String) -> Str`; a forged `DynArray(i64) -> Str`, another
+physical/logical mismatch, or an untyped source rejects before GEP/load construction.
+
 Generic bodies are reparsed and checked after concrete substitution. Non-generic interfaces carry
 only the unchanged signatures and reachable structural types. Whole-program and per-unit
 compilation must accept the same source and produce the same output. No interface version or ABI
@@ -105,10 +110,11 @@ fingerprint changes; ordinary body/MIR fingerprints change when the expression c
 | Type formation and result | Admit exactly dynamic `array<string>` as physical `String` to logical `Str`; preserve all Copy results, the existing receiver-only response method place, and every other Move rejection. | Wildcard-free type matrix covering String, Str, primitive, Move record/sum, nested array, response, resource, box, builder, buffer, and opaque twins; positive `DynArray(String) -> Str`, `DynArray(Str) -> Str`, and receiver-only `DynResponseArray -> HttpResponse` records plus forged receiver/result mutations. |
 | Construction and source ownership | Build arrays through `array_builder<string>`, index zero/last repeatedly, retain the array, and deep-drop every original element once. | `borrowed_params` executable owner plus existing `m12_array_builder` deep-drop owner. |
 | Receiver/index control | Preserve receiver then index order, one evaluation, existing bounds failure, and no action after every terminating receiver/index family. | Side-effect order case; negative/len index subprocesses; `?`, return, break, exit, abort, and divergence MIR/runtime twins. |
+| Borrow-transparent receiver lowering | A receiver delivered by a plain block, `unsafe`, anonymous arena, named arena, or `task_group` is excluded from eager nonborrow lowering and is evaluated once through `lower_borrowed_owned`; statements and arena/task framing occur exactly once. | Parameterize `owned_temporaries::borrowed_scope_temporaries_lower_their_scope_exactly_once` over `Index` beside the existing string-borrow consumer and retain all five structural cells. |
 | Move-in, move-out, nulling, replacement, Drop | Indexing performs none; explicit `.clone()` is the only owned result. Source move/drop/replacement/`borrow mut` invalidates a retained view, while unrelated mutation remains valid. | MoveCheck invalidation matrix, repeated source use, clone/drop counter or repeated-cycle control, unrelated-root positive. |
 | Borrow roots and escape | Direct, field, borrowed-projection, and temporary receivers carry complete storage generations and contained input/arena roots through local binding, return, `if`, `match`, `else`, Result `?`, `map_err`, loop joins, and exact/fallback `borrow mut` retention. | `borrowed_params::owned_string_array_index_views_preserve_control_provenance` covers every named wrapper for direct/field/projection/temporary inputs, return, exact named and imported/indirect fallback retention, and frame/input/arena/source-invalidation negatives. |
 | Checked HIR | Recompute the one physical/logical mismatch, child order, termination, retained-storage snapshot, and provenance. No new variant or metadata can bypass exhaustive validation. | Producer-valid HIR plus wrong receiver/result/index, forced fallthrough/action after termination, and stale/missing/extra source-fact mutations; existing variant-sweep tripwire unchanged. |
-| MIR and LLVM | Reuse bounds-checked `SliceIndex`; load only `{ptr,len}` as `Str`; inherit borrow owners; emit no clone, owner copy, cleanup, null, allocation, or runtime helper. | MIR print/shape assertion, LLVM type/one-load assertion, malformed checked-HIR rejection before codegen. |
+| MIR and LLVM | Reuse bounds-checked `SliceIndex`; validation recovers the physical source element and admits ordinary exact pairs plus only `DynArray(String) -> Str`; load only `{ptr,len}` as `Str`; inherit borrow owners; emit no clone, owner copy, cleanup, null, allocation, or runtime helper. | MIR print/shape assertion, LLVM type/one-load assertion, malformed checked-HIR rejection, and a forged `DynArray(i64) -> Str` MIR mutation rejected before LLVM GEP/load construction. |
 | Generic, interface, cache | Concrete generic `array<T>` accepts only `T=string`; whole/per-unit behavior agrees; exact body/type edits invalidate dependents and revert restores hits. | Generic/imported driver owner, whole/per-unit executable parity, focused cache edit/revert owner. |
 | Existing Move-record surfaces | `rows[i].string_field` and explicit `borrow` call remain the only non-consuming record-element reads; `row := rows[i]` and by-value calls still reject. | Existing `ElemField` and `BorrowedIndex` owners plus explicit whole-record ordinary-value negative. |
 | Existing tensor-render migration | `src/gguf.align::render_tensors` replaces its NUL-separated prefix stream and parallel offset arrays with an indexed `array<TensorRow>` or equivalent, using the already-shipped Move-record field view. | The first registered Request 22 target and `make gguf-smoke` after pin adoption. |
@@ -156,7 +162,8 @@ The 2026-08-31 author pass verified:
 3. Every ownership, region, cleanup, identity, prerequisite, and acceptance field is present or
    explicitly N/A.
 4. Every closure-matrix row has an implementation owner and exact regression target before coding,
-   including every value-carrying control wrapper and all three registered consumer targets.
+   including every value-carrying control wrapper, all five borrow-transparent receiver scopes, the
+   malformed-MIR physical/result mismatch, and all three registered consumer targets.
 5. No example implies a whole Move record value, hidden clone, or new reference/storage state.
 6. The design consumes only shipped plan-28 mechanisms and introduces no later evaluator,
    tokenizer, runtime, or package capability.

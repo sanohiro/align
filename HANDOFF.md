@@ -16,8 +16,11 @@ surface is added. The independent review of `d349700d` found four valid boundary
 documentation issues; the consolidated repair preserves existing Index positives, enumerates every
 provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
 registered consumer targets. PR #913 is open. Because `main` advanced through provenance-adjacent
-Request 21 work, complete one fresh base-integration review, refresh exact-head preflight and the PR,
-then merge the design and implement its Rust and owner-test closure.
+Request 21 work, the fresh base-integration review of `93d23e8f` found three valid closure and
+coordination issues. The consolidated repair adds all five borrow-transparent exact-once cells,
+physical-source validation for malformed `SliceIndex`, and the required external Request 22
+`ACCEPTED` register update. Refresh exact-head preflight and PR evidence, merge the design, then
+implement its Rust and owner-test closure.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
