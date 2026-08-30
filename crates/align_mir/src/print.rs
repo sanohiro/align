@@ -955,6 +955,29 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpReadStreamStatus { stream } => format!("http_read_stream_status({})", operand_str(stream)),
         Rvalue::HttpReadStreamHeader { stream, name, out } => format!("http_read_stream_header({}, {}, -> _{out})", operand_str(stream), operand_str(name)),
         Rvalue::HttpReadStreamRead { stream, buffer, out } => format!("http_read_stream_read({}, {}, -> _{out})", operand_str(stream), operand_str(buffer)),
+        Rvalue::HttpReadStreamSse { stream } => {
+            format!("http_read_stream_sse({})", operand_str(stream))
+        }
+        Rvalue::HttpSseStreamLastEventId { stream } => {
+            format!("http_sse_stream_last_event_id({})", operand_str(stream))
+        }
+        Rvalue::HttpSseStreamRetryMs { stream } => {
+            format!("http_sse_stream_retry_ms({})", operand_str(stream))
+        }
+        Rvalue::HttpSseStreamNext {
+            stream,
+            buffer,
+            present,
+            retry_present,
+            retry_ms,
+            event,
+            data,
+            last_event_id,
+        } => format!(
+            "http_sse_stream_next({}, {}, -> _{present}, _{retry_present}, _{retry_ms}, _{event}, _{data}, _{last_event_id})",
+            operand_str(stream),
+            operand_str(buffer),
+        ),
         Rvalue::HttpGetMany { client, urls, max_concurrency, out } => format!(
             "http_get_many({}, {}, {}, -> _{out})",
             operand_str(client),

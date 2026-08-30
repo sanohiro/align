@@ -1637,6 +1637,23 @@ pub enum ExprKind {
     /// `stream.read(out)` — de-frame one caller-buffered body window. The stream and output buffer
     /// are both mutably borrowed; the result is a byte count or transport/framing error. Impure.
     HttpReadStreamRead { stream: Box<Expr>, buffer: Box<Expr> },
+    /// `stream.sse()` — Pure consuming ownership transition over the identical runtime handle.
+    HttpReadStreamSse {
+        stream: Box<Expr>,
+    },
+    /// `events.last_event_id()` — Pure view of blank-line-committed reconnect state.
+    HttpSseStreamLastEventId {
+        stream: Box<Expr>,
+    },
+    /// `events.retry_ms()` — Pure inline Copy committed reconnect delay.
+    HttpSseStreamRetryMs {
+        stream: Box<Expr>,
+    },
+    /// `events.next(out)` — Impure WHATWG interpretation and atomic caller-buffer publication.
+    HttpSseStreamNext {
+        stream: Box<Expr>,
+        buffer: Box<Expr>,
+    },
     /// `cl.get_many(urls, max_concurrency)` — perform a batch of GETs over bounded concurrency,
     /// yielding `Result<array<response>, Error>` (the `ty` — an owned [`crate::Ty::DynResponseArray`]
     /// Ok payload; results in input order, all-or-Err). `cl` is a bound [`crate::Ty::HttpClient`] local

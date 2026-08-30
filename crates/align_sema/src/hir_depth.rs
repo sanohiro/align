@@ -636,6 +636,10 @@ fn walk_body_records<'a>(
                     stream: lhs,
                     buffer: rhs,
                 }
+                | ExprKind::HttpSseStreamNext {
+                    stream: lhs,
+                    buffer: rhs,
+                }
                 | ExprKind::HttpCtxHeader {
                     headers: lhs,
                     name: rhs,
@@ -809,6 +813,9 @@ fn walk_body_records<'a>(
                 | ExprKind::HttpRespStatus { resp: recv }
                 | ExprKind::HttpRespBody { resp: recv }
                 | ExprKind::HttpReadStreamStatus { stream: recv }
+                | ExprKind::HttpReadStreamSse { stream: recv }
+                | ExprKind::HttpSseStreamLastEventId { stream: recv }
+                | ExprKind::HttpSseStreamRetryMs { stream: recv }
                 | ExprKind::HttpAccept { server: recv }
                 | ExprKind::HttpCtxMethod { ctx: recv }
                 | ExprKind::HttpCtxPath { ctx: recv }

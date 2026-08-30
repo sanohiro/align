@@ -10,8 +10,8 @@ generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
-owned JSON, exclusive filesystem publication, retained-root regular-file access, and raw HTTP client
-receive streaming, there are 304 `RuntimeKey`
+owned JSON, exclusive filesystem publication, retained-root regular-file access, and HTTP client
+raw/SSE receive streaming, there are 308 `RuntimeKey`
 variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
@@ -24,7 +24,7 @@ runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 317 records. Request 12 adds the keyed bounded-builder stack
+therefore has 321 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -35,10 +35,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 317 base records.
+The compiler-visible native registry is always exactly the 321 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 325.
+records extend only the verification-time maximum runtime-export table to 329.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -50,9 +50,10 @@ spelling.
 Request 11 added six regular `RuntimeKey` rows for bounded process capture. Request 5 subsequently
 added the two bounded-HTTP setters, and Request 9 then added `BuilderWriteUint`.
 The raw HTTP receive-stream capability subsequently added six keyed rows for buffer-capacity
-inspection, stream construction/access/read, and Drop. Their runtime definitions and registry
-entries activated atomically: the current exact counts are 304 keyed records, 317 base records, and
-325 records in the
+inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
+the consuming transition, state getters, and event read. Their runtime definitions and registry
+entries activated atomically: the current exact counts are 308 keyed records, 321 base records, and
+329 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
 ## HTTP client raw receive-stream substrate (implemented)
@@ -73,6 +74,22 @@ success. Header lookup publishes a borrowed view into the retained head block. R
 byte count to its out slot and mutates only the caller buffer; a source-visible zero-capacity buffer
 is rejected before this ABI is called. `HttpReadStreamFree` is null-safe and closes rather than
 draining an incomplete response.
+
+## HTTP client SSE receive extension (implemented)
+
+The second HTTP receive-stream capability adds exactly four keyed records and no new ABI shape:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `HttpReadStreamSse` | `align_rt_http_read_stream_sse` | A50: `ptr @SYM(ptr)` |
+| `HttpSseStreamLastEventId` | `align_rt_http_sse_stream_last_event_id` | A83: `{ ptr, i64 } @SYM(ptr)` |
+| `HttpSseStreamNext` | `align_rt_http_sse_stream_next` | A24: `i32 @SYM(ptr, ptr, ptr)` |
+| `HttpSseStreamRetryMs` | `align_rt_http_sse_stream_retry_ms` | A29: `i64 @SYM(ptr)` |
+
+The transition preserves the one runtime pointer while MIR nulls the consumed raw source. `Next`
+writes the fixed 64-byte native envelope only through its output pointer and returns the existing
+signed HTTP status discriminator. The ID getter returns a stream-bound view, retry uses `-1` as the
+`None` sentinel, and the raw/SSE types share the one null-safe free row.
 
 ## Request 9 owned JSON extension
 
@@ -415,24 +432,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 304 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 308 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 317 base native symbols against default-feature `align_runtime` exports,
+- the 321 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 321 `alloc-count` and 321 `par-map-probe` native symbols against
+- the 325 `alloc-count` and 325 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 325 maximum native symbols against `align_runtime` built with
+- the 329 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 317 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  317 exact registry function types through the production compatibility
+- all 321 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  321 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

@@ -4477,6 +4477,7 @@ fn validate_tagged_program_inner(
                 | Scalar::ResponseBuilder
                 | Scalar::HttpStream
                 | Scalar::HttpReadStream
+                | Scalar::HttpSseStream
                 | Scalar::RunOutput
                 | Scalar::RunBytes
                 // MIR carries no function-type table; the embedded signature facts are validated
@@ -4615,6 +4616,7 @@ fn validate_tagged_program_inner(
                         | Ty::ResponseBuilder
                         | Ty::HttpStream
                         | Ty::HttpReadStream
+                        | Ty::HttpSseStream
                         | Ty::HttpHeaders
                         | Ty::JsonDoc
                         | Ty::Fn(_)
@@ -7593,6 +7595,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::HttpReadStream
+        | Scalar::HttpSseStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn(_)
@@ -8153,7 +8156,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
         // Not currently admitted as a box/array payload, but keep this size function total for
         // malformed MIR and consistent with the handle's one-pointer ABI.
-        Scalar::HttpReadStream => 8,
+        Scalar::HttpReadStream | Scalar::HttpSseStream => 8,
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
@@ -8258,7 +8261,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::HttpRequestCtx => RuntimeKey::HttpCtxFree,
         Ty::ResponseBuilder => RuntimeKey::HttpResponseFree,
         Ty::HttpStream => RuntimeKey::HttpStreamFree,
-        Ty::HttpReadStream => RuntimeKey::HttpReadStreamFree,
+        Ty::HttpReadStream | Ty::HttpSseStream => RuntimeKey::HttpReadStreamFree,
         // Unreachable while every `align_sema::MOVE_HANDLE_TYPES` entry has a row above, which is
         // what the sweep test asserts. Kept fail-closed rather than panicking in a compiler.
         _ => return None,
@@ -12615,7 +12618,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_insert_value(agg, len, 1, "collen").map_err(|e| self.err(e))?.into_struct_value().into()
             }
             Rvalue::OptionSome(op) => {
-                let Ty::Option(s) = result_ty else {
+                let Ty::Option(s) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+                else {
                     return Err(self.err("Some result is not an Option"));
                 };
                 let oty = option_struct_type(
@@ -12641,7 +12645,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::OptionNone => {
-                let Ty::Option(s) = result_ty else {
+                let Ty::Option(s) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+                else {
                     return Err(self.err("None result is not an Option"));
                 };
                 // All-zero aggregate → tag 0 (None).
@@ -15996,6 +16001,124 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("http_read_stream_read returned no status value"))?
+            }
+            Rvalue::HttpReadStreamSse { stream } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpReadStreamSse),
+                        &[stream.into()],
+                        "httpreadsse",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_read_stream_sse returned no stream value"))?
+            }
+            Rvalue::HttpSseStreamLastEventId { stream } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpSseStreamLastEventId),
+                        &[stream.into()],
+                        "httpsselastid",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_sse_stream_last_event_id returned no view"))?
+            }
+            Rvalue::HttpSseStreamRetryMs { stream } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpSseStreamRetryMs),
+                        &[stream.into()],
+                        "httpsseretry",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_sse_stream_retry_ms returned no value"))?
+            }
+            Rvalue::HttpSseStreamNext {
+                stream,
+                buffer,
+                present,
+                retry_present,
+                retry_ms,
+                event,
+                data,
+                last_event_id,
+            } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                let buffer = self.operand(buffer)?.into_pointer_value();
+                let native_ty = self.ctx.i64_type().array_type(8);
+                let native = self.alloca_at_entry(native_ty.into(), "http.sse.next")?;
+                self.builder
+                    .build_store(native, native_ty.const_zero())
+                    .map_err(|e| self.err(e))?;
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpSseStreamNext),
+                        &[stream.into(), buffer.into(), native.into()],
+                        "httpssenext",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("http_sse_stream_next returned no status value"))?;
+
+                let offset_ptr = |this: &Self, offset: u64, name: &str| {
+                    let offset = this.ctx.i64_type().const_int(offset, false);
+                    unsafe {
+                        this.builder
+                            .build_gep(this.ctx.i8_type(), native, &[offset], name)
+                            .map_err(|e| this.err(e))
+                    }
+                };
+                for (offset, slot, name) in [
+                    (0, *present, "httpsse.present"),
+                    (1, *retry_present, "httpsse.retry.present"),
+                ] {
+                    let pointer = offset_ptr(self, offset, name)?;
+                    let byte = self
+                        .builder
+                        .build_load(self.ctx.i8_type(), pointer, name)
+                        .map_err(|e| self.err(e))?
+                        .into_int_value();
+                    let widened = self
+                        .builder
+                        .build_int_z_extend(byte, self.ctx.i32_type(), name)
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_store(self.slots[&slot], widened)
+                        .map_err(|e| self.err(e))?;
+                }
+                let retry_ptr = offset_ptr(self, 8, "httpsse.retry.ptr")?;
+                let retry = self
+                    .builder
+                    .build_load(self.ctx.i64_type(), retry_ptr, "httpsse.retry")
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_store(self.slots[retry_ms], retry)
+                    .map_err(|e| self.err(e))?;
+                for (offset, slot, name) in [
+                    (16, *event, "httpsse.event"),
+                    (32, *data, "httpsse.data"),
+                    (48, *last_event_id, "httpsse.id"),
+                ] {
+                    let pointer = offset_ptr(self, offset, name)?;
+                    let view = self
+                        .builder
+                        .build_load(slice_struct_type(self.ctx), pointer, name)
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_store(self.slots[&slot], view)
+                        .map_err(|e| self.err(e))?;
+                }
+                status
             }
             // cl.get_many — the runtime writes an owned `array<response>` `{ptr,len}` header into `out`
             // and returns an i32 status (0 = ok; else the lowest-index error). Zero the out slot first

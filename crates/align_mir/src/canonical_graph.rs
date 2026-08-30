@@ -2487,6 +2487,7 @@ fn scalar(
             Scalar::ResourceRef(id) => node!(35, Resource, id),
             Scalar::RunBytes => leaf!(36),
             Scalar::HttpReadStream => leaf!(37),
+            Scalar::HttpSseStream => leaf!(38),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2709,6 +2710,7 @@ fn ty(
             }
             Ty::RunBytes => leaf!(60),
             Ty::HttpReadStream => leaf!(61),
+            Ty::HttpSseStream => leaf!(62),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }

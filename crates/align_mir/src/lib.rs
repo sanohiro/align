@@ -2213,6 +2213,30 @@ pub enum Rvalue {
         buffer: Operand,
         out: Slot,
     },
+    /// Consuming raw-to-SSE transition. The runtime keeps the same pointer; MIR nulls the source.
+    HttpReadStreamSse {
+        stream: Operand,
+    },
+    /// Blank-line-committed reconnect id view. Pure and stream-bound.
+    HttpSseStreamLastEventId {
+        stream: Operand,
+    },
+    /// Blank-line-committed retry delay, with `-1` as the native `None` sentinel.
+    HttpSseStreamRetryMs {
+        stream: Operand,
+    },
+    /// Interpret and publish at most one SSE event. The backend unpacks the fixed native envelope
+    /// into these language-layout slots; the rvalue itself yields the native status code.
+    HttpSseStreamNext {
+        stream: Operand,
+        buffer: Operand,
+        present: Slot,
+        retry_present: Slot,
+        retry_ms: Slot,
+        event: Slot,
+        data: Slot,
+        last_event_id: Slot,
+    },
     /// `cl.get_many(urls, max_concurrency)` — batched concurrent GET: the runtime writes an owned
     /// `array<response>` `{ptr,len}` header (a buffer of `response` handles, input order) to `out` and
     /// returns an `i32` status (0 = ok; else the lowest-index transport/parse error). `client` is
@@ -2578,6 +2602,10 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
         | Rvalue::HttpReadStreamStatus { .. }
         | Rvalue::HttpReadStreamHeader { .. }
         | Rvalue::HttpReadStreamRead { .. }
+        | Rvalue::HttpReadStreamSse { .. }
+        | Rvalue::HttpSseStreamLastEventId { .. }
+        | Rvalue::HttpSseStreamRetryMs { .. }
+        | Rvalue::HttpSseStreamNext { .. }
         | Rvalue::HttpGetMany { .. } => Some(Capability::Tls),
         _ => None,
     }
@@ -6229,6 +6257,10 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpReadStreamStatus { .. }
             | hir::ExprKind::HttpReadStreamHeader { .. }
             | hir::ExprKind::HttpReadStreamRead { .. }
+            | hir::ExprKind::HttpReadStreamSse { .. }
+            | hir::ExprKind::HttpSseStreamLastEventId { .. }
+            | hir::ExprKind::HttpSseStreamRetryMs { .. }
+            | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -6402,6 +6434,10 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpReadStreamStatus { .. }
         | hir::ExprKind::HttpReadStreamHeader { .. }
         | hir::ExprKind::HttpReadStreamRead { .. }
+        | hir::ExprKind::HttpReadStreamSse { .. }
+        | hir::ExprKind::HttpSseStreamLastEventId { .. }
+        | hir::ExprKind::HttpSseStreamRetryMs { .. }
+        | hir::ExprKind::HttpSseStreamNext { .. }
         | hir::ExprKind::HttpGetMany { .. }
         | hir::ExprKind::HttpServe { .. }
         | hir::ExprKind::HttpAccept { .. }
@@ -7481,6 +7517,10 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpReadStreamStatus { .. }
             | hir::ExprKind::HttpReadStreamHeader { .. }
             | hir::ExprKind::HttpReadStreamRead { .. }
+            | hir::ExprKind::HttpReadStreamSse { .. }
+            | hir::ExprKind::HttpSseStreamLastEventId { .. }
+            | hir::ExprKind::HttpSseStreamRetryMs { .. }
+            | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -14302,6 +14342,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::HttpReadStream
+        | Scalar::HttpSseStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn(_) => KeyOrder::PartialFloat,
@@ -17362,6 +17403,31 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
             lower_http_read_stream_read(b, stream, buffer, e.ty)
         }
+        hir::ExprKind::HttpReadStreamSse { stream } => {
+            let source = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let value = b.fresh_value(Ty::HttpSseStream);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::HttpReadStreamSse { stream: source },
+            ));
+            null_moved_source(b, stream);
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpSseStreamLastEventId { stream } => {
+            let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let value = b.fresh_value(Ty::Str);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::HttpSseStreamLastEventId { stream },
+            ));
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpSseStreamRetryMs { stream } => {
+            lower_http_sse_stream_retry_ms(b, stream, e.ty)
+        }
+        hir::ExprKind::HttpSseStreamNext { stream, buffer } => {
+            lower_http_sse_stream_next(b, stream, buffer, e.ty)
+        }
         // `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an
         // owned `array<response>` into an out slot + returns an i32 status; branch Ok(array)/Err — the
         // owned-array-from-runtime shape of `fs.read_dir`, not the single-handle `lower_http_response_result`.
@@ -18160,6 +18226,207 @@ fn lower_http_read_stream_read(
     b.terminate(Term::Goto(join));
 
     b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn lower_http_sse_stream_retry_ms(b: &mut Builder, stream: &hir::Expr, result_ty: Ty) -> Operand {
+    let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+    let retry = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(retry, Rvalue::HttpSseStreamRetryMs { stream }));
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ge,
+            Operand::Value(retry),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    b.cur = some_bb;
+    let some = b.fresh_value(result_ty);
+    b.push(Stmt::Let(some, Rvalue::OptionSome(Operand::Value(retry))));
+    b.push(Stmt::Store(result, Operand::Value(some)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let none = b.fresh_value(result_ty);
+    b.push(Stmt::Let(none, Rvalue::OptionNone));
+    b.push(Stmt::Store(result, Operand::Value(none)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn lower_http_sse_stream_next(
+    b: &mut Builder,
+    stream: &hir::Expr,
+    buffer: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+    let buffer = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+
+    let capacity = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(capacity, Rvalue::BufferCapacity(buffer.clone())));
+    let positive = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        positive,
+        Rvalue::Bin(
+            BinOp::Gt,
+            Operand::Value(capacity),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
+    let call_bb = b.new_block();
+    let abort_bb = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(positive), call_bb, abort_bb));
+
+    b.cur = abort_bb;
+    let aborted = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        aborted,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = call_bb;
+    let Ty::Result(option_scalar, _) = result_ty else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let option_ty = align_sema::scalar_to_ty(option_scalar);
+    let Ty::Tagged(option_id) = option_ty else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let Some(hir::TaggedType::Option(event_scalar)) =
+        b.tagged_types.get(option_id as usize).copied()
+    else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let event_ty = align_sema::scalar_to_ty(event_scalar);
+    let retry_option_ty = Ty::Option(Scalar::Int(IntTy {
+        bits: 64,
+        signed: true,
+    }));
+    let present_out = b.new_slot(status_ty());
+    let retry_present_out = b.new_slot(status_ty());
+    let retry_out = b.new_slot(i64_ty());
+    let event_out = b.new_slot(Ty::Str);
+    let data_out = b.new_slot(Ty::Str);
+    let id_out = b.new_slot(Ty::Str);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        code,
+        Rvalue::HttpSseStreamNext {
+            stream,
+            buffer,
+            present: present_out,
+            retry_present: retry_present_out,
+            retry_ms: retry_out,
+            event: event_out,
+            data: data_out,
+            last_event_id: id_out,
+        },
+    ));
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let outer_join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
+
+    b.cur = ok_bb;
+    let present = b.fresh_value(status_ty());
+    b.push(Stmt::Let(present, Rvalue::Load(present_out)));
+    let has_event = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        has_event,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(present),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let option_join = b.new_block();
+    let option = b.new_slot(option_ty);
+    b.terminate(Term::Branch(Operand::Value(has_event), some_bb, none_bb));
+
+    b.cur = some_bb;
+    let retry_present = b.fresh_value(status_ty());
+    b.push(Stmt::Let(retry_present, Rvalue::Load(retry_present_out)));
+    let retry = lower_present_flag_option(b, retry_present, retry_out, i64_ty(), retry_option_ty);
+    let event_record = b.new_slot(event_ty);
+    for (field, out, ty) in [
+        (0, event_out, Ty::Str),
+        (1, data_out, Ty::Str),
+        (2, id_out, Ty::Str),
+    ] {
+        let value = b.fresh_value(ty);
+        b.push(Stmt::Let(value, Rvalue::Load(out)));
+        b.push(Stmt::StoreField(
+            event_record,
+            vec![field],
+            Operand::Value(value),
+        ));
+    }
+    b.push(Stmt::StoreField(event_record, vec![3], retry));
+    let event = b.fresh_value(event_ty);
+    b.push(Stmt::Let(event, Rvalue::Load(event_record)));
+    let some = b.fresh_value(option_ty);
+    b.push(Stmt::Let(some, Rvalue::OptionSome(Operand::Value(event))));
+    b.push(Stmt::Store(option, Operand::Value(some)));
+    b.terminate(Term::Goto(option_join));
+
+    b.cur = none_bb;
+    let none = b.fresh_value(option_ty);
+    b.push(Stmt::Let(none, Rvalue::OptionNone));
+    b.push(Stmt::Store(option, Operand::Value(none)));
+    b.terminate(Term::Goto(option_join));
+
+    b.cur = option_join;
+    let option_value = b.fresh_value(option_ty);
+    b.push(Stmt::Let(option_value, Rvalue::Load(option)));
+    let ok = b.fresh_value(result_ty);
+    b.push(Stmt::Let(
+        ok,
+        Rvalue::ResultOk(Operand::Value(option_value)),
+    ));
+    b.push(Stmt::Store(result, Operand::Value(ok)));
+    b.terminate(Term::Goto(outer_join));
+
+    b.cur = err_bb;
+    let error = make_http_client_error_from_status(b, code, result_ty);
+    let err = b.fresh_value(result_ty);
+    b.push(Stmt::Let(err, Rvalue::ResultErr(error)));
+    b.push(Stmt::Store(result, Operand::Value(err)));
+    b.terminate(Term::Goto(outer_join));
+
+    b.cur = outer_join;
     let value = b.fresh_value(result_ty);
     b.push(Stmt::Let(value, Rvalue::Load(result)));
     Operand::Value(value)
@@ -19530,6 +19797,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
         Ty::HttpReadStream => "http_read_stream".to_string(),
+        Ty::HttpSseStream => "http_sse_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
         Ty::JsonScanner(id) => format!("json.scanner<struct#{id}>"),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -24719,9 +24987,10 @@ fn main() -> i32 = 0
         let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
         let p = lower(src);
         // `Point` plus the always-registered builtin structs `argon2_params` (the std.crypto Argon2
-        // parameters type) and `regex_match` (the std.regex match span) — both present in every
-        // program's struct table, like the builtin `Error` enum.
-        assert_eq!(p.structs.len(), 3);
+        // parameters type), `http_sse_event` (the std.http SSE event view), and `regex_match` (the
+        // std.regex match span) — all present in every program's struct table, like the builtin
+        // `Error` enum.
+        assert_eq!(p.structs.len(), 4);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.

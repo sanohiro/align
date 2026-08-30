@@ -1282,6 +1282,19 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             stream: boxed!(stream),
             buffer: boxed!(buffer),
         },
+        ExprKind::HttpReadStreamSse { stream } => ExprKind::HttpReadStreamSse {
+            stream: boxed!(stream),
+        },
+        ExprKind::HttpSseStreamLastEventId { stream } => ExprKind::HttpSseStreamLastEventId {
+            stream: boxed!(stream),
+        },
+        ExprKind::HttpSseStreamRetryMs { stream } => ExprKind::HttpSseStreamRetryMs {
+            stream: boxed!(stream),
+        },
+        ExprKind::HttpSseStreamNext { stream, buffer } => ExprKind::HttpSseStreamNext {
+            stream: boxed!(stream),
+            buffer: boxed!(buffer),
+        },
         ExprKind::HttpGetMany {
             client,
             urls,
@@ -2115,6 +2128,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             stream: lhs,
             buffer: rhs,
         }
+        | ExprKind::HttpSseStreamNext {
+            stream: lhs,
+            buffer: rhs,
+        }
         | ExprKind::HttpCtxHeader {
             headers: lhs,
             name: rhs,
@@ -2311,6 +2328,9 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::HttpRespStatus { resp: recv }
         | ExprKind::HttpRespBody { resp: recv }
         | ExprKind::HttpReadStreamStatus { stream: recv }
+        | ExprKind::HttpReadStreamSse { stream: recv }
+        | ExprKind::HttpSseStreamLastEventId { stream: recv }
+        | ExprKind::HttpSseStreamRetryMs { stream: recv }
         | ExprKind::HttpAccept { server: recv }
         | ExprKind::HttpCtxMethod { ctx: recv }
         | ExprKind::HttpCtxPath { ctx: recv }

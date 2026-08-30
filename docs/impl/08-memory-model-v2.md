@@ -863,7 +863,11 @@ retention.” The memory-model consequences are:
   eager-operand classification, exact-destination self-exemption, and the
   post-operand transition; the action invalidates an earlier overlapping
   `borrow mut` place (including a backing alias) without self-invalidating its
-  own exact destination; builder reallocation advances the builder
+  own exact destination; a caller-owned `borrow mut` buffer advances its
+  `ParamStorage` generation without ending provenance merely contained by the
+  parameter, and one compound action may advance both caller storage and a
+  stateful source handle before publishing a result that views the new storage
+  generation; builder reallocation advances the builder
   allocation/header only, while element owners remain content provenance and a
   region builder keeps its constructor-selected storage region;
 - returning calls retain strong header and backing-fact replacement for
