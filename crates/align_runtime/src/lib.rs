@@ -16,6 +16,8 @@
 // `align_rt_str_*` symbols.
 mod str_prims;
 pub use str_prims::*;
+mod crypto_asymmetric;
+pub use crypto_asymmetric::*;
 
 /// Builtin `print` for integers: write the decimal value + newline to stdout.
 ///

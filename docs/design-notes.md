@@ -1198,8 +1198,8 @@ converge on this:
   Non-entry modules therefore resolve a same-module declaration before a builtin alias. The closed
   explicit table is `core.Error` (always in scope), `crypto.argon2_params` plus the six settled
   `crypto.{rs256,es256,ed25519}_{private,public}_key` spellings (`std.crypto` import), and
-  `regex.regex_match` (`std.regex` import). The signature-key entries activate atomically with the
-  pending asymmetric implementation. The entry namespace
+  `regex.regex_match` (`std.regex` import). The signature-key entries shipped atomically with the
+  asymmetric implementation. The entry namespace
   remains unmangled and rejects a true canonical collision. This preserves one lookup rule and does
   not weaken the no-shadowing rule for values.
 

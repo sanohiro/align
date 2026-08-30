@@ -4463,6 +4463,7 @@ fn validate_tagged_program_inner(
                 | Scalar::Reader
                 | Scalar::Writer
                 | Scalar::Buffer
+                | Scalar::SignatureKey(_)
                 | Scalar::Regex
                 | Scalar::Captures
                 | Scalar::CliParsed
@@ -4594,6 +4595,7 @@ fn validate_tagged_program_inner(
                         | Ty::Writer
                         | Ty::Reader
                         | Ty::Buffer
+                        | Ty::SignatureKey(_)
                         | Ty::StrFinder
                         | Ty::File
                         | Ty::Rng
@@ -7581,6 +7583,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Buffer
+        | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
         | Scalar::CliParsed
@@ -8144,7 +8147,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
-        Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
+        Scalar::Buffer | Scalar::SignatureKey(_) => {
+            unreachable!("a buffer/key handle is not a box/array payload")
+        }
         Scalar::Regex => unreachable!("a regex handle is not a box/array payload"),
         Scalar::Captures => unreachable!("a captures handle is not a box/array payload"),
         Scalar::File => unreachable!("a file handle is not a box/array payload"),
@@ -8242,6 +8247,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Writer => RuntimeKey::IoWriterFree,
         Ty::Reader => RuntimeKey::IoReaderFree,
         Ty::Buffer => RuntimeKey::BufferFree,
+        Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
         Ty::Captures => RuntimeKey::RegexCapturesFree,
@@ -15420,6 +15426,127 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("crypto argon2id returns i32 status")
+            }
+            Rvalue::CryptoPrivateKeyFromPem { algorithm, pem, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (pp, pl) = self.split_str(pem)?;
+                let algorithm = self.ctx.i32_type().const_int(*algorithm as u64, false);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CryptoPrivateKeyFromPem),
+                        &[algorithm.into(), pp.into(), pl.into(), out_ptr.into()],
+                        "crypto_key_from_pem",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("crypto key constructor returned no status"))?
+            }
+            Rvalue::CryptoPublicKeyFromPem { algorithm, pem, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (pp, pl) = self.split_str(pem)?;
+                let algorithm = self.ctx.i32_type().const_int(*algorithm as u64, false);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CryptoPublicKeyFromPem),
+                        &[algorithm.into(), pp.into(), pl.into(), out_ptr.into()],
+                        "crypto_key_from_pem",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("crypto key constructor returned no status"))?
+            }
+            Rvalue::CryptoPublicKeyFromJwk(args) => {
+                let out_ptr = self.slots[&args.out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (first_ptr, first_len) = self.split_str(&args.first)?;
+                let (second_ptr, second_len) = match &args.second {
+                    Some(second) => self.split_str(second)?,
+                    None => (
+                        self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
+                        self.ctx.i64_type().const_zero().into(),
+                    ),
+                };
+                let algorithm = self.ctx.i32_type().const_int(args.algorithm as u64, false);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CryptoPublicKeyFromJwk),
+                        &[
+                            algorithm.into(),
+                            first_ptr.into(),
+                            first_len.into(),
+                            second_ptr.into(),
+                            second_len.into(),
+                            out_ptr.into(),
+                        ],
+                        "crypto_key_from_jwk",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("crypto JWK constructor returned no status"))?
+            }
+            Rvalue::CryptoSign { algorithm, key, message, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let key = self.operand(key)?;
+                let (message_ptr, message_len) = self.split_str(message)?;
+                let algorithm = self.ctx.i32_type().const_int(*algorithm as u64, false);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CryptoSign),
+                        &[
+                            algorithm.into(),
+                            key.into(),
+                            message_ptr.into(),
+                            message_len.into(),
+                            out_ptr.into(),
+                        ],
+                        "crypto_sign",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("crypto sign returned no status"))?
+            }
+            Rvalue::CryptoVerify(args) => {
+                let out_ptr = self.slots[&args.out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.i32_type().const_zero())
+                    .map_err(|e| self.err(e))?;
+                let key = self.operand(&args.key)?;
+                let (message_ptr, message_len) = self.split_str(&args.message)?;
+                let (signature_ptr, signature_len) = self.split_str(&args.signature)?;
+                let algorithm = self.ctx.i32_type().const_int(args.algorithm as u64, false);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CryptoVerify),
+                        &[
+                            algorithm.into(),
+                            key.into(),
+                            message_ptr.into(),
+                            message_len.into(),
+                            signature_ptr.into(),
+                            signature_len.into(),
+                            out_ptr.into(),
+                        ],
+                        "crypto_verify",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("crypto verify returned no status"))?
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime
@@ -23078,6 +23205,47 @@ fn main() -> i32 = 0
             helper.matches("call void @align_rt_free(").count(),
             4,
             "every dynamic aggregate-array field owns one buffer:\n{helper}"
+        );
+    }
+
+    #[test]
+    fn dynamic_signature_key_record_array_recursively_frees_key_then_buffer() {
+        let result = codegen_program(
+            vec![Stmt::DropFlagInit(0), Stmt::Drop(0)],
+            vec![],
+            vec![Ty::DynStructArray(0, Layout::Aos)],
+            vec![test_struct(
+                "KeyHolder",
+                &[
+                    Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private),
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                ],
+            )],
+            vec![],
+            vec![],
+        );
+        assert!(
+            result.is_ok(),
+            "a dynamic AoS record containing a signature key must lower through recursive Drop: {result:?}"
+        );
+        let ir = result.unwrap_or_default();
+
+        assert!(
+            ir.contains("dropdeep.head") && ir.contains("dropdeep.body"),
+            "the dynamic array Drop must walk every initialized record:\n{ir}"
+        );
+        let helper = function_body(&ir, "__align_drop_struct$0");
+        assert_eq!(
+            helper.matches("call void @align_rt_crypto_key_free(").count(),
+            1,
+            "the record Drop helper must free its one signature-key field exactly once:\n{helper}"
+        );
+        assert!(
+            ir.contains("call void @align_rt_free("),
+            "the dynamic array Drop must free its outer AoS buffer after the record walk:\n{ir}"
         );
     }
 

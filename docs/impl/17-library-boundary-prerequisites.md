@@ -44,7 +44,7 @@ single-writer precondition are authoritative in
 `docs/impl/std-design/fs.md`. This section records the boundary before its
 implementation activates any new `RuntimeKey` or validator variant.
 
-## Asymmetric crypto native boundary (design accepted; implementation pending)
+## Asymmetric crypto native boundary (implemented 2026-08-30)
 
 The post-pkg.db asymmetric signature suite is another consumer of this general boundary. Six
 algorithm/class-specific builtin Move types share one payloaded `SignatureKey(kind)` compiler
@@ -4407,7 +4407,7 @@ Acceptance:
   builtin alias. Explicit `core.Error`, `crypto.argon2_params`, and `regex.regex_match` references
   retain builtin capability classification. Producer-only entry declarations of the three names
   reject before interface publication, so semantic import has no `ReservedLocalType` failure;
-- the pending asymmetric implementation extends that same parameterized rule to its six key names:
+- the asymmetric implementation extends that same parameterized rule to its six key names:
   same-module locals win bare lookup, bare misses need no import, `crypto.*` forms require
   `std.crypto`, and entry collisions reject; its crypto carrier/interface owner lands atomically
   with the new spellings;

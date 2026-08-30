@@ -10,8 +10,8 @@ generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
-owned JSON, exclusive filesystem publication, retained-root regular-file access, and HTTP client
-raw/SSE receive streaming, there are 308 `RuntimeKey`
+owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
+raw/SSE receive streaming, and asymmetric signatures, there are 314 `RuntimeKey`
 variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
@@ -24,7 +24,7 @@ runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 321 records. Request 12 adds the keyed bounded-builder stack
+therefore has 327 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -32,13 +32,13 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `void @align_rt_test_par_map_force_caller(i32)`,
 `i64 @align_rt_test_par_map_min_chunk()`,
 `i64 @align_rt_test_par_map_min_chunk_for(i64, i64, i64)`, and
-`i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
-Rust state only and adds no unmangled native export.
+`i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
+`crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 321 base records.
+The compiler-visible native registry is always exactly the 327 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 329.
+records extend only the verification-time maximum runtime-export table to 335.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -51,9 +51,9 @@ Request 11 added six regular `RuntimeKey` rows for bounded process capture. Requ
 added the two bounded-HTTP setters, and Request 9 then added `BuilderWriteUint`.
 The raw HTTP receive-stream capability subsequently added six keyed rows for buffer-capacity
 inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
-the consuming transition, state getters, and event read. Their runtime definitions and registry
-entries activated atomically: the current exact counts are 308 keyed records, 321 base records, and
-329 records in the
+the consuming transition, state getters, and event read. The asymmetric signature suite then added
+six keyed rows. Their runtime definitions and registry entries activated atomically: the current
+exact counts are 314 keyed records, 327 base records, and 335 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
 ## HTTP client raw receive-stream substrate (implemented)
@@ -91,12 +91,12 @@ writes the fixed 64-byte native envelope only through its output pointer and ret
 signed HTTP status discriminator. The ID getter returns a stream-bound view, retry uses `-1` as the
 `None` sentinel, and the raw/SSE types share the one null-safe free row.
 
-## Asymmetric signature delta (designed; not yet in the shipped inventory)
+## Asymmetric signature delta (implemented 2026-08-30)
 
-The accepted post-pkg.db design adds six keyed records atomically when implemented. Until then they
-are excluded from the exact current counts and the shipped A00–A105 table below.
+The post-pkg.db implementation adds six keyed records atomically. They are included in the exact
+current counts and the shipped A00–A109 table below.
 
-| Planned runtime key | Exact symbol | Planned ABI row and exact declaration |
+| Runtime key | Exact symbol | ABI row and exact declaration |
 |---|---|---|
 | `CryptoPrivateKeyFromPem` | `align_rt_crypto_private_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
 | `CryptoPublicKeyFromPem` | `align_rt_crypto_public_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
@@ -128,9 +128,8 @@ wrapper-owned canonical/on-curve/non-small-order point validation. Final free or
 follow the exact crypto design ledger: zero success; `AL_INVALID` for direct or closed-queue
 constructor/key rejection and malformed internal ABI; `AL_CODE` for opaque provider/allocation/
 empty-or-unknown queue failure; post-view signature mismatch publishes
-false; and free is null-safe and one-time. Implementation moves these rows into the main keyed
-inventory, increases the keyed/base/max counts by six, and changes the table's shipped ABI range to
-A00–A109 in the same commit.
+false; and free is null-safe and one-time. These rows are part of the main keyed inventory; they
+increase the keyed/base/max counts by six and extend the shipped ABI range to A00–A109.
 
 ## Request 9 owned JSON extension
 
@@ -282,6 +281,10 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A103 | `i32 @SYM(ptr, i64, ptr, i64, ptr, i64, ptr, i64, i64, ptr)` | `align_rt_json_decode` (final nullable arena) |
 | A104 | `i32 @SYM(ptr, i64, ptr, i64, i64, ptr, ptr, i64, i64, ptr)` | `align_rt_json_decode_struct_array` (final nullable arena) |
 | A105 | `i32 @SYM(ptr, i64, ptr, ptr, ptr)` | `align_rt_json_decode_union` (final nullable arena) |
+| A106 | `i32 @SYM(i32, ptr, i64, ptr)` | `align_rt_crypto_private_key_from_pem`, `align_rt_crypto_public_key_from_pem` |
+| A107 | `i32 @SYM(i32, ptr, i64, ptr, i64, ptr)` | `align_rt_crypto_public_key_from_jwk` |
+| A108 | `i32 @SYM(i32, ptr, ptr, i64, ptr)` | `align_rt_crypto_sign` |
+| A109 | `i32 @SYM(i32, ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_crypto_verify` |
 | A18 | `i32 @SYM(ptr, i64, ptr, ptr, i64, ptr, i64, ptr, i64, i64)` | `align_rt_json_scan_next` |
 | A19 | `i32 @SYM(ptr, ptr)` | `align_rt_builder_finish_bounded_stack`, `align_rt_tcp_accept`, `align_rt_command_run`, `align_rt_io_writer_write_builder`, `align_rt_http_accept`, `align_rt_http_respond`, `align_rt_http_stream_reject` |
 | A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event` |
@@ -326,7 +329,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A59 | `void @SYM(i64) {noreturn}` | `align_rt_process_exit` |
 | A60 | `void @SYM(i64, i64) {noreturn}` | `align_rt_bounds_fail`, `align_rt_len_mismatch_fail`, `align_rt_utf8_boundary_fail` |
 | A61 | `void @SYM(i64, i64, i64) {noreturn}` | `align_rt_range_fail` |
-| A62 | `void @SYM(ptr)` | `align_rt_arena_end`, `align_rt_tg_end`, `align_rt_free`, `align_rt_str_finder_free`, `align_rt_builder_pop_comma`, `align_rt_tcp_conn_free`, `align_rt_tcp_listener_free`, `align_rt_udp_socket_free`, `align_rt_child_free`, `align_rt_command_env_clear`, `align_rt_command_free`, `align_rt_run_output_free`, `align_rt_io_reader_free`, `align_rt_io_writer_free`, `align_rt_io_file_free`, `align_rt_buffer_free`, `align_rt_array_builder_free`, `align_rt_array_builder_free_stack`, `align_rt_array_builder_free_strings`, `align_rt_array_builder_free_strings_stack`, `align_rt_crypto_random`, `align_rt_rng_seed_os`, `align_rt_cli_command_free`, `align_rt_cli_parsed_free`, `align_rt_http_request_free`, `align_rt_http_read_stream_free`, `align_rt_http_resp_free`, `align_rt_http_client_free`, `align_rt_http_server_free`, `align_rt_regex_captures_free`, `align_rt_regex_free`, `align_rt_http_ctx_free`, `align_rt_http_response_free`, `align_rt_http_stream_free`, `align_rt_builder_free`, `align_rt_builder_free_stack` |
+| A62 | `void @SYM(ptr)` | `align_rt_arena_end`, `align_rt_tg_end`, `align_rt_free`, `align_rt_str_finder_free`, `align_rt_builder_pop_comma`, `align_rt_tcp_conn_free`, `align_rt_tcp_listener_free`, `align_rt_udp_socket_free`, `align_rt_child_free`, `align_rt_command_env_clear`, `align_rt_command_free`, `align_rt_run_output_free`, `align_rt_io_reader_free`, `align_rt_io_writer_free`, `align_rt_io_file_free`, `align_rt_buffer_free`, `align_rt_array_builder_free`, `align_rt_array_builder_free_stack`, `align_rt_array_builder_free_strings`, `align_rt_array_builder_free_strings_stack`, `align_rt_crypto_random`, `align_rt_crypto_key_free`, `align_rt_rng_seed_os`, `align_rt_cli_command_free`, `align_rt_cli_parsed_free`, `align_rt_http_request_free`, `align_rt_http_read_stream_free`, `align_rt_http_resp_free`, `align_rt_http_client_free`, `align_rt_http_server_free`, `align_rt_regex_captures_free`, `align_rt_regex_free`, `align_rt_http_ctx_free`, `align_rt_http_response_free`, `align_rt_http_stream_free`, `align_rt_builder_free`, `align_rt_builder_free_stack` |
 | A63 | `void @SYM(ptr, double)` | `align_rt_builder_write_f64` |
 | A64 | `void @SYM(ptr, float)` | `align_rt_builder_write_f32` |
 | A65 | `void @SYM(ptr, i32)` | `align_rt_builder_write_bool`, `align_rt_builder_write_char` |
@@ -473,24 +476,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 308 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 314 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 321 base native symbols against default-feature `align_runtime` exports,
+- the 327 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 325 `alloc-count` and 325 `par-map-probe` native symbols against
+- the 331 `alloc-count` and 331 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 329 maximum native symbols against `align_runtime` built with
+- the 335 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 321 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  321 exact registry function types through the production compatibility
+- all 327 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  327 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

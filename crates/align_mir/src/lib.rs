@@ -1944,6 +1944,24 @@ pub enum Rvalue {
     /// `lower_expr` stack frame (each holds an `Rvalue` temporary), regressing the recursive
     /// `expr_depth` headroom (#296).
     CryptoArgon2(Box<Argon2Args>),
+    CryptoPrivateKeyFromPem {
+        algorithm: align_sema::SignatureAlgorithm,
+        pem: Operand,
+        out: Slot,
+    },
+    CryptoPublicKeyFromPem {
+        algorithm: align_sema::SignatureAlgorithm,
+        pem: Operand,
+        out: Slot,
+    },
+    CryptoPublicKeyFromJwk(Box<SignatureJwkArgs>),
+    CryptoSign {
+        algorithm: align_sema::SignatureAlgorithm,
+        key: Operand,
+        message: Operand,
+        out: Slot,
+    },
+    CryptoVerify(Box<SignatureVerifyArgs>),
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -2494,6 +2512,23 @@ pub struct Argon2Args {
     pub out: Slot,
 }
 
+#[derive(Clone, Debug)]
+pub struct SignatureJwkArgs {
+    pub algorithm: align_sema::SignatureAlgorithm,
+    pub first: Operand,
+    pub second: Option<Operand>,
+    pub out: Slot,
+}
+
+#[derive(Clone, Debug)]
+pub struct SignatureVerifyArgs {
+    pub algorithm: align_sema::SignatureAlgorithm,
+    pub key: Operand,
+    pub message: Operand,
+    pub signature: Operand,
+    pub out: Slot,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Const {
     Int(i128, Ty),
@@ -2594,7 +2629,12 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
         | Rvalue::CryptoHmac { .. }
         | Rvalue::CryptoHkdf { .. }
         | Rvalue::CryptoAead { .. }
-        | Rvalue::CryptoArgon2(_) => Some(Capability::Crypto),
+        | Rvalue::CryptoArgon2(_)
+        | Rvalue::CryptoPrivateKeyFromPem { .. }
+        | Rvalue::CryptoPublicKeyFromPem { .. }
+        | Rvalue::CryptoPublicKeyFromJwk(_)
+        | Rvalue::CryptoSign { .. }
+        | Rvalue::CryptoVerify(_) => Some(Capability::Crypto),
         Rvalue::HttpClientGet { .. }
         | Rvalue::HttpClientPost { .. }
         | Rvalue::HttpClientRequest { .. }
@@ -2612,11 +2652,12 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
 }
 
 /// The capabilities a single function requires — the gated external libraries its builtins or
-/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A receive-stream Drop can close a
-/// TLS connection even when the function never reads it, so the slot types are part of this answer
-/// alongside [`rvalue_capability`]. The per-function granularity is what the M15 per-unit interface
-/// summary unions over a unit's functions. Emitted in first-seen order (deduped); an empty vec for a
-/// function with no gated feature.
+/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A signature-key Drop calls
+/// libcrypto and a receive-stream Drop can close a TLS connection even when the function never uses
+/// either handle, so the slot types are part of this answer alongside [`rvalue_capability`]. The
+/// per-function granularity is what the M15 per-unit interface summary unions over a unit's
+/// functions. Emitted in first-seen order (deduped); an empty vec for a function with no gated
+/// feature.
 #[inline(never)]
 pub fn function_capabilities(
     f: &Function,
@@ -2635,6 +2676,19 @@ pub fn function_capabilities(
                 caps.push(cap);
             }
         }
+    }
+    if !caps.contains(&Capability::Crypto)
+        && f.slots.iter().copied().any(|ty| {
+            align_sema::ty_contains_signature_key(
+                ty,
+                structs,
+                tuples,
+                enums,
+                tagged_types,
+            )
+        })
+    {
+        caps.push(Capability::Crypto);
     }
     if !caps.contains(&Capability::Tls)
         && f.slots.iter().copied().any(|ty| {
@@ -6402,6 +6456,11 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::RunBytesCode { .. }
         | hir::ExprKind::RunBytesStdout { .. }
         | hir::ExprKind::RunBytesStderr { .. } => lower_command(b, e),
+        hir::ExprKind::CryptoPrivateKeyFromPem { .. }
+        | hir::ExprKind::CryptoPublicKeyFromPem { .. }
+        | hir::ExprKind::CryptoPublicKeyFromJwk { .. }
+        | hir::ExprKind::CryptoSign { .. }
+        | hir::ExprKind::CryptoVerify { .. } => lower_crypto_signature(b, e),
         hir::ExprKind::PathJoin { .. }
         | hir::ExprKind::PathComponent { .. }
         | hir::ExprKind::PathNormalize { .. } => lower_path_expr(b, e),
@@ -7301,6 +7360,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 salt,
                 params,
             } => lower_crypto_argon2(b, password, salt, params, e.ty),
+            hir::ExprKind::CryptoPrivateKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromJwk { .. }
+            | hir::ExprKind::CryptoSign { .. }
+            | hir::ExprKind::CryptoVerify { .. } => lower_crypto_signature(b, e),
             // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
             // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
             hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
@@ -14328,6 +14392,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Buffer
+        | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
         | Scalar::CliParsed
@@ -16994,6 +17059,126 @@ fn lower_crypto_argon2(
         })),
     ));
     emit_status_buffer_result(b, code, out, ty)
+}
+
+fn emit_status_bool_result(b: &mut Builder, code: ValueId, out: Slot, result_ty: Ty) -> Operand {
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty()))),
+    ));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let result_slot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    b.cur = ok_bb;
+    let raw = b.fresh_value(status_ty());
+    b.push(Stmt::Let(raw, Rvalue::Load(out)));
+    let verified = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        verified,
+        Rvalue::Bin(BinOp::Ne, Operand::Value(raw), Operand::Const(Const::Int(0, status_ty()))),
+    ));
+    let ok = b.fresh_value(result_ty);
+    b.push(Stmt::Let(ok, Rvalue::ResultOk(Operand::Value(verified))));
+    b.push(Stmt::Store(result_slot, Operand::Value(ok)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = err_bb;
+    let error = make_error_from_status(b, code, result_ty);
+    let err = b.fresh_value(result_ty);
+    b.push(Stmt::Let(err, Rvalue::ResultErr(error)));
+    b.push(Stmt::Store(result_slot, Operand::Value(err)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let result = b.fresh_value(result_ty);
+    b.push(Stmt::Let(result, Rvalue::Load(result_slot)));
+    Operand::Value(result)
+}
+
+#[inline(never)]
+fn lower_crypto_signature(b: &mut Builder, expression: &hir::Expr) -> Operand {
+    match &expression.kind {
+        hir::ExprKind::CryptoPrivateKeyFromPem { algorithm, pem }
+        | hir::ExprKind::CryptoPublicKeyFromPem { algorithm, pem } => {
+            let private = matches!(expression.kind, hir::ExprKind::CryptoPrivateKeyFromPem { .. });
+            let handle_ty = Ty::SignatureKey(if private {
+                algorithm.private_kind()
+            } else {
+                algorithm.public_kind()
+            });
+            let out = b.new_slot(handle_ty);
+            let pem = lower_required!(b, lower_expr(b, pem), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            let value = if private {
+                Rvalue::CryptoPrivateKeyFromPem { algorithm: *algorithm, pem, out }
+            } else {
+                Rvalue::CryptoPublicKeyFromPem { algorithm: *algorithm, pem, out }
+            };
+            b.push(Stmt::Let(code, value));
+            emit_open_handle_result(b, code, out, handle_ty, expression.ty)
+        }
+        hir::ExprKind::CryptoPublicKeyFromJwk { algorithm, first, second } => {
+            let handle_ty = Ty::SignatureKey(algorithm.public_kind());
+            let out = b.new_slot(handle_ty);
+            let first = lower_required!(b, lower_expr(b, first), Operand::Const(Const::Unit));
+            let second = if let Some(second) = second {
+                Some(lower_required!(b, lower_expr(b, second), Operand::Const(Const::Unit)))
+            } else {
+                None
+            };
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::CryptoPublicKeyFromJwk(Box::new(SignatureJwkArgs {
+                    algorithm: *algorithm,
+                    first,
+                    second,
+                    out,
+                })),
+            ));
+            emit_open_handle_result(b, code, out, handle_ty, expression.ty)
+        }
+        hir::ExprKind::CryptoSign { algorithm, key, message } => {
+            let out = b.new_slot(Ty::Buffer);
+            let key = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
+            let message = lower_required!(b, lower_expr(b, message), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::CryptoSign { algorithm: *algorithm, key, message, out },
+            ));
+            emit_status_buffer_result(b, code, out, expression.ty)
+        }
+        hir::ExprKind::CryptoVerify { algorithm, key, message, signature } => {
+            let out = b.new_slot(status_ty());
+            let key = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
+            let message = lower_required!(b, lower_expr(b, message), Operand::Const(Const::Unit));
+            let signature = lower_required!(b, lower_expr(b, signature), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::CryptoVerify(Box::new(SignatureVerifyArgs {
+                    algorithm: *algorithm,
+                    key,
+                    message,
+                    signature,
+                    out,
+                })),
+            ));
+            emit_status_bool_result(b, code, out, expression.ty)
+        }
+        // The out-of-line dispatcher above admits only the five signature variants. Keep a
+        // fail-closed terminal for a future dispatcher/helper drift instead of panicking in the
+        // compiler on an unchecked or hand-overridden HIR record.
+        _ => {
+            b.terminate(Term::Unreachable);
+            terminated_operand()
+        }
+    }
 }
 
 /// `c.parse(args)` → the runtime writes an owned `cli parsed` handle into an out slot and returns an
@@ -19758,6 +19943,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(
                 "array_builder<{}>",

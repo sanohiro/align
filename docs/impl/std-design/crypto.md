@@ -6,9 +6,8 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/crypto.md)
 
-> **Status:** complete for the M11 symmetric/hash/KDF surface. The post-pkg.db asymmetric signature
-> suite is designed below; implementation is pending. The documented BLAKE3 exception remains
-> deferred.
+> **Status:** complete for the M11 symmetric/hash/KDF surface and the post-pkg.db asymmetric
+> signature suite (implemented 2026-08-30). The documented BLAKE3 exception remains deferred.
 
 ## Overview
 
@@ -538,7 +537,7 @@ reviewer's later discovery.
 | Provider provenance | Each shell owns a private ordinary libctx and its explicitly loaded built-in default provider; all decode/import/signature/digest fetches use exact `provider=default`; key and operation provider pointers equal the owned pointer; no global ctx/config/search path/default property/provider is consumed | child-process owner with hostile `OPENSSL_CONF`/`OPENSSL_MODULES`, global null provider, and incompatible global default properties; exact pointer assertions; independent-key overlap and teardown stress |
 | Constant-time boundary | Constructor parsing/checking, including public BN validation, is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the pointer-verified built-in default provider primitive is the named dependency. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact `_ex` libctx/property/provider-pointer and EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
 | Compilation paths | direct/imported calls, public key-bearing signatures, function values, generic monomorphization around a concrete key, whole-program/per-unit compilation, object/frontend cache edit/revert, optimized/unoptimized LLVM, and malformed HIR carry identical algorithm/kind/effect/cleanup facts | `crypto_asymmetric` driver owner, interface/cache owners, checked-HIR validator matrix |
-| Resource claim | PEM exact limit, RSA size bound, one private libctx/provider/PKEY shell per live key, one exact wrapper `SensitiveDer` plus bounded OpenSSL-owned PKCS#8/import storage only during private construction, fixed-count Ed public BN temporaries, fixed ES/Ed operation temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation and private-construction peak/cleanse record plus deterministic limit tests |
+| Resource claim | PEM exact limit, RSA size bound, one private libctx/provider/PKEY shell per live key, one exact decoded `SensitiveDer` plus one bounded clear-free canonical re-encoding scratch and bounded OpenSSL-owned PKCS#8/import storage during private construction, fixed-count Ed public BN temporaries, fixed ES/Ed operation temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation and private-construction peak/cleanse record plus deterministic limit tests |
 
 The implementation is one capability PR even though it is expected to exceed roughly 1,000
 hand-written changed lines. The six static types, their constructors, runtime kind checks, and the

@@ -49,6 +49,93 @@ impl FloatTy {
     }
 }
 
+/// The closed asymmetric-signature algorithms exposed by `std.crypto`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SignatureAlgorithm {
+    Rs256 = 0,
+    Es256 = 1,
+    Ed25519 = 2,
+}
+
+impl SignatureAlgorithm {
+    pub const fn private_kind(self) -> SignatureKeyKind {
+        match self {
+            Self::Rs256 => SignatureKeyKind::Rs256Private,
+            Self::Es256 => SignatureKeyKind::Es256Private,
+            Self::Ed25519 => SignatureKeyKind::Ed25519Private,
+        }
+    }
+
+    pub const fn public_kind(self) -> SignatureKeyKind {
+        match self {
+            Self::Rs256 => SignatureKeyKind::Rs256Public,
+            Self::Es256 => SignatureKeyKind::Es256Public,
+            Self::Ed25519 => SignatureKeyKind::Ed25519Public,
+        }
+    }
+}
+
+/// The six nominal asymmetric-key owners. The kind is repeated in the runtime shell and checked
+/// at every native operation boundary, so malformed HIR/MIR cannot turn a static type mismatch
+/// into an EVP type confusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SignatureKeyKind {
+    Rs256Private = 0,
+    Rs256Public = 1,
+    Es256Private = 2,
+    Es256Public = 3,
+    Ed25519Private = 4,
+    Ed25519Public = 5,
+}
+
+impl SignatureKeyKind {
+    pub const ALL: [Self; 6] = [
+        Self::Rs256Private,
+        Self::Rs256Public,
+        Self::Es256Private,
+        Self::Es256Public,
+        Self::Ed25519Private,
+        Self::Ed25519Public,
+    ];
+
+    pub const fn algorithm(self) -> SignatureAlgorithm {
+        match self {
+            Self::Rs256Private | Self::Rs256Public => SignatureAlgorithm::Rs256,
+            Self::Es256Private | Self::Es256Public => SignatureAlgorithm::Es256,
+            Self::Ed25519Private | Self::Ed25519Public => SignatureAlgorithm::Ed25519,
+        }
+    }
+
+    pub const fn is_private(self) -> bool {
+        matches!(self, Self::Rs256Private | Self::Es256Private | Self::Ed25519Private)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rs256Private => "rs256_private_key",
+            Self::Rs256Public => "rs256_public_key",
+            Self::Es256Private => "es256_private_key",
+            Self::Es256Public => "es256_public_key",
+            Self::Ed25519Private => "ed25519_private_key",
+            Self::Ed25519Public => "ed25519_public_key",
+        }
+    }
+}
+
+pub fn signature_key_kind_from_name(name: &str) -> Option<SignatureKeyKind> {
+    Some(match name {
+        "rs256_private_key" | "crypto.rs256_private_key" => SignatureKeyKind::Rs256Private,
+        "rs256_public_key" | "crypto.rs256_public_key" => SignatureKeyKind::Rs256Public,
+        "es256_private_key" | "crypto.es256_private_key" => SignatureKeyKind::Es256Private,
+        "es256_public_key" | "crypto.es256_public_key" => SignatureKeyKind::Es256Public,
+        "ed25519_private_key" | "crypto.ed25519_private_key" => SignatureKeyKind::Ed25519Private,
+        "ed25519_public_key" | "crypto.ed25519_public_key" => SignatureKeyKind::Ed25519Public,
+        _ => return None,
+    })
+}
+
 /// A variable-free scalar type — the only payloads M2 allows inside `Option`/`Result`.
 /// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -140,6 +227,9 @@ pub enum Scalar {
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
     Buffer,
+    /// One of the six nominal asymmetric-signature key owners. The payload is the exact algorithm
+    /// and private/public kind; the value is one opaque runtime-shell pointer and is Move.
+    SignatureKey(SignatureKeyKind),
     /// A compiled `regex` payload (`Result<regex, Error>` from `regex.compile`). An owned **Move**
     /// handle containing the compiled automaton; the enclosing `Result` owns and drops it. Opaque
     /// pointer, free-standing and never region-tracked.
@@ -242,7 +332,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -527,6 +617,8 @@ pub enum Ty {
     /// `slice<u8>` borrow), `.len()` is its byte count; `Drop`-freed. Constructing / reading it is
     /// pure (no I/O).
     Buffer,
+    /// A nominal asymmetric-signature key owner. One opaque runtime-shell pointer, Move.
+    SignatureKey(SignatureKeyKind),
     /// `array_builder<T>` (`core`, M12 A6) — a growable typed array builder, the
     /// typed member of the grow-then-freeze family (`builder`->`string`, `buffer`->bytes,
     /// this->`array<T>`). An opaque
@@ -805,6 +897,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Writer
         | Ty::Reader
         | Ty::Buffer
+        | Ty::SignatureKey(_)
         | Ty::ArrayBuilder { .. }
         | Ty::VecArrayBuilder { .. }
         | Ty::MaskArrayBuilder { .. }
@@ -867,6 +960,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Buffer
+        | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
         | Scalar::CliParsed
@@ -924,6 +1018,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Writer => Some(Scalar::Writer),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
+        Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
         // A compiled regex owned handle as the `Result` Ok payload of `regex.compile`.
         Ty::Regex => Some(Scalar::Regex),
         Ty::Captures => Some(Scalar::Captures),
@@ -1055,6 +1150,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Buffer => Ty::Buffer,
+        Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
         Scalar::Captures => Ty::Captures,
         Scalar::File => Ty::File,
@@ -1266,7 +1362,12 @@ pub fn heap_tree_record_error(
                 });
             }
             Work::Field { ty, path } => match ty {
-                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {}
+                Ty::Int(_)
+                | Ty::Float(_)
+                | Ty::Bool
+                | Ty::Char
+                | Ty::String
+                | Ty::SignatureKey(_) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
                     ty: scalar_to_ty(payload),
@@ -2309,6 +2410,7 @@ pub fn drop_plan(
                         | Ty::Writer
                         | Ty::Reader
                         | Ty::Buffer
+                        | Ty::SignatureKey(_)
                         | Ty::ArrayBuilder(_)
                         | Ty::VecArrayBuilder(..)
                         | Ty::MaskArrayBuilder(..)
@@ -2663,6 +2765,147 @@ pub fn ty_mentions_resource(
     false
 }
 
+/// Whether `ty` reaches an asymmetric-signature key through any by-value type edge. Keys may be
+/// carried by ordinary owning structs/sums/Option/Result values and by AoS arrays of owning
+/// structs, but a collection whose scalar element reaches a key would copy that one-word owner on
+/// element access. Keep that negative decision structural: a key hidden behind a tagged or sum
+/// payload must not bypass the direct `SignatureKey` element check.
+pub fn ty_contains_signature_key(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut work = vec![root];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::SignatureKey(_) => return true,
+            Ty::Option(payload)
+            | Ty::Array(payload, _)
+            | Ty::Slice(payload)
+            | Ty::DynArray(payload)
+            | Ty::ArrayBuilder(payload)
+            | Ty::Box(payload)
+            | Ty::Task(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Struct(id) if visited_structs.insert(id) => {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(enumeration) = enums.get(id as usize) {
+                    work.extend(
+                        enumeration
+                            .variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _)
+            | Ty::Soa(id)
+            | Ty::JsonScanner(id)
+            | Ty::DictEncoded(id, _) => work.push(Ty::Struct(id)),
+            Ty::DynVecArray(element, lanes) | Ty::VecArrayBuilder(element, lanes) => {
+                work.push(Ty::Vec(element, lanes));
+            }
+            Ty::DynMaskArray(element, lanes) | Ty::MaskArrayBuilder(element, lanes) => {
+                work.push(Ty::Mask(element, lanes));
+            }
+            Ty::DynFixedArray(element, length)
+            | Ty::FixedArrayBuilder(element, length) => {
+                work.push(Ty::Array(element, length));
+            }
+            Ty::Int(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Vec(..)
+            | Ty::Mask(..)
+            | Ty::SoaParam(_)
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::Str
+            | Ty::String
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
+            | Ty::Builder
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::StrFinder
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::RunBytes
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::HttpReadStream
+            | Ty::HttpSseStream
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::Fn(_)
+            | Ty::Unit
+            | Ty::Error
+            | Ty::Tagged(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Enum(_) => {}
+        }
+    }
+    false
+}
+
 /// Whether a value may contain a borrowed view whose backing owner must remain live. MIR uses the
 /// same cycle-safe graph classification when deciding whether an indexed result retains a
 /// synthetic temporary owner or can release it immediately after a scalar load. This is narrower
@@ -2814,6 +3057,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Buffer
+            | Scalar::SignatureKey(_)
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -2940,6 +3184,7 @@ fn ty_contains_http_receive_stream(
             | Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::StrFinder
             | Ty::File
             | Ty::Rng
@@ -3012,6 +3257,7 @@ pub fn http_stream_carrier_class(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Buffer
+            | Scalar::SignatureKey(_)
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -3137,6 +3383,7 @@ pub fn http_stream_carrier_class(
             | Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
             | Ty::MaskArrayBuilder(..)
@@ -3767,6 +4014,18 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("reader", Ty::Reader),
     ("writer", Ty::Writer),
     ("buffer", Ty::Buffer),
+    ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
+    ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
+    ("rs256_public_key", Ty::SignatureKey(SignatureKeyKind::Rs256Public)),
+    ("crypto.rs256_public_key", Ty::SignatureKey(SignatureKeyKind::Rs256Public)),
+    ("es256_private_key", Ty::SignatureKey(SignatureKeyKind::Es256Private)),
+    ("crypto.es256_private_key", Ty::SignatureKey(SignatureKeyKind::Es256Private)),
+    ("es256_public_key", Ty::SignatureKey(SignatureKeyKind::Es256Public)),
+    ("crypto.es256_public_key", Ty::SignatureKey(SignatureKeyKind::Es256Public)),
+    ("ed25519_private_key", Ty::SignatureKey(SignatureKeyKind::Ed25519Private)),
+    ("crypto.ed25519_private_key", Ty::SignatureKey(SignatureKeyKind::Ed25519Private)),
+    ("ed25519_public_key", Ty::SignatureKey(SignatureKeyKind::Ed25519Public)),
+    ("crypto.ed25519_public_key", Ty::SignatureKey(SignatureKeyKind::Ed25519Public)),
     ("file", Ty::File),
     ("regex", Ty::Regex),
     ("captures", Ty::Captures),
@@ -5389,6 +5648,42 @@ const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
         bare: "argon2_params",
         explicit: "crypto.argon2_params",
         canonical: "argon2_params",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "rs256_private_key",
+        explicit: "crypto.rs256_private_key",
+        canonical: "rs256_private_key",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "rs256_public_key",
+        explicit: "crypto.rs256_public_key",
+        canonical: "rs256_public_key",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "es256_private_key",
+        explicit: "crypto.es256_private_key",
+        canonical: "es256_private_key",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "es256_public_key",
+        explicit: "crypto.es256_public_key",
+        canonical: "es256_public_key",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "ed25519_private_key",
+        explicit: "crypto.ed25519_private_key",
+        canonical: "ed25519_private_key",
+        required_import: Some("std.crypto"),
+    },
+    BuiltinNominalAlias {
+        bare: "ed25519_public_key",
+        explicit: "crypto.ed25519_public_key",
+        canonical: "ed25519_public_key",
         required_import: Some("std.crypto"),
     },
     BuiltinNominalAlias {
@@ -7278,6 +7573,10 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // through the same structural provenance machinery.
                     Ty::Resource(id) => payload.push(Scalar::Resource(id)),
                     Ty::ResourceRef(id) => payload.push(Scalar::ResourceRef(id)),
+                    // Algorithm-specific signature keys are one-pointer Move leaves like opaque
+                    // resources. The active sum arm owns exactly one shell; tag-switched Drop
+                    // routes it through the shared null-safe crypto-key free mapping.
+                    Ty::SignatureKey(kind) => payload.push(Scalar::SignatureKey(kind)),
                     // A plain-data struct payload — `str`-bearing is now allowed (J1: the enum is
                     // region-tracked through it). Move-ness is checked after all enums resolve.
                     Ty::Struct(id) => {
@@ -7680,6 +7979,15 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             params.push(ty);
         }
         for (parameter, &ty) in f.params.iter().zip(&params) {
+            if ty_contains_signature_key(ty, &structs, &tuples, &enums, &tagged_types)
+                && matches!(parameter.mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut)
+            {
+                diags.error(
+                    "a parameter containing a signature key may be passed by value or shared `borrow`, never `out` or `borrow mut`"
+                        .to_string(),
+                    parameter.ty.span(),
+                );
+            }
             match http_stream_carrier_class(
                 ty,
                 &structs,
@@ -14211,6 +14519,27 @@ impl EffectScan<'_> {
                 walk!(params);
                 self.impure_direct = true;
             }
+            ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+            | ExprKind::CryptoPublicKeyFromPem { pem, .. } => {
+                walk!(pem);
+                self.impure_direct = true;
+            }
+            ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+                walk!(first);
+                if let Some(second) = second { walk!(second); }
+                self.impure_direct = true;
+            }
+            ExprKind::CryptoSign { key, message, .. } => {
+                walk!(key);
+                walk!(message);
+                self.impure_direct = true;
+            }
+            ExprKind::CryptoVerify { key, message, signature, .. } => {
+                walk!(key);
+                walk!(message);
+                walk!(signature);
+                self.impure_direct = true;
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 walk!(source);
@@ -17442,6 +17771,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Raw
             | Ty::Builder
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::Box(_)
             | Ty::Struct(_)
             | Ty::Tuple(_)
@@ -19562,6 +19892,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Raw
             | Ty::Builder
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
             // bytes) — it borrows nothing, so it carries no inferred region.
             | Ty::StrFinder
@@ -21561,6 +21892,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
+            | ExprKind::CryptoPrivateKeyFromPem { .. }
+            | ExprKind::CryptoPublicKeyFromPem { .. }
+            | ExprKind::CryptoPublicKeyFromJwk { .. }
+            | ExprKind::CryptoSign { .. }
+            | ExprKind::CryptoVerify { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::JsonEncodeBounded { .. }
@@ -21991,6 +22327,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
+            | ExprKind::CryptoPrivateKeyFromPem { .. }
+            | ExprKind::CryptoPublicKeyFromPem { .. }
+            | ExprKind::CryptoPublicKeyFromJwk { .. }
+            | ExprKind::CryptoSign { .. }
+            | ExprKind::CryptoVerify { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => {}
             }
@@ -25439,6 +25780,21 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(salt, depth);
                 self.walk(params, depth);
             }
+            ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+            | ExprKind::CryptoPublicKeyFromPem { pem, .. } => self.walk(pem, depth),
+            ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+                self.walk(first, depth);
+                if let Some(second) = second { self.walk(second, depth); }
+            }
+            ExprKind::CryptoSign { key, message, .. } => {
+                self.walk(key, depth);
+                self.walk(message, depth);
+            }
+            ExprKind::CryptoVerify { key, message, signature, .. } => {
+                self.walk(key, depth);
+                self.walk(message, depth);
+                self.walk(signature, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -27494,7 +27850,12 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CryptoHmac { .. }
         | ExprKind::CryptoHkdf { .. }
         | ExprKind::CryptoAead { .. }
-        | ExprKind::CryptoArgon2 { .. } => {
+        | ExprKind::CryptoArgon2 { .. }
+        | ExprKind::CryptoPrivateKeyFromPem { .. }
+        | ExprKind::CryptoPublicKeyFromPem { .. }
+        | ExprKind::CryptoPublicKeyFromJwk { .. }
+        | ExprKind::CryptoSign { .. }
+        | ExprKind::CryptoVerify { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::Missing)
         }
     }
@@ -34539,6 +34900,9 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
+            | ExprKind::CryptoPrivateKeyFromPem { .. } | ExprKind::CryptoPublicKeyFromPem { .. }
+            | ExprKind::CryptoPublicKeyFromJwk { .. } | ExprKind::CryptoSign { .. }
+            | ExprKind::CryptoVerify { .. }
             // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
             // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
             // whose `{start,end}` are Copy byte offsets, NOT a view into the text; `find_all`/`split`
@@ -40957,6 +41321,25 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, salt, moved, false, false);
                 move_expr!(self, params, moved, false, false);
             }
+            ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+            | ExprKind::CryptoPublicKeyFromPem { pem, .. } => {
+                move_expr!(self, pem, moved, false, false);
+            }
+            ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+                move_expr!(self, first, moved, false, false);
+                if let Some(second) = second {
+                    move_expr!(self, second, moved, false, false);
+                }
+            }
+            ExprKind::CryptoSign { key, message, .. } => {
+                move_expr!(self, key, moved, false, false);
+                move_expr!(self, message, moved, false, false);
+            }
+            ExprKind::CryptoVerify { key, message, signature, .. } => {
+                move_expr!(self, key, moved, false, false);
+                move_expr!(self, message, moved, false, false);
+                move_expr!(self, signature, moved, false, false);
+            }
             // Tuple elements may be Copy or Move. Recurse through each element so owned values are
             // consumed at construction and tuple-index provenance remains visible to the move and
             // borrow analyses.
@@ -41724,6 +42107,22 @@ impl<'a, 't> Checker<'a, 't> {
                 );
             }
             for (parameter, &ty) in f.params.iter().zip(&param_tys) {
+                if ty_contains_signature_key(
+                    ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) && matches!(
+                    parameter.mode,
+                    ast::ParamMode::Out | ast::ParamMode::BorrowMut
+                ) {
+                    self.diags.error(
+                        "generic substitution cannot place a signature-key owner in an `out` or `borrow mut` parameter"
+                            .to_string(),
+                        parameter.ty.span(),
+                    );
+                }
                 match http_stream_carrier_class(
                     ty,
                     self.structs,
@@ -46614,6 +47013,21 @@ impl<'a, 't> Checker<'a, 't> {
                         | "chacha20_poly1305_seal"
                         | "chacha20_poly1305_open"
                         | "argon2id"
+                        | "rs256_private_key_from_pem"
+                        | "es256_private_key_from_pem"
+                        | "ed25519_private_key_from_pem"
+                        | "rs256_public_key_from_pem"
+                        | "es256_public_key_from_pem"
+                        | "ed25519_public_key_from_pem"
+                        | "rs256_public_key_from_jwk"
+                        | "es256_public_key_from_jwk"
+                        | "ed25519_public_key_from_jwk"
+                        | "rs256_sign"
+                        | "es256_sign"
+                        | "ed25519_sign"
+                        | "rs256_verify"
+                        | "es256_verify"
+                        | "ed25519_verify"
                 )
             {
                 self.require_import("std.crypto", &format!("crypto.{method}"), span);
@@ -55685,6 +56099,13 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "argon2id" {
             return self.check_crypto_argon2(args, span);
         }
+        if method.ends_with("_key_from_pem")
+            || method.ends_with("_key_from_jwk")
+            || method.ends_with("_sign")
+            || method.ends_with("_verify")
+        {
+            return self.check_crypto_signature(method, args, span);
+        }
         if method == "constant_time_equal" {
             if args.len() != 2 {
                 self.diags
@@ -55719,6 +56140,140 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::CryptoRandom { out: Box::new(out) }, ty: Ty::Unit, span }
+    }
+
+    /// The algorithm-specific asymmetric-signature surface. One builder owns all algorithms so
+    /// arity, stable shared-borrow places, nominal key identity, and Result shapes cannot drift.
+    fn check_crypto_signature(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = || Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let algorithm = if method.starts_with("rs256_") {
+            SignatureAlgorithm::Rs256
+        } else if method.starts_with("es256_") {
+            SignatureAlgorithm::Es256
+        } else if method.starts_with("ed25519_") {
+            SignatureAlgorithm::Ed25519
+        } else {
+            unreachable!("signature dispatch is gated by a closed method set")
+        };
+        let error = Scalar::Enum(self.error_enum_id);
+
+        if method.ends_with("_private_key_from_pem") || method.ends_with("_public_key_from_pem") {
+            if args.len() != 1 {
+                self.diags.error(
+                    format!("'crypto.{method}' expects 1 argument (pem), got {}", args.len()),
+                    span,
+                );
+                return err();
+            }
+            let pem = self.check_str_init(&args[0]);
+            if pem.ty == Ty::Error {
+                return err();
+            }
+            let private = method.ends_with("_private_key_from_pem");
+            let kind = if private { algorithm.private_kind() } else { algorithm.public_kind() };
+            return Expr {
+                kind: if private {
+                    ExprKind::CryptoPrivateKeyFromPem { algorithm, pem: Box::new(pem) }
+                } else {
+                    ExprKind::CryptoPublicKeyFromPem { algorithm, pem: Box::new(pem) }
+                },
+                ty: Ty::Result(Scalar::SignatureKey(kind), error),
+                span,
+            };
+        }
+
+        if method.ends_with("_public_key_from_jwk") {
+            let expected = if algorithm == SignatureAlgorithm::Ed25519 { 1 } else { 2 };
+            if args.len() != expected {
+                self.diags.error(
+                    format!("'crypto.{method}' expects {expected} decoded JWK byte field(s), got {}", args.len()),
+                    span,
+                );
+                return err();
+            }
+            let Some(first) = self.check_byte_view(&args[0], &format!("crypto.{method}")) else {
+                return err();
+            };
+            let second = if expected == 2 {
+                let Some(value) = self.check_byte_view(&args[1], &format!("crypto.{method}")) else {
+                    return err();
+                };
+                Some(Box::new(value))
+            } else {
+                None
+            };
+            return Expr {
+                kind: ExprKind::CryptoPublicKeyFromJwk {
+                    algorithm,
+                    first: Box::new(first),
+                    second,
+                },
+                ty: Ty::Result(Scalar::SignatureKey(algorithm.public_kind()), error),
+                span,
+            };
+        }
+
+        let verify = method.ends_with("_verify");
+        let expected_arity = if verify { 3 } else { 2 };
+        if args.len() != expected_arity {
+            let tail = if verify { "key, message, signature" } else { "key, message" };
+            self.diags.error(
+                format!("'crypto.{method}' expects {expected_arity} arguments ({tail}), got {}", args.len()),
+                span,
+            );
+            return err();
+        }
+        let key = self.check_expr(&args[0], None);
+        let expected_key = Ty::SignatureKey(if verify {
+            algorithm.public_kind()
+        } else {
+            algorithm.private_kind()
+        });
+        if key.ty != Ty::Error && self.resolve(key.ty) != expected_key {
+            self.diags.error(
+                format!("'crypto.{method}' expects {}, got {}", ty_name(expected_key), ty_name(self.resolve(key.ty))),
+                args[0].span,
+            );
+            return err();
+        }
+        if key.ty == Ty::Error {
+            return err();
+        }
+        if !matches!(key.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
+            self.diags.error(
+                format!("the shared-borrow key argument to 'crypto.{method}' must be a stable named local or field"),
+                args[0].span,
+            );
+            return err();
+        }
+        let Some(message) = self.check_byte_view(&args[1], &format!("crypto.{method}")) else {
+            return err();
+        };
+        if verify {
+            let Some(signature) = self.check_byte_view(&args[2], &format!("crypto.{method}")) else {
+                return err();
+            };
+            Expr {
+                kind: ExprKind::CryptoVerify {
+                    algorithm,
+                    key: Box::new(key),
+                    message: Box::new(message),
+                    signature: Box::new(signature),
+                },
+                ty: Ty::Result(Scalar::Bool, error),
+                span,
+            }
+        } else {
+            Expr {
+                kind: ExprKind::CryptoSign {
+                    algorithm,
+                    key: Box::new(key),
+                    message: Box::new(message),
+                },
+                ty: Ty::Result(Scalar::Buffer, error),
+                span,
+            }
+        }
     }
 
     /// `std.crypto` (M11 Slice 2) — `sha256(data)` / `sha512(data)`, the cryptographic digests via
@@ -60018,6 +60573,21 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(salt);
                 self.finalize_expr(params);
             }
+            ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+            | ExprKind::CryptoPublicKeyFromPem { pem, .. } => self.finalize_expr(pem),
+            ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+                self.finalize_expr(first);
+                if let Some(second) = second { self.finalize_expr(second); }
+            }
+            ExprKind::CryptoSign { key, message, .. } => {
+                self.finalize_expr(key);
+                self.finalize_expr(message);
+            }
+            ExprKind::CryptoVerify { key, message, signature, .. } => {
+                self.finalize_expr(key);
+                self.finalize_expr(message);
+                self.finalize_expr(signature);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
@@ -61034,6 +61604,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(elem) => format!("array_builder<{}>", scalar_name(elem)),
         ty @ (Ty::VecArrayBuilder(..)
         | Ty::MaskArrayBuilder(..)
@@ -61162,6 +61733,7 @@ fn resolved_type_source_spelling(
             Ty::Char => "char".to_string(),
             Ty::Str => "str".to_string(),
             Ty::String => "string".to_string(),
+            Ty::SignatureKey(kind) => kind.name().to_string(),
             Ty::Unit => "()".to_string(),
             Ty::Param(i) => format!("T{i}"),
             Ty::Struct(id) => struct_source_spellings
@@ -61776,13 +62348,17 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            collection_scalar_type(element)
-                .map(Ty::Slice)
-                .unwrap_or(Ty::Error)
+            if ty_contains_signature_key(element, structs, &[], enums, tagged_types) {
+                Ty::Error
+            } else {
+                collection_scalar_type(element)
+                    .map(Ty::Slice)
+                    .unwrap_or(Ty::Error)
+            }
         }
         Ty::Array(s, n) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            fixed_array_type(element, n).unwrap_or(Ty::Error)
+            fixed_array_type(element, n, structs, enums, tagged_types).unwrap_or(Ty::Error)
         }
         Ty::DynArray(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
@@ -61790,9 +62366,15 @@ fn subst_param_ty(
         }
         Ty::ArrayBuilder(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            array_builder_elem(element)
-                .map(Ty::array_builder)
-                .unwrap_or(Ty::Error)
+            if !matches!(element, Ty::Struct(_))
+                && ty_contains_signature_key(element, structs, &[], enums, tagged_types)
+            {
+                Ty::Error
+            } else {
+                array_builder_elem(element)
+                    .map(Ty::array_builder)
+                    .unwrap_or(Ty::Error)
+            }
         }
         Ty::Task(s) => Ty::Task(subst_scalar(s, args, tagged_types)),
         other => other,
@@ -61839,6 +62421,7 @@ fn dynamic_array_type(
             Some(Ty::DynFixedStructArray(id, length))
         }
         Ty::Slice(elem) => scalar_to_prim(elem).map(Ty::DynSliceArray),
+        other if ty_contains_signature_key(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(Ty::DynArray),
     }
 }
@@ -61846,9 +62429,16 @@ fn dynamic_array_type(
 /// Form the exact fixed-array representation after a generic literal element is substituted.
 /// A template temporarily represents `[value: T]` as `Ty::Array(Param, N)`; a struct argument must
 /// select the dedicated inline `StructArray` form before body analysis and MIR validation.
-fn fixed_array_type(element: Ty, length: u32) -> Option<Ty> {
+fn fixed_array_type(
+    element: Ty,
+    length: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
+        other if ty_contains_signature_key(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
 }
@@ -62523,6 +63113,13 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
+    if matches!(ty, Ty::SignatureKey(_)) && !allow_param {
+        diags.error(
+            format!("{what} cannot be `{}` — a signature key is a single owner, not a collection element", ty_name(ty)),
+            span,
+        );
+        return None;
+    }
     if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
@@ -62553,13 +63150,37 @@ fn scalar_arg(
 /// (`{fn_ptr, env_ptr}`), already represented by `Scalar::Fn`; keeping them out of `ty_to_scalar`
 /// preserves the narrower Option/Result/box payload surface while allowing homogeneous callback
 /// lists such as pkg.web middleware.
+#[derive(Clone, Copy)]
+struct CollectionTypeTables<'a> {
+    structs: &'a [StructDef],
+    tuples: &'a [hir::TupleDef],
+    enums: &'a [hir::EnumDef],
+}
+
 fn collection_scalar_arg(
     ty: Ty,
     what: &str,
+    tables: CollectionTypeTables<'_>,
     tagged_types: &mut Vec<hir::TaggedType>,
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
+    if ty_contains_signature_key(
+        ty,
+        tables.structs,
+        tables.tuples,
+        tables.enums,
+        tagged_types,
+    ) {
+        diags.error(
+            format!(
+                "{what} cannot be `{}` — a signature key is a single owner, not a collection element",
+                ty_name(ty)
+            ),
+            span,
+        );
+        return None;
+    }
     if let Some(scalar) = collection_scalar_type(ty) {
         return Some(scalar);
     }
@@ -62582,6 +63203,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
     if matches!(
         ty,
         Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::CliCommand
             | Ty::HttpRequest
             | Ty::Command
@@ -62901,6 +63523,21 @@ fn resolve_type(
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
+                if ty_contains_signature_key(
+                    pty,
+                    cx.structs,
+                    cx.tuples,
+                    cx.enums,
+                    cx.tagged_types,
+                ) && matches!(p.mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut)
+                {
+                    diags.error(
+                        "a function-value parameter containing a signature key may be passed by value or shared `borrow`, never `out` or `borrow mut`"
+                            .to_string(),
+                        p.ty.span(),
+                    );
+                    return Ty::Error;
+                }
                 let carrier = http_stream_carrier_class(
                     pty,
                     cx.structs,
@@ -63053,7 +63690,18 @@ fn resolve_type(
             span,
             diags,
         ) {
-            Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
+            Some(canonical) => {
+                if let Some(kind) = signature_key_kind_from_name(&canonical) {
+                    if !args.is_empty() {
+                        diags.error(format!("{canonical} takes no type arguments"), span);
+                        Ty::Error
+                    } else {
+                        Ty::SignatureKey(kind)
+                    }
+                } else {
+                    resolve_user_type(&canonical, args, cx, type_params, span, diags)
+                }
+            }
             None => Ty::Error,
         };
     }
@@ -63121,6 +63769,18 @@ fn resolve_type(
             }
             Ty::Buffer
         }
+        name @ ("rs256_private_key"
+        | "rs256_public_key"
+        | "es256_private_key"
+        | "es256_public_key"
+        | "ed25519_private_key"
+        | "ed25519_public_key") => {
+            if !args.is_empty() {
+                diags.error(format!("{name} takes no type arguments"), span);
+                return Ty::Error;
+            }
+            Ty::SignatureKey(signature_key_kind_from_name(name).expect("matched signature-key name"))
+        }
         // `array_builder<T>` — one owner type for the heap and explicit-region constructors. Type
         // formation admits the union of both concrete element sets; the constructor selects and
         // validates the allocation mode (`array_builder()` vs `array_builder(out)`).
@@ -63139,6 +63799,24 @@ fn resolve_type(
                 span,
                 diags,
             ) {
+                return Ty::Error;
+            }
+            if !matches!(inner, Ty::Struct(_))
+                && ty_contains_signature_key(
+                    inner,
+                    cx.structs,
+                    cx.tuples,
+                    cx.enums,
+                    cx.tagged_types,
+                )
+            {
+                diags.error(
+                    format!(
+                        "array_builder element cannot be `{}` — a signature key is a single owner, not a builder element",
+                        ty_name(inner)
+                    ),
+                    span,
+                );
                 return Ty::Error;
             }
             let normalized = match inner {
@@ -63407,7 +64085,18 @@ fn resolve_type(
             if reject_abstract_nominal_container(inner, "slice", cx, span, diags) {
                 return Ty::Error;
             }
-            match collection_scalar_arg(inner, "slice element", cx.tagged_types, span, diags) {
+            match collection_scalar_arg(
+                inner,
+                "slice element",
+                CollectionTypeTables {
+                    structs: cx.structs,
+                    tuples: cx.tuples,
+                    enums: cx.enums,
+                },
+                cx.tagged_types,
+                span,
+                diags,
+            ) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
@@ -63482,6 +64171,11 @@ fn resolve_type(
                         collection_scalar_arg(
                             inner,
                             "array element",
+                            CollectionTypeTables {
+                                structs: cx.structs,
+                                tuples: cx.tuples,
+                                enums: cx.enums,
+                            },
                             cx.tagged_types,
                             span,
                             diags,
@@ -63528,6 +64222,11 @@ fn resolve_type(
                 _ => match collection_scalar_arg(
                     inner,
                     "array element",
+                    CollectionTypeTables {
+                        structs: cx.structs,
+                        tuples: cx.tuples,
+                        enums: cx.enums,
+                    },
                     cx.tagged_types,
                     span,
                     diags,
@@ -63772,6 +64471,12 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Writer,
     Ty::Reader,
     Ty::Buffer,
+    Ty::SignatureKey(SignatureKeyKind::Rs256Private),
+    Ty::SignatureKey(SignatureKeyKind::Rs256Public),
+    Ty::SignatureKey(SignatureKeyKind::Es256Private),
+    Ty::SignatureKey(SignatureKeyKind::Es256Public),
+    Ty::SignatureKey(SignatureKeyKind::Ed25519Private),
+    Ty::SignatureKey(SignatureKeyKind::Ed25519Public),
     Ty::Regex,
     Ty::Captures,
     Ty::CliCommand,
@@ -65421,7 +66126,7 @@ mod tests {
             }
         }
         assert_eq!(
-            variants, 276,
+            variants, 281,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -72955,6 +73660,18 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             !region_plain_type_ok(Ty::Struct(0), &move_heap_only, &[], &[]),
             "a Move HeapTreeRecord must never be dual-mode because RegionPlain rejects every owning leaf"
+        );
+        let signature_key_record = vec![structure(
+            "SignatureKeyRecord",
+            vec![(
+                "key",
+                Ty::SignatureKey(SignatureKeyKind::Ed25519Private),
+            )],
+        )];
+        assert!(heap_tree_record_type_ok(0, &signature_key_record, &[]));
+        assert!(
+            !region_plain_type_ok(Ty::Struct(0), &signature_key_record, &[], &[]),
+            "a signature-key record is a heap-only Move record"
         );
 
         for (name, excluded, expected) in [

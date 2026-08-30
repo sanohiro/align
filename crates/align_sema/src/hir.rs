@@ -1832,6 +1832,26 @@ pub enum ExprKind {
     /// — never `Pure`, so excluded from `par_map`). All three operands are borrowed, never consumed
     /// (`params` is a Copy struct).
     CryptoArgon2 { password: Box<Expr>, salt: Box<Expr>, params: Box<Expr> },
+    /// Parse one exact unencrypted PKCS#8 private key for `algorithm` and return a fresh nominal
+    /// private-key shell. The PEM view is borrowed; the result owns the shell.
+    CryptoPrivateKeyFromPem { algorithm: crate::SignatureAlgorithm, pem: Box<Expr> },
+    /// Parse one exact SPKI public key for `algorithm` and return a fresh nominal public-key shell.
+    CryptoPublicKeyFromPem { algorithm: crate::SignatureAlgorithm, pem: Box<Expr> },
+    /// Construct a public key from already-decoded JWK components. Ed25519 has no second field.
+    CryptoPublicKeyFromJwk {
+        algorithm: crate::SignatureAlgorithm,
+        first: Box<Expr>,
+        second: Option<Box<Expr>>,
+    },
+    /// Sign the complete message with a stable shared-borrow private-key place.
+    CryptoSign { algorithm: crate::SignatureAlgorithm, key: Box<Expr>, message: Box<Expr> },
+    /// Verify the complete message/signature with a stable shared-borrow public-key place.
+    CryptoVerify {
+        algorithm: crate::SignatureAlgorithm,
+        key: Box<Expr>,
+        message: Box<Expr>,
+        signature: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

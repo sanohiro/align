@@ -370,6 +370,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Buffer
+            | Scalar::SignatureKey(_)
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -508,6 +509,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::StrFinder
             | Ty::File
             | Ty::Rng

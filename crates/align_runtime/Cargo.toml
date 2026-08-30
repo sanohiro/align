@@ -25,6 +25,9 @@ par-map-probe = []
 # Measurement aid for `bench/task_group`: expose an idle barrier so timing arms do not inherit
 # detached no-op helper jobs from the persistent pool. This is not a runtime capability.
 task-group-probe = []
+# Measurement aid for `bench/crypto_asymmetric`: count live published key shells and the exact
+# wrapper-owned clear-free DER allocations during construction. Off by default and not a gate.
+crypto-asymmetric-probe = []
 
 [dependencies]
 align_hash = { path = "../align_hash" }

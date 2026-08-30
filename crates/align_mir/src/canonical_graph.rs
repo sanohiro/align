@@ -2492,6 +2492,11 @@ fn scalar(
             Scalar::RunBytes => leaf!(36),
             Scalar::HttpReadStream => leaf!(37),
             Scalar::HttpSseStream => leaf!(38),
+            Scalar::SignatureKey(kind) => {
+                out.push(39);
+                out.push(kind as u8);
+                Ok(())
+            }
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2715,6 +2720,11 @@ fn ty(
             Ty::RunBytes => leaf!(60),
             Ty::HttpReadStream => leaf!(61),
             Ty::HttpSseStream => leaf!(62),
+            Ty::SignatureKey(kind) => {
+                out.push(63);
+                out.push(kind as u8);
+                Ok(())
+            }
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -4026,6 +4036,12 @@ mod tests {
             Scalar::ResourceRef(1) => [35, 1, 0x60, 0, 0],
             Scalar::RunBytes => [36],
             Scalar::HttpReadStream => [37], Scalar::HttpSseStream => [38],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Private) => [39, 0],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Public) => [39, 1],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Es256Private) => [39, 2],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Es256Public) => [39, 3],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [39, 4],
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [39, 5],
         );
     }
 
@@ -4072,6 +4088,12 @@ mod tests {
                 => [59, 1, 1, 32, 4, 0, 0, 0],
             Ty::RunBytes => [60],
             Ty::HttpReadStream => [61], Ty::HttpSseStream => [62],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Rs256Private) => [63, 0],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Rs256Public) => [63, 1],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Es256Private) => [63, 2],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Es256Public) => [63, 3],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [63, 4],
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [63, 5],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );

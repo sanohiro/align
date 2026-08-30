@@ -1125,6 +1125,25 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(salt), child_depth));
                     work.push((BodyRecord::Expr(params), child_depth));
                 }
+                ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+                | ExprKind::CryptoPublicKeyFromPem { pem, .. } => {
+                    work.push((BodyRecord::Expr(pem), child_depth));
+                }
+                ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+                    work.push((BodyRecord::Expr(first), child_depth));
+                    if let Some(second) = second {
+                        work.push((BodyRecord::Expr(second), child_depth));
+                    }
+                }
+                ExprKind::CryptoSign { key, message, .. } => {
+                    work.push((BodyRecord::Expr(key), child_depth));
+                    work.push((BodyRecord::Expr(message), child_depth));
+                }
+                ExprKind::CryptoVerify { key, message, signature, .. } => {
+                    work.push((BodyRecord::Expr(key), child_depth));
+                    work.push((BodyRecord::Expr(message), child_depth));
+                    work.push((BodyRecord::Expr(signature), child_depth));
+                }
                 ExprKind::ResourceFromRaw { raw, parent, .. } => {
                     work.push((BodyRecord::Expr(raw), child_depth));
                     if let Some(parent) = parent {
