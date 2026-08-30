@@ -1423,6 +1423,42 @@ quiet_fail_status=0
   exit 1
 }
 
+quiet_expected_out="$quiet_dir/expected-out"
+"$quiet_runner" --expect-failure "quiet expected failure" -- \
+  "$quiet_dir/fail" >"$quiet_expected_out" 2>&1
+[[ "$(wc -l <"$quiet_expected_out" | tr -d '[:space:]')" -eq 1 ]] &&
+  grep -Fq 'quiet expected failure: expected failure observed (exit 7' \
+    "$quiet_expected_out" &&
+  ! grep -Eq 'partial-stdout|failure-stderr' "$quiet_expected_out" || {
+  echo "the quiet wrapper did not summarize an expected failure:" >&2
+  cat "$quiet_expected_out" >&2
+  exit 1
+}
+quiet_expected_verbose_out="$quiet_dir/expected-verbose-out"
+ALIGN_QUIET_VERBOSE=1 \
+  "$quiet_runner" --expect-failure "quiet expected failure" -- \
+  "$quiet_dir/fail" >"$quiet_expected_verbose_out" 2>&1
+grep -Fq 'partial-stdout' "$quiet_expected_verbose_out" &&
+  grep -Fq 'failure-stderr' "$quiet_expected_verbose_out" || {
+  echo "verbose expected-failure mode did not restore captured output:" >&2
+  cat "$quiet_expected_verbose_out" >&2
+  exit 1
+}
+
+quiet_unexpected_pass_out="$quiet_dir/unexpected-pass-out"
+quiet_unexpected_pass_status=0
+"$quiet_runner" --expect-failure "quiet unexpected pass" -- \
+  "$quiet_dir/pass" >"$quiet_unexpected_pass_out" 2>&1 ||
+  quiet_unexpected_pass_status=$?
+[[ "$quiet_unexpected_pass_status" -eq 1 ]] &&
+  grep -Fq 'quiet unexpected pass: FAILED (expected a non-zero exit, got 0' \
+    "$quiet_unexpected_pass_out" &&
+  grep -Fq 'routine line 1' "$quiet_unexpected_pass_out" || {
+  echo "the quiet wrapper did not explain an unexpectedly passing command:" >&2
+  cat "$quiet_unexpected_pass_out" >&2
+  exit 1
+}
+
 quiet_artifact="$quiet_dir/artifact"
 quiet_artifact_out="$quiet_dir/artifact-out"
 "$quiet_runner" --stdout "$quiet_artifact" "quiet artifact" -- \

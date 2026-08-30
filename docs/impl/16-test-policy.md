@@ -85,6 +85,11 @@ human output, and an interrupt replays the partial captured output before
 cleanup. This is an output-volume policy only; it changes no selected test,
 timeout, or verdict.
 
+An inverted self-test uses `--expect-failure`: a non-zero child status becomes
+one successful summary that includes the observed status, while an unexpected
+zero replays the captured output and fails the wrapper. This keeps expected-red
+configuration owners terse without weakening their verdict.
+
 The ordinary gate does not run:
 
 - the full driver regression corpus;

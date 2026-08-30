@@ -2,31 +2,44 @@
 # Capture a command's routine output, print one success summary, and replay the
 # captured detail only when the command fails.
 #
-#   usage: scripts/run-quiet.sh [--stdout FILE] LABEL -- COMMAND [ARG...]
+#   usage: scripts/run-quiet.sh [--stdout FILE] [--expect-failure] LABEL -- COMMAND [ARG...]
 #
 # --stdout keeps machine-readable stdout in FILE while capturing stderr. On a
 # failure both streams are replayed; on success FILE remains available to the
 # caller without flooding the terminal. ALIGN_QUIET_VERBOSE=1 replays captured
-# human output after a successful command too.
+# human output after a successful command too. --expect-failure inverts only
+# the command verdict: a non-zero child is a terse wrapper success, while an
+# unexpected zero replays the output and fails.
 set -uo pipefail
 
+usage() {
+  echo "usage: scripts/run-quiet.sh [--stdout FILE] [--expect-failure] LABEL -- COMMAND [ARG...]" >&2
+  exit 2
+}
+
 stdout_file=""
-if [ "${1:-}" = --stdout ]; then
-  [ $# -ge 3 ] || {
-    echo "usage: scripts/run-quiet.sh [--stdout FILE] LABEL -- COMMAND [ARG...]" >&2
-    exit 2
-  }
-  stdout_file="$2"
-  [ -n "$stdout_file" ] || {
-    echo "--stdout requires a non-empty file path" >&2
-    exit 2
-  }
-  shift 2
-fi
+expect_failure=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stdout)
+      [ $# -ge 2 ] || usage
+      stdout_file="$2"
+      [ -n "$stdout_file" ] || {
+        echo "--stdout requires a non-empty file path" >&2
+        exit 2
+      }
+      shift 2
+      ;;
+    --expect-failure)
+      expect_failure=1
+      shift
+      ;;
+    *) break ;;
+  esac
+done
 
 [ $# -ge 3 ] && [ "$2" = -- ] || {
-  echo "usage: scripts/run-quiet.sh [--stdout FILE] LABEL -- COMMAND [ARG...]" >&2
-  exit 2
+  usage
 }
 label="$1"
 shift 2
@@ -71,7 +84,25 @@ else
 fi
 elapsed="$(($(date +%s) - started))"
 
-if [ "$status" -eq 0 ]; then
+if [ "$expect_failure" -eq 1 ] && [ "$status" -ne 0 ]; then
+  printf '%s: expected failure observed (exit %s, %ss)\n' \
+    "$label" "$status" "$elapsed"
+  if [ "$verbose" -eq 1 ]; then
+    [ ! -s "$log" ] || cat "$log"
+    if [ -n "$stdout_file" ] && [ -s "$stdout_file" ]; then
+      cat "$stdout_file"
+    fi
+  fi
+  exit 0
+elif [ "$expect_failure" -eq 1 ]; then
+  printf '%s: FAILED (expected a non-zero exit, got 0; %ss)\n' \
+    "$label" "$elapsed" >&2
+  [ ! -s "$log" ] || cat "$log" >&2
+  if [ -n "$stdout_file" ] && [ -s "$stdout_file" ]; then
+    cat "$stdout_file" >&2
+  fi
+  exit 1
+elif [ "$status" -eq 0 ]; then
   printf '%s: ok (%ss)\n' "$label" "$elapsed"
   if [ "$verbose" -eq 1 ] && [ -s "$log" ]; then
     cat "$log"

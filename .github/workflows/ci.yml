@@ -261,26 +261,16 @@ jobs:
         if: matrix.db-shard == 'catalog-stream'
         shell: bash
         run: |
-          set +e
-          env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
+          scripts/run-quiet.sh --expect-failure \
+            "database CI test: missing PostgreSQL URL" -- \
+            env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
             -p align_driver --test pkg_db_q2 postgres_required_mode_requires_configuration -- --exact
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "required PostgreSQL mode accepted a missing URL" >&2
-            exit 1
-          fi
 
-          set +e
-          env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
+          scripts/run-quiet.sh --expect-failure \
+            "database CI test: missing pgvector URL" -- \
+            env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
             -p align_driver --test pkg_db_vc1 \
             pgvector_required_mode_requires_configuration -- --exact
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "required pgvector mode accepted a missing URL" >&2
-            exit 1
-          fi
 
       - name: Required database owner suites
         shell: bash

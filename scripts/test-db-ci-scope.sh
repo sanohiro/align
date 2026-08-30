@@ -209,6 +209,9 @@ grep -Fq 'name: PostgreSQL integration (${{ matrix.db-shard }})' "$ci_workflow"
 grep -Fq 'run: scripts/run-db-suites.sh "${{ matrix.db-shard }}"' "$ci_workflow"
 grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
 test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
+test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' "$ci_workflow")" -eq 2
+test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' \
+  "$repo_root/scripts/db-verify-local.sh")" -eq 2
 
 expected_owners="$(printf '%s\n' \
   pkg_db_q1 pkg_db_q2 pkg_db_q3 pkg_db_q4a pkg_db_q4b pkg_db_q5a \
