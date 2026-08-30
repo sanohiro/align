@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-29._ align-llm Request 21's borrowed projection view repair is merged in
+_Last updated: 2026-08-30._ align-llm Request 21's borrowed projection view repair is merged in
 Align PR #892
 against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
 an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
@@ -374,18 +374,15 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **Next convergence capability:** HTTP client streaming receive is designed in
-  `docs/impl/std-design/http.md`. The dependent `http_read_stream` carrier and
-  caller-buffer de-framed read boundary are implemented; the next capability is
-  its consuming `http_sse_stream` transition with caller-buffer WHATWG event reads. Exact
-  completion may return the connection to its borrowed client pool; mid-body
-  Drop closes without draining. Per-call framing and SSE-source work guards keep
-  each operation bounded without imposing a lifetime body cap. Streams use one
-  positive carrier grammar: bare or finite builtin Option/Result paths only;
-  an exhaustive type-discriminator classifier rejects every other storage edge,
-  including tuples, by default. SSE reconnect state commits atomically with its
-  control block/event. The raw-stream capability is the first of the two planned
-  PRs; transactional SSE interpretation is the second.
+- **Latest convergence capability:** HTTP client streaming receive is implemented against
+  `docs/impl/std-design/http.md`. The dependent `http_read_stream` carrier, caller-buffer
+  de-framed raw read, consuming `http_sse_stream` transition, and caller-buffer WHATWG event read
+  share one transport/framing owner. Exact completion may return the connection to its borrowed
+  client pool; mid-body Drop closes without draining. Per-call framing and SSE-source work guards
+  keep each operation bounded without imposing a lifetime body cap. Both stream types use one
+  positive carrier grammar: bare or finite builtin Option/Result paths only; the exhaustive
+  type-discriminator classifier rejects every other storage edge, including tuples, by default.
+  SSE reconnect state commits atomically with its control block/event.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

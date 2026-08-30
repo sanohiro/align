@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use align_sema::{
-    AggregateArrayElem, ArrayBuilderElem, Layout, PrimScalar, Scalar, Ty, hir,
+    AggregateArrayElem, ArrayBuilderElem, IntTy, Layout, PrimScalar, Scalar, Ty, hir,
 };
 use align_span::Span;
 
@@ -1107,7 +1107,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn field_type_ok(&self, ty: Ty, allow_param: bool) -> bool {
         match ty {
-            Ty::RunBytes | Ty::HttpReadStream => false,
+            Ty::RunBytes | Ty::HttpReadStream | Ty::HttpSseStream => false,
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
@@ -1337,6 +1337,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpRequestCtx
             | Scalar::HttpStream
             | Scalar::HttpReadStream
+            | Scalar::HttpSseStream
             | Scalar::ResponseBuilder
             | Scalar::RunOutput => !matches!(mode, ScalarPlacement::Collection),
             Scalar::RunBytes => !matches!(mode, ScalarPlacement::Collection),
@@ -1377,7 +1378,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::ResponseBuilder => true,
-            Scalar::HttpReadStream => false,
+            Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
             Scalar::DynArray(_) => true,
             Scalar::DynStructArray(id) => {
@@ -1483,7 +1484,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream => true,
-            Ty::HttpReadStream => true,
+            Ty::HttpReadStream | Ty::HttpSseStream => true,
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
             Ty::CliParsed
@@ -1978,6 +1979,7 @@ impl<'a> Validator<'a> {
             | Ty::ResponseBuilder
             | Ty::HttpStream
             | Ty::HttpReadStream
+            | Ty::HttpSseStream
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Unit => true,
@@ -2031,6 +2033,7 @@ impl<'a> Validator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::HttpReadStream
+            | Scalar::HttpSseStream
             | Scalar::RunOutput => true,
             Scalar::RunBytes => true,
         }
@@ -3000,6 +3003,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::ResponseBuilder
             | Ty::HttpStream
             | Ty::HttpReadStream
+                | Ty::HttpSseStream
             | Ty::JsonDoc => true,
             Ty::Param(_)
             | Ty::SoaParam(_)
@@ -3300,6 +3304,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::HttpReadStream
+                | Scalar::HttpSseStream
             | Scalar::RunOutput => true,
             Scalar::RunBytes => true,
             Scalar::Param(_) | Scalar::SoaParam(_) => false,
@@ -4059,6 +4064,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpReadStreamStatus { .. }
             | hir::ExprKind::HttpReadStreamHeader { .. }
             | hir::ExprKind::HttpReadStreamRead { .. }
+            | hir::ExprKind::HttpReadStreamSse { .. }
+            | hir::ExprKind::HttpSseStreamLastEventId { .. }
+            | hir::ExprKind::HttpSseStreamRetryMs { .. }
+            | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -4372,6 +4381,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpReadStreamStatus { .. }
             | hir::ExprKind::HttpReadStreamHeader { .. }
             | hir::ExprKind::HttpReadStreamRead { .. }
+                | hir::ExprKind::HttpReadStreamSse { .. }
+                | hir::ExprKind::HttpSseStreamLastEventId { .. }
+                | hir::ExprKind::HttpSseStreamRetryMs { .. }
+                | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
@@ -4518,15 +4531,16 @@ impl<'a> BodyValidator<'a> {
     /// A streamed response read mutates its transport/framing cursor. Nonparameter locals own that
     /// cursor; a parameter may advance it only by value or through an exclusive mutable borrow.
     /// This independently rejects handcrafted HIR that bypasses the source checker.
-    fn http_read_stream_cursor_place(
+    fn http_stream_cursor_place(
         &self,
         context: &BodyContext,
         expression: &hir::Expr,
+        ty: Ty,
     ) -> bool {
         let hir::ExprKind::Local(id) = expression.kind else {
             return false;
         };
-        if !self.local_handle_place(context, expression, Ty::HttpReadStream) {
+        if !self.local_handle_place(context, expression, ty) {
             return false;
         }
         let Some(function) = self.program.fns.get(context.function) else {
@@ -4539,6 +4553,27 @@ impl<'a> BodyValidator<'a> {
             function.param_modes.get(position),
             Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut)
         )
+    }
+
+    fn owned_http_stream_place(
+        &self,
+        context: &BodyContext,
+        expression: &hir::Expr,
+        ty: Ty,
+    ) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        if !self.local_handle_place(context, expression, ty) {
+            return false;
+        }
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+            return true;
+        };
+        function.param_modes.get(position) == Some(&align_ast::ParamMode::ByValue)
     }
 
     fn source_mut_local(&self, context: &BodyContext, expression: &hir::Expr, ty: Ty) -> bool {
@@ -8347,21 +8382,73 @@ impl<'a> BodyValidator<'a> {
                     .then(|| result(Ty::HttpReadStream, &[client, req]))?
             }
             hir::ExprKind::HttpReadStreamStatus { stream } => {
-                (local(stream, Ty::HttpReadStream) && stream.ty == Ty::HttpReadStream)
+                (matches!(stream.ty, Ty::HttpReadStream | Ty::HttpSseStream)
+                    && local(stream, stream.ty))
                     .then(|| strict(i64, &[stream]))?
             }
             hir::ExprKind::HttpReadStreamHeader { stream, name } => {
-                (local(stream, Ty::HttpReadStream)
-                    && stream.ty == Ty::HttpReadStream
+                (matches!(stream.ty, Ty::HttpReadStream | Ty::HttpSseStream)
+                    && local(stream, stream.ty)
                     && name.ty == Ty::Str)
                     .then(|| strict(Ty::Option(Scalar::Str), &[stream, name]))?
             }
             hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
-                (self.http_read_stream_cursor_place(context, stream)
+                (self.http_stream_cursor_place(context, stream, Ty::HttpReadStream)
                     && stream.ty == Ty::HttpReadStream
                     && mutable_local(buffer, Ty::Buffer)
                     && buffer.ty == Ty::Buffer)
                     .then(|| result(i64, &[stream, buffer]))?
+            }
+            hir::ExprKind::HttpReadStreamSse { stream } => {
+                (self.owned_http_stream_place(context, stream, Ty::HttpReadStream)
+                    && stream.ty == Ty::HttpReadStream)
+                    .then(|| strict(Ty::HttpSseStream, &[stream]))?
+            }
+            hir::ExprKind::HttpSseStreamLastEventId { stream } => {
+                (local(stream, Ty::HttpSseStream) && stream.ty == Ty::HttpSseStream)
+                    .then(|| strict(Ty::Str, &[stream]))?
+            }
+            hir::ExprKind::HttpSseStreamRetryMs { stream } => {
+                (local(stream, Ty::HttpSseStream) && stream.ty == Ty::HttpSseStream).then(
+                    || {
+                        strict(
+                            Ty::Option(Scalar::Int(IntTy {
+                                bits: 64,
+                                signed: true,
+                            })),
+                            &[stream],
+                        )
+                    },
+                )?
+            }
+            hir::ExprKind::HttpSseStreamNext { stream, buffer } => {
+                let event_id = self.program.structs.iter().position(|definition| {
+                    definition.name == "http_sse_event"
+                        && definition.source_name == "http_sse_event"
+                        && definition.align.is_none()
+                        && !definition.c_repr
+                        && definition.fields.len() == 4
+                        && definition.fields[0].name == "event"
+                        && definition.fields[0].ty == Ty::Str
+                        && definition.fields[1].name == "data"
+                        && definition.fields[1].ty == Ty::Str
+                        && definition.fields[2].name == "last_event_id"
+                        && definition.fields[2].ty == Ty::Str
+                        && definition.fields[3].name == "retry_ms"
+                        && definition.fields[3].ty
+                            == Ty::Option(Scalar::Int(IntTy {
+                                bits: 64,
+                                signed: true,
+                            }))
+                })? as u32;
+                let option_id = self.program.tagged_types.iter().position(|tagged| {
+                    *tagged == hir::TaggedType::Option(Scalar::Struct(event_id))
+                })? as u32;
+                (self.http_stream_cursor_place(context, stream, Ty::HttpSseStream)
+                    && stream.ty == Ty::HttpSseStream
+                    && mutable_local(buffer, Ty::Buffer)
+                    && buffer.ty == Ty::Buffer)
+                    .then(|| result(Ty::Tagged(option_id), &[stream, buffer]))?
             }
             hir::ExprKind::HttpGetMany {
                 client,
@@ -8575,6 +8662,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::ResponseBuilder
             | Ty::HttpStream
             | Ty::HttpReadStream
+                | Ty::HttpSseStream
             | Ty::Param(_)
             | Ty::SoaParam(_)
             | Ty::IntVar(_)

@@ -1328,6 +1328,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("reader", 0, BuiltinCapability::BorrowLeaf),
     ("writer", 0, BuiltinCapability::BorrowLeaf),
     ("http_read_stream", 0, BuiltinCapability::BorrowLeaf),
+    ("http_sse_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_headers", 0, BuiltinCapability::BorrowLeaf),
     ("json.doc", 0, BuiltinCapability::BorrowLeaf),
     ("slice", 1, BuiltinCapability::BorrowLeaf),

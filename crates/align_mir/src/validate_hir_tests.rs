@@ -10851,7 +10851,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 272,
+        variants, 276,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -10880,6 +10880,38 @@ fn hir_body_validator_native() {
     let regex_match = push_builtin_regex_match(&mut program);
     let argon2_params = push_builtin_argon2_params(&mut program);
     let i64_ty = int(64);
+    let http_sse_event = program.structs.len() as u32;
+    program.structs.push(StructDef {
+        name: "http_sse_event".to_string(),
+        source_name: "http_sse_event".to_string(),
+        fields: vec![
+            FieldDef {
+                name: "event".to_string(),
+                ty: Ty::Str,
+            },
+            FieldDef {
+                name: "data".to_string(),
+                ty: Ty::Str,
+            },
+            FieldDef {
+                name: "last_event_id".to_string(),
+                ty: Ty::Str,
+            },
+            FieldDef {
+                name: "retry_ms".to_string(),
+                ty: Ty::Option(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                })),
+            },
+        ],
+        align: None,
+        c_repr: false,
+    });
+    let http_sse_option = program.tagged_types.len() as u32;
+    program
+        .tagged_types
+        .push(hir::TaggedType::Option(Scalar::Struct(http_sse_event)));
     let i32_ty = int(32);
     let u8_scalar = Scalar::Int(IntTy { bits: 8, signed: false });
     let bytes = Ty::Slice(u8_scalar);
@@ -10888,6 +10920,7 @@ fn hir_body_validator_native() {
     let result_buffer = native_result(Ty::Buffer, error);
     let result_response = native_result(Ty::HttpResponse, error);
     let result_read_stream = native_result(Ty::HttpReadStream, error);
+    let result_sse_event = native_result(Ty::Tagged(http_sse_option), error);
     let result_u8_array = Ty::DynArray(u8_scalar);
 
     macro_rules! add {
@@ -12592,6 +12625,113 @@ fn hir_body_validator_native() {
         result_i64
     );
     add!(
+        "native_http_read_stream_sse",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamSse {
+                stream: Box::new(native_local(0, Ty::HttpReadStream)),
+            },
+            Ty::HttpSseStream,
+        ),
+        vec![body_test_local(
+            0,
+            "stream",
+            Ty::HttpReadStream,
+            false,
+            false
+        )],
+        Ty::HttpSseStream
+    );
+    add!(
+        "native_http_sse_stream_status",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamStatus {
+                stream: Box::new(native_local(0, Ty::HttpSseStream)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(
+            0,
+            "events",
+            Ty::HttpSseStream,
+            false,
+            false
+        )],
+        i64_ty
+    );
+    add!(
+        "native_http_sse_stream_header",
+        body_test_expr(
+            hir::ExprKind::HttpReadStreamHeader {
+                stream: Box::new(native_local(0, Ty::HttpSseStream)),
+                name: Box::new(native_str()),
+            },
+            Ty::Option(Scalar::Str),
+        ),
+        vec![body_test_local(
+            0,
+            "events",
+            Ty::HttpSseStream,
+            false,
+            false
+        )],
+        Ty::Option(Scalar::Str)
+    );
+    add!(
+        "native_http_sse_stream_last_event_id",
+        body_test_expr(
+            hir::ExprKind::HttpSseStreamLastEventId {
+                stream: Box::new(native_local(0, Ty::HttpSseStream)),
+            },
+            Ty::Str,
+        ),
+        vec![body_test_local(
+            0,
+            "events",
+            Ty::HttpSseStream,
+            false,
+            false
+        )],
+        Ty::Str
+    );
+    add!(
+        "native_http_sse_stream_retry_ms",
+        body_test_expr(
+            hir::ExprKind::HttpSseStreamRetryMs {
+                stream: Box::new(native_local(0, Ty::HttpSseStream)),
+            },
+            Ty::Option(Scalar::Int(IntTy {
+                bits: 64,
+                signed: true
+            })),
+        ),
+        vec![body_test_local(
+            0,
+            "events",
+            Ty::HttpSseStream,
+            false,
+            false
+        )],
+        Ty::Option(Scalar::Int(IntTy {
+            bits: 64,
+            signed: true
+        }))
+    );
+    add!(
+        "native_http_sse_stream_next",
+        body_test_expr(
+            hir::ExprKind::HttpSseStreamNext {
+                stream: Box::new(native_local(0, Ty::HttpSseStream)),
+                buffer: Box::new(native_local(1, Ty::Buffer)),
+            },
+            result_sse_event,
+        ),
+        vec![
+            body_test_local(0, "events", Ty::HttpSseStream, false, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+        ],
+        result_sse_event
+    );
+    add!(
         "native_http_get_many",
         body_test_expr(
             hir::ExprKind::HttpGetMany {
@@ -12931,6 +13071,7 @@ fn hir_body_validator_native() {
     for name in [
         "native_http_client_request_stream",
         "native_http_read_stream_read",
+        "native_http_sse_stream_next",
     ] {
         let mut reject = program.clone();
         body_value_expression_mut(&mut reject, name).ty = Ty::Bool;
@@ -12942,6 +13083,11 @@ fn hir_body_validator_native() {
     for name in [
         "native_http_read_stream_status",
         "native_http_read_stream_header",
+        "native_http_sse_stream_status",
+        "native_http_sse_stream_header",
+        "native_http_sse_stream_last_event_id",
+        "native_http_sse_stream_retry_ms",
+        "native_http_read_stream_sse",
     ] {
         let mut reject = program.clone();
         body_statement_expression_mut(&mut reject, name).ty = Ty::Bool;
@@ -12989,6 +13135,115 @@ fn hir_body_validator_native() {
             "{name}: temporary stream receiver"
         );
     }
+
+    for name in [
+        "native_http_sse_stream_status",
+        "native_http_sse_stream_header",
+        "native_http_sse_stream_last_event_id",
+        "native_http_sse_stream_retry_ms",
+    ] {
+        let mut reject = program.clone();
+        let expression = body_statement_expression_mut(&mut reject, name);
+        let stream = match &mut expression.kind {
+            hir::ExprKind::HttpReadStreamStatus { stream }
+            | hir::ExprKind::HttpReadStreamHeader { stream, .. }
+            | hir::ExprKind::HttpSseStreamLastEventId { stream }
+            | hir::ExprKind::HttpSseStreamRetryMs { stream } => stream,
+            _ => panic!("{name}: SSE stream fixture lost its discriminator"),
+        };
+        *stream = Box::new(body_test_expr(
+            hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(native_local(0, Ty::HttpSseStream))),
+            }),
+            Ty::HttpSseStream,
+        ));
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: temporary SSE stream receiver"
+        );
+    }
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(&mut reject, "native_http_read_stream_sse");
+    let hir::ExprKind::HttpReadStreamSse { stream } = &mut expression.kind else {
+        panic!("raw-to-SSE fixture lost its discriminator")
+    };
+    *stream = Box::new(body_test_expr(
+        hir::ExprKind::Block(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(native_local(0, Ty::HttpReadStream))),
+        }),
+        Ty::HttpReadStream,
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "raw-to-SSE requires an owned cursor place"
+    );
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_http_sse_stream_next");
+    let hir::ExprKind::HttpSseStreamNext { stream, .. } = &mut expression.kind else {
+        panic!("SSE next fixture lost its discriminator")
+    };
+    *stream = Box::new(body_test_expr(
+        hir::ExprKind::Block(hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(native_local(0, Ty::HttpSseStream))),
+        }),
+        Ty::HttpSseStream,
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "SSE next rejects a temporary cursor"
+    );
+
+    let mut reject = program.clone();
+    let function = reject
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_sse_stream_next")
+        .expect("SSE next fixture is present");
+    function.locals[1].is_mut = false;
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "SSE next output buffer must be mutable"
+    );
+
+    let mut exclusive = program.clone();
+    let function = exclusive
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_sse_stream_next")
+        .expect("SSE next fixture is present");
+    function.params = vec![0];
+    function.param_modes = vec![align_ast::ParamMode::BorrowMut];
+    function.locals[0].is_param = true;
+    function.locals[0].is_mut = true;
+    assert!(
+        body_core_metadata_is_valid(&exclusive),
+        "SSE next accepts an exclusive mutable cursor borrow"
+    );
+
+    let mut shared = exclusive;
+    let function = shared
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "native_http_sse_stream_next")
+        .expect("SSE next fixture is present");
+    function.param_modes[0] = align_ast::ParamMode::Borrow;
+    function.locals[0].is_mut = false;
+    assert!(
+        !body_core_metadata_is_valid(&shared),
+        "SSE next must reject a shared cursor borrow"
+    );
+
+    let mut reject = program.clone();
+    reject.structs[http_sse_event as usize].fields[2].ty = Ty::Bool;
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "SSE next requires the canonical http_sse_event field envelope"
+    );
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "native_http_read_stream_read");
@@ -14570,6 +14825,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::HttpReadStream
+        | Scalar::HttpSseStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn { .. }
@@ -14632,7 +14888,9 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::ResponseBuilder,
         Scalar::HttpStream,
         Scalar::HttpReadStream,
+        Scalar::HttpSseStream,
         Scalar::RunOutput,
+        Scalar::RunBytes,
         Scalar::Fn(0),
         Scalar::Resource(0),
         Scalar::ResourceRef(0),

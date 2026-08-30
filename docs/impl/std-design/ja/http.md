@@ -16,8 +16,8 @@ HTTP/1.1 のプリミティブであり、フレームワークではない(draf
 TLS はクライアント優先で先送り。HTTP/3、ルーティング、ミドルウェアは std ではなく pkg である。
 
 **モジュール状態: v1 COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。最初の
-post-`pkg.db` convergence item である client streaming receive は **2026-08-29 設計済み**で、dependent raw
-`http_read_stream` boundary は **2026-08-30 実装済み**。consuming SSE transition が次の capability である。
+post-`pkg.db` convergence item である client streaming receive は **2026-08-30 実装済み**で、dependent raw
+`http_read_stream` boundary と consuming `http_sse_stream` transition の両方が出荷済みである。
 サーバ側 TLS、クライアント証明書、カスタム CA、セッション再開、失効確認は別のバックログ項目である。
 
 ## Signatures
@@ -1224,7 +1224,7 @@ benchmark は不要。この contract は throughput ではなく resource ceili
 が直接測る。code/allocation/public method/framing precedence/layer ownership の変更は implementation 前に ledger
 を reopen する。
 
-## Client streaming receive（post-`pkg.db` convergence item 1 — 2026-08-29 設計済み、raw stream 2026-08-30 実装済み）
+## Client streaming receive（post-`pkg.db` convergence item 1 — 2026-08-30 実装済み）
 
 whole-body API は一つの owned `response` が必要な terminal には正しいが、終端のない provider stream や
 大きな download には正しくない。この capability は Request 4 の incremental decoder を一つの dependent

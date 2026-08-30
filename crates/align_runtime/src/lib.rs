@@ -19649,12 +19649,520 @@ enum HttpExchange {
 }
 
 const HTTP_CLIENT_READ_CHUNK: usize = 32 * 1024;
+const HTTP_MAX_SSE_METADATA: usize = 262_144;
+
+/// One exactly sized retained byte allocation. `len` is the initialized prefix; replacement
+/// allocates the requested bound before releasing the old storage so the ledger's simultaneous
+/// old/new high-water claim is directly observable.
+struct HttpSseBytes {
+    storage: Box<[u8]>,
+    len: usize,
+}
+
+impl HttpSseBytes {
+    fn new() -> Self {
+        Self {
+            storage: Box::default(),
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.storage.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.storage[..self.len]
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn grow_exact(&mut self, capacity: usize) {
+        if capacity <= self.capacity() {
+            return;
+        }
+        let mut replacement = vec![0u8; capacity].into_boxed_slice();
+        replacement[..self.len].copy_from_slice(self.as_slice());
+        self.storage = replacement;
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), i32> {
+        if self.len == self.capacity() {
+            return Err(AL_INVALID);
+        }
+        self.storage[self.len] = byte;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+const SSE_REPLACEMENT: &[u8; 3] = b"\xef\xbf\xbd";
+
+/// Allocation-free UTF-8 replacement iterator. Valid runs are checked once and then yielded one
+/// scalar at a time; malformed maximal subparts use the same `Utf8Error::error_len` partition as
+/// `String::from_utf8_lossy`, but without constructing a `Cow`.
+struct HttpSseUtf8<'a> {
+    input: &'a [u8],
+    pos: usize,
+    valid_end: usize,
+}
+
+impl<'a> HttpSseUtf8<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            pos: 0,
+            valid_end: 0,
+        }
+    }
+
+    fn next_bytes(&mut self) -> Option<&'a [u8]> {
+        loop {
+            if self.pos < self.valid_end {
+                let width = match self.input[self.pos] {
+                    0x00..=0x7f => 1,
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => return None,
+                };
+                let start = self.pos;
+                self.pos += width;
+                return Some(&self.input[start..self.pos]);
+            }
+            if self.pos == self.input.len() {
+                return None;
+            }
+            let rest = &self.input[self.pos..];
+            match core::str::from_utf8(rest) {
+                Ok(_) => {
+                    self.valid_end = self.input.len();
+                }
+                Err(error) if error.valid_up_to() != 0 => {
+                    self.valid_end = self.pos + error.valid_up_to();
+                }
+                Err(error) => {
+                    let consumed = error.error_len().unwrap_or(rest.len());
+                    self.pos += consumed;
+                    return Some(SSE_REPLACEMENT);
+                }
+            }
+        }
+    }
+}
+
+fn http_sse_lossy_len(input: &[u8]) -> Result<usize, i32> {
+    let mut decoded = HttpSseUtf8::new(input);
+    let mut length = 0usize;
+    while let Some(bytes) = decoded.next_bytes() {
+        length = length.checked_add(bytes.len()).ok_or(AL_INVALID)?;
+    }
+    Ok(length)
+}
+
+fn http_sse_write_lossy(input: &[u8], output: &mut [u8], cursor: &mut usize) -> Result<(), i32> {
+    let mut decoded = HttpSseUtf8::new(input);
+    while let Some(bytes) = decoded.next_bytes() {
+        let end = cursor.checked_add(bytes.len()).ok_or(AL_INVALID)?;
+        let Some(target) = output.get_mut(*cursor..end) else {
+            return Err(AL_HTTP_BODY_LIMIT);
+        };
+        target.copy_from_slice(bytes);
+        *cursor = end;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct HttpSseSpan {
+    start: usize,
+    len: usize,
+}
+
+impl HttpSseSpan {
+    fn bytes<'a>(self, block: &'a [u8]) -> Result<&'a [u8], i32> {
+        block
+            .get(self.start..self.start.checked_add(self.len).ok_or(AL_INVALID)?)
+            .ok_or(AL_INVALID)
+    }
+}
+
+struct HttpSseBlockPlan {
+    data_fields: usize,
+    data_len: usize,
+    event: Option<HttpSseSpan>,
+    event_len: usize,
+    id: Option<HttpSseSpan>,
+    id_len: usize,
+    retry_ms: Option<i64>,
+}
+
+fn http_sse_parse_retry(value: &[u8]) -> Option<i64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut result = 0i64;
+    for &byte in value {
+        let digit = i64::from(byte - b'0');
+        result = result.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(result)
+}
+
+fn http_sse_plan_block(block: &[u8]) -> Result<HttpSseBlockPlan, i32> {
+    let mut plan = HttpSseBlockPlan {
+        data_fields: 0,
+        data_len: 0,
+        event: None,
+        event_len: 0,
+        id: None,
+        id_len: 0,
+        retry_ms: None,
+    };
+    let mut line_start = 0usize;
+    while line_start < block.len() {
+        let relative_end = memchr::memchr(b'\n', &block[line_start..]).ok_or(AL_INVALID)?;
+        let line_end = line_start.checked_add(relative_end).ok_or(AL_INVALID)?;
+        let line = &block[line_start..line_end];
+        let colon = memchr::memchr(b':', line);
+        let (name, value_start) = match colon {
+            Some(colon) => {
+                let after = line_start
+                    .checked_add(colon)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(AL_INVALID)?;
+                let value_start = after + usize::from(block.get(after) == Some(&b' '));
+                (&line[..colon], value_start)
+            }
+            None => (line, line_end),
+        };
+        let value = block.get(value_start..line_end).ok_or(AL_INVALID)?;
+        let span = HttpSseSpan {
+            start: value_start,
+            len: value.len(),
+        };
+        match name {
+            b"data" => {
+                plan.data_fields = plan.data_fields.checked_add(1).ok_or(AL_INVALID)?;
+                plan.data_len = plan
+                    .data_len
+                    .checked_add(http_sse_lossy_len(value)?)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(AL_INVALID)?;
+            }
+            b"event" => {
+                plan.event = Some(span);
+                plan.event_len = http_sse_lossy_len(value)?;
+            }
+            b"id" if !value.contains(&0) => {
+                plan.id = Some(span);
+                plan.id_len = http_sse_lossy_len(value)?;
+            }
+            b"retry" => {
+                if let Some(retry_ms) = http_sse_parse_retry(value) {
+                    plan.retry_ms = Some(retry_ms);
+                }
+            }
+            _ => {}
+        }
+        line_start = line_end.checked_add(1).ok_or(AL_INVALID)?;
+    }
+    if plan.data_fields != 0 {
+        plan.data_len = plan.data_len.checked_sub(1).ok_or(AL_INVALID)?;
+    }
+    Ok(plan)
+}
+
+#[derive(Clone, Copy)]
+struct HttpSsePublished {
+    event_start: usize,
+    event_len: usize,
+    data_start: usize,
+    data_len: usize,
+    id_start: usize,
+    id_len: usize,
+    retry_ms: Option<i64>,
+    total: usize,
+}
+
+enum HttpSseFeed {
+    Continue,
+    Event(HttpSsePublished),
+}
+
+struct HttpSseState {
+    block: HttpSseBytes,
+    committed_id: HttpSseBytes,
+    retry_ms: Option<i64>,
+    line_has_content: bool,
+    skip_lf: bool,
+    bom_decided: bool,
+    bom_probe: [u8; 3],
+    bom_probe_len: usize,
+}
+
+impl HttpSseState {
+    fn new(strip_leading_bom: bool) -> Self {
+        Self {
+            block: HttpSseBytes::new(),
+            committed_id: HttpSseBytes::new(),
+            retry_ms: None,
+            line_has_content: false,
+            skip_lf: false,
+            bom_decided: !strip_leading_bom,
+            bom_probe: [0; 3],
+            bom_probe_len: 0,
+        }
+    }
+
+    fn prepare_call(&mut self, capacity: usize) -> Result<usize, i32> {
+        if self.block.len != 0 || self.line_has_content {
+            return Err(AL_INVALID);
+        }
+        let bound = capacity
+            .checked_add(HTTP_MAX_SSE_METADATA)
+            .ok_or(AL_INVALID)?;
+        self.block.grow_exact(bound);
+        Ok(bound)
+    }
+
+    fn discard_pending(&mut self) {
+        self.block.clear();
+        self.line_has_content = false;
+        self.bom_probe_len = 0;
+        self.bom_decided = true;
+    }
+
+    fn id_growth_capacity(&self, length: usize, output_capacity: usize) -> usize {
+        let current = self.committed_id.capacity();
+        if current == 0 {
+            return length;
+        }
+        length.max(output_capacity.min(current.saturating_mul(2)))
+    }
+
+    fn commit_id_from_lossy(
+        &mut self,
+        span: HttpSseSpan,
+        output_capacity: usize,
+    ) -> Result<(), i32> {
+        let block = self.block.as_slice();
+        let source = span.bytes(block)?;
+        let length = http_sse_lossy_len(source)?;
+        if length > output_capacity {
+            return Err(AL_HTTP_BODY_LIMIT);
+        }
+        if length > self.committed_id.capacity() {
+            self.committed_id
+                .grow_exact(self.id_growth_capacity(length, output_capacity));
+        }
+        let mut cursor = 0usize;
+        http_sse_write_lossy(
+            source,
+            &mut self.committed_id.storage[..length],
+            &mut cursor,
+        )?;
+        if cursor != length {
+            return Err(AL_INVALID);
+        }
+        self.committed_id.len = length;
+        Ok(())
+    }
+
+    fn commit_id_from_output(&mut self, source: &[u8], output_capacity: usize) {
+        if source.len() > self.committed_id.capacity() {
+            self.committed_id
+                .grow_exact(self.id_growth_capacity(source.len(), output_capacity));
+        }
+        self.committed_id.storage[..source.len()].copy_from_slice(source);
+        self.committed_id.len = source.len();
+    }
+
+    fn dispatch_block(
+        &mut self,
+        output: &mut [u8],
+        output_capacity: usize,
+    ) -> Result<Option<HttpSsePublished>, i32> {
+        let plan = http_sse_plan_block(self.block.as_slice())?;
+        if plan.id.is_some() && plan.id_len > output_capacity {
+            return Err(AL_HTTP_BODY_LIMIT);
+        }
+        if plan.data_fields == 0 {
+            if let Some(id) = plan.id {
+                self.commit_id_from_lossy(id, output_capacity)?;
+            }
+            if let Some(retry_ms) = plan.retry_ms {
+                self.retry_ms = Some(retry_ms);
+            }
+            self.block.clear();
+            return Ok(None);
+        }
+
+        let event_len = if plan.event_len == 0 {
+            b"message".len()
+        } else {
+            plan.event_len
+        };
+        let id_len = if plan.id.is_some() {
+            plan.id_len
+        } else {
+            self.committed_id.len
+        };
+        let total = event_len
+            .checked_add(plan.data_len)
+            .and_then(|n| n.checked_add(id_len))
+            .ok_or(AL_HTTP_BODY_LIMIT)?;
+        if total > output_capacity || output.len() < total {
+            return Err(AL_HTTP_BODY_LIMIT);
+        }
+
+        let mut cursor = 0usize;
+        let event_start = cursor;
+        if plan.event_len == 0 {
+            output[..b"message".len()].copy_from_slice(b"message");
+            cursor = b"message".len();
+        } else {
+            let event = plan.event.ok_or(AL_INVALID)?.bytes(self.block.as_slice())?;
+            http_sse_write_lossy(event, output, &mut cursor)?;
+        }
+        let data_start = cursor;
+        let mut data_seen = 0usize;
+        let block = self.block.as_slice();
+        let mut line_start = 0usize;
+        while line_start < block.len() {
+            let relative_end = memchr::memchr(b'\n', &block[line_start..]).ok_or(AL_INVALID)?;
+            let line_end = line_start.checked_add(relative_end).ok_or(AL_INVALID)?;
+            let line = &block[line_start..line_end];
+            let colon = memchr::memchr(b':', line);
+            let (name, value_start) = match colon {
+                Some(colon) => {
+                    let after = line_start
+                        .checked_add(colon)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(AL_INVALID)?;
+                    let value_start = after + usize::from(block.get(after) == Some(&b' '));
+                    (&line[..colon], value_start)
+                }
+                None => (line, line_end),
+            };
+            if name == b"data" {
+                http_sse_write_lossy(&block[value_start..line_end], output, &mut cursor)?;
+                data_seen += 1;
+                if data_seen < plan.data_fields {
+                    output[cursor] = b'\n';
+                    cursor += 1;
+                }
+            }
+            line_start = line_end.checked_add(1).ok_or(AL_INVALID)?;
+        }
+        let id_start = cursor;
+        if let Some(id) = plan.id {
+            http_sse_write_lossy(id.bytes(self.block.as_slice())?, output, &mut cursor)?;
+        } else {
+            let committed = self.committed_id.as_slice();
+            output[cursor..cursor + committed.len()].copy_from_slice(committed);
+            cursor += committed.len();
+        }
+        if cursor != total {
+            return Err(AL_INVALID);
+        }
+        if plan.id.is_some() {
+            self.commit_id_from_output(&output[id_start..id_start + id_len], output_capacity);
+        }
+        if let Some(retry_ms) = plan.retry_ms {
+            self.retry_ms = Some(retry_ms);
+        }
+        let retry_ms = self.retry_ms;
+        self.block.clear();
+        Ok(Some(HttpSsePublished {
+            event_start,
+            event_len,
+            data_start,
+            data_len: plan.data_len,
+            id_start,
+            id_len,
+            retry_ms,
+            total,
+        }))
+    }
+
+    fn feed_line_byte(
+        &mut self,
+        byte: u8,
+        output: &mut [u8],
+        output_capacity: usize,
+    ) -> Result<HttpSseFeed, i32> {
+        if self.skip_lf {
+            self.skip_lf = false;
+            if byte == b'\n' {
+                return Ok(HttpSseFeed::Continue);
+            }
+        }
+        if byte == b'\r' || byte == b'\n' {
+            if byte == b'\r' {
+                self.skip_lf = true;
+            }
+            if self.line_has_content {
+                self.block.push(b'\n')?;
+                self.line_has_content = false;
+                return Ok(HttpSseFeed::Continue);
+            }
+            return Ok(match self.dispatch_block(output, output_capacity)? {
+                Some(event) => HttpSseFeed::Event(event),
+                None => HttpSseFeed::Continue,
+            });
+        }
+        self.block.push(byte)?;
+        self.line_has_content = true;
+        Ok(HttpSseFeed::Continue)
+    }
+
+    fn feed_source_byte(
+        &mut self,
+        byte: u8,
+        output: &mut [u8],
+        output_capacity: usize,
+    ) -> Result<HttpSseFeed, i32> {
+        if self.bom_decided {
+            return self.feed_line_byte(byte, output, output_capacity);
+        }
+        const BOM: &[u8; 3] = b"\xef\xbb\xbf";
+        if byte == BOM[self.bom_probe_len] {
+            self.bom_probe[self.bom_probe_len] = byte;
+            self.bom_probe_len += 1;
+            if self.bom_probe_len == BOM.len() {
+                self.bom_probe_len = 0;
+                self.bom_decided = true;
+            }
+            return Ok(HttpSseFeed::Continue);
+        }
+        self.bom_decided = true;
+        let count = self.bom_probe_len;
+        self.bom_probe_len = 0;
+        for index in 0..count {
+            if let HttpSseFeed::Event(event) =
+                self.feed_line_byte(self.bom_probe[index], output, output_capacity)?
+            {
+                return Ok(HttpSseFeed::Event(event));
+            }
+        }
+        self.feed_line_byte(byte, output, output_capacity)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HttpReadStreamState {
     Active,
     Complete,
     Failed(i32),
+}
+
+enum HttpBodyStep {
+    Payload(usize),
+    Complete,
+    NeedPayload,
 }
 
 /// A checked-out HTTP response body cursor. The fixed head allocation remains in `decoder`; the
@@ -19673,6 +20181,7 @@ pub struct HttpReadStream {
     scratch_end: usize,
     has_deadline: bool,
     state: HttpReadStreamState,
+    sse: Option<HttpSseState>,
 }
 
 impl HttpReadStream {
@@ -19708,13 +20217,40 @@ impl HttpReadStream {
         status
     }
 
-    fn read_into(&mut self, output: &mut [u8]) -> Result<usize, i32> {
+    fn decoder_needs_payload(&self) -> bool {
+        matches!(
+            self.decoder.state,
+            HttpDecodeState::Fixed { remaining: 1.. }
+                | HttpDecodeState::CloseDelimited
+                | HttpDecodeState::ChunkData { remaining: 1.. }
+        )
+    }
+
+    fn body_limit_exhausted(&self) -> bool {
+        self.decoder
+            .explicit_body_limit
+            .is_some_and(|limit| self.decoder.streamed_body_len >= limit as u64)
+    }
+
+    /// Advance the shared framing/transport owner once. SSE asks for one payload byte at a time so
+    /// a blank-line publication cannot consume the following event; a zero output drives only HTTP
+    /// framing at the exact SSE-work boundary, with one-byte wire reads preventing over-guard body
+    /// co-reads.
+    fn read_body_step(
+        &mut self,
+        output: &mut [u8],
+        max_wire_read: usize,
+        defer_payload_completion: bool,
+    ) -> Result<HttpBodyStep, i32> {
         match self.state {
-            HttpReadStreamState::Complete => return Ok(0),
+            HttpReadStreamState::Complete => return Ok(HttpBodyStep::Complete),
             HttpReadStreamState::Failed(status) => return Err(status),
             HttpReadStreamState::Active => {}
         }
-        self.decoder.reset_stream_framing_allowance();
+        if self.decoder.complete() {
+            self.finish_success();
+            return Ok(HttpBodyStep::Complete);
+        }
         let mut written = 0usize;
         loop {
             if self.scratch_start < self.scratch_end {
@@ -19733,11 +20269,22 @@ impl HttpReadStream {
                     self.scratch_end = 0;
                 }
                 if self.decoder.complete() {
+                    if written != 0 && defer_payload_completion {
+                        return Ok(HttpBodyStep::Payload(written));
+                    }
                     self.finish_success();
-                    return Ok(written);
+                    return Ok(if written == 0 {
+                        HttpBodyStep::Complete
+                    } else {
+                        HttpBodyStep::Payload(written)
+                    });
                 }
                 if written == output.len() {
-                    return Ok(written);
+                    return Ok(if written == 0 {
+                        HttpBodyStep::NeedPayload
+                    } else {
+                        HttpBodyStep::Payload(written)
+                    });
                 }
                 if consumed == 0 && self.scratch_start < self.scratch_end {
                     return Err(self.fail(AL_INVALID));
@@ -19750,9 +20297,15 @@ impl HttpReadStream {
             // A positive payload result ends the call before another transport read. Already-co-read
             // framing above may still have been consumed after the first payload byte.
             if written > 0 {
-                return Ok(written);
+                return Ok(HttpBodyStep::Payload(written));
             }
-            let limit = self.decoder.stream_read_limit(output.len());
+            if output.is_empty() && self.decoder_needs_payload() {
+                return Ok(HttpBodyStep::NeedPayload);
+            }
+            let limit = self
+                .decoder
+                .stream_read_limit(output.len())
+                .min(max_wire_read);
             if limit == 0 {
                 return Err(self.fail(AL_INVALID));
             }
@@ -19770,7 +20323,104 @@ impl HttpReadStream {
                         return Err(self.fail(AL_INVALID));
                     }
                     self.finish_success();
-                    return Ok(0);
+                    return Ok(HttpBodyStep::Complete);
+                }
+            }
+        }
+    }
+
+    fn read_into(&mut self, output: &mut [u8]) -> Result<usize, i32> {
+        match self.state {
+            HttpReadStreamState::Complete => return Ok(0),
+            HttpReadStreamState::Failed(status) => return Err(status),
+            HttpReadStreamState::Active => {}
+        }
+        self.decoder.reset_stream_framing_allowance();
+        match self.read_body_step(output, usize::MAX, false)? {
+            HttpBodyStep::Payload(written) => Ok(written),
+            HttpBodyStep::Complete => Ok(0),
+            HttpBodyStep::NeedPayload => Err(self.fail(AL_INVALID)),
+        }
+    }
+
+    fn next_sse(
+        &mut self,
+        output: &mut [u8],
+        output_capacity: usize,
+    ) -> Result<Option<HttpSsePublished>, i32> {
+        match self.state {
+            HttpReadStreamState::Complete => return Ok(None),
+            HttpReadStreamState::Failed(status) => return Err(status),
+            HttpReadStreamState::Active => {}
+        }
+        let allowance = self
+            .sse
+            .as_mut()
+            .ok_or(AL_INVALID)?
+            .prepare_call(output_capacity)?;
+        self.decoder.reset_stream_framing_allowance();
+        let mut processed = 0usize;
+        loop {
+            if processed == allowance {
+                match self.read_body_step(&mut [], 1, true) {
+                    Ok(HttpBodyStep::Complete) => {
+                        self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                        return Ok(None);
+                    }
+                    Ok(HttpBodyStep::NeedPayload | HttpBodyStep::Payload(_)) => {
+                        self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                        let status = if self.body_limit_exhausted() {
+                            AL_HTTP_BODY_LIMIT
+                        } else {
+                            AL_INVALID
+                        };
+                        return Err(self.fail(status));
+                    }
+                    Err(status) => {
+                        self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                        return Err(status);
+                    }
+                }
+            }
+
+            let mut byte = [0u8; 1];
+            match self.read_body_step(&mut byte, usize::MAX, true) {
+                Ok(HttpBodyStep::Payload(1)) => {
+                    processed += 1;
+                    let feed = self.sse.as_mut().ok_or(AL_INVALID)?.feed_source_byte(
+                        byte[0],
+                        output,
+                        output_capacity,
+                    );
+                    match feed {
+                        Ok(HttpSseFeed::Continue) => {}
+                        Ok(HttpSseFeed::Event(event)) => {
+                            if self.decoder.complete() {
+                                self.finish_success();
+                            }
+                            return Ok(Some(event));
+                        }
+                        Err(status) => {
+                            self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                            return Err(self.fail(status));
+                        }
+                    }
+                }
+                Ok(HttpBodyStep::Payload(_)) => {
+                    self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                    return Err(self.fail(AL_INVALID));
+                }
+                Ok(HttpBodyStep::Complete) => {
+                    self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                    return Ok(None);
+                }
+                Ok(HttpBodyStep::NeedPayload) => {
+                    self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                    return Err(self.fail(AL_INVALID));
+                }
+                Err(status) => {
+                    self.sse.as_mut().ok_or(AL_INVALID)?.discard_pending();
+                    return Err(status);
                 }
             }
         }
@@ -19948,6 +20598,7 @@ unsafe fn http_client_perform_stream(
                 scratch_end: count,
                 has_deadline,
                 state: HttpReadStreamState::Active,
+                sse: None,
             };
             if stream.decoder.complete() {
                 stream.finish_success();
@@ -20073,6 +20724,9 @@ pub unsafe extern "C" fn align_rt_http_read_stream_read(
     if buffer.cap == 0 || buffer.data.capacity() < buffer.cap {
         return AL_INVALID;
     }
+    if stream.sse.is_some() {
+        return AL_INVALID;
+    }
     buffer.data.clear();
     let output = unsafe {
         core::slice::from_raw_parts_mut(buffer.data.spare_capacity_mut().as_mut_ptr().cast(), buffer.cap)
@@ -20085,6 +20739,175 @@ pub unsafe extern "C" fn align_rt_http_read_stream_read(
             0
         }
         Err(status) => status,
+    }
+}
+
+/// Canonical result envelope for `http_sse_stream.next`: two presence bytes, six reserved zeroes,
+/// inline retry, then event/data/last-event-id views. The cross-target ABI is 64 bytes aligned to 8.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AlignHttpSseNext {
+    pub present: u8,
+    pub retry_present: u8,
+    pub reserved: [u8; 6],
+    pub retry_ms: i64,
+    pub event: AlignStr,
+    pub data: AlignStr,
+    pub last_event_id: AlignStr,
+}
+
+impl AlignHttpSseNext {
+    const fn empty() -> Self {
+        Self {
+            present: 0,
+            retry_present: 0,
+            reserved: [0; 6],
+            retry_ms: 0,
+            event: AlignStr {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+            data: AlignStr {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+            last_event_id: AlignStr {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<AlignHttpSseNext>() == 64);
+const _: () = assert!(core::mem::align_of::<AlignHttpSseNext>() == 8);
+
+/// Consume a raw response stream into SSE interpretation without I/O or allocation. The runtime
+/// pointer stays identical; the language-level Move transition nulls the source handle.
+///
+/// # Safety
+/// A non-null `stream` must be a live raw stream handle and exclusively owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_read_stream_sse(
+    stream: *mut HttpReadStream,
+) -> *mut HttpReadStream {
+    let Some(stream_ref) = (unsafe { stream.as_mut() }) else {
+        return core::ptr::null_mut();
+    };
+    if stream_ref.sse.is_some() {
+        return core::ptr::null_mut();
+    }
+    let strip_leading_bom = stream_ref.decoder.streamed_body_len == 0;
+    stream_ref.sse = Some(HttpSseState::new(strip_leading_bom));
+    stream
+}
+
+/// Borrow the last blank-line-committed SSE id. A null or raw-mode handle yields an empty view.
+///
+/// # Safety
+/// A non-null `stream` must point to a live raw/SSE-compatible stream handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_sse_stream_last_event_id(
+    stream: *const HttpReadStream,
+) -> AlignStr {
+    let Some(state) = (unsafe { stream.as_ref() }).and_then(|stream| stream.sse.as_ref()) else {
+        return AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        };
+    };
+    let bytes = state.committed_id.as_slice();
+    AlignStr {
+        ptr: if bytes.is_empty() {
+            core::ptr::null()
+        } else {
+            bytes.as_ptr()
+        },
+        len: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+    }
+}
+
+/// Return the committed reconnect delay, using `-1` as the ABI `None` sentinel.
+///
+/// # Safety
+/// A non-null `stream` must point to a live raw/SSE-compatible stream handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_sse_stream_retry_ms(stream: *const HttpReadStream) -> i64 {
+    (unsafe { stream.as_ref() })
+        .and_then(|stream| stream.sse.as_ref())
+        .and_then(|state| state.retry_ms)
+        .unwrap_or(-1)
+}
+
+/// Decode and publish at most one SSE event through the caller's fixed-capacity buffer. The output
+/// envelope is zeroed before any input validation; errors and terminal `None` leave it zero.
+///
+/// # Safety
+/// `out` must be writable. Non-null `stream` and `buffer` must be live, exclusively borrowed handles
+/// of their declared types. Null/zero-capacity inputs are rejected before stream state or I/O.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_sse_stream_next(
+    stream: *mut HttpReadStream,
+    buffer: *mut Buffer,
+    out: *mut AlignHttpSseNext,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignHttpSseNext::empty() };
+    let Some(buffer) = (unsafe { buffer.as_mut() }) else {
+        return AL_INVALID;
+    };
+    buffer.len = 0;
+    if buffer.cap == 0 || buffer.data.capacity() < buffer.cap {
+        return AL_INVALID;
+    }
+    let Some(stream) = (unsafe { stream.as_mut() }) else {
+        return AL_INVALID;
+    };
+    if stream.sse.is_none() {
+        return AL_INVALID;
+    }
+    buffer.data.clear();
+    let output = unsafe {
+        core::slice::from_raw_parts_mut(
+            buffer.data.spare_capacity_mut().as_mut_ptr().cast(),
+            buffer.cap,
+        )
+    };
+    match stream.next_sse(output, buffer.cap) {
+        Ok(None) => 0,
+        Ok(Some(event)) => {
+            unsafe { buffer.data.set_len(event.total) };
+            buffer.len = event.total;
+            let base = buffer.data.as_ptr();
+            unsafe {
+                *out = AlignHttpSseNext {
+                    present: 1,
+                    retry_present: u8::from(event.retry_ms.is_some()),
+                    reserved: [0; 6],
+                    retry_ms: event.retry_ms.unwrap_or(0),
+                    event: AlignStr {
+                        ptr: base.add(event.event_start),
+                        len: event.event_len as i64,
+                    },
+                    data: AlignStr {
+                        ptr: base.add(event.data_start),
+                        len: event.data_len as i64,
+                    },
+                    last_event_id: AlignStr {
+                        ptr: base.add(event.id_start),
+                        len: event.id_len as i64,
+                    },
+                };
+            }
+            0
+        }
+        Err(status) => {
+            buffer.data.clear();
+            buffer.len = 0;
+            status
+        }
     }
 }
 
@@ -34875,6 +35698,747 @@ mod tests {
         body
     }
 
+    fn http_sse_response(body: &[u8], chunked: bool) -> Vec<u8> {
+        if chunked {
+            let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            for part in body.chunks(3) {
+                response.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+                response.extend_from_slice(part);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            response
+        } else {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            response
+        }
+    }
+
+    fn http_sse_chunked_parts(parts: &[&[u8]]) -> Vec<u8> {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in parts {
+            response.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            response.extend_from_slice(part);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    fn open_http_sse_stream(client: *mut HttpClient, url: &str) -> *mut HttpReadStream {
+        let raw = open_http_read_stream(client, url);
+        let events = unsafe { align_rt_http_read_stream_sse(raw) };
+        assert_eq!(
+            events, raw,
+            "the Pure transition keeps the one runtime owner"
+        );
+        events
+    }
+
+    fn http_sse_next_owned(
+        stream: *mut HttpReadStream,
+        buffer: *mut Buffer,
+    ) -> (i32, AlignHttpSseNext, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut event = AlignHttpSseNext::empty();
+        let status = unsafe { align_rt_http_sse_stream_next(stream, buffer, &mut event) };
+        let copy = |view: AlignStr| {
+            if view.len == 0 {
+                Vec::new()
+            } else {
+                unsafe { safe_slice(view.ptr, view.len) }.to_vec()
+            }
+        };
+        let event_bytes = copy(event.event);
+        let data = copy(event.data);
+        let id = copy(event.last_event_id);
+        (status, event, event_bytes, data, id)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DirectSseEvent {
+        event: Vec<u8>,
+        data: Vec<u8>,
+        id: Vec<u8>,
+        retry_ms: Option<i64>,
+    }
+
+    fn decode_sse_direct(
+        body: &[u8],
+        capacity: usize,
+        strip_leading_bom: bool,
+    ) -> (Result<Vec<DirectSseEvent>, i32>, Vec<u8>, Option<i64>) {
+        let mut state = HttpSseState::new(strip_leading_bom);
+        let mut events = Vec::new();
+        let mut position = 0usize;
+        while position < body.len() {
+            let allowance = match state.prepare_call(capacity) {
+                Ok(allowance) => allowance,
+                Err(status) => {
+                    return (
+                        Err(status),
+                        state.committed_id.as_slice().to_vec(),
+                        state.retry_ms,
+                    );
+                }
+            };
+            let mut output = vec![0u8; capacity];
+            let mut processed = 0usize;
+            let mut published = None;
+            while position < body.len() {
+                if processed == allowance {
+                    state.discard_pending();
+                    return (
+                        Err(AL_INVALID),
+                        state.committed_id.as_slice().to_vec(),
+                        state.retry_ms,
+                    );
+                }
+                let feed = state.feed_source_byte(body[position], &mut output, capacity);
+                position += 1;
+                processed += 1;
+                match feed {
+                    Ok(HttpSseFeed::Continue) => {}
+                    Ok(HttpSseFeed::Event(event)) => {
+                        published = Some(event);
+                        break;
+                    }
+                    Err(status) => {
+                        state.discard_pending();
+                        return (
+                            Err(status),
+                            state.committed_id.as_slice().to_vec(),
+                            state.retry_ms,
+                        );
+                    }
+                }
+            }
+            if let Some(event) = published {
+                events.push(DirectSseEvent {
+                    event: output[event.event_start..event.event_start + event.event_len].to_vec(),
+                    data: output[event.data_start..event.data_start + event.data_len].to_vec(),
+                    id: output[event.id_start..event.id_start + event.id_len].to_vec(),
+                    retry_ms: event.retry_ms,
+                });
+            } else {
+                // EOF never dispatches an incomplete block and never commits its candidates.
+                state.discard_pending();
+            }
+        }
+        (
+            Ok(events),
+            state.committed_id.as_slice().to_vec(),
+            state.retry_ms,
+        )
+    }
+
+    #[test]
+    fn http_sse_field_and_line_ending_matrix_is_exact() {
+        for separator in [b"\n".as_slice(), b"\r".as_slice(), b"\r\n".as_slice()] {
+            let mut body = Vec::new();
+            for line in [
+                b":comment".as_slice(),
+                b"DATA: ignored".as_slice(),
+                b"unknown: ignored".as_slice(),
+                b"event: first".as_slice(),
+                b"event: update".as_slice(),
+                b"id: prior".as_slice(),
+                b"id: delivered".as_slice(),
+                b"retry: 0009".as_slice(),
+                b"retry: invalid".as_slice(),
+                b"data: one".as_slice(),
+                b"data:  two".as_slice(),
+            ] {
+                body.extend_from_slice(line);
+                body.extend_from_slice(separator);
+            }
+            body.extend_from_slice(separator);
+            body.extend_from_slice(b"id:");
+            body.extend_from_slice(separator);
+            body.extend_from_slice(separator);
+            body.extend_from_slice(b"data");
+            body.extend_from_slice(separator);
+            body.extend_from_slice(separator);
+
+            let (events, id, retry) = decode_sse_direct(&body, 128, true);
+            assert_eq!(
+                events,
+                Ok(vec![
+                    DirectSseEvent {
+                        event: b"update".to_vec(),
+                        data: b"one\n two".to_vec(),
+                        id: b"delivered".to_vec(),
+                        retry_ms: Some(9),
+                    },
+                    DirectSseEvent {
+                        event: b"message".to_vec(),
+                        data: Vec::new(),
+                        id: Vec::new(),
+                        retry_ms: Some(9),
+                    },
+                ])
+            );
+            assert!(id.is_empty(), "an empty id field resets the committed id");
+            assert_eq!(
+                retry,
+                Some(9),
+                "an invalid retry does not erase a valid candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn http_sse_utf8_replacement_and_output_capacity_are_byte_exact() {
+        let body = b"event:\xff\ndata:a\xffb\nid:\xff\n\n";
+        let replacement = "\u{fffd}".as_bytes();
+        let expected_total = replacement.len() + (1 + replacement.len() + 1) + replacement.len();
+        for (capacity, expected_status) in [
+            (expected_total, 0),
+            (expected_total - 1, AL_HTTP_BODY_LIMIT),
+        ] {
+            let (events, id, retry) = decode_sse_direct(body, capacity, true);
+            if expected_status == 0 {
+                assert_eq!(
+                    events,
+                    Ok(vec![DirectSseEvent {
+                        event: replacement.to_vec(),
+                        data: "a\u{fffd}b".as_bytes().to_vec(),
+                        id: replacement.to_vec(),
+                        retry_ms: None,
+                    }]),
+                );
+                assert_eq!(id, replacement);
+            } else {
+                assert_eq!(events, Err(expected_status));
+                assert!(id.is_empty(), "a failed publication must not commit its id");
+            }
+            assert_eq!(retry, None);
+        }
+    }
+
+    #[test]
+    fn http_sse_incomplete_eof_discards_every_uncommitted_candidate() {
+        let body = b"id: committed\nretry: 3\n\nid: pending\nretry: 4\ndata: unseen";
+        let (events, id, retry) = decode_sse_direct(body, 128, true);
+        assert_eq!(events, Ok(Vec::new()));
+        assert_eq!(id, b"committed");
+        assert_eq!(retry, Some(3));
+    }
+
+    #[test]
+    fn http_sse_whatwg_fields_utf8_lines_and_atomic_state() {
+        let body = b"\xef\xbb\xbf: comment\r\nid: control\rretry: 1000\r\r\n\
+event: update\ndata: one\r\ndata: tw\xffo\rid: delivered\nretry: 2000\n\n\
+data:\ndata:\n\n";
+        for chunked in [false, true] {
+            let (port, server) = http_serve_once(http_sse_response(body, chunked));
+            let url = format!("http://127.0.0.1:{port}/events");
+            let client = align_rt_http_client_new();
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(128);
+
+            let (status, first, event, data, id) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(first.present, 1);
+            assert_eq!(first.retry_present, 1);
+            assert_eq!(first.retry_ms, 2000);
+            assert_eq!(event, b"update");
+            assert_eq!(data, "one\ntw\u{fffd}o".as_bytes());
+            assert_eq!(id, b"delivered");
+            assert_eq!(first.reserved, [0; 6]);
+            assert_eq!(unsafe { align_rt_http_sse_stream_retry_ms(stream) }, 2000);
+            let committed = unsafe { align_rt_http_sse_stream_last_event_id(stream) };
+            assert_eq!(
+                unsafe { safe_slice(committed.ptr, committed.len) },
+                b"delivered"
+            );
+
+            let (status, second, event, data, id) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(second.present, 1);
+            assert_eq!(event, b"message");
+            assert_eq!(data, b"\n");
+            assert_eq!(id, b"delivered");
+            assert_eq!(second.retry_ms, 2000);
+
+            let (status, terminal, _, _, _) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(terminal.present, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_sse_replacement_fields_preserve_prior_candidates() {
+        let body = b"id: keep\nid: ignored\0tail\nretry: 7\nretry: 9223372036854775808\n\
+event: first\nevent:\ndata: x\n\n";
+        let (port, server) = http_serve_once(http_sse_response(body, false));
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let stream = open_http_sse_stream(client, &url);
+        let buffer = align_rt_buffer_new(64);
+
+        let (status, event, kind, data, id) = http_sse_next_owned(stream, buffer);
+        assert_eq!(status, 0);
+        assert_eq!(event.retry_ms, 7);
+        assert_eq!(
+            kind, b"message",
+            "the final empty event field selects the default"
+        );
+        assert_eq!(data, b"x");
+        assert_eq!(
+            id, b"keep",
+            "a NUL id line does not erase the earlier candidate"
+        );
+
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn http_sse_output_capacity_is_exact_and_error_is_stable() {
+        for (capacity, expected_status) in [(8, 0), (7, AL_HTTP_BODY_LIMIT)] {
+            let (port, server) = http_serve_once(http_sse_response(b"data:x\n\n", false));
+            let url = format!("http://127.0.0.1:{port}/events");
+            let client = align_rt_http_client_new();
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(capacity);
+
+            let (status, event, kind, data, _) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, expected_status, "capacity {capacity}");
+            if expected_status == 0 {
+                assert_eq!(event.present, 1);
+                assert_eq!(kind, b"message");
+                assert_eq!(data, b"x");
+                assert_eq!(unsafe { align_rt_buffer_len(buffer) }, capacity);
+            } else {
+                assert_eq!(event.present, 0);
+                assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+                let (again, empty, _, _, _) = http_sse_next_owned(stream, buffer);
+                assert_eq!(again, AL_HTTP_BODY_LIMIT);
+                assert_eq!(empty.present, 0);
+            }
+
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_sse_incomplete_eof_and_output_failure_roll_back_only_pending_block() {
+        for body in [
+            b"id: old\n\nid: pending\ndata: unterminated".as_slice(),
+            b"id: old\n\nid: pending\ndata: too-long\n\n",
+        ] {
+            let (port, server) = http_serve_once(http_sse_response(body, false));
+            let url = format!("http://127.0.0.1:{port}/events");
+            let client = align_rt_http_client_new();
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(8);
+            let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
+            if body.ends_with(b"\n\n") {
+                assert_eq!(status, AL_HTTP_BODY_LIMIT);
+            } else {
+                assert_eq!(status, 0);
+            }
+            assert_eq!(event.present, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+            let committed = unsafe { align_rt_http_sse_stream_last_event_id(stream) };
+            assert_eq!(unsafe { safe_slice(committed.ptr, committed.len) }, b"old");
+
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
+
+        let body = b"id: old\n\nid: pending\ndata: truncated";
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body.len() + 1,
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let (port, server) = http_serve_once(response);
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let stream = open_http_sse_stream(client, &url);
+        let buffer = align_rt_buffer_new(64);
+        let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
+        assert_eq!(
+            status, AL_INVALID,
+            "truncated fixed framing is not a clean SSE EOF"
+        );
+        assert_eq!(event.present, 0);
+        let committed = unsafe { align_rt_http_sse_stream_last_event_id(stream) };
+        assert_eq!(unsafe { safe_slice(committed.ptr, committed.len) }, b"old");
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn http_sse_explicit_body_limit_precedes_publication_and_is_stable() {
+        let body = b"data:x\n\n";
+        for (label, response, limit, expected) in [
+            ("fixed-exact", http_sse_response(body, false), 8, 0),
+            (
+                "chunked-excess",
+                http_sse_response(body, true),
+                7,
+                AL_HTTP_BODY_LIMIT,
+            ),
+            (
+                "close-excess",
+                {
+                    let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+                    response.extend_from_slice(body);
+                    response
+                },
+                7,
+                AL_HTTP_BODY_LIMIT,
+            ),
+        ] {
+            let (port, server) = http_serve_once(response);
+            let url = format!("http://127.0.0.1:{port}/{label}");
+            let client = align_rt_http_client_new();
+            unsafe { align_rt_http_client_max_response_body_bytes(client, limit) };
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(8);
+            for attempt in 0..=usize::from(expected != 0) {
+                let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
+                assert_eq!(status, expected, "{label} attempt {attempt}");
+                if expected == 0 {
+                    assert_eq!(event.present, 1);
+                    assert_eq!(data, b"x");
+                } else {
+                    assert_eq!(event.present, 0);
+                    assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+                }
+            }
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_sse_exact_completion_returns_the_connection_to_the_pool() {
+        let response = http_sse_response(b"data:x\n\n", false);
+        let (port, server) = http_serve_pool(response, 1, false);
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(8);
+            let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(event.present, 1);
+            assert_eq!(data, b"x");
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "completed SSE reads reuse one connection"
+        );
+    }
+
+    #[test]
+    fn http_sse_timeout_rolls_back_pending_state_and_is_stable() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind SSE timeout");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept SSE timeout");
+            let mut request = [0u8; 512];
+            assert!(socket.read(&mut request).unwrap_or(0) > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nid: old\nretry: 3\n\nid: pending\nretry: 4\ndata: unseen",
+                )
+                .unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let request = unsafe {
+            align_rt_http_request_new(b"GET".as_ptr(), 3, url.as_ptr(), url.len() as i64)
+        };
+        unsafe { align_rt_http_timeout(request, 50_000_000) };
+        let mut raw = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_request_stream(client, request, &mut raw) },
+            0,
+        );
+        let stream = unsafe { align_rt_http_read_stream_sse(raw) };
+        let buffer = align_rt_buffer_new(64);
+        for _ in 0..2 {
+            let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, AL_TIMEOUT);
+            assert_eq!(event.present, 0);
+            assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+            let committed = unsafe { align_rt_http_sse_stream_last_event_id(stream) };
+            assert_eq!(unsafe { safe_slice(committed.ptr, committed.len) }, b"old");
+            assert_eq!(unsafe { align_rt_http_sse_stream_retry_ms(stream) }, 3);
+        }
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_sse_storage_grows_to_the_exact_caller_derived_bounds() {
+        let body = b"id:a\ndata:x\n\nid:123456\ndata:y\n\n";
+        let (port, server) = http_serve_once(http_sse_response(body, false));
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let stream = open_http_sse_stream(client, &url);
+
+        let small = align_rt_buffer_new(9);
+        let (status, event, _, _, id) = http_sse_next_owned(stream, small);
+        assert_eq!(status, 0);
+        assert_eq!(event.present, 1);
+        assert_eq!(id, b"a");
+        let state = unsafe { &*stream }.sse.as_ref().unwrap();
+        assert_eq!(state.block.capacity(), HTTP_MAX_SSE_METADATA + 9);
+        assert_eq!(state.committed_id.capacity(), 1);
+
+        let larger = align_rt_buffer_new(14);
+        let (status, event, _, _, id) = http_sse_next_owned(stream, larger);
+        assert_eq!(status, 0);
+        assert_eq!(event.present, 1);
+        assert_eq!(id, b"123456");
+        let state = unsafe { &*stream }.sse.as_ref().unwrap();
+        assert_eq!(state.block.capacity(), HTTP_MAX_SSE_METADATA + 14);
+        assert_eq!(state.committed_id.capacity(), 6);
+
+        unsafe { align_rt_buffer_free(larger) };
+        unsafe { align_rt_buffer_free(small) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn http_sse_source_work_guard_exact_and_rejected_next() {
+        let capacity = 8usize;
+        let ignored_prefix = |kind: &str, length: usize| {
+            let mut prefix = match kind {
+                "comment" => b":".to_vec(),
+                "unknown" => b"unknown:".to_vec(),
+                "invalid-retry" => b"retry:x".to_vec(),
+                "invalid-utf8-name" => b"\xff:".to_vec(),
+                "control-only" => {
+                    let repeats = length.saturating_sub(4) / 5;
+                    let mut bytes = b"id:\n\n".repeat(repeats);
+                    bytes.extend_from_slice(b":xx\n");
+                    bytes
+                }
+                _ => unreachable!(),
+            };
+            if kind != "control-only" {
+                assert!(prefix.len() < length);
+                prefix.resize(length - 1, b'x');
+                prefix.push(b'\n');
+            } else if prefix.len() < length {
+                let missing = length - prefix.len();
+                let insert = prefix.len() - 1;
+                prefix.splice(insert..insert, std::iter::repeat_n(b'x', missing));
+            }
+            assert_eq!(prefix.len(), length, "{kind}");
+            prefix
+        };
+        for kind in [
+            "comment",
+            "unknown",
+            "invalid-retry",
+            "invalid-utf8-name",
+            "control-only",
+        ] {
+            for extra in [0usize, 1] {
+                let ignored_len = HTTP_MAX_SSE_METADATA + extra;
+                let mut body = ignored_prefix(kind, ignored_len);
+                body.extend_from_slice(b"data:x\n\n");
+                assert_eq!(body.len(), capacity + HTTP_MAX_SSE_METADATA + extra);
+
+                let (port, server) = http_serve_once(http_sse_response(&body, false));
+                let url = format!("http://127.0.0.1:{port}/events");
+                let client = align_rt_http_client_new();
+                let stream = open_http_sse_stream(client, &url);
+                let buffer = align_rt_buffer_new(capacity as i64);
+                let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
+                if extra == 0 {
+                    assert_eq!(status, 0, "{kind}");
+                    assert_eq!(event.present, 1, "{kind}");
+                    assert_eq!(data, b"x", "{kind}");
+                } else {
+                    assert_eq!(status, AL_INVALID, "{kind}");
+                    assert_eq!(event.present, 0, "{kind}");
+                    assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0, "{kind}");
+                }
+                unsafe { align_rt_buffer_free(buffer) };
+                unsafe { align_rt_http_read_stream_free(stream) };
+                unsafe { align_rt_http_client_free(client) };
+                let _ = server.join().unwrap();
+            }
+        }
+
+        let allowance = capacity + HTTP_MAX_SSE_METADATA;
+        let mut body = vec![b'x'; allowance + 1];
+        body[0] = b':';
+        for (label, limit, expected) in [
+            ("body-cap", allowance as i64, AL_HTTP_BODY_LIMIT),
+            ("work-cap", 0, AL_INVALID),
+        ] {
+            let response = http_sse_chunked_parts(&[&body[..allowance], &body[allowance..]]);
+            let (port, server) = http_serve_once(response);
+            let url = format!("http://127.0.0.1:{port}/events");
+            let client = align_rt_http_client_new();
+            unsafe { align_rt_http_client_max_response_body_bytes(client, limit) };
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(capacity as i64);
+            for attempt in 0..2 {
+                let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
+                assert_eq!(status, expected, "{label} attempt {attempt}");
+                assert_eq!(event.present, 0, "{label} attempt {attempt}");
+                assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 0);
+            }
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+            unsafe { align_rt_http_client_free(client) };
+            let _ = server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_sse_raw_prefix_disables_suffix_bom_stripping() {
+        let body = b"X\xef\xbb\xbfdata: hidden\n\n";
+        let (port, server) = http_serve_once(http_sse_response(body, false));
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let raw = open_http_read_stream(client, &url);
+        let prefix = align_rt_buffer_new(1);
+        let mut count = 0;
+        assert_eq!(
+            unsafe { align_rt_http_read_stream_read(raw, prefix, &mut count) },
+            0
+        );
+        assert_eq!(count, 1);
+        let stream = unsafe { align_rt_http_read_stream_sse(raw) };
+        let output = align_rt_buffer_new(64);
+        let (status, terminal, _, _, _) = http_sse_next_owned(stream, output);
+        assert_eq!(status, 0);
+        assert_eq!(
+            terminal.present, 0,
+            "the suffix BOM remains part of an unknown field name"
+        );
+
+        unsafe { align_rt_buffer_free(output) };
+        unsafe { align_rt_buffer_free(prefix) };
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn http_sse_ffi_validation_layout_and_sentinels() {
+        assert_eq!(core::mem::size_of::<AlignHttpSseNext>(), 64);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, present), 0);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, retry_present), 1);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, retry_ms), 8);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, event), 16);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, data), 32);
+        assert_eq!(core::mem::offset_of!(AlignHttpSseNext, last_event_id), 48);
+        assert!(unsafe { align_rt_http_read_stream_sse(core::ptr::null_mut()) }.is_null());
+        assert_eq!(
+            unsafe { align_rt_http_sse_stream_retry_ms(core::ptr::null()) },
+            -1
+        );
+        let empty = unsafe { align_rt_http_sse_stream_last_event_id(core::ptr::null()) };
+        assert!(empty.ptr.is_null());
+        assert_eq!(empty.len, 0);
+
+        let buffer = align_rt_buffer_new(8);
+        let zero = align_rt_buffer_new(0);
+        let mut event = AlignHttpSseNext {
+            present: 9,
+            retry_present: 9,
+            reserved: [9; 6],
+            retry_ms: 9,
+            event: AlignStr {
+                ptr: 1usize as *const u8,
+                len: 9,
+            },
+            data: AlignStr {
+                ptr: 1usize as *const u8,
+                len: 9,
+            },
+            last_event_id: AlignStr {
+                ptr: 1usize as *const u8,
+                len: 9,
+            },
+        };
+        assert_eq!(
+            unsafe { align_rt_http_sse_stream_next(core::ptr::null_mut(), buffer, &mut event) },
+            AL_INVALID
+        );
+        assert_eq!(event.present, 0);
+        event.present = 9;
+        assert_eq!(
+            unsafe { align_rt_http_sse_stream_next(core::ptr::null_mut(), zero, &mut event) },
+            AL_INVALID
+        );
+        assert_eq!(event.present, 0);
+        assert_eq!(
+            unsafe {
+                align_rt_http_sse_stream_next(core::ptr::null_mut(), buffer, core::ptr::null_mut())
+            },
+            AL_INVALID
+        );
+
+        let (port, server) = http_serve_once(http_sse_response(b"data:x\n\n", false));
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        let stream = open_http_sse_stream(client, &url);
+        event.present = 9;
+        assert_eq!(
+            unsafe { align_rt_http_sse_stream_next(stream, zero, &mut event) },
+            AL_INVALID,
+        );
+        assert_eq!(event.present, 0);
+        let (status, published, kind, data, _) = http_sse_next_owned(stream, buffer);
+        assert_eq!(status, 0);
+        assert_eq!(published.present, 1);
+        assert_eq!(kind, b"message");
+        assert_eq!(data, b"x");
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+
+        unsafe { align_rt_buffer_free(zero) };
+        unsafe { align_rt_buffer_free(buffer) };
+    }
+
     #[test]
     fn http_read_stream_fixed_head_views_and_caller_windows() {
         let response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 11\r\nX-Mode: raw\r\n\r\nhello world".to_vec();
@@ -36774,6 +38338,41 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             server.join().unwrap(),
             1,
             "two completed streams reuse one live TLS connection",
+        );
+    }
+
+    #[test]
+    fn https_sse_stream_matches_plaintext_and_reuses_the_live_tls_connection() {
+        let _net_guard = GET_MANY_SERVER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let body = b"id: secure\nretry: 42\nevent: update\ndata: one\ndata: two\n\n";
+        let response = http_sse_response(body, true);
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response, 1, false);
+        let url = format!("https://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let stream = open_http_sse_stream(client, &url);
+            let buffer = align_rt_buffer_new(64);
+            let (status, event, kind, data, id) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(event.present, 1);
+            assert_eq!(event.retry_ms, 42);
+            assert_eq!(kind, b"update");
+            assert_eq!(data, b"one\ntwo");
+            assert_eq!(id, b"secure");
+            let (status, terminal, _, _, _) = http_sse_next_owned(stream, buffer);
+            assert_eq!(status, 0);
+            assert_eq!(terminal.present, 0);
+            unsafe { align_rt_buffer_free(buffer) };
+            unsafe { align_rt_http_read_stream_free(stream) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "two completed SSE streams reuse one verified TLS connection",
         );
     }
 

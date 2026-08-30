@@ -1078,9 +1078,29 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_read_stream_read",
             shape: RuntimeAbiShape::A24,
         },
+        RuntimeKey::HttpReadStreamSse => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_read_stream_sse",
+            shape: RuntimeAbiShape::A50,
+        },
         RuntimeKey::HttpReadStreamStatus => RuntimeAbi {
             key,
             symbol: "align_rt_http_read_stream_status",
+            shape: RuntimeAbiShape::A29,
+        },
+        RuntimeKey::HttpSseStreamLastEventId => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_sse_stream_last_event_id",
+            shape: RuntimeAbiShape::A83,
+        },
+        RuntimeKey::HttpSseStreamNext => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_sse_stream_next",
+            shape: RuntimeAbiShape::A24,
+        },
+        RuntimeKey::HttpSseStreamRetryMs => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_sse_stream_retry_ms",
             shape: RuntimeAbiShape::A29,
         },
         RuntimeKey::HttpRespBody => RuntimeAbi {
@@ -1835,15 +1855,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 304 || keyed_runtime_abis().len() != 304 {
+    if RuntimeKey::ALL.len() != 308 || keyed_runtime_abis().len() != 308 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 317 {
+    if runtime_abis().count() != 321 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(317);
+    let mut symbols = HashSet::with_capacity(321);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3212,17 +3232,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 317);
+        assert_eq!(rows.len(), 321);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            317
+            321
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            317
+            321
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3252,7 +3272,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 317);
+        assert_eq!(rows.len(), 321);
 
         for row in rows {
             let symbol = row.symbol;
