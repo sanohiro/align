@@ -53,7 +53,10 @@ functions close child launch/fd/acknowledgement/completion I/O. Production mode 
 option products each have explicit terminal-consumer owners. Its codegen/cache identity is the
 complete span-erased semantic projection; current spans/located metadata may shift. The fixed
 launch/acknowledgement ABI separates bounded harness setup failure from user termination, and the
-parent control and capture endpoints are nonblocking. The projection preserves structurally ordered
+parent control and capture endpoints are nonblocking. The driver snapshots one native suite cwd
+after CLI validation; every child installs it, replaces fd 0/1/2/3, and closes fd 4 and above, so
+neither cwd nor ambient descriptors depend on later parent mutation. The projection preserves
+structurally ordered
 expression-ownership facts and semantic descriptor fields while omitting their diagnostic spans.
 One state-machine owner covers every terminal path, holds
 the group leader unreaped while signalling the pinned group then direct PID, then reaps only its
@@ -61,11 +64,14 @@ direct child; cleanup failures stop after preserving already-selected bounded ev
 signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM. Returning error paths restore prior dispositions;
 terminal paths retain the controller through summary publication, then block/recheck and exit
 directly. A lock-free output permit makes a signal selected during one raw write terminal before
-any later syscall; the final guard uses raw `_exit(128 + signal)`, yielding numeric
+any later syscall, while each handler preserves the interrupted thread's exact `errno`; the final
+guard uses raw `_exit(128 + signal)`, yielding numeric
 129/130/131/143 `WIFEXITED` statuses rather than `WIFSIGNALED`. Canonical ids use the entry source's
 declared module path, or `main` only when omitted; that implicit `main` rejects before catalog
 construction when an imported source explicitly declares `module main`.
 Names reject exactly the C0/C1 ranges U+0000..U+001F and U+007F..U+009F.
+All compiler/per-unit/harness build stages complete normal cleanup before signal-controller
+acquisition; only the final executable stage crosses into the non-returning runner.
 
 Record: `docs/impl/core-design/test.md`, `draft.md` §18.1, `docs/language-spec.md`
 

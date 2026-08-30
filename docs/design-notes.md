@@ -1329,7 +1329,9 @@ unwinding to the language. A compiler-owned completion record means an early exi
 masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
 from user termination, and one deadline covers both states through cleanup. The parent control and
 capture endpoints are nonblocking, so an acknowledgement or short output without completion returns
-to poll instead of stalling that deadline. One dedicated runner
+to poll instead of stalling that deadline. The driver snapshots one native suite cwd after CLI
+validation. Every spawn installs it, replaces fd 0/1/2/3, and closes fd 4 and above, making child
+cwd and descriptor visibility independent of later embedding-thread mutations. One dedicated runner
 state machine owns signals, polling, capture, and wait status: every terminal path keeps the leader
 unreaped while it signals the pinned group and then the direct PID, then reaps only its direct child
 and continues only after cleanup succeeds. The direct target also closes a leader that left the
@@ -1339,7 +1341,9 @@ this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, an
 acquisition through summary publication. Returning error paths restore prior handlers; terminal
 suite paths retain the controller, block and recheck those signals after the last write, then exit
 directly. One lock-free `Idle/Writing/Selected/WritingPending` state prevents any new raw output
-syscall after selection while preserving only an already-started syscall's prefix. The final guard
+syscall after selection while preserving only an already-started syscall's prefix. Each handler
+saves and restores the interrupted thread's exact `errno` around arbitration and self-pipe work.
+The final guard
 uses raw `_exit(128 + signal)`, so SIGHUP/SIGINT/SIGQUIT/SIGTERM are observed as numeric
 129/130/131/143 `WIFEXITED` statuses, never as re-raised `WIFSIGNALED` termination. A prior ignored
 or custom handler therefore cannot change a published terminal result.
@@ -1351,6 +1355,9 @@ close-on-exec, acknowledgement, and completion encoding/send, while the driver i
 independent peer codecs. Target/profile/runtime LTO reach unit and harness objects; jobs, cache
 statistics, timeout, and capture bounds each stop at their named scheduling, diagnostic, or runner
 consumer.
+After link, every whole/per-unit/harness build-stage owner completes normal cleanup before
+signal-controller acquisition. Only the final executable stage enters the runner, because a raw
+terminal exit cannot run Rust destructors for any build owner left alive.
 
 Capture moves from a live row to an immutable quiesced row after child cleanup. A pass consumes and
 discards it; a failure retains it through the last direct reporting write and only then releases it.

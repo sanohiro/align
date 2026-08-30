@@ -398,7 +398,8 @@ facts must live in this repository.
   preallocated output/full-row deadline, terminal-observation control barrier, all-terminal
   pinned-group then direct-PID signalling before reap, nonblocking capture/control drains,
   evidence retained through reporting, lock-free signal/write arbitration, numeric raw-exit
-  statuses for the four graceful signals, controller-owned terminal summary commit, and
+  statuses for the four graceful signals, exact handler `errno` preservation, controller-owned
+  terminal summary commit, and
   failure-only output replay. Compiler formation normalizes final syntactic-tail assertions only
   at root completion or structural statement placement and freezes
   the complete production prefix before appending a test-generated function/type/descriptor/
@@ -407,7 +408,9 @@ facts must live in this repository.
   projection, including structurally ordered ownership facts and semantic descriptor fields.
   Before artifact work, test mode rejects every catalog-reachable `process.command` through direct,
   imported, function-value, lifted, and monomorphized edges; unreachable production use stays
-  unchanged. An implicit entry `main` cannot collide with an imported declared `main`, and
+  unchanged. One suite cwd is fixed after CLI validation, child fd 0..3 are replaced and fd 4+
+  closed, and all build-stage owners finish normal Drop before runner entry. An implicit entry
+  `main` cannot collide with an imported declared `main`, and
   `align-repl` rejects test-bearing entries transactionally. No dynamic command sentinel or fifth
   child-control ABI is part of the capability.
   Implementation is the next

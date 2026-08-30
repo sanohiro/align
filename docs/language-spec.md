@@ -1234,7 +1234,9 @@ group per test, sequentially. A compiler-private completion record distinguishes
 return from exit, exec, abort, and crash. Each row has bounded time from pre-spawn through launch,
 execution, group signalling, capture drain, and direct-child reap plus bounded per-stream capture;
 pre-ack timeout/output is infrastructure failure. Parent control and capture receives are
-nonblocking. Every verified terminal path signals the pinned group and then the still-unreaped
+nonblocking. One native suite cwd is snapshotted after CLI validation and installed for every row;
+the child receives exactly fd 0 `/dev/null`, fd 1/2 capture, and fd 3 control, with every fd 4 and
+above closed. Every verified terminal path signals the pinned group and then the still-unreaped
 direct PID before reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
 passing suite always has one summary line. No user `main` is required or automatically invoked. Production
@@ -1250,14 +1252,15 @@ close-on-exec, acknowledgement, and completion encoding/send. Production prefix 
 one-shot/watch, whole/per-unit, ThinLTO, and PGO routes, while each accepted test option has one
 fixed terminal consumer. The signal controller remains installed through
 summary publication. One lock-free permit prevents a new raw output syscall after a graceful signal
-is selected; the final blocked recheck uses raw `_exit(128 + signal)`, so the four handled signals
+is selected, and each handler preserves the interrupted thread's exact `errno`; the final blocked
+recheck uses raw `_exit(128 + signal)`, so the four handled signals
 produce numeric statuses 129/130/131/143 (`WIFEXITED`, not `WIFSIGNALED`). Production codegen/cache
 identity is the complete span-erased semantic projection; current spans and located output may
 shift after an earlier test edit. Structurally ordered expression-ownership facts and semantic
 descriptor fields remain in that identity even though their diagnostic spans do not. Test
 compilation has a separate versioned cache domain. The
 complete grammar, bounds, wire bytes, error precedence, CLI
-options, ownership, reporting, and
+options, ownership, build-stage cleanup before runner entry, reporting, and
 acceptance matrix are in `docs/impl/core-design/test.md`.
 
 Before test cache lookup, native-capability collection, or artifact allocation, the validated

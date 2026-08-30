@@ -3872,7 +3872,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   lifecycle owner, terminal-observation control barrier, all-terminal pinned-group then direct-PID
   signalling before reap, nonblocking capture/control drains, quiesced evidence retained
   through reporting, lock-free signal/write arbitration, numeric raw-exit status for four graceful
-  signals, controller-owned terminal summary commit, and
+  signals, exact handler `errno` preservation, controller-owned terminal summary commit, and
   failure-only evidence replay. Compiler formation normalizes final syntactic-tail assertions only
   at root completion or structural statement placement and
   freezes the complete production prefix before appending the test-generated function/type/
@@ -3882,7 +3882,10 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   Query/command descriptors remain prefix-owned top-level declarations and tests consume their
   ordinary prepared metadata offline. The harness alone owns literal `main`; source main uses its
   encoded private identity, and four exact unkeyed runtime rows own child launch/fd/ack/completion
-  I/O. Test formation rejects every catalog-reachable `process.command` before cache/capability/
+  I/O. One CLI-bound native cwd is installed for every child; fd 0..3 are replaced and fd 4+
+  closed. All build-stage owners complete normal Drop before runner entry; only the executable
+  stage crosses that boundary. Test formation rejects every catalog-reachable `process.command`
+  before cache/capability/
   artifact work, while unreachable production use is unchanged; no dynamic supervisor ABI ships.
   An implicit entry `main` rejects against imported declared `main`, and `align-repl` rejects a
   test-bearing submitted entry transactionally. Production modes and accepted test options have

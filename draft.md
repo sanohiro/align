@@ -2729,12 +2729,19 @@ bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (defaul
 configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
 acknowledgement is infrastructure failure. The parent control endpoint is nonblocking before spawn,
 and both capture read endpoints are nonblocking too, so every control/stdout/stderr drain returns to
-deadline processing when its queue is empty. Every verified
+deadline processing when its queue is empty. Immediately after CLI validation and before source or
+artifact work, the driver snapshots one native suite working directory; failure is
+`alignc: test runner working directory failed (os error <signed-i32>)`. Every child uses that same
+snapshot. Its spawn actions install the cwd, replace fd 0 with `/dev/null`, fd 1/2 with capture, and
+fd 3 with control, then close every fd numbered 4 or above; no ambient parent descriptor survives.
+Every verified
 terminal path signals the pinned child process group and then its still-unreaped direct PID before
 reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup. One lock-free
 `Idle/Writing/Selected/WritingPending` state gives each raw report write an exclusive permit; a
 signal during one permitted syscall selects after its complete/partial prefix and prevents every
-later syscall. The runner retains its signal controller while writing the final summary, then
+later syscall. Each installed handler preserves the interrupted thread's exact `errno` across every
+arbitration and self-pipe path. The runner retains its signal controller while writing the final
+summary, then
 blocks and rechecks those signals and invokes raw `_exit(128 + signal)`. The resulting statuses are
 129/130/131/143 and are observed as `WIFEXITED`, never as re-raised `WIFSIGNALED`; restored prior
 handlers cannot change terminal output. Passing output is suppressed; a failure replays only that test's
@@ -2744,7 +2751,9 @@ alone owns literal `main`; every permitted source-main ABI uses the existing enc
 identity and no ordinary main wrapper is emitted. Four exact compiler-private runtime functions own
 launch receive, fd close-on-exec, acknowledgement, and completion encoding/send. Test target,
 profile, and runtime-LTO options reach both unit and harness objects; jobs/cache statistics and
-timeout/output terminate at scheduling/diagnostics and runner state. The exact grammar, bounds,
+timeout/output and suite cwd terminate at scheduling/diagnostics and runner state. After link and
+before signal-controller acquisition, every whole/per-unit/harness build-stage owner completes
+ordinary cleanup; only the final executable stage enters the runner. The exact grammar, bounds,
 record bytes, validation order, ownership, cache identity,
 reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
 
