@@ -375,18 +375,17 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **Next convergence capability:** HTTP client streaming receive is designed in
-  `docs/impl/std-design/http.md`. The locked surface is one dependent
-  `http_read_stream` with caller-buffer de-framed reads, followed by a consuming
-  `http_sse_stream` transition with caller-buffer WHATWG event reads. Exact
+  `docs/impl/std-design/http.md`. The dependent `http_read_stream` carrier and
+  caller-buffer de-framed read boundary are implemented; the next capability is
+  its consuming `http_sse_stream` transition with caller-buffer WHATWG event reads. Exact
   completion may return the connection to its borrowed client pool; mid-body
   Drop closes without draining. Per-call framing and SSE-source work guards keep
   each operation bounded without imposing a lifetime body cap. Streams use one
   positive carrier grammar: bare or finite builtin Option/Result paths only;
   an exhaustive type-discriminator classifier rejects every other storage edge,
   including tuples, by default. SSE reconnect state commits atomically with its
-  control block/event. Implementation remains two
-  capability PRs: carrier substrate plus raw streaming first, then transactional
-  SSE interpretation.
+  control block/event. The raw-stream capability is the first of the two planned
+  PRs; transactional SSE interpretation is the second.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

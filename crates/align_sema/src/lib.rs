@@ -203,6 +203,10 @@ pub enum Scalar {
     /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
     /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
     HttpStream,
+    /// A dependent raw HTTP client body stream. The active handle owns one checked-out connection
+    /// and retains a shared borrow of its creating client. It may ride only the builtin
+    /// Option/Result carrier grammar; every other enclosing storage edge is rejected.
+    HttpReadStream,
     /// A `run_output` payload (`Result<run_output, Error>` from `c.run()`, `std.process` Slice 4). An
     /// owned **Move** handle (the exit code + two captured byte buffers); the enclosing `Result`'s
     /// `Drop` frees it (`run_output_free`). Opaque pointer, like [`Scalar::HttpResponse`] — owned, never
@@ -235,7 +239,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -683,6 +687,9 @@ pub enum Ty {
     /// **Impure** (network).
     /// Opaque pointer.
     HttpStream,
+    /// A dependent client receive stream returned by `client.request_stream`. Move, Drop-bearing,
+    /// and lifetime-tied to its creating `HttpClient` through borrow provenance.
+    HttpReadStream,
     /// A `http_headers` (`std.http`) — a **detached view of one request's parsed header table**,
     /// minted by `ctx.headers()` (http.md item 10). **Copy, non-owning, region-tracked** — the
     /// `json.doc` lane, never a Move handle: it owns nothing, is never dropped, and never makes its
@@ -818,6 +825,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        | Ty::HttpReadStream
         | Ty::HttpHeaders
         | Ty::JsonDoc
         | Ty::JsonScanner { .. }
@@ -865,6 +873,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpReadStream
         | Scalar::RunOutput
         | Scalar::RunBytes
         | Scalar::Fn { .. }
@@ -933,6 +942,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::ResponseBuilder => Some(Scalar::ResponseBuilder),
         // A `http_stream` owned handle as the `Result` Ok payload of `ctx.respond_stream()`.
         Ty::HttpStream => Some(Scalar::HttpStream),
+        Ty::HttpReadStream => Some(Scalar::HttpReadStream),
         // A `run_output` owned handle as the `Result` Ok payload of `c.run()` (std.process Slice 4).
         // (A `command` builder is never a payload — like `http request`, it has no `Scalar`, `None` here.)
         Ty::RunOutput => Some(Scalar::RunOutput),
@@ -975,6 +985,42 @@ pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
     }
 }
 
+fn fn_sig_scalar_with_http_stream_carrier(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &mut Vec<hir::TaggedType>,
+) -> Option<Scalar> {
+    match http_stream_carrier_class(ty, structs, tuples, enums, tagged_types) {
+        HttpStreamCarrierClass::Forbidden => None,
+        HttpStreamCarrierClass::None => fn_sig_scalar(ty),
+        HttpStreamCarrierClass::Carrier => match ty {
+            Ty::Option(payload) => Some(Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Option(payload),
+            ))),
+            Ty::Result(ok, err) => Some(Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Result(ok, err),
+            ))),
+            other => fn_sig_scalar(other),
+        },
+    }
+}
+
+fn fn_value_ret_ok_with_http_stream_carrier(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    fn_value_ret_ok(ty)
+        || http_stream_carrier_class(ty, structs, tuples, enums, tagged_types)
+            == HttpStreamCarrierClass::Carrier
+}
+
 pub fn scalar_to_ty(s: Scalar) -> Ty {
     match s {
         Scalar::Int(it) => Ty::Int(it),
@@ -1013,6 +1059,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
         Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
+        Scalar::HttpReadStream => Ty::HttpReadStream,
         Scalar::RunOutput => Ty::RunOutput,
         Scalar::RunBytes => Ty::RunBytes,
         Scalar::Fn(fid) => Ty::Fn(fid),
@@ -2273,6 +2320,7 @@ pub fn drop_plan(
                         | Ty::HttpRequestCtx
                         | Ty::ResponseBuilder
                         | Ty::HttpStream
+                        | Ty::HttpReadStream
                         | Ty::Command
                         | Ty::RunOutput
                         | Ty::RunBytes
@@ -2535,7 +2583,7 @@ pub fn ty_mentions_resource(
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
-            Ty::Resource(_) | Ty::ResourceRef(_) => return true,
+            Ty::Resource(_) | Ty::ResourceRef(_) | Ty::HttpReadStream => return true,
             Ty::Array(scalar, _)
             | Ty::DynArray(scalar)
             | Ty::Option(scalar)
@@ -2639,7 +2687,8 @@ pub fn ty_may_borrow(
             | Ty::DynSliceArray(_)
             | Ty::Fn(_)
             | Ty::Resource(_)
-            | Ty::ResourceRef(_) => return true,
+            | Ty::ResourceRef(_)
+            | Ty::HttpReadStream => return true,
             Ty::Tagged(id) if visited_tagged.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
@@ -2701,6 +2750,426 @@ pub fn ty_may_borrow(
         }
     }
     false
+}
+
+/// Classification of the dependent HTTP receive-stream storage grammar. `Carrier` is exactly a
+/// bare stream or a finite builtin Option/Result path containing one; `Forbidden` means a stream is
+/// reachable only through another storage edge. `None` contains no dependent stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpStreamCarrierClass {
+    None,
+    Carrier,
+    Forbidden,
+}
+
+fn ty_contains_http_read_stream(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    fn push_scalar(work: &mut Vec<Ty>, scalar: Scalar) -> bool {
+        match scalar {
+            Scalar::HttpReadStream => true,
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                work.push(Ty::Struct(id));
+                false
+            }
+            Scalar::Enum(id) => {
+                work.push(Ty::Enum(id));
+                false
+            }
+            Scalar::Tagged(id) => {
+                work.push(Ty::Tagged(id));
+                false
+            }
+            Scalar::Int(_)
+            | Scalar::Float(_)
+            | Scalar::Bool
+            | Scalar::Char
+            | Scalar::Unit
+            | Scalar::String
+            | Scalar::DynArray(_)
+            | Scalar::DynResponseArray
+            | Scalar::Str
+            | Scalar::Slice(_)
+            | Scalar::SoaParam(_)
+            | Scalar::JsonDoc
+            | Scalar::Param(_)
+            | Scalar::Reader
+            | Scalar::Writer
+            | Scalar::Buffer
+            | Scalar::Regex
+            | Scalar::Captures
+            | Scalar::CliParsed
+            | Scalar::TcpConn
+            | Scalar::TcpListener
+            | Scalar::UdpSocket
+            | Scalar::Child
+            | Scalar::File
+            | Scalar::HttpResponse
+            | Scalar::HttpServer
+            | Scalar::HttpRequestCtx
+            | Scalar::ResponseBuilder
+            | Scalar::HttpStream
+            | Scalar::RunOutput
+            | Scalar::RunBytes
+            | Scalar::Fn(_)
+            | Scalar::Resource(_)
+            | Scalar::ResourceRef(_) => false,
+        }
+    }
+
+    let mut work = vec![root];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::HttpReadStream => return true,
+            Ty::Option(payload)
+            | Ty::Box(payload)
+            | Ty::Array(payload, _)
+            | Ty::Vec(payload, _)
+            | Ty::Mask(payload, _)
+            | Ty::Slice(payload)
+            | Ty::DynArray(payload)
+            | Ty::ArrayBuilder(payload)
+            | Ty::Task(payload) => {
+                if push_scalar(&mut work, payload) {
+                    return true;
+                }
+            }
+            Ty::Result(ok, err) => {
+                if push_scalar(&mut work, ok) || push_scalar(&mut work, err) {
+                    return true;
+                }
+            }
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(entry) = tagged_types.get(id as usize) {
+                    match *entry {
+                        hir::TaggedType::Option(payload) => {
+                            if push_scalar(&mut work, payload) {
+                                return true;
+                            }
+                        }
+                        hir::TaggedType::Result(ok, err) => {
+                            if push_scalar(&mut work, ok) || push_scalar(&mut work, err) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            Ty::Struct(id) if visited_structs.insert(id) => {
+                if let Some(definition) = structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(definition) = tuples.get(id as usize) {
+                    for &element in definition.elems.iter().rev() {
+                        if push_scalar(&mut work, element) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(definition) = enums.get(id as usize) {
+                    for &payload in definition
+                        .variants
+                        .iter()
+                        .rev()
+                        .flat_map(|variant| variant.payload.iter().rev())
+                    {
+                        if push_scalar(&mut work, payload) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _)
+            | Ty::Soa(id)
+            | Ty::JsonScanner(id)
+            | Ty::DictEncoded(id, _) => work.push(Ty::Struct(id)),
+            Ty::DynVecArray(element, lanes) | Ty::VecArrayBuilder(element, lanes) => {
+                work.push(Ty::Vec(element, lanes));
+            }
+            Ty::DynMaskArray(element, lanes) | Ty::MaskArrayBuilder(element, lanes) => {
+                work.push(Ty::Mask(element, lanes));
+            }
+            Ty::DynFixedArray(element, length)
+            | Ty::FixedArrayBuilder(element, length) => work.push(Ty::Array(element, length)),
+            Ty::Int(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::SoaParam(_)
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::Str
+            | Ty::String
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
+            | Ty::Builder
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::StrFinder
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::RunBytes
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::Fn(_)
+            | Ty::Unit
+            | Ty::Error
+            | Ty::Tagged(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Enum(_) => {}
+        }
+    }
+    false
+}
+
+pub fn http_stream_carrier_class(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> HttpStreamCarrierClass {
+    enum PayloadClass {
+        Stream,
+        Tagged(u32),
+        Other(Ty),
+    }
+
+    fn payload_class(payload: Scalar) -> PayloadClass {
+        match payload {
+            Scalar::HttpReadStream => PayloadClass::Stream,
+            Scalar::Tagged(id) => PayloadClass::Tagged(id),
+            scalar @ (Scalar::Int(_)
+            | Scalar::Float(_)
+            | Scalar::Bool
+            | Scalar::Char
+            | Scalar::Unit
+            | Scalar::Struct(_)
+            | Scalar::String
+            | Scalar::DynArray(_)
+            | Scalar::DynStructArray(_)
+            | Scalar::DynResponseArray
+            | Scalar::Str
+            | Scalar::Slice(_)
+            | Scalar::Enum(_)
+            | Scalar::Soa(_)
+            | Scalar::SoaParam(_)
+            | Scalar::JsonDoc
+            | Scalar::Param(_)
+            | Scalar::Reader
+            | Scalar::Writer
+            | Scalar::Buffer
+            | Scalar::Regex
+            | Scalar::Captures
+            | Scalar::CliParsed
+            | Scalar::TcpConn
+            | Scalar::TcpListener
+            | Scalar::UdpSocket
+            | Scalar::Child
+            | Scalar::File
+            | Scalar::HttpResponse
+            | Scalar::HttpServer
+            | Scalar::HttpRequestCtx
+            | Scalar::ResponseBuilder
+            | Scalar::HttpStream
+            | Scalar::RunOutput
+            | Scalar::RunBytes
+            | Scalar::Fn(_)
+            | Scalar::Resource(_)
+            | Scalar::ResourceRef(_)) => PayloadClass::Other(scalar_to_ty(scalar)),
+        }
+    }
+
+    enum Work {
+        Enter(Ty),
+        Exit(u32),
+    }
+
+    let mut work = vec![Work::Enter(root)];
+    let mut active = HashSet::new();
+    let mut complete = HashSet::new();
+    let mut found = false;
+    while let Some(item) = work.pop() {
+        let ty = match item {
+            Work::Exit(id) => {
+                if !active.remove(&id) {
+                    return HttpStreamCarrierClass::Forbidden;
+                }
+                complete.insert(id);
+                continue;
+            }
+            Work::Enter(ty) => ty,
+        };
+        match ty {
+            Ty::HttpReadStream => found = true,
+            Ty::Option(payload) => match payload_class(payload) {
+                PayloadClass::Stream => found = true,
+                PayloadClass::Tagged(id) => work.push(Work::Enter(Ty::Tagged(id))),
+                PayloadClass::Other(child) => {
+                    if ty_contains_http_read_stream(child, structs, tuples, enums, tagged_types) {
+                        return HttpStreamCarrierClass::Forbidden;
+                    }
+                }
+            },
+            Ty::Result(ok, err) => {
+                for payload in [ok, err] {
+                    match payload_class(payload) {
+                        PayloadClass::Stream => found = true,
+                        PayloadClass::Tagged(id) => work.push(Work::Enter(Ty::Tagged(id))),
+                        PayloadClass::Other(child) => {
+                            if ty_contains_http_read_stream(
+                                child,
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                            ) {
+                                return HttpStreamCarrierClass::Forbidden;
+                            }
+                        }
+                    }
+                }
+            }
+            Ty::Tagged(id) => {
+                if complete.contains(&id) {
+                    continue;
+                }
+                if !active.insert(id) {
+                    return HttpStreamCarrierClass::Forbidden;
+                }
+                let Some(entry) = tagged_types.get(id as usize) else {
+                    return HttpStreamCarrierClass::Forbidden;
+                };
+                work.push(Work::Exit(id));
+                match *entry {
+                    hir::TaggedType::Option(payload) => {
+                        work.push(Work::Enter(Ty::Option(payload)));
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        work.push(Work::Enter(Ty::Result(ok, err)));
+                    }
+                }
+            }
+            other @ (Ty::Int(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Box(_)
+            | Ty::Array(..)
+            | Ty::Vec(..)
+            | Ty::Mask(..)
+            | Ty::StructArray(..)
+            | Ty::DynStructArray(..)
+            | Ty::Slice(_)
+            | Ty::Soa(_)
+            | Ty::SoaParam(_)
+            | Ty::DynSliceArray(_)
+            | Ty::DynArray(_)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynResponseArray
+            | Ty::Str
+            | Ty::String
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
+            | Ty::Builder
+            | Ty::Writer
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::ArrayBuilder(_)
+            | Ty::VecArrayBuilder(..)
+            | Ty::MaskArrayBuilder(..)
+            | Ty::FixedArrayBuilder(..)
+            | Ty::FixedStructArrayBuilder(..)
+            | Ty::StrFinder
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::RunBytes
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::JsonScanner(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Fn(_)
+            | Ty::Enum(_)
+            | Ty::Task(_)
+            | Ty::DictEncoded(..)
+            | Ty::Unit
+            | Ty::Error) => {
+                if ty_contains_http_read_stream(other, structs, tuples, enums, tagged_types) {
+                    return HttpStreamCarrierClass::Forbidden;
+                }
+            }
+        }
+    }
+    if found {
+        HttpStreamCarrierClass::Carrier
+    } else {
+        HttpStreamCarrierClass::None
+    }
 }
 
 /// Whether a struct transitively contains a decoded `str` view or a scalar-array slot that can
@@ -3294,6 +3763,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("http_request_ctx", Ty::HttpRequestCtx),
     ("response_builder", Ty::ResponseBuilder),
     ("http_stream", Ty::HttpStream),
+    ("http_read_stream", Ty::HttpReadStream),
     ("array", Ty::DynArray(BRIDGE_ELEM)),
     ("array_builder", Ty::ArrayBuilder(BRIDGE_ELEM)),
     ("box", Ty::Box(BRIDGE_ELEM)),
@@ -7152,6 +7622,27 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             }
             params.push(ty);
         }
+        for (parameter, &ty) in f.params.iter().zip(&params) {
+            match http_stream_carrier_class(
+                ty,
+                &structs,
+                &tuples,
+                &enums,
+                &tagged_types,
+            ) {
+                HttpStreamCarrierClass::Forbidden => diags.error(
+                    "an http_read_stream parameter may use only the builtin Option/Result carrier grammar; structs, sums, tuples, collections, boxes, tasks, and other storage edges are forbidden"
+                        .to_string(),
+                    parameter.ty.span(),
+                ),
+                HttpStreamCarrierClass::Carrier if parameter.mode.is_out() => diags.error(
+                    "an http_read_stream carrier cannot be an `out` parameter; pass or borrow it, or return it"
+                        .to_string(),
+                    parameter.ty.span(),
+                ),
+                _ => {}
+            }
+        }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
         // holes via call results.
@@ -7201,6 +7692,20 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 if r == Ty::RunBytes {
                     diags.error(
                         "run_bytes cannot be returned directly; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                            .to_string(),
+                        t.span(),
+                    );
+                }
+                if http_stream_carrier_class(
+                    r,
+                    &structs,
+                    &tuples,
+                    &enums,
+                    &tagged_types,
+                ) == HttpStreamCarrierClass::Forbidden
+                {
+                    diags.error(
+                        "an http_read_stream return may use only the builtin Option/Result carrier grammar; structs, sums, tuples, collections, boxes, tasks, and other storage edges are forbidden"
                             .to_string(),
                         t.span(),
                     );
@@ -13511,6 +14016,21 @@ impl EffectScan<'_> {
                 walk!(req);
                 self.impure_direct = true;
             }
+            ExprKind::HttpClientRequestStream { client, req } => {
+                walk!(client);
+                walk!(req);
+                self.impure_direct = true;
+            }
+            ExprKind::HttpReadStreamStatus { stream } => walk!(stream),
+            ExprKind::HttpReadStreamHeader { stream, name } => {
+                walk!(stream);
+                walk!(name);
+            }
+            ExprKind::HttpReadStreamRead { stream, buffer } => {
+                walk!(stream);
+                walk!(buffer);
+                self.impure_direct = true;
+            }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
                 walk!(client);
                 walk!(urls);
@@ -16904,6 +17424,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::Command
             | Ty::RunOutput
             | Ty::RunBytes
@@ -18861,7 +19382,7 @@ impl<'a> EscapeCheck<'a> {
                 Ty::Tagged(id),
                 self.tagged_types,
             )),
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_)
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::HttpReadStream | Ty::DynArray(_)
             | Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
             | Ty::DynFixedArray(..)
@@ -20458,6 +20979,23 @@ impl<'a> EscapeCheck<'a> {
                     vec![(resp, depth, None)],
                 );
             }
+            // A receive stream retains a shared dependency on its creating client. The constructor
+            // wraps that dependent owner in Result::Ok; a header view then inherits the stream's
+            // own (already client-capped) lifetime.
+            ExprKind::HttpClientRequestStream { client, .. } => {
+                push_fold(
+                    &mut work,
+                    self.borrowed_storage_cap(client),
+                    vec![(client, depth, None)],
+                );
+            }
+            ExprKind::HttpReadStreamHeader { stream, .. } => {
+                push_fold(
+                    &mut work,
+                    self.borrowed_storage_cap(stream),
+                    vec![(stream, depth, None)],
+                );
+            }
             // `out.stdout()`/`out.stderr()` are `str` **views** into the `run_output` handle's owned
             // buffers (freed at frame exit), so — like the `resp.*` / `p.get_str` views — they are
             // `Frame`-regioned and bound to `out` (or shorter if `out` is arena-scoped). An escape past
@@ -20921,6 +21459,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpClientGet { .. }
             | ExprKind::HttpClientPost { .. }
             | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpReadStreamStatus { .. }
+            | ExprKind::HttpReadStreamRead { .. }
             | ExprKind::HttpGetMany { .. }
             | ExprKind::HttpServe { .. }
             | ExprKind::HttpAccept { .. }
@@ -21336,6 +21876,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpClientGet { .. }
             | ExprKind::HttpClientPost { .. }
             | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpClientRequestStream { .. }
+            | ExprKind::HttpReadStreamStatus { .. }
+            | ExprKind::HttpReadStreamHeader { .. }
+            | ExprKind::HttpReadStreamRead { .. }
             | ExprKind::HttpGetMany { .. }
             | ExprKind::HttpServe { .. }
             | ExprKind::HttpAccept { .. }
@@ -24699,6 +25243,19 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(client, depth);
                 self.walk(req, depth);
             }
+            ExprKind::HttpClientRequestStream { client, req } => {
+                self.walk(client, depth);
+                self.walk(req, depth);
+            }
+            ExprKind::HttpReadStreamStatus { stream } => self.walk(stream, depth),
+            ExprKind::HttpReadStreamHeader { stream, name } => {
+                self.walk(stream, depth);
+                self.walk(name, depth);
+            }
+            ExprKind::HttpReadStreamRead { stream, buffer } => {
+                self.walk(stream, depth);
+                self.walk(buffer, depth);
+            }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
                 self.walk(client, depth);
                 self.walk(urls, depth);
@@ -26815,6 +27372,10 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpClientGet { .. }
         | ExprKind::HttpClientPost { .. }
         | ExprKind::HttpClientRequest { .. }
+        | ExprKind::HttpClientRequestStream { .. }
+        | ExprKind::HttpReadStreamStatus { .. }
+        | ExprKind::HttpReadStreamHeader { .. }
+        | ExprKind::HttpReadStreamRead { .. }
         | ExprKind::HttpGetMany { .. }
         | ExprKind::HttpServe { .. }
         | ExprKind::HttpAccept { .. }
@@ -33216,6 +33777,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ResultErr(value) => self
                 .borrow_fact(value)
                 .prefixed(BorrowProjection::ResultErr),
+            ExprKind::HttpClientRequestStream { client, .. } => BorrowFact::from_direct(
+                self.storage_roots(client),
+            )
+            .prefixed(BorrowProjection::ResultOk),
+            ExprKind::HttpReadStreamHeader { stream, .. } => {
+                BorrowFact::from_direct(self.storage_roots(stream))
+            }
             ExprKind::Try(result) => self.project_fact_or_flatten(
                 result.ty,
                 self.borrow_fact(result),
@@ -33506,6 +34074,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CliGetStr { parsed: buffer, .. }
             | ExprKind::HttpRespHeader { resp: buffer, .. }
             | ExprKind::HttpRespBody { resp: buffer }
+            | ExprKind::HttpReadStreamHeader { stream: buffer, .. }
             | ExprKind::HttpCtxMethod { ctx: buffer }
             | ExprKind::HttpCtxPath { ctx: buffer }
             | ExprKind::HttpCtxBody { ctx: buffer }
@@ -33526,6 +34095,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RunOutputStderr { out: buffer } => self.storage_roots(buffer),
             ExprKind::RunBytesStdout { out: buffer }
             | ExprKind::RunBytesStderr { out: buffer } => self.storage_roots(buffer),
+            ExprKind::HttpClientRequestStream { client, .. } => self.storage_roots(client),
             // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
             // (notably `c.reader().buffered()` still borrows `c`).
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
@@ -33846,6 +34416,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | ExprKind::HttpParse { .. } | ExprKind::HttpRespStatus { .. } | ExprKind::HttpClient
             | ExprKind::HttpClientGet { .. } | ExprKind::HttpClientPost { .. } | ExprKind::HttpClientRequest { .. }
+            | ExprKind::HttpReadStreamStatus { .. } | ExprKind::HttpReadStreamRead { .. }
             | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
             | ExprKind::HttpResponseBuilder { .. } | ExprKind::HttpRbHeader { .. } | ExprKind::HttpRbBody { .. }
             | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
@@ -37220,6 +37791,7 @@ impl<'a> MoveCheck<'a> {
         match kind {
             ExprKind::ReaderRead { buffer, .. }
             | ExprKind::ReaderReadLine { buffer, .. }
+            | ExprKind::HttpReadStreamRead { buffer, .. }
             | ExprKind::FilePread { buffer, .. }
             | ExprKind::UdpRecvFrom { buffer, .. }
             | ExprKind::CryptoRandom { out: buffer }
@@ -40105,6 +40677,21 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, client, moved, false, false);
                 move_expr!(self, req, moved, true, true);
             }
+            ExprKind::HttpClientRequestStream { client, req } => {
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, req, moved, true, true);
+            }
+            ExprKind::HttpReadStreamStatus { stream } => {
+                move_expr!(self, stream, moved, false, false);
+            }
+            ExprKind::HttpReadStreamHeader { stream, name } => {
+                move_expr!(self, stream, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+            }
+            ExprKind::HttpReadStreamRead { stream, buffer } => {
+                move_expr!(self, stream, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
+            }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
                 // `client`/`urls`/`max_concurrency` are all borrowed — nothing is consumed (the client
                 // fires many batches; the URL slice is read-only; the degree is a scalar).
@@ -40962,6 +41549,41 @@ impl<'a, 't> Checker<'a, 't> {
             if ret == Ty::RunBytes {
                 self.diags.error(
                     "generic substitution cannot produce a bare run_bytes return; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                        .to_string(),
+                    f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
+                );
+            }
+            for (parameter, &ty) in f.params.iter().zip(&param_tys) {
+                match http_stream_carrier_class(
+                    ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    HttpStreamCarrierClass::Forbidden => self.diags.error(
+                        "generic substitution placed an http_read_stream behind a forbidden storage edge"
+                            .to_string(),
+                        parameter.ty.span(),
+                    ),
+                    HttpStreamCarrierClass::Carrier if parameter.mode.is_out() => self.diags.error(
+                        "generic substitution cannot produce an `out` http_read_stream carrier"
+                            .to_string(),
+                        parameter.ty.span(),
+                    ),
+                    _ => {}
+                }
+            }
+            if http_stream_carrier_class(
+                ret,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) == HttpStreamCarrierClass::Forbidden
+            {
+                self.diags.error(
+                    "generic substitution placed a returned http_read_stream behind a forbidden storage edge"
                         .to_string(),
                     f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
                 );
@@ -42682,7 +43304,7 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
     ) -> Expr {
         let err = || Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
-        let Some(sig) = self.sigs.get(&mangled) else {
+        let Some(sig) = self.sigs.get(&mangled).cloned() else {
             self.diags.error(format!("undefined function: '{display}'"), span);
             return err();
         };
@@ -42694,8 +43316,26 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err();
         }
-        let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
-        let ret_ok = fn_value_ret_ok(sig.ret);
+        let params: Option<Vec<Scalar>> = sig
+            .params
+            .iter()
+            .map(|t| {
+                fn_sig_scalar_with_http_stream_carrier(
+                    *t,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                )
+            })
+            .collect();
+        let ret_ok = fn_value_ret_ok_with_http_stream_carrier(
+            sig.ret,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
         let sig_ret = sig.ret;
         match (params, ret_ok) {
             (Some(ps), true) if !sig.param_modes.iter().any(|m| m.is_out()) => {
@@ -43846,13 +44486,38 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Scalar signature only (slice ②a), matching named function values. The captures are
         // hidden from the closure's *type* — only the explicit parameters appear in `Ty::Fn`.
-        let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| fn_sig_scalar(self.finalize(*t))).collect();
+        let mut pscalars = Vec::with_capacity(param_tys.len());
+        for &parameter in &param_tys {
+            let parameter = self.finalize(parameter);
+            let Some(scalar) = fn_sig_scalar_with_http_stream_carrier(
+                parameter,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) else {
+                self.diags.error(
+                    "a lambda value supports only scalar parameters or http_read_stream Option/Result carriers"
+                        .to_string(),
+                    span,
+                );
+                return err;
+            };
+            pscalars.push(scalar);
+        }
         let rty = self.finalize(ret);
-        let (Some(ps), true) = (pscalars, fn_value_ret_ok(rty)) else {
+        let ret_ok = fn_value_ret_ok_with_http_stream_carrier(
+            rty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        if !ret_ok {
             self.diags.error("a lambda value supports only scalar parameters, and a scalar or `Result` return".to_string(), span);
             return err;
-        };
-        let ps = ps
+        }
+        let ps = pscalars
             .into_iter()
             .map(|p| (ast::ParamMode::ByValue, p))
             .collect();
@@ -45956,6 +46621,9 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty == Ty::Reader {
                 return self.check_reader_method(recv_expr, method, args, span);
             }
+            if recv_expr.ty == Ty::HttpReadStream && method == "read" {
+                return self.check_http_read_stream_method(recv_expr, method, args, span);
+            }
             if method == "bytes" {
                 if recv_expr.ty == Ty::Buffer {
                     return self.check_buffer_bytes(recv_expr, args, span);
@@ -46338,10 +47006,13 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.http` (Slice 2) client requests on an `http client`: `cl.get(url)` /
             // `cl.post(url, body)` / `cl.request(req)` each yield `Result<response, Error>`. Impure
             // (network). Type-guarded, same as the response getters above.
-            "get" | "post" | "request" | "get_many" | "timeout" | "max_response_body_bytes"
+            "get" | "post" | "request" | "request_stream" | "get_many" | "timeout" | "max_response_body_bytes"
                 if recv_ty == Ty::HttpClient =>
             {
                 self.check_http_client_method(recv_expr, method, args, span)
+            }
+            "status" | "header" | "read" if recv_ty == Ty::HttpReadStream => {
+                self.check_http_read_stream_method(recv_expr, method, args, span)
             }
             // (`srv.accept()` on an `http_server` is dispatched by the early `method == "accept"`
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
@@ -55827,12 +56498,14 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::HttpClient, ty: Ty::HttpClient, span }
     }
 
-    /// `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` on an `http client`
+    /// `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` / `cl.request_stream(req)` on an
+    /// `http client`
     /// ([`Ty::HttpClient`]), the receiver already evaluated. The receiver must be a **bound local**
     /// (the v1 Move-temporary gate, the reader/writer/cli precedent); `cl` is borrowed (a client fires
-    /// many requests). Each yields `Result<response, Error>`. `get`/`post` take a `str` url (and `post`
-    /// a `bytes` body); `request` takes an `http request` (`Ty::HttpRequest`) that is **consumed**
-    /// (moved into the call — the runtime frees it). All Impure (network).
+    /// many requests). The whole-body methods yield `Result<response, Error>`; `request_stream`
+    /// yields the dependent `Result<http_read_stream, Error>`. `get`/`post` take a `str` url (and
+    /// `post` a `bytes` body); both request methods take an `http request` (`Ty::HttpRequest`) that
+    /// is **consumed** (moved into the call — the runtime frees it). All are Impure (network).
     fn check_http_client_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
@@ -55891,6 +56564,34 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::HttpClientRequest { client: Box::new(recv_expr), req: Box::new(req) }, ty: result_ty, span }
             }
+            "request_stream" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.request_stream()' takes 1 argument (an http request), got {}", args.len()), span);
+                    return err;
+                }
+                let req = self.check_expr(&args[0], None);
+                if req.ty == Ty::Error {
+                    return err;
+                }
+                if self.resolve(req.ty) != Ty::HttpRequest {
+                    self.diags.error(
+                        format!("'.request_stream()' expects an http request (from `http.request(...)`), got {}", ty_name(req.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpClientRequestStream {
+                        client: Box::new(recv_expr),
+                        req: Box::new(req),
+                    },
+                    ty: Ty::Result(
+                        Scalar::HttpReadStream,
+                        Scalar::Enum(self.error_enum_id),
+                    ),
+                    span,
+                }
+            }
             "get_many" => {
                 // `cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>`
                 // (std.http item 6 / R5). `urls` is borrowed (read-only), `cl` is borrowed (shared
@@ -55942,10 +56643,129 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many / timeout / max_response_body_bytes)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / request_stream / get_many / timeout / max_response_body_bytes)"), span);
                 err
             }
         }
+    }
+
+    fn check_http_read_stream_method(
+        &mut self,
+        recv_expr: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http_read_stream to a local before reading it".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match method {
+            "status" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.status()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpReadStreamStatus { stream: Box::new(recv_expr) },
+                    ty: i64_ty,
+                    span,
+                }
+            }
+            "header" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.header()' takes 1 argument (the header name), got {}", args.len()), span);
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                if name.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpReadStreamHeader {
+                        stream: Box::new(recv_expr),
+                        name: Box::new(name),
+                    },
+                    ty: Ty::Option(Scalar::Str),
+                    span,
+                }
+            }
+            "read" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.read()' takes 1 argument (a mut buffer), got {}", args.len()), span);
+                    return err;
+                }
+                let buffer = self.check_expr(&args[0], Some(Ty::Buffer));
+                if buffer.ty == Ty::Error {
+                    return err;
+                }
+                if buffer.ty != Ty::Buffer {
+                    self.diags.error(format!("'.read()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+                    return err;
+                }
+                if !self.require_mut_buffer_local(&args[0], ".read()") {
+                    return err;
+                }
+                if !self.require_http_read_stream_cursor(&recv_expr) {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpReadStreamRead {
+                        stream: Box::new(recv_expr),
+                        buffer: Box::new(buffer),
+                    },
+                    ty: Ty::Result(
+                        Scalar::Int(IntTy { bits: 64, signed: true }),
+                        Scalar::Enum(self.error_enum_id),
+                    ),
+                    span,
+                }
+            }
+            _ => {
+                self.diags.error(
+                    format!(
+                        "'.{method}()' is not a method on an http_read_stream (try status / header / read)"
+                    ),
+                    span,
+                );
+                err
+            }
+        }
+    }
+
+    /// A response-body cursor advances on every successful read. An owned/by-value local may do so
+    /// without source-level `mut` (the opaque handle remains in the same slot), but a parameter that
+    /// belongs to the caller needs the exclusive `borrow mut` mode. Status/header inspection remains
+    /// valid through a shared borrow and therefore does not use this gate.
+    fn require_http_read_stream_cursor(&mut self, receiver: &Expr) -> bool {
+        let ExprKind::Local(local) = receiver.kind else {
+            return false;
+        };
+        let Some(position) = self
+            .current_params
+            .iter()
+            .position(|parameter| *parameter == local)
+        else {
+            return true;
+        };
+        if self.current_param_modes.get(position) == Some(&ast::ParamMode::Borrow) {
+            let name = self.locals[local as usize].name.clone();
+            self.diags.error(
+                format!(
+                    "cannot advance shared-borrowed http_read_stream '{name}' in '.read()' (declare the parameter as `borrow mut`)"
+                ),
+                receiver.span,
+            );
+            return false;
+        }
+        true
     }
 
     /// `http.serve(host, port)` — bind a listening socket, yielding `Result<http_server, Error>`
@@ -58749,6 +59569,19 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(client);
                 self.finalize_expr(req);
             }
+            ExprKind::HttpClientRequestStream { client, req } => {
+                self.finalize_expr(client);
+                self.finalize_expr(req);
+            }
+            ExprKind::HttpReadStreamStatus { stream } => self.finalize_expr(stream),
+            ExprKind::HttpReadStreamHeader { stream, name } => {
+                self.finalize_expr(stream);
+                self.finalize_expr(name);
+            }
+            ExprKind::HttpReadStreamRead { stream, buffer } => {
+                self.finalize_expr(stream);
+                self.finalize_expr(buffer);
+            }
             ExprKind::HttpGetMany { client, urls, max_concurrency } => {
                 self.finalize_expr(client);
                 self.finalize_expr(urls);
@@ -59866,6 +60699,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::HttpHeaders => "http_headers".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::HttpReadStream => "http_read_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
         Ty::JsonScanner(id) => format!("json.scanner<struct#{id}>"),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -60287,6 +61121,7 @@ fn resolved_type_source_spelling(
             Ty::HttpHeaders => "http_headers".to_string(),
             Ty::ResponseBuilder => "response_builder".to_string(),
             Ty::HttpStream => "http_stream".to_string(),
+            Ty::HttpReadStream => "http_read_stream".to_string(),
             Ty::JsonDoc => "json.doc".to_string(),
             Ty::JsonScanner(id) => format!(
                 "json.scanner<{}>",
@@ -61322,7 +62157,7 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -61399,6 +62234,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::HttpServer
             | Ty::HttpRequestCtx
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::ResponseBuilder
             | Ty::RunOutput
             | Ty::RunBytes
@@ -61698,6 +62534,29 @@ fn resolve_type(
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
+                let carrier = http_stream_carrier_class(
+                    pty,
+                    cx.structs,
+                    cx.tuples,
+                    cx.enums,
+                    cx.tagged_types,
+                );
+                if carrier == HttpStreamCarrierClass::Forbidden {
+                    diags.error(
+                        "a function-value parameter may contain http_read_stream only through builtin Option/Result tags"
+                            .to_string(),
+                        p.ty.span(),
+                    );
+                    return Ty::Error;
+                }
+                if p.mode.is_out() && carrier == HttpStreamCarrierClass::Carrier {
+                    diags.error(
+                        "an http_read_stream carrier cannot be an `out` function-value parameter"
+                            .to_string(),
+                        p.ty.span(),
+                    );
+                    return Ty::Error;
+                }
                 if p.mode.is_out() && !matches!(pty, Ty::Slice(_)) {
                     diags.error(
                         format!(
@@ -61708,7 +62567,13 @@ fn resolve_type(
                     );
                     return Ty::Error;
                 }
-                match ty_to_scalar(pty) {
+                match fn_sig_scalar_with_http_stream_carrier(
+                    pty,
+                    cx.structs,
+                    cx.tuples,
+                    cx.enums,
+                    cx.tagged_types,
+                ) {
                     Some(s) => pscalars.push((p.mode, s)),
                     None => {
                         diags.error(
@@ -61726,6 +62591,21 @@ fn resolve_type(
             // fallible handler needs; it is NOT narrowed to a `Scalar`.
             let rty = resolve_type(ret, cx, type_params, diags);
             if rty == Ty::Error {
+                return Ty::Error;
+            }
+            if http_stream_carrier_class(
+                rty,
+                cx.structs,
+                cx.tuples,
+                cx.enums,
+                cx.tagged_types,
+            ) == HttpStreamCarrierClass::Forbidden
+            {
+                diags.error(
+                    "a function-value return may contain http_read_stream only through builtin Option/Result tags"
+                        .to_string(),
+                    ret.span(),
+                );
                 return Ty::Error;
             }
             return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rty));
@@ -62073,6 +62953,12 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::HttpStream
+        }
+        "http_read_stream" => {
+            if !args.is_empty() {
+                diags.error("http_read_stream takes no type arguments".to_string(), span);
+            }
+            Ty::HttpReadStream
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
@@ -62529,6 +63415,7 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::HttpRequestCtx,
     Ty::ResponseBuilder,
     Ty::HttpStream,
+    Ty::HttpReadStream,
     // `command` / `run_output` / `run_bytes` — bare opaque-pointer Move handles freed by their
     // matching runtime free entry. Kept in lockstep with codegen's `handle_free_key`; RunBytes keeps
     // its narrower Result/local placement rule in the type-formation gates above.
@@ -62550,6 +63437,15 @@ fn http_headers_placement_error(what: &str) -> String {
 /// Whether a resolved type has a field representation. Detailed restrictions for inline layout
 /// and recursive ownership are applied after all definitions exist.
 fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    // A dependent receive stream may only be stored in its builtin Option/Result carrier grammar.
+    // User fields are a distinct storage edge and are therefore forbidden even when the immediate
+    // field type is one of those tags. The complete graph classifier runs where all nominal tables
+    // are available; this direct leaf guard closes concrete and generic field formation here.
+    if http_stream_carrier_class(ty, &[], &[], &[], tagged_types)
+        != HttpStreamCarrierClass::None
+    {
+        return false;
+    }
     // A struct field is a primitive scalar, `str` (a borrow), an owned value, an inline struct or
     // enum, a view/handle, an **`Option<T>`/`Result<T, E>`** whose payload is itself a valid field
     // shape, or an owned array. An owned (`string`, Move-struct, handle, option payload, or array)
@@ -62903,6 +63799,7 @@ fn enum_payload_ok(
             ) -> bool {
                 match scalar {
                     Scalar::Param(_) => false,
+                    Scalar::HttpReadStream => false,
                     Scalar::Struct(id)
                     | Scalar::DynStructArray(id)
                     | Scalar::Soa(id) => structs.get(id as usize).is_some(),
@@ -63229,6 +64126,92 @@ mod tests {
     use super::*;
     use align_lexer::tokenize;
     use align_parser::parse_file;
+
+    #[test]
+    fn http_stream_carrier_classifier_rejects_every_nesting_edge() {
+        let structures = vec![StructDef {
+            name: "StreamHolder".to_string(),
+            source_name: "StreamHolder".to_string(),
+            fields: vec![FieldDef {
+                name: "stream".to_string(),
+                ty: Ty::HttpReadStream,
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        let tuples = vec![hir::TupleDef {
+            elems: vec![Scalar::HttpReadStream],
+        }];
+        let enums = vec![hir::EnumDef {
+            name: "StreamChoice".to_string(),
+            source_name: "StreamChoice".to_string(),
+            variants: vec![hir::EnumVariant {
+                name: "Stream".to_string(),
+                payload: vec![Scalar::HttpReadStream],
+                field_base: 0,
+            }],
+        }];
+        let tagged = vec![hir::TaggedType::Option(Scalar::HttpReadStream)];
+        let class = |ty| {
+            http_stream_carrier_class(ty, &structures, &tuples, &enums, &tagged)
+        };
+
+        for carrier in [
+            Ty::HttpReadStream,
+            Ty::Option(Scalar::HttpReadStream),
+            Ty::Result(Scalar::HttpReadStream, Scalar::Unit),
+            Ty::Result(Scalar::Unit, Scalar::HttpReadStream),
+            Ty::Tagged(0),
+        ] {
+            assert_eq!(class(carrier), HttpStreamCarrierClass::Carrier, "{carrier:?}");
+        }
+
+        for forbidden in [
+            Ty::Option(Scalar::Struct(0)),
+            Ty::Result(Scalar::Unit, Scalar::Struct(0)),
+            Ty::Box(Scalar::HttpReadStream),
+            Ty::Box(Scalar::Tagged(0)),
+            Ty::Array(Scalar::HttpReadStream, 1),
+            Ty::Vec(Scalar::HttpReadStream, 2),
+            Ty::Mask(Scalar::HttpReadStream, 2),
+            Ty::Slice(Scalar::HttpReadStream),
+            Ty::DynArray(Scalar::HttpReadStream),
+            Ty::ArrayBuilder(Scalar::HttpReadStream),
+            Ty::Task(Scalar::HttpReadStream),
+            Ty::Struct(0),
+            Ty::Tuple(0),
+            Ty::Enum(0),
+            Ty::StructArray(0, 1),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::DynFixedStructArray(0, 1),
+            Ty::FixedStructArrayBuilder(0, 1),
+            Ty::Soa(0),
+            Ty::JsonScanner(0),
+            Ty::DictEncoded(0, 0),
+            Ty::DynVecArray(Scalar::HttpReadStream, 2),
+            Ty::VecArrayBuilder(Scalar::HttpReadStream, 2),
+            Ty::DynMaskArray(Scalar::HttpReadStream, 2),
+            Ty::MaskArrayBuilder(Scalar::HttpReadStream, 2),
+            Ty::DynFixedArray(Scalar::HttpReadStream, 1),
+            Ty::FixedArrayBuilder(Scalar::HttpReadStream, 1),
+        ] {
+            assert_eq!(
+                class(forbidden),
+                HttpStreamCarrierClass::Forbidden,
+                "{forbidden:?}",
+            );
+        }
+
+        // The exhaustive no-wildcard matches in the classifier and `variant_sweep_tripwire` are
+        // the compile-time discriminator inventory: a new variant cannot silently inherit `None`.
+        assert_eq!(
+            class(Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+            HttpStreamCarrierClass::None,
+        );
+    }
 
     #[test]
     fn storage_generation_formation_and_malformed_matrix() {
@@ -64060,7 +65043,7 @@ mod tests {
             }
         }
         assert_eq!(
-            variants, 268,
+            variants, 272,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

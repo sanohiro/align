@@ -852,7 +852,13 @@ fn partition_capabilities(
 
     let mut caps_by_unit: HashMap<String, Vec<String>> = HashMap::new();
     for f in &mir.fns {
-        let caps = align_mir::function_capabilities(f);
+        let caps = align_mir::function_capabilities(
+            f,
+            &mir.structs,
+            &mir.tuples,
+            &mir.enums,
+            &mir.tagged_types,
+        );
         if caps.is_empty() {
             continue;
         }
@@ -1321,6 +1327,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("region", 0, BuiltinCapability::BorrowLeaf),
     ("reader", 0, BuiltinCapability::BorrowLeaf),
     ("writer", 0, BuiltinCapability::BorrowLeaf),
+    ("http_read_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_headers", 0, BuiltinCapability::BorrowLeaf),
     ("json.doc", 0, BuiltinCapability::BorrowLeaf),
     ("slice", 1, BuiltinCapability::BorrowLeaf),

@@ -725,6 +725,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferNew(cap) => format!("buffer_new({})", operand_str(cap)),
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
+        Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),
         Rvalue::BytesRead { bytes, offset, be, .. } => {
             format!("bytes_read{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(offset))
         }
@@ -950,6 +951,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("http_client_post({}, {}, {}, -> _{out})", operand_str(client), operand_str(url), operand_str(body))
         }
         Rvalue::HttpClientRequest { client, req, out } => format!("http_client_request({}, {}, -> _{out})", operand_str(client), operand_str(req)),
+        Rvalue::HttpClientRequestStream { client, req, out } => format!("http_client_request_stream({}, {}, -> _{out})", operand_str(client), operand_str(req)),
+        Rvalue::HttpReadStreamStatus { stream } => format!("http_read_stream_status({})", operand_str(stream)),
+        Rvalue::HttpReadStreamHeader { stream, name, out } => format!("http_read_stream_header({}, {}, -> _{out})", operand_str(stream), operand_str(name)),
+        Rvalue::HttpReadStreamRead { stream, buffer, out } => format!("http_read_stream_read({}, {}, -> _{out})", operand_str(stream), operand_str(buffer)),
         Rvalue::HttpGetMany { client, urls, max_concurrency, out } => format!(
             "http_get_many({}, {}, {}, -> _{out})",
             operand_str(client),

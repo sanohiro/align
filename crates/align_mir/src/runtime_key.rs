@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 298] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 304] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -48,6 +48,7 @@ runtime_keys! {
     BoundsFail => "bounds_fail",
     BufferAppend => "buffer_append",
     BufferBytes => "buffer_bytes",
+    BufferCapacity => "buffer_capacity",
     BufferFree => "buffer_free",
     BufferLen => "buffer_len",
     BufferNew => "buffer_new",
@@ -159,6 +160,7 @@ runtime_keys! {
     HttpClientNew => "http_client_new",
     HttpClientPost => "http_client_post",
     HttpClientRequest => "http_client_request",
+    HttpClientRequestStream => "http_client_request_stream",
     HttpClientTimeout => "http_client_timeout",
     HttpCtxBody => "http_ctx_body",
     HttpCtxFree => "http_ctx_free",
@@ -171,6 +173,10 @@ runtime_keys! {
     HttpParse => "http_parse",
     HttpRbBody => "http_rb_body",
     HttpRbHeader => "http_rb_header",
+    HttpReadStreamFree => "http_read_stream_free",
+    HttpReadStreamHeader => "http_read_stream_header",
+    HttpReadStreamRead => "http_read_stream_read",
+    HttpReadStreamStatus => "http_read_stream_status",
     HttpRequest => "http_request",
     HttpRequestFree => "http_request_free",
     HttpRespBody => "http_resp_body",
@@ -323,7 +329,7 @@ runtime_keys! {
     Utf8Valid => "utf8_valid",
 }
 
-const _: [(); 298] = [(); RuntimeKey::ALL.len()];
+const _: [(); 304] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -332,7 +338,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 298);
+        assert_eq!(RuntimeKey::ALL.len(), 304);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

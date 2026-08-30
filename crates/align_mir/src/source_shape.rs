@@ -383,6 +383,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpReadStream
             | Scalar::RunOutput
             | Scalar::RunBytes => left == right,
         }
@@ -527,6 +528,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpReadStream
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Unit

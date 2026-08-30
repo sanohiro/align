@@ -428,6 +428,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_buffer_bytes",
             shape: RuntimeAbiShape::A72,
         },
+        RuntimeKey::BufferCapacity => RuntimeAbi {
+            key,
+            symbol: "align_rt_buffer_capacity",
+            shape: RuntimeAbiShape::A29,
+        },
         RuntimeKey::BufferFree => RuntimeAbi {
             key,
             symbol: "align_rt_buffer_free",
@@ -983,6 +988,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_client_request",
             shape: RuntimeAbiShape::A24,
         },
+        RuntimeKey::HttpClientRequestStream => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_client_request_stream",
+            shape: RuntimeAbiShape::A24,
+        },
         RuntimeKey::HttpClientTimeout => RuntimeAbi {
             key,
             symbol: "align_rt_http_client_timeout",
@@ -1052,6 +1062,26 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_http_request_free",
             shape: RuntimeAbiShape::A62,
+        },
+        RuntimeKey::HttpReadStreamFree => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_read_stream_free",
+            shape: RuntimeAbiShape::A62,
+        },
+        RuntimeKey::HttpReadStreamHeader => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_read_stream_header",
+            shape: RuntimeAbiShape::A22,
+        },
+        RuntimeKey::HttpReadStreamRead => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_read_stream_read",
+            shape: RuntimeAbiShape::A24,
+        },
+        RuntimeKey::HttpReadStreamStatus => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_read_stream_status",
+            shape: RuntimeAbiShape::A29,
         },
         RuntimeKey::HttpRespBody => RuntimeAbi {
             key,
@@ -1805,15 +1835,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 298 || keyed_runtime_abis().len() != 298 {
+    if RuntimeKey::ALL.len() != 304 || keyed_runtime_abis().len() != 304 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 311 {
+    if runtime_abis().count() != 317 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(311);
+    let mut symbols = HashSet::with_capacity(317);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3182,17 +3212,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 311);
+        assert_eq!(rows.len(), 317);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            311
+            317
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            311
+            317
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3222,7 +3252,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 311);
+        assert_eq!(rows.len(), 317);
 
         for row in rows {
             let symbol = row.symbol;
