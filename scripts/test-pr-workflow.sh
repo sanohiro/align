@@ -2262,6 +2262,11 @@ awk -F'\t' '
 # and the per-binary cap documented where someone tempted to raise the job
 # timeout will read it.
 nightly_workflow="$repo_root/.github/workflows/nightly.yml"
+if grep -Eq '^ *run: scripts/run-quiet\.sh ".*: ' \
+  "$ci_workflow" "$nightly_workflow"; then
+  echo "a quiet workflow command contains an unquoted YAML mapping colon" >&2
+  exit 1
+fi
 grep -Fq 'timeout-minutes: 30' "$nightly_workflow" || {
   echo "nightly.yml no longer carries the 30-minute suite budget" >&2
   exit 1
