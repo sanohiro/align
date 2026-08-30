@@ -1456,8 +1456,9 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   forms as `writer.write`), `exists` (a plain `bool` — every `stat` failure folds to `false`, never
   a `Result`), `remove`, `read_dir` (an **owned `array<string>`** — a new `PrimScalar::String` lets
   it be a `Result` payload, and its `Drop` is a **deep** free `align_rt_free_string_array`: each
-  element buffer, then the header, distinct from a scalar `array<T>`; Move-element *indexing* stays
-  deferred project-wide, so v1 uses the array whole — `.len()`, move/return), and `read_file_view`
+  element buffer, then the header, distinct from a scalar `array<T>`; Move-element *indexing* was
+  deferred for this v1 slice, so it used the array whole — `.len()`, move/return; the later
+  Request 22 design admits the canonical `str` view of a selected string), and `read_file_view`
   (an `mmap` view; requires an enclosing `arena {}` — sema-checked like `heap.new`; the mapping is
   registered on the runtime `Arena` and `munmap`ped at arena end, so **every** exit — block end /
   `return` / `?` — releases it via `ArenaEnd`, no separate `Drop`; the view's region is the arena,

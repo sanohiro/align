@@ -359,6 +359,13 @@ those same owner-generation and input/arena roots through direct, field, and bor
 bases. Returned views and views retained into a `borrow mut` destination cannot outlive those roots.
 If the index expression terminates, no bounds action or result is formed.
 
+Ordinary indexing of `array<string>` returns a non-consuming `str` view of the selected owned
+string. Receiver and index keep the existing evaluation, termination, and hard bounds semantics;
+the array remains the sole element owner, and the view carries the complete source generation and
+contained region roots. No clone, allocation, cleanup bit, source null, or ownership transfer is
+created; `.clone()` remains the explicit path to an owned result. Other whole Move elements remain
+unavailable as ordinary values.
+
 An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
 or AoS record array: `inspect(values[i])` is valid only when the selected direct, imported, or
 function-value target's corresponding parameter is `borrow` and `values` is a stable local,

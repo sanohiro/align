@@ -316,7 +316,13 @@ nested `str` and `slice<T>`. The implementation follows the canonical Copy/borro
 a `str` special case. A terminating index produces no bounds action or result. This is the existing
 inferred-region model applied to a new reachable path, not a reference type or array special case.
 
-**A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
+**An owned string array reads through its existing view type.** `string` already has exactly one
+non-owning form, `str`, and both share the two-word text layout. Ordinary `texts[i]` therefore
+returns `str`: the array remains sole owner, existing root/region analysis ties the view to that
+generation, and `.clone()` is still the visible owned-copy operation. This closes the real
+tokenizer consumer without inventing a general reference type or hidden aggregate binding.
+
+**A borrowed Move record array element is a call place, not a value.** Decoded artifact graphs store Move
 records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or
 require partial element transfer and cleanup, neither of which a read-only verifier intends. The
 general completion is narrower and explicit: `inspect(rows[i])` is accepted when the selected

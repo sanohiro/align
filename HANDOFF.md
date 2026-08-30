@@ -7,17 +7,25 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-30._ align-llm Request 21's borrowed projection view repair is merged in
-Align PR #892
-against `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`. The pinned compiler accepted
-an `array<T>` field below a borrowed `Option<MoveRecord>` projection as a `slice<T>` argument during
-checking, then LLVM validation rejected the same field path because it compared the view type with
-the owning array type. Codegen now admits only the existing exact scalar/AoS array-to-slice layout
-retypes with canonical element identity and rejects forged mismatched elements. The focused owner
-covers Some/None, sibling and repeated access, scalar/AoS arrays, whole/per-unit execution, and
-malformed MIR. The align-llm pin adoption remains. Request 19's shared recursive-Drop
-codegen is merged and real-client adopted through Align `4b515f8d37de2e9a9ba06170c5842fd12dc1cba2`.
-Request 18's retained-root regular-file constructors are implemented
+_Last updated: 2026-08-31._ align-llm Request 22 is active on
+`agent/request22-string-index`. `docs/impl/30-borrowed-string-array-index-plan.md` is the accepted
+design: ordinary `array<string>[i]` becomes the canonical non-consuming `str` view, while the
+already-shipped `array<MoveRecord>[i].field` and explicit shared-borrow call paths retain the record
+half of the request. No general reference value, whole Move-record binding, clone, ABI, or runtime
+surface is added. The independent review of `d349700d` found four valid boundary, closure, and
+documentation issues; the consolidated repair preserves existing Index positives, enumerates every
+provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
+registered consumer targets. PR #913 is open. Because `main` advanced through provenance-adjacent
+Request 21 work, the fresh base-integration review of `93d23e8f` found three valid closure and
+coordination issues. The consolidated repair adds all five borrow-transparent exact-once cells,
+physical-source validation for malformed `SliceIndex`, and the required external Request 22
+`ACCEPTED` register update. Refresh exact-head preflight and PR evidence, merge the design, then
+implement its Rust and owner-test closure.
+
+Request 21's borrowed projection view repair is merged in Align PR #892 against
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
+Request 19's shared recursive-Drop codegen is merged and real-client adopted through Align
+`4b515f8d37de2e9a9ba06170c5842fd12dc1cba2`. Request 18's retained-root regular-file constructors are implemented
 against the accepted design in `docs/impl/29-fs-retained-root-plan.md` and real-client verified by
 align-llm PR #99 at `78eae459fd1f88bad1c3c3ca7b86921a08ecf168`, pinned to Align merge
 `19c3db144c462bf7d6784f88d64cc124229b7ec2`; C6d is complete. Request 16's sum-payload projection and
@@ -423,8 +431,9 @@ facts must live in this repository.
   merged in align-llm PR #107, so the register can close it. The required `macos-15` PR leg runs the existing
   `m5_owned_json` owner, and the discovered storage-generation regression no longer falsely retains
   a `JsonOwnedDecode` input/arena fact. The complete owner passed locally on Apple Silicon and in the
-  required macOS CI leg. Request 19's Align-side implementation is complete; its merge and the
-  consumer-owned pin, hosted-lane restoration, and fresh-worker proof remain.
+  required macOS CI leg. Request 19 is merged and real-client adopted through align-llm PR #108.
+  Request 21's projection-view repair is merged in Align and awaits consumer pin adoption. Request
+  22's string-array indexing design is active and blocks the R7 tokenizer implementation.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -510,6 +519,7 @@ Owned declared JSON plan             docs/impl/24-owned-json-plan.md
 Recursive owned JSON plan            docs/impl/25-recursive-owned-json-plan.md
 Borrowed sum projection plan         docs/impl/26-borrowed-sum-projection-plan.md
 Borrowed dynamic aggregate plan      docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md
+Borrowed string-array index plan     docs/impl/30-borrowed-string-array-index-plan.md
 Out-of-gate failure baseline         scripts/known-failures.txt
 Historical session journal           docs/archive/HANDOFF-2026-08-13.md
 Earlier session journal              docs/archive/HANDOFF-2026-07-25.md

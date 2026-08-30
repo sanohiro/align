@@ -211,6 +211,15 @@ through a `BorrowedProjection` retain the projection's owner generation and ever
 input/arena root. A terminating index emits no bounds action, load, result, or retained fact. The
 fallthrough path uses the existing MIR bounds CFG and Copy load; no new MIR or LLVM node is needed.
 
+Ordinary `Index` over `array<string>` uses the same path with physical element `String` and logical
+result `Str`. Checked HIR admits only that representation-compatible mismatch. MIR emits the
+existing `SliceIndex`, inherits the source borrow owners, and gives the result no cleanup; LLVM
+loads the shared `{ptr,len}` layout without a clone, source null, element Drop, allocation, or
+runtime call. MIR validation and codegen preflight recover the source collection's physical element
+and admit ordinary exact pairs plus only `DynArray(String) -> Str`, rejecting every other mismatch
+before LLVM pointer construction. The exact contract and closure matrix are in
+`docs/impl/30-borrowed-string-array-index-plan.md`.
+
 An indexed Move element passed to an explicit shared-`borrow` parameter lowers as a checked dynamic
 element place through direct, imported, and indirect targets: the base borrowed place,
 once-evaluated index operand, and exact element type. The source root is reserved from index

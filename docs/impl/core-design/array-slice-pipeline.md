@@ -116,8 +116,8 @@ and demanded where it matters (`par_map`; and pipeline lambdas reject allocation
 ## Errors & aborts
 
 No `Result` in this area. Shape mistakes are compile errors (unterminated pipeline, arity
-mismatch in a stage lambda, Move-element slicing/indexing, aliasing `out` args, `map_into`
-source/dst overlap, unequal fixed `zip` lengths). Runtime aborts: index/range out of bounds,
+mismatch in a stage lambda, Move-element slicing or unsupported whole-value indexing, aliasing
+`out` args, `map_into` source/dst overlap, unequal fixed `zip` lengths). Runtime aborts: index/range out of bounds,
 `map_into` length mismatch, or unequal runtime `zip` lengths.
 Empty input is an answer, never an error: `sum` 0, `count` 0, `any` false, `all` true; `min`/
 `max` on a provably-empty filter yield the sentinel identity (branchless `where` reducers, #303).
@@ -135,10 +135,12 @@ input-vs-output scope; sources are allowed to alias one another and are never de
 
 ## Spec'd but not implemented
 
-- Slicing/indexing **Move-element** collections ("slicing a collection of the Move type … not
-  supported yet"). Fixed arrays of Move structs and owned struct-array fields already have
-  recursive element drop; the remaining issue is the read operation's borrow-vs-transfer rule,
-  not missing destruction for the collection itself.
+- Slicing **Move-element** collections and ordinary whole-value indexing of every Move element
+  remain unsupported except for the accepted, implementation-pending plan-30
+  `array<string>[i] -> str` view. Move-record arrays retain their direct-field view and explicit
+  shared-borrow call-place forms. Fixed arrays of Move structs and owned struct-array fields already
+  have recursive element drop; the remaining gap is a public view type or transfer rule for the
+  whole element, not missing destruction for the collection itself.
 - Dynamic `array<Struct>` element-field writes with a **non-primitive leaf** (str/owned/nested-
   Move) — `StoreElemFieldPtr` is primitive-leaf-only (#316).
 - Nested element write `arr[i].a.x = v` works; nested **soa** columns and element write via
