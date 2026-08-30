@@ -391,6 +391,12 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
+- **Next language capability:** `core.test` is designed in
+  `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
+  explicit test-only assertions, one linked test artifact run sequentially in a fresh process group
+  per test, a fail-closed normal-return record, bounded time/output, and failure-only output replay.
+  Production interfaces/MIR/links stay test-free. Implementation is the next code PR; `std.id`
+  remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

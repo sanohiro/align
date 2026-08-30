@@ -212,6 +212,30 @@ as one mode, not as a mutable local declaration. The checking and return-provena
 provenance for every argument mode, including distinct Copy/Move aggregate holders, so a
 `BorrowMut` operand cannot invalidate a peer argument delivered to the same call.
 
+### Test declarations (designed 2026-08-30; implementation pending)
+
+```ebnf
+test_decl = "test" string block
+```
+
+`test` remains an identifier token and is contextual only at item position when followed by one
+string token and a block. The AST gains `Item::Test(TestDecl { name, body, span })`; it does not
+reuse `FnDecl`, because it has no source name, visibility, parameters, generics, return annotation,
+or expression body. `pub test`, attributes, a missing string/block, and function-like near-shapes
+receive test-specific recovery before the next top-level item.
+
+Depth capping visits the test block exactly as a function block. The formatter preserves the
+ordinary string token and formats the block with the same block rules; the contextual word is
+always spelled `test`. Sema supplies the compiler-private `Result<Unit, Error>` function shape and
+the documented implicit Ok tail. With `import core.test`, qualified `test.expect` and
+`test.expect_eq` remain ordinary call-shaped AST expressions; semantic context restricts them to
+standalone statements in the lexical test body and ordinary nested blocks, never a lambda.
+
+Normal commands parse and check tests but production lowering omits them. Test lowering retains the
+canonical module/name id and source ordinal in a flagged checked-HIR record. The exact grammar,
+name/catalog bounds, mode split, cache identity, and closure matrix are
+`core-design/test.md`; that document, not this representation summary, owns the public contract.
+
 ### Type declarations (keyword-less)
 
 struct and sum type are written in the **same syntactic position** and disambiguated by content.
@@ -597,6 +621,7 @@ struct File { module: Option<Path>, imports: Vec<Path>, items: Vec<Item> }
 
 enum Item {
     Fn(FnDecl),
+    Test(TestDecl),
     Type(TypeDecl),
     Resource(ResourceDecl),
     Const(ConstDecl),
@@ -611,6 +636,7 @@ struct FnDecl {
     body: FnBody,            // Block | ExprEq
     span: Span,
 }
+struct TestDecl { name: String, body: Block, span: Span }
 enum ParamMode { ByValue, Out, Borrow, BorrowMut }
 struct Param { mode: ParamMode, name: Ident, ty: Type }
 struct FnTypeParam { mode: ParamMode, ty: Type }

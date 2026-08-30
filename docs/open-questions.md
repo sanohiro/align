@@ -19,6 +19,26 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### In-language tests are private Result blocks with process isolation (SETTLED 2026-08-30)
+
+**Decision:** one private top-level `test` declaration carries a bounded string name and a block,
+creates no callable/exported name, and is checked as a compiler-private
+`fn() -> Result<(), core.Error>` with a documented implicit successful tail. With
+`import core.test`, exactly the standalone `test.expect(bool)` and
+`test.expect_eq(left, right)` assertions may early-return `Error.Invalid` from the lexical test
+body. Equality remains the ordinary `==` family; there is no assertion reflection or second error
+model.
+
+`alignc test` discovers only the explicit entry/import closure, links it once in a distinct test
+cache domain, and runs the dependency-first/source-order catalog sequentially in one fresh process
+group per test. A bounded compiler-private completion record proves normal Ok/Err return; exit,
+exec, abort, crash, timeout, output excess, and malformed records fail closed. Time and stdout/stderr
+are bounded. Passing output is suppressed and only a failed test's bounded bytes are replayed, so
+successful suite output is one summary line independent of test count. Production commands check
+test bodies but omit them from production MIR, interfaces, capabilities, and artifacts.
+
+Record: `docs/impl/core-design/test.md`, `draft.md` §18.1, `docs/language-spec.md`
+
 ### `pkg.db.sqlite` scalar callbacks use static targets (SETTLED 2026-08-13)
 
 **Decision:** D14's first native-callback rail accepts one exact noncapturing named or lifted Align
@@ -3086,15 +3106,6 @@ qualifying types by explicit per-type decision, with `id` the first. The criteri
 common key type. Do not ship a method-comparison dialect or an undecided `==`; if unresolved, defer
 `std.id` whole (ideal-or-defer). When settled, update `draft.md`, `docs/language-spec.md`, and
 `docs/design-notes.md` in one pass.
-
-### `test` block syntax for in-language testing — pending (post-`pkg.db`, `core.test`)
-
-No in-language test mechanism exists. Proposal: a top-level `test "name" { body }` declaration typed
-as `fn() -> Result<(), Error>` (failure = `Err` early-return, reusing the one error model), with
-`expect` / `expect_eq` builtins callable only inside test blocks, and an `align test` runner that
-executes one test per subprocess (abort isolation) in declaration order. This adds new grammar, so it
-goes through the large-design gate before implementation. The tail `Ok(())` wrap is part of the
-`test` construct and must be documented, not hidden (nothing-hidden).
 
 ### Library stances pending confirmation — YAML / i18n / server TLS / long-lived mutable state
 

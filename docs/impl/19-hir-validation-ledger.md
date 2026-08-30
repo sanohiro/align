@@ -520,6 +520,39 @@ each envelope field, each child, each post relation, stored `Expr.ty`, and each
 applicable ownership fact one at a time, then checks the universal precedence
 with parent-plus-first-child and first-child-plus-later-child pairs.
 
+### Planned `core.test` records (designed 2026-08-30; inactive until implementation)
+
+The accepted `core.test` capability adds one optional `TestMeta` envelope to `hir::Fn`; it does not
+infer test identity from a generated function name. `None` is an ordinary function. `Some(meta)`
+requires zero parameters and type parameters, exact `Result<Unit,builtin Error>` return, private
+source origin, Impure effect, no public/interface record, and a body whose reachable fallthrough is
+the producer-inserted `Ok(Unit)` tail. `meta.canonical_id` is valid UTF-8, 1..=1,024 bytes, equals
+the checked module path plus `::` plus the decoded bounded source name, and is unique. Its
+`source_ordinal: u32` is dense from zero in source declaration order within that module. At most
+65,535 `Some` records exist in the driver-selected closure.
+
+The HIR expression discriminator is
+`TestAssert { condition, kind, line, column }`, where `kind` is the closed
+`True | Equal` byte, `condition` is exact Bool, and line/column are positive `u32` coordinates of
+the source assertion call. It is valid only in a `Some(TestMeta)` root and outside every nested
+lambda function; the complete expression is Unit. `Equal` is emitted only after sema has checked
+the original two operands with the ordinary `BinOp::Eq` rule and built one left-to-right Eq child;
+the validator does not reconstruct the unavailable two source operands from a bool. MIR lowers a
+false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
+true condition to Unit fallthrough.
+
+Validation order is function envelope, `TestMeta` presence/tag, id bytes, ordinal, header
+correlation, body children, assertion envelope/kind/location/condition, then the ordinary function
+completion and ownership records. Production lowering validates these records and omits every
+`Some` function; test lowering validates and includes them. The lowering mode is an explicit API
+and cache input, never inferred from whether a Program happens to contain a test. An assertion in
+an ordinary function, a test marked public/Pure, a missing synthetic Ok, duplicate/sparse ordinal,
+or any future metadata/assertion kind fails before MIR construction.
+
+This section activates atomically with the implementation and its parameterized valid/malformed
+owners. The public grammar, runner, cache, and process protocol remain owned by
+`core-design/test.md`.
+
 ## Header-adjacent records
 
 | Record | Exact contract |

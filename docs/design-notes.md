@@ -1286,6 +1286,31 @@ primitive implementation with RSA blinding retained. Signature verification uses
 Functional vectors establish cryptographic semantics, while wrapper/API/provider-provenance
 inspection — not noisy timing statistics — owns the constant-time boundary.
 
+## Why tests are Result blocks run in separate processes
+
+An Align test reuses the language's one error model. Its body is a compiler-private
+`fn() -> Result<(), Error>` with a documented successful tail, so helpers return Result, `?`
+propagates, Err fails, and ordinary cleanup runs. Assertions are explicit `core.test` operations;
+there is no exception, panic-catching framework, boolean-returning second dialect, or hidden global
+registry.
+
+The declaration is not an ordinary named function. It has no parameters, visibility, callable
+identity, or interface entry because production code must not acquire a test-only dependency.
+Normal commands still check it, then omit it from production MIR and linking. Test mode has a
+separate cache identity and links the explicit import closure once.
+
+Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
+the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
+unwinding to the language. A compiler-owned completion record means an early exit zero cannot
+masquerade as a returned Ok. The runner applies fixed time and output bounds, reaps the full child
+group on failure, and continues deterministically.
+
+Passing stdout and stderr are retained only while the child is live, then discarded. A failure
+replays just that test's bounded evidence. This makes a thousand passing tests produce the same
+one-line result as one passing test, without sacrificing the diagnostic bytes at the failure site.
+Terse success is therefore part of the runner contract, not an optional CI convention layered over
+an inherently noisy tool.
+
 ---
 
 ## In one sentence

@@ -976,6 +976,7 @@ core.arena
 
 core.json
 core.template
+core.test
 
 core.hash
 core.math
@@ -1183,7 +1184,7 @@ per call; only the closed input-rejection set maps Invalid, while empty/unknown/
 fetch failures map `Error.Code(0)`. Every post-view signature mismatch is
 `Ok(false)`. Construction is trusted setup without a timing promise; signing an admitted key is
 constant-time for secret contents at fixed public lengths under the pointer-verified built-in
-OpenSSL default-provider dependency. The implementation is pending; the exact surface, formats,
+OpenSSL default-provider dependency. The implementation shipped on 2026-08-30; the exact surface, formats,
 bounds, secret cleanup, error precedence, ownership, ABI, timing boundary, and closure matrix are
 `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
@@ -1203,6 +1204,30 @@ boundaries. Invalid syntax/resource limits are `Error.Invalid`; an invalid `find
 programmer error and aborts. The engine guarantees automata-style predictable matching and excludes
 look-around/backreferences. No regex literal or implicit cache is part of the language. (`draft.md`
 §18.2.)
+
+## In-Language Tests
+
+A private top-level `test` declaration carries one ordinary string name and one block. It creates no
+callable or exported name. Its body is checked as a compiler-private
+`fn() -> Result<(), core.Error>` with one documented implicit `Ok(())` after a Unit fallthrough;
+ordinary `?`, Err, cleanup, and hard-error behavior are unchanged. Names are bounded, control-free,
+and unique per module. Canonical ids are `<module>::<name>`, and discovery is limited to the explicit
+entry/import closure in deterministic dependency-first, then declaration order.
+
+With `import core.test`, `test.expect(bool)` and `test.expect_eq(left, right)` are standalone
+test-body assertions. Equality reuses the language's existing `==` rule and left-to-right eager
+evaluation. Failure reports the canonical id and one-based call location, then returns
+`Error.Invalid` through the test cleanup edge; no operand reflection or formatting is added.
+
+`alignc test` links the closure once and launches that immutable test artifact in a fresh process
+group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
+return from exit, exec, abort, and crash. Each test has bounded time and per-stream capture. Passing
+output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a
+fully passing suite always has one summary line. No user `main` is required or invoked. Production
+commands type-check tests but omit their bodies, capabilities, and names from production MIR,
+interfaces, links, and artifacts. Test compilation has a separate versioned cache domain. The
+complete grammar, bounds, wire bytes, error precedence, CLI options, ownership, reporting, and
+acceptance matrix are in `docs/impl/core-design/test.md`.
 
 ## Packages
 

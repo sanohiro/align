@@ -2359,6 +2359,7 @@ core.arena
 
 core.json
 core.template
+core.test
 
 core.hash
 core.math
@@ -2663,6 +2664,43 @@ hash128(data) -> (u64, u64)    // 128-bit result as a tuple (no u128 type)
 Deterministic for a given input within a build (fixed seed). **Non-cryptographic**: not
 DoS-resistant, not a stable on-disk/wire format, not for security. Cryptographic hashes are in
 std.crypto.
+
+### core.test
+
+A private top-level test declaration consists of the contextual word `test`, one ordinary string
+token, and a block. It creates no callable name or public interface entry. The decoded name is
+nonempty, at most 256 UTF-8 bytes, contains no control character, and is unique within its module.
+The canonical test id is the canonical module path, `::`, and that name; the entry module path is
+`main`. Only tests in the explicit entry/import closure exist for a command.
+
+The body is checked as a compiler-private zero-parameter function returning
+`Result<(), core.Error>`. Completing its written Unit block supplies one documented `Ok(())` tail;
+ordinary `?` and explicit Err returns use the existing error model. Normal completion and Err run
+ordinary cleanup, while the existing hard-error, abort, and successful-exec behavior is unchanged.
+Tests are Impure and are not callable or exported.
+
+`import core.test` admits exactly the qualified standalone assertion statements
+`test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
+ordinary nested blocks, excluding lambdas. The first requires exact bool. The second reuses the
+ordinary `==` admission/type rule and evaluates left then right once. A false assertion identifies
+the canonical test id and one-based call location, then follows the test's Err cleanup edge with
+`Error.Invalid`; operand values and source text are not formatted or reflected.
+
+`alignc test <entry.align>` checks the explicit module closure, links one private test executable,
+and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
+group per test. It requires no user `main` and never invokes one. A compiler-owned completion record
+written only after a normal selected-test return prevents exit, exec, abort, or a crash from
+impersonating success. Each test has a default 60-second deadline (configurable through bounded
+`--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each, configurable
+through bounded `--max-output-bytes`). Passing output is suppressed; a failure replays only that
+test's bounded evidence. A fully passing suite therefore emits one summary line regardless of test
+count. The exact grammar, bounds, record bytes, validation order, ownership, cache identity,
+reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
+
+Production commands parse and type-check test declarations but omit them from production MIR,
+link capabilities, interfaces, and executables. A test-only edit may miss the source-keyed frontend
+cache but leaves the production object key and executable bytes unchanged. Test compilation uses a
+separate versioned cache domain.
 
 ---
 
@@ -3163,7 +3201,7 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 ```
 
 The asymmetric signature extension adds six algorithm-and-class-specific Move key types and the
-following exact surface. It is designed; implementation is pending.
+following exact surface. It shipped on 2026-08-30.
 
 ```text
 crypto.rs256_private_key_from_pem(pem: str) -> Result<rs256_private_key, Error>

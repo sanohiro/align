@@ -3837,7 +3837,7 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
 An item without a status is not a committed contract: it becomes a gated design under
 `impl/std-design/` or `impl/pkg-design/` at its own implementation start (broad-contract items —
-`core.test` syntax, `std.id` scalar admission — go through the design/open-questions gate first).
+`std.id` scalar admission remains behind the design/open-questions and friction-ledger gates).
 An item marked `DESIGNED` is locked by its named design ledger even though implementation remains
 pending. This section records their sequencing and status; it does not lock an unmarked surface.
 
@@ -3858,16 +3858,20 @@ pending. This section records their sequencing and status; it does not lock an u
 ### Planned packages (order)
 
 ```text
-language self-hosting : core.test (+bench) -> std.log -> core.codec -> pkg.frame
+language self-hosting : core.test -> std.log -> core.codec -> pkg.frame
 domain                : pkg.auth -> pkg.kv -> pkg.csv -> pkg.ws -> pkg.template
 cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 / MinIO / B2)
 ```
 
 ### One-line capability outline (core / prerequisites / open decision)
 
-- **core.test** — top-level `test "name" { body: Result<(), Error> }`; `expect`/`expect_eq`
-  (test-block-only builtins); per-test subprocess runner; failure = `Err` early-return.
-  **Requires a language decision: new `test` block syntax — design gate.**
+- **core.test — DESIGNED 2026-08-30** — private top-level named Result blocks; explicit
+  `core.test` assertion import; one immutable test artifact run sequentially in a fresh process
+  group per catalog row; compiler-owned normal-return proof; bounded time/output; passing output
+  suppressed and failure evidence replayed. Production MIR/interfaces/links exclude tests. The
+  exact public ledger, completion-record bytes, validation order, cache identity, and one-capability
+  implementation matrix are `core-design/test.md`; an in-language benchmark runner remains a later
+  consumer rather than part of this test capability.
 - **std.id** — one 128-bit Copy scalar; ULID / UUIDv7 / UUIDv4 differ only by generation rule +
   text form; monotonic ULID via an explicit Move generator; CSPRNG source; parse strict.
   **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,
