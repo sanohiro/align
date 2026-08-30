@@ -58,33 +58,33 @@ maximum optional-probe export table. No unkeyed or probe category changed.
 
 ## Proposed core.test child-control extension (not implemented)
 
-The accepted `core.test` design reserves five compiler-private unkeyed rows. They are not part of
+The accepted `core.test` design reserves four compiler-private unkeyed rows. They are not part of
 the shipped counts above until the implementation lands; activation will leave the keyed count at
-314, increase `UnkeyedRuntimeKey` from 13 to 18, the base registry from 327 to 332, and the maximum
-optional-probe table from 335 to 340. The registry keys, LLVM declarations, Rust exports, collision
+314, increase `UnkeyedRuntimeKey` from 13 to 17, the base registry from 327 to 331, and the maximum
+optional-probe table from 335 to 339. The registry keys, LLVM declarations, Rust exports, collision
 reservation, runtime ABI fingerprint, and test-mode selectors activate atomically. Only a generated
 test harness may select them; they receive no language-callable `RuntimeKey` or compatible user
 extern reuse.
+
+The first-capability test-callgraph validator rejects every catalog-reachable
+`ExprKind::ProcessCommand` before runtime selection or artifact allocation. It therefore adds no
+containment descriptor, supervisor-status codec, or fifth child-control ABI row; ordinary
+production `process.command` continues to select its shipped runtime entries unchanged.
 
 | Planned unkeyed key | Exact symbol and LLVM declaration | Exact Rust ABI |
 |---|---|---|
 | `TestLaunchRecvV1` | `i32 @align_rt_test_launch_recv_v1(i32, ptr)` | `extern "C" fn(i32, *mut u32) -> i32` |
 | `TestFdCloexecV1` | `i32 @align_rt_test_fd_cloexec_v1(i32)` | `extern "C" fn(i32) -> i32` |
-| `TestContainmentInstallV1` | `i32 @align_rt_test_containment_install_v1(i32)` | `extern "C" fn(i32) -> i32` |
 | `TestAckV1` | `i32 @align_rt_test_ack_v1(i32, i32)` | `extern "C" fn(i32, u32) -> i32` |
 | `TestReportV1` | `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
-All five declarations carry the existing generated `nounwind` function attribute and no curated
+All four declarations carry the existing generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
 before I/O, performs one blocking datagram receive with a fixed 17-byte capacity and EINTR retry,
 requires the exact 16-byte `ALTESTL` v1 envelope with zero reserved bytes, and stores the decoded
 little-endian ordinal only on success. The generated harness, not the runtime, validates that ordinal
 against its linked catalog. `TestFdCloexecV1` adds `FD_CLOEXEC` to fd 3 without changing any other
-descriptor flag. `TestContainmentInstallV1` accepts only open fd 4, adds `FD_CLOEXEC`, and changes one
-runtime atomic exactly once from disabled to that borrowed descriptor number. Repeated, wrong-fd,
-or closed-fd input is `EINVAL`; the installed descriptor is never closed, replaced, or reset by an
-ordinary runtime path. Test-aware `process.command` reads it only to retain the row's aggregate
-containment witness in a timed/bounded sentinel.
+descriptor flag.
 
 `TestAckV1` accepts every `u32` ordinal and emits the exact 16-byte `ALTESTA` v1 envelope.
 `TestReportV1` accepts only outcome 0 with tag 255/code zero, or outcome 1 with tag 0..=4 and code
@@ -92,13 +92,11 @@ zero unless tag 4; it emits the exact 20-byte `ALTEST\0` v1 envelope. Each encod
 stack-resident fixed array and one datagram send, retries EINTR, and maps a short send to `EIO`.
 Every row returns zero on success or a positive raw OS code, with `EINVAL` for an invalid ABI
 argument and `EPROTO` for malformed launch bytes. They allocate nothing, retain no pointer or
-descriptor; only containment install retains the fd-4 integer identity and changes child-global
-state. No row closes fd 3 or fd 4. The harness owns both until successful `process.exec` closes them
-through close-on-exec or process termination closes them after the harness returns; bounded-command
-sentinels retain inherited fd 4 until their nested group is terminal. The independent driver codecs
-and runtime codecs pin the three semantic goldens plus the fd-4 empty/EOF witness states in
-`core-design/test.md`; malformed-input, install-state, EINTR, short-send, export-parity,
-whole/per-unit, and reserved-child-exit owners land with the rows.
+descriptor, never close fd 3, and change no process-global state. The harness owns fd 3 until
+successful `process.exec` closes it through close-on-exec or process termination closes it after the
+harness returns. The independent driver codecs and the runtime codecs both pin the three semantic
+goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
+and reserved-child-exit owners land with the rows.
 
 ## HTTP client raw receive-stream substrate (implemented)
 

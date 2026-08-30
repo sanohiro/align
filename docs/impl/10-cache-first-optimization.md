@@ -484,11 +484,17 @@ excludes the overlay but does not acquire private-body or descriptor inputs from
 Test-mode unit/object keys additionally include every local overlay suffix plus target, profile,
 resolved runtime-LTO state, imported interfaces, and the runtime ABI fingerprint. The separate
 harness key includes the ordered canonical-id-to-`align_test$<8hex>` map, the sole literal `main` and
-encoded source-main policy, all five child-control runtime ABI rows, and launch/ack/completion/
-containment-witness/command-sentinel-status/final-commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
+encoded source-main policy, all four child-control runtime ABI rows, and launch/ack/completion/final-
+commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
 artifact identity because they terminate at build scheduling, diagnostics, and runner state. A
 database descriptor never enters the overlay; tests consume its production descriptor identity and
 ordinary offline metadata.
+
+The combined-view validator rejects a catalog-reachable `ProcessCommand` before either unit or
+harness key lookup, so the first capability has no command-supervisor, containment-witness, or
+status-codec cache input. The existing test-mode version covers the static reachability policy;
+unreachable production command code retains its ordinary production identity and may retain its
+ordinary runtime selection in a frozen-prefix test object, but has no executable catalog-root edge.
 
 The program key's "seeded diagnostic sink" component is not defensive padding. `align_sema` READS
 the sink it is handed: `declaration_has_prior_error` suppresses static-descriptor discovery for a

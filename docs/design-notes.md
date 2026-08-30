@@ -1315,9 +1315,15 @@ separate cache identity and links the explicit import closure once. Database des
 overlay exception requiring a second preparation workflow: their constructors remain ordinary
 named top-level descriptor functions formed in the prefix, and tests reuse that metadata offline.
 The prefix selector is exercised across one-shot/watch, whole/per-unit, ThinLTO, and PGO modes.
+Before test artifact work, the combined-view validator rejects every catalog-reachable
+`ProcessCommand` through direct, imported, function-value, lifted, and concrete-monomorph edges.
+This keeps the first capability honest about descendant containment without adding a hidden
+sentinel/status protocol to `std.process`; unreachable production command helpers and all
+production artifacts remain unchanged. The same exhaustiveness audit makes `align-repl` reject a
+test-bearing submitted entry transactionally, and an implicit entry `main` rejects against an
+imported declared `main` before catalog construction.
 
-Each catalog row runs that same immutable artifact in a fresh process group with one aggregate
-containment witness. Process isolation is
+Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
 unwinding to the language. A compiler-owned completion record means an early exit zero cannot
 masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
@@ -1329,20 +1335,19 @@ unreaped while it signals the pinned group and then the direct PID, then reaps o
 and continues only after cleanup succeeds. The direct target also closes a leader that left the
 verified group. A second control drain after non-reaping terminal observation closes the fast-exit
 race between completion send and status observation. Descendants are signalled but not reaped by
-this parent. An untimed/unbounded command stays in the row group. A timed/bounded command first arms
-a witness-retaining sentinel around its nested target group; harness death makes that sentinel kill
-the group, and the runner requires aggregate witness EOF before quiescence. A scoped process-global
-controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM from child acquisition through summary
-publication. A lock-free `Idle/Writing/Selected/WritingPending` state makes a raw write permit and
-signal selection mutually exclusive: a permitted syscall precedes selection and no later syscall
-can start. Returning error paths restore prior handlers; terminal suite paths retain the controller,
-block and recheck those signals after the last write, then exit
-directly. A prior ignored or custom handler therefore cannot change a published terminal result.
+this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM from child
+acquisition through summary publication. Returning error paths restore prior handlers; terminal
+suite paths retain the controller, block and recheck those signals after the last write, then exit
+directly. One lock-free `Idle/Writing/Selected/WritingPending` state prevents any new raw output
+syscall after selection while preserving only an already-started syscall's prefix. The final guard
+uses raw `_exit(128 + signal)`, so SIGHUP/SIGINT/SIGQUIT/SIGTERM are observed as numeric
+129/130/131/143 `WIFEXITED` statuses, never as re-raised `WIFSIGNALED` termination. A prior ignored
+or custom handler therefore cannot change a published terminal result.
 
 The test artifact also has one entry and one child-control boundary. Its generated harness alone
 owns literal `main`; every source-main ABI uses the existing encoded private identity and loses its
-ordinary production wrapper. Five exact unkeyed runtime functions own launch receive, fd
-close-on-exec, containment-witness installation, acknowledgement, and completion encoding/send, while the driver implements the
+ordinary production wrapper. Four exact unkeyed runtime functions own launch receive, fd
+close-on-exec, acknowledgement, and completion encoding/send, while the driver implements the
 independent peer codecs. Target/profile/runtime LTO reach unit and harness objects; jobs, cache
 statistics, timeout, and capture bounds each stop at their named scheduling, diagnostic, or runner
 consumer.

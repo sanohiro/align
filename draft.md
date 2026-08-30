@@ -2674,8 +2674,11 @@ rejects visibility on a test. A test creates no callable name or public interfac
 nonempty, at most 256 UTF-8 bytes, contains no C0/C1 control (U+0000..U+001F or
 U+007F..U+009F), and is unique within its module.
 The canonical test id is the canonical module path, `::`, and that name. An entry source uses its
-declared module path, or `main` only when it omits a module declaration. Only tests in the explicit
-entry/import closure exist for a command.
+declared module path, or `main` only when it omits a module declaration. If such an entry imports a
+source that explicitly declares `module main`, loading rejects before catalog construction with
+`default entry module 'main' conflicts with imported module 'main'; declare the entry module
+explicitly`; an explicitly declared entry path uses the ordinary duplicate-module rule. Only tests
+in the explicit entry/import closure exist for a command.
 
 The body is checked as a compiler-private zero-parameter function returning
 `Result<(), core.Error>`. Completing its written Unit block supplies one documented `Ok(())` tail;
@@ -2692,6 +2695,18 @@ identities or artifacts. Database Query/command constructors remain restricted t
 top-level descriptor functions, so they are always prefix-owned; a test can use one but cannot form
 an overlay database descriptor. `alignc test` consumes the same prepared metadata offline.
 
+Before cache lookup, native-capability collection, object generation, or harness allocation,
+`alignc test` walks the validated catalog-root call graph in catalog order, then dependency-edge and
+structural HIR order. Direct/imported calls, function-value targets, lifted callbacks/destructors,
+and concrete generic monomorphs are all reachability edges. A reachable
+`process.command` constructor rejects with
+`process.command is not available from test code; run the external process in an owner test`; a
+shared site is diagnosed once at its first root. An unreachable production helper containing that
+constructor remains valid, stays in the frozen prefix, and may retain ordinary runtime selection
+in inert object code, but has no executable edge from the harness or a catalog root. The first
+capability provides no dynamic command supervisor or containment channel.
+Other settled process operations retain their row process-group behavior.
+
 `import core.test` admits exactly the qualified standalone assertion statements
 `test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
 ordinary nested blocks, excluding lambdas. The first requires exact bool. The second reuses the
@@ -2706,7 +2721,7 @@ location, then follows the test's Err cleanup edge with
 
 `alignc test <entry.align>` checks the explicit module closure, links one private test executable,
 and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
-group plus one aggregate containment witness per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
+group per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
 written only after a normal selected-test return prevents exit, exec, abort, or a crash from
 impersonating success. Each catalog row has a default 60-second deadline from pre-spawn through
 launch, execution, group signalling, capture drain, and direct-child reap (configurable through
@@ -2716,21 +2731,18 @@ acknowledgement is infrastructure failure. The parent control endpoint is nonblo
 and both capture read endpoints are nonblocking too, so every control/stdout/stderr drain returns to
 deadline processing when its queue is empty. Every verified
 terminal path signals the pinned child process group and then its still-unreaped direct PID before
-reaping. An untimed/unbounded `process.command` remains in that group; every timed/bounded command
-arms a witness-retaining sentinel before releasing its nested target group, and row quiescence
-requires witness EOF after those sentinels have killed their groups. Deliberate `setsid` escape
-retains the process API's explicit exclusion. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded
-graceful cleanup and conventional exit. One lock-free state serializes each raw report write against
-signal selection, so a syscall already holding the permit precedes selection and no syscall starts
-after selection. The runner retains its signal controller while writing the final summary, then
-blocks and rechecks those signals and exits directly, so restored prior handlers
-cannot change terminal output. Passing output is suppressed; a failure replays only that test's
+reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup. One lock-free
+`Idle/Writing/Selected/WritingPending` state gives each raw report write an exclusive permit; a
+signal during one permitted syscall selects after its complete/partial prefix and prevents every
+later syscall. The runner retains its signal controller while writing the final summary, then
+blocks and rechecks those signals and invokes raw `_exit(128 + signal)`. The resulting statuses are
+129/130/131/143 and are observed as `WIFEXITED`, never as re-raised `WIFSIGNALED`; restored prior
+handlers cannot change terminal output. Passing output is suppressed; a failure replays only that test's
 bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
 A zero-test command reports `alignc: no tests found` and builds no artifact. The generated harness
 alone owns literal `main`; every permitted source-main ABI uses the existing encoded internal
-identity and no ordinary main wrapper is emitted. Five exact compiler-private runtime functions own
-launch receive, fd close-on-exec, containment-witness installation, acknowledgement, and completion
-encoding/send. Test target,
+identity and no ordinary main wrapper is emitted. Four exact compiler-private runtime functions own
+launch receive, fd close-on-exec, acknowledgement, and completion encoding/send. Test target,
 profile, and runtime-LTO options reach both unit and harness objects; jobs/cache statistics and
 timeout/output terminate at scheduling/diagnostics and runner state. The exact grammar, bounds,
 record bytes, validation order, ownership, cache identity,
@@ -2749,6 +2761,13 @@ shift after an earlier test edit and do not enter production codegen identity. T
 projection records each expression's ownership fact in structural order and every non-location
 descriptor field, so omitting spans cannot create an ownership-sensitive memo collision. Test
 compilation uses a separate versioned cache domain.
+
+`align-repl` parses the same contextual top-level declaration but rejects an entire submitted entry
+containing any formed test before replacement resolution, session mutation, compilation, or
+execution. Its exact diagnostic is
+`error: test declarations are not available in align-repl; use 'alignc test <entry.align>'`;
+existing entries, the next ordinal, retained checked state, and the output snapshot remain
+unchanged.
 
 ---
 

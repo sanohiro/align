@@ -231,7 +231,10 @@ annotation, or expression body.
 The decoded name is 1..=256 UTF-8 bytes and rejects exactly U+0000..U+001F and
 U+007F..U+009F before canonical-id construction. The sema catalog owner pins both boundary
 neighbors and the complete 1,024-byte id limit. Canonical identity retains the source's declared
-module path; only an entry source without a module declaration defaults to `main`.
+module path; only an entry source without a module declaration defaults to `main`. That default
+rejects before catalog construction if an imported source explicitly declares `module main`, using
+the exact diagnostic recorded in `core-design/test.md`; explicit entry paths retain ordinary
+duplicate-module validation.
 
 Depth capping visits the test block exactly as a function block. The formatter preserves the
 ordinary string token and formats the block with the same block rules; the contextual word is
@@ -262,6 +265,16 @@ retains current spans for diagnostics and located output. The exact grammar, nam
 mode split, cache identity, and closure
 matrix are `core-design/test.md`; that document, not this representation summary, owns the public
 contract.
+
+Before test cache lookup, native-capability collection, or artifact allocation, the combined-view
+validator walks every function reachable from catalog roots through direct/imported calls,
+function-value targets, lifted callbacks/destructors, and concrete monomorphs. Reachable
+`ExprKind::ProcessCommand` rejects deterministically; unreachable production use remains valid and
+may remain inert in frozen-prefix test objects but has no path from a catalog root. `align-repl`
+closes its separate item match by rejecting a complete
+submitted entry containing any formed `Item::Test` before replacement resolution or session
+mutation. The exact diagnostics, traversal order, malformed-HIR rule, and owner matrices remain in
+`core-design/test.md` and `22-repl-plan.md`.
 
 ### Type declarations (keyword-less)
 

@@ -558,6 +558,14 @@ Catalog order is the driver-selected dependency-first unit order followed by `so
 its length is at most 65,535. The overlay owns these three strings independently; none is rebuilt
 from the hidden function symbol.
 
+Before catalog construction, the loader rejects an entry that omits its module declaration when
+an imported source explicitly declares `module main`. The exact diagnostic is
+`default entry module 'main' conflicts with imported module 'main'; declare the entry module
+explicitly`. This check precedes canonical-id uniqueness and source-ordinal validation, so the
+implicit entry identity can never alias the imported declared identity. An explicitly declared
+entry path uses the ordinary duplicate-module rule. Whole/per-unit owners cover the rejected pair,
+nearby distinct paths, and diagnostic precedence over duplicate test ids.
+
 Formation is two-phase. Signature and declaration validation still sees every item. Sema then
 checks all ordinary source bodies, closes their lifted helpers, generic function/type/resource
 monomorphs, interned tuple/function/tagged types, analyses, capability use, and static descriptors,
@@ -582,7 +590,22 @@ through every checked-HIR reference or generation edge, including direct calls, 
 callback/destructor descriptors, lifted targets, nominal field/variant/resource types, interned
 type members, and transitive function/type/resource monomorph demands. It rejects any
 production-prefix edge to an overlay suffix and any database-consumer overlay descriptor. Owner
-matrices cover a test lambda, a test-only generic
+Before cache lookup, capability collection, or artifact allocation, the selected combined-view
+validator walks that same graph from catalog roots in catalog order and dependency-edge then
+structural HIR order. A reachable `ExprKind::ProcessCommand` rejects with exactly
+`process.command is not available from test code; run the external process in an owner test`.
+Direct/imported calls, function-value targets, lifted callbacks/destructors, and concrete generic
+monomorphs are all edges; a shared site is diagnosed once at its first root. An unreachable
+production function containing `ProcessCommand` remains valid and may stay as inert code in the
+frozen-prefix test object with its ordinary runtime selection; no catalog root can execute it. The
+ordinary production validator continues to admit it. A handcrafted
+combined view cannot bypass the rule by storing the expression in the production prefix when a
+catalog root reaches it.
+
+Owner matrices cover direct/nested/imported/function-value/lifted/generic reachable commands,
+shared-site and catalog/source-order precedence, an unreachable production control, malformed
+prefix/overlay placement, whole/per-unit parity, and inert-prefix retention. They also cover
+a test lambda, a test-only generic
 monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
 class, capability library use, and static descriptor. Adding or editing only tests must leave the
 canonical span-erased semantic/codegen projection of the production Program, semantic descriptor

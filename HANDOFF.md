@@ -394,17 +394,22 @@ facts must live in this repository.
 - **Next language capability:** `core.test` is designed in
   `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
   explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
-  group with an aggregate containment witness per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
+  group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
   preallocated output/full-row deadline, terminal-observation control barrier, all-terminal
-  pinned-group then direct-PID signalling before reap, nonblocking capture/control/witness drains,
-  witness-retaining sentinels for timed/bounded command subgroups, evidence retained through
-  reporting, lock-free write/signal arbitration, controller-owned four-signal terminal summary commit, and
+  pinned-group then direct-PID signalling before reap, nonblocking capture/control drains,
+  evidence retained through reporting, lock-free signal/write arbitration, numeric raw-exit
+  statuses for the four graceful signals, controller-owned terminal summary commit, and
   failure-only output replay. Compiler formation normalizes final syntactic-tail assertions only
   at root completion or structural statement placement and freezes
   the complete production prefix before appending a test-generated function/type/descriptor/
   capability overlay; production interfaces exclude that overlay, while production MIR/links,
   optimization remarks, and DB preparation descriptors use its span-erased semantic/codegen
   projection, including structurally ordered ownership facts and semantic descriptor fields.
+  Before artifact work, test mode rejects every catalog-reachable `process.command` through direct,
+  imported, function-value, lifted, and monomorphized edges; unreachable production use stays
+  unchanged. An implicit entry `main` cannot collide with an imported declared `main`, and
+  `align-repl` rejects test-bearing entries transactionally. No dynamic command sentinel or fifth
+  child-control ABI is part of the capability.
   Implementation is the next
   code PR; `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
