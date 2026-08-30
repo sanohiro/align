@@ -1,5 +1,6 @@
 //! Foreground `alignc build --watch` controller.
 
+use super::signal_lease::DriverSignalLease;
 use super::watch_native::{NativeHandle, NativeWatchErrorKind, NativeWatcher};
 use super::{link_lib_union, stem};
 use align_driver::{
@@ -30,14 +31,13 @@ const SIGNAL_MASK: u16 = 0b111;
 const FATAL_SHIFT: u16 = 3;
 const FATAL_MASK: u16 = 0b111 << FATAL_SHIFT;
 
-static SIGNAL_OWNER: AtomicBool = AtomicBool::new(false);
-
 pub(super) struct WakeState {
     control: AtomicU16,
     dirty: AtomicBool,
     uncertain: AtomicBool,
     read_fd: RawFd,
     write_fd: RawFd,
+    _signal_lease: DriverSignalLease,
 }
 
 impl WakeState {
@@ -1253,20 +1253,11 @@ impl LinkOutputSink for TranscriptSink<'_> {
 }
 
 fn install_wake_and_signals() -> io::Result<Arc<WakeState>> {
-    if SIGNAL_OWNER
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(io::Error::other("another watch signal owner is active"));
-    }
-    let result = install_wake_and_signals_inner();
-    if result.is_err() {
-        SIGNAL_OWNER.store(false, Ordering::Release);
-    }
-    result
+    let lease = DriverSignalLease::acquire()?;
+    install_wake_and_signals_inner(lease)
 }
 
-fn install_wake_and_signals_inner() -> io::Result<Arc<WakeState>> {
+fn install_wake_and_signals_inner(lease: DriverSignalLease) -> io::Result<Arc<WakeState>> {
     let signals = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
     let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
     let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
@@ -1323,6 +1314,7 @@ fn install_wake_and_signals_inner() -> io::Result<Arc<WakeState>> {
         uncertain: AtomicBool::new(false),
         read_fd: fds[0],
         write_fd: fds[1],
+        _signal_lease: lease,
     });
     let mut registered = Vec::with_capacity(signals.len());
     for (index, signal) in signals.into_iter().enumerate() {

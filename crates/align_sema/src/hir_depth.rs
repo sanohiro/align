@@ -305,7 +305,9 @@ fn walk_body_records<'a>(
                         work.push((BodyRecord::Expr(value), child_depth));
                     }
                 }
-                Stmt::Expr(expr) => work.push((BodyRecord::Expr(expr), child_depth)),
+                Stmt::TestAssert { condition, .. } | Stmt::Expr(condition) => {
+                    work.push((BodyRecord::Expr(condition), child_depth));
+                }
             },
             BodyRecord::MatchArm { arm, .. } => {
                 work.push((BodyRecord::Expr(&arm.body), child_depth));

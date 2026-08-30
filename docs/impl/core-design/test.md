@@ -6,8 +6,9 @@ and test anchors).
 
 > 🌐 **English** · [Japanese](./ja/test.md)
 
-> **Status:** proposed design completed 2026-08-30; implementation pending. No parser, compiler,
-> runner, or assertion surface is shipped by this document alone.
+> **Status:** implemented 2026-08-31. The parser, checked-HIR overlay, MIR/LLVM lowering,
+> compiler-private runtime ABI, cache separation, and bounded sequential runner ship as one
+> capability.
 
 ## Public-contract ledger
 

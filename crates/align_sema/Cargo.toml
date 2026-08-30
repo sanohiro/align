@@ -8,6 +8,8 @@ license.workspace = true
 align_span = { path = "../align_span" }
 align_diag = { path = "../align_diag" }
 align_ast = { path = "../align_ast" }
+bincode = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 align_lexer = { path = "../align_lexer" }

@@ -127,6 +127,17 @@ pub(crate) fn parse_as_file(text: &str) -> Option<align_ast::File> {
     Some(parsed)
 }
 
+/// Whether this complete submission contains any contextual test declaration. The caller invokes
+/// this before replacement resolution, compilation, or session mutation so a mixed paste is one
+/// rejected transaction.
+pub(crate) fn contains_test_declaration(text: &str) -> bool {
+    parse_as_file(text).is_some_and(|file| {
+        file.items
+            .iter()
+            .any(|item| matches!(item, align_ast::Item::Test(_)))
+    })
+}
+
 /// Parse `text` as a statement by parsing a probe program that contains it as `main`'s only
 /// statement. Returns whether it parses; sema is not run.
 pub(crate) fn parses_as_statement(text: &str) -> bool {
@@ -156,6 +167,7 @@ pub(crate) fn declared_names(file: &align_ast::File) -> Vec<String> {
 pub(crate) fn item_names(item: &align_ast::Item) -> Vec<String> {
     match item {
         align_ast::Item::Fn(d) => vec![d.name.name.clone()],
+        align_ast::Item::Test(_) => Vec::new(),
         align_ast::Item::Struct(d) => vec![d.name.name.clone()],
         align_ast::Item::Enum(d) => vec![d.name.name.clone()],
         align_ast::Item::Resource(d) => vec![d.name.name.clone()],
@@ -169,6 +181,7 @@ pub(crate) fn item_names(item: &align_ast::Item) -> Vec<String> {
 pub(crate) fn item_text<'a>(source: &'a str, item: &align_ast::Item) -> &'a str {
     let span = match item {
         align_ast::Item::Fn(d) => d.span,
+        align_ast::Item::Test(d) => d.span,
         align_ast::Item::Struct(d) => d.span,
         align_ast::Item::Enum(d) => d.span,
         align_ast::Item::Resource(d) => d.span,
@@ -239,7 +252,8 @@ pub(crate) fn top_level_binding_names(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shape, needs_more, parses_as_statement, shape_of, top_level_binding_names};
+    use super::{Shape, contains_test_declaration, needs_more, parses_as_statement, shape_of, top_level_binding_names,
+    };
 
     #[test]
     fn classification_lexical_front_door_is_total() {
@@ -288,5 +302,15 @@ mod tests {
         }
         assert!(parses_as_statement("print(1)"));
         assert!(parses_as_statement("x := 1"));
+    }
+
+    #[test]
+    fn test_declaration_probe_rejects_the_complete_mixed_submission() {
+        assert!(contains_test_declaration("test \"one\" {}"));
+        assert!(contains_test_declaration(
+            "fn keep() {}\ntest \"blocked\" {}\nPoint { x: i64 }"
+        ));
+        assert!(!contains_test_declaration("test {}"));
+        assert!(!contains_test_declaration("fn test() {}"));
     }
 }

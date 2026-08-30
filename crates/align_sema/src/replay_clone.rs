@@ -256,6 +256,13 @@ fn clone_stmt(clones: &mut ChildValues, stmt: &Stmt) -> Option<Stmt> {
             },
             accepted: *accepted,
         },
+        Stmt::TestAssert {
+            kind, canonical_id, ..
+        } => Stmt::TestAssert {
+            kind: *kind,
+            condition: clones.expr()?,
+            canonical_id: canonical_id.clone(),
+        },
         Stmt::Expr(_) => Stmt::Expr(clones.expr()?),
     })
 }
@@ -1506,7 +1513,7 @@ impl<'a> CloneFrame<'a> {
         }
     }
 
-    fn finish(self) -> Option<CloneValue> {
+    fn finish(self, erase_spans: bool) -> Option<CloneValue> {
         match self {
             Self::Block { source, values, .. } => {
                 Some(CloneValue::Block(finish_children(values, |children| {
@@ -1523,7 +1530,11 @@ impl<'a> CloneFrame<'a> {
                     Some(hir::Expr {
                         kind: clone_expr_kind(children, &source.kind)?,
                         ty: source.ty,
-                        span: source.span,
+                        span: if erase_spans {
+                            align_span::Span::new(0, 0, 0)
+                        } else {
+                            source.span
+                        },
                     })
                 })?))
             }
@@ -1544,13 +1555,26 @@ impl<'a> CloneFrame<'a> {
     }
 }
 
-fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
+fn clone_function(function: &hir::Fn, erase_spans: bool) -> Option<(hir::Fn, Vec<u8>)> {
     let events = crate::hir_depth::clone_events(&function.body)?;
     let mut frames = Vec::new();
     let mut root = None;
+    let mut ownership = Vec::new();
+    let mut matched_ownership = std::collections::HashSet::new();
     for event in events {
         match event {
             crate::hir_depth::CloneEvent::RecordEnter { id, record } => {
+                if let crate::hir_depth::BodyRecord::Expr(expression) = record {
+                    let fact = match function.drop_individual_exprs.get(&expression.span) {
+                        Some(true) => 2,
+                        Some(false) => 1,
+                        None => 0,
+                    };
+                    ownership.push(fact);
+                    if fact != 0 {
+                        matched_ownership.insert(expression.span);
+                    }
+                }
                 frames.push(CloneFrame::new(id, record)?);
             }
             crate::hir_depth::CloneEvent::RecordExit { id } => {
@@ -1558,7 +1582,7 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
                 if frame.id() != id {
                     return None;
                 }
-                let value = frame.finish()?;
+                let value = frame.finish(erase_spans)?;
                 if let Some(parent) = frames.last_mut() {
                     parent.push(value);
                 } else if root.replace(value).is_some() {
@@ -1570,6 +1594,9 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
     if !frames.is_empty() {
         return None;
     }
+    if matched_ownership.len() != function.drop_individual_exprs.len() {
+        return None;
+    }
     let body = match root {
         Some(CloneValue::Block(body)) => body,
         Some(CloneValue::Expr(_))
@@ -1579,7 +1606,8 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
         | Some(CloneValue::TemplatePart(_))
         | None => return None,
     };
-    Some(hir::Fn {
+    Some((
+        hir::Fn {
         name: function.name.clone(),
         origin: function.origin,
         params: function.params.clone(),
@@ -1591,23 +1619,49 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
         parallel_transfer: function.parallel_transfer.clone(),
         locals: function.locals.clone(),
         body,
-        span: function.span,
+        span: if erase_spans {
+                align_span::Span::new(0, 0, 0)
+            } else {
+                function.span
+            },
         drop_locals: function.drop_locals.clone(),
         drop_individual_locals: function.drop_individual_locals.clone(),
-        drop_individual_exprs: function.drop_individual_exprs.clone(),
-    })
+        drop_individual_exprs: if erase_spans {
+                std::collections::HashMap::new()
+            } else {
+                function.drop_individual_exprs.clone()
+            },
+        },
+        ownership,
+    ))
 }
 
 pub(crate) fn clone_program(program: &hir::Program) -> Option<hir::Program> {
+    clone_program_internal(program, false).map(|(program, _)| program)
+}
+
+pub(crate) fn clone_program_with_projection(
+    program: &hir::Program,
+) -> Option<(hir::Program, Vec<Vec<u8>>)> {
+    clone_program_internal(program, true)
+}
+
+fn clone_program_internal(
+    program: &hir::Program,
+    erase_spans: bool,
+) -> Option<(hir::Program, Vec<Vec<u8>>)> {
     let mut fns = Vec::with_capacity(program.fns.len());
+    let mut ownership = Vec::with_capacity(program.fns.len());
     for function in &program.fns {
-        let Some(function) = clone_function(function) else {
+        let Some((function, facts)) = clone_function(function, erase_spans) else {
             drop_functions(fns);
             return None;
         };
         fns.push(function);
+        ownership.push(facts);
     }
-    Some(hir::Program {
+    Some((
+        hir::Program {
         fns,
         externs: program.externs.clone(),
         link_libs: program.link_libs.clone(),
@@ -1618,7 +1672,9 @@ pub(crate) fn clone_program(program: &hir::Program) -> Option<hir::Program> {
         tuples: program.tuples.clone(),
         fn_types: program.fn_types.clone(),
         imported_fns: program.imported_fns.clone(),
-    })
+    },
+        ownership,
+    ))
 }
 
 enum DropWork {
@@ -1781,6 +1837,14 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     if let Some(value) = value {
                         work.push(DropWork::Expr(value));
                     }
+                }
+                Stmt::TestAssert {
+                    kind: _,
+                    condition,
+                    canonical_id,
+                } => {
+                    drop(canonical_id);
+                    work.push(DropWork::Expr(condition));
                 }
                 Stmt::Expr(expr) => work.push(DropWork::Expr(expr)),
             },
@@ -2789,5 +2853,78 @@ mod tests {
             |_children| Some(()),
         );
         assert!(extra.is_none(), "extra child must fail closed");
+    }
+
+    #[test]
+    fn ownership_fact_changes_lowering_key() {
+        let mut first = program_with_body(hir::Block {
+            stmts: vec![Stmt::Expr(leaf(Span::new(0, 7, 8)))],
+            value: None,
+        });
+        first.fns[0].span = Span::new(0, 1, 9);
+        let mut shifted = program_with_body(hir::Block {
+            stmts: vec![Stmt::Expr(leaf(Span::new(4, 70, 80)))],
+            value: None,
+        });
+        shifted.fns[0].span = Span::new(4, 10, 90);
+        assert_eq!(
+            crate::production_codegen_projection(&first),
+            crate::production_codegen_projection(&shifted),
+            "diagnostic locations entered production codegen identity"
+        );
+
+        first.fns[0]
+            .drop_individual_exprs
+            .insert(Span::new(0, 7, 8), true);
+        shifted.fns[0]
+            .drop_individual_exprs
+            .insert(Span::new(4, 70, 80), false);
+        assert_ne!(
+            crate::production_codegen_projection(&first),
+            crate::production_codegen_projection(&shifted),
+            "individual and arena ownership facts shared an identity"
+        );
+    }
+
+    #[test]
+    fn orphan_ownership_fact_rejects() {
+        let mut program = program_with_body(hir::Block {
+            stmts: vec![Stmt::Expr(leaf(Span::new(0, 7, 8)))],
+            value: None,
+        });
+        program.fns[0]
+            .drop_individual_exprs
+            .insert(Span::new(0, 100, 101), true);
+        assert!(crate::production_codegen_projection(&program).is_none());
+    }
+
+    #[test]
+    fn production_projection_fits_the_checked_hir_owner_stack() {
+        let mut expression = leaf(Span::new(0, 1, 2));
+        for offset in 0..crate::hir_depth::MAX_CHECKED_HIR_DEPTH - 2 {
+            expression = hir::Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expression),
+                },
+                ty: int_ty(),
+                span: Span::new(0, offset as u32 + 2, offset as u32 + 3),
+            };
+        }
+        let program = program_with_body(hir::Block {
+            stmts: vec![Stmt::Expr(expression)],
+            value: None,
+        });
+        let projected = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let projected = crate::production_codegen_projection(&program).is_some();
+                drop_program(program);
+                projected
+            })
+            .expect("projection owner thread")
+            .join()
+            .expect("projection owner thread panicked");
+        assert!(projected);
     }
 }

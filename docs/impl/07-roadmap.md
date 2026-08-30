@@ -3866,7 +3866,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 
 ### One-line capability outline (core / prerequisites / open decision)
 
-- **core.test — DESIGNED 2026-08-30** — private top-level named Result blocks; explicit
+- **core.test — IMPLEMENTED 2026-08-31** — private top-level named Result blocks; explicit
   `core.test` assertion import with Bool-result equality only; one immutable test artifact run
   sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
   compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated

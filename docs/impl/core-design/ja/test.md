@@ -5,8 +5,9 @@
 
 > [English](../test.md) · **日本語**
 
-> **ステータス:** proposed design completed 2026-08-30、implementation pending。この文書だけでは
-> parser、compiler、runner、assertion surface のいずれも出荷されない。
+> **ステータス:** 2026-08-31 implemented。parser、checked-HIR overlay、MIR/LLVM lowering、
+> compiler-private runtime ABI、cache separation、bounded sequential runnerを一つの
+> capabilityとして出荷する。
 
 ## Public-contract ledger
 

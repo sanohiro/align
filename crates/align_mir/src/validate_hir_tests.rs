@@ -190,6 +190,23 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+fn checked_test_program(source: &str) -> hir::Program {
+    let mut diagnostics = Diagnostics::new();
+    let tokens = tokenize(0, source, &mut diagnostics);
+    let file = parse_file(tokens, &mut diagnostics);
+    let checked = align_sema::check_program_with_static_descriptors(
+        &[align_sema::Module {
+            path: "main".to_string(),
+            file: &file,
+            is_entry: true,
+            interface_only: false,
+        }],
+        &mut diagnostics,
+    );
+    assert!(!diagnostics.has_errors(), "test fixture must check");
+    checked.test_overlay.expect("test overlay").program
+}
+
 #[test]
 fn heap_record_array_builder_rows_match_the_producer() {
     let source = concat!(
@@ -1531,6 +1548,51 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
             captures: vec![0],
         };
     });
+}
+
+#[test]
+fn test_function_origin_requires_the_exact_private_abi() {
+    let base = checked_test_program("test \"shape\" {}\n");
+    assert!(validate_hir::declaration_header_metadata_is_valid(&base));
+    let test = base
+        .fns
+        .iter()
+        .position(|function| function.origin == hir::FnOrigin::Test)
+        .expect("test function");
+
+    let mut parameter = base.clone();
+    let local = parameter.fns[test].locals.len() as u32;
+    parameter.fns[test].params.push(local);
+    parameter.fns[test]
+        .param_modes
+        .push(align_ast::ParamMode::ByValue);
+    parameter.fns[test].locals.push(hir::Local {
+        id: local,
+        name: "value".to_string(),
+        ty: Ty::Bool,
+        is_mut: false,
+        is_param: true,
+        align: None,
+    });
+    assert_header_rejected("test function parameter", &parameter);
+
+    let mut result = base.clone();
+    result.fns[test].ret = Ty::Unit;
+    assert_header_rejected("test function result", &result);
+
+    let mut wrong_error = base.clone();
+    let other = wrong_error.enums.len() as u32;
+    let mut definition = wrong_error
+        .enums
+        .iter()
+        .find(|definition| definition.name == "Error")
+        .expect("builtin Error")
+        .clone();
+    definition.name = "OtherError".to_string();
+    definition.source_name = "OtherError".to_string();
+    wrong_error.enums.push(definition);
+    wrong_error.fns[test].ret = Ty::Result(Scalar::Unit, Scalar::Enum(other));
+    assert_header_rejected("test function non-builtin Error", &wrong_error);
 }
 
 #[test]

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeType {
+    I8,
     I32,
     I64,
     F32,
@@ -138,6 +139,10 @@ enum RuntimeAbiShape {
     A107,
     A108,
     A109,
+    A110,
+    A111,
+    A112,
+    A113,
 }
 
 #[derive(Clone, Copy)]
@@ -173,9 +178,13 @@ pub(super) enum UnkeyedRuntimeKey {
     F64TextLen = 10,
     F32TextWrite = 11,
     F64TextWrite = 12,
+    TestLaunchRecvV1 = 13,
+    TestFdCloexecV1 = 14,
+    TestAckV1 = 15,
+    TestReportV1 = 16,
 }
 
-pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 13] = [
+pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 17] = [
     UnkeyedRuntimeKey::ReportError,
     UnkeyedRuntimeKey::ArgsBuild,
     UnkeyedRuntimeKey::ArenaReset,
@@ -189,6 +198,10 @@ pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 13] = [
     UnkeyedRuntimeKey::F64TextLen,
     UnkeyedRuntimeKey::F32TextWrite,
     UnkeyedRuntimeKey::F64TextWrite,
+    UnkeyedRuntimeKey::TestLaunchRecvV1,
+    UnkeyedRuntimeKey::TestFdCloexecV1,
+    UnkeyedRuntimeKey::TestAckV1,
+    UnkeyedRuntimeKey::TestReportV1,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1892,12 +1905,12 @@ pub(super) fn validate_registry() -> Result<(), String> {
     if RuntimeKey::ALL.len() != 314 || keyed_runtime_abis().len() != 314 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 327 {
+    if runtime_abis().count() != 331 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(327);
+    let mut symbols = HashSet::with_capacity(331);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -2013,7 +2026,85 @@ pub(super) fn unkeyed_runtime_abi(key: UnkeyedRuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_f64_text_write",
             shape: RuntimeAbiShape::A102,
         },
+        UnkeyedRuntimeKey::TestLaunchRecvV1 => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_test_launch_recv_v1",
+            shape: RuntimeAbiShape::A110,
+        },
+        UnkeyedRuntimeKey::TestFdCloexecV1 => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_test_fd_cloexec_v1",
+            shape: RuntimeAbiShape::A111,
+        },
+        UnkeyedRuntimeKey::TestAckV1 => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_test_ack_v1",
+            shape: RuntimeAbiShape::A112,
+        },
+        UnkeyedRuntimeKey::TestReportV1 => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_test_report_v1",
+            shape: RuntimeAbiShape::A113,
+        },
     }
+}
+
+/// Canonical cache identity for the complete compiler-private child-control ABI. Keep this beside
+/// the typed rows so a signature, attribute, symbol, or ordinal change cannot leave a hand-written
+/// test cache marker stale.
+pub(super) fn test_control_fingerprint() -> Vec<u8> {
+    fn native_type_tag(value: NativeType) -> u8 {
+        match value {
+            NativeType::I8 => 0,
+            NativeType::I32 => 1,
+            NativeType::I64 => 2,
+            NativeType::F32 => 3,
+            NativeType::F64 => 4,
+            NativeType::Ptr => 5,
+        }
+    }
+
+    fn native_return_tag(value: NativeReturn) -> u8 {
+        match value {
+            NativeReturn::Void => 0,
+            NativeReturn::I32 => 1,
+            NativeReturn::I64 => 2,
+            NativeReturn::F32 => 3,
+            NativeReturn::F64 => 4,
+            NativeReturn::Ptr => 5,
+            NativeReturn::I64Pair => 6,
+            NativeReturn::PtrLen => 7,
+        }
+    }
+
+    let mut bytes = b"align-test-control-runtime-abi-v1\0".to_vec();
+    for key in [
+        UnkeyedRuntimeKey::TestLaunchRecvV1,
+        UnkeyedRuntimeKey::TestFdCloexecV1,
+        UnkeyedRuntimeKey::TestAckV1,
+        UnkeyedRuntimeKey::TestReportV1,
+    ] {
+        let abi = unkeyed_runtime_abi(key);
+        let spec = shape_spec(abi.shape);
+        bytes.push(key as u8);
+        bytes.extend_from_slice(&(abi.symbol.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(abi.symbol.as_bytes());
+        bytes.push(native_return_tag(spec.ret));
+        bytes.extend_from_slice(&(spec.params.len() as u32).to_le_bytes());
+        bytes.extend(spec.params.iter().copied().map(native_type_tag));
+        bytes.push(u8::from(spec.return_noalias));
+        bytes.push(u8::from(spec.memory_argmem_read));
+        bytes.extend_from_slice(&(spec.fn_attrs.len() as u32).to_le_bytes());
+        for attribute in spec.fn_attrs {
+            bytes.extend_from_slice(&(attribute.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(attribute.as_bytes());
+        }
+        bytes.extend_from_slice(&(spec.read_ptr_params.len() as u32).to_le_bytes());
+        for ordinal in spec.read_ptr_params {
+            bytes.extend_from_slice(&ordinal.to_le_bytes());
+        }
+    }
+    bytes
 }
 
 pub(super) fn unkeyed_symbol(key: UnkeyedRuntimeKey) -> &'static str {
@@ -2037,6 +2128,16 @@ pub(super) fn runtime_abi_by_id(id: RuntimeAbiId) -> RuntimeAbi {
     }
 }
 
+fn is_test_control_key(key: UnkeyedRuntimeKey) -> bool {
+    matches!(
+        key,
+        UnkeyedRuntimeKey::TestLaunchRecvV1
+            | UnkeyedRuntimeKey::TestFdCloexecV1
+            | UnkeyedRuntimeKey::TestAckV1
+            | UnkeyedRuntimeKey::TestReportV1
+    )
+}
+
 /// Whether a source-derived extern type is compatible with the fixed native row of the same
 /// physical name. Unknown names are ordinary user externs and therefore have no fixed row to
 /// compare. Fixed names compare the complete LLVM function type, including the return and every
@@ -2047,6 +2148,7 @@ pub(super) fn native_extern_abi_matches<'c>(
     ctx: &'c Context,
 ) -> bool {
     match runtime_abi_for_symbol(symbol) {
+        Some(RuntimeAbiId::Unkeyed(key)) if is_test_control_key(key) => false,
         Some(id) => actual == function_type(id, ctx),
         None => true,
     }
@@ -2054,6 +2156,7 @@ pub(super) fn native_extern_abi_matches<'c>(
 
 fn native_type<'c>(ctx: &'c Context, ty: NativeType) -> BasicTypeEnum<'c> {
     match ty {
+        NativeType::I8 => ctx.i8_type().into(),
         NativeType::I32 => ctx.i32_type().into(),
         NativeType::I64 => ctx.i64_type().into(),
         NativeType::F32 => ctx.f32_type().into(),
@@ -3282,13 +3385,51 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             memory_argmem_read: false,
             read_ptr_params: &[],
         },
+        RuntimeAbiShape::A110 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::I32, NativeType::Ptr],
+            return_noalias: false,
+            fn_attrs: &["nounwind"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A111 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::I32],
+            return_noalias: false,
+            fn_attrs: &["nounwind"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A112 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::I32, NativeType::I32],
+            return_noalias: false,
+            fn_attrs: &["nounwind"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A113 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[
+                NativeType::I32,
+                NativeType::I8,
+                NativeType::I8,
+                NativeType::I32,
+                NativeType::I32,
+            ],
+            return_noalias: false,
+            fn_attrs: &["nounwind"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, keyed_runtime_abis, native_extern_abi_matches,
+        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, is_test_control_key, keyed_runtime_abis, native_extern_abi_matches,
         runtime_abi, runtime_abi_by_id, runtime_abi_for_symbol, runtime_abis, unkeyed_symbol,
         validate_registry,
     };
@@ -3315,21 +3456,21 @@ mod tests {
         assert_ord::<RuntimeAbiId>();
         assert_eq!(
             UNKEYED_RUNTIME_KEYS.map(|key| key as u8),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 327);
+        assert_eq!(rows.len(), 331);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            327
+            331
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            327
+            331
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3359,14 +3500,17 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 327);
+        assert_eq!(rows.len(), 331);
 
         for row in rows {
             let symbol = row.symbol;
             let expected = row.function_type(&ctx);
-            assert!(
+            let compiler_private =
+                matches!(row.key, RuntimeAbiId::Unkeyed(key) if is_test_control_key(key));
+            assert_eq!(
                 native_extern_abi_matches(symbol, expected, &ctx),
-                "rejected exact native extern type for {symbol}",
+                !compiler_private,
+                "source-extern admission drifted for {symbol}",
             );
 
             let params = expected.get_param_types();

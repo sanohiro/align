@@ -509,6 +509,65 @@ fn disabled_memo_is_a_complete_bypass() {
     assert_eq!(off, warm, "a disabled build must equal the replayed build");
 }
 
+#[test]
+fn test_only_width_shift_preserves_production_identity() {
+    let _guard = memo_guard(true);
+    let source = |name: &str| {
+        format!(
+            "fn before() -> i64 = 1\n\
+             test \"{name}\" {{}}\n\
+             fn after() -> i64 = before() + 1\n\
+             fn main() -> i32 = after() as i32\n"
+        )
+    };
+    let narrow = [("main.align", source("x"))];
+    let wide = [("main.align", source("a much wider test-only catalog name"))];
+    let first = build("memo-test-width-narrow", &narrow);
+    let before = memo::stats();
+    let shifted = build("memo-test-width-wide", &wide);
+    let after = memo::stats();
+
+    assert_eq!(shifted.mir_hashes, first.mir_hashes);
+    assert_eq!(shifted.impl_hashes, first.impl_hashes);
+    assert_eq!(shifted.objects, first.objects);
+    assert_eq!(after.unit_misses - before.unit_misses, 1);
+    assert_eq!(after.lowering_hits - before.lowering_hits, 1);
+    if backend_available() {
+        assert_eq!(after.object_hits - before.object_hits, 1);
+    }
+}
+
+#[test]
+fn production_memo_cannot_replace_the_test_overlay() {
+    let _guard = memo_guard(true);
+    let source = "module app\ntest \"case\" {}\n";
+    let proj = Proj::new(
+        "memo-production-before-test",
+        &[("main.align", source)],
+        "main.align",
+    );
+    let entry = proj.dir.join("main.align");
+    let name = entry.display().to_string();
+
+    let mut production_map = SourceMap::new();
+    let production = build_per_unit(&mut production_map, &name, source);
+    assert!(!production.diags.has_errors(), "production prefix must check");
+    assert_eq!(production.units.len(), 1);
+    let before = memo::stats();
+
+    let mut test_map = SourceMap::new();
+    let test = align_driver::build_test_per_unit_at(&mut test_map, &name, source, &entry);
+    assert!(!test.diags.has_errors(), "test overlay must form after a production memo entry");
+    assert!(test.boundary_error.is_none());
+    assert_eq!(test.units.len(), 1);
+    assert_eq!(test.units[0].tests.len(), 1);
+    let after = memo::stats();
+    assert_eq!(after.unit_hits, before.unit_hits);
+    assert_eq!(after.unit_misses, before.unit_misses);
+    assert_eq!(after.object_hits, before.object_hits);
+    assert_eq!(after.object_misses, before.object_misses);
+    assert_eq!(after.retained_bytes, before.retained_bytes);
+}
 
 // ---- pkg.db-backed owners: static descriptors and the sema diagnostic sink -----------------------
 

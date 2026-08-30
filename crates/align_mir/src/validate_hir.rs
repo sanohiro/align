@@ -143,7 +143,9 @@ fn push_statement_expressions<'a>(statement: &'a hir::Stmt, work: &mut Vec<&'a h
                 work.push(value);
             }
         }
-        hir::Stmt::Expr(expression) => work.push(expression),
+        hir::Stmt::TestAssert { condition, .. } | hir::Stmt::Expr(condition) => {
+            work.push(condition);
+        }
     }
 }
 
@@ -320,6 +322,18 @@ impl<'a> DeclarationValidator<'a> {
                 hir::ReturnBorrowSummary::None => true,
                 hir::ReturnBorrowSummary::Roots { captures, .. } => captures.is_empty(),
             },
+            hir::FnOrigin::Test => {
+                let expected = self
+                    .builtin_error_id()
+                    .map(|error| Ty::Result(Scalar::Unit, Scalar::Enum(error)));
+                function.params.is_empty()
+                    && function.param_modes.is_empty()
+                    && expected == Some(function.ret)
+                    && function.return_borrow == hir::ReturnBorrowSummary::None
+                    && function.return_region == hir::ReturnRegionSummary::None
+                    && function.return_cleanup == hir::ReturnCleanupAbi::None
+                    && function.parallel_transfer == hir::ReturnBorrowSummary::None
+            }
             hir::FnOrigin::Lifted { capture_count } => {
                 usize::try_from(capture_count).is_ok_and(|count| count <= function.params.len())
                     && function
@@ -436,7 +450,8 @@ impl<'a> DeclarationValidator<'a> {
                 &function.param_modes,
                 match function.origin {
                     hir::FnOrigin::Lifted { capture_count } => capture_count,
-                    hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => 0,
+                    hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph
+                    | hir::FnOrigin::Test => 0,
                 },
             )
     }
@@ -2673,7 +2688,8 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::Stmt::LetTuple { .. }
             | hir::Stmt::Return(_)
             | hir::Stmt::Break { .. }
-            | hir::Stmt::Expr(_) => true,
+            | hir::Stmt::TestAssert { .. }
+                | hir::Stmt::Expr(_) => true,
         }
     }
 
@@ -3669,7 +3685,28 @@ impl<'a> BodyValidator<'a> {
                     } else {
                         matches!(local.ty, Ty::StructArray(id, _) if id == *struct_id)
                     }
-            }
+                }
+                hir::Stmt::TestAssert { canonical_id, .. } => {
+                    !canonical_id.is_empty()
+                        && canonical_id.len() <= 1_024
+                        && !canonical_id.chars().any(
+                            |ch| matches!(ch, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}'),
+                        )
+                        && self
+                            .program
+                            .fns
+                            .get(context.function)
+                            .is_some_and(|function| {
+                                function.origin == hir::FnOrigin::Test
+                                    && matches!(
+                                        function.ret,
+                                        Ty::Result(
+                                            align_sema::Scalar::Unit,
+                                            align_sema::Scalar::Enum(_)
+                                        )
+                                    )
+                            })
+                }
             hir::Stmt::Return(_) | hir::Stmt::Break { .. } | hir::Stmt::Expr(_) => true,
         };
         if !valid {
@@ -8798,7 +8835,8 @@ impl<'a> BodyValidator<'a> {
             Some(hir::FnOrigin::Lifted { capture_count }) => {
                 usize::try_from(capture_count).ok() == Some(captures.len())
             }
-            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+            Some(hir::FnOrigin::Test) => false,
+                Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
         }
     }
 
@@ -10581,7 +10619,8 @@ impl<'a> BodyValidator<'a> {
             Some(hir::FnOrigin::Lifted { capture_count }) => {
                 usize::try_from(capture_count).ok() == Some(captures.len())
             }
-            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+            Some(hir::FnOrigin::Test) => false,
+                Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
         }
     }
 
@@ -10836,6 +10875,15 @@ impl<'a> BodyValidator<'a> {
                     breaks.push(value_ty);
                 }
                 self.store_statement(statement, Ty::Unit, false, breaks)
+                }
+                hir::Stmt::TestAssert { .. } => {
+                    let Some(flow) = flows.first() else {
+                        return false;
+                    };
+                    if flow.ty != Ty::Bool {
+                        return false;
+                    }
+                    self.store_statement(statement, Ty::Unit, flow.falls, flow.breaks.clone())
             }
             hir::Stmt::Expr(_) => {
                 let Some(flow) = flows.first() else {
@@ -11070,6 +11118,9 @@ impl<'a> BodyValidator<'a> {
                 && self.body_ty_matches(signature.ret, function.ret);
         };
         if signature.is_extern {
+                return false;
+            }
+            if matches!(origin, hir::FnOrigin::Test) {
             return false;
         }
         if let Some(spawn) = spawn {
@@ -12377,7 +12428,7 @@ fn statement_children(statement: &hir::Stmt) -> Vec<&hir::Expr> {
         hir::Stmt::Return(value) | hir::Stmt::Break { value, .. } => {
             value.as_ref().into_iter().collect()
         }
-        hir::Stmt::Expr(expression) => vec![expression],
+        hir::Stmt::TestAssert { condition, .. } | hir::Stmt::Expr(condition) => vec![condition],
     }
 }
 

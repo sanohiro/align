@@ -744,10 +744,9 @@ pub fn build_summaries_with_effects(
                     }
                     // Non-pub consts are module-private: not part of the exported interface surface.
                 }
-                align_ast::Item::Extern(..) => {}
-                // extern fns are import-only (a bodyless FFI declaration bound to a C symbol), never
-                // part of a unit's exported interface. (An `extern "C"` import is a link/impl concern;
-                // exporting a body via `extern "C"` is explicitly out of M15.)
+                align_ast::Item::Test(..) | align_ast::Item::Extern(..) => {} // extern fns are import-only (a bodyless FFI declaration bound to a C symbol), never
+                                                                              // part of a unit's exported interface. (An `extern "C"` import is a link/impl concern;
+                                                                              // exporting a body via `extern "C"` is explicitly out of M15.)
             }
         }
 

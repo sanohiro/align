@@ -14373,12 +14373,208 @@ unsafe fn native_rename_no_replace(source: *const u8, destination: *const u8) ->
 #[cfg(target_os = "linux")]
 const SOCK_CLOEXEC: i32 = 0o2000000;
 /// `fcntl` file-descriptor-flag commands + the `FD_CLOEXEC` bit (non-Linux CLOEXEC fallback).
-#[cfg(not(target_os = "linux"))]
 const F_GETFD: i32 = 1;
-#[cfg(not(target_os = "linux"))]
 const F_SETFD: i32 = 2;
-#[cfg(not(target_os = "linux"))]
 const FD_CLOEXEC: i32 = 1;
+
+const TEST_LAUNCH_HEADER_V1: &[u8; 8] = b"ALTESTL\x01";
+const TEST_ACK_HEADER_V1: &[u8; 8] = b"ALTESTA\x01";
+const TEST_REPORT_HEADER_V1: &[u8; 8] = b"ALTEST\0\x01";
+
+fn test_raw_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn test_launch_ordinal_v1(record: &[u8]) -> Result<u32, i32> {
+    if record.len() != 16
+        || &record[..8] != TEST_LAUNCH_HEADER_V1
+        || record[12] != 0
+        || record[13] != 0
+        || record[14] != 0
+        || record[15] != 0
+    {
+        return Err(libc::EPROTO);
+    }
+    Ok(u32::from_le_bytes([
+        record[8], record[9], record[10], record[11],
+    ]))
+}
+
+fn test_ack_record_v1(ordinal: u32) -> [u8; 16] {
+    let mut record = [0; 16];
+    record[..8].copy_from_slice(TEST_ACK_HEADER_V1);
+    record[8..12].copy_from_slice(&ordinal.to_le_bytes());
+    record
+}
+
+fn test_report_record_v1(
+    outcome: u8,
+    error_tag: u8,
+    error_code: i32,
+    ordinal: u32,
+) -> Result<[u8; 20], i32> {
+    let valid = (outcome == 0 && error_tag == 255 && error_code == 0)
+        || (outcome == 1 && error_tag <= 4 && (error_tag == 4 || error_code == 0));
+    if !valid {
+        return Err(libc::EINVAL);
+    }
+
+    let mut record = [0; 20];
+    record[..8].copy_from_slice(TEST_REPORT_HEADER_V1);
+    record[8] = outcome;
+    record[9] = error_tag;
+    record[12..16].copy_from_slice(&error_code.to_le_bytes());
+    record[16..20].copy_from_slice(&ordinal.to_le_bytes());
+    Ok(record)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SEND_BEHAVIOR: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TEST_RECV_EINTR_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_set_errno(code: i32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = code;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = code;
+    }
+}
+
+fn test_send_syscall(fd: i32, record: &[u8]) -> isize {
+    #[cfg(test)]
+    if let Some(result) = TEST_SEND_BEHAVIOR.with(|behavior| match behavior.replace(0) {
+        1 => {
+            test_set_errno(libc::EINTR);
+            Some(-1)
+        }
+        2 => Some(record.len().saturating_sub(1) as isize),
+        3 => {
+            test_set_errno(libc::EACCES);
+            Some(-1)
+        }
+        _ => None,
+    }) {
+        return result;
+    }
+    unsafe {
+        send(
+            fd,
+            record.as_ptr().cast::<core::ffi::c_void>(),
+            record.len(),
+            0,
+        )
+    }
+}
+
+fn test_recv_syscall(fd: i32, record: &mut [u8]) -> isize {
+    #[cfg(test)]
+    if TEST_RECV_EINTR_ONCE.with(|behavior| behavior.replace(false)) {
+        test_set_errno(libc::EINTR);
+        return -1;
+    }
+    unsafe {
+        recv(
+            fd,
+            record.as_mut_ptr().cast::<core::ffi::c_void>(),
+            record.len(),
+            0,
+        )
+    }
+}
+
+fn test_send_record_v1(fd: i32, record: &[u8]) -> i32 {
+    loop {
+        let sent = test_send_syscall(fd, record);
+        if sent == record.len() as isize {
+            return 0;
+        }
+        if sent >= 0 {
+            return libc::EIO;
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return test_raw_errno();
+    }
+}
+
+/// Receive and validate one v1 test launch datagram, writing its little-endian catalog ordinal.
+/// Returns zero on success, otherwise `EINVAL`, `EPROTO`, or the positive raw socket errno.
+///
+/// # Safety
+/// `out_ordinal` must be null or point to a writable, four-byte-aligned `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_test_launch_recv_v1(fd: i32, out_ordinal: *mut u32) -> i32 {
+    if out_ordinal.is_null() || !(out_ordinal as usize).is_multiple_of(core::mem::align_of::<u32>())
+    {
+        return libc::EINVAL;
+    }
+    unsafe { *out_ordinal = 0 };
+
+    let mut record = [0u8; 17];
+    let received = loop {
+        let received = test_recv_syscall(fd, &mut record);
+        if received >= 0 {
+            break received as usize;
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return test_raw_errno();
+    };
+    if received != 16 {
+        return libc::EPROTO;
+    }
+    match test_launch_ordinal_v1(&record[..received]) {
+        Ok(ordinal) => {
+            unsafe { *out_ordinal = ordinal };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Add `FD_CLOEXEC` to one child-control descriptor without changing its other descriptor flags.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_fd_cloexec_v1(fd: i32) -> i32 {
+    let flags = unsafe { fcntl(fd, F_GETFD, 0) };
+    if flags < 0 {
+        return test_raw_errno();
+    }
+    if unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) } < 0 {
+        return test_raw_errno();
+    }
+    0
+}
+
+/// Send one v1 launch acknowledgement datagram for `ordinal`.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_ack_v1(fd: i32, ordinal: u32) -> i32 {
+    test_send_record_v1(fd, &test_ack_record_v1(ordinal))
+}
+
+/// Send one validated v1 test outcome datagram for `ordinal`.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_test_report_v1(
+    fd: i32,
+    outcome: u8,
+    error_tag: u8,
+    error_code: i32,
+    ordinal: u32,
+) -> i32 {
+    match test_report_record_v1(outcome, error_tag, error_code, ordinal) {
+        Ok(record) => test_send_record_v1(fd, &record),
+        Err(status) => status,
+    }
+}
 
 /// Set `FD_CLOEXEC` on `fd` (best-effort). The non-Linux fallback where no atomic CLOEXEC-at-creation
 /// variant (`SOCK_CLOEXEC` / `accept4`) exists, so an Align-owned fd still doesn't leak into a spawned
@@ -23484,6 +23680,10 @@ const _: extern "C" fn(f32) -> i64 = align_rt_f32_text_len;
 const _: extern "C" fn(f64) -> i64 = align_rt_f64_text_len;
 const _: unsafe extern "C" fn(f32, *mut u8, i64) -> i64 = align_rt_f32_text_write;
 const _: unsafe extern "C" fn(f64, *mut u8, i64) -> i64 = align_rt_f64_text_write;
+const _: unsafe extern "C" fn(i32, *mut u32) -> i32 = align_rt_test_launch_recv_v1;
+const _: extern "C" fn(i32) -> i32 = align_rt_test_fd_cloexec_v1;
+const _: extern "C" fn(i32, u32) -> i32 = align_rt_test_ack_v1;
+const _: extern "C" fn(i32, u8, u8, i32, u32) -> i32 = align_rt_test_report_v1;
 
 #[cfg(test)]
 mod tests {
@@ -23541,9 +23741,204 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 311);
-        assert_eq!(registry.len(), 311);
+        assert_eq!(runtime.len(), 315);
+        assert_eq!(registry.len(), 315);
         assert_eq!(runtime, registry);
+    }
+
+    fn test_datagram_pair() -> [i32; 2] {
+        let mut fds = [-1; 2];
+        let status =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(status, 0);
+        fds
+    }
+
+    fn test_recv_datagram(fd: i32, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        let received = unsafe {
+            libc::recv(
+                fd,
+                bytes.as_mut_ptr().cast::<core::ffi::c_void>(),
+                bytes.len(),
+                0,
+            )
+        };
+        assert_eq!(received, len as isize);
+        bytes
+    }
+
+    #[test]
+    fn test_child_control_v1_codecs_match_golden_bytes() {
+        let launch = *b"ALTESTL\x01\x07\0\0\0\0\0\0\0";
+        assert_eq!(test_launch_ordinal_v1(&launch), Ok(7));
+        assert_eq!(test_ack_record_v1(7), *b"ALTESTA\x01\x07\0\0\0\0\0\0\0");
+        assert_eq!(
+            test_report_record_v1(0, 255, 0, 7).unwrap(),
+            *b"ALTEST\0\x01\0\xff\0\0\0\0\0\0\x07\0\0\0"
+        );
+        assert_eq!(
+            test_report_record_v1(1, 1, 0, 7).unwrap(),
+            *b"ALTEST\0\x01\x01\x01\0\0\0\0\0\0\x07\0\0\0"
+        );
+        assert_eq!(
+            test_report_record_v1(1, 4, -9, 7).unwrap(),
+            *b"ALTEST\0\x01\x01\x04\0\0\xf7\xff\xff\xff\x07\0\0\0"
+        );
+
+        let mut malformed = launch;
+        malformed[12] = 1;
+        assert_eq!(test_launch_ordinal_v1(&malformed), Err(libc::EPROTO));
+        for product in [(0, 0, 0), (0, 255, 1), (1, 5, 0), (1, 1, 9), (2, 0, 0)] {
+            assert_eq!(
+                test_report_record_v1(product.0, product.1, product.2, 7),
+                Err(libc::EINVAL)
+            );
+        }
+        for tag in 0..=3 {
+            assert!(test_report_record_v1(1, tag, 0, 7).is_ok());
+        }
+        assert!(test_report_record_v1(1, 4, i32::MIN, 7).is_ok());
+        assert!(test_report_record_v1(1, 4, i32::MAX, 7).is_ok());
+    }
+
+    #[test]
+    fn test_child_control_v1_exports_transport_one_datagram() {
+        let fds = test_datagram_pair();
+        let launch = *b"ALTESTL\x01\x07\0\0\0\0\0\0\0";
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    fds[0],
+                    launch.as_ptr().cast::<core::ffi::c_void>(),
+                    launch.len(),
+                    0,
+                )
+            },
+            16
+        );
+        let mut ordinal = 99;
+        assert_eq!(
+            unsafe { align_rt_test_launch_recv_v1(fds[1], &mut ordinal) },
+            0
+        );
+        assert_eq!(ordinal, 7);
+
+        assert_eq!(align_rt_test_ack_v1(fds[1], 7), 0);
+        assert_eq!(
+            test_recv_datagram(fds[0], 16),
+            b"ALTESTA\x01\x07\0\0\0\0\0\0\0"
+        );
+        assert_eq!(align_rt_test_report_v1(fds[1], 1, 4, -9, 7), 0);
+        assert_eq!(
+            test_recv_datagram(fds[0], 20),
+            b"ALTEST\0\x01\x01\x04\0\0\xf7\xff\xff\xff\x07\0\0\0"
+        );
+        assert_eq!(align_rt_test_report_v1(fds[1], 0, 0, 0, 7), libc::EINVAL);
+
+        assert_eq!(align_rt_test_fd_cloexec_v1(fds[1]), 0);
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn test_child_control_v1_retries_eintr_and_closes_short_and_error_sends() {
+        let fds = test_datagram_pair();
+        let launch = *b"ALTESTL\x01\x07\0\0\0\0\0\0\0";
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    fds[0],
+                    launch.as_ptr().cast::<core::ffi::c_void>(),
+                    launch.len(),
+                    0,
+                )
+            },
+            16
+        );
+        TEST_RECV_EINTR_ONCE.with(|behavior| behavior.set(true));
+        let mut ordinal = 99;
+        assert_eq!(
+            unsafe { align_rt_test_launch_recv_v1(fds[1], &mut ordinal) },
+            0
+        );
+        assert_eq!(ordinal, 7);
+
+        TEST_SEND_BEHAVIOR.with(|behavior| behavior.set(1));
+        assert_eq!(align_rt_test_ack_v1(fds[1], 7), 0);
+        assert_eq!(
+            test_recv_datagram(fds[0], 16),
+            b"ALTESTA\x01\x07\0\0\0\0\0\0\0"
+        );
+        TEST_SEND_BEHAVIOR.with(|behavior| behavior.set(2));
+        assert_eq!(align_rt_test_ack_v1(fds[1], 7), libc::EIO);
+        TEST_SEND_BEHAVIOR.with(|behavior| behavior.set(3));
+        assert_eq!(align_rt_test_ack_v1(fds[1], 7), libc::EACCES);
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn test_launch_v1_rejects_bad_pointer_and_malformed_datagram_before_publication() {
+        assert_eq!(
+            unsafe { align_rt_test_launch_recv_v1(-1, core::ptr::null_mut()) },
+            libc::EINVAL
+        );
+        let mut aligned = [0u32; 2];
+        let misaligned = unsafe { aligned.as_mut_ptr().cast::<u8>().add(1).cast::<u32>() };
+        assert_eq!(
+            unsafe { align_rt_test_launch_recv_v1(-1, misaligned) },
+            libc::EINVAL
+        );
+
+        let valid = *b"ALTESTL\x01\x07\0\0\0\0\0\0\0";
+        let mut wrong_magic = valid;
+        wrong_magic[0] ^= 1;
+        let mut reserved = valid;
+        reserved[15] = 1;
+        for malformed in [
+            valid[..15].to_vec(),
+            valid.to_vec(),
+            wrong_magic.to_vec(),
+            reserved.to_vec(),
+        ] {
+            let bytes = if malformed == valid {
+                let mut long = malformed;
+                long.push(0);
+                long
+            } else {
+                malformed
+            };
+            let fds = test_datagram_pair();
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        fds[0],
+                        bytes.as_ptr().cast::<core::ffi::c_void>(),
+                        bytes.len(),
+                        0,
+                    )
+                },
+                bytes.len() as isize
+            );
+            let mut ordinal = 99;
+            assert_eq!(
+                unsafe { align_rt_test_launch_recv_v1(fds[1], &mut ordinal) },
+                libc::EPROTO
+            );
+            assert_eq!(ordinal, 0);
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+        }
     }
 
     #[test]

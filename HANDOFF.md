@@ -7,44 +7,12 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-31._ A macOS preflight-restoration prerequisite is active on
-`agent/restore-macos-preflight`. Request 22's reviewed implementation is preserved separately on
-`agent/request22-string-index-impl` at `88ef17c9`; its final preflight exposed three failures already
-present on `main`: Linux-only ELF helpers fail macOS Clippy, an invalid-UTF-8 filename owner assumes
-Linux filesystem behavior, and W13 retries Darwin's exited-leader empty-group `EPERM` forever.
-The accepted W13 contract and implementation now admit only terminal-proved Darwin group races;
-Linux-only ELF inventory code and the raw-byte filename owner are platform-gated. Focused LLVM
-identity tests passed 7/7, static-input tests 28/28, W13 tests 12/12, and the exact workspace
-Clippy gate passed with `-D warnings`. The comprehensive review of `61e9e4fd` found one valid P2:
-leader termination alone did not prove an `EPERM` group was empty. The consolidated repair defers
-that error through direct-child reap and then performs only signal-zero probes until `ESRCH`, so a
-surviving or unsignalable group cannot release the stage or lease and a reused PGID is never
-signalled. The expanded W13 owner passes 13/13 and exact Clippy still passes. Commit the repair,
-rerun affected verification, inspect the repair delta, run exact-head preflight, merge the
-prerequisite, then refresh and publish Request 22. The first repaired-head aggregate then exposed
-one more member of the already-owned invalid-UTF-8 filename class in the native response-file
-round-trip. The complete filesystem audit gates the runtime read-dir and watch-build raw-name owners
-to Linux and omits only that raw filename from the macOS response-path matrix; byte-only encoders and
-CLI arguments remain cross-platform, while Q3 already conditionally asserts only when the host
-creates the name. The previously failing response-file owner now passes and the two Linux owners are
-absent from the macOS test inventory. Amend this bounded preflight repair and rerun exact-head
-preflight.
-
-align-llm Request 22's accepted design is
-`docs/impl/30-borrowed-string-array-index-plan.md`: ordinary `array<string>[i]` becomes the canonical
-non-consuming `str` view, while the
-already-shipped `array<MoveRecord>[i].field` and explicit shared-borrow call paths retain the record
-half of the request. No general reference value, whole Move-record binding, clone, ABI, or runtime
-surface is added. The independent review of `d349700d` found four valid boundary, closure, and
-documentation issues; the consolidated repair preserves existing Index positives, enumerates every
-provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
-registered consumer targets. PR #913 is merged. Because `main` advanced through provenance-adjacent
-Request 21 work, the fresh base-integration review of `93d23e8f` found three valid closure and
-coordination issues. The consolidated repair adds all five borrow-transparent exact-once cells,
-physical-source validation for malformed `SliceIndex`, and the required external Request 22
-`ACCEPTED` register update. The implementation and owner-test closure is complete on the preserved
-implementation branch; its comprehensive review found one bare-`count()` unused-load regression,
-repaired in the consolidated head above.
+_Last updated: 2026-08-31._ `core.test` is implemented against the accepted
+`docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
+PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
+reviewed implementation and owner-test closure are preserved on
+`agent/request22-string-index-impl` at `88ef17c9`. Refresh that branch against current `main` and
+publish it next; then design `std.log` as the next self-hosting layer.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -423,30 +391,18 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Next language capability:** `core.test` is designed in
-  `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
-  explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
-  group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
-  preallocated output/full-row deadline, terminal-observation control barrier, all-terminal
-  pinned-group then direct-PID signalling before reap, nonblocking capture/control drains,
-  evidence retained through reporting, lock-free signal/write arbitration, numeric raw-exit
-  statuses for the four graceful signals, exact handler `errno` preservation, controller-owned
-  terminal summary commit, and
-  failure-only output replay. Compiler formation normalizes final syntactic-tail assertions only
-  at root completion or structural statement placement and freezes
-  the complete production prefix before appending a test-generated function/type/descriptor/
-  capability overlay; production interfaces exclude that overlay, while production MIR/links,
-  optimization remarks, and DB preparation descriptors use its span-erased semantic/codegen
-  projection, including structurally ordered ownership facts and semantic descriptor fields.
-  Before artifact work, test mode rejects every catalog-reachable `process.command` through direct,
-  imported, function-value, lifted, and monomorphized edges; unreachable production use stays
-  unchanged. One suite cwd is fixed after CLI validation, child fd 0..3 are replaced and fd 4+
-  closed, and all build-stage owners finish normal Drop before runner entry. An implicit entry
-  `main` cannot collide with an imported declared `main`, and
-  `align-repl` rejects test-bearing entries transactionally. No dynamic command sentinel or fifth
-  child-control ABI is part of the capability.
-  Implementation is the next
-  code PR; `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
+- **Latest language capability:** `core.test` is implemented against
+  `docs/impl/core-design/test.md`. Private top-level Result tests, explicit Bool assertions,
+  production-prefix/test-overlay isolation, exact compiler-private child-control ABI, distinct
+  cache identity, one immutable linked artifact, and the bounded sequential process-group runner
+  ship together. The owner set fixes production artifact/interface identity, checked-HIR and
+  runtime ABI shape, catalog and harness bytes, timeout/output cleanup, graceful-signal numeric
+  exit, source-main isolation, reachable-`process.command` rejection, and transactional REPL
+  rejection.
+- **Next language capability:** refresh and publish the completed align-llm Request 22 implementation
+  from `agent/request22-string-index-impl` against
+  `docs/impl/30-borrowed-string-array-index-plan.md`, then design `std.log` as the next self-hosting
+  layer. `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,
@@ -457,7 +413,7 @@ facts must live in this repository.
   a `JsonOwnedDecode` input/arena fact. The complete owner passed locally on Apple Silicon and in the
   required macOS CI leg. Request 19 is merged and real-client adopted through align-llm PR #108.
   Request 21's projection-view repair is merged in Align and awaits consumer pin adoption. Request
-  22's string-array indexing design is active and blocks the R7 tokenizer implementation.
+  22's string-array indexing design is merged; its implementation blocks the R7 tokenizer.
 
 Consumer-gated deferrals that remain intentional:
 

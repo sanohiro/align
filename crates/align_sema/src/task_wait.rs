@@ -934,6 +934,8 @@ impl<'a> Analyzer<'a> {
                     Stmt::LetTuple { init, .. }
                     | Stmt::AssignField { value: init, .. }
                     | Stmt::AssignVecLane { value: init, .. }
+                    | Stmt::TestAssert {
+                        condition: init, .. }
                     | Stmt::Expr(init) => {
                         work.push(ReplayWork::StmtAfterClear);
                         work.push(ReplayWork::EvalExpr {

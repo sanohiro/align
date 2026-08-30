@@ -15,16 +15,15 @@ use std::path::Path;
 /// three summary-based entry points, plus the preserve-set / opt-level helpers.
 pub mod thinlto;
 
-/// ThinLTO S0 feasibility spike (feature-gated; historical S0 go/no-go probes).
-#[cfg(feature = "thinlto-spike")]
-pub mod thinlto_spike;
-
+mod drop_codegen;
+mod llvm_build_id;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
-mod drop_codegen;
-mod llvm_build_id;
 mod runtime_abi;
+/// ThinLTO S0 feasibility spike (feature-gated; historical S0 go/no-go probes).
+#[cfg(feature = "thinlto-spike")]
+pub mod thinlto_spike;
 
 pub use llvm_build_id::loaded_llvm_build_id;
 
@@ -450,6 +449,435 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
         rt_lto,
         ModuleScope::Whole,
     )?;
+    write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// One compiler-private test root and its exact external harness dispatch symbol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestRoot {
+    pub function: String,
+    pub symbol: String,
+}
+
+pub fn test_control_runtime_abi_fingerprint() -> Vec<u8> {
+    runtime_abi::test_control_fingerprint()
+}
+
+fn builtin_error_enum_is_exact(program: &Program, id: u32) -> bool {
+    let Some(definition) = program.enums.get(id as usize) else {
+        return false;
+    };
+    if definition.name != "Error"
+        || definition.source_name != "Error"
+        || definition.variants.len() != 5
+    {
+        return false;
+    }
+    let tag_only = |index: usize, name: &str| {
+        let variant = &definition.variants[index];
+        variant.name == name && variant.payload.is_empty() && variant.field_base == 1
+    };
+    let code = &definition.variants[ERROR_VARIANT_CODE as usize];
+    tag_only(0, "NotFound")
+        && tag_only(1, "Invalid")
+        && tag_only(2, "Denied")
+        && tag_only(3, "Timeout")
+        && code.name == "Code"
+        && code.payload.as_slice()
+            == [Scalar::Int(IntTy {
+                bits: 32,
+                signed: true,
+            })]
+        && code.field_base == 1
+}
+
+fn test_root_map(roots: &[TestRoot]) -> Result<HashMap<ProgramCall, String>, CodegenError> {
+    if roots.len() > 65_535 {
+        return Err(CodegenError::Lowering(
+            "test root count exceeds 65,535".to_owned(),
+        ));
+    }
+    let mut mapped = HashMap::with_capacity(roots.len());
+    let mut symbols = HashSet::with_capacity(roots.len());
+    for root in roots {
+        let valid_symbol = root
+            .symbol
+            .strip_prefix("align_test$")
+            .is_some_and(|suffix| {
+                suffix.len() == 8
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !valid_symbol || !symbols.insert(root.symbol.as_str()) {
+            return Err(CodegenError::Lowering(
+                "test root has a malformed or duplicate dispatch symbol".to_owned(),
+            ));
+        }
+        let logical = ProgramCall::try_from_logical(&root.function).map_err(|_| {
+            CodegenError::Lowering("test root has an invalid logical identity".to_owned())
+        })?;
+        if mapped.insert(logical, root.symbol.clone()).is_some() {
+            return Err(CodegenError::Lowering(
+                "test root has a duplicate logical identity".to_owned(),
+            ));
+        }
+    }
+    Ok(mapped)
+}
+
+/// Emit the combined compiler-private test program. Source `main` never owns the C entry in this
+/// mode; catalog roots alone stay externally linkable under their reserved hidden symbols.
+pub fn emit_test_object(
+    program: &Program,
+    roots: &[TestRoot],
+    out: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: Option<&[u8]>,
+) -> Result<(), CodegenError> {
+    let roots = test_root_map(roots)?;
+    for logical in roots.keys() {
+        let function = program
+            .fns
+            .iter()
+            .find(|function| &function.name == logical)
+            .ok_or_else(|| CodegenError::Lowering("test root function is absent".to_owned()))?;
+        if !function.params.is_empty()
+            || !matches!(
+                function.ret,
+                Ty::Result(Scalar::Unit, Scalar::Enum(error))
+                    if builtin_error_enum_is_exact(program, error)
+            )
+        {
+            return Err(CodegenError::Lowering(
+                "test root function has a disagreeing ABI".to_owned(),
+            ));
+        }
+    }
+
+    let ctx = Context::create();
+    let (module, tm) = build_program_module(
+        &ctx,
+        program,
+        target,
+        profile,
+        &[],
+        rt_lto,
+        ModuleScope::Test { roots: &roots },
+    )?;
+    write_object(&module, out, &tm, profile.pipeline())
+}
+
+/// Emit the sole literal C `main` for a test executable. It receives one launch record on fd 3,
+/// acknowledges it, dispatches exactly one catalog root, and reports the returned Result.
+pub fn emit_test_harness_object(
+    root_symbols: &[String],
+    out: &Path,
+    target: &BuildTarget,
+    profile: Profile,
+) -> Result<(), CodegenError> {
+    if root_symbols.is_empty() || root_symbols.len() > 65_535 {
+        return Err(CodegenError::Lowering(
+            "test harness root count is outside 1..=65,535".to_owned(),
+        ));
+    }
+    for (ordinal, symbol) in root_symbols.iter().enumerate() {
+        if symbol != &format!("align_test${ordinal:08x}") {
+            return Err(CodegenError::Lowering(
+                "test harness root order or symbol is malformed".to_owned(),
+            ));
+        }
+    }
+
+    let ctx = Context::create();
+    let module = ctx.create_module("align.test.harness");
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
+    module.set_data_layout(&tm.get_target_data().get_data_layout());
+    module.set_triple(&tm.get_triple());
+    let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
+    let i8_ty = ctx.i8_type();
+    let i32_ty = ctx.i32_type();
+    let error_ty = ctx.struct_type(&[i32_ty.into(), i32_ty.into()], false);
+    let result_ty = ctx.struct_type(&[i8_ty.into(), i32_ty.into(), error_ty.into()], false);
+    let test_ty = result_ty.fn_type(&[], false);
+    let tests = root_symbols
+        .iter()
+        .map(|symbol| {
+            let function = module.add_function(symbol, test_ty, None);
+            mark_nounwind(&ctx, function);
+            function
+        })
+        .collect::<Vec<_>>();
+
+    let native = |key| {
+        let abi = runtime_abi::unkeyed_runtime_abi(key);
+        let function = abi.declare(&ctx, &module);
+        abi.apply_attributes(&ctx, function);
+        function
+    };
+    let launch_recv = native(runtime_abi::UnkeyedRuntimeKey::TestLaunchRecvV1);
+    let fd_cloexec = native(runtime_abi::UnkeyedRuntimeKey::TestFdCloexecV1);
+    let ack = native(runtime_abi::UnkeyedRuntimeKey::TestAckV1);
+    let report = native(runtime_abi::UnkeyedRuntimeKey::TestReportV1);
+
+    let main = module.add_function("main", i32_ty.fn_type(&[], false), None);
+    mark_nounwind(&ctx, main);
+    let builder = ctx.create_builder();
+    let entry = ctx.append_basic_block(main, "entry");
+    let launch_ok = ctx.append_basic_block(main, "launch.ok");
+    let launch_failed = ctx.append_basic_block(main, "launch.failed");
+    let cloexec_ok = ctx.append_basic_block(main, "cloexec.ok");
+    let cloexec_failed = ctx.append_basic_block(main, "cloexec.failed");
+    let ack_ok = ctx.append_basic_block(main, "ack.ok");
+    let ack_failed = ctx.append_basic_block(main, "ack.failed");
+    let dispatch = ctx.append_basic_block(main, "dispatch");
+    let invalid_ordinal = ctx.append_basic_block(main, "ordinal.invalid");
+    let report_block = ctx.append_basic_block(main, "report");
+    let report_ok = ctx.append_basic_block(main, "report.ok");
+    let report_failed = ctx.append_basic_block(main, "report.failed");
+
+    builder.position_at_end(entry);
+    let ordinal_slot = builder
+        .build_alloca(i32_ty, "ordinal.slot")
+        .map_err(lower)?;
+    let result_slot = builder
+        .build_alloca(result_ty, "result.slot")
+        .map_err(lower)?;
+    let fd = i32_ty.const_int(3, false);
+    let launch_status = builder
+        .build_call(
+            launch_recv,
+            &[fd.into(), ordinal_slot.into()],
+            "launch.status",
+        )
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("test launch receive returned void".to_owned()))?
+        .into_int_value();
+    let launch_succeeded = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            launch_status,
+            i32_ty.const_zero(),
+            "launch.succeeded",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(launch_succeeded, launch_ok, launch_failed)
+        .map_err(lower)?;
+
+    builder.position_at_end(launch_failed);
+    builder
+        .build_return(Some(&i32_ty.const_int(120, false)))
+        .map_err(lower)?;
+
+    builder.position_at_end(launch_ok);
+    let ordinal = builder
+        .build_load(i32_ty, ordinal_slot, "ordinal")
+        .map_err(lower)?
+        .into_int_value();
+    let ordinal_valid = builder
+        .build_int_compare(
+            IntPredicate::ULT,
+            ordinal,
+            i32_ty.const_int(root_symbols.len() as u64, false),
+            "ordinal.valid",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(ordinal_valid, cloexec_ok, invalid_ordinal)
+        .map_err(lower)?;
+
+    builder.position_at_end(invalid_ordinal);
+    builder
+        .build_return(Some(&i32_ty.const_int(120, false)))
+        .map_err(lower)?;
+
+    builder.position_at_end(cloexec_ok);
+    let cloexec_status = builder
+        .build_call(fd_cloexec, &[fd.into()], "cloexec.status")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("test fd-cloexec returned void".to_owned()))?
+        .into_int_value();
+    let cloexec_succeeded = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            cloexec_status,
+            i32_ty.const_zero(),
+            "cloexec.succeeded",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(cloexec_succeeded, ack_ok, cloexec_failed)
+        .map_err(lower)?;
+
+    builder.position_at_end(cloexec_failed);
+    builder
+        .build_return(Some(&i32_ty.const_int(121, false)))
+        .map_err(lower)?;
+
+    builder.position_at_end(ack_ok);
+    let ack_status = builder
+        .build_call(ack, &[fd.into(), ordinal.into()], "ack.status")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("test acknowledgement returned void".to_owned()))?
+        .into_int_value();
+    let ack_succeeded = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            ack_status,
+            i32_ty.const_zero(),
+            "ack.succeeded",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(ack_succeeded, dispatch, ack_failed)
+        .map_err(lower)?;
+
+    builder.position_at_end(ack_failed);
+    builder
+        .build_return(Some(&i32_ty.const_int(122, false)))
+        .map_err(lower)?;
+
+    builder.position_at_end(dispatch);
+    let mut cases = Vec::with_capacity(tests.len());
+    for (index, function) in tests.iter().enumerate() {
+        let run = ctx.append_basic_block(main, &format!("test.{index}"));
+        cases.push((i32_ty.const_int(index as u64, false), run));
+        builder.position_at_end(run);
+        let result = builder
+            .build_call(*function, &[], "test.result")
+            .map_err(lower)?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Lowering("test root returned void".to_owned()))?;
+        builder.build_store(result_slot, result).map_err(lower)?;
+        builder
+            .build_unconditional_branch(report_block)
+            .map_err(lower)?;
+    }
+    builder.position_at_end(dispatch);
+    builder
+        .build_switch(ordinal, invalid_ordinal, &cases)
+        .map_err(lower)?;
+
+    builder.position_at_end(report_block);
+    let result = builder
+        .build_load(result_ty, result_slot, "result")
+        .map_err(lower)?
+        .into_struct_value();
+    let result_tag = builder
+        .build_extract_value(result, 0, "result.tag")
+        .map_err(lower)?
+        .into_int_value();
+    let is_error = builder
+        .build_int_compare(
+            IntPredicate::NE,
+            result_tag,
+            i8_ty.const_zero(),
+            "result.is_error",
+        )
+        .map_err(lower)?;
+    let error = builder
+        .build_extract_value(result, 2, "result.error")
+        .map_err(lower)?
+        .into_struct_value();
+    let error_tag = builder
+        .build_extract_value(error, 0, "error.tag")
+        .map_err(lower)?
+        .into_int_value();
+    let error_tag = builder
+        .build_int_truncate(error_tag, i8_ty, "error.tag8")
+        .map_err(lower)?;
+    let error_code = builder
+        .build_extract_value(error, 1, "error.code")
+        .map_err(lower)?
+        .into_int_value();
+    let outcome = builder
+        .build_select(
+            is_error,
+            i8_ty.const_int(1, false),
+            i8_ty.const_zero(),
+            "report.outcome",
+        )
+        .map_err(lower)?
+        .into_int_value();
+    let report_tag = builder
+        .build_select(
+            is_error,
+            error_tag,
+            i8_ty.const_int(255, false),
+            "report.error_tag",
+        )
+        .map_err(lower)?
+        .into_int_value();
+    let report_code = builder
+        .build_select(
+            is_error,
+            error_code,
+            i32_ty.const_zero(),
+            "report.error_code",
+        )
+        .map_err(lower)?
+        .into_int_value();
+    let report_status = builder
+        .build_call(
+            report,
+            &[
+                fd.into(),
+                outcome.into(),
+                report_tag.into(),
+                report_code.into(),
+                ordinal.into(),
+            ],
+            "report.status",
+        )
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("test completion report returned void".to_owned()))?
+        .into_int_value();
+    let report_succeeded = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            report_status,
+            i32_ty.const_zero(),
+            "report.succeeded",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(report_succeeded, report_ok, report_failed)
+        .map_err(lower)?;
+
+    builder.position_at_end(report_failed);
+    builder
+        .build_return(Some(&i32_ty.const_int(123, false)))
+        .map_err(lower)?;
+
+    builder.position_at_end(report_ok);
+    let exit_status = builder
+        .build_select(
+            is_error,
+            i32_ty.const_int(1, false),
+            i32_ty.const_zero(),
+            "test.exit_status",
+        )
+        .map_err(lower)?
+        .into_int_value();
+    builder.build_return(Some(&exit_status)).map_err(lower)?;
+
+    module.verify().map_err(|error| {
+        CodegenError::Lowering(format!(
+            "generated test harness failed LLVM verification: {error}"
+        ))
+    })?;
+    apply_size_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
 }
 
@@ -2527,6 +2955,9 @@ impl std::fmt::Debug for PartitionCodegenView<'_> {
 #[derive(Clone, Copy)]
 enum ModuleScope<'a> {
     Whole,
+    Test {
+        roots: &'a HashMap<ProgramCall, String>,
+    },
     Function {
         selected: &'a ProgramCall,
         definition: &'a ThinPeerDeclaration,
@@ -2537,14 +2968,14 @@ enum ModuleScope<'a> {
 impl ModuleScope<'_> {
     fn defines(self, function: &Function) -> bool {
         match self {
-            ModuleScope::Whole => true,
+            ModuleScope::Whole | ModuleScope::Test { .. } => true,
             ModuleScope::Function { selected, .. } => &function.name == selected,
         }
     }
 
     fn declares(self, function: &Function) -> bool {
         match self {
-            ModuleScope::Whole => true,
+            ModuleScope::Whole | ModuleScope::Test { .. } => true,
             ModuleScope::Function {
                 selected, peers, ..
             } => {
@@ -2561,6 +2992,10 @@ impl ModuleScope<'_> {
     ) -> Result<(String, Option<ThinFunctionLinkage>), CodegenError> {
         match self {
             ModuleScope::Whole => Ok((symbol_name(function, exports), None)),
+            ModuleScope::Test { roots } => Ok(match roots.get(&function.name) {
+                Some(symbol) => (symbol.clone(), Some(ThinFunctionLinkage::UnitLocal)),
+                None => (encoded_program_symbol(&function.name), None),
+            }),
             ModuleScope::Function {
                 selected,
                 definition,
@@ -2578,7 +3013,15 @@ impl ModuleScope<'_> {
     }
 
     fn emits_resource_thunks(self) -> bool {
+        matches!(self, ModuleScope::Whole | ModuleScope::Test { .. })
+    }
+
+    fn emits_main_wrapper(self) -> bool {
         matches!(self, ModuleScope::Whole)
+    }
+
+    fn is_test(self) -> bool {
+        matches!(self, ModuleScope::Test { .. })
     }
 }
 
@@ -2595,7 +3038,7 @@ fn build_module<'c>(
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
     match scope {
-        ModuleScope::Whole => validate_tagged_program(program)?,
+        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
         ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
     }
     validate_resource_program(program)?;
@@ -2888,6 +3331,7 @@ fn build_module<'c>(
             program,
             exports,
             partition_linkage,
+            scope.is_test(),
         );
         program_funcs.insert(f.name.clone(), fv);
     }
@@ -3461,7 +3905,8 @@ fn build_module<'c>(
     // previously a `()`-returning `main` WAS the C entry directly, declared `void`, and `ret void`
     // left the C ABI's i32 return register undefined; see `docs/open-questions.md` "Unit-returning
     // `fn main()` yields a nondeterministic exit code").
-    if let Some(f) =
+    if scope.emits_main_wrapper()
+        && let Some(f) =
         program.fns.iter().filter(|function| scope.defines(function)).find(|f| {
             f.name.as_str() == "main"
                 && (matches!(f.ret, Ty::Result(..)) || f.ret == Ty::Unit)
@@ -4132,34 +4577,6 @@ fn validate_tagged_program_inner(
             }
         }
         Ok(())
-    }
-
-    fn builtin_error_enum_is_exact(program: &Program, id: u32) -> bool {
-        let Some(definition) = program.enums.get(id as usize) else {
-            return false;
-        };
-        if definition.name != "Error"
-            || definition.source_name != "Error"
-            || definition.variants.len() != 5
-        {
-            return false;
-        }
-        let tag_only = |index: usize, name: &str| {
-            let variant = &definition.variants[index];
-            variant.name == name && variant.payload.is_empty() && variant.field_base == 1
-        };
-        let code = &definition.variants[ERROR_VARIANT_CODE as usize];
-        tag_only(0, "NotFound")
-            && tag_only(1, "Invalid")
-            && tag_only(2, "Denied")
-            && tag_only(3, "Timeout")
-            && code.name == "Code"
-            && code.payload.as_slice()
-                == [Scalar::Int(IntTy {
-                    bits: 32,
-                    signed: true,
-                })]
-            && code.field_base == 1
     }
 
     fn main_result_is_exact(program: &Program, ret: Ty) -> bool {
@@ -6575,7 +6992,8 @@ fn callable_preflight(
             format!("extern:{}", callable_hex(&function.name)),
         )?;
     }
-    if program
+    if scope.emits_main_wrapper()
+        && program
         .fns
         .iter()
         .any(|function| scope.defines(function) && function.name.as_str() == "main")
@@ -8436,6 +8854,7 @@ fn declare_fn<'c>(
     program: &Program,
     exports: &[String],
     partition_linkage: Option<ThinFunctionLinkage>,
+    test_mode: bool,
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
@@ -8485,7 +8904,8 @@ fn declare_fn<'c>(
     //    so a dependent unit's object can resolve the cross-unit call. `f.exportable` is set only by
     //    per-unit lowering; the whole-program path leaves it `false`, so the default object is
     //    byte-identical (every function but `main`/`--export` still internalizes).
-    let direct_main = f.name.as_str() == "main"
+    let direct_main = !test_mode
+        && f.name.as_str() == "main"
         && !matches!(f.ret, Ty::Result(..))
         && f.ret != Ty::Unit;
     let explicit_export = f.name.as_str() != "main"
@@ -20641,7 +21061,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Some(align_sema::hir::TaggedType::Option(payload)) => (*payload, option_struct_type(self.ctx, *payload, self.struct_types, self.enum_types, self.tagged_types)),
                             _ => return Err(self.err("borrowed place Option projection has the wrong type")),
                         },
-                        _ => return Err(self.err("borrowed place Option projection crosses a non-Option type")),
+                        _ => return Err(self.err("borrowed place Option projection crosses a non-Option type",
+                            )),
                     };
                     ptr = self.builder.build_struct_gep(option_ty, ptr, 1, "borrow.option.some").map_err(|e| self.err(e))?;
                     ty = align_sema::scalar_to_ty(payload);
@@ -20654,7 +21075,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Some(align_sema::hir::TaggedType::Result(ok, err)) => (*ok, *err, result_struct_type(self.ctx, *ok, *err, self.struct_types, self.enum_types, self.tagged_types)),
                             _ => return Err(self.err("borrowed place Result projection has the wrong type")),
                         },
-                        _ => return Err(self.err("borrowed place Result projection crosses a non-Result type")),
+                        _ => return Err(self.err("borrowed place Result projection crosses a non-Result type",
+                            )),
                     };
                     let is_ok = matches!(segment, align_sema::hir::BorrowedPathSegment::ResultOk);
                     ptr = self

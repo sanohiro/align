@@ -36,11 +36,25 @@ pub enum Vis {
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(FnDecl),
+    Test(TestDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
     Resource(ResourceDecl),
     Const(ConstDecl),
     Extern(ExternBlock),
+}
+
+/// A compiler-private in-language test declaration: `test "name" { ... }`.
+///
+/// `test` remains a contextual identifier. This node is formed only by the exact item-position
+/// `test` + string lookahead and creates no language-visible callable or name binding.
+#[derive(Clone, Debug)]
+pub struct TestDecl {
+    /// Decoded contents of the ordinary Align string token.
+    pub name: String,
+    pub name_span: Span,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// A package-defined opaque Move resource: `pub resource conn = pkg.internal.drop_conn`.
@@ -180,7 +194,7 @@ pub struct Param {
 
 /// Function parameter ownership/access mode. The parser treats `out`, `borrow`, and `borrow mut`
 /// contextually so the same words remain available as ordinary identifiers and type names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ParamMode {
     ByValue,
     Out,
@@ -297,7 +311,7 @@ pub enum Stmt {
     Expr(Expr),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -322,7 +336,7 @@ pub enum BinOp {
     Shr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum UnOp {
     Neg,
     Not,

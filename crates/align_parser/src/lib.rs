@@ -96,6 +96,7 @@ fn cap_expr_depths(file: &mut File, diags: &mut Diagnostics) {
                 FnBody::Block(b) => cap_block_depth(b, 1, diags),
                 FnBody::Expr(e) => cap_expr_depth(e, 1, diags),
             },
+            Item::Test(test) => cap_block_depth(&mut test.body, 1, diags),
             Item::Const(c) => cap_expr_depth(&mut c.value, 1, diags),
             // Structs / enums / extern blocks carry no expression bodies.
             Item::Struct(_) | Item::Enum(_) | Item::Resource(_) | Item::Extern(_) => {}
@@ -539,6 +540,10 @@ impl<'a> Parser<'a> {
                     .error("`pub` is not allowed on an `extern` declaration (a foreign symbol is already global)", self.span());
             }
             self.parse_extern().map(Item::Extern)
+        } else if matches!(self.peek(), TokKind::Ident(word) if word == "test")
+            && matches!(self.peek_at(1), TokKind::Str(_))
+        {
+            self.parse_test(vis).map(Item::Test)
         } else if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
         } else if matches!(self.peek(), TokKind::Ident(word) if word == "resource")
@@ -572,6 +577,49 @@ impl<'a> Parser<'a> {
                 .error("expected `fn`, a type declaration, or a constant (`NAME := …`) at top level", self.span());
             None
         }
+    }
+
+    /// Contextual compiler-private declaration: `test "name" { ... }`.
+    ///
+    /// The two-token lookahead in [`Self::parse_item`] has already committed to this declaration,
+    /// so every other declaration shape is diagnosed as a malformed test instead of falling back
+    /// to a keyword-less type declaration.
+    fn parse_test(&mut self, vis: Vis) -> Option<TestDecl> {
+        let start = self.span();
+        self.bump(); // contextual `test`
+        let name_token = self.bump();
+        let name_span = name_token.span;
+        let TokKind::Str(name) = name_token.kind else {
+            self.diags
+                .error("a test declaration requires a string name", name_span);
+            return None;
+        };
+        if matches!(vis, Vis::Pub) {
+            self.diags
+                .error("a test declaration is private and cannot be `pub`", start);
+        }
+        if !self.at(&TokKind::LBrace) {
+            self.diags.error(
+                "a test declaration must be `test \"name\" { ... }` with no parameters, type parameters, return type, expression body, attributes, or declaration name",
+                self.span(),
+            );
+            // Recovery stays committed to the test: skip its forbidden signature/name tail and,
+            // when present, parse the following block so the next top-level item remains aligned.
+            while !matches!(self.peek(), TokKind::LBrace | TokKind::End | TokKind::Eof) {
+                self.bump();
+            }
+            if self.at(&TokKind::End) || self.at(&TokKind::Eof) {
+                return None;
+            }
+        }
+        let body = self.parse_block()?;
+        let span = start.merge(body.span);
+        Some(TestDecl {
+            name,
+            name_span,
+            body,
+            span,
+        })
     }
 
     /// Contextual opaque resource declaration:
@@ -1979,6 +2027,41 @@ mod tests {
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
         (f, d.has_errors())
+    }
+
+    #[test]
+    fn contextual_test_declaration_and_type_twins() {
+        let (file, errors) =
+            parse("test \"decodes\\nname\" { value := 1 }\ntest {}\npub test {}\n");
+        assert!(!errors);
+        let Item::Test(test) = &file.items[0] else {
+            panic!("expected contextual test")
+        };
+        assert_eq!(test.name, "decodes\nname");
+        assert_eq!(test.body.stmts.len(), 1);
+        assert!(matches!(file.items[1], Item::Struct(_)));
+        assert!(matches!(file.items[2], Item::Struct(_)));
+    }
+
+    #[test]
+    fn committed_test_near_shapes_reject_without_losing_the_next_item() {
+        for source in [
+            "pub test \"visible\" {}\nfn good() -> i32 = 0\n",
+            "test \"params\"() {}\nfn good() -> i32 = 0\n",
+            "test \"generic\"<T> {}\nfn good() -> i32 = 0\n",
+            "test \"return\" -> i32 {}\nfn good() -> i32 = 0\n",
+            "test \"expr\" = ()\nfn good() -> i32 = 0\n",
+            "test \"named\" extra {}\nfn good() -> i32 = 0\n",
+        ] {
+            let (file, errors) = parse(source);
+            assert!(errors, "malformed test unexpectedly accepted: {source}");
+            assert!(
+                file.items
+                    .iter()
+                    .any(|item| matches!(item, Item::Fn(function) if function.name.name == "good")),
+                "recovery lost the following declaration: {source}"
+            );
+        }
     }
 
     #[test]
