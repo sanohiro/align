@@ -239,11 +239,28 @@ Its base64 body uses the standard alphabet, canonical final padding, and LF or C
 every non-final body line is exactly 64 base64 characters and the final body line is 4..=64
 characters in a multiple of four. The exact matching END line follows immediately. At most one
 final LF or CRLF is accepted; leading text, horizontal whitespace, a second block, or any other
-trailing byte rejects. The decoded payload must be one complete BER/DER object with no trailing
-octet: unencrypted PKCS#8 `PrivateKeyInfo` / `OneAsymmetricKey` for `PRIVATE KEY`, or
-`SubjectPublicKeyInfo` for `PUBLIC KEY`. `ENCRYPTED PRIVATE KEY`, traditional `RSA PRIVATE KEY` /
-`EC PRIVATE KEY`, certificates, and OpenSSH keys therefore reject before any password, terminal,
-file, network, or environment lookup can occur.
+trailing byte rejects. The decoded payload must be one complete canonical DER object with no
+trailing octet: an unencrypted PKCS#8 v1 `PrivateKeyInfo` whose version INTEGER is exactly zero for
+`PRIVATE KEY`, or `SubjectPublicKeyInfo` for `PUBLIC KEY`. A standard optional `[0]` attributes set
+is accepted in `PrivateKeyInfo` but cannot select an algorithm/provider or affect the imported key.
+RFC 5958 `OneAsymmetricKey` version one, including its optional public-key field, rejects; OpenSSL
+3.0 cannot decode that form through the admitted path. `ENCRYPTED PRIVATE KEY`, traditional
+`RSA PRIVATE KEY` / `EC PRIVATE KEY` (including their DER payload relabeled as `PRIVATE KEY`),
+certificates, and OpenSSH keys therefore reject before any password, terminal, file, network, or
+environment lookup can occur.
+
+Private DER has exactly one decoder path. A bounded non-allocating DER envelope walk first requires
+the top-level SEQUENCE's first child to be the canonical three octets `INTEGER, length 1, value 0`
+and its `AlgorithmIdentifier` to be the exact constructor algorithm: `rsaEncryption` with NULL
+parameters, `id-ecPublicKey` with named-curve `prime256v1`, or id-Ed25519 with absent parameters.
+Then `d2i_PKCS8_PRIV_KEY_INFO`, `PKCS8_pkey_get0` agreement, complete-cursor checks, byte-for-byte comparison with
+`i2d_PKCS8_PRIV_KEY_INFO` canonical re-encoding, and finally
+`EVP_PKCS82PKEY_ex` in the owned library context with `provider=default`. It never calls
+`d2i_AutoPrivateKey_ex`, so a PKCS#1 RSA or SEC1 EC object cannot enter through an auto-detected
+legacy format. The same non-allocating envelope check fixes the public SPKI algorithm identifier
+before OpenSSL. Public DER then uses `d2i_PUBKEY_ex` in that context and requires complete cursor
+consumption plus byte-for-byte `i2d_PUBKEY` canonical re-encoding. Every private re-encoding scratch
+is secret storage and follows the same cleanse-before-free rule as decoded private DER.
 
 After decoding, the constructor requires the exact advertised key class and algorithm. RSA keys
 must have a 2048..=8192-bit odd modulus and an odd public exponent `>= 3` that fits in an unsigned
@@ -298,13 +315,24 @@ future carrier. Keys have no borrowed input lifetime and no process-global regis
 signing or verification call keeps the owner usable afterward and cannot retain the message or
 signature view.
 
-Private scalar material stays inside the provider-owned key and is released by `EVP_PKEY_free`;
-the runtime does not copy it into an Align `buffer`. The caller-owned PEM `str` remains the caller's
-storage and is not zeroized. PEM scanning borrows the at-most-65,536-byte input and the memory BIO
-uses its explicit length. JWK construction uses only bounded component views and a 65-byte stack EC
-point. Ed25519 validation allocates a fixed-count set of public-data BN temporaries only during
-construction. Provider, library-context, operation-context, key, BN, and shell allocations are
-fallible and are released on every failure.
+Private scalar material never enters an Align `buffer`. The caller-owned PEM `str` remains the
+caller's storage and is not zeroized. PEM scanning borrows the at-most-65,536-byte input. Base64
+decoding computes its exact output length with checked arithmetic, calls fallible `OPENSSL_malloc`
+once, and stores the result as `SensitiveDer { ptr: NonNull<u8>, len: usize }`. It decodes directly
+into that fixed non-growing allocation without an intermediate native copy. Its Drop calls
+`OPENSSL_clear_free(ptr, len)` on success and every post-allocation base64, DER, import, validation,
+or later-allocation failure. The buffer is dropped immediately
+after the provider has imported the key. Every private canonical-re-encoding scratch uses
+`OPENSSL_clear_free`. The `PKCS8_PRIV_KEY_INFO` and imported `EVP_PKEY` remain OpenSSL-owned and are
+released by `PKCS8_PRIV_KEY_INFO_free` and `EVP_PKEY_free`; acceptance pins the OpenSSL 3.0 cleanup
+dependency that the PKCS#8 ASN.1 free callback cleanses its private octets and
+`EVP_PKCS82PKEY_ex` clear-frees its internal encoded import buffer. No wrapper pointer into either
+object survives its owning call.
+
+JWK construction uses only bounded component views and a 65-byte stack EC point. Ed25519 validation
+allocates a fixed-count set of public-data BN temporaries only during construction. Provider,
+library-context, operation-context, key, BN, PKCS#8, re-encoding, and shell allocations are fallible
+and are released on every failure.
 
 Signing and verification borrow the complete message without an Align-side message copy. RS256
 and ES256 use incremental EVP digest-sign/verify; Ed25519 uses the required one-shot pure-EdDSA
@@ -319,9 +347,10 @@ provider verification. `Ok(true)` means verification under the exact named algor
 Every constructor, sign, and verify operation is **Impure** because it crosses EVP. There is no
 shared key cache or mutable wrapper-global state, so calls over independent keys may overlap. Each
 constructor creates an ordinary `OSSL_LIB_CTX`, explicitly loads the built-in provider named
-`default`, and uses the exact property query `provider=default` for `_ex` decoding, `fromdata`, and
-signature/digest fetches: `d2i_AutoPrivateKey_ex`, `d2i_PUBKEY_ex`,
-`EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`, and `EVP_DigestSignInit_ex`/
+`default`, and uses the exact property query `provider=default` for import, `_ex` decoding,
+`fromdata`, and signature/digest fetches: `d2i_PKCS8_PRIV_KEY_INFO` followed by
+`EVP_PKCS82PKEY_ex`, `d2i_PUBKEY_ex`, `EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`, and
+`EVP_DigestSignInit_ex`/
 `EVP_DigestVerifyInit_ex` are the admitted construction/operation families. It never uses a
 null/global library context, loads an OpenSSL configuration,
 changes a provider search path or default property, or loads another provider. The resulting
@@ -366,6 +395,32 @@ valid, every signature length, encoding, or mathematical mismatch is data (`Ok(f
 error. Allocation failure, parse failure, and signing failure never publish a partial key or
 signature.
 
+OpenSSL's thread-local error queue is operation-local wrapper state, not an ambient input. Immediately
+before each fallible OpenSSL call the wrapper calls `ERR_clear_error`; it classifies and drains the
+queue immediately after that call, then clears it before returning or making the next call. A
+successful call also clears incidental entries. These calls are synchronous and make no callback
+into Align, so no same-thread operation can interleave between clear and drain; independent runtime
+threads have independent queues. A stale caller/provider error present on entry is deliberately
+discarded and cannot change the result.
+
+Failure classification is closed and ordered:
+
+| Failing operation | `Error.Invalid` evidence | `Error.Code(0)` evidence |
+|---|---|---|
+| wrapper PEM/base64/DER version/canonical/complete-cursor or JWK checks | direct checked rejection; OpenSSL is not consulted for the result | checked allocation/length arithmetic failure |
+| `d2i_PKCS8_PRIV_KEY_INFO` or `d2i_PUBKEY_ex` | a non-empty drained queue containing only the checked-in ASN.1 input-decode reason set, including the common `ERR_R_NESTED_ASN1_ERROR`/`ERR_R_MISSING_ASN1_EOS` wrappers | empty queue; `ERR_SYSTEM_ERROR`; fatal, malloc, internal, fetch, or unsupported reason; any other common or non-ASN.1 entry; any entry outside the closed set |
+| `i2d_PKCS8_PRIV_KEY_INFO` or `i2d_PUBKEY` | none; byte mismatch after successful re-encoding is a wrapper canonical-DER rejection | every call or allocation failure |
+| `EVP_PKCS82PKEY_ex` or JWK `fromdata` | every entry belongs to the checked-in ASN.1/RSA/EC input-rejection set or is one of `EVP_R_DECODE_ERROR`, `EVP_R_PRIVATE_KEY_DECODE_ERROR`, `EVP_R_INVALID_KEY`, `EVP_R_INVALID_KEY_LENGTH`, `EVP_R_INVALID_SEED_LENGTH`, `PROV_R_BAD_ENCODING`, `PROV_R_BAD_LENGTH`, `PROV_R_INVALID_DATA`, `PROV_R_INVALID_KEY`, `PROV_R_INVALID_KEY_LENGTH`, or `PROV_R_INVALID_SEED_LENGTH` | empty queue; `ERR_SYSTEM_ERROR`; fatal, malloc, internal, fetch, or unsupported reason; any entry outside the closed input set |
+| provider private/public/pairwise check | documented zero invalid result with no resource/internal entry | negative/unsupported result, empty failure queue, or any resource/internal entry |
+| provider/context/fetch/pointer-provenance/sign/verify setup or engine call | none; verify's documented mismatch is separately `Ok(false)` | every failure |
+
+`Error.Code(0)` dominates a mixed queue. The implementation classifies with `ERR_SYSTEM_ERROR`,
+`ERR_GET_LIB`, `ERR_GET_REASON`, and `ERR_GET_RFLAGS` against symbolic library/reason constants,
+never localized text or unstable numeric literals. The complete set lives next to the classifier,
+is equality-tested against this table's named families, and an OpenSSL version change may only add a
+reason through a reviewed owner vector; an empty or future unknown failure therefore fails closed to
+`Error.Code(0)`.
+
 For a multi-invalid runtime call, validation order is exact:
 
 1. require a non-null, naturally aligned ABI output slot and zero it, then validate the closed
@@ -380,12 +435,15 @@ For a multi-invalid runtime call, validation order is exact:
 4. validate public structural lengths. PEM is `1..=65,536`; JWK uses the exact component bounds
    above; an empty message is valid. Once both verify views are valid, a wrong signature length
    publishes `false` before reading message contents;
-5. validate the PEM envelope/base64 and obtain its bounded decoded bytes, or validate the cheap JWK
-   numeric/component encoding;
-6. create the private library context and explicit built-in default provider; decode exactly one
-   complete object/import with `provider=default`, require the exact key algorithm/class/size/group,
-   run the applicable provider key check, run the independent Ed25519 public-point check where
-   applicable, and require the key's provider pointer to equal the owned provider;
+5. validate the PEM envelope/base64, allocate the exact decoded buffer, and decode into
+   `SensitiveDer`, or validate the cheap JWK numeric/component encoding;
+6. create the private library context and explicit built-in default provider; for private input use
+   only the PKCS#8-specific decode/version/canonical/import sequence above, and for public input
+   decode one complete canonical SPKI, scoping and classifying each error queue before proceeding;
+   require the exact key algorithm/class/size/group, run the applicable provider key check, run the
+   independent Ed25519 public-point check where applicable, and require the key's provider pointer
+   to equal the owned provider. Cleanse and release all private decode/re-encoding storage before
+   publishing the shell;
 7. create the operation context in that private context with `provider=default`, require its provider
    pointer to equal the owned provider, set the exact digest/padding/group parameters, and run the
    engine;
@@ -450,15 +508,17 @@ reviewer's later discovery.
 |---|---|---|
 | Type formation and interface | six no-import bare fallbacks plus six import-required qualified names; local-shadow/entry-collision/import-use rules; Copy rejected; Move and return-cleanup reconstruction; canonical kind/tag round-trip and exact next-unknown rejection | `align_interface::summary` builtin/source-import sweep; `align_mir::canonical_graph` exact goldens; `crypto_asymmetric::type_identity_matrix` whole/per-unit |
 | Carrier closure | Admit local, by-value/return/shared-borrow, struct/sum/Option/Result, and recursively dropped fixed/dynamic AoS Move-struct arrays. Reject direct or tagged/sum key elements in fixed/dynamic scalar arrays, slices, vectors/masks, builders, and pipelines; tuple/box; closure/task/parallel capture; `out`/`borrow mut`; global/constant; user-native/`layout(C)`; print/equality/order/hash. A future carrier fails closed. | one parameterized sema/checked-HIR `signature_key_carrier_matrix`, recursive DropPlan/codegen owner, malformed future-kind negative |
-| Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one complete shell owner, failure leaves null; wrong label/algorithm/class/curve/size/component and exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix` |
+| Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one complete shell owner, failure leaves null; private input is exact canonical PKCS#8 v1 `PrivateKeyInfo` version zero through the dedicated decoder/import path; wrong label, relabeled PKCS#1/SEC1 DER, `OneAsymmetricKey`, trailing/noncanonical DER, algorithm/class/curve/size/component, and exact 65,536/65,537 PEM boundary reject | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix`, including relabeled legacy and version-one negatives |
 | Ed25519 point admission | Every SPKI/JWK public value and every PKCS#8-derived public value passes wrapper-owned RFC 8032 compressed recovery, canonical `y`, sign-bit, curve-equation, re-encoding, and `[8]A != identity` checks independently of provider `public_check`; BN failure and invalid point remain distinct errors | direct positive RFC 8032 vectors; `y >= p`, nonsquare, `x=0/sign=1`, re-encoding, identity and all seven other small-order negatives through PEM and JWK; injected BN/raw-public-extraction failures and private-constructor helper-call assertion; a provider-check-success case cannot override wrapper rejection |
 | Move-in/out and cleanup | local bind, by-value parameter/return, shared borrow, struct/sum/Option/Result construction, `?`, `else`, `match`, `map_err`, branch/loop joins, replacement, early return, and ordinary/malformed Drop each preserve one kind and exactly-one free; source nulling precedes any later Drop | parameterized `crypto_asymmetric::ownership_matrix`; runtime free counter/failpoints; checked-HIR one-field negatives |
 | Sign/verify semantics | empty/binary/large messages; RS256 padding+digest and modulus-width result; ES256 DER/raw conversion including leading zeros and invalid r/s; Ed25519 one-shot no-digest; valid/wrong-message/wrong-key/wrong-length signatures; key remains usable | RFC 7515/7518, RFC 8032/8410, and OpenSSL-cross-checked vectors in runtime and `crypto_asymmetric` |
-| FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; libctx/provider/ctx/key/BIO/BIGNUM/signature/shell storage frees on every injected failure; final free order is PKEY, thread-local context cleanup, provider, libctx, shell; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot and failpoint sweeps, ABI declaration golden, capability-linking twins |
+| Private decoder and secret cleanup | Base64 decodes directly into one exact-length `OPENSSL_malloc` allocation owned by non-growing `SensitiveDer`; success and every failure use `OPENSSL_clear_free`. Only the wrapper version/algorithm check → `d2i_PKCS8_PRIV_KEY_INFO` → canonical/full-consumption checks → `EVP_PKCS82PKEY_ex` path is admitted; private re-encoding scratch clear-frees; PKCS#8 object and import-copy native cleanse dependencies are pinned. | cleanse spy and allocation failpoints at decode/DER/import/validation/success; optimized source/LLVM/API audit keeps `OPENSSL_clear_free` live; relabeled PKCS#1/SEC1, version-one, attributes, noncanonical, trailing, and malformed-inner owner vectors |
+| OpenSSL error classification | Each fallible call clears, immediately drains/classifies, and re-clears its thread-local queue. Direct invalid input and the closed input-reason set map Invalid; empty/unknown/system/fatal/resource/internal/fetch/unsupported map Code; Code dominates mixed stacks; stale entry and independent-thread queues cannot affect a call. | malformed ASN.1 and inner-key vectors for all algorithms; injected allocation at decoder/import; stale, empty, unknown, mixed-invalid-plus-allocation, queue-empty-on-exit, and parallel independent-queue owners |
+| FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; libctx/provider/ctx/key/PKCS#8/DER/BIGNUM/signature/shell storage frees on every injected failure; final free order is PKEY, thread-local context cleanup, provider, libctx, shell; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot, cleanse, error-queue, and failpoint sweeps; ABI declaration golden; capability-linking twins |
 | Provider provenance | Each shell owns a private ordinary libctx and its explicitly loaded built-in default provider; all decode/import/signature/digest fetches use exact `provider=default`; key and operation provider pointers equal the owned pointer; no global ctx/config/search path/default property/provider is consumed | child-process owner with hostile `OPENSSL_CONF`/`OPENSSL_MODULES`, global null provider, and incompatible global default properties; exact pointer assertions; independent-key overlap and teardown stress |
 | Constant-time boundary | Constructor parsing/checking, including public BN validation, is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the pointer-verified built-in default provider primitive is the named dependency. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact `_ex` libctx/property/provider-pointer and EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
 | Compilation paths | direct/imported calls, public key-bearing signatures, function values, generic monomorphization around a concrete key, whole-program/per-unit compilation, object/frontend cache edit/revert, optimized/unoptimized LLVM, and malformed HIR carry identical algorithm/kind/effect/cleanup facts | `crypto_asymmetric` driver owner, interface/cache owners, checked-HIR validator matrix |
-| Resource claim | PEM exact limit, RSA size bound, one private libctx/provider/PKEY shell per live key, fixed-count Ed public BN temporaries only during construction, fixed ES/Ed operation temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation record plus deterministic limit tests |
+| Resource claim | PEM exact limit, RSA size bound, one private libctx/provider/PKEY shell per live key, one exact wrapper `SensitiveDer` plus bounded OpenSSL-owned PKCS#8/import storage only during private construction, fixed-count Ed public BN temporaries, fixed ES/Ed operation temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation and private-construction peak/cleanse record plus deterministic limit tests |
 
 The implementation is one capability PR even though it is expected to exceed roughly 1,000
 hand-written changed lines. The six static types, their constructors, runtime kind checks, and the
@@ -474,7 +534,8 @@ implementation continues.
 
 Acceptance requires the complete matrix above, `scripts/cargo.sh test -p align_runtime`, the focused
 `crypto_asymmetric` driver owner, interface/canonical/ABI goldens, capability-linking twins, the
-constant-time boundary audit, bounded PR gate, and Clippy. The local benchmark runs only because
+private-decoder/cleanse/error-queue and constant-time boundary audits, bounded PR gate, and Clippy.
+The local benchmark runs only because
 this ledger makes an explicit message-copy/resource claim; it is not a correctness or
 constant-time gate and sets no latency target.
 
@@ -491,6 +552,9 @@ constant-time gate and sets no latency target.
 | P1 provider provenance was only an ambient assumption | Reopened the provider axis: every key owns an isolated libctx and built-in default provider, every fetch uses `provider=default`, key/operation pointers are checked, teardown is ordered, and hostile-global child tests own substitution. |
 | P1 Ed25519 provider check did not validate the encoded point | Reopened point admission: the wrapper independently performs canonical RFC 8032 recovery, curve/re-encoding checks, and complete small-order rejection for PEM, JWK, and private-derived public values. |
 | P2 two HTTP tail sentences still claimed implementation was pending | Corrected the remaining `draft.md` and condensed-spec status sentences to the implemented state. |
+| P1 decoded private DER had no cleanse owner | Reopened private-decoder cleanup: exact-length non-growing `SensitiveDer` and every private re-encoding scratch clear-free on success and every failure, with native PKCS#8/import cleanup dependencies and optimized-artifact/failpoint owners. |
+| P2 the auto private decoder admitted relabeled legacy DER | Removed `d2i_AutoPrivateKey_ex`; only canonical version-zero `PrivateKeyInfo` through the PKCS#8-specific decoder/import path is admitted, with relabeled PKCS#1/SEC1 and `OneAsymmetricKey` negatives. |
+| P2 decoder null conflated invalid input with allocation/engine failure | Added per-call error-queue isolation, a closed input-reason set, Code-dominant mixed-stack precedence, and malformed/allocation/stale/empty/unknown/parallel owners. |
 
 This section is the source of truth. Its public types/signatures and algorithm/error/ownership
 contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-questions.md`,

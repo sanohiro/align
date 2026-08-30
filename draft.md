@@ -3185,21 +3185,25 @@ crypto.ed25519_verify(borrow key: ed25519_public_key, message: bytes, signature:
 
 RS256 is RSASSA-PKCS1-v1_5 with SHA-256. ES256 is P-256 ECDSA with SHA-256 and uses the
 JOSE 64-byte `r || s` signature rather than DER. Ed25519 is pure Ed25519 with no caller-selected
-digest, context, or prehash. The PEM constructors accept one bounded unencrypted PKCS#8
-`PRIVATE KEY` or SPKI `PUBLIC KEY`; encrypted/traditional/certificate/OpenSSH forms reject without
-a password or ambient I/O. The JWK constructors take already-base64url-decoded public fields and
+digest, context, or prehash. The PEM constructors accept one bounded unencrypted canonical PKCS#8
+v1 `PrivateKeyInfo` with version zero under `PRIVATE KEY`, or canonical SPKI under `PUBLIC KEY`;
+`OneAsymmetricKey` and encrypted/traditional/certificate/OpenSSH forms reject without a password or
+ambient I/O. Private input uses only the PKCS#8-specific decoder/import path, and every wrapper-owned
+decoded or re-encoded private DER buffer is cleansed before free. The JWK constructors take
+already-base64url-decoded public fields and
 perform complete algorithm/size/point validation. Each key is an independent Move owner of a shell
 that pins a private OpenSSL context and its built-in default provider; every fetch uses exact
 `provider=default`, and global provider configuration cannot substitute it. Ed25519 point admission
 independently checks canonical RFC 8032 recovery and rejects small-order public points rather than
 delegating that invariant to `EVP_PKEY_public_check`. Sign/verify borrow the key and complete message.
-Constructor/key-format or malformed internal ABI
-input is `Error.Invalid`, a provider/allocation failure is `Error.Code(0)`, and every signature
+Constructor/key-format or malformed internal ABI input is `Error.Invalid`; each OpenSSL call clears
+and drains its thread-local error queue, with only the closed input-rejection set mapping Invalid and
+empty/unknown/resource/internal/fetch failures mapping `Error.Code(0)`. Every signature
 length/encoding/mathematical mismatch after valid byte views is `Ok(false)`. Key construction is a
 trusted setup operation with no timing promise. Signing an admitted key is constant-time with
 respect to private-key/message contents at fixed public lengths under the pointer-verified built-in
-OpenSSL default-provider dependency. The exact PEM grammar, RSA bounds, validation order,
-ownership/allocation rules, ABI,
+OpenSSL default-provider dependency. The exact PEM grammar, RSA bounds, validation/error precedence,
+private-secret cleanup, ownership/allocation rules, ABI,
 cache identity, timing boundary, and closure matrix are authoritative in
 `docs/impl/std-design/crypto.md`.
 

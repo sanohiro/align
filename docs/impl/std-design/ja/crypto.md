@@ -160,11 +160,30 @@ UTF-8 であり、各 constructor は最初に `1..=65,536` bytes を要求し e
 padding、LF/CRLF line ending を使う。non-final body line は exact 64 base64 characters、final
 body line は 4..=64 characters かつ4の倍数である。対応する exact END line が直後に続く。
 final LF/CRLF は高々1つ。leading text、horizontal whitespace、second block、その他の trailing
-byte は reject する。decoded payload は trailing octet のない complete BER/DER object 1つで
-なければならない。`PRIVATE KEY` は unencrypted PKCS#8 `PrivateKeyInfo` /
-`OneAsymmetricKey`、`PUBLIC KEY` は `SubjectPublicKeyInfo` である。したがって
-`ENCRYPTED PRIVATE KEY`、traditional `RSA PRIVATE KEY` / `EC PRIVATE KEY`、certificate、
-OpenSSH key は password/terminal/file/network/environment lookup より前に reject する。
+byte は reject する。decoded payload は trailing octet のない complete canonical DER object
+1つでなければならない。`PRIVATE KEY` は version INTEGER が exact zero の unencrypted PKCS#8
+v1 `PrivateKeyInfo`、`PUBLIC KEY` は `SubjectPublicKeyInfo` である。`PrivateKeyInfo` の standard
+optional `[0]` attributes set は accept するが、algorithm/provider を select できず imported key
+にも影響しない。optional public-key field を含む RFC 5958 `OneAsymmetricKey` version one は
+reject する。OpenSSL 3.0 は admitted path でその form を decode できない。したがって
+`ENCRYPTED PRIVATE KEY`、traditional `RSA PRIVATE KEY` / `EC PRIVATE KEY`（その DER payload
+を `PRIVATE KEY` と relabel したものを含む）、certificate、OpenSSH key は
+password/terminal/file/network/environment lookup より前に reject する。
+
+private DER の decoder path は1つだけである。bounded non-allocating DER envelope walk がまず
+top-level SEQUENCE の first child に canonical な3 octets `INTEGER, length 1, value 0` を要求し、
+`AlgorithmIdentifier` に exact constructor algorithm、すなわち NULL parameter の
+`rsaEncryption`、named-curve `prime256v1` の `id-ecPublicKey`、または absent parameter の
+id-Ed25519 を要求する。その後 `d2i_PKCS8_PRIV_KEY_INFO`、`PKCS8_pkey_get0` agreement、
+complete-cursor check、
+`i2d_PKCS8_PRIV_KEY_INFO` canonical re-encoding との byte-for-byte comparison、owned library
+context と `provider=default` を使う `EVP_PKCS82PKEY_ex` の順に進む。
+`d2i_AutoPrivateKey_ex` は呼ばないため、PKCS#1 RSA/SEC1 EC object は auto-detected legacy
+format として入れない。同じ non-allocating envelope check が OpenSSL より前に public SPKI
+algorithm identifier も固定する。public DER はその後同 context の `d2i_PUBKEY_ex` を使い、complete cursor
+consumption と `i2d_PUBKEY` canonical re-encoding との byte-for-byte comparison を要求する。
+private re-encoding scratch はすべて secret storage で、decoded private DER と同じ
+cleanse-before-free rule に従う。
 
 decode 後、constructor は advertised key class/algorithm との exact 一致を要求する。RSA key
 は 2048..=8192-bit の odd modulus と、unsigned 64-bit に収まる odd public exponent `>= 3`
@@ -219,13 +238,24 @@ closed positive/negative inventory は structural carrier classifier 1つが所�
 fail closed する。key は input borrow lifetime や process-global registration を持たない。borrowed
 sign/verify 後も owner は利用でき、message/signature view を retain しない。
 
-private scalar material は provider-owned key 内に留まり `EVP_PKEY_free` で release される。
-runtime は Align `buffer` へ copy しない。caller-owned PEM `str` は caller storage のままで
-zeroize しない。PEM scan は高々65,536-byte input を borrow し、memory BIO は explicit length
-を使う。JWK construction は bounded component view と 65-byte stack EC point だけを使う。
-Ed25519 validation は construction 中だけ fixed-count の public-data BN temporary を allocate する。
-provider/library-context/operation-context/key/BN/shell allocation は fallible で、failure path ごとに
-release する。
+private scalar material は Align `buffer` に入らない。caller-owned PEM `str` は caller storage
+のままで zeroize しない。PEM scan は高々65,536-byte input を borrow する。base64 decode は
+checked arithmetic で exact output length を計算し、fallible `OPENSSL_malloc` を1回呼び、
+result を `SensitiveDer { ptr: NonNull<u8>, len: usize }` として保持する。fixed non-growing
+allocation へ intermediate native copy なしで直接 decode する。その Drop は success と全
+post-allocation base64/DER/import/validation/later-allocation failure で
+`OPENSSL_clear_free(ptr, len)` を呼ぶ。provider import 後すぐに buffer を drop する。
+private canonical-re-encoding scratch はすべて `OPENSSL_clear_free` を使う。
+`PKCS8_PRIV_KEY_INFO` と imported `EVP_PKEY` は OpenSSL-owned のままで、それぞれ
+`PKCS8_PRIV_KEY_INFO_free` と `EVP_PKEY_free` で release する。acceptance は OpenSSL 3.0 の
+cleanup dependency、すなわち PKCS#8 ASN.1 free callback が private octet を cleanse し、
+`EVP_PKCS82PKEY_ex` が internal encoded import buffer を clear-free することを pin する。
+wrapper pointer はいずれの object からも owning call を越えて生存しない。
+
+JWK construction は bounded component view と 65-byte stack EC point だけを使う。Ed25519
+validation は construction 中だけ fixed-count の public-data BN temporary を allocate する。
+provider/library-context/operation-context/key/BN/PKCS#8/re-encoding/shell allocation は fallible
+で、failure path ごとに release する。
 
 sign/verify は complete message を Align-side copy なしで borrow する。RS256/ES256 は
 incremental EVP digest-sign/verify、Ed25519 は null digest name の required one-shot pure-EdDSA
@@ -239,10 +269,11 @@ wrong-modulus-width、ES256/Ed25519 の non-64-byte signature も provider verif
 
 constructor/sign/verify はすべて EVP を越えるため **Impure**。shared key cache や mutable
 wrapper-global state はなく、independent key の call は overlap できる。各 constructor は ordinary
-`OSSL_LIB_CTX` を作り、`default` という built-in provider を explicit load し、`_ex` decode、
-`fromdata`、signature/digest fetch に exact property query `provider=default` を使う。admitted
-construction/operation family は `d2i_AutoPrivateKey_ex`、`d2i_PUBKEY_ex`、
-`EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`、`EVP_DigestSignInit_ex`/
+`OSSL_LIB_CTX` を作り、`default` という built-in provider を explicit load し、import、`_ex`
+decode、`fromdata`、signature/digest fetch に exact property query `provider=default` を使う。
+admitted construction/operation family は `d2i_PKCS8_PRIV_KEY_INFO` に続く
+`EVP_PKCS82PKEY_ex`、`d2i_PUBKEY_ex`、`EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`、
+`EVP_DigestSignInit_ex`/
 `EVP_DigestVerifyInit_ex` である。null/global library context を使わず、OpenSSL configuration を
 load せず、provider search path/default property
 を変更せず、別 provider を load しない。result の `EVP_PKEY_get0_provider` pointer は publish 前に
@@ -285,6 +316,32 @@ fetch/context/allocation または non-verification engine failure は既存の 
 後の signature length/encoding/mathematical mismatch はすべて error でなく data (`Ok(false)`)。
 allocation/parse/sign failure は partial key/signature を publish しない。
 
+OpenSSL の thread-local error queue は ambient input でなく operation-local wrapper state である。
+fallible OpenSSL call の直前に wrapper は `ERR_clear_error` を呼び、その call の直後に queue
+全体を classify/drain して、return または次の call より前に再び clear する。successful call
+も incidental entry を clear する。call は synchronous で Align への callback を行わないため、
+clear と drain の間に same-thread operation は interleave できない。independent runtime thread
+は independent queue を持つ。entry 時の stale caller/provider error は意図的に discard し、
+result を変えられない。
+
+failure classification は closed かつ ordered である。
+
+| Failing operation | `Error.Invalid` evidence | `Error.Code(0)` evidence |
+|---|---|---|
+| wrapper PEM/base64/DER version/canonical/complete-cursor または JWK check | direct checked rejection。result のため OpenSSL を consult しない | checked allocation/length arithmetic failure |
+| `d2i_PKCS8_PRIV_KEY_INFO` または `d2i_PUBKEY_ex` | common wrapper `ERR_R_NESTED_ASN1_ERROR`/`ERR_R_MISSING_ASN1_EOS` を含む checked-in ASN.1 input-decode reason set だけを持つ non-empty drained queue | empty queue、`ERR_SYSTEM_ERROR`、fatal/malloc/internal/fetch/unsupported reason、その他の common/non-ASN.1 entry、closed set 外の entry のいずれか |
+| `i2d_PKCS8_PRIV_KEY_INFO` または `i2d_PUBKEY` | なし。successful re-encoding 後の byte mismatch は wrapper canonical-DER rejection | 全 call/allocation failure |
+| `EVP_PKCS82PKEY_ex` または JWK `fromdata` | 全 entry が checked-in ASN.1/RSA/EC input-rejection set、または `EVP_R_DECODE_ERROR`、`EVP_R_PRIVATE_KEY_DECODE_ERROR`、`EVP_R_INVALID_KEY`、`EVP_R_INVALID_KEY_LENGTH`、`EVP_R_INVALID_SEED_LENGTH`、`PROV_R_BAD_ENCODING`、`PROV_R_BAD_LENGTH`、`PROV_R_INVALID_DATA`、`PROV_R_INVALID_KEY`、`PROV_R_INVALID_KEY_LENGTH`、`PROV_R_INVALID_SEED_LENGTH` のいずれか | empty queue、`ERR_SYSTEM_ERROR`、fatal/malloc/internal/fetch/unsupported reason、closed input set 外の entry のいずれか |
+| provider private/public/pairwise check | resource/internal entry のない documented zero invalid result | negative/unsupported result、empty failure queue、resource/internal entry のいずれか |
+| provider/context/fetch/pointer-provenance/sign/verify setup または engine call | なし。verify の documented mismatch は別に `Ok(false)` | 全 failure |
+
+mixed queue では `Error.Code(0)` が優先する。implementation は `ERR_SYSTEM_ERROR`、
+`ERR_GET_LIB`、`ERR_GET_REASON`、`ERR_GET_RFLAGS` と symbolic library/reason constant で classify
+し、localized text や unstable numeric literal を使わない。complete set は classifier の隣に置き、
+この table の named family と equality-test する。OpenSSL version change で reason を追加するには
+reviewed owner vector を要求する。empty/future unknown failure は fail closed して
+`Error.Code(0)` になる。
+
 multi-invalid runtime call の validation order は exact に次のとおり。
 
 1. non-null かつ naturally aligned な ABI output slot を要求して zero し、closed algorithm tag を
@@ -299,12 +356,14 @@ multi-invalid runtime call の validation order は exact に次のとおり。
 4. public structural length を validate。PEM は `1..=65,536`、JWK は上記 exact component bound、
    empty message は valid。verify view 2つが valid になった後の wrong signature length は message
    content を読む前に `false` を publish する。
-5. PEM envelope/base64 を validate して bounded decoded bytes を得る。または cheap JWK
-   numeric/component encoding を validate。
-6. private library context と explicit built-in default provider を作り、`provider=default` で exact
-   complete object 1つを decode/import する。exact key algorithm/class/size/group、applicable
-   provider key check、該当する independent Ed25519 public-point check を要求し、key provider
-   pointer と owned provider の一致を要求する。
+5. PEM envelope/base64 を validate し、exact decoded buffer を allocate して `SensitiveDer` へ
+   decode する。または cheap JWK numeric/component encoding を validate。
+6. private library context と explicit built-in default provider を作る。private input は上記
+   PKCS#8-specific decode/version/canonical/import sequence だけを使い、public input は complete
+   canonical SPKI 1つを decode する。各 error queue を scope/classify してから次へ進む。exact key
+   algorithm/class/size/group、applicable provider key check、該当する independent Ed25519
+   public-point check、key provider pointer と owned provider の一致を要求する。shell publish
+   より前に private decode/re-encoding storage をすべて cleanse/release する。
 7. private context 内で `provider=default` を使って operation context を作り、その provider pointer
    と owned provider の一致を要求し、exact digest/padding/group parameter を設定して engine を実行。
 8. produced length/ES256 conversion を validate し、その後だけ owner/result を publish。
@@ -366,15 +425,17 @@ new artifact/file format/CLI flag/environment variable/provider selector/package
 |---|---|---|
 | Type formation and interface | no-import bare fallback 6 + import-required qualified name 6、local-shadow/entry-collision/import-use、Copy reject、Move/return-cleanup reconstruction、canonical kind/tag round-trip と exact next-unknown reject | `align_interface::summary` builtin/source-import sweep、`align_mir::canonical_graph` exact golden、`crypto_asymmetric::type_identity_matrix` whole/per-unit |
 | Carrier closure | local、by-value/return/shared-borrow、struct/sum/Option/Result、recursive Drop される fixed/dynamic AoS Move-struct array を admit。direct または tagged/sum key の fixed/dynamic scalar array、slice、vector/mask、builder、pipeline element、tuple/box、closure/task/parallel capture、`out`/`borrow mut`、global/constant、user-native/`layout(C)`、print/equality/order/hash を reject。future carrier は fail closed | parameterized sema/checked-HIR `signature_key_carrier_matrix`、recursive DropPlan/codegen owner、malformed future-kind negative |
-| Construction | private PEM 3、public PEM 3、decoded-JWK 3 constructor。success は complete shell owner 1つを initialize、failure は null。wrong label/algorithm/class/curve/size/component と exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vector + `crypto_asymmetric::constructor_matrix` |
+| Construction | private PEM 3、public PEM 3、decoded-JWK 3 constructor。success は complete shell owner 1つを initialize、failure は null。private input は dedicated decoder/import path を通る exact canonical PKCS#8 v1 `PrivateKeyInfo` version zero。wrong label、relabeled PKCS#1/SEC1 DER、`OneAsymmetricKey`、trailing/noncanonical DER、algorithm/class/curve/size/component と exact 65,536/65,537 PEM boundary を reject | runtime RFC/PEM/JWK vector + relabeled legacy/version-one negative を含む `crypto_asymmetric::constructor_matrix` |
 | Ed25519 point admission | 全 SPKI/JWK public value と全 PKCS#8-derived public value が provider `public_check` と独立した wrapper-owned RFC 8032 compressed recovery、canonical `y`、sign-bit、curve-equation、re-encoding、`[8]A != identity` check を通る。BN failure と invalid point は異なる error | direct positive RFC 8032 vector、PEM/JWK を通す `y >= p`、nonsquare、`x=0/sign=1`、re-encoding、identity + 他7つの small-order negative、injected BN/raw-public-extraction failure、private-constructor helper-call assertion、provider-check success が wrapper rejection を override できない case |
 | Move-in/out and cleanup | local bind、by-value parameter/return、shared borrow、struct/sum/Option/Result construction、`?`、`else`、`match`、`map_err`、branch/loop join、replacement、early return、ordinary/malformed Drop が kind 1つと exactly-one free を保持。source nulling は later Drop より先 | parameterized `crypto_asymmetric::ownership_matrix`、runtime free counter/failpoint、checked-HIR one-field negative |
 | Sign/verify semantics | empty/binary/large message、RS256 padding+digest/modulus-width result、leading zero/invalid r/s を含む ES256 DER/raw、Ed25519 one-shot no-digest、valid/wrong-message/wrong-key/wrong-length signature、key reusable | runtime と `crypto_asymmetric` の RFC 7515/7518、RFC 8032/8410、OpenSSL cross-check vector |
-| FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの libctx/provider/ctx/key/BIO/BIGNUM/signature/shell storage free、final free order は PKEY、thread-local context cleanup、provider、libctx、shell。partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot + failpoint sweep、ABI declaration golden、capability-linking twin |
+| Private decoder and secret cleanup | base64 は non-growing `SensitiveDer` が所有する exact-length `OPENSSL_malloc` allocation 1つへ直接 decode。success と全 failure で `OPENSSL_clear_free`。wrapper version/algorithm check → `d2i_PKCS8_PRIV_KEY_INFO` → canonical/full-consumption check → `EVP_PKCS82PKEY_ex` だけを admit。private re-encoding scratch は clear-free し、PKCS#8 object/import-copy native cleanse dependency を pin | decode/DER/import/validation/success の cleanse spy と allocation failpoint、optimized source/LLVM/API で `OPENSSL_clear_free` が live なことを audit、relabeled PKCS#1/SEC1、version-one、attributes、noncanonical、trailing、malformed-inner owner vector |
+| OpenSSL error classification | 各 fallible call は thread-local queue を clear、直後に drain/classify、再clear。direct invalid input と closed input-reason set は Invalid、empty/unknown/system/fatal/resource/internal/fetch/unsupported は Code、mixed stack は Code 優先。stale entry と independent-thread queue は call に影響しない | 全 algorithm の malformed ASN.1/inner-key vector、decoder/import allocation injection、stale/empty/unknown/mixed-invalid-plus-allocation/queue-empty-on-exit/parallel independent-queue owner |
+| FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの libctx/provider/ctx/key/PKCS#8/DER/BIGNUM/signature/shell storage free、final free order は PKEY、thread-local context cleanup、provider、libctx、shell。partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot、cleanse/error-queue/failpoint sweep、ABI declaration golden、capability-linking twin |
 | Provider provenance | 各 shell は private ordinary libctx と explicit load した built-in default provider を所有。全 decode/import/signature/digest fetch は exact `provider=default`。key/operation provider pointer は owned pointer と一致。global ctx/config/search path/default property/provider を一切 consume しない | hostile `OPENSSL_CONF`/`OPENSSL_MODULES`、global null provider、incompatible global default property を持つ child-process owner、exact pointer assertion、independent-key overlap/teardown stress |
 | Constant-time boundary | public BN validation を含む constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。pointer-verified built-in default provider primitive が named dependency。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact `_ex` libctx/property/provider-pointer と EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
 | Compilation paths | direct/imported call、public key-bearing signature、function value、concrete key 周辺 generic monomorphization、whole/per-unit、object/frontend cache edit/revert、optimized/unoptimized LLVM、malformed HIR で identical algorithm/kind/effect/cleanup fact | `crypto_asymmetric` driver owner、interface/cache owner、checked-HIR validator matrix |
-| Resource claim | PEM exact limit、RSA size bound、live key ごとの private libctx/provider/PKEY shell 1つ、construction 中だけの fixed-count Ed public BN temporary、fixed ES/Ed operation temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation record + deterministic limit test |
+| Resource claim | PEM exact limit、RSA size bound、live key ごとの private libctx/provider/PKEY shell 1つ、private construction 中だけの exact wrapper `SensitiveDer` 1つ + bounded OpenSSL-owned PKCS#8/import storage、fixed-count Ed public BN temporary、fixed ES/Ed operation temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation + private-construction peak/cleanse record + deterministic limit test |
 
 実装は hand-written changed lines が roughly 1,000 を超える見込みでも capability PR 1つとする。
 6 static type、constructor、runtime kind check、最初の sign/verify consumer は1つの proof boundary
@@ -390,7 +451,8 @@ review 前に author は applicable matrix cell を implementation/regression �
 
 acceptance は complete matrix、`scripts/cargo.sh test -p align_runtime`、focused
 `crypto_asymmetric` driver owner、interface/canonical/ABI golden、capability-linking twin、
-constant-time boundary audit、bounded PR gate、Clippy を要求する。local benchmark は ledger が
+private-decoder/cleanse/error-queue と constant-time boundary audit、bounded PR gate、Clippy を
+要求する。local benchmark は ledger が
 explicit message-copy/resource claim を持つためだけに実行し、correctness/constant-time gate でも
 latency target でもない。
 
@@ -407,6 +469,9 @@ latency target でもない。
 | P1 provider provenance が ambient assumption だけだった | provider axis を reopen。全 key が isolated libctx/built-in default provider を所有し、全 fetch は `provider=default`、key/operation pointer を check、teardown order を固定し、hostile-global child test が substitution を own する。 |
 | P1 Ed25519 provider check が encoded point を validate しなかった | point admission を reopen。wrapper が PEM/JWK/private-derived public value に canonical RFC 8032 recovery、curve/re-encoding check、complete small-order rejection を独立実行する。 |
 | P2 HTTP tail sentence 2つが implementation pending と記述していた | 残った `draft.md` と condensed spec の status sentence を implemented state に修正。 |
+| P1 decoded private DER に cleanse owner がなかった | private-decoder cleanup を reopen。exact-length non-growing `SensitiveDer` と全 private re-encoding scratch を success/全 failure で clear-free し、native PKCS#8/import cleanup dependency と optimized-artifact/failpoint owner を追加。 |
+| P2 auto private decoder が relabeled legacy DER を admit した | `d2i_AutoPrivateKey_ex` を除去。PKCS#8-specific decoder/import path の canonical version-zero `PrivateKeyInfo` だけを admit し、relabeled PKCS#1/SEC1 と `OneAsymmetricKey` negative を追加。 |
+| P2 decoder null が invalid input と allocation/engine failure を混同した | per-call error-queue isolation、closed input-reason set、Code-dominant mixed-stack precedence、malformed/allocation/stale/empty/unknown/parallel owner を追加。 |
 
 この節が source of truth である。public type/signature と algorithm/error/ownership contract は
 `draft.md` §18.2、`docs/language-spec.md`、`docs/open-questions.md`、

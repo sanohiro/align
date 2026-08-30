@@ -5583,11 +5583,15 @@ record: blake3, zeroize-on-drop key buffers (P6), nonce-generating seal convenie
 **Status update (2026-08-30, post-pkg.db asymmetric design SETTLED; implementation pending):**
 RS256, ES256, and Ed25519 use six distinct private/public Move key types plus per-algorithm
 construct/sign/verify functions, so algorithm and key-class confusion is closed statically. Private
-keys load only from one bounded unencrypted PKCS#8 `PRIVATE KEY` PEM; public keys load from SPKI
+keys load only from one bounded canonical unencrypted PKCS#8 v1 `PrivateKeyInfo` version-zero
+`PRIVATE KEY` PEM; public keys load from canonical SPKI
 `PUBLIC KEY` PEM or already-base64url-decoded JWK fields. RS256 is PKCS#1 v1.5 + SHA-256, ES256 is
 P-256 + SHA-256 with exact raw 64-byte `r || s`, and Ed25519 is pure Ed25519 with no digest/context/
 prehash selector. Sign/verify borrow the key and message; constructor/key-format or malformed
-internal-ABI rejection is `Error.Invalid`, provider/allocation failure is opaque `Error.Code(0)`,
+internal-ABI rejection is `Error.Invalid`. The private path is PKCS#8-specific, rejects
+`OneAsymmetricKey` and relabeled PKCS#1/SEC1 DER, and cleanses every wrapper-owned decoded/re-encoded
+private DER allocation. Per-call error-queue isolation maps only a closed input-rejection set to
+Invalid; empty/unknown/resource/internal/fetch failure is opaque `Error.Code(0)`,
 and every signature mismatch after valid byte views is `Ok(false)`. Each key shell owns an isolated
 OpenSSL context and explicitly loaded built-in default provider; exact `provider=default` fetches
 and provider-pointer checks exclude ambient substitution. Ed25519 public values pass wrapper-owned

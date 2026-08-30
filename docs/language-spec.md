@@ -1168,19 +1168,24 @@ reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
 requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
 and returns `Error.Code` when it is unavailable. The designed asymmetric extension adds distinct
-Move private/public key types for RS256, ES256, and Ed25519; unencrypted PKCS#8 private PEM, SPKI
-public PEM, and already-decoded JWK public constructors; and per-algorithm sign/verify functions.
+Move private/public key types for RS256, ES256, and Ed25519; canonical unencrypted PKCS#8 v1
+`PrivateKeyInfo` version-zero private PEM, canonical SPKI public PEM, and already-decoded JWK public
+constructors; and per-algorithm sign/verify functions. `OneAsymmetricKey` and relabeled PKCS#1/SEC1
+DER reject; the private path uses a PKCS#8-specific decoder and cleanses every wrapper-owned decoded
+or re-encoded private DER buffer before free.
 RS256 is PKCS#1 v1.5 with SHA-256, ES256 is P-256/SHA-256 with raw 64-byte `r || s`, and Ed25519 is
 pure Ed25519. Each key owns an isolated OpenSSL context with the built-in default provider pinned by
 exact `provider=default` fetches and provider-pointer checks; global provider configuration cannot
 substitute it. Ed25519 construction independently validates canonical RFC 8032 point recovery and
 rejects small-order public points instead of trusting provider `public_check`. Sign/verify borrow the
-key; malformed constructor/internal-ABI input is
-`Error.Invalid`, an engine failure is `Error.Code(0)`, and every post-view signature mismatch is
+key; malformed constructor/internal-ABI input is `Error.Invalid`. OpenSSL error queues are isolated
+per call; only the closed input-rejection set maps Invalid, while empty/unknown/resource/internal/
+fetch failures map `Error.Code(0)`. Every post-view signature mismatch is
 `Ok(false)`. Construction is trusted setup without a timing promise; signing an admitted key is
 constant-time for secret contents at fixed public lengths under the pointer-verified built-in
 OpenSSL default-provider dependency. The implementation is pending; the exact surface, formats,
-bounds, ownership, ABI, timing boundary, and closure matrix are `impl/std-design/crypto.md`.
+bounds, secret cleanup, error precedence, ownership, ABI, timing boundary, and closure matrix are
+`impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every

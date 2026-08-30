@@ -113,13 +113,19 @@ Every input length is nonnegative and `usize`-representable before slice formati
 carry null and uses an internal empty sentinel, while positive length requires non-null. Ed25519's
 absent second JWK pair is exactly null/zero. Every handle repeats the closed key-kind byte and each
 operation checks algorithm, public/private class, and kind before EVP. Its private shell fields own
-one ordinary library context, its explicitly loaded built-in default provider, and the PKEY. Every
+one ordinary library context, its explicitly loaded built-in default provider, and the PKEY.
+Private PEM is canonical PKCS#8 v1 `PrivateKeyInfo` version zero decoded only through
+`d2i_PKCS8_PRIV_KEY_INFO` and `EVP_PKCS82PKEY_ex`; one exact `SensitiveDer` and every private
+re-encoding scratch cleanse before free on all paths. Each fallible OpenSSL call clears and drains
+its thread-local error queue; a closed input-rejection set maps `AL_INVALID`, while empty/unknown/
+resource/internal/fetch entries map `AL_CODE` and Code dominates a mixed queue. Every
 decode/import/signature/digest fetch uses exact `provider=default`; the key and operation provider
 pointers must equal the owned provider before publication/action, and Ed25519 construction performs
 wrapper-owned canonical/on-curve/non-small-order point validation. Final free order is PKEY,
 `OPENSSL_thread_stop_ex`, provider unload, library-context free, then shell free. Status and cleanup
-follow the exact crypto design ledger: zero success; `AL_INVALID` for constructor/key or malformed internal ABI
-rejection; `AL_CODE` for opaque provider/allocation failure; post-view signature mismatch publishes
+follow the exact crypto design ledger: zero success; `AL_INVALID` for direct or closed-queue
+constructor/key rejection and malformed internal ABI; `AL_CODE` for opaque provider/allocation/
+empty-or-unknown queue failure; post-view signature mismatch publishes
 false; and free is null-safe and one-time. Implementation moves these rows into the main keyed
 inventory, increases the keyed/base/max counts by six, and changes the table's shipped ABI range to
 A00–A109 in the same commit.

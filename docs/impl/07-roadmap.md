@@ -3846,7 +3846,7 @@ pending. This section records their sequencing and status; it does not lock an u
 ```text
 1. HTTP client streaming receive (de-chunk + incremental read + SSE) — IMPLEMENTED 2026-08-30
      highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
-2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + PKCS#8 PEM) — DESIGNED 2026-08-30
+2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — DESIGNED 2026-08-30
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
 3. Small pieces: std.xml (well-formed read-only) + std.time named formatters
      unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
@@ -3896,7 +3896,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   non-goal). Plus `encoding.percent_encode_path`.
 - **std.crypto asymmetric — DESIGNED 2026-08-30, implementation pending** — six distinct
   algorithm/class Move key types; per-alg RS256 / ES256 / Ed25519 sign+verify; bounded unencrypted
-  PKCS#8 private PEM, SPKI public PEM, and decoded-JWK public construction. RS256 is PKCS#1 v1.5 +
+  canonical PKCS#8 v1 `PrivateKeyInfo` version-zero private PEM, canonical SPKI public PEM, and
+  decoded-JWK public construction. The private decoder is PKCS#8-specific, cleanses wrapper-owned
+  private DER, and uses per-call error-queue classification. RS256 is PKCS#1 v1.5 +
   SHA-256; ES256 is P-256 + SHA-256 with raw `r || s` 64B; Ed25519 is pure Ed25519. All operations
   are Impure FFI. Each key shell pins a private OpenSSL context/built-in default provider, and
   Ed25519 point admission is wrapper-owned rather than delegated to provider `public_check`. The

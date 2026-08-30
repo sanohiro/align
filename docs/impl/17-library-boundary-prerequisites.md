@@ -65,16 +65,23 @@ HIR, MIR, canonical type identity, runtime-key selection, and LLVM: private PEM 
 public PEM construction, decoded-JWK public construction, sign, and verify. The runtime repeats the
 closed algorithm/class kind in every handle and rejects a mismatch before EVP. All output slots are
 validated/alignment-checked and zeroed before work; every signed length and null/zero/positive input
-view is validated before slice formation. Every BIO/libctx/provider/context/key/BN/signature/shell
-allocation is released on failure, and no owner or signature is published before complete
-validation. Every decode/import/operation fetch uses exact `provider=default` in the private context,
+view is validated before slice formation. Private PEM admits only canonical PKCS#8 v1
+`PrivateKeyInfo` version zero through `d2i_PKCS8_PRIV_KEY_INFO` and `EVP_PKCS82PKEY_ex`; relabeled
+legacy DER and `OneAsymmetricKey` reject. Base64 decodes into one exact `SensitiveDer` allocation,
+and it plus every private re-encoding scratch is cleansed before free on all paths. Every
+libctx/provider/context/key/PKCS#8/DER/BN/signature/shell allocation is released on failure, and no
+owner or signature is published before complete validation. Each fallible OpenSSL call isolates its
+thread-local error queue; only a closed input-rejection set maps Invalid, while empty/unknown/
+resource/internal/fetch entries map Code and Code dominates a mixed queue. Every
+decode/import/operation fetch uses exact `provider=default` in the private context,
 and key/operation provider pointers must equal the shell's owned provider; global OpenSSL
 configuration and providers are never consulted. Ed25519 PEM/JWK and private-derived public values
 also pass wrapper-owned RFC 8032 canonical/on-curve/non-small-order validation independently of
 provider `public_check`. Key import is trusted setup without a timing promise; fixed-public-length
 signing uses no wrapper secret flow and relies explicitly on the pointer-verified built-in default
 provider's constant-time primitive with RSA blinding retained.
-The exact public surface, format and multi-invalid precedence, Move/control-path closure matrix,
+The exact public surface, format/error/multi-invalid precedence, private-secret cleanup,
+Move/control-path closure matrix,
 stable discriminant bytes, A106–A109 ABI, interface/cache requirements, and one-capability-PR
 boundary are authoritative in
 `docs/impl/std-design/crypto.md` “Asymmetric signature suite”; the checked-HIR and runtime inventory
