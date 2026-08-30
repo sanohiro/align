@@ -2706,7 +2706,7 @@ location, then follows the test's Err cleanup edge with
 
 `alignc test <entry.align>` checks the explicit module closure, links one private test executable,
 and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
-group per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
+group plus one aggregate containment witness per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
 written only after a normal selected-test return prevents exit, exec, abort, or a crash from
 impersonating success. Each catalog row has a default 60-second deadline from pre-spawn through
 launch, execution, group signalling, capture drain, and direct-child reap (configurable through
@@ -2716,15 +2716,21 @@ acknowledgement is infrastructure failure. The parent control endpoint is nonblo
 and both capture read endpoints are nonblocking too, so every control/stdout/stderr drain returns to
 deadline processing when its queue is empty. Every verified
 terminal path signals the pinned child process group and then its still-unreaped direct PID before
-reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup and conventional
-exit. The runner retains its signal controller while writing the final
-summary, then blocks and rechecks those signals and exits directly, so restored prior handlers
+reaping. An untimed/unbounded `process.command` remains in that group; every timed/bounded command
+arms a witness-retaining sentinel before releasing its nested target group, and row quiescence
+requires witness EOF after those sentinels have killed their groups. Deliberate `setsid` escape
+retains the process API's explicit exclusion. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded
+graceful cleanup and conventional exit. One lock-free state serializes each raw report write against
+signal selection, so a syscall already holding the permit precedes selection and no syscall starts
+after selection. The runner retains its signal controller while writing the final summary, then
+blocks and rechecks those signals and exits directly, so restored prior handlers
 cannot change terminal output. Passing output is suppressed; a failure replays only that test's
 bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
 A zero-test command reports `alignc: no tests found` and builds no artifact. The generated harness
 alone owns literal `main`; every permitted source-main ABI uses the existing encoded internal
-identity and no ordinary main wrapper is emitted. Four exact compiler-private runtime functions own
-launch receive, fd close-on-exec, acknowledgement, and completion encoding/send. Test target,
+identity and no ordinary main wrapper is emitted. Five exact compiler-private runtime functions own
+launch receive, fd close-on-exec, containment-witness installation, acknowledgement, and completion
+encoding/send. Test target,
 profile, and runtime-LTO options reach both unit and harness objects; jobs/cache statistics and
 timeout/output terminate at scheduling/diagnostics and runner state. The exact grammar, bounds,
 record bytes, validation order, ownership, cache identity,

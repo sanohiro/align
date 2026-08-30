@@ -3867,11 +3867,12 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 
 - **core.test — DESIGNED 2026-08-30** — private top-level named Result blocks; explicit
   `core.test` assertion import with Bool-result equality only; one immutable test artifact run
-  sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
+  sequentially in a fresh process group plus aggregate containment witness per catalog row; fixed bounded launch acknowledgement and
   compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated
   lifecycle owner, terminal-observation control barrier, all-terminal pinned-group then direct-PID
   signalling before reap, nonblocking capture/control drains, quiesced evidence retained
-  through reporting, controller-owned terminal summary commit for four graceful signals, and
+  through reporting, witness-retaining sentinels for timed/bounded `process.command` subgroups,
+  lock-free write/signal arbitration, controller-owned terminal summary commit for four graceful signals, and
   failure-only evidence replay. Compiler formation normalizes final syntactic-tail assertions only
   at root completion or structural statement placement and
   freezes the complete production prefix before appending the test-generated function/type/
@@ -3880,7 +3881,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   including structurally ordered ownership facts and semantic descriptor fields. Database
   Query/command descriptors remain prefix-owned top-level declarations and tests consume their
   ordinary prepared metadata offline. The harness alone owns literal `main`; source main uses its
-  encoded private identity, and four exact unkeyed runtime rows own child launch/fd/ack/completion
+  encoded private identity, and five exact unkeyed runtime rows own child launch/fd/containment/ack/completion
   I/O. Production modes and accepted test options have closed terminal-consumer matrices, and owner/
   CI commands retain terse success through the existing quiet wrapper. The
   exact public ledger, control-protocol bytes, lifecycle state matrix, cache identity, and

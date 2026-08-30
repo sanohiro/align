@@ -1228,12 +1228,16 @@ statement only at root test completion or structural statement placement; every 
 even when its consumer expects Unit.
 
 `alignc test` links the closure once and launches that immutable test artifact in a fresh process
-group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
+group with an aggregate containment witness per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
 return from exit, exec, abort, and crash. Each row has bounded time from pre-spawn through launch,
 execution, group signalling, capture drain, and direct-child reap plus bounded per-stream capture;
 pre-ack timeout/output is infrastructure failure. Parent control and capture receives are
 nonblocking. Every verified terminal path signals the pinned group and then the still-unreaped
-direct PID before reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
+direct PID before reap. Untimed/unbounded commands remain in that group; a timed/bounded
+`process.command` arms a witness-retaining sentinel before releasing its nested target group, and
+row quiescence requires witness EOF after sentinel cleanup. SIGHUP, SIGINT, SIGQUIT, and SIGTERM
+receive bounded cleanup, while one lock-free state serializes their selection against every raw
+report write. Passing
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
 passing suite always has one summary line. No user `main` is required or automatically invoked. Production
 commands complete and freeze the ordinary-source prefix before forming a separate test overlay for
@@ -1243,8 +1247,8 @@ partitions but omit the overlay from production MIR, interfaces, links, and arti
 ordinary named top-level descriptor functions and are therefore prefix-owned; tests reuse their
 prepared metadata offline, and `db prepare` needs no test mode. The generated harness alone owns
 literal `main`; every permitted source-main ABI is encoded as an ordinary internal function without
-its production wrapper. Four exact compiler-private runtime functions own launch receive, fd
-close-on-exec, acknowledgement, and completion encoding/send. Production prefix selection covers
+its production wrapper. Five exact compiler-private runtime functions own launch receive, fd
+close-on-exec, containment-witness installation, acknowledgement, and completion encoding/send. Production prefix selection covers
 one-shot/watch, whole/per-unit, ThinLTO, and PGO routes, while each accepted test option has one
 fixed terminal consumer. The signal controller remains installed through
 summary publication and a final blocked recheck before direct exit. Production codegen/cache

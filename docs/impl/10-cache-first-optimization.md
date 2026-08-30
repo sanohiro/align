@@ -484,8 +484,8 @@ excludes the overlay but does not acquire private-body or descriptor inputs from
 Test-mode unit/object keys additionally include every local overlay suffix plus target, profile,
 resolved runtime-LTO state, imported interfaces, and the runtime ABI fingerprint. The separate
 harness key includes the ordered canonical-id-to-`align_test$<8hex>` map, the sole literal `main` and
-encoded source-main policy, all four child-control runtime ABI rows, and launch/ack/completion/final-
-commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
+encoded source-main policy, all five child-control runtime ABI rows, and launch/ack/completion/
+containment-witness/command-sentinel-status/final-commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
 artifact identity because they terminate at build scheduling, diagnostics, and runner state. A
 database descriptor never enters the overlay; tests consume its production descriptor identity and
 ordinary offline metadata.

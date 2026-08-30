@@ -532,6 +532,31 @@ descendant は process-group 契約外だが、read end を閉じるので呼び
 descendant を reap すると主張しない。別 command は mutable state を共有せず、並行実行は独立する。safe Align
 では実行中の同一 command を再設定できず、同期 run が完了してから再利用する。
 
+### Test-artifact containment seam（core.testと同時にproposed）
+
+Ordinary artifactは上のshipped lifecycleを維持する。generated `core.test` harnessはrow Ack前に
+compiler-private borrowed containment-witness descriptorを1つinstallする。untimed/unbounded commandは
+harness row group内。positive timeoutまたはexplicit capture boundではruntimeがまずsentinelをforkし、
+sentinelはrow group外へ移ってCLOEXEC witness/private abort pipeをretainする。そのsentinelだけが外部targetを
+distinct group leaderとしてforkし、group proof/private-fd close後にpre-exec gateからreleaseする。setup failureはreleaseしない。
+
+Harness death/private-pipe EOFはsentinelがtarget group、unreaped direct targetの順にSIGKILLし、targetをEINTR
+retryでreap、group existenceがexact `ESRCH`になるまでpollしてからwitness close/exitする。ordinary target
+terminalもpublic `code()`をpreserveしてsame residual cleanupを行う。live harnessはsentinelをreapしてreturnし、
+death後OS orphan reaperがownするのはsentinel statusだけ。外部targetはprivate fdをexec後inheritしない。
+全active nested groupはtarget reap/group absenceまでwitness writerを持ち、outer runnerはaggregate EOF前に
+quiesceできない。deliberate `setsid` escapeは既存exclusion。通常終了するgroupのsource signature/result/output/
+ordinary-artifact behaviorは変えない。
+
+Sentinel/live harnessはprivate CLOEXEC status pipeもownする。normal target cleanup後、sentinelはexact 16 bytesを
+blocking/EINTR retryで1回writeする。byte 0..7=`41 4c 54 43 4d 44 53 01`、byte 8はkind（0=result、1=runtime
+error）、byte 9..11=zero、byte 12..15=little-endian i32（kind 0はpublic code 0..=255、kind 1はpositive raw
+OS code）。short writeはinternal `EIO`。harnessはこの順でvalidateし、resultをordinary output code、errorを
+`Error.Code`へmap、status-pipe EOF後にsentinel reap。timeout/output/hard capture/harness deathはabort writerを
+closeしstatus recordなしでsame target cleanup。goldenはresult 7=`414c54434d4453010000000007000000`、error
+5=`414c54434d4453010100000005000000`。magic/version/kind/reserved/value/truncation/repetition/trailing/EOF/I-O errorは
+output handle publish前にfailする。
+
 ### Runtime と cache identity
 
 実装は既存 signature を変更せず、次の ABI entry を追加する。
@@ -580,6 +605,7 @@ entry を無効化する。
 | Move と Drop | formation、construction、`Result` move-in/out、`?`、`else`、`match`、`map_err`、replacement、return、source nulling、early exit は各 output を1回 Drop。aggregate/capture/temporary と escaped view を拒否。Owner: `m11_process_command` ownership matrix と checked-HIR variant tripwire。 |
 | Allocation、descriptor setup、malformed limit | exact layout/shell を pipe/fork 前に割り当て、zero は byte store 無し、unrepresentable layout は `Invalid`、物理 capture/output allocation failure は子が存在する前に no-unwind abort、両 read fd は fork 前に nonblocking または setup failure、固定 poll/scratch/wait storage により親側 bounded capture/reap state machine の post-fork heap allocation は0、capture capacity は `L` 以下。Owner: 第1/第2/shell allocation の subprocess fatal-OOM failpoint、`fcntl` failpoint、`command_capture_allocation_bound`。child marker で fork 未到達を証明。 |
 | Child launch boundary | bounded terminal は既存の post-fork child `chdir`/environment/`execvp` path を再利用し、新しい child-side operation を追加しない。`clearenv`/`setenv`/`execvp` は allocation し得て P11 を保ち、親側 capture bound/fatal-OOM-before-fork claim は適用しない。Owner: `m11_process_command` 内の既存 cwd/env/env_clear/exit-127 regression。 |
+| `core.test` containment | install-once witness有効時、untimed/unbounded targetはrow group。timed/bounded targetはrow外sentinelがdistinct target groupを確立後だけrelease。sentinelがtarget signal/reap/group-absence proofを常にownし、live harnessはexact status codec validate後sentinel reap、death後OS orphan reaperはsentinel statusだけ、outer quiescenceはwitness EOFを要求。Owner: `command_test_containment_state_matrix`、`command_test_containment_status_codec` + core.test nested-tree/witness owner。 |
 | Reuse と concurrency | 1 command が保持/上書き bound で text/byte run を反復し、2つの独立 command は shared state 無しで並行実行。Owner: `command_capture_reuse_and_independent_concurrency`。 |
 | Generic/interface/per-unit/cache parity | `Result<run_bytes, Error>` を返す関数は whole-program/per-unit で同じ type/ABI。interface round-trip と exact edit/revert cache identity が一致。Owner: process interface/per-unit/cache tests。 |
 | Existing behavior | setter 無し `run()` は無制限で byte-for-byte compatible。cwd/env/env_clear/timeout、large dual-pipe、nonzero exit、text view owner は green のまま。Owner: 完全な `m11_process_command` target。 |
@@ -618,6 +644,7 @@ truncated-success path が reachable のままなので、design/implementation 
 | P1 pending lifecycle を shipped スライス 5 に帰属 | 設計時の status 分離は、完全な Request 11 state machine が atomic に有効化されるまで旧 Slice-5 behavior と区別した。 |
 | P2 pending direct-pid fallback を shipped スライス 5 に帰属 | 設計時 ledger は waitable child への direct-pid fallback を implementation に予約し、shipped runtime と owner が現在それを検証する。 |
 | P2 `code()` を region-bound view と記述 | condensed specification は `code()` を Copy `i64` とし、region-bound zero-copy view を `stdout()`/`stderr()` だけに限定した。 |
+| P1 timed/bounded command subgroupがkilled test harness後もlive | Test-only seamがtarget creation前にrow外witness sentinelを確立し、harness death/ordinary completionでtarget kill/reap/group absenceを証明、outer quiescenceはaggregate witness EOFを待つ。 |
 
 ## Acceptance gate
 

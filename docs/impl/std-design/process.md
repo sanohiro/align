@@ -563,6 +563,42 @@ blocked. The caller never claims to reap descendants. Distinct commands share no
 concurrent runs are independent. The same `command` cannot be mutably configured during a run in safe
 Align, and one synchronous run completes before that command is reused.
 
+### Test-artifact containment seam (proposed with core.test)
+
+Ordinary artifacts retain the shipped lifecycle above. A generated `core.test` harness instead
+installs one compiler-private borrowed containment-witness descriptor before it acknowledges its
+row. An untimed, unbounded command remains in the harness row group. For a positive timeout or an
+explicit capture bound, the runtime first forks a sentinel that leaves the harness row group and
+retains the close-on-exec witness plus one private close-on-exec abort pipe. Only that sentinel then
+forks the external target as a distinct group leader. The target remains behind a pre-exec gate
+until the sentinel has proved its group identity and closed every private descriptor that must not
+cross exec; no setup failure may release it.
+
+Harness death or EOF on the private pipe makes the sentinel send `SIGKILL` to the target group and
+then its unreaped direct target, reap that target with EINTR retry, and poll group existence through
+exact `ESRCH` before closing the witness and exiting. An ordinary target terminal status follows the
+same residual-group cleanup while preserving the target's public `code()` value. A live harness
+reaps the sentinel before returning; after harness death the OS orphan reaper owns only the
+sentinel's terminal status. The external target inherits neither private descriptor across exec.
+Every active nested group therefore has a witness writer until target reap and group-absence proof
+complete, and the outer test runner cannot quiesce a row until the aggregate witness reaches EOF. A
+target that deliberately escapes with `setsid` retains the existing explicit exclusion. This
+internal test supervisor changes no source signature, result code, output, allocation promise, or
+ordinary-artifact behavior for a command whose group terminates with its direct target.
+
+The sentinel and live harness also own one private close-on-exec status pipe. After normal target
+cleanup the sentinel performs one blocking EINTR-retried write of exactly 16 bytes: bytes 0..7 are
+`41 4c 54 43 4d 44 53 01`; byte 8 is kind `0` for result or `1` for runtime error; bytes 9..11 are
+zero; bytes 12..15 are little-endian i32, restricted to public command code 0..=255 for kind 0 and a
+positive raw OS code for kind 1. A short write is internal `EIO`. The harness validates in that
+order, maps result to the ordinary output code or error to `Error.Code`, requires status-pipe EOF,
+then reaps the sentinel. Timeout, output excess, hard capture failure, or harness-death abort closes
+the abort writer; that selected path receives no status record and the sentinel exits only after the
+same target/group cleanup. Fixed codec goldens pin result 7 as
+`414c54434d4453010000000007000000` and error 5 as
+`414c54434d4453010100000005000000`; bad magic/version/kind/reserved/value, truncation, repetition,
+trailing data, premature EOF, and read/write error fail before an output handle is published.
+
 ### Runtime and cache identity
 
 The implementation adds these ABI entries without changing an existing signature:
@@ -616,6 +652,7 @@ source-derived frontend/object cache entry.
 | Move and Drop | Formation, construction, `Result` move-in/out, `?`, `else`, `match`, `map_err`, replacement, return, source nulling, and early exit drop each output once; aggregate/capture/temporary and escaped views reject. Owners: `m11_process_command` ownership matrix plus the checked-HIR variant tripwire. |
 | Allocation, descriptor setup, and malformed limits | Exact layouts/shell are allocated before pipes/fork; zero allocates no byte stores; unrepresentable layout is `Invalid`; physical capture/output allocation failure aborts without unwind before a child exists; both read fds become nonblocking before fork or setup fails cleanly; fixed poll/scratch/wait storage gives the parent bounded capture/reap state machine zero post-fork heap allocations; capture capacity never exceeds `L`. Owners: subprocess fatal-OOM failpoints for first/second/shell allocation, `fcntl` failpoints, and `command_capture_allocation_bound`; child-side markers prove fork was never reached. |
 | Child launch boundary | Bounded terminals reuse the existing post-fork child `chdir`/environment/`execvp` path and introduce no new child-side operation. `clearenv`/`setenv`/`execvp` may allocate and retain P11; the parent capture bound and fatal-OOM-before-fork claim do not apply to them. Owners: existing cwd/env/env_clear/exit-127 regressions within `m11_process_command`. |
+| `core.test` containment | With the test-only install-once witness active, untimed/unbounded targets remain in the row group. Every timed/bounded target stays gated until an outside-row sentinel is armed and has established the distinct target group; setup failure, harness death, target error, ordinary completion, residual same-group descendants, and explicit `setsid` escape follow the fixed ownership above. The sentinel always owns target signalling/reap/group-absence proof. A live harness validates the exact status codec and reaps the sentinel; after harness death the OS orphan reaper owns only its terminal status, while outer row quiescence requires witness EOF. Owners: `command_test_containment_state_matrix`, `command_test_containment_status_codec`, plus the core.test nested-process-tree/witness owner. |
 | Reuse and concurrency | One command repeats text and byte runs with the persisted/overwritten bound; two independent commands run concurrently without shared state. Owner: `command_capture_reuse_and_independent_concurrency`. |
 | Generic/interface/per-unit/cache parity | A function returning `Result<run_bytes, Error>` has identical whole-program and per-unit type/ABI; interface round-trip and exact edit/revert cache identity agree. Owners: process interface/per-unit/cache tests. |
 | Existing behavior | No-setter `run()` remains unbounded and byte-for-byte compatible; cwd/env/env_clear/timeout, large dual-pipe, nonzero exit, and text view owners remain green. Owner: complete `m11_process_command` target. |
@@ -657,6 +694,7 @@ implementation remain one mergeable capability.
 | P1 pending lifecycle was attributed to shipped Slice 5 | The design-time status split kept the old Slice-5 behavior distinct until the complete Request 11 state machine activated atomically. |
 | P2 pending direct-pid fallback was attributed to shipped Slice 5 | The design-time ledger reserved the direct-pid fallback while the child remains waitable; the shipped runtime and owner now exercise it. |
 | P2 `code()` was described as a region-bound view | The condensed specification now identifies `code()` as a Copy `i64` and limits region-bound zero-copy views to `stdout()`/`stderr()`. |
+| P1 a timed/bounded command subgroup could outlive a killed test harness | The test-only seam establishes an outside-row witness sentinel before target creation; it kills/reaps the direct target, proves target-group absence on harness death and ordinary completion, and makes outer row quiescence wait for aggregate witness EOF. |
 
 ## Acceptance gate
 
