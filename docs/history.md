@@ -1,5 +1,19 @@
 # History of Align
 
+## 2026-08-31: owned string arrays index to the canonical text view
+
+The R7 tokenizer consumer made the remaining Move-array gap concrete: an `array<string>` could be
+built and dropped but its text could not be read as an ordinary expression. A general hidden
+reference value for every Move element was rejected. Move-record arrays already support direct
+bounds-checked field reads, including owned `string` fields as `str`, and explicit shared-borrow
+calls already receive a checked element place without copying the record.
+
+The one consumer-complete extension is therefore `texts[i] -> str`. The array remains the sole
+owner, the view keeps the source generation and contained region roots, and existing index order,
+termination, bounds, temporary-owner, and invalidation rules apply. There is no clone, allocation,
+cleanup bit, source null, ABI change, or new indexing spelling. Whole Move records remain
+unavailable as ordinary values.
+
 ## 2026-08-11: PostgreSQL streamed delivery is one explicit native rail
 
 The first D13 rail shipped common bounded batches and direct SoA projection while retaining

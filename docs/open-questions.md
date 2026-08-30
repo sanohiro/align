@@ -4187,7 +4187,7 @@ These are the common library-boundary mechanisms for native stateful packages, i
 The exact surface and compiler contract are in
 `impl/17-library-boundary-prerequisites.md` §§2–3.
 
-### Borrow-safe sum and dynamic aggregate projection — Settled 2026-08-18; extended 2026-08-19
+### Borrow-safe sum and dynamic aggregate projection — Settled 2026-08-18; extended 2026-08-19 and 2026-08-31
 
 An exhaustive `match` over a stable place whose exact root/path pair has a direct `borrow` or
 `borrow mut` fact may inspect an owned `Option<T>`, `Result<T,E>`, or user sum without consuming it;
@@ -4213,6 +4213,14 @@ preserves the complete source generation and input/arena roots through direct, f
 projection bases, including return and `borrow mut` destination retention. A terminating index
 forms no bounds action or result.
 
+The later align-llm Request 22 extension permits ordinary `array<string>` indexing as a
+non-consuming `str` view. The array remains the sole owner; existing receiver/index/termination and
+bounds order is unchanged, and the view carries the complete source generation and contained roots
+without allocation, clone, cleanup, nulling, or transfer. This uses the existing canonical borrowed
+text type rather than adding a general reference value. Whole Move records remain unavailable as
+ordinary values; their existing direct-field read and explicit shared-borrow call cover the shipped
+record surface.
+
 The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
 dynamic array only as the argument to an explicit shared-`borrow` parameter on a direct, imported,
 or function-value target. Its base must be a stable local, borrowed/projection binding, or
@@ -4232,7 +4240,8 @@ branch, loop, and early-exit behavior. There is no new syntax, reference type, l
 runtime representation, ABI field, allocation path, JSON exception, or package-specific API. The
 complete base contract and extension, projection paths, checked-HIR/MIR boundaries, and closure
 matrices are in `docs/impl/26-borrowed-sum-projection-plan.md` and
-`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`.
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; the later string-array view extension
+and its closure matrix are in `docs/impl/30-borrowed-string-array-index-plan.md`.
 
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).

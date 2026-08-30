@@ -71,10 +71,11 @@ type tables; admitting another region-bearing Copy leaf without adding its proje
 owner is a variant-sweep failure.
 
 The indexed shared-borrow surface uses the same two ordinary dynamic array classes and concrete
-element grammar. Copy element indexing keeps its existing by-value behavior. A Move element becomes
-addressable only as the argument to an explicit shared-`borrow` parameter. Ordinary `values[index]`
-in a value position still rejects rather than copying or moving the element, and `borrow mut` of an
-element remains deferred because it would require element-local replacement and cleanup state.
+element grammar. Copy element indexing keeps its existing by-value behavior. This plan admits a
+Move element only as the argument to an explicit shared-`borrow` parameter. The later Request 22
+extension in plan 30 additionally maps ordinary `array<string>[index]` to the canonical `str` view;
+every other whole Move element still rejects in a value position, and `borrow mut` remains deferred
+because it would require element-local replacement and cleanup state.
 
 ## 3. Semantic and lifetime contract
 

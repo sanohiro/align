@@ -204,6 +204,12 @@ preserves the complete owner generation and input/arena roots for direct, field,
 borrowed-projection bases. Return and `borrow mut` retention cannot outlive those roots. A
 terminating index forms no bounds action or result.
 
+Indexing an `array<string>` yields a non-consuming `str` view. The array remains the sole owner;
+the view carries its complete source generation and contained region roots and creates no clone,
+allocation, cleanup bit, nulling, or transfer. Receiver/index order, termination, and hard bounds
+behavior match every ordinary dynamic-array index. Other whole Move elements are not ordinary
+values.
+
 An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
 shared-`borrow` parameter selected by a direct, imported, or function-value call. The array base
 must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
