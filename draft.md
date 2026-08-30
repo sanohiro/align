@@ -650,6 +650,12 @@ The compiler-provided nominal aliases form this closed table:
 |---|---|---|
 | `Error` | `core.Error` | language-syntactic core; always in scope and requires no import |
 | `argon2_params` | `crypto.argon2_params` | requires `import std.crypto` |
+| `rs256_private_key` | `crypto.rs256_private_key` | requires `import std.crypto` |
+| `rs256_public_key` | `crypto.rs256_public_key` | requires `import std.crypto` |
+| `es256_private_key` | `crypto.es256_private_key` | requires `import std.crypto` |
+| `es256_public_key` | `crypto.es256_public_key` | requires `import std.crypto` |
+| `ed25519_private_key` | `crypto.ed25519_private_key` | requires `import std.crypto` |
+| `ed25519_public_key` | `crypto.ed25519_public_key` | requires `import std.crypto` |
 | `regex_match` | `regex.regex_match` | requires `import std.regex` |
 
 A non-entry module may declare a local type with any bare alias in this table. Inside that module
@@ -3155,6 +3161,38 @@ crypto.aes_gcm_open(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> 
 crypto.chacha20_poly1305_seal(...) / _open(...)                 // same shape as aes_gcm
 crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-hosted
 ```
+
+The asymmetric signature extension adds six algorithm-and-class-specific Move key types and the
+following exact surface. It is designed; implementation is pending.
+
+```text
+crypto.rs256_private_key_from_pem(pem: str) -> Result<rs256_private_key, Error>
+crypto.es256_private_key_from_pem(pem: str) -> Result<es256_private_key, Error>
+crypto.ed25519_private_key_from_pem(pem: str) -> Result<ed25519_private_key, Error>
+crypto.rs256_public_key_from_pem(pem: str) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_pem(pem: str) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_pem(pem: str) -> Result<ed25519_public_key, Error>
+crypto.rs256_public_key_from_jwk(n: bytes, e: bytes) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_jwk(x: bytes, y: bytes) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_jwk(x: bytes) -> Result<ed25519_public_key, Error>
+crypto.rs256_sign(borrow key: rs256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.es256_sign(borrow key: es256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.ed25519_sign(borrow key: ed25519_private_key, message: bytes) -> Result<buffer, Error>
+crypto.rs256_verify(borrow key: rs256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.es256_verify(borrow key: es256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.ed25519_verify(borrow key: ed25519_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+```
+
+RS256 is RSASSA-PKCS1-v1_5 with SHA-256. ES256 is P-256 ECDSA with SHA-256 and uses the
+JOSE 64-byte `r || s` signature rather than DER. Ed25519 is pure Ed25519 with no caller-selected
+digest, context, or prehash. The PEM constructors accept one bounded unencrypted PKCS#8
+`PRIVATE KEY` or SPKI `PUBLIC KEY`; encrypted/traditional/certificate/OpenSSH forms reject without
+a password or ambient I/O. The JWK constructors take already-base64url-decoded public fields and
+perform complete algorithm/size/point validation. Keys are independent Move owners of one EVP key;
+sign/verify borrow them and the complete message. Invalid input/key format is `Error.Invalid`, a
+provider/allocation failure is `Error.Code(0)`, and a signature mismatch is `Ok(false)`. The exact
+PEM grammar, RSA bounds, validation order, ownership/allocation rules, ABI, cache identity, and
+closure matrix are authoritative in `docs/impl/std-design/crypto.md`.
 
 `argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a builtin struct
 (reserved name, ordinary struct literal): memory cost in KiB, iterations, lanes, and output

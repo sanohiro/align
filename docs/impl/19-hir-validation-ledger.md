@@ -1017,6 +1017,11 @@ merely because its `Ty` matches.
 | `CryptoHkdf` | `env[]; child[salt,ikm,info,len]`; `byte-view,byte-view,byte-view,i64; result ERR(Buffer); all borrowed, fresh owned output; Impure`. |
 | `CryptoAead` | `env[cipher,dir]`; `child[key,nonce,input,aad]`; all byte-view; `result ERR(Buffer); all borrowed; cipher fixes 32-byte key/12-byte nonce/16-byte tag contract; dir selects seal/open and all-or-nothing open; fresh owned success output; Impure`. |
 | `CryptoArgon2` | `env[]; child[password,salt,params]`; `byte-view,byte-view,Struct(argon2_params_id)` with exact four ordered i64 fields; result ERR(Buffer); all borrowed, fresh owned output; Impure`. |
+| `CryptoPrivateKeyFromPem` *(designed; pending)* | `env[algorithm]`; `child[pem]`; `Str; result ERR(SignatureKey(algorithm,Private)); pem borrowed, fresh validated independent Move owner on success; Impure`. |
+| `CryptoPublicKeyFromPem` *(designed; pending)* | `env[algorithm]`; `child[pem]`; `Str; result ERR(SignatureKey(algorithm,Public)); pem borrowed, fresh validated independent Move owner on success; Impure`. |
+| `CryptoPublicKeyFromJwk` *(designed; pending)* | `env[algorithm]`; `child[first,second?]`; RS256/ES256 require exactly two byte views and Ed25519 exactly one; `result ERR(SignatureKey(algorithm,Public)); inputs borrowed, fresh validated independent Move owner; Impure`. |
+| `CryptoSign` *(designed; pending)* | `env[algorithm]`; `child[key,message]`; exact shared-borrow place `SignatureKey(algorithm,Private)`, byte-view; `result ERR(Buffer); key/message borrowed, fresh exact-width signature on success; Impure`. |
+| `CryptoVerify` *(designed; pending)* | `env[algorithm]`; `child[key,message,signature]`; exact shared-borrow place `SignatureKey(algorithm,Public)`, byte-view, byte-view; `result ERR(Bool); all borrowed; mismatch is Ok(false), engine failure is Err; Impure`. |
 
 ### am-b3 helper discriminators
 
@@ -1028,6 +1033,9 @@ merely because its `Ty` matches.
 | `AeadDir::Open` | Input is ciphertext followed by tag; authentication failure releases no plaintext. |
 | `HashAlgo::Sha256` | Exact digest length 32 and runtime key `crypto_sha256`. |
 | `HashAlgo::Sha512` | Exact digest length 64 and runtime key `crypto_sha512`. |
+| `SignatureAlgorithm::Rs256` *(designed; pending)* | Stable byte 0; RSASSA-PKCS1-v1_5 with SHA-256; private/public key kinds 0/1. |
+| `SignatureAlgorithm::Es256` *(designed; pending)* | Stable byte 1; P-256 ECDSA with SHA-256 and raw 64-byte `r || s`; private/public key kinds 2/3. |
+| `SignatureAlgorithm::Ed25519` *(designed; pending)* | Stable byte 2; pure Ed25519 with no digest/context/prehash; private/public key kinds 4/5. |
 | `CliFlagKind::Bool` | No default child; parsed result Bool. |
 | `CliFlagKind::I64` | Exactly one i64 default child; parsed result i64. |
 | `CliFlagKind::Str` | Exactly one Str default child; parsed result Str view. |

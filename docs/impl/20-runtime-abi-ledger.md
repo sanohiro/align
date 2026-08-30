@@ -91,6 +91,29 @@ writes the fixed 64-byte native envelope only through its output pointer and ret
 signed HTTP status discriminator. The ID getter returns a stream-bound view, retry uses `-1` as the
 `None` sentinel, and the raw/SSE types share the one null-safe free row.
 
+## Asymmetric signature delta (designed; not yet in the shipped inventory)
+
+The accepted post-pkg.db design adds six keyed records atomically when implemented. Until then they
+are excluded from the exact current counts and the shipped A00–A105 table below.
+
+| Planned runtime key | Exact symbol | Planned ABI row and exact declaration |
+|---|---|---|
+| `CryptoPrivateKeyFromPem` | `align_rt_crypto_private_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
+| `CryptoPublicKeyFromPem` | `align_rt_crypto_public_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
+| `CryptoPublicKeyFromJwk` | `align_rt_crypto_public_key_from_jwk` | A107: `i32 @SYM(i32, ptr, i64, ptr, i64, ptr)` |
+| `CryptoSign` | `align_rt_crypto_sign` | A108: `i32 @SYM(i32, ptr, ptr, i64, ptr)` |
+| `CryptoVerify` | `align_rt_crypto_verify` | A109: `i32 @SYM(i32, ptr, ptr, i64, ptr, i64, ptr)` |
+| `CryptoKeyFree` | `align_rt_crypto_key_free` | A62: `void @SYM(ptr)` |
+
+`algorithm` is the closed `i32` ABI form of `0=RS256`, `1=ES256`, `2=Ed25519`; the runtime validates
+it before narrowing. The JWK row passes Ed25519's absent second component as null/zero. Constructor
+and sign output slots are null-initialized handle slots; verify's final `i32` slot is zero-initialized.
+Every handle repeats the closed key-kind byte and each operation checks algorithm, public/private
+class, and kind before EVP. Status and cleanup follow the exact crypto design ledger: zero success,
+`AL_INVALID` input/key rejection, `AL_CODE` opaque provider/allocation failure, and null-safe one-time
+free. Implementation moves these rows into the main keyed inventory, increases the keyed/base/max
+counts by six, and changes the table's shipped ABI range to A00–A109 in the same commit.
+
 ## Request 9 owned JSON extension
 
 The implemented Request 9 design in `docs/impl/24-owned-json-plan.md` adds exactly

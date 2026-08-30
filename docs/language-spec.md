@@ -450,15 +450,17 @@ with `result.map_err(f)`). Error **context is structured, not free-form**: a var
 relevant data (a position, a code), e.g. `ParseError { BadToken(Pos), Eof }` — there is no
 `.with_context("…")` string-chaining.
 
-The compiler-provided nominal aliases are exactly `Error` → `core.Error`, `argon2_params` →
-`crypto.argon2_params`, and `regex_match` → `regex.regex_match`. `core.Error` is language-syntactic
-core and is always available without an import. The other explicit spellings require respectively
-`import std.crypto` and `import std.regex`, and their type references count as uses for the
-unused-import lint. A non-entry module may declare a local type with any of those bare names: bare
-lookup resolves locally, the explicit spelling still names the builtin, and importers use the
-ordinary qualified local name such as `pkg.db.Error`. Without a same-module declaration the bare
-alias retains its builtin meaning. The entry module cannot declare a type whose unmangled canonical
-name collides with one of these builtins.
+The compiler-provided nominal aliases are exactly `Error` → `core.Error`; `argon2_params`,
+`rs256_private_key`, `rs256_public_key`, `es256_private_key`, `es256_public_key`,
+`ed25519_private_key`, and `ed25519_public_key` → the same name prefixed by `crypto.`; and
+`regex_match` → `regex.regex_match`. `core.Error` is language-syntactic core and is always available
+without an import. The crypto and regex explicit spellings require respectively `import std.crypto`
+and `import std.regex`, and their type references count as uses for the unused-import lint. A
+non-entry module may declare a local type with any of those bare names: bare lookup resolves locally,
+the explicit spelling still names the builtin, and importers use the ordinary qualified local name
+such as `pkg.db.Error`. Without a same-module declaration the bare alias retains its builtin meaning.
+The entry module cannot declare a type whose unmangled canonical name collides with one of these
+builtins.
 
 The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
 `Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
@@ -1165,7 +1167,13 @@ reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
 `std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
 requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
-and returns `Error.Code` when it is unavailable.
+and returns `Error.Code` when it is unavailable. The designed asymmetric extension adds distinct
+Move private/public key types for RS256, ES256, and Ed25519; unencrypted PKCS#8 private PEM, SPKI
+public PEM, and already-decoded JWK public constructors; and per-algorithm sign/verify functions.
+RS256 is PKCS#1 v1.5 with SHA-256, ES256 is P-256/SHA-256 with raw 64-byte `r || s`, and Ed25519 is
+pure Ed25519. Sign/verify borrow the key; malformed input is `Error.Invalid`, an engine failure is
+`Error.Code(0)`, and a signature mismatch is `Ok(false)`. The implementation is pending; the exact
+surface, formats, bounds, ownership, ABI, and closure matrix are `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every

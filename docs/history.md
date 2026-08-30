@@ -474,3 +474,20 @@ names use a canonical `key_ordinal`, and schema/table reference components rejec
 native access in declaration order.
 The repository's design process now requires one public-contract ledger and an author-side
 ledger-to-prose pass before independent review.
+
+---
+
+## Asymmetric signature suite settled
+
+On 2026-08-30, the post-`pkg.db` crypto convergence item was settled as an implementation-pending
+RS256, ES256, and Ed25519 suite. It uses six distinct private/public Move key types and per-algorithm
+construct, sign, and verify functions. Private construction accepts only bounded unencrypted
+PKCS#8 PEM; public construction accepts SPKI PEM or decoded JWK components. RS256 fixes PKCS#1
+v1.5/SHA-256, ES256 fixes P-256/SHA-256 and raw 64-byte JOSE signatures, and Ed25519 fixes pure
+Ed25519.
+
+The decision rejected a generic key handle, runtime algorithm strings, encrypted/traditional PEM,
+private JWK, key generation/export, and ambient password or provider selection. Sign and verify
+borrow their typed keys; invalid material is `Error.Invalid`, provider/allocation failure remains
+opaque `Error.Code(0)`, and signature mismatch is `Ok(false)`. The public-contract and
+implementation-closure ledger is `docs/impl/std-design/crypto.md` “Asymmetric signature suite.”

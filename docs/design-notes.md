@@ -1238,6 +1238,28 @@ look-around, returns byte spans rather than allocating matched strings, and star
 compile/is_match/find/find_at. Captures/replacement/split can be added at the library boundary when a
 real consumer establishes their ownership and allocation shapes; none requires a language change.
 
+## Why asymmetric signature keys are algorithm-specific
+
+The post-`pkg.db` asymmetric crypto extension uses six compiler-provided Move key types rather
+than one generic provider handle: private and public types for RS256, ES256, and Ed25519. This
+makes algorithm and signing-versus-verification confusion a type error, keeps ownership visible,
+and avoids a runtime algorithm selector that would create a second cryptographic paradigm.
+
+Construction is deliberately narrower than a general key-file API. Private keys accept one
+bounded unencrypted PKCS#8 `PRIVATE KEY` PEM, public keys accept SPKI `PUBLIC KEY` PEM or
+already-base64url-decoded JWK components, and sign/verify borrow an exact typed key. Password
+callbacks, certificates, OpenSSH/traditional PEM, private JWK, key generation/export, and
+provider selection remain outside the surface. This keeps file, terminal, environment, and
+network access out of crypto parsing and leaves encoding to the existing one
+`encoding.base64url_decode` path.
+
+Wire signatures follow the ecosystem formats that consume them: RS256 is PKCS#1 v1.5 with
+SHA-256 at modulus width, ES256 is P-256/SHA-256 with exact JOSE `r || s`, and Ed25519 is pure
+Ed25519. Separate public functions retain the one-way surface while one payloaded compiler key
+kind and one checked runtime shell share the implementation proof. The authoritative exact
+surface, validation precedence, ABI, resource bounds, and implementation closure matrix are in
+`docs/impl/std-design/crypto.md` “Asymmetric signature suite.”
+
 ---
 
 ## In one sentence

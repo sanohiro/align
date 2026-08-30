@@ -5571,6 +5571,19 @@ optimized artifact. Full shipped-feature record in the roadmap's M11 section. De
 record: blake3, zeroize-on-drop key buffers (P6), nonce-generating seal convenience (P3),
 `OSSL_set_max_threads`, fixed-size `array<u8; N>` returns.
 
+**Status update (2026-08-30, post-pkg.db asymmetric design SETTLED; implementation pending):**
+RS256, ES256, and Ed25519 use six distinct private/public Move key types plus per-algorithm
+construct/sign/verify functions, so algorithm and key-class confusion is closed statically. Private
+keys load only from one bounded unencrypted PKCS#8 `PRIVATE KEY` PEM; public keys load from SPKI
+`PUBLIC KEY` PEM or already-base64url-decoded JWK fields. RS256 is PKCS#1 v1.5 + SHA-256, ES256 is
+P-256 + SHA-256 with exact raw 64-byte `r || s`, and Ed25519 is pure Ed25519 with no digest/context/
+prehash selector. Sign/verify borrow the key and message; format/key rejection is `Error.Invalid`,
+provider/allocation failure is opaque `Error.Code(0)`, and signature mismatch is `Ok(false)`.
+Encrypted/traditional/certificate/OpenSSH PEM, private JWK, key generation/export, RSA-PSS, generic
+algorithm selectors, and a second provider are excluded. Exact input grammar, resource bounds,
+validation order, ABI, cache identity, and implementation closure matrix are locked by
+`impl/std-design/crypto.md` “Asymmetric signature suite.”
+
 ### std.ndslice — strided multi-dimensional views (Future)
 
 **Recorded 2026-07-04 (external design-note review adoption).** A std-layer (not syntax) strided 2D+

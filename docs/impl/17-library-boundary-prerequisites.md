@@ -44,6 +44,26 @@ single-writer precondition are authoritative in
 `docs/impl/std-design/fs.md`. This section records the boundary before its
 implementation activates any new `RuntimeKey` or validator variant.
 
+## Asymmetric crypto native boundary (design accepted; implementation pending)
+
+The post-pkg.db asymmetric signature suite is another consumer of this general boundary. Six
+algorithm/class-specific builtin Move types share one payloaded `SignatureKey(kind)` compiler
+representation and one provider-managed runtime shell; they are not package-defined resources and
+do not expose `raw`, a manual close, or a generic algorithm selector. Constructors return a fresh
+owner, ordinary moves null the source, aggregate replacement/Drop reaches the one null-safe
+`align_rt_crypto_key_free`, and `borrow` sign/verify parameters retain neither key nor message.
+
+Five generic operation shapes carry the closed `SignatureAlgorithm` discriminator through checked
+HIR, MIR, canonical type identity, runtime-key selection, and LLVM: private PEM construction,
+public PEM construction, decoded-JWK public construction, sign, and verify. The runtime repeats the
+closed algorithm/class kind in every handle and rejects a mismatch before EVP. All output slots are
+zeroed before work, every BIO/provider/context/key/signature allocation is released on failure, and
+no owner or signature is published before complete validation. The exact public surface, format and
+multi-invalid precedence, Move/control-path closure matrix, stable discriminant bytes, A106–A109
+ABI, interface/cache requirements, and one-capability-PR boundary are authoritative in
+`docs/impl/std-design/crypto.md` “Asymmetric signature suite”; the checked-HIR and runtime inventory
+deltas are mirrored in `19-hir-validation-ledger.md` and `20-runtime-abi-ledger.md`.
+
 ## 1. Decisions
 
 Seven prerequisites are accepted:

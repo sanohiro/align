@@ -6,7 +6,9 @@ module.
 
 > 🌐 **English** · [Japanese](./ja/crypto.md)
 
-> **Status:** complete for the M11 v1 surface. The documented BLAKE3 exception remains deferred.
+> **Status:** complete for the M11 symmetric/hash/KDF surface. The post-pkg.db asymmetric signature
+> suite is designed below; implementation is pending. The documented BLAKE3 exception remains
+> deferred.
 
 ## Overview
 
@@ -157,3 +159,241 @@ all-or-nothing shape. Plus the `constant_time_equal` self-host (branchless, no e
 - import-required
 - capability-linking tests prove that EVP-backed crypto retains libcrypto and programs with no
   Crypto/TLS capability do not link it
+
+## Asymmetric signature suite (post-pkg.db)
+
+This section is the authoritative public-contract ledger for RS256, ES256, and Ed25519 signing and
+verification. It extends the shipped M11 engine rather than adding a second crypto provider. The
+suite is deliberately algorithm-specific in both function and key type: no string/enum algorithm
+selector and no generic key handle can make an RSA key reach an EC or Ed25519 operation.
+
+Normative algorithms and wire signatures are fixed as follows.
+
+| Name | Exact operation | Public signature bytes |
+|---|---|---|
+| RS256 | RSASSA-PKCS1-v1_5 with SHA-256, not RSA-PSS | exactly the RSA modulus width, 256..=1024 bytes for an admitted 2048..=8192-bit key |
+| ES256 | ECDSA over named curve P-256 with SHA-256 | exactly 64 bytes: 32-byte big-endian `r` followed by 32-byte big-endian `s`, including leading zero bytes; DER is internal only |
+| Ed25519 | pure Ed25519 over the complete message, with no caller digest, context, or prehash | exactly 64 bytes |
+
+The RS256 and ES256 records follow RFC 7518 sections 3.3 and 3.4. Ed25519 follows RFC 8032 and its
+PKCS#8/SPKI identifiers follow RFC 8410. The implementation passes the exact digest/padding/group
+parameters to OpenSSL EVP; provider defaults may not choose them.
+
+### Public surface ledger
+
+The six compiler-provided nominal types are distinct **Move** owners:
+
+```text
+rs256_private_key       rs256_public_key
+es256_private_key       es256_public_key
+ed25519_private_key     ed25519_public_key
+```
+
+Each bare spelling is available after `import std.crypto`. Its explicit builtin spelling prefixes
+`crypto.`, for example `crypto.rs256_private_key`; that spelling requires and counts as a use of
+the same import. A same-module declaration wins bare lookup, while the explicit spelling always
+names the builtin. The entry module cannot declare a colliding bare name. Public interface
+production and import validation recognize both spellings and retain the required `std.crypto`
+source import.
+
+These are the exact constructors and operations; there are no defaults or optional arguments.
+`bytes` has the existing borrowed byte-view meaning. The explicit `borrow` mode requires a stable
+bound key place and never consumes it.
+
+```text
+crypto.rs256_private_key_from_pem(pem: str) -> Result<rs256_private_key, Error>
+crypto.es256_private_key_from_pem(pem: str) -> Result<es256_private_key, Error>
+crypto.ed25519_private_key_from_pem(pem: str) -> Result<ed25519_private_key, Error>
+
+crypto.rs256_public_key_from_pem(pem: str) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_pem(pem: str) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_pem(pem: str) -> Result<ed25519_public_key, Error>
+
+crypto.rs256_public_key_from_jwk(n: bytes, e: bytes) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_jwk(x: bytes, y: bytes) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_jwk(x: bytes) -> Result<ed25519_public_key, Error>
+
+crypto.rs256_sign(borrow key: rs256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.es256_sign(borrow key: es256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.ed25519_sign(borrow key: ed25519_private_key, message: bytes) -> Result<buffer, Error>
+
+crypto.rs256_verify(borrow key: rs256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.es256_verify(borrow key: es256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.ed25519_verify(borrow key: ed25519_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+```
+
+The `_from_jwk` functions consume already-base64url-decoded JWK fields, not JSON or encoded text.
+Callers use the one existing `encoding.base64url_decode` path before construction. No private JWK,
+key generation, key export, certificate parser, encrypted PEM, password callback, RSA-PSS,
+Ed25519ctx/ph, generic `sign`/`verify`, or implicit algorithm selection is added.
+
+### Key input and validation contract
+
+PEM constructors accept one bounded RFC 7468 textual block. The input is UTF-8 by `str`; each
+constructor first requires `1..=65,536` bytes and rejects an embedded NUL. The block starts at byte
+zero with the exact applicable `-----BEGIN PRIVATE KEY-----` or `-----BEGIN PUBLIC KEY-----` line.
+Its base64 body uses the standard alphabet, canonical final padding, and LF or CRLF line endings;
+every non-final body line is exactly 64 base64 characters and the final body line is 4..=64
+characters in a multiple of four. The exact matching END line follows immediately. At most one
+final LF or CRLF is accepted; leading text, horizontal whitespace, a second block, or any other
+trailing byte rejects. The decoded payload must be one complete BER/DER object with no trailing
+octet: unencrypted PKCS#8 `PrivateKeyInfo` / `OneAsymmetricKey` for `PRIVATE KEY`, or
+`SubjectPublicKeyInfo` for `PUBLIC KEY`. `ENCRYPTED PRIVATE KEY`, traditional `RSA PRIVATE KEY` /
+`EC PRIVATE KEY`, certificates, and OpenSSH keys therefore reject before any password, terminal,
+file, network, or environment lookup can occur.
+
+After decoding, the constructor requires the exact advertised key class and algorithm. RSA keys
+must have a 2048..=8192-bit odd modulus and an odd public exponent `>= 3` that fits in an unsigned
+64-bit integer; private keys pass the provider's complete private/pairwise check and public keys
+pass its public check. ES256 keys must name P-256 exactly and pass the full EC private/public check.
+Ed25519 keys must use the id-Ed25519 algorithm with absent parameters and pass the provider's
+private/public check. A key of another class, curve, size, or algorithm is `Error.Invalid`; it is
+never converted.
+
+JWK components are borrowed binary integers/points:
+
+| Constructor | Exact decoded fields and validation |
+|---|---|
+| `rs256_public_key_from_jwk` | `n` and `e` are minimal unsigned big-endian values with no leading zero. `n` is odd and its actual bit width is 2048..=8192; `e` is 1..=8 bytes, fits `u64`, is odd, and is `>= 3`. The resulting RSA key passes the provider public check. |
+| `es256_public_key_from_jwk` | `x` and `y` are each exactly 32-byte big-endian P-256 coordinates. The uncompressed point `0x04 || x || y` must be canonical, on-curve, non-infinite, and pass the provider public check. |
+| `ed25519_public_key_from_jwk` | `x` is exactly the 32-byte RFC 8037 Ed25519 public value and passes canonical/provider public-key validation. |
+
+All cheap structural checks precede provider key construction. No constructor publishes a handle
+until decoding, algorithm matching, bounds, and complete key validation have succeeded.
+
+### Ownership, allocation, and effects
+
+Each successful constructor returns a fresh one-word opaque owner of one provider-managed
+`EVP_PKEY`. Move transfers copy the pointer then null the complete source; replacement and every
+active aggregate Drop call the one null-safe `align_rt_crypto_key_free` exactly once. The types use
+the ordinary independent builtin-Move carrier rules: locals, by-value/shared-borrow parameters,
+returns, and recursively admitted struct/sum/Option/Result fields are valid; fixed/dynamic arrays
+and every other placement that already rejects an owned handle remain invalid. Keys have no
+borrowed input lifetime and no process-global registration. A borrowed signing or verification
+call keeps the owner usable afterward and cannot retain the message or signature view.
+
+Private scalar material stays inside the provider-owned key and is released by `EVP_PKEY_free`;
+the runtime does not copy it into an Align `buffer`. The caller-owned PEM `str` remains the caller's
+storage and is not zeroized. PEM scanning borrows the at-most-65,536-byte input and the memory BIO
+uses its explicit length. JWK construction uses only bounded component views and a 65-byte stack EC
+point. Provider objects/context allocations and the one key shell are fallible and are released on
+every failure.
+
+Signing and verification borrow the complete message without an Align-side message copy. RS256
+and ES256 use incremental EVP digest-sign/verify; Ed25519 uses the required one-shot pure-EdDSA
+call with a null digest name. A successful sign allocates and publishes one fresh `buffer`: exact
+modulus width for RS256 and 64 bytes for ES256/Ed25519. ES256's EVP DER signature is decoded into
+bounded internal `r`/`s` storage before the raw result is published. Failure publishes no buffer.
+Verification allocates no public result; ES256 converts the fixed raw input to a bounded internal
+DER value. An exact-length mathematically invalid or malformed signature returns `Ok(false)`;
+RS256 wrong-modulus-width and ES256/Ed25519 non-64-byte signatures also return `Ok(false)` before
+provider verification. `Ok(true)` means verification under the exact named algorithm only.
+
+Every constructor, sign, and verify operation is **Impure** because it crosses EVP. There is no
+shared key cache or mutable wrapper-global state, so calls may overlap freely. The named ambient
+platform dependency is the already-linked OpenSSL default library context/provider availability;
+the wrapper passes exact algorithm parameters and itself reads no configuration, path, environment,
+terminal, network, or clock. ES256 signing may consume provider randomness; RS256 and Ed25519 do
+not promise an observable determinism contract even where their standard construction is
+deterministic.
+
+### Errors and deterministic precedence
+
+Public validation/format/key rejection is `Error.Invalid`. Provider fetch/context/allocation or a
+non-verification engine failure is the existing opaque `Error.Code(0)`; no OpenSSL error-stack
+number or text is exposed. Signature mismatch is data (`Ok(false)`), not an error. Allocation
+failure, parse failure, and signing failure never publish a partial key or signature.
+
+For a multi-invalid runtime call, validation order is exact:
+
+1. validate and zero the ABI output slot, then validate the closed algorithm/key-kind tag (malformed
+   checked HIR only);
+2. validate all public lengths and structural rules left-to-right (`pem`; `n` then `e`; `x` then
+   `y`; or signature length);
+3. validate PEM envelope/base64/complete decoded object, or JWK numeric/point encoding;
+4. require the exact key algorithm/class/size/group, then run the applicable complete provider key
+   check;
+5. create the operation context, set the exact digest/padding/group parameters, and run the engine;
+6. validate the produced length/ES256 conversion and only then publish the owner or result.
+
+A verification signature-length failure returns `Ok(false)` after the typed key handle is checked
+and before the message is processed. An invalid key cannot be masked by an invalid signature in
+malformed HIR. Cleanup runs before the winning result is returned and never replaces it.
+
+### Runtime ABI and compiler identity
+
+One internal `SignatureAlgorithm` byte is closed as `0=RS256`, `1=ES256`, `2=Ed25519`. One
+`SignatureKeyKind` byte is closed as `0=RS256-private`, `1=RS256-public`, `2=ES256-private`,
+`3=ES256-public`, `4=Ed25519-private`, `5=Ed25519-public`; every other value rejects before an EVP
+call. The runtime shell repeats that kind and every operation checks it, so malformed MIR cannot
+turn static type confusion into an unsafe provider call.
+
+The implementation adds these exact internal declarations (`algorithm` is `i32` at the C ABI;
+the one-byte range is validated before narrowing):
+
+```text
+i32 @align_rt_crypto_private_key_from_pem(i32, ptr, i64, ptr)
+i32 @align_rt_crypto_public_key_from_pem(i32, ptr, i64, ptr)
+i32 @align_rt_crypto_public_key_from_jwk(i32, ptr, i64, ptr, i64, ptr)
+i32 @align_rt_crypto_sign(i32, ptr, ptr, i64, ptr)
+i32 @align_rt_crypto_verify(i32, ptr, ptr, i64, ptr, i64, ptr)
+void @align_rt_crypto_key_free(ptr)
+```
+
+The JWK ABI passes Ed25519's absent second component as null/zero. Constructor/sign result slots are
+pointer-sized handle slots initialized to null; verify's final slot is an `i32` initialized to zero.
+Status `0` is success, `AL_INVALID` maps to `Error.Invalid`, and `AL_CODE` maps to `Error.Code(0)`.
+
+Checked HIR and MIR use one payloaded key type rather than six unrelated enum arms. Canonical type
+record version 3 assigns `Scalar::SignatureKey(kind)` leaf tag 39 followed by the exact one-byte
+kind, and `Ty::SignatureKey(kind)` leaf tag 63 followed by that byte. The next tags 40/64 remain
+unknown because the kind is payload, not another leaf family. Interface format 8 remains unchanged:
+these nominal paths use its existing length-prefixed UTF-8 type record. The producer and importer
+recognize all twelve bare/qualified paths, preserve `std.crypto` as a required source import, and
+reconstruct Move/return-cleanup identity. Each key fingerprint is nominal — the exact closed kind,
+not the `EVP_PKEY` layout or a structural definition graph. There are no runtime inspection fields,
+descriptor thunks, or source/artifact reads. Operation and helper discriminants enter the compiler
+build fingerprint, in-process memo, frontend/object cache keys, and whole/per-unit parity once;
+an exact source edit/revert restores the prior key.
+
+OpenSSL libcrypto remains capability-linked only when one of these operations is reachable. No new
+artifact, file format, CLI flag, environment variable, provider selector, or package dependency is
+introduced.
+
+### Implementation closure matrix
+
+This is the author-side matrix required before implementation; no row may be closed only by a
+reviewer's later discovery.
+
+| Axis | Required closure | Owner evidence |
+|---|---|---|
+| Type formation and interface | six bare plus six qualified names; local-shadow/entry-collision/import-use rules; Copy rejected; Move and return-cleanup reconstruction; canonical kind/tag round-trip and exact next-unknown rejection | `align_interface::summary` builtin sweep; `align_mir::canonical_graph` exact goldens; `crypto_asymmetric::type_identity_matrix` whole/per-unit |
+| Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one owner, failure leaves null; wrong label/algorithm/class/curve/size/component and exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix` |
+| Move-in/out and cleanup | local bind, by-value parameter/return, shared borrow, struct/sum/Option/Result construction, `?`, `else`, `match`, `map_err`, branch/loop joins, replacement, early return, and ordinary/malformed Drop each preserve one kind and exactly-one free; source nulling precedes any later Drop | parameterized `crypto_asymmetric::ownership_matrix`; runtime free counter/failpoints; checked-HIR one-field negatives |
+| Sign/verify semantics | empty/binary/large messages; RS256 padding+digest and modulus-width result; ES256 DER/raw conversion including leading zeros and invalid r/s; Ed25519 one-shot no-digest; valid/wrong-message/wrong-key/wrong-length signatures; key remains usable | RFC 7515/7518, RFC 8032/8410, and OpenSSL-cross-checked vectors in runtime and `crypto_asymmetric` |
+| FFI/allocation/cleanup | every length uses checked conversion; output slots zero before work; ctx/key/BIO/BIGNUM/signature storage frees on every injected failure; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime failpoint sweep, ABI declaration golden, capability-linking twins |
+| Compilation paths | direct/imported calls, public key-bearing signatures, function values, generic monomorphization around a concrete key, whole-program/per-unit compilation, object/frontend cache edit/revert, optimized/unoptimized LLVM, and malformed HIR carry identical algorithm/kind/effect/cleanup facts | `crypto_asymmetric` driver owner, interface/cache owners, checked-HIR validator matrix |
+| Resource claim | PEM exact limit, RSA size bound, fixed ES/Ed temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` peak-wrapper-allocation record plus deterministic limit tests |
+
+The implementation is one capability PR even though it is expected to exceed roughly 1,000
+hand-written changed lines. The six static types, their constructors, runtime kind checks, and the
+first sign/verify consumers are one proof boundary: splitting them would land dormant key producers
+or duplicate the type/Drop/interface/ABI proof once per algorithm. RS256, ES256, and Ed25519 remain
+parameterized cells of that one boundary, not three independent ownership mechanisms.
+
+Before review, the author must map every applicable matrix cell to implementation and a regression
+or explicitly defer it here. A P1 or strategy-changing review finding reopens this matrix before
+implementation continues.
+
+### Acceptance and synchronized sources
+
+Acceptance requires the complete matrix above, `scripts/cargo.sh test -p align_runtime`, the focused
+`crypto_asymmetric` driver owner, interface/canonical/ABI goldens, capability-linking twins, the
+bounded PR gate, and Clippy. The local benchmark runs only because this ledger makes an explicit
+message-copy/resource claim; it is not a correctness gate and sets no latency target.
+
+This section is the source of truth. Its public types/signatures and algorithm/error/ownership
+contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-questions.md`,
+`docs/impl/07-roadmap.md`, `docs/impl/19-hir-validation-ledger.md`,
+`docs/impl/20-runtime-abi-ledger.md`, and the Japanese mirror. Implementation status changes only at
+the capability boundary; it does not rewrite this contract.
