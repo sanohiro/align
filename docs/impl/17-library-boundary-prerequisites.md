@@ -48,8 +48,10 @@ implementation activates any new `RuntimeKey` or validator variant.
 
 The post-pkg.db asymmetric signature suite is another consumer of this general boundary. Six
 algorithm/class-specific builtin Move types share one payloaded `SignatureKey(kind)` compiler
-representation and one provider-managed runtime shell; they are not package-defined resources and
-do not expose `raw`, a manual close, or a generic algorithm selector. Constructors return a fresh
+representation and one runtime shell; the shell owns its repeated kind, private ordinary
+`OSSL_LIB_CTX`, explicitly loaded built-in default provider, and provider-managed `EVP_PKEY`.
+They are not package-defined resources and do not expose `raw`, a manual close, or a generic
+algorithm selector. Constructors return a fresh
 owner, ordinary moves null the source, aggregate replacement/Drop reaches the one null-safe
 `align_rt_crypto_key_free`, and `borrow` sign/verify parameters retain neither key nor message.
 One fail-closed structural carrier classifier admits local/by-value/return/shared-borrow and
@@ -63,10 +65,15 @@ HIR, MIR, canonical type identity, runtime-key selection, and LLVM: private PEM 
 public PEM construction, decoded-JWK public construction, sign, and verify. The runtime repeats the
 closed algorithm/class kind in every handle and rejects a mismatch before EVP. All output slots are
 validated/alignment-checked and zeroed before work; every signed length and null/zero/positive input
-view is validated before slice formation. Every BIO/provider/context/key/signature allocation is
-released on failure, and no owner or signature is published before complete validation. Key import
-is trusted setup without a timing promise; fixed-public-length signing uses no wrapper secret flow
-and relies explicitly on the default provider's constant-time primitive with RSA blinding retained.
+view is validated before slice formation. Every BIO/libctx/provider/context/key/BN/signature/shell
+allocation is released on failure, and no owner or signature is published before complete
+validation. Every decode/import/operation fetch uses exact `provider=default` in the private context,
+and key/operation provider pointers must equal the shell's owned provider; global OpenSSL
+configuration and providers are never consulted. Ed25519 PEM/JWK and private-derived public values
+also pass wrapper-owned RFC 8032 canonical/on-curve/non-small-order validation independently of
+provider `public_check`. Key import is trusted setup without a timing promise; fixed-public-length
+signing uses no wrapper secret flow and relies explicitly on the pointer-verified built-in default
+provider's constant-time primitive with RSA blinding retained.
 The exact public surface, format and multi-invalid precedence, Move/control-path closure matrix,
 stable discriminant bytes, A106–A109 ABI, interface/cache requirements, and one-capability-PR
 boundary are authoritative in

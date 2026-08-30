@@ -490,7 +490,10 @@ The decision rejected a generic key handle, runtime algorithm strings, encrypted
 private JWK, key generation/export, and ambient password or provider selection. Sign and verify
 borrow their typed keys; constructor/key-format or malformed internal-ABI input is `Error.Invalid`,
 provider/allocation failure remains opaque `Error.Code(0)`, and every post-view signature mismatch
-is `Ok(false)`. The settled timing boundary treats construction as trusted setup without a timing
-promise and signing as constant-time for secret contents at fixed public lengths under the named
-OpenSSL-provider assumption. The public-contract and implementation-closure ledger is
+is `Ok(false)`. Each key shell owns an isolated OpenSSL context and explicitly loaded built-in
+default provider; exact property fetches and provider-pointer checks prevent ambient substitution.
+Ed25519 admission independently validates canonical RFC 8032 point recovery and rejects small-order
+points. The settled timing boundary treats construction as trusted setup without a timing promise
+and signing as constant-time for secret contents at fixed public lengths under that pointer-verified
+built-in default-provider dependency. The public-contract and implementation-closure ledger is
 `docs/impl/std-design/crypto.md` “Asymmetric signature suite.”

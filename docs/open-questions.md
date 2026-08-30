@@ -5588,9 +5588,13 @@ keys load only from one bounded unencrypted PKCS#8 `PRIVATE KEY` PEM; public key
 P-256 + SHA-256 with exact raw 64-byte `r || s`, and Ed25519 is pure Ed25519 with no digest/context/
 prehash selector. Sign/verify borrow the key and message; constructor/key-format or malformed
 internal-ABI rejection is `Error.Invalid`, provider/allocation failure is opaque `Error.Code(0)`,
-and every signature mismatch after valid byte views is `Ok(false)`. Constructors carry no timing
-promise; signing an admitted key is constant-time for private-key/message contents at fixed public
-lengths under the named OpenSSL-provider assumption.
+and every signature mismatch after valid byte views is `Ok(false)`. Each key shell owns an isolated
+OpenSSL context and explicitly loaded built-in default provider; exact `provider=default` fetches
+and provider-pointer checks exclude ambient substitution. Ed25519 public values pass wrapper-owned
+canonical RFC 8032 recovery and small-order rejection independently of provider `public_check`.
+Constructors carry no timing promise; signing an admitted key is constant-time for private-key/
+message contents at fixed public lengths under the pointer-verified built-in default-provider
+dependency.
 Encrypted/traditional/certificate/OpenSSH PEM, private JWK, key generation/export, RSA-PSS, generic
 algorithm selectors, and a second provider are excluded. Exact input grammar, resource bounds,
 validation order, ABI, cache identity, and implementation closure matrix are locked by

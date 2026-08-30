@@ -249,9 +249,24 @@ After decoding, the constructor requires the exact advertised key class and algo
 must have a 2048..=8192-bit odd modulus and an odd public exponent `>= 3` that fits in an unsigned
 64-bit integer; private keys pass the provider's complete private/pairwise check and public keys
 pass its public check. ES256 keys must name P-256 exactly and pass the full EC private/public check.
-Ed25519 keys must use the id-Ed25519 algorithm with absent parameters and pass the provider's
-private/public check. A key of another class, curve, size, or algorithm is `Error.Invalid`; it is
-never converted.
+Ed25519 keys must use the id-Ed25519 algorithm with absent parameters. A key of another class,
+curve, size, or algorithm is `Error.Invalid`; it is never converted.
+
+Ed25519 admission does not treat `EVP_PKEY_public_check` as point validation. One wrapper helper
+validates the exact 32-byte compressed public value from every SPKI/JWK and the value obtained with
+`EVP_PKEY_get_raw_public_key` from every PKCS#8 seed-derived key. It interprets the low 255 bits as
+little-endian `y` and the high bit as the `x` sign, requires `y < p = 2^255 - 19`, and performs RFC
+8032 section 5.1.3 recovery with the fixed `d = -121665 / 121666 mod p`. It computes
+`q = (y^2 - 1) / (d*y^2 + 1) mod p`, rejects a zero denominator, and obtains a square root with the
+fixed `(p + 3) / 8` exponent and RFC `sqrt(-1)` correction; it does not call `BN_mod_sqrt`. A
+non-square result and the forbidden `x = 0` with sign bit one reject. The recovered point must
+satisfy the twisted-Edwards equation and serialize byte-for-byte to the input. Three complete
+extended-coordinate Edwards doublings must not produce the projective identity `X = 0, Y = Z`,
+which rejects the entire small-order subgroup without exceptional affine inversions; no stronger
+prime-subgroup-membership promise is made. This public-data, variable-time check uses fallible
+`BIGNUM`/`BN_CTX` temporaries and precedes handle publication. An invalid encoding/point is
+`Error.Invalid`; a BN API allocation/arithmetic failure is `Error.Code(0)`. The provider
+private/public check remains an additional algorithm check, not the owner of these point invariants.
 
 JWK components are borrowed binary integers/points:
 
@@ -259,15 +274,17 @@ JWK components are borrowed binary integers/points:
 |---|---|
 | `rs256_public_key_from_jwk` | `n` and `e` are minimal unsigned big-endian values with no leading zero. `n` is odd and its actual bit width is 2048..=8192; `e` is 1..=8 bytes, fits `u64`, is odd, and is `>= 3`. The resulting RSA key passes the provider public check. |
 | `es256_public_key_from_jwk` | `x` and `y` are each exactly 32-byte big-endian P-256 coordinates. The uncompressed point `0x04 || x || y` must be canonical, on-curve, non-infinite, and pass the provider public check. |
-| `ed25519_public_key_from_jwk` | `x` is exactly the 32-byte RFC 8037 Ed25519 public value and passes canonical/provider public-key validation. |
+| `ed25519_public_key_from_jwk` | `x` is exactly the 32-byte RFC 8037 Ed25519 public value and passes the wrapper-owned canonical/on-curve/non-small-order validation above plus the provider algorithm check. |
 
 All cheap structural checks precede provider key construction. No constructor publishes a handle
 until decoding, algorithm matching, bounds, and complete key validation have succeeded.
 
 ### Ownership, allocation, and effects
 
-Each successful constructor returns a fresh one-word opaque owner of one provider-managed
-`EVP_PKEY`. Move transfers copy the pointer then null the complete source; replacement and every
+Each successful constructor returns a fresh one-word opaque owner of one runtime shell. The shell
+owns the repeated key kind, one private `OSSL_LIB_CTX`, its explicitly loaded built-in OpenSSL
+`default` `OSSL_PROVIDER`, and one provider-managed `EVP_PKEY`. Move transfers copy the shell pointer
+then null the complete source; replacement and every
 active aggregate Drop call the one null-safe `align_rt_crypto_key_free` exactly once. The types use
 the ordinary independent builtin-Move carrier rules: locals, by-value/shared-borrow parameters,
 returns, and recursively admitted struct/sum/Option/Result fields are valid. A fixed or dynamic AoS
@@ -285,8 +302,9 @@ Private scalar material stays inside the provider-owned key and is released by `
 the runtime does not copy it into an Align `buffer`. The caller-owned PEM `str` remains the caller's
 storage and is not zeroized. PEM scanning borrows the at-most-65,536-byte input and the memory BIO
 uses its explicit length. JWK construction uses only bounded component views and a 65-byte stack EC
-point. Provider objects/context allocations and the one key shell are fallible and are released on
-every failure.
+point. Ed25519 validation allocates a fixed-count set of public-data BN temporaries only during
+construction. Provider, library-context, operation-context, key, BN, and shell allocations are
+fallible and are released on every failure.
 
 Signing and verification borrow the complete message without an Align-side message copy. RS256
 and ES256 use incremental EVP digest-sign/verify; Ed25519 uses the required one-shot pure-EdDSA
@@ -299,12 +317,31 @@ RS256 wrong-modulus-width and ES256/Ed25519 non-64-byte signatures also return `
 provider verification. `Ok(true)` means verification under the exact named algorithm only.
 
 Every constructor, sign, and verify operation is **Impure** because it crosses EVP. There is no
-shared key cache or mutable wrapper-global state, so calls may overlap freely. The named ambient
-platform dependency is the already-linked OpenSSL default library context/provider availability;
-the wrapper passes exact algorithm parameters and itself reads no configuration, path, environment,
-terminal, network, or clock. ES256 signing may consume provider randomness; RS256 and Ed25519 do
-not promise an observable determinism contract even where their standard construction is
+shared key cache or mutable wrapper-global state, so calls over independent keys may overlap. Each
+constructor creates an ordinary `OSSL_LIB_CTX`, explicitly loads the built-in provider named
+`default`, and uses the exact property query `provider=default` for `_ex` decoding, `fromdata`, and
+signature/digest fetches: `d2i_AutoPrivateKey_ex`, `d2i_PUBKEY_ex`,
+`EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`, and `EVP_DigestSignInit_ex`/
+`EVP_DigestVerifyInit_ex` are the admitted construction/operation families. It never uses a
+null/global library context, loads an OpenSSL configuration,
+changes a provider search path or default property, or loads another provider. The resulting
+`EVP_PKEY_get0_provider` pointer must equal the shell's provider pointer before publication; every
+sign/verify context's `EVP_PKEY_CTX_get0_provider` pointer must equal it before the engine action.
+A mismatch/fetch failure is opaque `Error.Code(0)`. Thus process-global providers, default
+properties, `OPENSSL_CONF`, and `OPENSSL_MODULES` cannot substitute an implementation. The only
+ambient platform dependency is the already-linked libcrypto containing its built-in default
+provider. The wrapper passes exact algorithm parameters and reads no configuration, path,
+environment, terminal, network, or clock. ES256 signing may consume provider randomness; RS256 and
+Ed25519 do not promise an observable determinism contract even where their standard construction is
 deterministic.
+
+The shell and its context stay on the owning runtime thread because key task/parallel capture is
+forbidden. An operation frees its digest/PKEY context before returning. Final Drop frees the
+`EVP_PKEY`, calls `OPENSSL_thread_stop_ex` for the private context on that thread, unloads the owned
+provider, frees the library context, and then frees the shell. Partial construction unwinds the same
+acquired-prefix order. No provider or context outlives the shell and no shell mutates global OpenSSL
+state. Cleanup return statuses never replace the operation's winning result; library-context free is
+the final release even if provider unload reports failure.
 
 Constant-time scope is exact. Algorithm, key class, all lengths, formats, allocation outcomes, and
 success/error class are public. A constructor handles secret private-key bytes, but PEM/DER parsing
@@ -312,10 +349,13 @@ and provider key validation make no timing promise and are restricted to trusted
 not expose construction as a remote or repeated timing oracle. After successful construction, sign
 is constant-time with respect to private-key and message contents for fixed public lengths: wrapper
 code never extracts private components or branches/indexes on them, uses only the named high-level
-EVP signature operation, and leaves RSA blinding enabled. The OpenSSL default provider's
-constant-time primitive implementation is an explicit dependency assumption. Verification handles
-public material and has no constant-time promise. Evidence audits wrapper source/LLVM and linked EVP
-APIs/parameters; functional vectors or noisy wall-clock statistics are not constant-time evidence.
+EVP signature operation, and leaves RSA blinding enabled. The pinned built-in default provider's
+constant-time primitive implementation is an explicit dependency; provider provenance is checked at
+key and operation construction rather than assumed from ambient selection. Verification and the
+wrapper-owned Ed25519 public-point check handle public material and have no constant-time promise.
+Evidence audits wrapper source/LLVM, exact `_ex` context/property arguments, provider-pointer checks,
+and linked EVP APIs/parameters; functional vectors or noisy wall-clock statistics are not
+constant-time evidence.
 
 ### Errors and deterministic precedence
 
@@ -340,10 +380,15 @@ For a multi-invalid runtime call, validation order is exact:
 4. validate public structural lengths. PEM is `1..=65,536`; JWK uses the exact component bounds
    above; an empty message is valid. Once both verify views are valid, a wrong signature length
    publishes `false` before reading message contents;
-5. validate PEM envelope/base64/complete decoded object, or JWK numeric/point encoding;
-6. require the exact key algorithm/class/size/group, then run the applicable complete provider key
-   check;
-7. create the operation context, set the exact digest/padding/group parameters, and run the engine;
+5. validate the PEM envelope/base64 and obtain its bounded decoded bytes, or validate the cheap JWK
+   numeric/component encoding;
+6. create the private library context and explicit built-in default provider; decode exactly one
+   complete object/import with `provider=default`, require the exact key algorithm/class/size/group,
+   run the applicable provider key check, run the independent Ed25519 public-point check where
+   applicable, and require the key's provider pointer to equal the owned provider;
+7. create the operation context in that private context with `provider=default`, require its provider
+   pointer to equal the owned provider, set the exact digest/padding/group parameters, and run the
+   engine;
 8. validate the produced length/ES256 conversion and only then publish the owner or result.
 
 A verification signature-length failure returns `Ok(false)` after the typed key handle is checked
@@ -356,7 +401,8 @@ One internal `SignatureAlgorithm` byte is closed as `0=RS256`, `1=ES256`, `2=Ed2
 `SignatureKeyKind` byte is closed as `0=RS256-private`, `1=RS256-public`, `2=ES256-private`,
 `3=ES256-public`, `4=Ed25519-private`, `5=Ed25519-public`; every other value rejects before an EVP
 call. The runtime shell repeats that kind and every operation checks it, so malformed MIR cannot
-turn static type confusion into an unsafe provider call.
+turn static type confusion into an unsafe provider call. Its remaining private fields are the owned
+library-context, provider, and PKEY pointers; none is exposed through the ABI.
 
 The implementation adds these exact internal declarations (`algorithm` is `i32` at the C ABI;
 the one-byte range is validated before narrowing):
@@ -404,13 +450,15 @@ reviewer's later discovery.
 |---|---|---|
 | Type formation and interface | six no-import bare fallbacks plus six import-required qualified names; local-shadow/entry-collision/import-use rules; Copy rejected; Move and return-cleanup reconstruction; canonical kind/tag round-trip and exact next-unknown rejection | `align_interface::summary` builtin/source-import sweep; `align_mir::canonical_graph` exact goldens; `crypto_asymmetric::type_identity_matrix` whole/per-unit |
 | Carrier closure | Admit local, by-value/return/shared-borrow, struct/sum/Option/Result, and recursively dropped fixed/dynamic AoS Move-struct arrays. Reject direct or tagged/sum key elements in fixed/dynamic scalar arrays, slices, vectors/masks, builders, and pipelines; tuple/box; closure/task/parallel capture; `out`/`borrow mut`; global/constant; user-native/`layout(C)`; print/equality/order/hash. A future carrier fails closed. | one parameterized sema/checked-HIR `signature_key_carrier_matrix`, recursive DropPlan/codegen owner, malformed future-kind negative |
-| Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one owner, failure leaves null; wrong label/algorithm/class/curve/size/component and exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix` |
+| Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one complete shell owner, failure leaves null; wrong label/algorithm/class/curve/size/component and exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix` |
+| Ed25519 point admission | Every SPKI/JWK public value and every PKCS#8-derived public value passes wrapper-owned RFC 8032 compressed recovery, canonical `y`, sign-bit, curve-equation, re-encoding, and `[8]A != identity` checks independently of provider `public_check`; BN failure and invalid point remain distinct errors | direct positive RFC 8032 vectors; `y >= p`, nonsquare, `x=0/sign=1`, re-encoding, identity and all seven other small-order negatives through PEM and JWK; injected BN/raw-public-extraction failures and private-constructor helper-call assertion; a provider-check-success case cannot override wrapper rejection |
 | Move-in/out and cleanup | local bind, by-value parameter/return, shared borrow, struct/sum/Option/Result construction, `?`, `else`, `match`, `map_err`, branch/loop joins, replacement, early return, and ordinary/malformed Drop each preserve one kind and exactly-one free; source nulling precedes any later Drop | parameterized `crypto_asymmetric::ownership_matrix`; runtime free counter/failpoints; checked-HIR one-field negatives |
 | Sign/verify semantics | empty/binary/large messages; RS256 padding+digest and modulus-width result; ES256 DER/raw conversion including leading zeros and invalid r/s; Ed25519 one-shot no-digest; valid/wrong-message/wrong-key/wrong-length signatures; key remains usable | RFC 7515/7518, RFC 8032/8410, and OpenSSL-cross-checked vectors in runtime and `crypto_asymmetric` |
-| FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; ctx/key/BIO/BIGNUM/signature storage frees on every injected failure; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot and failpoint sweeps, ABI declaration golden, capability-linking twins |
-| Constant-time boundary | Constructor parsing/checking is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the default provider primitive is the named dependency assumption. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
+| FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; libctx/provider/ctx/key/BIO/BIGNUM/signature/shell storage frees on every injected failure; final free order is PKEY, thread-local context cleanup, provider, libctx, shell; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot and failpoint sweeps, ABI declaration golden, capability-linking twins |
+| Provider provenance | Each shell owns a private ordinary libctx and its explicitly loaded built-in default provider; all decode/import/signature/digest fetches use exact `provider=default`; key and operation provider pointers equal the owned pointer; no global ctx/config/search path/default property/provider is consumed | child-process owner with hostile `OPENSSL_CONF`/`OPENSSL_MODULES`, global null provider, and incompatible global default properties; exact pointer assertions; independent-key overlap and teardown stress |
+| Constant-time boundary | Constructor parsing/checking, including public BN validation, is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the pointer-verified built-in default provider primitive is the named dependency. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact `_ex` libctx/property/provider-pointer and EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
 | Compilation paths | direct/imported calls, public key-bearing signatures, function values, generic monomorphization around a concrete key, whole-program/per-unit compilation, object/frontend cache edit/revert, optimized/unoptimized LLVM, and malformed HIR carry identical algorithm/kind/effect/cleanup facts | `crypto_asymmetric` driver owner, interface/cache owners, checked-HIR validator matrix |
-| Resource claim | PEM exact limit, RSA size bound, fixed ES/Ed temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` peak-wrapper-allocation record plus deterministic limit tests |
+| Resource claim | PEM exact limit, RSA size bound, one private libctx/provider/PKEY shell per live key, fixed-count Ed public BN temporaries only during construction, fixed ES/Ed operation temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation record plus deterministic limit tests |
 
 The implementation is one capability PR even though it is expected to exceed roughly 1,000
 hand-written changed lines. The six static types, their constructors, runtime kind checks, and the
@@ -440,6 +488,9 @@ constant-time gate and sets no latency target.
 | P2 malformed signature conflicted with format rejection | Restricted `Error.Invalid` to constructor/internal-ABI rejection and made every post-view signature mismatch `Ok(false)`. |
 | P2 bare key alias import rule conflicted with the nominal model | Restored no-import bare fallback; only qualified type spellings and value operations require `std.crypto`. |
 | P2 HTTP streaming implementation status drifted | Synchronized the roadmap, settled record, draft, and language digest to implemented 2026-08-30. |
+| P1 provider provenance was only an ambient assumption | Reopened the provider axis: every key owns an isolated libctx and built-in default provider, every fetch uses `provider=default`, key/operation pointers are checked, teardown is ordered, and hostile-global child tests own substitution. |
+| P1 Ed25519 provider check did not validate the encoded point | Reopened point admission: the wrapper independently performs canonical RFC 8032 recovery, curve/re-encoding checks, and complete small-order rejection for PEM, JWK, and private-derived public values. |
+| P2 two HTTP tail sentences still claimed implementation was pending | Corrected the remaining `draft.md` and condensed-spec status sentences to the implemented state. |
 
 This section is the source of truth. Its public types/signatures and algorithm/error/ownership
 contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-questions.md`,

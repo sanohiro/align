@@ -112,8 +112,13 @@ be non-null/aligned and is zero-initialized. An invalid slot returns `AL_INVALID
 Every input length is nonnegative and `usize`-representable before slice formation; zero length may
 carry null and uses an internal empty sentinel, while positive length requires non-null. Ed25519's
 absent second JWK pair is exactly null/zero. Every handle repeats the closed key-kind byte and each
-operation checks algorithm, public/private class, and kind before EVP. Status and cleanup follow the
-exact crypto design ledger: zero success; `AL_INVALID` for constructor/key or malformed internal ABI
+operation checks algorithm, public/private class, and kind before EVP. Its private shell fields own
+one ordinary library context, its explicitly loaded built-in default provider, and the PKEY. Every
+decode/import/signature/digest fetch uses exact `provider=default`; the key and operation provider
+pointers must equal the owned provider before publication/action, and Ed25519 construction performs
+wrapper-owned canonical/on-curve/non-small-order point validation. Final free order is PKEY,
+`OPENSSL_thread_stop_ex`, provider unload, library-context free, then shell free. Status and cleanup
+follow the exact crypto design ledger: zero success; `AL_INVALID` for constructor/key or malformed internal ABI
 rejection; `AL_CODE` for opaque provider/allocation failure; post-view signature mismatch publishes
 false; and free is null-safe and one-time. Implementation moves these rows into the main keyed
 inventory, increases the keyed/base/max counts by six, and changes the table's shipped ABI range to

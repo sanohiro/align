@@ -170,8 +170,25 @@ decode 後、constructor は advertised key class/algorithm との exact 一致�
 は 2048..=8192-bit の odd modulus と、unsigned 64-bit に収まる odd public exponent `>= 3`
 を持つ。private key は provider の complete private/pairwise check、public key は public check
 を通る。ES256 は exact P-256 named group と full EC private/public check を要求する。Ed25519
-は parameter absent の id-Ed25519 と provider private/public check を要求する。異なる class、
-curve、size、algorithm は `Error.Invalid` であり、変換しない。
+は parameter absent の id-Ed25519 を要求する。異なる class、curve、size、algorithm は
+`Error.Invalid` であり、変換しない。
+
+Ed25519 admission は `EVP_PKEY_public_check` を point validation として扱わない。wrapper helper
+1つが、全 SPKI/JWK の exact 32-byte compressed public value と全 PKCS#8 seed-derived key から
+`EVP_PKEY_get_raw_public_key` で得た value を検証する。low 255 bits を little-endian `y`、high bit
+を `x` sign と解釈し、`y < p = 2^255 - 19` を要求して、fixed
+`d = -121665 / 121666 mod p` により RFC 8032 section 5.1.3 recovery を実行する。
+`q = (y^2 - 1) / (d*y^2 + 1) mod p` を計算し、zero denominator を reject し、fixed
+`(p + 3) / 8` exponent と RFC `sqrt(-1)` correction で square root を得る。`BN_mod_sqrt` は
+呼ばない。non-square result と forbidden `x = 0` + sign bit one は reject する。recovered point は
+twisted-Edwards equation を満たし、input と byte-for-byte に serialize されなければならない。
+complete extended-coordinate Edwards doubling を3回行った結果は projective identity
+`X = 0, Y = Z` であってはならない。これにより exceptional affine inversion なしで small-order
+subgroup 全体を reject する。それより強い prime-subgroup-membership promise は持たない。この
+public-data variable-time check は fallible な `BIGNUM`/`BN_CTX` temporary を使い、handle publish
+より前に行う。invalid encoding/point は `Error.Invalid`、BN API allocation/arithmetic failure は
+`Error.Code(0)`。provider private/public check は追加の algorithm check であり、これら point
+invariant の owner ではない。
 
 JWK component は borrowed binary integer/point である。
 
@@ -179,15 +196,17 @@ JWK component は borrowed binary integer/point である。
 |---|---|
 | `rs256_public_key_from_jwk` | `n`/`e` は leading zero のない minimal unsigned big-endian。`n` は odd かつ actual bit width 2048..=8192。`e` は 1..=8 bytes、`u64` に収まり、odd、`>= 3`。constructed RSA key は provider public check を通る。 |
 | `es256_public_key_from_jwk` | `x`/`y` は各 exact 32-byte big-endian P-256 coordinate。uncompressed point `0x04 || x || y` は canonical、on-curve、non-infinite で provider public check を通る。 |
-| `ed25519_public_key_from_jwk` | `x` は exact 32-byte RFC 8037 Ed25519 public value で canonical/provider public-key validation を通る。 |
+| `ed25519_public_key_from_jwk` | `x` は exact 32-byte RFC 8037 Ed25519 public value で、上記 wrapper-owned canonical/on-curve/non-small-order validation と provider algorithm check を通る。 |
 
 cheap structural check はすべて provider key construction より前に行う。decode、algorithm
 match、bounds、complete key validation が成功するまで handle を publish しない。
 
 ### Ownership, allocation, and effects
 
-各 successful constructor は provider-managed `EVP_PKEY` 1つを所有する fresh one-word opaque
-owner を返す。Move transfer は pointer を copy して complete source を null にする。replacement
+各 successful constructor は runtime shell 1つを指す fresh one-word opaque owner を返す。shell は
+repeated key kind、private `OSSL_LIB_CTX` 1つ、explicit load した built-in OpenSSL `default`
+`OSSL_PROVIDER`、provider-managed `EVP_PKEY` 1つを所有する。Move transfer は shell pointer を
+copy して complete source を null にする。replacement
 と active aggregate Drop は null-safe な `align_rt_crypto_key_free` を exact once 呼ぶ。type は
 ordinary independent builtin-Move carrier rule を使う。local、by-value/shared-borrow parameter、
 return、recursively admitted struct/sum/Option/Result field は valid。key を含む Move struct の
@@ -204,8 +223,9 @@ private scalar material は provider-owned key 内に留まり `EVP_PKEY_free` �
 runtime は Align `buffer` へ copy しない。caller-owned PEM `str` は caller storage のままで
 zeroize しない。PEM scan は高々65,536-byte input を borrow し、memory BIO は explicit length
 を使う。JWK construction は bounded component view と 65-byte stack EC point だけを使う。
-provider object/context allocation と key shell 1つは fallible で、failure path ごとに release
-する。
+Ed25519 validation は construction 中だけ fixed-count の public-data BN temporary を allocate する。
+provider/library-context/operation-context/key/BN/shell allocation は fallible で、failure path ごとに
+release する。
 
 sign/verify は complete message を Align-side copy なしで borrow する。RS256/ES256 は
 incremental EVP digest-sign/verify、Ed25519 は null digest name の required one-shot pure-EdDSA
@@ -218,11 +238,30 @@ wrong-modulus-width、ES256/Ed25519 の non-64-byte signature も provider verif
 `Ok(false)`。`Ok(true)` は exact named algorithm だけでの verification を意味する。
 
 constructor/sign/verify はすべて EVP を越えるため **Impure**。shared key cache や mutable
-wrapper-global state はなく、call は自由に overlap できる。named ambient platform dependency
-は既存の linked OpenSSL default library context/provider availability のみ。wrapper は exact
-algorithm parameter を渡し、それ自身は configuration/path/environment/terminal/network/clock
-を読まない。ES256 sign は provider randomness を消費し得る。RS256/Ed25519 も標準構成が
-deterministic な場合を含め observable determinism contract を約束しない。
+wrapper-global state はなく、independent key の call は overlap できる。各 constructor は ordinary
+`OSSL_LIB_CTX` を作り、`default` という built-in provider を explicit load し、`_ex` decode、
+`fromdata`、signature/digest fetch に exact property query `provider=default` を使う。admitted
+construction/operation family は `d2i_AutoPrivateKey_ex`、`d2i_PUBKEY_ex`、
+`EVP_PKEY_CTX_new_from_name`/`EVP_PKEY_fromdata`、`EVP_DigestSignInit_ex`/
+`EVP_DigestVerifyInit_ex` である。null/global library context を使わず、OpenSSL configuration を
+load せず、provider search path/default property
+を変更せず、別 provider を load しない。result の `EVP_PKEY_get0_provider` pointer は publish 前に
+shell provider pointer と一致し、各 sign/verify context の `EVP_PKEY_CTX_get0_provider` pointer は
+engine action 前に一致しなければならない。mismatch/fetch failure は opaque `Error.Code(0)`。
+したがって process-global provider/default property、`OPENSSL_CONF`、`OPENSSL_MODULES` は
+implementation を substitute できない。ambient platform dependency は linked libcrypto 内蔵の
+built-in default provider だけである。wrapper は exact algorithm parameter を渡し、
+configuration/path/environment/terminal/network/clock を読まない。ES256 sign は provider
+randomness を消費し得る。RS256/Ed25519 も標準構成が deterministic な場合を含め observable
+determinism contract を約束しない。
+
+key の task/parallel capture を forbidden にしているため shell/context は owning runtime thread に
+留まる。operation は return 前に digest/PKEY context を free する。final Drop は `EVP_PKEY` を
+free し、同 thread で private context の `OPENSSL_thread_stop_ex` を呼び、owned provider を unload、
+library context を free、最後に shell を free する。partial construction は同じ acquired-prefix order
+で unwind する。provider/context は shell より長く生存せず、shell は global OpenSSL state を
+mutate しない。cleanup return status は operation の winning result を置換せず、provider unload が
+failure を報告しても library-context free が final release になる。
 
 constant-time scope は exact である。algorithm、key class、全 length、format、allocation outcome、
 success/error class は public。constructor は secret private-key bytes を扱うが、PEM/DER parsing と
@@ -230,11 +269,13 @@ provider key validation は timing を約束せず trusted setup に限定する
 remote/repeated timing oracle として公開してはならない。successful construction 後の sign は、
 fixed public length における private-key/message content に関して constant-time である。wrapper
 code は private component を extract せず、それに branch/index せず、named high-level EVP
-signature operation だけを使い、RSA blinding を enabled のまま保つ。OpenSSL default provider の
-constant-time primitive implementation は明示した dependency assumption である。verification は
-public material を扱い constant-time promise を持たない。evidence は wrapper source/LLVM と linked
-EVP API/parameter を audit する。functional vector や noisy wall-clock statistic は constant-time
-evidence ではない。
+signature operation だけを使い、RSA blinding を enabled のまま保つ。pinned built-in default
+provider の constant-time primitive implementation は明示した dependency であり、provider
+provenance は ambient selection の assumption でなく key/operation construction 時に check する。
+verification と wrapper-owned Ed25519 public-point check は public material を扱い constant-time
+promise を持たない。evidence は wrapper source/LLVM、exact `_ex` context/property argument、
+provider-pointer check、linked EVP API/parameter を audit する。functional vector や noisy
+wall-clock statistic は constant-time evidence ではない。
 
 ### Errors and deterministic precedence
 
@@ -258,9 +299,14 @@ multi-invalid runtime call の validation order は exact に次のとおり。
 4. public structural length を validate。PEM は `1..=65,536`、JWK は上記 exact component bound、
    empty message は valid。verify view 2つが valid になった後の wrong signature length は message
    content を読む前に `false` を publish する。
-5. PEM envelope/base64/complete decoded object、または JWK numeric/point encoding を validate。
-6. exact key algorithm/class/size/group を要求し、applicable complete provider key check を実行。
-7. operation context を作り exact digest/padding/group parameter を設定して engine を実行。
+5. PEM envelope/base64 を validate して bounded decoded bytes を得る。または cheap JWK
+   numeric/component encoding を validate。
+6. private library context と explicit built-in default provider を作り、`provider=default` で exact
+   complete object 1つを decode/import する。exact key algorithm/class/size/group、applicable
+   provider key check、該当する independent Ed25519 public-point check を要求し、key provider
+   pointer と owned provider の一致を要求する。
+7. private context 内で `provider=default` を使って operation context を作り、その provider pointer
+   と owned provider の一致を要求し、exact digest/padding/group parameter を設定して engine を実行。
 8. produced length/ES256 conversion を validate し、その後だけ owner/result を publish。
 
 verify の signature-length failure は typed key handle check 後、message 処理前に
@@ -273,7 +319,8 @@ internal `SignatureAlgorithm` byte は closed `0=RS256`, `1=ES256`, `2=Ed25519`�
 `SignatureKeyKind` byte は closed `0=RS256-private`, `1=RS256-public`, `2=ES256-private`,
 `3=ES256-public`, `4=Ed25519-private`, `5=Ed25519-public`。他の値は EVP call 前に reject。
 runtime shell は kind を再保持し、各 operation が check するため malformed MIR でも static
-type confusion は unsafe provider call にならない。
+type confusion は unsafe provider call にならない。残る private field は owned library-context、
+provider、PKEY pointer であり、ABI には公開しない。
 
 実装は次の exact internal declaration を追加する（C ABI の `algorithm` は `i32`。1-byte
 range を validate してから narrow する）。
@@ -319,13 +366,15 @@ new artifact/file format/CLI flag/environment variable/provider selector/package
 |---|---|---|
 | Type formation and interface | no-import bare fallback 6 + import-required qualified name 6、local-shadow/entry-collision/import-use、Copy reject、Move/return-cleanup reconstruction、canonical kind/tag round-trip と exact next-unknown reject | `align_interface::summary` builtin/source-import sweep、`align_mir::canonical_graph` exact golden、`crypto_asymmetric::type_identity_matrix` whole/per-unit |
 | Carrier closure | local、by-value/return/shared-borrow、struct/sum/Option/Result、recursive Drop される fixed/dynamic AoS Move-struct array を admit。direct または tagged/sum key の fixed/dynamic scalar array、slice、vector/mask、builder、pipeline element、tuple/box、closure/task/parallel capture、`out`/`borrow mut`、global/constant、user-native/`layout(C)`、print/equality/order/hash を reject。future carrier は fail closed | parameterized sema/checked-HIR `signature_key_carrier_matrix`、recursive DropPlan/codegen owner、malformed future-kind negative |
-| Construction | private PEM 3、public PEM 3、decoded-JWK 3 constructor。success は owner 1つを initialize、failure は null。wrong label/algorithm/class/curve/size/component と exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vector + `crypto_asymmetric::constructor_matrix` |
+| Construction | private PEM 3、public PEM 3、decoded-JWK 3 constructor。success は complete shell owner 1つを initialize、failure は null。wrong label/algorithm/class/curve/size/component と exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vector + `crypto_asymmetric::constructor_matrix` |
+| Ed25519 point admission | 全 SPKI/JWK public value と全 PKCS#8-derived public value が provider `public_check` と独立した wrapper-owned RFC 8032 compressed recovery、canonical `y`、sign-bit、curve-equation、re-encoding、`[8]A != identity` check を通る。BN failure と invalid point は異なる error | direct positive RFC 8032 vector、PEM/JWK を通す `y >= p`、nonsquare、`x=0/sign=1`、re-encoding、identity + 他7つの small-order negative、injected BN/raw-public-extraction failure、private-constructor helper-call assertion、provider-check success が wrapper rejection を override できない case |
 | Move-in/out and cleanup | local bind、by-value parameter/return、shared borrow、struct/sum/Option/Result construction、`?`、`else`、`match`、`map_err`、branch/loop join、replacement、early return、ordinary/malformed Drop が kind 1つと exactly-one free を保持。source nulling は later Drop より先 | parameterized `crypto_asymmetric::ownership_matrix`、runtime free counter/failpoint、checked-HIR one-field negative |
 | Sign/verify semantics | empty/binary/large message、RS256 padding+digest/modulus-width result、leading zero/invalid r/s を含む ES256 DER/raw、Ed25519 one-shot no-digest、valid/wrong-message/wrong-key/wrong-length signature、key reusable | runtime と `crypto_asymmetric` の RFC 7515/7518、RFC 8032/8410、OpenSSL cross-check vector |
-| FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの ctx/key/BIO/BIGNUM/signature storage free、partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot + failpoint sweep、ABI declaration golden、capability-linking twin |
-| Constant-time boundary | constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。default provider primitive は named dependency assumption。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
+| FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの libctx/provider/ctx/key/BIO/BIGNUM/signature/shell storage free、final free order は PKEY、thread-local context cleanup、provider、libctx、shell。partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot + failpoint sweep、ABI declaration golden、capability-linking twin |
+| Provider provenance | 各 shell は private ordinary libctx と explicit load した built-in default provider を所有。全 decode/import/signature/digest fetch は exact `provider=default`。key/operation provider pointer は owned pointer と一致。global ctx/config/search path/default property/provider を一切 consume しない | hostile `OPENSSL_CONF`/`OPENSSL_MODULES`、global null provider、incompatible global default property を持つ child-process owner、exact pointer assertion、independent-key overlap/teardown stress |
+| Constant-time boundary | public BN validation を含む constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。pointer-verified built-in default provider primitive が named dependency。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact `_ex` libctx/property/provider-pointer と EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
 | Compilation paths | direct/imported call、public key-bearing signature、function value、concrete key 周辺 generic monomorphization、whole/per-unit、object/frontend cache edit/revert、optimized/unoptimized LLVM、malformed HIR で identical algorithm/kind/effect/cleanup fact | `crypto_asymmetric` driver owner、interface/cache owner、checked-HIR validator matrix |
-| Resource claim | PEM exact limit、RSA size bound、fixed ES/Ed temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` peak-wrapper-allocation record + deterministic limit test |
+| Resource claim | PEM exact limit、RSA size bound、live key ごとの private libctx/provider/PKEY shell 1つ、construction 中だけの fixed-count Ed public BN temporary、fixed ES/Ed operation temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation record + deterministic limit test |
 
 実装は hand-written changed lines が roughly 1,000 を超える見込みでも capability PR 1つとする。
 6 static type、constructor、runtime kind check、最初の sign/verify consumer は1つの proof boundary
@@ -355,6 +404,9 @@ latency target でもない。
 | P2 malformed signature と format rejection が矛盾した | `Error.Invalid` を constructor/internal-ABI rejection に限定し、post-view signature mismatch をすべて `Ok(false)` に固定。 |
 | P2 bare key alias の import rule が nominal model と矛盾した | no-import bare fallback を復元し、qualified type spelling と value operation だけが `std.crypto` を要求。 |
 | P2 HTTP streaming implementation status が drift した | roadmap、Settled record、draft、language digest を 2026-08-30 implemented に同期。 |
+| P1 provider provenance が ambient assumption だけだった | provider axis を reopen。全 key が isolated libctx/built-in default provider を所有し、全 fetch は `provider=default`、key/operation pointer を check、teardown order を固定し、hostile-global child test が substitution を own する。 |
+| P1 Ed25519 provider check が encoded point を validate しなかった | point admission を reopen。wrapper が PEM/JWK/private-derived public value に canonical RFC 8032 recovery、curve/re-encoding check、complete small-order rejection を独立実行する。 |
+| P2 HTTP tail sentence 2つが implementation pending と記述していた | 残った `draft.md` と condensed spec の status sentence を implemented state に修正。 |
 
 この節が source of truth である。public type/signature と algorithm/error/ownership contract は
 `draft.md` §18.2、`docs/language-spec.md`、`docs/open-questions.md`、

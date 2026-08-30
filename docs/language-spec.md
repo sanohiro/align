@@ -1139,7 +1139,7 @@ body or event-output bound uses `Error.Code(-1)` with no partial publication and
 connection. Separately, one `next` may scan at most its output capacity plus 262,144 de-framed
 source bytes, including ignored and control-only fields; exceeding that structural work guard is
 `Error.Invalid`. The exact contract is the client-streaming ledger in
-`docs/impl/std-design/http.md`; the surface is designed but not yet implemented.
+`docs/impl/std-design/http.md`; the surface was implemented on 2026-08-30.
 `std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`
@@ -1171,12 +1171,16 @@ and returns `Error.Code` when it is unavailable. The designed asymmetric extensi
 Move private/public key types for RS256, ES256, and Ed25519; unencrypted PKCS#8 private PEM, SPKI
 public PEM, and already-decoded JWK public constructors; and per-algorithm sign/verify functions.
 RS256 is PKCS#1 v1.5 with SHA-256, ES256 is P-256/SHA-256 with raw 64-byte `r || s`, and Ed25519 is
-pure Ed25519. Sign/verify borrow the key; malformed constructor/internal-ABI input is
+pure Ed25519. Each key owns an isolated OpenSSL context with the built-in default provider pinned by
+exact `provider=default` fetches and provider-pointer checks; global provider configuration cannot
+substitute it. Ed25519 construction independently validates canonical RFC 8032 point recovery and
+rejects small-order public points instead of trusting provider `public_check`. Sign/verify borrow the
+key; malformed constructor/internal-ABI input is
 `Error.Invalid`, an engine failure is `Error.Code(0)`, and every post-view signature mismatch is
 `Ok(false)`. Construction is trusted setup without a timing promise; signing an admitted key is
-constant-time for secret contents at fixed public lengths under the named OpenSSL-provider
-assumption. The implementation is pending; the exact surface, formats, bounds, ownership, ABI,
-timing boundary, and closure matrix are `impl/std-design/crypto.md`.
+constant-time for secret contents at fixed public lengths under the pointer-verified built-in
+OpenSSL default-provider dependency. The implementation is pending; the exact surface, formats,
+bounds, ownership, ABI, timing boundary, and closure matrix are `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every

@@ -1262,13 +1262,20 @@ kind and one checked runtime shell share the implementation proof. The authorita
 surface, validation precedence, ABI, resource bounds, and implementation closure matrix are in
 `docs/impl/std-design/crypto.md` “Asymmetric signature suite.”
 
-The timing boundary is deliberately honest about the borrowed engine. Key parsing and provider
-validation are trusted setup and make no timing promise; exposing them as a repeated remote oracle
-is outside the contract. After admission, the signing wrapper never extracts private components or
-branches/indexes on their contents, uses only the high-level EVP signature operation, and relies on
-the OpenSSL default provider's constant-time primitive implementation with RSA blinding retained.
-Signature verification uses public material. Functional vectors establish cryptographic semantics,
-while wrapper/API inspection — not noisy timing statistics — owns the constant-time boundary.
+The runtime shell owns one private OpenSSL library context and explicitly loaded built-in default
+provider. Exact `provider=default` fetches plus key/operation provider-pointer checks make ambient
+configuration unable to substitute the implementation. Ed25519 admission independently performs
+canonical RFC 8032 point recovery and small-order rejection because provider `public_check` does not
+own that invariant.
+
+The timing boundary is deliberately honest about the borrowed engine. Key parsing, public-point
+validation, and provider validation are trusted setup and make no timing promise; exposing them as
+a repeated remote oracle is outside the contract. After admission, the signing wrapper never
+extracts private components or branches/indexes on their contents, uses only the high-level EVP
+signature operation, and relies on the pointer-verified built-in default provider's constant-time
+primitive implementation with RSA blinding retained. Signature verification uses public material.
+Functional vectors establish cryptographic semantics, while wrapper/API/provider-provenance
+inspection — not noisy timing statistics — owns the constant-time boundary.
 
 ---
 

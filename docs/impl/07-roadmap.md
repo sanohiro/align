@@ -3898,7 +3898,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   algorithm/class Move key types; per-alg RS256 / ES256 / Ed25519 sign+verify; bounded unencrypted
   PKCS#8 private PEM, SPKI public PEM, and decoded-JWK public construction. RS256 is PKCS#1 v1.5 +
   SHA-256; ES256 is P-256 + SHA-256 with raw `r || s` 64B; Ed25519 is pure Ed25519. All operations
-  are Impure FFI. The authoritative ledger and one-PR implementation closure matrix are
+  are Impure FFI. Each key shell pins a private OpenSSL context/built-in default provider, and
+  Ed25519 point admission is wrapper-owned rather than delegated to provider `public_check`. The
+  authoritative ledger and one-PR implementation closure matrix are
   `impl/std-design/crypto.md` “Asymmetric signature suite.”
 - **std.http client streaming — IMPLEMENTED 2026-08-30** — the sole constructor
   is `cl.request_stream(req) -> Result<http_read_stream, Error>` (distinct from the shipped
