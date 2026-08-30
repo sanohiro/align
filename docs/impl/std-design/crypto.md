@@ -411,10 +411,30 @@ Failure classification is closed and ordered:
 | `d2i_PKCS8_PRIV_KEY_INFO` or `d2i_PUBKEY_ex` | a non-empty drained queue containing only the checked-in ASN.1 input-decode reason set, including the common `ERR_R_NESTED_ASN1_ERROR`/`ERR_R_MISSING_ASN1_EOS` wrappers | empty queue; `ERR_SYSTEM_ERROR`; fatal, malloc, internal, fetch, or unsupported reason; any other common or non-ASN.1 entry; any entry outside the closed set |
 | `i2d_PKCS8_PRIV_KEY_INFO` or `i2d_PUBKEY` | none; byte mismatch after successful re-encoding is a wrapper canonical-DER rejection | every call or allocation failure |
 | `EVP_PKCS82PKEY_ex` or JWK `fromdata` | every entry belongs to the checked-in ASN.1/RSA/EC input-rejection set or is one of `EVP_R_DECODE_ERROR`, `EVP_R_PRIVATE_KEY_DECODE_ERROR`, `EVP_R_INVALID_KEY`, `EVP_R_INVALID_KEY_LENGTH`, `EVP_R_INVALID_SEED_LENGTH`, `PROV_R_BAD_ENCODING`, `PROV_R_BAD_LENGTH`, `PROV_R_INVALID_DATA`, `PROV_R_INVALID_KEY`, `PROV_R_INVALID_KEY_LENGTH`, or `PROV_R_INVALID_SEED_LENGTH` | empty queue; `ERR_SYSTEM_ERROR`; fatal, malloc, internal, fetch, or unsupported reason; any entry outside the closed input set |
-| provider private/public/pairwise check | documented zero invalid result with no resource/internal entry | negative/unsupported result, empty failure queue, or any resource/internal entry |
-| provider/context/fetch/pointer-provenance/sign/verify setup or engine call | none; verify's documented mismatch is separately `Ok(false)` | every failure |
+| provider private/public/pairwise check | only the exhaustive return-code/queue table below | only the exhaustive return-code/queue table below |
+| signature verification engine call | only the exhaustive return-code/queue table below | only the exhaustive return-code/queue table below |
+| provider/context/fetch/pointer-provenance/sign setup or signing engine call | none | every non-success return |
 
-`Error.Code(0)` dominates a mixed queue. The implementation classifies with `ERR_SYSTEM_ERROR`,
+For a failed or mismatch-returning call, the drained queue has exactly one wrapper class. `Empty`
+has no entry. `InputOnly` is non-empty and every entry belongs to that call's closed input- or
+signature-mismatch set. `CodeBearing` contains at least one system/fatal/malloc/internal/fetch/
+unsupported/unknown entry; it includes every mixed queue and dominates the other entries. These
+classes and the native result form this exhaustive, disjoint product:
+
+| Native operation | Return | Queue after the call | Public result |
+|---|---:|---|---|
+| provider private/public/pairwise check | `1` | any | continue; clear incidental entries |
+| provider private/public/pairwise check | `0` | `Empty` or `InputOnly` | `Error.Invalid` |
+| provider private/public/pairwise check | `0` | `CodeBearing` | `Error.Code(0)` |
+| provider private/public/pairwise check | negative (including unsupported `-2`) or any other value | any | `Error.Code(0)` |
+| signature verification | `1` | any | `Ok(true)`; clear incidental entries |
+| signature verification | `0` | `Empty` or `InputOnly` | `Ok(false)` |
+| signature verification | `0` | `CodeBearing` | `Error.Code(0)` |
+| signature verification | negative or any other value | any | `Error.Code(0)` |
+
+Thus an empty queue is invalid key/signature data only with the documented zero return; it is Code
+with a decoder/import null or another failed engine call. A non-empty queue never turns a negative,
+unsupported, or unexpected return into Invalid/mismatch. The implementation classifies with `ERR_SYSTEM_ERROR`,
 `ERR_GET_LIB`, `ERR_GET_REASON`, and `ERR_GET_RFLAGS` against symbolic library/reason constants,
 never localized text or unstable numeric literals. The complete set lives next to the classifier,
 is equality-tested against this table's named families, and an OpenSSL version change may only add a
@@ -513,7 +533,7 @@ reviewer's later discovery.
 | Move-in/out and cleanup | local bind, by-value parameter/return, shared borrow, struct/sum/Option/Result construction, `?`, `else`, `match`, `map_err`, branch/loop joins, replacement, early return, and ordinary/malformed Drop each preserve one kind and exactly-one free; source nulling precedes any later Drop | parameterized `crypto_asymmetric::ownership_matrix`; runtime free counter/failpoints; checked-HIR one-field negatives |
 | Sign/verify semantics | empty/binary/large messages; RS256 padding+digest and modulus-width result; ES256 DER/raw conversion including leading zeros and invalid r/s; Ed25519 one-shot no-digest; valid/wrong-message/wrong-key/wrong-length signatures; key remains usable | RFC 7515/7518, RFC 8032/8410, and OpenSSL-cross-checked vectors in runtime and `crypto_asymmetric` |
 | Private decoder and secret cleanup | Base64 decodes directly into one exact-length `OPENSSL_malloc` allocation owned by non-growing `SensitiveDer`; success and every failure use `OPENSSL_clear_free`. Only the wrapper version/algorithm check → `d2i_PKCS8_PRIV_KEY_INFO` → canonical/full-consumption checks → `EVP_PKCS82PKEY_ex` path is admitted; private re-encoding scratch clear-frees; PKCS#8 object and import-copy native cleanse dependencies are pinned. | cleanse spy and allocation failpoints at decode/DER/import/validation/success; optimized source/LLVM/API audit keeps `OPENSSL_clear_free` live; relabeled PKCS#1/SEC1, version-one, attributes, noncanonical, trailing, and malformed-inner owner vectors |
-| OpenSSL error classification | Each fallible call clears, immediately drains/classifies, and re-clears its thread-local queue. Direct invalid input and the closed input-reason set map Invalid; empty/unknown/system/fatal/resource/internal/fetch/unsupported map Code; Code dominates mixed stacks; stale entry and independent-thread queues cannot affect a call. | malformed ASN.1 and inner-key vectors for all algorithms; injected allocation at decoder/import; stale, empty, unknown, mixed-invalid-plus-allocation, queue-empty-on-exit, and parallel independent-queue owners |
+| OpenSSL error classification | Each fallible call clears, immediately drains/classifies, and re-clears its thread-local queue. Direct invalid input and the closed input-reason set map Invalid; empty/unknown/system/fatal/resource/internal/fetch/unsupported follow the call-specific table; Code dominates mixed failure stacks; stale entry and independent-thread queues cannot affect a call. Provider checks and verify exhaust the return-code × `Empty`/`InputOnly`/`CodeBearing` product without overlap. | malformed ASN.1 and inner-key vectors for all algorithms; injected allocation at decoder/import; stale, empty, unknown, mixed-invalid-plus-allocation, queue-empty-on-exit, and parallel independent-queue owners; direct provider-check `{1,0,-1,-2,other}` and verify `{1,0,-1,other}` × all three queue-class vectors |
 | FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; libctx/provider/ctx/key/PKCS#8/DER/BIGNUM/signature/shell storage frees on every injected failure; final free order is PKEY, thread-local context cleanup, provider, libctx, shell; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot, cleanse, error-queue, and failpoint sweeps; ABI declaration golden; capability-linking twins |
 | Provider provenance | Each shell owns a private ordinary libctx and its explicitly loaded built-in default provider; all decode/import/signature/digest fetches use exact `provider=default`; key and operation provider pointers equal the owned pointer; no global ctx/config/search path/default property/provider is consumed | child-process owner with hostile `OPENSSL_CONF`/`OPENSSL_MODULES`, global null provider, and incompatible global default properties; exact pointer assertions; independent-key overlap and teardown stress |
 | Constant-time boundary | Constructor parsing/checking, including public BN validation, is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the pointer-verified built-in default provider primitive is the named dependency. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact `_ex` libctx/property/provider-pointer and EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
@@ -555,6 +575,7 @@ constant-time gate and sets no latency target.
 | P1 decoded private DER had no cleanse owner | Reopened private-decoder cleanup: exact-length non-growing `SensitiveDer` and every private re-encoding scratch clear-free on success and every failure, with native PKCS#8/import cleanup dependencies and optimized-artifact/failpoint owners. |
 | P2 the auto private decoder admitted relabeled legacy DER | Removed `d2i_AutoPrivateKey_ex`; only canonical version-zero `PrivateKeyInfo` through the PKCS#8-specific decoder/import path is admitted, with relabeled PKCS#1/SEC1 and `OneAsymmetricKey` negatives. |
 | P2 decoder null conflated invalid input with allocation/engine failure | Added per-call error-queue isolation, a closed input-reason set, Code-dominant mixed-stack precedence, and malformed/allocation/stale/empty/unknown/parallel owners. |
+| P2 provider-check and verify result/queue classes overlapped | Partitioned each native return code against mutually exclusive `Empty`/`InputOnly`/`CodeBearing` queues; zero+empty now has one call-specific result, Code dominates mixed failure queues, and direct Cartesian-product owners close every cell. |
 
 This section is the source of truth. Its public types/signatures and algorithm/error/ownership
 contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-questions.md`,

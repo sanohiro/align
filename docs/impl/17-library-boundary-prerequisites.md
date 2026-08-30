@@ -71,8 +71,10 @@ legacy DER and `OneAsymmetricKey` reject. Base64 decodes into one exact `Sensiti
 and it plus every private re-encoding scratch is cleansed before free on all paths. Every
 libctx/provider/context/key/PKCS#8/DER/BN/signature/shell allocation is released on failure, and no
 owner or signature is published before complete validation. Each fallible OpenSSL call isolates its
-thread-local error queue; only a closed input-rejection set maps Invalid, while empty/unknown/
-resource/internal/fetch entries map Code and Code dominates a mixed queue. Every
+thread-local error queue. Provider checks and verify exhaust a disjoint native-return ×
+`Empty`/`InputOnly`/`CodeBearing` queue table: documented zero plus Empty/InputOnly is invalid data
+or mismatch, CodeBearing dominates a zero, and negative/unsupported/unexpected returns are Code.
+Decoder/import empty/unknown/resource/internal/fetch entries are Code. Every
 decode/import/operation fetch uses exact `provider=default` in the private context,
 and key/operation provider pointers must equal the shell's owned provider; global OpenSSL
 configuration and providers are never consulted. Ed25519 PEM/JWK and private-derived public values

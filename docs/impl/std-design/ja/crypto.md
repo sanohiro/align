@@ -332,10 +332,31 @@ failure classification は closed かつ ordered である。
 | `d2i_PKCS8_PRIV_KEY_INFO` または `d2i_PUBKEY_ex` | common wrapper `ERR_R_NESTED_ASN1_ERROR`/`ERR_R_MISSING_ASN1_EOS` を含む checked-in ASN.1 input-decode reason set だけを持つ non-empty drained queue | empty queue、`ERR_SYSTEM_ERROR`、fatal/malloc/internal/fetch/unsupported reason、その他の common/non-ASN.1 entry、closed set 外の entry のいずれか |
 | `i2d_PKCS8_PRIV_KEY_INFO` または `i2d_PUBKEY` | なし。successful re-encoding 後の byte mismatch は wrapper canonical-DER rejection | 全 call/allocation failure |
 | `EVP_PKCS82PKEY_ex` または JWK `fromdata` | 全 entry が checked-in ASN.1/RSA/EC input-rejection set、または `EVP_R_DECODE_ERROR`、`EVP_R_PRIVATE_KEY_DECODE_ERROR`、`EVP_R_INVALID_KEY`、`EVP_R_INVALID_KEY_LENGTH`、`EVP_R_INVALID_SEED_LENGTH`、`PROV_R_BAD_ENCODING`、`PROV_R_BAD_LENGTH`、`PROV_R_INVALID_DATA`、`PROV_R_INVALID_KEY`、`PROV_R_INVALID_KEY_LENGTH`、`PROV_R_INVALID_SEED_LENGTH` のいずれか | empty queue、`ERR_SYSTEM_ERROR`、fatal/malloc/internal/fetch/unsupported reason、closed input set 外の entry のいずれか |
-| provider private/public/pairwise check | resource/internal entry のない documented zero invalid result | negative/unsupported result、empty failure queue、resource/internal entry のいずれか |
-| provider/context/fetch/pointer-provenance/sign/verify setup または engine call | なし。verify の documented mismatch は別に `Ok(false)` | 全 failure |
+| provider private/public/pairwise check | 下記 exhaustive return-code/queue table だけに従う | 下記 exhaustive return-code/queue table だけに従う |
+| signature verification engine call | 下記 exhaustive return-code/queue table だけに従う | 下記 exhaustive return-code/queue table だけに従う |
+| provider/context/fetch/pointer-provenance/sign setup または signing engine call | なし | 全 non-success return |
 
-mixed queue では `Error.Code(0)` が優先する。implementation は `ERR_SYSTEM_ERROR`、
+failed または mismatch-returning call の drained queue は exact wrapper class 1つを持つ。
+`Empty` は entry なし。`InputOnly` は non-empty で、全 entry がその call の closed input または
+signature-mismatch set に属する。`CodeBearing` は system/fatal/malloc/internal/fetch/unsupported/
+unknown entry を1つ以上含み、全 mixed queue を含んで他 entry より優先する。class と native
+result の exhaustive disjoint product は次のとおり。
+
+| Native operation | Return | Queue after the call | Public result |
+|---|---:|---|---|
+| provider private/public/pairwise check | `1` | any | 続行し incidental entry を clear |
+| provider private/public/pairwise check | `0` | `Empty` または `InputOnly` | `Error.Invalid` |
+| provider private/public/pairwise check | `0` | `CodeBearing` | `Error.Code(0)` |
+| provider private/public/pairwise check | negative（unsupported `-2` を含む）またはその他の値 | any | `Error.Code(0)` |
+| signature verification | `1` | any | `Ok(true)`。incidental entry を clear |
+| signature verification | `0` | `Empty` または `InputOnly` | `Ok(false)` |
+| signature verification | `0` | `CodeBearing` | `Error.Code(0)` |
+| signature verification | negative またはその他の値 | any | `Error.Code(0)` |
+
+したがって empty queue は documented zero return と組み合わさる場合だけ invalid key/signature
+data であり、decoder/import null または別の failed engine call では Code になる。non-empty
+queue は negative/unsupported/unexpected return を Invalid/mismatch に変えない。implementation は
+`ERR_SYSTEM_ERROR`、
 `ERR_GET_LIB`、`ERR_GET_REASON`、`ERR_GET_RFLAGS` と symbolic library/reason constant で classify
 し、localized text や unstable numeric literal を使わない。complete set は classifier の隣に置き、
 この table の named family と equality-test する。OpenSSL version change で reason を追加するには
@@ -430,7 +451,7 @@ new artifact/file format/CLI flag/environment variable/provider selector/package
 | Move-in/out and cleanup | local bind、by-value parameter/return、shared borrow、struct/sum/Option/Result construction、`?`、`else`、`match`、`map_err`、branch/loop join、replacement、early return、ordinary/malformed Drop が kind 1つと exactly-one free を保持。source nulling は later Drop より先 | parameterized `crypto_asymmetric::ownership_matrix`、runtime free counter/failpoint、checked-HIR one-field negative |
 | Sign/verify semantics | empty/binary/large message、RS256 padding+digest/modulus-width result、leading zero/invalid r/s を含む ES256 DER/raw、Ed25519 one-shot no-digest、valid/wrong-message/wrong-key/wrong-length signature、key reusable | runtime と `crypto_asymmetric` の RFC 7515/7518、RFC 8032/8410、OpenSSL cross-check vector |
 | Private decoder and secret cleanup | base64 は non-growing `SensitiveDer` が所有する exact-length `OPENSSL_malloc` allocation 1つへ直接 decode。success と全 failure で `OPENSSL_clear_free`。wrapper version/algorithm check → `d2i_PKCS8_PRIV_KEY_INFO` → canonical/full-consumption check → `EVP_PKCS82PKEY_ex` だけを admit。private re-encoding scratch は clear-free し、PKCS#8 object/import-copy native cleanse dependency を pin | decode/DER/import/validation/success の cleanse spy と allocation failpoint、optimized source/LLVM/API で `OPENSSL_clear_free` が live なことを audit、relabeled PKCS#1/SEC1、version-one、attributes、noncanonical、trailing、malformed-inner owner vector |
-| OpenSSL error classification | 各 fallible call は thread-local queue を clear、直後に drain/classify、再clear。direct invalid input と closed input-reason set は Invalid、empty/unknown/system/fatal/resource/internal/fetch/unsupported は Code、mixed stack は Code 優先。stale entry と independent-thread queue は call に影響しない | 全 algorithm の malformed ASN.1/inner-key vector、decoder/import allocation injection、stale/empty/unknown/mixed-invalid-plus-allocation/queue-empty-on-exit/parallel independent-queue owner |
+| OpenSSL error classification | 各 fallible call は thread-local queue を clear、直後に drain/classify、再clear。direct invalid input と closed input-reason set は Invalid、empty/unknown/system/fatal/resource/internal/fetch/unsupported は call-specific table に従い、mixed failure stack は Code 優先。stale entry と independent-thread queue は call に影響しない。provider check/verify は return-code × `Empty`/`InputOnly`/`CodeBearing` product を overlap なく exhaust | 全 algorithm の malformed ASN.1/inner-key vector、decoder/import allocation injection、stale/empty/unknown/mixed-invalid-plus-allocation/queue-empty-on-exit/parallel independent-queue owner、direct provider-check `{1,0,-1,-2,other}` と verify `{1,0,-1,other}` × 全3 queue-class vector |
 | FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの libctx/provider/ctx/key/PKCS#8/DER/BIGNUM/signature/shell storage free、final free order は PKEY、thread-local context cleanup、provider、libctx、shell。partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot、cleanse/error-queue/failpoint sweep、ABI declaration golden、capability-linking twin |
 | Provider provenance | 各 shell は private ordinary libctx と explicit load した built-in default provider を所有。全 decode/import/signature/digest fetch は exact `provider=default`。key/operation provider pointer は owned pointer と一致。global ctx/config/search path/default property/provider を一切 consume しない | hostile `OPENSSL_CONF`/`OPENSSL_MODULES`、global null provider、incompatible global default property を持つ child-process owner、exact pointer assertion、independent-key overlap/teardown stress |
 | Constant-time boundary | public BN validation を含む constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。pointer-verified built-in default provider primitive が named dependency。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact `_ex` libctx/property/provider-pointer と EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
@@ -472,6 +493,7 @@ latency target でもない。
 | P1 decoded private DER に cleanse owner がなかった | private-decoder cleanup を reopen。exact-length non-growing `SensitiveDer` と全 private re-encoding scratch を success/全 failure で clear-free し、native PKCS#8/import cleanup dependency と optimized-artifact/failpoint owner を追加。 |
 | P2 auto private decoder が relabeled legacy DER を admit した | `d2i_AutoPrivateKey_ex` を除去。PKCS#8-specific decoder/import path の canonical version-zero `PrivateKeyInfo` だけを admit し、relabeled PKCS#1/SEC1 と `OneAsymmetricKey` negative を追加。 |
 | P2 decoder null が invalid input と allocation/engine failure を混同した | per-call error-queue isolation、closed input-reason set、Code-dominant mixed-stack precedence、malformed/allocation/stale/empty/unknown/parallel owner を追加。 |
+| P2 provider-check/verify result と queue class が overlap した | 各 native return code を mutually exclusive `Empty`/`InputOnly`/`CodeBearing` queue と partition。zero+empty は call-specific result 1つを持ち、mixed failure queue は Code 優先、direct Cartesian-product owner が全 cell を close。 |
 
 この節が source of truth である。public type/signature と algorithm/error/ownership contract は
 `draft.md` §18.2、`docs/language-spec.md`、`docs/open-questions.md`、
