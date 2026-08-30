@@ -15,8 +15,9 @@ half of the request. No general reference value, whole Move-record binding, clon
 surface is added. The independent review of `d349700d` found four valid boundary, closure, and
 documentation issues; the consolidated repair preserves existing Index positives, enumerates every
 provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
-registered consumer targets. Publish the reviewed design, then implement its Rust and owner-test
-closure.
+registered consumer targets. PR #913 is open. Because `main` advanced through provenance-adjacent
+Request 21 work, complete one fresh base-integration review, refresh exact-head preflight and the PR,
+then merge the design and implement its Rust and owner-test closure.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -427,9 +428,9 @@ facts must live in this repository.
   merged in align-llm PR #107, so the register can close it. The required `macos-15` PR leg runs the existing
   `m5_owned_json` owner, and the discovered storage-generation regression no longer falsely retains
   a `JsonOwnedDecode` input/arena fact. The complete owner passed locally on Apple Silicon and in the
-  required macOS CI leg. Request 19's Align-side implementation is merged; the consumer-owned pin,
-  hosted-lane restoration, and fresh-worker proof remain. Request 22's string-array indexing design
-  is active and blocks the R7 tokenizer implementation.
+  required macOS CI leg. Request 19 is merged and real-client adopted through align-llm PR #108.
+  Request 21's projection-view repair is merged in Align and awaits consumer pin adoption. Request
+  22's string-array indexing design is active and blocks the R7 tokenizer implementation.
 
 Consumer-gated deferrals that remain intentional:
 
