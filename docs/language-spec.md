@@ -1211,7 +1211,8 @@ A private top-level `test` declaration carries one ordinary string name and one 
 callable or exported name. Its body is checked as a compiler-private
 `fn() -> Result<(), core.Error>` with one documented implicit `Ok(())` after a Unit fallthrough;
 ordinary `?`, Err, cleanup, and hard-error behavior are unchanged. Names are bounded, control-free,
-and unique per module. Canonical ids are `<module>::<name>`, and discovery is limited to the explicit
+excluding exactly U+0000..U+001F and U+007F..U+009F, and unique per module. Canonical ids are
+`<module>::<name>`, and discovery is limited to the explicit
 entry/import closure in deterministic dependency-first, then declaration order.
 
 With `import core.test`, `test.expect(bool)` and `test.expect_eq(left, right)` are standalone
@@ -1223,9 +1224,12 @@ reflection or formatting is added.
 
 `alignc test` links the closure once and launches that immutable test artifact in a fresh process
 group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
-return from exit, exec, abort, and crash. Each test has bounded time and per-stream capture. Passing
-output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a
-fully passing suite always has one summary line. No user `main` is required or invoked. Production
+return from exit, exec, abort, and crash. Each row has bounded time from pre-spawn through launch,
+execution, group signalling, capture drain, and direct-child reap plus bounded per-stream capture;
+pre-ack timeout/output is infrastructure failure. Every terminal path signals the pinned group
+before direct-child reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
+output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
+passing suite always has one summary line. No user `main` is required or invoked. Production
 commands type-check tests but omit their bodies, capabilities, and names from production MIR,
 interfaces, links, and artifacts; `explain-opt` also omits them from located MIR/remarks, and
 `db prepare` omits test-body queries from static descriptors/native preparation. Test compilation

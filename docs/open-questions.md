@@ -37,9 +37,11 @@ are bounded. Passing output is suppressed and only a failed test's bounded bytes
 successful suite output is one summary line independent of test count. Production commands check
 test bodies but omit them from production MIR, interfaces, capabilities, and artifacts, including
 optimization remarks and database preparation descriptors. The fixed launch/acknowledgement ABI
-separates harness setup failure from user termination; cleanup failures stop the suite after
-preserving already-selected bounded evidence, and the runner signals descendants but reaps only its
-direct child.
+separates bounded harness setup failure from user termination. One state-machine owner covers every
+terminal path, holds the group leader unreaped while signalling the pinned group, then reaps only its
+direct child; cleanup failures stop after preserving already-selected bounded evidence. A scoped
+signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM and restores prior dispositions on ordinary
+return. Names reject exactly the C0/C1 ranges U+0000..U+001F and U+007F..U+009F.
 
 Record: `docs/impl/core-design/test.md`, `draft.md` §18.1, `docs/language-spec.md`
 

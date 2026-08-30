@@ -394,8 +394,9 @@ facts must live in this repository.
 - **Next language capability:** `core.test` is designed in
   `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
   explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
-  group per test, a fixed launch acknowledgement, fail-closed normal-return record, bounded
-  preallocated output/time, direct-child cleanup, and failure-only output replay. Production
+  group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
+  preallocated output/full-row deadline, all-terminal group signalling before direct-child reap,
+  four-signal cleanup, and failure-only output replay. Production
   interfaces/MIR/links, optimization remarks, and DB preparation descriptors stay test-free.
   Implementation is the next code PR; `std.id`
   remains blocked on the settled scalar equality rule and friction-ledger evidence.

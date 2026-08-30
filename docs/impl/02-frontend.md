@@ -224,6 +224,10 @@ reuse `FnDecl`, because it has no source name, visibility, parameters, generics,
 or expression body. `pub test`, attributes, a missing string/block, and function-like near-shapes
 receive test-specific recovery before the next top-level item.
 
+The decoded name is 1..=256 UTF-8 bytes and rejects exactly U+0000..U+001F and
+U+007F..U+009F before canonical-id construction. The sema catalog owner pins both boundary
+neighbors and the complete 1,024-byte id limit.
+
 Depth capping visits the test block exactly as a function block. The formatter preserves the
 ordinary string token and formats the block with the same block rules; the contextual word is
 always spelled `test`. Sema supplies the compiler-private `Result<Unit, Error>` function shape and

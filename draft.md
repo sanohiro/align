@@ -2669,7 +2669,8 @@ std.crypto.
 
 A private top-level test declaration consists of the contextual word `test`, one ordinary string
 token, and a block. It creates no callable name or public interface entry. The decoded name is
-nonempty, at most 256 UTF-8 bytes, contains no control character, and is unique within its module.
+nonempty, at most 256 UTF-8 bytes, contains no C0/C1 control (U+0000..U+001F or
+U+007F..U+009F), and is unique within its module.
 The canonical test id is the canonical module path, `::`, and that name; the entry module path is
 `main`. Only tests in the explicit entry/import closure exist for a command.
 
@@ -2692,11 +2693,16 @@ location, then follows the test's Err cleanup edge with
 and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
 group per test. It requires no user `main` and never invokes one. A compiler-owned completion record
 written only after a normal selected-test return prevents exit, exec, abort, or a crash from
-impersonating success. Each test has a default 60-second deadline (configurable through bounded
-`--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each, configurable
-through bounded `--max-output-bytes`). Passing output is suppressed; a failure replays only that
-test's bounded evidence. A fully passing suite therefore emits one summary line regardless of test
-count. The exact grammar, bounds, record bytes, validation order, ownership, cache identity,
+impersonating success. Each catalog row has a default 60-second deadline from pre-spawn through
+launch, execution, group signalling, capture drain, and direct-child reap (configurable through
+bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each,
+configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
+acknowledgement is infrastructure failure. Every terminal path signals the pinned child process
+group before reaping its direct child; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful
+cleanup and conventional exit. Passing output is suppressed; a failure replays only that test's
+bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
+A zero-test command reports `alignc: no tests found` and builds no artifact. The exact grammar, bounds, record
+bytes, validation order, ownership, cache identity,
 reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
 
 Production commands parse and type-check test declarations but omit them from production MIR,

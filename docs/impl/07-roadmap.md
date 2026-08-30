@@ -3867,11 +3867,12 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 
 - **core.test — DESIGNED 2026-08-30** — private top-level named Result blocks; explicit
   `core.test` assertion import with Bool-result equality only; one immutable test artifact run
-  sequentially in a fresh process group per catalog row; fixed launch acknowledgement and
-  compiler-owned normal-return proof; bounded preallocated output and time; full-group signalling,
-  direct-child reap, and failure-only evidence replay. Production MIR/interfaces/links,
+  sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
+  compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated
+  lifecycle owner, all-terminal full-group signalling before direct-child reap, four graceful
+  signals, and failure-only evidence replay. Production MIR/interfaces/links,
   optimization remarks, and database preparation descriptors exclude tests. The exact public
-  ledger, control-protocol bytes, cleanup precedence, cache identity, and one-capability
+  ledger, control-protocol bytes, lifecycle state matrix, cache identity, and one-capability
   implementation matrix are `core-design/test.md`; an in-language benchmark runner remains a later
   consumer rather than part of this test capability.
 - **std.id** — one 128-bit Copy scalar; ULID / UUIDv7 / UUIDv4 differ only by generation rule +
