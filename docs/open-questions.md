@@ -29,6 +29,8 @@ keyword-less types while `pub test "..." {}` rejects. It creates no callable/exp
 `test.expect_eq(left, right)` assertions may early-return `Error.Invalid` from the lexical test
 body. Equality remains the ordinary `==` family and must produce exact bool, so vector/mask equality
 is rejected rather than implicitly reduced; there is no assertion reflection or second error model.
+A final syntactic block-tail assertion becomes the final statement only at root completion or
+structural statement placement; every Value edge rejects, including expected Unit.
 
 `alignc test` discovers only the explicit entry/import closure, links it once in a distinct test
 cache domain, and runs the dependency-first/source-order catalog sequentially in one fresh process
@@ -38,10 +40,12 @@ are bounded. Passing output is suppressed and only a failed test's bounded bytes
 successful suite output is one summary line independent of test count. Production commands check
 test bodies only after closing and freezing an ordinary-source prefix; test roots and every
 generated helper, monomorph, type, descriptor, and capability live in a separate overlay. Production
-commands validate both partitions but consume only the byte-stable prefix, including for
-optimization remarks and database preparation descriptors. The fixed launch/acknowledgement ABI
-separates bounded harness setup failure from user termination. One state-machine owner covers every
-terminal path, holds the group leader unreaped while signalling the pinned group, then reaps only its
+commands validate both partitions but consume only the frozen prefix, including for
+optimization remarks and database preparation descriptors. Its codegen/cache identity is the
+complete span-erased semantic projection; current spans/located metadata may shift. The fixed
+launch/acknowledgement ABI separates bounded harness setup failure from user termination, and the
+parent control endpoint is nonblocking. One state-machine owner covers every terminal path, holds
+the group leader unreaped while signalling the pinned group then direct PID, then reaps only its
 direct child; cleanup failures stop after preserving already-selected bounded evidence. A scoped
 signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM. Returning error paths restore prior dispositions;
 terminal paths retain the controller through summary publication, then block/recheck and exit

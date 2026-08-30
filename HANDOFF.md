@@ -395,13 +395,15 @@ facts must live in this repository.
   `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
   explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
   group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
-  preallocated output/full-row deadline, terminal-observation control barrier, all-terminal group
-  signalling before direct-child reap, evidence retained through reporting, controller-owned
-  four-signal terminal summary commit, and failure-only output replay. Compiler formation freezes
+  preallocated output/full-row deadline, terminal-observation control barrier, all-terminal
+  pinned-group then direct-PID signalling before reap, nonblocking control drains,
+  evidence retained through reporting, controller-owned four-signal terminal summary commit, and
+  failure-only output replay. Compiler formation normalizes final syntactic-tail assertions only
+  at root completion or structural statement placement and freezes
   the complete production prefix before appending a test-generated function/type/descriptor/
   capability overlay; production interfaces/MIR/links, optimization remarks, and DB preparation
-  descriptors consume only that byte-stable prefix. Implementation is the next code PR; `std.id`
-  remains blocked on the settled scalar equality rule and friction-ledger evidence.
+  descriptors consume only its span-erased semantic/codegen projection. Implementation is the next
+  code PR; `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

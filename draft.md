@@ -2695,7 +2695,10 @@ identities or artifacts.
 ordinary nested blocks, excluding lambdas. The first requires exact bool. The second reuses the
 ordinary `==` admission/type rule, additionally requires that comparison to return exact bool, and
 evaluates left then right once. Vector/mask equality returns a mask and is therefore rejected rather
-than implicitly reduced. A false assertion identifies the canonical test id and one-based call
+than implicitly reduced. The ordinary parser may represent a final assertion before `}` as a block
+tail; test-context checking consumes it as the final statement only at root completion or when the
+enclosing block/control expression is itself a statement. Every value edge rejects, even when its
+consumer expects Unit. A false assertion identifies the canonical test id and one-based call
 location, then follows the test's Err cleanup edge with
 `Error.Invalid`; operand values and source text are not formatted or reflected.
 
@@ -2707,9 +2710,11 @@ impersonating success. Each catalog row has a default 60-second deadline from pr
 launch, execution, group signalling, capture drain, and direct-child reap (configurable through
 bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each,
 configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
-acknowledgement is infrastructure failure. Every terminal path signals the pinned child process
-group before reaping its direct child; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful
-cleanup and conventional exit. The runner retains its signal controller while writing the final
+acknowledgement is infrastructure failure. The parent control endpoint is nonblocking before spawn,
+so every datagram drain returns to deadline processing when its queue is empty. Every verified
+terminal path signals the pinned child process group and then its still-unreaped direct PID before
+reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup and conventional
+exit. The runner retains its signal controller while writing the final
 summary, then blocks and rechecks those signals and exits directly, so restored prior handlers
 cannot change terminal output. Passing output is suppressed; a failure replays only that test's
 bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
@@ -2722,8 +2727,10 @@ and consume only the frozen production prefix for MIR, link capabilities, interf
 executables. This excludes the complete test-generated closure from `explain-opt` located
 MIR/remarks and excludes test-only queries from `db prepare` static descriptors and native
 preparation. A test-only edit may miss the source-keyed frontend cache but leaves the production
-HIR tables, descriptors, MIR, object key, link inputs, and executable bytes unchanged. Test
-compilation uses a separate versioned cache domain.
+span-erased semantic HIR projection, descriptors, MIR codegen graph, object key, link inputs, and
+executable bytes unchanged. Current spans and located metadata may shift after an earlier test edit
+and do not enter production codegen identity. Test compilation uses a separate versioned cache
+domain.
 
 ---
 

@@ -240,16 +240,22 @@ the documented implicit Ok tail. With `import core.test`, qualified `test.expect
 `test.expect_eq` remain ordinary call-shaped AST expressions; semantic context restricts them to
 standalone statements in the lexical test body and ordinary nested blocks, never a lambda. The
 equality form must produce exact `bool`; an ordinary vector/mask equality result is rejected rather
-than reduced.
+than reduced. Because ordinary parsing stores the final expression before `}` in `Block::tail`,
+test-context sema normalizes an exact assertion there into the final statement only at root
+completion or structural statement placement. Every Value edge rejects, including expected Unit.
+Checked HIR therefore retains only `Stmt::Expr(TestAssert)` without changing ordinary block
+parsing.
 
 Normal commands parse and check tests after closing and freezing the complete ordinary-source HIR
 prefix. Test roots and every artifact generated only while checking them append to a checked-HIR
 overlay. Production lowering validates the partition but consumes only the prefix; `explain-opt`
 therefore forms no overlay MIR/remark, while `db prepare` retains test diagnostics but forms no
 overlay static descriptor. Catalog records retain canonical module/name identity and source ordinal
-independently from overlay function symbols. The exact grammar,
-name/catalog bounds, mode split, cache identity, and closure matrix are
-`core-design/test.md`; that document, not this representation summary, owns the public contract.
+independently from overlay function symbols. Production cache/codegen identity uses the complete
+span-erased semantic prefix; the checked prefix still retains current spans for diagnostics and
+located output. The exact grammar, name/catalog bounds, mode split, cache identity, and closure
+matrix are `core-design/test.md`; that document, not this representation summary, owns the public
+contract.
 
 ### Type declarations (keyword-less)
 

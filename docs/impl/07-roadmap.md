@@ -3869,15 +3869,17 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `core.test` assertion import with Bool-result equality only; one immutable test artifact run
   sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
   compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated
-  lifecycle owner, terminal-observation control barrier, all-terminal full-group signalling before
-  direct-child reap, quiesced evidence retained through reporting, controller-owned terminal
-  summary commit for four graceful signals, and failure-only evidence replay. Compiler formation
+  lifecycle owner, terminal-observation control barrier, all-terminal pinned-group then direct-PID
+  signalling before reap, nonblocking control drains, quiesced evidence retained
+  through reporting, controller-owned terminal summary commit for four graceful signals, and
+  failure-only evidence replay. Compiler formation normalizes final syntactic-tail assertions only
+  at root completion or structural statement placement and
   freezes the complete production prefix before appending the test-generated function/type/
   descriptor/capability overlay; production MIR/interfaces/links, optimization remarks, and
-  database preparation descriptors consume only that byte-stable prefix. The exact public
-  ledger, control-protocol bytes, lifecycle state matrix, cache identity, and one-capability
-  implementation matrix are `core-design/test.md`; an in-language benchmark runner remains a later
-  consumer rather than part of this test capability.
+  database preparation descriptors consume only its span-erased semantic/codegen projection. The
+  exact public ledger, control-protocol bytes, lifecycle state matrix, cache identity, and
+  one-capability implementation matrix are `core-design/test.md`; an in-language benchmark runner
+  remains a later consumer rather than part of this test capability.
 - **std.id** — one 128-bit Copy scalar; ULID / UUIDv7 / UUIDv4 differ only by generation rule +
   text form; monotonic ULID via an explicit Move generator; CSPRNG source; parse strict.
   **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,

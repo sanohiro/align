@@ -577,8 +577,20 @@ type members, and transitive function/type/resource monomorph demands. It reject
 production-prefix edge to an overlay suffix. Owner matrices cover a test lambda, a test-only generic
 monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
 class, capability library use, and static descriptor. Adding or editing only tests must leave the
-encoded production Program, descriptor vector, MIR, object key, link inputs, and executable bytes
-identical in whole-program and per-unit paths.
+canonical span-erased semantic/codegen projection of the production Program, descriptor vector,
+span-erased MIR codegen graph, object key, link inputs, and executable bytes identical in
+whole-program and per-unit paths. The checked Program itself retains current source spans for
+diagnostics and located output; those spans and their source-keyed/located metadata may change when
+an earlier test edit shifts byte offsets and never enter the production semantic/codegen key.
+
+The production key projection is one exhaustive structural encoder, not filtered `Debug` text. It
+starts with the versioned domain `align-production-codegen-v1`, visits production Program tables,
+functions, statements, and expressions in stored order, encodes every non-`Span` field through the
+existing canonical scalar/sequence encoders, then encodes `production_static_descriptors` in order.
+Every HIR variant must be matched explicitly, so a new field or variant cannot silently disappear;
+only recursively typed `Span` fields are omitted. Raw Program `Debug`, diagnostics, source paths,
+located-MIR records, and `TestOverlay` are forbidden inputs. The whole-program and per-unit lowering
+keys consume this same projection before adding their existing mode/target/profile inputs.
 
 The HIR expression discriminator is
 `TestAssert { condition, kind, line, column }`, where `kind` is the closed
@@ -595,6 +607,16 @@ the validator does not reconstruct the unavailable two source operands from a bo
 false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
 true condition to Unit fallthrough.
 
+The ordinary parser still represents the last expression before `}` as `Block::tail`, including on
+its own terminated source line. Sema assigns `Statement | Value` placement from the AST parent before
+checking children. At the root test completion or in a nested block/control expression that is
+itself a complete `Stmt::Expr`, sema recognizes an exact imported assertion call in that syntactic
+tail, consumes it as the final assertion statement, and leaves Unit fallthrough; checked HIR
+therefore still stores only `Stmt::Expr(TestAssert)` and no assertion value. The same call remains a
+rejected Value when the enclosing block or control expression is consumed by a binding, argument,
+return, break, or other operand, even if that consumer expects Unit. Ordinary functions, lambdas,
+non-assertion tails, and parser behavior are unchanged.
+
 Validation order is the complete production prefix, overlay table bounds, catalog length/order,
 catalog identity bytes and root/back-reference correlation, overlay reachability closure, overlay
 function envelopes and bodies, assertion envelope/placement/kind/location/condition, then ordinary
@@ -608,8 +630,11 @@ duplicate/sparse ordinal, or any future metadata/assertion kind fails before MIR
 This section activates atomically with the implementation and its parameterized valid/malformed
 owners. Metadata owners mutate each identity string independently and together, declared/default
 entry paths, every root/back-reference and prefix/suffix boundary, ordinal, and duplicate relation;
-assertion owners place each kind in every `Stmt::Expr` depth plus every rejected value-position
-family. The public grammar, runner, cache, and process protocol remain owned by
+assertion owners place each kind in every `Stmt::Expr` depth, the root and every statement-placement
+nested final syntactic tail, plus every rejected value-consuming tail family including expected
+Unit. Cache owners mutate only earlier test source width and prove changing spans/located metadata
+beside an unchanged span-erased semantic projection and production artifact. The public grammar,
+runner, cache, and process protocol remain owned by
 `core-design/test.md`.
 
 ## Header-adjacent records

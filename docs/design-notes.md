@@ -1294,6 +1294,12 @@ propagates, Err fails, and ordinary cleanup runs. Assertions are explicit `core.
 there is no exception, panic-catching framework, boolean-returning second dialect, or hidden global
 registry.
 
+The ordinary parser's final-expression rule remains unchanged. Test-context sema treats an exact
+final assertion as a statement only at root completion or when its enclosing block/control is
+structurally a statement; every Value edge, including expected Unit, rejects. This preserves the one
+statement-only assertion form without requiring a dummy trailing expression or inventing a
+parser-only assertion node.
+
 The declaration is not an ordinary named function. It has no parameters, visibility, callable
 identity, or interface entry because production code must not acquire a test-only dependency.
 Normal semantic formation closes and freezes the complete production program first. Test checking
@@ -1301,16 +1307,21 @@ then appends roots plus every test-generated helper, monomorph, type, descriptor
 a separate overlay. Normal commands validate the partition and consume only the frozen prefix,
 while test mode combines both. This boundary preserves production ids and bytes instead of trying
 to discard only visibly tagged root functions after they have already influenced shared tables.
-Test mode has a separate cache identity and links the explicit import closure once.
+Codegen/cache identity projects that prefix without source spans: diagnostics and located output
+retain current offsets, while an earlier test edit cannot perturb production objects. Test mode has
+a separate cache identity and links the explicit import closure once.
 
 Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
 unwinding to the language. A compiler-owned completion record means an early exit zero cannot
 masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
-from user termination, and one deadline covers both states through cleanup. One dedicated runner
+from user termination, and one deadline covers both states through cleanup. The parent control
+endpoint is nonblocking, so an acknowledgement without completion returns to poll instead of
+stalling that deadline. One dedicated runner
 state machine owns signals, polling, capture, and wait status: every terminal path keeps the leader
-unreaped while it signals the pinned group, then reaps only its direct child and continues only after
-cleanup succeeds. A second control drain after non-reaping terminal observation closes the fast-exit
+unreaped while it signals the pinned group and then the direct PID, then reaps only its direct child
+and continues only after cleanup succeeds. The direct target also closes a leader that left the
+verified group. A second control drain after non-reaping terminal observation closes the fast-exit
 race between completion send and status observation. Descendants are signalled but not reaped by
 this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM from child
 acquisition through summary publication. Returning error paths restore prior handlers; terminal
