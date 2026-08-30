@@ -1196,8 +1196,10 @@ converge on this:
   reserve the same word across every vendored module: that would make ordinary qualified APIs such
   as `pkg.db.Error` impossible even though user types already have canonical module identities.
   Non-entry modules therefore resolve a same-module declaration before a builtin alias. The closed
-  explicit table is `core.Error` (always in scope), `crypto.argon2_params` (`std.crypto` import), and
-  `regex.regex_match` (`std.regex` import). The entry namespace
+  explicit table is `core.Error` (always in scope), `crypto.argon2_params` plus the six settled
+  `crypto.{rs256,es256,ed25519}_{private,public}_key` spellings (`std.crypto` import), and
+  `regex.regex_match` (`std.regex` import). The signature-key entries activate atomically with the
+  pending asymmetric implementation. The entry namespace
   remains unmangled and rejects a true canonical collision. This preserves one lookup rule and does
   not weaken the no-shadowing rule for values.
 
@@ -1237,6 +1239,52 @@ runtime may explode on adversarial input. Therefore v1 deliberately excludes bac
 look-around, returns byte spans rather than allocating matched strings, and starts with only
 compile/is_match/find/find_at. Captures/replacement/split can be added at the library boundary when a
 real consumer establishes their ownership and allocation shapes; none requires a language change.
+
+## Why asymmetric signature keys are algorithm-specific
+
+The post-`pkg.db` asymmetric crypto extension uses six compiler-provided Move key types rather
+than one generic provider handle: private and public types for RS256, ES256, and Ed25519. This
+makes algorithm and signing-versus-verification confusion a type error, keeps ownership visible,
+and avoids a runtime algorithm selector that would create a second cryptographic paradigm.
+
+Construction is deliberately narrower than a general key-file API. Private keys accept one
+bounded canonical unencrypted PKCS#8 v1 `PrivateKeyInfo` version zero in `PRIVATE KEY` PEM, public
+keys accept canonical SPKI `PUBLIC KEY` PEM or
+already-base64url-decoded JWK components, and sign/verify borrow an exact typed key. Password
+callbacks, certificates, OpenSSH/traditional PEM, private JWK, key generation/export, and
+provider selection remain outside the surface. `OneAsymmetricKey` and relabeled PKCS#1/SEC1 DER
+cannot enter through format auto-detection: the one private path is PKCS#8-specific. Its exact
+decoded and canonical-reencoding buffers are explicit secret owners cleansed before free. This keeps file, terminal, environment, and
+network access out of crypto parsing and leaves encoding to the existing one
+`encoding.base64url_decode` path.
+
+Wire signatures follow the ecosystem formats that consume them: RS256 is PKCS#1 v1.5 with
+SHA-256 at modulus width, ES256 is P-256/SHA-256 with exact JOSE `r || s`, and Ed25519 is pure
+Ed25519. Separate public functions retain the one-way surface while one payloaded compiler key
+kind and one checked runtime shell share the implementation proof. The authoritative exact
+surface, validation/error precedence, private-secret cleanup, ABI, resource bounds, and implementation closure matrix are in
+`docs/impl/std-design/crypto.md` “Asymmetric signature suite.”
+
+The runtime shell owns one private OpenSSL library context and explicitly loaded built-in default
+provider. Exact `provider=default` fetches plus key/operation provider-pointer checks make ambient
+configuration unable to substitute the implementation. Ed25519 admission independently performs
+canonical RFC 8032 point recovery and small-order rejection because provider `public_check` does not
+own that invariant.
+
+OpenSSL's error queue is thread-local ambient state, so every fallible call clears, immediately
+drains/classifies, and clears it again. Only a closed input-rejection set becomes `Error.Invalid`;
+an empty, unknown, mixed resource, internal, fetch, or unsupported failure becomes opaque
+`Error.Code(0)`. This makes stale errors irrelevant and prevents allocation failure from looking
+like malformed key data.
+
+The timing boundary is deliberately honest about the borrowed engine. Key parsing, public-point
+validation, and provider validation are trusted setup and make no timing promise; exposing them as
+a repeated remote oracle is outside the contract. After admission, the signing wrapper never
+extracts private components or branches/indexes on their contents, uses only the high-level EVP
+signature operation, and relies on the pointer-verified built-in default provider's constant-time
+primitive implementation with RSA blinding retained. Signature verification uses public material.
+Functional vectors establish cryptographic semantics, while wrapper/API/provider-provenance
+inspection — not noisy timing statistics — owns the constant-time boundary.
 
 ---
 

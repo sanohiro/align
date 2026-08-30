@@ -91,6 +91,47 @@ writes the fixed 64-byte native envelope only through its output pointer and ret
 signed HTTP status discriminator. The ID getter returns a stream-bound view, retry uses `-1` as the
 `None` sentinel, and the raw/SSE types share the one null-safe free row.
 
+## Asymmetric signature delta (designed; not yet in the shipped inventory)
+
+The accepted post-pkg.db design adds six keyed records atomically when implemented. Until then they
+are excluded from the exact current counts and the shipped A00–A105 table below.
+
+| Planned runtime key | Exact symbol | Planned ABI row and exact declaration |
+|---|---|---|
+| `CryptoPrivateKeyFromPem` | `align_rt_crypto_private_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
+| `CryptoPublicKeyFromPem` | `align_rt_crypto_public_key_from_pem` | A106: `i32 @SYM(i32, ptr, i64, ptr)` |
+| `CryptoPublicKeyFromJwk` | `align_rt_crypto_public_key_from_jwk` | A107: `i32 @SYM(i32, ptr, i64, ptr, i64, ptr)` |
+| `CryptoSign` | `align_rt_crypto_sign` | A108: `i32 @SYM(i32, ptr, ptr, i64, ptr)` |
+| `CryptoVerify` | `align_rt_crypto_verify` | A109: `i32 @SYM(i32, ptr, ptr, i64, ptr, i64, ptr)` |
+| `CryptoKeyFree` | `align_rt_crypto_key_free` | A62: `void @SYM(ptr)` |
+
+`algorithm` is the closed `i32` ABI form of `0=RS256`, `1=ES256`, `2=Ed25519`; the runtime validates
+it before narrowing. The JWK row passes Ed25519's absent second component as null/zero. Constructor
+and sign output slots must be non-null/aligned and are null-initialized; verify's final `i32` slot must
+be non-null/aligned and is zero-initialized. An invalid slot returns `AL_INVALID` without writing.
+Every input length is nonnegative and `usize`-representable before slice formation; zero length may
+carry null and uses an internal empty sentinel, while positive length requires non-null. Ed25519's
+absent second JWK pair is exactly null/zero. Every handle repeats the closed key-kind byte and each
+operation checks algorithm, public/private class, and kind before EVP. Its private shell fields own
+one ordinary library context, its explicitly loaded built-in default provider, and the PKEY.
+Private PEM is canonical PKCS#8 v1 `PrivateKeyInfo` version zero decoded only through
+`d2i_PKCS8_PRIV_KEY_INFO` and `EVP_PKCS82PKEY_ex`; one exact `SensitiveDer` and every private
+re-encoding scratch cleanse before free on all paths. Each fallible OpenSSL call clears and drains
+its thread-local error queue. Provider checks and verify exhaust a disjoint native-return ×
+`Empty`/`InputOnly`/`CodeBearing` queue table: documented zero plus Empty/InputOnly is
+`AL_INVALID`/false, CodeBearing dominates a zero, and negative/unsupported/unexpected returns are
+`AL_CODE`. Decoder/import empty/unknown/resource/internal/fetch entries are `AL_CODE`. Every
+decode/import/signature/digest fetch uses exact `provider=default`; the key and operation provider
+pointers must equal the owned provider before publication/action, and Ed25519 construction performs
+wrapper-owned canonical/on-curve/non-small-order point validation. Final free order is PKEY,
+`OPENSSL_thread_stop_ex`, provider unload, library-context free, then shell free. Status and cleanup
+follow the exact crypto design ledger: zero success; `AL_INVALID` for direct or closed-queue
+constructor/key rejection and malformed internal ABI; `AL_CODE` for opaque provider/allocation/
+empty-or-unknown queue failure; post-view signature mismatch publishes
+false; and free is null-safe and one-time. Implementation moves these rows into the main keyed
+inventory, increases the keyed/base/max counts by six, and changes the table's shipped ABI range to
+A00–A109 in the same commit.
+
 ## Request 9 owned JSON extension
 
 The implemented Request 9 design in `docs/impl/24-owned-json-plan.md` adds exactly

@@ -650,6 +650,12 @@ The compiler-provided nominal aliases form this closed table:
 |---|---|---|
 | `Error` | `core.Error` | language-syntactic core; always in scope and requires no import |
 | `argon2_params` | `crypto.argon2_params` | requires `import std.crypto` |
+| `rs256_private_key` | `crypto.rs256_private_key` | requires `import std.crypto` |
+| `rs256_public_key` | `crypto.rs256_public_key` | requires `import std.crypto` |
+| `es256_private_key` | `crypto.es256_private_key` | requires `import std.crypto` |
+| `es256_public_key` | `crypto.es256_public_key` | requires `import std.crypto` |
+| `ed25519_private_key` | `crypto.ed25519_private_key` | requires `import std.crypto` |
+| `ed25519_public_key` | `crypto.ed25519_public_key` | requires `import std.crypto` |
 | `regex_match` | `regex.regex_match` | requires `import std.regex` |
 
 A non-entry module may declare a local type with any bare alias in this table. Inside that module
@@ -3156,6 +3162,51 @@ crypto.chacha20_poly1305_seal(...) / _open(...)                 // same shape as
 crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-hosted
 ```
 
+The asymmetric signature extension adds six algorithm-and-class-specific Move key types and the
+following exact surface. It is designed; implementation is pending.
+
+```text
+crypto.rs256_private_key_from_pem(pem: str) -> Result<rs256_private_key, Error>
+crypto.es256_private_key_from_pem(pem: str) -> Result<es256_private_key, Error>
+crypto.ed25519_private_key_from_pem(pem: str) -> Result<ed25519_private_key, Error>
+crypto.rs256_public_key_from_pem(pem: str) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_pem(pem: str) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_pem(pem: str) -> Result<ed25519_public_key, Error>
+crypto.rs256_public_key_from_jwk(n: bytes, e: bytes) -> Result<rs256_public_key, Error>
+crypto.es256_public_key_from_jwk(x: bytes, y: bytes) -> Result<es256_public_key, Error>
+crypto.ed25519_public_key_from_jwk(x: bytes) -> Result<ed25519_public_key, Error>
+crypto.rs256_sign(borrow key: rs256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.es256_sign(borrow key: es256_private_key, message: bytes) -> Result<buffer, Error>
+crypto.ed25519_sign(borrow key: ed25519_private_key, message: bytes) -> Result<buffer, Error>
+crypto.rs256_verify(borrow key: rs256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.es256_verify(borrow key: es256_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+crypto.ed25519_verify(borrow key: ed25519_public_key, message: bytes, signature: bytes) -> Result<bool, Error>
+```
+
+RS256 is RSASSA-PKCS1-v1_5 with SHA-256. ES256 is P-256 ECDSA with SHA-256 and uses the
+JOSE 64-byte `r || s` signature rather than DER. Ed25519 is pure Ed25519 with no caller-selected
+digest, context, or prehash. The PEM constructors accept one bounded unencrypted canonical PKCS#8
+v1 `PrivateKeyInfo` with version zero under `PRIVATE KEY`, or canonical SPKI under `PUBLIC KEY`;
+`OneAsymmetricKey` and encrypted/traditional/certificate/OpenSSH forms reject without a password or
+ambient I/O. Private input uses only the PKCS#8-specific decoder/import path, and every wrapper-owned
+decoded or re-encoded private DER buffer is cleansed before free. The JWK constructors take
+already-base64url-decoded public fields and
+perform complete algorithm/size/point validation. Each key is an independent Move owner of a shell
+that pins a private OpenSSL context and its built-in default provider; every fetch uses exact
+`provider=default`, and global provider configuration cannot substitute it. Ed25519 point admission
+independently checks canonical RFC 8032 recovery and rejects small-order public points rather than
+delegating that invariant to `EVP_PKEY_public_check`. Sign/verify borrow the key and complete message.
+Constructor/key-format or malformed internal ABI input is `Error.Invalid`; each OpenSSL call clears
+and drains its thread-local error queue, with only the closed input-rejection set mapping Invalid and
+empty/unknown/resource/internal/fetch failures mapping `Error.Code(0)`. Every signature
+length/encoding/mathematical mismatch after valid byte views is `Ok(false)`. Key construction is a
+trusted setup operation with no timing promise. Signing an admitted key is constant-time with
+respect to private-key/message contents at fixed public lengths under the pointer-verified built-in
+OpenSSL default-provider dependency. The exact PEM grammar, RSA bounds, validation/error precedence,
+private-secret cleanup, ownership/allocation rules, ABI,
+cache identity, timing boundary, and closure matrix are authoritative in
+`docs/impl/std-design/crypto.md`.
+
 `argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a builtin struct
 (reserved name, ordinary struct literal): memory cost in KiB, iterations, lanes, and output
 length in bytes. AEAD uses 32-byte keys and 12-byte nonces; seal output is
@@ -3185,7 +3236,7 @@ bytes: body cap + 262,144-byte cumulative head allowance + one 32,768-byte read 
 framing, allocation, cleanup, batch, TLS, and error-precedence contract is the Request 5 ledger in
 `docs/impl/std-design/http.md`.
 
-The designed post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
+The implemented post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
 
 ```text
 cl.request_stream(req: request) -> Result<http_read_stream, Error>
@@ -3238,7 +3289,7 @@ connection. Independently, one `next` scans at most the output capacity plus 262
 source bytes; comments, unknown fields, invalid retry lines, and control-only blocks consume that
 allowance, and excess is `Error.Invalid`. The exact ownership, parsing, ABI, allocation,
 validation-order, and acceptance ledger is `docs/impl/std-design/http.md` “Client streaming
-receive.” This surface is designed but not yet implemented.
+receive.” This surface was implemented on 2026-08-30.
 
 ```text
 request

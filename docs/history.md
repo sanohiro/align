@@ -474,3 +474,29 @@ names use a canonical `key_ordinal`, and schema/table reference components rejec
 native access in declaration order.
 The repository's design process now requires one public-contract ledger and an author-side
 ledger-to-prose pass before independent review.
+
+---
+
+## Asymmetric signature suite settled
+
+On 2026-08-30, the post-`pkg.db` crypto convergence item was settled as an implementation-pending
+RS256, ES256, and Ed25519 suite. It uses six distinct private/public Move key types and per-algorithm
+construct, sign, and verify functions. Private construction accepts only bounded canonical
+PKCS#8 v1 `PrivateKeyInfo` version-zero PEM through a PKCS#8-specific path; public construction
+accepts canonical SPKI PEM or decoded JWK components. `OneAsymmetricKey` and relabeled PKCS#1/SEC1
+DER reject, and wrapper-owned private DER storage is cleansed before free. RS256 fixes PKCS#1
+v1.5/SHA-256, ES256 fixes P-256/SHA-256 and raw 64-byte JOSE signatures, and Ed25519 fixes pure
+Ed25519.
+
+The decision rejected a generic key handle, runtime algorithm strings, encrypted/traditional PEM,
+private JWK, key generation/export, and ambient password or provider selection. Sign and verify
+borrow their typed keys; constructor/key-format or malformed internal-ABI input is `Error.Invalid`,
+only a closed per-call OpenSSL input-rejection queue maps to Invalid; empty/unknown/resource/internal/
+fetch failure remains opaque `Error.Code(0)`, and every post-view signature mismatch
+is `Ok(false)`. Each key shell owns an isolated OpenSSL context and explicitly loaded built-in
+default provider; exact property fetches and provider-pointer checks prevent ambient substitution.
+Ed25519 admission independently validates canonical RFC 8032 point recovery and rejects small-order
+points. The settled timing boundary treats construction as trusted setup without a timing promise
+and signing as constant-time for secret contents at fixed public lengths under that pointer-verified
+built-in default-provider dependency. The public-contract and implementation-closure ledger is
+`docs/impl/std-design/crypto.md` “Asymmetric signature suite.”

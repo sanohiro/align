@@ -44,6 +44,51 @@ single-writer precondition are authoritative in
 `docs/impl/std-design/fs.md`. This section records the boundary before its
 implementation activates any new `RuntimeKey` or validator variant.
 
+## Asymmetric crypto native boundary (design accepted; implementation pending)
+
+The post-pkg.db asymmetric signature suite is another consumer of this general boundary. Six
+algorithm/class-specific builtin Move types share one payloaded `SignatureKey(kind)` compiler
+representation and one runtime shell; the shell owns its repeated kind, private ordinary
+`OSSL_LIB_CTX`, explicitly loaded built-in default provider, and provider-managed `EVP_PKEY`.
+They are not package-defined resources and do not expose `raw`, a manual close, or a generic
+algorithm selector. Constructors return a fresh
+owner, ordinary moves null the source, aggregate replacement/Drop reaches the one null-safe
+`align_rt_crypto_key_free`, and `borrow` sign/verify parameters retain neither key nor message.
+One fail-closed structural carrier classifier admits local/by-value/return/shared-borrow and
+recursive struct/sum/Option/Result ownership, including AoS Move-struct arrays, while rejecting
+direct/tagged key collections, tuples/boxes, capture/parallel transport, mutable/out/global/native
+exposure, and scalar observation. Bare key aliases need no import; only `crypto.*` spellings and
+value operations require `std.crypto`.
+
+Five generic operation shapes carry the closed `SignatureAlgorithm` discriminator through checked
+HIR, MIR, canonical type identity, runtime-key selection, and LLVM: private PEM construction,
+public PEM construction, decoded-JWK public construction, sign, and verify. The runtime repeats the
+closed algorithm/class kind in every handle and rejects a mismatch before EVP. All output slots are
+validated/alignment-checked and zeroed before work; every signed length and null/zero/positive input
+view is validated before slice formation. Private PEM admits only canonical PKCS#8 v1
+`PrivateKeyInfo` version zero through `d2i_PKCS8_PRIV_KEY_INFO` and `EVP_PKCS82PKEY_ex`; relabeled
+legacy DER and `OneAsymmetricKey` reject. Base64 decodes into one exact `SensitiveDer` allocation,
+and it plus every private re-encoding scratch is cleansed before free on all paths. Every
+libctx/provider/context/key/PKCS#8/DER/BN/signature/shell allocation is released on failure, and no
+owner or signature is published before complete validation. Each fallible OpenSSL call isolates its
+thread-local error queue. Provider checks and verify exhaust a disjoint native-return ×
+`Empty`/`InputOnly`/`CodeBearing` queue table: documented zero plus Empty/InputOnly is invalid data
+or mismatch, CodeBearing dominates a zero, and negative/unsupported/unexpected returns are Code.
+Decoder/import empty/unknown/resource/internal/fetch entries are Code. Every
+decode/import/operation fetch uses exact `provider=default` in the private context,
+and key/operation provider pointers must equal the shell's owned provider; global OpenSSL
+configuration and providers are never consulted. Ed25519 PEM/JWK and private-derived public values
+also pass wrapper-owned RFC 8032 canonical/on-curve/non-small-order validation independently of
+provider `public_check`. Key import is trusted setup without a timing promise; fixed-public-length
+signing uses no wrapper secret flow and relies explicitly on the pointer-verified built-in default
+provider's constant-time primitive with RSA blinding retained.
+The exact public surface, format/error/multi-invalid precedence, private-secret cleanup,
+Move/control-path closure matrix,
+stable discriminant bytes, A106–A109 ABI, interface/cache requirements, and one-capability-PR
+boundary are authoritative in
+`docs/impl/std-design/crypto.md` “Asymmetric signature suite”; the checked-HIR and runtime inventory
+deltas are mirrored in `19-hir-validation-ledger.md` and `20-runtime-abi-ledger.md`.
+
 ## 1. Decisions
 
 Seven prerequisites are accepted:
@@ -3975,10 +4020,12 @@ this is not a duplicate definition. Type resolution preserves sema's exact prece
    enter the shadowing pass. Otherwise, the first parameter that shares a local declared-type name
    reports `TypeParameterShadowsLocalType`;
 2. the qualified source builtins `json.doc`, `json.kind`, and `json.scanner<...>`, plus the closed
-   nominal-alias spellings `core.Error`, `crypto.argon2_params`, and `regex.regex_match`, resolve
-   before every qualified user definition. The `crypto` and `regex` forms require the matching std
-   capability in producer source; interface reconstruction derives the same imports from those
-   structured public type paths rather than serializing a second identity;
+   nominal-alias spellings `core.Error`, `crypto.argon2_params`, `regex.regex_match`, and — when the
+   accepted asymmetric suite activates — the six
+   `crypto.{rs256,es256,ed25519}_{private,public}_key` forms, resolve before every qualified user
+   definition. The `crypto` and `regex` forms require the matching std capability in producer
+   source; interface reconstruction derives the same imports from those structured public type
+   paths rather than serializing a second identity;
 3. another declared type parameter wins only when used bare and without arguments;
 4. every bare name first resolves through the local-definition index;
 5. only after a local miss, another bare source-builtin spelling resolves to that builtin; and
@@ -4360,6 +4407,10 @@ Acceptance:
   builtin alias. Explicit `core.Error`, `crypto.argon2_params`, and `regex.regex_match` references
   retain builtin capability classification. Producer-only entry declarations of the three names
   reject before interface publication, so semantic import has no `ReservedLocalType` failure;
+- the pending asymmetric implementation extends that same parameterized rule to its six key names:
+  same-module locals win bare lookup, bare misses need no import, `crypto.*` forms require
+  `std.crypto`, and entry collisions reject; its crypto carrier/interface owner lands atomically
+  with the new spellings;
 - a unit named `json` with a public local `doc` definition still resolves qualified `json.doc`,
   `json.kind`, and `json.scanner<...>` as source builtins; a non-shadowing type-parameter spelling
   reused by a resolvable builtin application follows that builtin, a type parameter matching a
