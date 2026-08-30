@@ -2673,14 +2673,22 @@ token, and a block. Only item-position `test` followed by a string commits to th
 rejects visibility on a test. A test creates no callable name or public interface entry. The decoded name is
 nonempty, at most 256 UTF-8 bytes, contains no C0/C1 control (U+0000..U+001F or
 U+007F..U+009F), and is unique within its module.
-The canonical test id is the canonical module path, `::`, and that name; the entry module path is
-`main`. Only tests in the explicit entry/import closure exist for a command.
+The canonical test id is the canonical module path, `::`, and that name. An entry source uses its
+declared module path, or `main` only when it omits a module declaration. Only tests in the explicit
+entry/import closure exist for a command.
 
 The body is checked as a compiler-private zero-parameter function returning
 `Result<(), core.Error>`. Completing its written Unit block supplies one documented `Ok(())` tail;
 ordinary `?` and explicit Err returns use the existing error model. Normal completion and Err run
 ordinary cleanup, while the existing hard-error, abort, and successful-exec behavior is unchanged.
 Tests are Impure and are not callable or exported.
+
+Semantic formation closes and freezes the complete ordinary-source program before checking test
+bodies. Test roots and every helper, monomorph, nominal or interned type, static descriptor, and
+native capability generated only by tests append to a separate test overlay. Production consumers
+validate the complete checked result but can select only the frozen prefix; test consumers select
+the validated prefix-plus-overlay closure. A test-only edit cannot reorder or mutate production
+identities or artifacts.
 
 `import core.test` admits exactly the qualified standalone assertion statements
 `test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
@@ -2701,17 +2709,21 @@ bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (defaul
 configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
 acknowledgement is infrastructure failure. Every terminal path signals the pinned child process
 group before reaping its direct child; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful
-cleanup and conventional exit. Passing output is suppressed; a failure replays only that test's
+cleanup and conventional exit. The runner retains its signal controller while writing the final
+summary, then blocks and rechecks those signals and exits directly, so restored prior handlers
+cannot change terminal output. Passing output is suppressed; a failure replays only that test's
 bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
 A zero-test command reports `alignc: no tests found` and builds no artifact. The exact grammar, bounds, record
 bytes, validation order, ownership, cache identity,
 reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
 
-Production commands parse and type-check test declarations but omit them from production MIR,
-link capabilities, interfaces, and executables. This includes excluding tests from `explain-opt`
-located MIR/remarks and excluding test-body queries from `db prepare` static descriptors and native
+Production commands parse and type-check test declarations, validate the prefix/overlay partition,
+and consume only the frozen production prefix for MIR, link capabilities, interfaces, and
+executables. This excludes the complete test-generated closure from `explain-opt` located
+MIR/remarks and excludes test-only queries from `db prepare` static descriptors and native
 preparation. A test-only edit may miss the source-keyed frontend cache but leaves the production
-object key and executable bytes unchanged. Test compilation uses a separate versioned cache domain.
+HIR tables, descriptors, MIR, object key, link inputs, and executable bytes unchanged. Test
+compilation uses a separate versioned cache domain.
 
 ---
 

@@ -230,7 +230,8 @@ annotation, or expression body.
 
 The decoded name is 1..=256 UTF-8 bytes and rejects exactly U+0000..U+001F and
 U+007F..U+009F before canonical-id construction. The sema catalog owner pins both boundary
-neighbors and the complete 1,024-byte id limit.
+neighbors and the complete 1,024-byte id limit. Canonical identity retains the source's declared
+module path; only an entry source without a module declaration defaults to `main`.
 
 Depth capping visits the test block exactly as a function block. The formatter preserves the
 ordinary string token and formats the block with the same block rules; the contextual word is
@@ -241,10 +242,12 @@ standalone statements in the lexical test body and ordinary nested blocks, never
 equality form must produce exact `bool`; an ordinary vector/mask equality result is rejected rather
 than reduced.
 
-Normal commands parse and check tests but production lowering omits them. `explain-opt` therefore
-forms no located test MIR/remark, while `db prepare` retains test diagnostics but forms no test-body
-static descriptor. Test lowering retains the canonical module/name id and source ordinal in a
-flagged checked-HIR record. The exact grammar,
+Normal commands parse and check tests after closing and freezing the complete ordinary-source HIR
+prefix. Test roots and every artifact generated only while checking them append to a checked-HIR
+overlay. Production lowering validates the partition but consumes only the prefix; `explain-opt`
+therefore forms no overlay MIR/remark, while `db prepare` retains test diagnostics but forms no
+overlay static descriptor. Catalog records retain canonical module/name identity and source ordinal
+independently from overlay function symbols. The exact grammar,
 name/catalog bounds, mode split, cache identity, and closure matrix are
 `core-design/test.md`; that document, not this representation summary, owns the public contract.
 

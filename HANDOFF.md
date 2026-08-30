@@ -396,10 +396,11 @@ facts must live in this repository.
   explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
   group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
   preallocated output/full-row deadline, terminal-observation control barrier, all-terminal group
-  signalling before direct-child reap, evidence retained through reporting, four-signal cleanup,
-  and failure-only output replay. Production
-  interfaces/MIR/links, optimization remarks, and DB preparation descriptors stay test-free.
-  Implementation is the next code PR; `std.id`
+  signalling before direct-child reap, evidence retained through reporting, controller-owned
+  four-signal terminal summary commit, and failure-only output replay. Compiler formation freezes
+  the complete production prefix before appending a test-generated function/type/descriptor/
+  capability overlay; production interfaces/MIR/links, optimization remarks, and DB preparation
+  descriptors consume only that byte-stable prefix. Implementation is the next code PR; `std.id`
   remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration

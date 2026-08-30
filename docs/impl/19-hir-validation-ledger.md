@@ -522,21 +522,63 @@ with parent-plus-first-child and first-child-plus-later-child pairs.
 
 ### Planned `core.test` records (designed 2026-08-30; inactive until implementation)
 
-The accepted `core.test` capability adds one optional `TestMeta` envelope to `hir::Fn`; it does not
-infer test identity from a generated function name. The exact private record is
-`TestMeta { source_module: String, source_name: String, canonical_id: String, source_ordinal: u32 }`.
-`None` is an ordinary function. `Some(meta)` requires zero parameters and type parameters, exact
-`Result<Unit,builtin Error>` return, private source origin, Impure effect, no public/interface
-record, and a body whose reachable fallthrough is the producer-inserted `Ok(Unit)` tail.
-`source_module` is the producer-retained canonical module path: it is valid UTF-8, every component
-repasses the ordinary identifier grammar, and it is `main` exactly for the entry source origin.
-`source_name` is the independently retained decoded declaration string, valid UTF-8 and 1..=256
-bytes with U+0000..U+001F and U+007F..U+009F rejected. `canonical_id` is valid UTF-8,
+The accepted `core.test` capability partitions checked output before test bodies may add generated
+artifacts. The exact private top-level shape is
+`CheckedProgram { production: hir::Program, production_static_descriptors: Vec<StaticDescriptor>,
+tests: Option<TestOverlay> }`. `production` is formed to its complete ordinary-source fixed point
+first and is then immutable. `TestOverlay` owns an ordered `catalog: Vec<TestMeta>`, test roots and
+their generated function closure in `fns: Vec<hir::Fn>`, appended suffixes for each of
+`Program::{structs,enums,resources,tagged_types,tuples,fn_types}`, and
+`test_static_descriptors: Vec<StaticDescriptor>`. It owns no replacement production entry and no
+second extern/import table. An overlay type id addresses the immutable production table as a prefix
+and its corresponding overlay table as a suffix; no overlay pass may insert into, reorder, or
+rewrite a production prefix.
+
+The exact catalog record is
+`TestMeta { function: u32, source_module: String, source_name: String, canonical_id: String,
+source_ordinal: u32 }`. Each overlay function has `test_catalog_index: Option<u32>` rather than a
+copied identity. A catalog slot points to one unique in-bounds overlay function whose back-reference
+equals that slot. That root requires zero parameters and type parameters, exact
+`Result<Unit,builtin Error>` return, private `FnOrigin::Source`, Impure effect, no public/interface
+record, and a body whose reachable fallthrough is the producer-inserted `Ok(Unit)` tail. Every
+production function and every generated overlay `Lifted`/`Monomorph` has `None`; no generated helper
+may impersonate a catalog root.
+
+`source_module` is the producer-retained canonical module path: it is valid UTF-8 and every
+component repasses the ordinary identifier grammar. For the entry source it is the declared module
+path, or `main` only when that source omits a module declaration; `is_entry` never rewrites a
+declared path. `source_name` is the independently retained decoded declaration string, valid UTF-8
+and 1..=256 bytes with U+0000..U+001F and U+007F..U+009F rejected. `canonical_id` is valid UTF-8,
 1..=1,024 bytes, and byte-equals `source_module + "::" + source_name`; the pair and id are unique.
-`source_ordinal` is dense from zero in source declaration order within each `source_module`. At
-most 65,535 `Some` records exist in the driver-selected closure. The HIR owner holds these three
-strings independently through validation and frees them with the function record; none is rebuilt
-from the hidden symbol.
+`source_ordinal` is dense from zero in source declaration order within each `source_module`.
+Catalog order is the driver-selected dependency-first unit order followed by `source_ordinal`, and
+its length is at most 65,535. The overlay owns these three strings independently; none is rebuilt
+from the hidden function symbol.
+
+Formation is two-phase. Signature and declaration validation still sees every item. Sema then
+checks all ordinary source bodies, closes their lifted helpers, generic function/type/resource
+monomorphs, interned tuple/function/tagged types, analyses, capability use, and static descriptors,
+and freezes that complete production prefix. Only then does it check test bodies against the
+read-only prefix. A test reuses an identical production monomorph already in the prefix; otherwise
+the test demand and every transitive lifted/monomorph/type/resource product append only to the
+overlay. Test analyses may read validated production facts but publish their own mutable facts in
+the overlay. Test static descriptors stay in `test_static_descriptors`; `db prepare` and every
+production consumer see only `production_static_descriptors`. Native capability collection runs
+after selecting the production view or combined test view, never while checking a test body.
+
+The validator proves the partition rather than trusting storage location alone. The production
+program validates independently and has no test back-reference. The combined validator resolves
+every overlay reference against prefix-plus-suffix bounds and requires each catalog root to be
+reachable from its own catalog slot. The complete overlay artifact graph—functions, every type-table
+suffix, and test static descriptors—must equal the closure reachable from the catalog-root set
+through every checked-HIR reference or generation edge, including direct calls, function values,
+callback/destructor descriptors, lifted targets, nominal field/variant/resource types, interned
+type members, and transitive function/type/resource monomorph demands. It rejects any
+production-prefix edge to an overlay suffix. Owner matrices cover a test lambda, a test-only generic
+monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
+class, capability library use, and static descriptor. Adding or editing only tests must leave the
+encoded production Program, descriptor vector, MIR, object key, link inputs, and executable bytes
+identical in whole-program and per-unit paths.
 
 The HIR expression discriminator is
 `TestAssert { condition, kind, line, column }`, where `kind` is the closed
@@ -553,20 +595,21 @@ the validator does not reconstruct the unavailable two source operands from a bo
 false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
 true condition to Unit fallthrough.
 
-Validation order is function envelope, `TestMeta` presence/tag, source-module bytes, source-name
-bytes, canonical-id correlation, ordinal, header correlation, body children, assertion
-envelope/placement/kind/location/condition, then the ordinary function completion and ownership
-records. Production lowering validates these records and omits every
-`Some` function; test lowering validates and includes them. The lowering mode is an explicit API
-and cache input, never inferred from whether a Program happens to contain a test. An assertion in
-an ordinary function, a test marked public/Pure, a missing synthetic Ok, duplicate/sparse ordinal,
-or any future metadata/assertion kind fails before MIR construction.
+Validation order is the complete production prefix, overlay table bounds, catalog length/order,
+catalog identity bytes and root/back-reference correlation, overlay reachability closure, overlay
+function envelopes and bodies, assertion envelope/placement/kind/location/condition, then ordinary
+function completion and ownership records. Every production lowering entry validates the complete
+`CheckedProgram` but lowers only the frozen production prefix; test lowering validates it and lowers
+prefix plus overlay. The selected view is an explicit API and cache input, never inferred from
+whether a Program happens to contain a test. An assertion in an ordinary or generated function, a
+test marked public/Pure, an orphan overlay helper, a prefix-to-suffix edge, a missing synthetic Ok,
+duplicate/sparse ordinal, or any future metadata/assertion kind fails before MIR construction.
 
 This section activates atomically with the implementation and its parameterized valid/malformed
-owners. Metadata owners mutate each identity string independently and together, entry/module
-correlation, every control boundary, ordinal, and duplicate relation; assertion owners place each
-kind in every `Stmt::Expr` depth plus every rejected value-position family. The public grammar,
-runner, cache, and process protocol remain owned by
+owners. Metadata owners mutate each identity string independently and together, declared/default
+entry paths, every root/back-reference and prefix/suffix boundary, ordinal, and duplicate relation;
+assertion owners place each kind in every `Stmt::Expr` depth plus every rejected value-position
+family. The public grammar, runner, cache, and process protocol remain owned by
 `core-design/test.md`.
 
 ## Header-adjacent records

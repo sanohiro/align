@@ -3870,9 +3870,11 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
   compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated
   lifecycle owner, terminal-observation control barrier, all-terminal full-group signalling before
-  direct-child reap, quiesced evidence retained through reporting, four graceful signals, and
-  failure-only evidence replay. Production MIR/interfaces/links,
-  optimization remarks, and database preparation descriptors exclude tests. The exact public
+  direct-child reap, quiesced evidence retained through reporting, controller-owned terminal
+  summary commit for four graceful signals, and failure-only evidence replay. Compiler formation
+  freezes the complete production prefix before appending the test-generated function/type/
+  descriptor/capability overlay; production MIR/interfaces/links, optimization remarks, and
+  database preparation descriptors consume only that byte-stable prefix. The exact public
   ledger, control-protocol bytes, lifecycle state matrix, cache identity, and one-capability
   implementation matrix are `core-design/test.md`; an in-language benchmark runner remains a later
   consumer rather than part of this test capability.

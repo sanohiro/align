@@ -1296,8 +1296,12 @@ registry.
 
 The declaration is not an ordinary named function. It has no parameters, visibility, callable
 identity, or interface entry because production code must not acquire a test-only dependency.
-Normal commands still check it, then omit it from production MIR and linking. Test mode has a
-separate cache identity and links the explicit import closure once.
+Normal semantic formation closes and freezes the complete production program first. Test checking
+then appends roots plus every test-generated helper, monomorph, type, descriptor, and capability to
+a separate overlay. Normal commands validate the partition and consume only the frozen prefix,
+while test mode combines both. This boundary preserves production ids and bytes instead of trying
+to discard only visibly tagged root functions after they have already influenced shared tables.
+Test mode has a separate cache identity and links the explicit import closure once.
 
 Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
@@ -1308,8 +1312,10 @@ state machine owns signals, polling, capture, and wait status: every terminal pa
 unreaped while it signals the pinned group, then reaps only its direct child and continues only after
 cleanup succeeds. A second control drain after non-reaping terminal observation closes the fast-exit
 race between completion send and status observation. Descendants are signalled but not reaped by
-this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM while
-children may exist, with explicit prior handler restoration on ordinary return.
+this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM from child
+acquisition through summary publication. Returning error paths restore prior handlers; terminal
+suite paths retain the controller, block and recheck those signals after the last write, then exit
+directly. A prior ignored or custom handler therefore cannot change a published terminal result.
 
 Capture moves from a live row to an immutable quiesced row after child cleanup. A pass consumes and
 discards it; a failure retains it through the last direct reporting write and only then releases it.

@@ -1214,8 +1214,9 @@ callable or exported name. Its body is checked as a compiler-private
 `fn() -> Result<(), core.Error>` with one documented implicit `Ok(())` after a Unit fallthrough;
 ordinary `?`, Err, cleanup, and hard-error behavior are unchanged. Names are bounded, control-free,
 excluding exactly U+0000..U+001F and U+007F..U+009F, and unique per module. Canonical ids are
-`<module>::<name>`, and discovery is limited to the explicit
-entry/import closure in deterministic dependency-first, then declaration order.
+`<module>::<name>`; the entry uses its declared module path, or `main` only when no module is
+declared. Discovery is limited to the explicit entry/import closure in deterministic
+dependency-first, then declaration order.
 
 With `import core.test`, `test.expect(bool)` and `test.expect_eq(left, right)` are standalone
 test-body assertions. Equality reuses the language's existing `==` rule, requires its result to be
@@ -1232,11 +1233,14 @@ pre-ack timeout/output is infrastructure failure. Every terminal path signals th
 before direct-child reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
 passing suite always has one summary line. No user `main` is required or invoked. Production
-commands type-check tests but omit their bodies, capabilities, and names from production MIR,
-interfaces, links, and artifacts; `explain-opt` also omits them from located MIR/remarks, and
-`db prepare` omits test-body queries from static descriptors/native preparation. Test compilation
-has a separate versioned cache domain. The complete grammar, bounds, wire bytes, error precedence,
-CLI options, ownership, reporting, and
+commands complete and freeze the ordinary-source prefix before forming a separate test overlay for
+roots and every generated helper, monomorph, type, descriptor, and capability. They validate both
+partitions but omit the overlay from production MIR, interfaces, links, and artifacts;
+`explain-opt` also omits it from located MIR/remarks, and `db prepare` omits its queries from
+production static descriptors/native preparation. The signal controller remains installed through
+summary publication and a final blocked recheck before direct exit. Test compilation has a
+separate versioned cache domain. The complete grammar, bounds, wire bytes, error precedence, CLI
+options, ownership, reporting, and
 acceptance matrix are in `docs/impl/core-design/test.md`.
 
 ## Packages

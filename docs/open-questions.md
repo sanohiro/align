@@ -36,13 +36,17 @@ group per test. A bounded compiler-private completion record proves normal Ok/Er
 exec, abort, crash, timeout, output excess, and malformed records fail closed. Time and stdout/stderr
 are bounded. Passing output is suppressed and only a failed test's bounded bytes are replayed, so
 successful suite output is one summary line independent of test count. Production commands check
-test bodies but omit them from production MIR, interfaces, capabilities, and artifacts, including
+test bodies only after closing and freezing an ordinary-source prefix; test roots and every
+generated helper, monomorph, type, descriptor, and capability live in a separate overlay. Production
+commands validate both partitions but consume only the byte-stable prefix, including for
 optimization remarks and database preparation descriptors. The fixed launch/acknowledgement ABI
 separates bounded harness setup failure from user termination. One state-machine owner covers every
 terminal path, holds the group leader unreaped while signalling the pinned group, then reaps only its
 direct child; cleanup failures stop after preserving already-selected bounded evidence. A scoped
-signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM and restores prior dispositions on ordinary
-return. Names reject exactly the C0/C1 ranges U+0000..U+001F and U+007F..U+009F.
+signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM. Returning error paths restore prior dispositions;
+terminal paths retain the controller through summary publication, then block/recheck and exit
+directly. Canonical ids use the entry source's declared module path, or `main` only when omitted.
+Names reject exactly the C0/C1 ranges U+0000..U+001F and U+007F..U+009F.
 
 Record: `docs/impl/core-design/test.md`, `draft.md` §18.1, `docs/language-spec.md`
 
