@@ -252,8 +252,10 @@ overlay. Production lowering validates the partition but consumes only the prefi
 therefore forms no overlay MIR/remark, while `db prepare` retains test diagnostics but forms no
 overlay static descriptor. Catalog records retain canonical module/name identity and source ordinal
 independently from overlay function symbols. Production cache/codegen identity uses the complete
-span-erased semantic prefix; the checked prefix still retains current spans for diagnostics and
-located output. The exact grammar, name/catalog bounds, mode split, cache identity, and closure
+span-erased semantic prefix, but encodes the exact expression-ownership fact stream and semantic
+static-descriptor fields rather than dropping span-keyed side-table meaning. The checked prefix still
+retains current spans for diagnostics and located output. The exact grammar, name/catalog bounds,
+mode split, cache identity, and closure
 matrix are `core-design/test.md`; that document, not this representation summary, owns the public
 contract.
 

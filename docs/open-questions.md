@@ -44,7 +44,9 @@ commands validate both partitions but consume only the frozen prefix, including 
 optimization remarks and database preparation descriptors. Its codegen/cache identity is the
 complete span-erased semantic projection; current spans/located metadata may shift. The fixed
 launch/acknowledgement ABI separates bounded harness setup failure from user termination, and the
-parent control endpoint is nonblocking. One state-machine owner covers every terminal path, holds
+parent control and capture endpoints are nonblocking. The projection preserves structurally ordered
+expression-ownership facts and semantic descriptor fields while omitting their diagnostic spans.
+One state-machine owner covers every terminal path, holds
 the group leader unreaped while signalling the pinned group then direct PID, then reaps only its
 direct child; cleanup failures stop after preserving already-selected bounded evidence. A scoped
 signal lease covers SIGHUP/SIGINT/SIGQUIT/SIGTERM. Returning error paths restore prior dispositions;

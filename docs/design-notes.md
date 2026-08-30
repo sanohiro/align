@@ -1308,16 +1308,18 @@ a separate overlay. Normal commands validate the partition and consume only the 
 while test mode combines both. This boundary preserves production ids and bytes instead of trying
 to discard only visibly tagged root functions after they have already influenced shared tables.
 Codegen/cache identity projects that prefix without source spans: diagnostics and located output
-retain current offsets, while an earlier test edit cannot perturb production objects. Test mode has
-a separate cache identity and links the explicit import closure once.
+retain current offsets, while an earlier test edit cannot perturb production objects. The projection
+still encodes each expression's ownership fact in structural order and every semantic descriptor
+field, so span erasure cannot merge different cleanup or static-artifact meaning. Test mode has a
+separate cache identity and links the explicit import closure once.
 
 Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
 unwinding to the language. A compiler-owned completion record means an early exit zero cannot
 masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
-from user termination, and one deadline covers both states through cleanup. The parent control
-endpoint is nonblocking, so an acknowledgement without completion returns to poll instead of
-stalling that deadline. One dedicated runner
+from user termination, and one deadline covers both states through cleanup. The parent control and
+capture endpoints are nonblocking, so an acknowledgement or short output without completion returns
+to poll instead of stalling that deadline. One dedicated runner
 state machine owns signals, polling, capture, and wait status: every terminal path keeps the leader
 unreaped while it signals the pinned group and then the direct PID, then reaps only its direct child
 and continues only after cleanup succeeds. The direct target also closes a leader that left the

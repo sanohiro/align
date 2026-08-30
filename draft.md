@@ -2711,7 +2711,8 @@ launch, execution, group signalling, capture drain, and direct-child reap (confi
 bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each,
 configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
 acknowledgement is infrastructure failure. The parent control endpoint is nonblocking before spawn,
-so every datagram drain returns to deadline processing when its queue is empty. Every verified
+and both capture read endpoints are nonblocking too, so every control/stdout/stderr drain returns to
+deadline processing when its queue is empty. Every verified
 terminal path signals the pinned child process group and then its still-unreaped direct PID before
 reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup and conventional
 exit. The runner retains its signal controller while writing the final
@@ -2727,10 +2728,12 @@ and consume only the frozen production prefix for MIR, link capabilities, interf
 executables. This excludes the complete test-generated closure from `explain-opt` located
 MIR/remarks and excludes test-only queries from `db prepare` static descriptors and native
 preparation. A test-only edit may miss the source-keyed frontend cache but leaves the production
-span-erased semantic HIR projection, descriptors, MIR codegen graph, object key, link inputs, and
-executable bytes unchanged. Current spans and located metadata may shift after an earlier test edit
-and do not enter production codegen identity. Test compilation uses a separate versioned cache
-domain.
+span-erased semantic HIR projection, semantic descriptor projection, MIR codegen graph, object key,
+link inputs, and executable bytes unchanged. Current HIR/descriptor spans and located metadata may
+shift after an earlier test edit and do not enter production codegen identity. The semantic
+projection records each expression's ownership fact in structural order and every non-location
+descriptor field, so omitting spans cannot create an ownership-sensitive memo collision. Test
+compilation uses a separate versioned cache domain.
 
 ---
 

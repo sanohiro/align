@@ -1231,9 +1231,9 @@ even when its consumer expects Unit.
 group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
 return from exit, exec, abort, and crash. Each row has bounded time from pre-spawn through launch,
 execution, group signalling, capture drain, and direct-child reap plus bounded per-stream capture;
-pre-ack timeout/output is infrastructure failure. Parent control receives are nonblocking. Every
-verified terminal path signals the pinned group and then the still-unreaped direct PID before reap.
-SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
+pre-ack timeout/output is infrastructure failure. Parent control and capture receives are
+nonblocking. Every verified terminal path signals the pinned group and then the still-unreaped
+direct PID before reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
 passing suite always has one summary line. No user `main` is required or invoked. Production
 commands complete and freeze the ordinary-source prefix before forming a separate test overlay for
@@ -1243,7 +1243,9 @@ partitions but omit the overlay from production MIR, interfaces, links, and arti
 production static descriptors/native preparation. The signal controller remains installed through
 summary publication and a final blocked recheck before direct exit. Production codegen/cache
 identity is the complete span-erased semantic projection; current spans and located output may
-shift after an earlier test edit. Test compilation has a separate versioned cache domain. The
+shift after an earlier test edit. Structurally ordered expression-ownership facts and semantic
+descriptor fields remain in that identity even though their diagnostic spans do not. Test
+compilation has a separate versioned cache domain. The
 complete grammar, bounds, wire bytes, error precedence, CLI
 options, ownership, reporting, and
 acceptance matrix are in `docs/impl/core-design/test.md`.

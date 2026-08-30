@@ -340,6 +340,9 @@ trusting the stored bits:
    equality. A projection-only borrowed binding contributes no entry. If two
    expressions share a span, the later producer insertion is
    authoritative; a conflicting handcrafted map cannot choose another value.
+   After this equality check, the `align-production-codegen-v1` encoder emits
+   the resulting lookup fact at each expression in the same universal child
+   order; it never serializes the map or trusts a separately supplied fact.
 5. Recompute every `Cell<bool>` statement flag after its children:
    `Assign.drop_old`, `Assign.drop_new`, and the corresponding indexed/field
    replacement behavior must equal the MoveCheck/EscapeCheck decision.
@@ -577,20 +580,34 @@ type members, and transitive function/type/resource monomorph demands. It reject
 production-prefix edge to an overlay suffix. Owner matrices cover a test lambda, a test-only generic
 monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
 class, capability library use, and static descriptor. Adding or editing only tests must leave the
-canonical span-erased semantic/codegen projection of the production Program, descriptor vector,
-span-erased MIR codegen graph, object key, link inputs, and executable bytes identical in
+canonical span-erased semantic/codegen projection of the production Program, semantic descriptor
+projection, span-erased MIR codegen graph, object key, link inputs, and executable bytes identical in
 whole-program and per-unit paths. The checked Program itself retains current source spans for
-diagnostics and located output; those spans and their source-keyed/located metadata may change when
-an earlier test edit shifts byte offsets and never enter the production semantic/codegen key.
+diagnostics and located output; those spans, descriptor diagnostic locations, and their
+source-keyed/located metadata may change when an earlier test edit shifts byte offsets and never
+enter the production semantic/codegen key.
 
 The production key projection is one exhaustive structural encoder, not filtered `Debug` text. It
 starts with the versioned domain `align-production-codegen-v1`, visits production Program tables,
 functions, statements, and expressions in stored order, encodes every non-`Span` field through the
-existing canonical scalar/sequence encoders, then encodes `production_static_descriptors` in order.
-Every HIR variant must be matched explicitly, so a new field or variant cannot silently disappear;
-only recursively typed `Span` fields are omitted. Raw Program `Debug`, diagnostics, source paths,
-located-MIR records, and `TestOverlay` are forbidden inputs. The whole-program and per-unit lowering
-keys consume this same projection before adding their existing mode/target/profile inputs.
+existing canonical scalar/sequence encoders, and after each expression encodes the exact tri-state
+`absent | arena | individual` result MIR obtains by looking up that expression's current span in the
+function's `drop_individual_exprs` as one u8 tag: `00`, `01`, or `02` respectively. The validator
+rejects a map key that matches no expression in that function; raw `HashMap` iteration and span
+bytes are never encoded. This makes an ownership
+fact semantic key material without making its diagnostic coordinate part of identity.
+
+The ordered `production_static_descriptors` projection encodes unit, item, descriptor id,
+visibility, consumer, driver, the source tag plus `File.path_literal` or `Inline.decoded_sql`,
+params/row types, complete reachable contracts, and static options. It omits only the
+constructor/common/native-options spans and the source variant's path/literal span. The source tag is
+u8 `00` File or `01` Inline; its payload and all other fields use the existing canonical encoders.
+Every HIR or descriptor variant must be matched explicitly, so a new field, variant, or semantic
+side table cannot silently disappear. Raw Program `Debug`, compiler source-file paths, diagnostics,
+located-MIR records, raw map iteration, and `TestOverlay` are forbidden inputs. The lowering memo
+key consumes the HIR projection plus its existing visibility/toggle inputs; production
+codegen/artifact identity consumes both projections before its existing mode/target/profile and
+resolved-artifact inputs.
 
 The HIR expression discriminator is
 `TestAssert { condition, kind, line, column }`, where `kind` is the closed
@@ -620,7 +637,8 @@ non-assertion tails, and parser behavior are unchanged.
 Validation order is the complete production prefix, overlay table bounds, catalog length/order,
 catalog identity bytes and root/back-reference correlation, overlay reachability closure, overlay
 function envelopes and bodies, assertion envelope/placement/kind/location/condition, then ordinary
-function completion and ownership records. Every production lowering entry validates the complete
+function completion and ownership records including per-function ownership side-table closure.
+Every production lowering entry validates the complete
 `CheckedProgram` but lowers only the frozen production prefix; test lowering validates it and lowers
 prefix plus overlay. The selected view is an explicit API and cache input, never inferred from
 whether a Program happens to contain a test. An assertion in an ordinary or generated function, a
@@ -633,8 +651,10 @@ entry paths, every root/back-reference and prefix/suffix boundary, ordinal, and 
 assertion owners place each kind in every `Stmt::Expr` depth, the root and every statement-placement
 nested final syntactic tail, plus every rejected value-consuming tail family including expected
 Unit. Cache owners mutate only earlier test source width and prove changing spans/located metadata
-beside an unchanged span-erased semantic projection and production artifact. The public grammar,
-runner, cache, and process protocol remain owned by
+beside an unchanged span-erased semantic projection and production artifact. They also independently
+mutate every ownership tri-state and descriptor semantic field, reject orphan ownership keys, and
+vary every descriptor-only span without changing the semantic descriptor projection. The public
+grammar, runner, cache, and process protocol remain owned by
 `core-design/test.md`.
 
 ## Header-adjacent records
