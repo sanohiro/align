@@ -28,6 +28,7 @@ ALIGN_TB_LOGS=""
 ALIGN_TB_RUNNING=""
 ALIGN_TB_JOBS=1
 ALIGN_TB_THREADS=1
+ALIGN_TB_VERBOSE="${ALIGN_TB_VERBOSE:-0}"
 # Per-binary wall-clock budget in seconds; 0 disables it. A hung binary
 # otherwise consumes the whole job budget and reports nothing at all, which is
 # the one failure mode a nightly detector cannot afford.
@@ -101,6 +102,13 @@ align_tb_export_dylib_path() {
 # the runnable thread count and peak RSS by the core count.
 align_tb_configure_jobs() {
   local ncpu
+  case "$ALIGN_TB_VERBOSE" in
+    0 | 1) ;;
+    *)
+      echo "ALIGN_TB_VERBOSE must be 0 or 1" >&2
+      return 2
+      ;;
+  esac
   ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
   case "$ncpu" in
     '' | *[!0-9]*) ncpu=4 ;;
@@ -218,9 +226,12 @@ align_tb_run() {
       sleep 0.2
       align_tb_reap_completed
     done
-    # Announce before launching: if a binary hangs, the last "start" line
-    # without a matching result names the suspect.
-    printf '%s: start %s\n' "$label" "$slot"
+    # Verbose mode announces before launching, so an interactive investigation
+    # can identify a hung binary. Routine CI keeps these per-binary lines out
+    # of successful logs; failures are replayed with their slot below.
+    if [ "$ALIGN_TB_VERBOSE" -eq 1 ]; then
+      printf '%s: start %s\n' "$label" "$slot"
+    fi
     (
       cd "$(dirname "$manifest")"
       binary_status=0
@@ -325,16 +336,41 @@ align_tb_failed_tests() {
   ' "$ALIGN_TB_LOGS/$1.log"
 }
 
-# Every binary's output, whichever of them failed. Returns 1 if any did.
+# Routine success is one aggregate line. A failure replays the complete log for
+# every failed binary, and verbose mode restores the per-binary success report
+# for investigations. Returns 1 if any binary failed.
 align_tb_report_all() {
-  local status=0 slot record binary_status elapsed
+  local label="${1:-run}" status=0 total=0 failed=0 slot record binary_status elapsed
   for slot in $(align_tb_slots); do
     record="$(align_tb_slot_record "$slot")"
     binary_status="${record%% *}"
-    elapsed="${record#* }"
-    printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed"
-    cat "$ALIGN_TB_LOGS/$slot.log"
-    [ "$binary_status" = 0 ] || status=1
+    total=$((total + 1))
+    if [ "$binary_status" != 0 ]; then
+      failed=$((failed + 1))
+      status=1
+    fi
   done
+
+  if [ "$ALIGN_TB_VERBOSE" -eq 1 ]; then
+    for slot in $(align_tb_slots); do
+      record="$(align_tb_slot_record "$slot")"
+      binary_status="${record%% *}"
+      elapsed="${record#* }"
+      printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed"
+      cat "$ALIGN_TB_LOGS/$slot.log"
+    done
+  elif [ "$status" -eq 0 ]; then
+    printf '%s: all %s binaries passed\n' "$label" "$total"
+  else
+    printf '%s: %s of %s binaries failed\n' "$label" "$failed" "$total" >&2
+    for slot in $(align_tb_slots); do
+      record="$(align_tb_slot_record "$slot")"
+      binary_status="${record%% *}"
+      [ "$binary_status" = 0 ] && continue
+      elapsed="${record#* }"
+      printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed" >&2
+      cat "$ALIGN_TB_LOGS/$slot.log" >&2
+    done
+  fi
   return "$status"
 }

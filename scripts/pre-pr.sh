@@ -310,8 +310,8 @@ if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
     echo "preflight: scripts/test-pr.sh exited $test_pr_status, Clippy exited $clippy_status" >&2
     exit 1
   fi
-  cat "$test_pr_log"
-  cat "$clippy_log"
+  echo "preflight: scripts/test-pr.sh passed"
+  echo "preflight: Clippy passed"
   trap - EXIT
   rm -f "$test_pr_log" "$clippy_log"
 fi

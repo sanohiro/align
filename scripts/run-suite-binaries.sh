@@ -153,8 +153,8 @@ else
   # that way for now: whether merging them into one `--all-targets`-style
   # build is worth it gets decided from the first fixed nightly's wall-clock,
   # not guessed here.
-  echo "suite: building the workspace"
-  "$script_dir/cargo.sh" build --workspace --locked
+  "$script_dir/run-quiet.sh" "suite build: workspace" -- \
+    "$script_dir/cargo.sh" build --workspace --locked
   # Where the artifacts landed comes from cargo itself: CARGO_TARGET_DIR alone
   # would miss CARGO_BUILD_TARGET_DIR and any .cargo/config override.
   target_dir="$("$script_dir/cargo.sh" metadata --format-version 1 --no-deps \
@@ -171,9 +171,10 @@ else
     echo "suite: workspace build did not produce $runtime_lib" >&2
     exit 2
   }
-  echo "suite: building every workspace test binary"
-  "$script_dir/cargo.sh" test --no-run --workspace --locked \
-    --message-format=json-render-diagnostics >"$artifacts"
+  "$script_dir/run-quiet.sh" --stdout "$artifacts" \
+    "suite build: test binaries" -- \
+    "$script_dir/cargo.sh" test --no-run --workspace --locked \
+    --message-format=json-render-diagnostics
 fi
 
 align_tb_discover "$artifacts" || {
@@ -344,19 +345,25 @@ fixed="$(LC_ALL=C comm -23 "$fixed_all" "$unknown" |
       printf '%s\n' "$entry"
   done)"
 
-# Full output for a binary that produced an unexpected failure; one line for
-# everything else, so the whole run stays auditable without burying the signal.
+# Full output for every binary that produced an unexpected failure. Successful,
+# known-failing, and environment-dependent binaries stay captured but silent;
+# ALIGN_TB_VERBOSE=1 restores the per-binary headers and summaries.
 noisy="$work/noisy"
 printf '%s\n' "$new_failures" | LC_ALL=C sed -n "s/$tab.*//p" | LC_ALL=C sort -u >"$noisy"
 for slot in $(align_tb_slots); do
   record="$(align_tb_slot_record "$slot")"
   binary_status="${record%% *}"
   elapsed="${record#* }"
-  printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed"
-  if LC_ALL=C grep -qxF "$slot" "$noisy"; then
-    cat "$ALIGN_TB_LOGS/$slot.log"
-  else
-    LC_ALL=C grep -E '^test result:' "$ALIGN_TB_LOGS/$slot.log" || true
+  if [ "$ALIGN_TB_VERBOSE" -eq 1 ]; then
+    printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed"
+    if LC_ALL=C grep -qxF "$slot" "$noisy"; then
+      cat "$ALIGN_TB_LOGS/$slot.log"
+    else
+      LC_ALL=C grep -E '^test result:' "$ALIGN_TB_LOGS/$slot.log" || true
+    fi
+  elif LC_ALL=C grep -qxF "$slot" "$noisy"; then
+    printf -- '--- %s (exit %s, %ss) ---\n' "$slot" "$binary_status" "$elapsed" >&2
+    cat "$ALIGN_TB_LOGS/$slot.log" >&2
   fi
 done
 

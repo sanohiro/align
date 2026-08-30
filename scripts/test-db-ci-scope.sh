@@ -152,7 +152,8 @@ assert_scope true "$db_package" "$workflow"
 
 runner_parent="$workflow"
 for runner_dependency in \
-  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh; do
+  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh \
+  run-quiet.sh; do
   printf '#!/usr/bin/env bash\n' > "$fixture/scripts/$runner_dependency"
   git -C "$fixture" add .
   git -C "$fixture" commit -qm "db-runner-$runner_dependency"

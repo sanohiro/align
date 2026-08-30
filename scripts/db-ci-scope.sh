@@ -51,7 +51,7 @@ while IFS= read -r -d '' path; do
     scripts/db-ci-scope.sh | scripts/test-db-ci-scope.sh | \
     scripts/db-verify-local.sh | scripts/run-db-suites.sh | \
     scripts/run-gate-binaries.sh | scripts/test-binaries-lib.sh | \
-    scripts/dyld-env.sh | \
+    scripts/dyld-env.sh | scripts/run-quiet.sh | \
     scripts/check-libpq-version.sh | \
     scripts/ci-pgdg.sh | scripts/ci-apt-llvm.sh | scripts/cargo.sh | \
     apps/db/* | \
