@@ -104,7 +104,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## Errors & aborts
 
-この領域では `Result` は使用されない。構造的な間違いはコンパイルエラーとなる（未終端のパイプライン、ステージのラムダの arity 不一致、Move 要素の slicing/indexing、`out` 引数の aliasing、`map_into` における source と dst の重複など）。
+この領域では `Result` は使用されない。構造的な間違いはコンパイルエラーとなる（未終端のパイプライン、ステージのラムダの arity 不一致、Move 要素の slicing または未対応の whole-value indexing、`out` 引数の aliasing、`map_into` における source と dst の重複など）。
 ランタイムでは、インデックスや範囲の境界外アクセス（out of bounds）、`map_into` や実行時の `zip` の長さ不一致が abort を引き起こす。
 固定長 `zip` における長さの不一致はコンパイルエラーとなる。空の入力はエラーではなく、ひとつの結果として扱われる（`sum` は 0、`count` は 0、`any` は false、`all` は true）。証明可能に空なフィルタに対する `min` / `max` は番兵（sentinel）となる単位元を返す（分岐のない `where` リデューサ、#303）。
 
@@ -115,7 +115,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## 仕様先行(未実装)
 
-- **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、読み出しを借用とするか所有権移動とするかという規則である。
+- **Move 要素** のコレクションの slicing と通常の whole-value indexing は未対応である。ただし、plan 30 で受理され実装待ちの `array<string>[i] -> str` view は例外である。Move record 配列では、直接 field view と明示的な shared-borrow call-place の形式が引き続き使用できる。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、要素全体に対する public view type または所有権移動の規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。
 - ネストした要素書き込み `arr[i].a.x = v` は動作する。しかし、ネストした **soa** 列や、テスト済みの形式を超える chained projection 経由での要素書き込みは未対応 — `08-nested-structs.md` の deferred リストを参照。
 - `soa` 列は汎用パス（generic path）経由では範囲スライスできない（列のウィンドウは実装済みの `s.field[a..b]` を経由する。未対応なのは汎用的な `check_slice_range` のアームのみである）。

@@ -8,12 +8,15 @@ per-PR journals are preserved in
 neither is a source of current status.
 
 _Last updated: 2026-08-31._ align-llm Request 22 is active on
-`agent/request22-string-index`. `docs/impl/30-borrowed-string-array-index-plan.md` is the design
-candidate: ordinary `array<string>[i]` becomes the canonical non-consuming `str` view, while the
+`agent/request22-string-index`. `docs/impl/30-borrowed-string-array-index-plan.md` is the accepted
+design: ordinary `array<string>[i]` becomes the canonical non-consuming `str` view, while the
 already-shipped `array<MoveRecord>[i].field` and explicit shared-borrow call paths retain the record
 half of the request. No general reference value, whole Move-record binding, clone, ABI, or runtime
-surface is added. Finish the author consistency pass, run one independent design review, repair
-valid findings, and publish the reviewed design before Rust implementation.
+surface is added. The independent review of `d349700d` found four valid boundary, closure, and
+documentation issues; the consolidated repair preserves existing Index positives, enumerates every
+provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
+registered consumer targets. Publish the reviewed design, then implement its Rust and owner-test
+closure.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.

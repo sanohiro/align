@@ -1,6 +1,6 @@
 # Borrowed string-array indexing
 
-Status: **DESIGN CANDIDATE; implementation blocked on one independent design review.**
+Status: **ACCEPTED after independent review; implementation pending.**
 
 This document owns the Align answer to align-llm Request 22. The first blocked consumer is the R7
 Qwen2 tokenizer: it materializes `tokenizer.ggml.tokens` and `tokenizer.ggml.merges` as
@@ -81,9 +81,10 @@ the only admitted mismatch. Checked HIR independently requires:
 - no result, storage fact, or bounds action after receiver/index termination; and
 - the exact source generation and contained roots in return, retention, and escape facts.
 
-Every other `Index` still requires its current exact element/result type relation. A forged
-`DynArray(String) -> String`, a `DynArray(Str) -> Str` record that claims this new physical rule,
-or any other Move result fails before MIR.
+Every other `Index` still requires its current exact element/result type relation. The existing
+`DynArray(Str) -> Str` relation and the receiver-only `DynResponseArray -> HttpResponse` method
+place remain admitted under their current rules. A forged `DynArray(String) -> String`,
+`DynArray(Str) -> String`, or any other unsupported source/result pair fails before MIR.
 
 MIR lowers the accepted node through the existing dynamic `SliceIndex` path. The destination value
 is typed `Str`; the source buffer element is layout-compatible `String`. Both are the same two-word
@@ -101,16 +102,18 @@ fingerprint changes; ordinary body/MIR fingerprints change when the expression c
 
 | Axis | Required closure | Exact owner evidence |
 | --- | --- | --- |
-| Type formation and result | Admit exactly dynamic `array<string>` as physical `String` to logical `Str`; preserve all Copy results and every other Move rejection. | Wildcard-free type matrix covering String, Str, primitive, Move record/sum, nested array, resource, box, builder, buffer, and opaque twins; forged HIR result mutations. |
+| Type formation and result | Admit exactly dynamic `array<string>` as physical `String` to logical `Str`; preserve all Copy results, the existing receiver-only response method place, and every other Move rejection. | Wildcard-free type matrix covering String, Str, primitive, Move record/sum, nested array, response, resource, box, builder, buffer, and opaque twins; positive `DynArray(String) -> Str`, `DynArray(Str) -> Str`, and receiver-only `DynResponseArray -> HttpResponse` records plus forged receiver/result mutations. |
 | Construction and source ownership | Build arrays through `array_builder<string>`, index zero/last repeatedly, retain the array, and deep-drop every original element once. | `borrowed_params` executable owner plus existing `m12_array_builder` deep-drop owner. |
 | Receiver/index control | Preserve receiver then index order, one evaluation, existing bounds failure, and no action after every terminating receiver/index family. | Side-effect order case; negative/len index subprocesses; `?`, return, break, exit, abort, and divergence MIR/runtime twins. |
 | Move-in, move-out, nulling, replacement, Drop | Indexing performs none; explicit `.clone()` is the only owned result. Source move/drop/replacement/`borrow mut` invalidates a retained view, while unrelated mutation remains valid. | MoveCheck invalidation matrix, repeated source use, clone/drop counter or repeated-cycle control, unrelated-root positive. |
-| Borrow roots and escape | Direct, field, borrowed-projection, and temporary receivers carry complete storage generations and contained input/arena roots through local binding, return, joins, and exact/fallback `borrow mut` retention. | Direct/field/projection/temporary return positives and frame/input/arena/source-invalidation negatives; exact named versus imported/indirect fallback retention. |
+| Borrow roots and escape | Direct, field, borrowed-projection, and temporary receivers carry complete storage generations and contained input/arena roots through local binding, return, `if`, `match`, `else`, Result `?`, `map_err`, loop joins, and exact/fallback `borrow mut` retention. | `borrowed_params::owned_string_array_index_views_preserve_control_provenance` covers every named wrapper for direct/field/projection/temporary inputs, return, exact named and imported/indirect fallback retention, and frame/input/arena/source-invalidation negatives. |
 | Checked HIR | Recompute the one physical/logical mismatch, child order, termination, retained-storage snapshot, and provenance. No new variant or metadata can bypass exhaustive validation. | Producer-valid HIR plus wrong receiver/result/index, forced fallthrough/action after termination, and stale/missing/extra source-fact mutations; existing variant-sweep tripwire unchanged. |
 | MIR and LLVM | Reuse bounds-checked `SliceIndex`; load only `{ptr,len}` as `Str`; inherit borrow owners; emit no clone, owner copy, cleanup, null, allocation, or runtime helper. | MIR print/shape assertion, LLVM type/one-load assertion, malformed checked-HIR rejection before codegen. |
 | Generic, interface, cache | Concrete generic `array<T>` accepts only `T=string`; whole/per-unit behavior agrees; exact body/type edits invalidate dependents and revert restores hits. | Generic/imported driver owner, whole/per-unit executable parity, focused cache edit/revert owner. |
 | Existing Move-record surfaces | `rows[i].string_field` and explicit `borrow` call remain the only non-consuming record-element reads; `row := rows[i]` and by-value calls still reject. | Existing `ElemField` and `BorrowedIndex` owners plus explicit whole-record ordinary-value negative. |
-| Real consumer | R7 reads GGUF token and merge arrays through ordinary indexes without a copied vocabulary or compatibility layout. | align-llm Request 22 adoption owners and the R7 hosted synthetic plus named real-model tokenizer parity qualification after the merged pin. |
+| Existing tensor-render migration | `src/gguf.align::render_tensors` replaces its NUL-separated prefix stream and parallel offset arrays with an indexed `array<TensorRow>` or equivalent, using the already-shipped Move-record field view. | The first registered Request 22 target and `make gguf-smoke` after pin adoption. |
+| Existing producer migrations | `GgufTable`, `BlockPlan`, and `model_forward.StepColumns` migrate their stream-plus-column internals together to indexable record arrays without changing their accessor signatures. | The second registered Request 22 target and its R1-QWEN-MODEL-IR, R1B-GPTOSS-MOE-IR, and R6-STEP-N focused owners after pin adoption. |
+| R7 tokenizer | R7 reads GGUF token and merge `array<string>` values through ordinary indexes without a copied vocabulary or compatibility layout. | The third registered Request 22 target: the hosted synthetic owner plus named real-Qwen2 tokenizer parity qualification after the merged pin. |
 
 One parameterized owner may close multiple cells when it would fail for each listed defect. No
 benchmark is required because this capability makes no performance or resource claim. The
@@ -147,12 +150,13 @@ only after the Align implementation merges.
 The 2026-08-31 author pass verified:
 
 1. This ledger, `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`, the Settled decision,
-   plan 28, the MIR guide, and the L2 prerequisite table all name exactly the String-to-Str array
-   projection and retain the existing Move-record boundaries.
+   plan 28, the English/Japanese array guide, the HIR/MIR guides, and the L2 prerequisite table all
+   name exactly the String-to-Str array projection and retain the existing Move-record boundaries.
 2. Receiver/index/termination/bounds precedence is identical in every source.
 3. Every ownership, region, cleanup, identity, prerequisite, and acceptance field is present or
    explicitly N/A.
-4. Every closure-matrix row has an implementation owner and exact regression target before coding.
+4. Every closure-matrix row has an implementation owner and exact regression target before coding,
+   including every value-carrying control wrapper and all three registered consumer targets.
 5. No example implies a whole Move record value, hidden clone, or new reference/storage state.
 6. The design consumes only shipped plan-28 mechanisms and introduces no later evaluator,
    tokenizer, runtime, or package capability.
