@@ -391,6 +391,30 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
+- **Next language capability:** `core.test` is designed in
+  `docs/impl/core-design/test.md`. The locked first slice adds private top-level Result tests,
+  explicit test-only Bool assertions, one linked test artifact run sequentially in a fresh process
+  group per test, a fixed bounded launch acknowledgement, fail-closed normal-return record,
+  preallocated output/full-row deadline, terminal-observation control barrier, all-terminal
+  pinned-group then direct-PID signalling before reap, nonblocking capture/control drains,
+  evidence retained through reporting, lock-free signal/write arbitration, numeric raw-exit
+  statuses for the four graceful signals, exact handler `errno` preservation, controller-owned
+  terminal summary commit, and
+  failure-only output replay. Compiler formation normalizes final syntactic-tail assertions only
+  at root completion or structural statement placement and freezes
+  the complete production prefix before appending a test-generated function/type/descriptor/
+  capability overlay; production interfaces exclude that overlay, while production MIR/links,
+  optimization remarks, and DB preparation descriptors use its span-erased semantic/codegen
+  projection, including structurally ordered ownership facts and semantic descriptor fields.
+  Before artifact work, test mode rejects every catalog-reachable `process.command` through direct,
+  imported, function-value, lifted, and monomorphized edges; unreachable production use stays
+  unchanged. One suite cwd is fixed after CLI validation, child fd 0..3 are replaced and fd 4+
+  closed, and all build-stage owners finish normal Drop before runner entry. An implicit entry
+  `main` cannot collide with an imported declared `main`, and
+  `align-repl` rejects test-bearing entries transactionally. No dynamic command sentinel or fifth
+  child-control ABI is part of the capability.
+  Implementation is the next
+  code PR; `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

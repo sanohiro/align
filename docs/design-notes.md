@@ -1286,6 +1286,88 @@ primitive implementation with RSA blinding retained. Signature verification uses
 Functional vectors establish cryptographic semantics, while wrapper/API/provider-provenance
 inspection — not noisy timing statistics — owns the constant-time boundary.
 
+## Why tests are Result blocks run in separate processes
+
+An Align test reuses the language's one error model. Its body is a compiler-private
+`fn() -> Result<(), Error>` with a documented successful tail, so helpers return Result, `?`
+propagates, Err fails, and ordinary cleanup runs. Assertions are explicit `core.test` operations;
+there is no exception, panic-catching framework, boolean-returning second dialect, or hidden global
+registry.
+
+The ordinary parser's final-expression rule remains unchanged. Test-context sema treats an exact
+final assertion as a statement only at root completion or when its enclosing block/control is
+structurally a statement; every Value edge, including expected Unit, rejects. This preserves the one
+statement-only assertion form without requiring a dummy trailing expression or inventing a
+parser-only assertion node.
+
+The declaration is not an ordinary named function. It has no parameters, visibility, callable
+identity, or interface entry because production code must not acquire a test-only dependency.
+Normal semantic formation closes and freezes the complete production program first. Test checking
+then appends roots plus every test-generated helper, monomorph, type, descriptor, and capability to
+a separate overlay. Normal commands validate the partition and consume only the frozen prefix,
+while test mode combines both. This boundary preserves production ids and bytes instead of trying
+to discard only visibly tagged root functions after they have already influenced shared tables.
+Codegen/cache identity projects that prefix without source spans: diagnostics and located output
+retain current offsets, while an earlier test edit cannot perturb production objects. The projection
+still encodes each expression's ownership fact in structural order and every semantic descriptor
+field, so span erasure cannot merge different cleanup or static-artifact meaning. Test mode has a
+separate cache identity and links the explicit import closure once. Database descriptors are not an
+overlay exception requiring a second preparation workflow: their constructors remain ordinary
+named top-level descriptor functions formed in the prefix, and tests reuse that metadata offline.
+The prefix selector is exercised across one-shot/watch, whole/per-unit, ThinLTO, and PGO modes.
+Before test artifact work, the combined-view validator rejects every catalog-reachable
+`ProcessCommand` through direct, imported, function-value, lifted, and concrete-monomorph edges.
+This keeps the first capability honest about descendant containment without adding a hidden
+sentinel/status protocol to `std.process`; unreachable production command helpers and all
+production artifacts remain unchanged. The same exhaustiveness audit makes `align-repl` reject a
+test-bearing submitted entry transactionally, and an implicit entry `main` rejects against an
+imported declared `main` before catalog construction.
+
+Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
+the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
+unwinding to the language. A compiler-owned completion record means an early exit zero cannot
+masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguishes harness setup
+from user termination, and one deadline covers both states through cleanup. The parent control and
+capture endpoints are nonblocking, so an acknowledgement or short output without completion returns
+to poll instead of stalling that deadline. The driver snapshots one native suite cwd after CLI
+validation. Every spawn installs it, replaces fd 0/1/2/3, and closes fd 4 and above, making child
+cwd and descriptor visibility independent of later embedding-thread mutations. One dedicated runner
+state machine owns signals, polling, capture, and wait status: every terminal path keeps the leader
+unreaped while it signals the pinned group and then the direct PID, then reaps only its direct child
+and continues only after cleanup succeeds. The direct target also closes a leader that left the
+verified group. A second control drain after non-reaping terminal observation closes the fast-exit
+race between completion send and status observation. Descendants are signalled but not reaped by
+this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM from child
+acquisition through summary publication. Returning error paths restore prior handlers; terminal
+suite paths retain the controller, block and recheck those signals after the last write, then exit
+directly. One lock-free `Idle/Writing/Selected/WritingPending` state prevents any new raw output
+syscall after selection while preserving only an already-started syscall's prefix. Each handler
+saves and restores the interrupted thread's exact `errno` around arbitration and self-pipe work.
+The final guard
+uses raw `_exit(128 + signal)`, so SIGHUP/SIGINT/SIGQUIT/SIGTERM are observed as numeric
+129/130/131/143 `WIFEXITED` statuses, never as re-raised `WIFSIGNALED` termination. A prior ignored
+or custom handler therefore cannot change a published terminal result.
+
+The test artifact also has one entry and one child-control boundary. Its generated harness alone
+owns literal `main`; every source-main ABI uses the existing encoded private identity and loses its
+ordinary production wrapper. Four exact unkeyed runtime functions own launch receive, fd
+close-on-exec, acknowledgement, and completion encoding/send, while the driver implements the
+independent peer codecs. Target/profile/runtime LTO reach unit and harness objects; jobs, cache
+statistics, timeout, and capture bounds each stop at their named scheduling, diagnostic, or runner
+consumer.
+After link, every whole/per-unit/harness build-stage owner completes normal cleanup before
+signal-controller acquisition. Only the final executable stage enters the runner, because a raw
+terminal exit cannot run Rust destructors for any build owner left alive.
+
+Capture moves from a live row to an immutable quiesced row after child cleanup. A pass consumes and
+discards it; a failure retains it through the last direct reporting write and only then releases it.
+This makes a thousand passing tests produce the same one-line result as one passing test, without
+sacrificing the diagnostic bytes at the failure site. Terse success is therefore part of the runner
+contract, not an optional CI convention layered over an inherently noisy tool.
+Repository owner and CI commands preserve the same property with the existing quiet wrapper:
+success is phase/aggregate summaries, while failure or interruption replays the captured diagnostic
+log without changing selection or verdict.
+
 ---
 
 ## In one sentence

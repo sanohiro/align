@@ -340,6 +340,9 @@ trusting the stored bits:
    equality. A projection-only borrowed binding contributes no entry. If two
    expressions share a span, the later producer insertion is
    authoritative; a conflicting handcrafted map cannot choose another value.
+   After this equality check, the `align-production-codegen-v1` encoder emits
+   the resulting lookup fact at each expression in the same universal child
+   order; it never serializes the map or trusts a separately supplied fact.
 5. Recompute every `Cell<bool>` statement flag after its children:
    `Assign.drop_old`, `Assign.drop_new`, and the corresponding indexed/field
    replacement behavior must equal the MoveCheck/EscapeCheck decision.
@@ -519,6 +522,168 @@ Each test starts with the semantic producer's valid record, mutates the tag,
 each envelope field, each child, each post relation, stored `Expr.ty`, and each
 applicable ownership fact one at a time, then checks the universal precedence
 with parent-plus-first-child and first-child-plus-later-child pairs.
+
+### Planned `core.test` records (designed 2026-08-30; inactive until implementation)
+
+The accepted `core.test` capability partitions checked output before test bodies may add generated
+artifacts. The exact private top-level shape is
+`CheckedProgram { production: hir::Program, production_static_descriptors: Vec<StaticDescriptor>,
+tests: Option<TestOverlay> }`. `production` is formed to its complete ordinary-source fixed point
+first and is then immutable. `TestOverlay` owns an ordered `catalog: Vec<TestMeta>`, test roots and
+their generated function closure in `fns: Vec<hir::Fn>`, appended suffixes for each of
+`Program::{structs,enums,resources,tagged_types,tuples,fn_types}`, and
+`test_static_descriptors: Vec<StaticDescriptor>`. It owns no replacement production entry and no
+second extern/import table. An overlay type id addresses the immutable production table as a prefix
+and its corresponding overlay table as a suffix; no overlay pass may insert into, reorder, or
+rewrite a production prefix.
+
+The exact catalog record is
+`TestMeta { function: u32, source_module: String, source_name: String, canonical_id: String,
+source_ordinal: u32 }`. Each overlay function has `test_catalog_index: Option<u32>` rather than a
+copied identity. A catalog slot points to one unique in-bounds overlay function whose back-reference
+equals that slot. That root requires zero parameters and type parameters, exact
+`Result<Unit,builtin Error>` return, private `FnOrigin::Source`, Impure effect, no public/interface
+record, and a body whose reachable fallthrough is the producer-inserted `Ok(Unit)` tail. Every
+production function and every generated overlay `Lifted`/`Monomorph` has `None`; no generated helper
+may impersonate a catalog root.
+
+`source_module` is the producer-retained canonical module path: it is valid UTF-8 and every
+component repasses the ordinary identifier grammar. For the entry source it is the declared module
+path, or `main` only when that source omits a module declaration; `is_entry` never rewrites a
+declared path. `source_name` is the independently retained decoded declaration string, valid UTF-8
+and 1..=256 bytes with U+0000..U+001F and U+007F..U+009F rejected. `canonical_id` is valid UTF-8,
+1..=1,024 bytes, and byte-equals `source_module + "::" + source_name`; the pair and id are unique.
+`source_ordinal` is dense from zero in source declaration order within each `source_module`.
+Catalog order is the driver-selected dependency-first unit order followed by `source_ordinal`, and
+its length is at most 65,535. The overlay owns these three strings independently; none is rebuilt
+from the hidden function symbol.
+
+Before catalog construction, the loader rejects an entry that omits its module declaration when
+an imported source explicitly declares `module main`. The exact diagnostic is
+`default entry module 'main' conflicts with imported module 'main'; declare the entry module
+explicitly`. This check precedes canonical-id uniqueness and source-ordinal validation, so the
+implicit entry identity can never alias the imported declared identity. An explicitly declared
+entry path uses the ordinary duplicate-module rule. Whole/per-unit owners cover the rejected pair,
+nearby distinct paths, and diagnostic precedence over duplicate test ids.
+
+Formation is two-phase. Signature and declaration validation still sees every item. Sema then
+checks all ordinary source bodies, closes their lifted helpers, generic function/type/resource
+monomorphs, interned tuple/function/tagged types, analyses, capability use, and static descriptors,
+and freezes that complete production prefix. Only then does it check test bodies against the
+read-only prefix. A test reuses an identical production monomorph already in the prefix; otherwise
+the test demand and every transitive lifted/monomorph/type/resource product append only to the
+overlay. Test analyses may read validated production facts but publish their own mutable facts in
+the overlay. Permitted non-database test static descriptors stay in `test_static_descriptors`; a
+database Query/command descriptor cannot be source-formed there because its constructor remains the
+complete body of an ordinary named top-level descriptor function, and the combined validator
+rejects a handcrafted database consumer in the overlay. `db prepare` therefore sees every
+source-formable database descriptor in `production_static_descriptors`; `alignc test` reuses the
+same offline policy/driver metadata. Native capability collection runs after selecting the
+production view or combined test view, never while checking a test body.
+
+The validator proves the partition rather than trusting storage location alone. The production
+program validates independently and has no test back-reference. The combined validator resolves
+every overlay reference against prefix-plus-suffix bounds and requires each catalog root to be
+reachable from its own catalog slot. The complete overlay artifact graph—functions, every type-table
+suffix, and test static descriptors—must equal the closure reachable from the catalog-root set
+through every checked-HIR reference or generation edge, including direct calls, function values,
+callback/destructor descriptors, lifted targets, nominal field/variant/resource types, interned
+type members, and transitive function/type/resource monomorph demands. It rejects any
+production-prefix edge to an overlay suffix and any database-consumer overlay descriptor. Owner
+Before cache lookup, capability collection, or artifact allocation, the selected combined-view
+validator walks that same graph from catalog roots in catalog order and dependency-edge then
+structural HIR order. A reachable `ExprKind::ProcessCommand` rejects with exactly
+`process.command is not available from test code; run the external process in an owner test`.
+Direct/imported calls, function-value targets, lifted callbacks/destructors, and concrete generic
+monomorphs are all edges; a shared site is diagnosed once at its first root. An unreachable
+production function containing `ProcessCommand` remains valid and may stay as inert code in the
+frozen-prefix test object with its ordinary runtime selection; no catalog root can execute it. The
+ordinary production validator continues to admit it. A handcrafted
+combined view cannot bypass the rule by storing the expression in the production prefix when a
+catalog root reaches it.
+
+Owner matrices cover direct/nested/imported/function-value/lifted/generic reachable commands,
+shared-site and catalog/source-order precedence, an unreachable production control, malformed
+prefix/overlay placement, whole/per-unit parity, and inert-prefix retention. They also cover
+a test lambda, a test-only generic
+monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
+class, capability library use, and static descriptor. Adding or editing only tests must leave the
+canonical span-erased semantic/codegen projection of the production Program, semantic descriptor
+projection, span-erased MIR codegen graph, object key, link inputs, and executable bytes identical in
+whole-program and per-unit paths. The checked Program itself retains current source spans for
+diagnostics and located output; those spans, descriptor diagnostic locations, and their
+source-keyed/located metadata may change when an earlier test edit shifts byte offsets and never
+enter the production semantic/codegen key.
+
+The production key projection is one exhaustive structural encoder, not filtered `Debug` text. It
+starts with the versioned domain `align-production-codegen-v1`, visits production Program tables,
+functions, statements, and expressions in stored order, encodes every non-`Span` field through the
+existing canonical scalar/sequence encoders, and after each expression encodes the exact tri-state
+`absent | arena | individual` result MIR obtains by looking up that expression's current span in the
+function's `drop_individual_exprs` as one u8 tag: `00`, `01`, or `02` respectively. The validator
+rejects a map key that matches no expression in that function; raw `HashMap` iteration and span
+bytes are never encoded. This makes an ownership
+fact semantic key material without making its diagnostic coordinate part of identity.
+
+The ordered `production_static_descriptors` projection encodes unit, item, descriptor id,
+visibility, consumer, driver, the source tag plus `File.path_literal` or `Inline.decoded_sql`,
+params/row types, complete reachable contracts, and static options. It omits only the
+constructor/common/native-options spans and the source variant's path/literal span. The source tag is
+u8 `00` File or `01` Inline; its payload and all other fields use the existing canonical encoders.
+Every HIR or descriptor variant must be matched explicitly, so a new field, variant, or semantic
+side table cannot silently disappear. Raw Program `Debug`, compiler source-file paths, diagnostics,
+located-MIR records, raw map iteration, and `TestOverlay` are forbidden inputs. The lowering memo
+key consumes the HIR projection plus its existing visibility/toggle inputs; production
+codegen/artifact identity consumes both projections before its existing mode/target/profile and
+resolved-artifact inputs.
+
+The HIR expression discriminator is
+`TestAssert { condition, kind, line, column }`, where `kind` is the closed
+`True | Equal` byte, `condition` is exact Bool, and line/column are positive `u32` coordinates of
+the source assertion call. It is valid only in a `Some(TestMeta)` root, outside every nested lambda
+function, and as the complete expression directly stored in `Stmt::Expr` of the test body or one
+of its ordinary nested blocks. The validator passes an explicit `Statement | Value` placement
+context through every expression edge: block values, let/assignment initializers, return/break
+payloads, call operands, and all other children are `Value` and reject `TestAssert`, while a nested
+block's own `Stmt::Expr` roots are `Statement`. The complete assertion expression is Unit. `Equal`
+is emitted only after sema has checked the original two operands with the ordinary `BinOp::Eq`
+rule, proved its result is exact Bool rather than vector/mask, and built one left-to-right Eq child;
+the validator does not reconstruct the unavailable two source operands from a bool. MIR lowers a
+false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
+true condition to Unit fallthrough.
+
+The ordinary parser still represents the last expression before `}` as `Block::tail`, including on
+its own terminated source line. Sema assigns `Statement | Value` placement from the AST parent before
+checking children. At the root test completion or in a nested block/control expression that is
+itself a complete `Stmt::Expr`, sema recognizes an exact imported assertion call in that syntactic
+tail, consumes it as the final assertion statement, and leaves Unit fallthrough; checked HIR
+therefore still stores only `Stmt::Expr(TestAssert)` and no assertion value. The same call remains a
+rejected Value when the enclosing block or control expression is consumed by a binding, argument,
+return, break, or other operand, even if that consumer expects Unit. Ordinary functions, lambdas,
+non-assertion tails, and parser behavior are unchanged.
+
+Validation order is the complete production prefix, overlay table bounds, catalog length/order,
+catalog identity bytes and root/back-reference correlation, overlay reachability closure, overlay
+function envelopes and bodies, assertion envelope/placement/kind/location/condition, then ordinary
+function completion and ownership records including per-function ownership side-table closure.
+Every production lowering entry validates the complete
+`CheckedProgram` but lowers only the frozen production prefix; test lowering validates it and lowers
+prefix plus overlay. The selected view is an explicit API and cache input, never inferred from
+whether a Program happens to contain a test. An assertion in an ordinary or generated function, a
+test marked public/Pure, an orphan overlay helper, a prefix-to-suffix edge, a missing synthetic Ok,
+duplicate/sparse ordinal, or any future metadata/assertion kind fails before MIR construction.
+
+This section activates atomically with the implementation and its parameterized valid/malformed
+owners. Metadata owners mutate each identity string independently and together, declared/default
+entry paths, every root/back-reference and prefix/suffix boundary, ordinal, and duplicate relation;
+assertion owners place each kind in every `Stmt::Expr` depth, the root and every statement-placement
+nested final syntactic tail, plus every rejected value-consuming tail family including expected
+Unit. Cache owners mutate only earlier test source width and prove changing spans/located metadata
+beside an unchanged span-erased semantic projection and production artifact. They also independently
+mutate every ownership tri-state and descriptor semantic field, reject orphan ownership keys, and
+vary every descriptor-only span without changing the semantic descriptor projection. The public
+grammar, runner, cache, and process protocol remain owned by
+`core-design/test.md`.
 
 ## Header-adjacent records
 

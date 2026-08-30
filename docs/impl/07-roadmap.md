@@ -3837,7 +3837,7 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
 An item without a status is not a committed contract: it becomes a gated design under
 `impl/std-design/` or `impl/pkg-design/` at its own implementation start (broad-contract items —
-`core.test` syntax, `std.id` scalar admission — go through the design/open-questions gate first).
+`std.id` scalar admission remains behind the design/open-questions and friction-ledger gates).
 An item marked `DESIGNED` is locked by its named design ledger even though implementation remains
 pending. This section records their sequencing and status; it does not lock an unmarked surface.
 
@@ -3858,16 +3858,42 @@ pending. This section records their sequencing and status; it does not lock an u
 ### Planned packages (order)
 
 ```text
-language self-hosting : core.test (+bench) -> std.log -> core.codec -> pkg.frame
+language self-hosting : core.test -> std.log -> core.codec -> pkg.frame
 domain                : pkg.auth -> pkg.kv -> pkg.csv -> pkg.ws -> pkg.template
 cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 / MinIO / B2)
 ```
 
 ### One-line capability outline (core / prerequisites / open decision)
 
-- **core.test** — top-level `test "name" { body: Result<(), Error> }`; `expect`/`expect_eq`
-  (test-block-only builtins); per-test subprocess runner; failure = `Err` early-return.
-  **Requires a language decision: new `test` block syntax — design gate.**
+- **core.test — DESIGNED 2026-08-30** — private top-level named Result blocks; explicit
+  `core.test` assertion import with Bool-result equality only; one immutable test artifact run
+  sequentially in a fresh process group per catalog row; fixed bounded launch acknowledgement and
+  compiler-owned normal-return proof; bounded preallocated output and full-row time; one dedicated
+  lifecycle owner, terminal-observation control barrier, all-terminal pinned-group then direct-PID
+  signalling before reap, nonblocking capture/control drains, quiesced evidence retained
+  through reporting, lock-free signal/write arbitration, numeric raw-exit status for four graceful
+  signals, exact handler `errno` preservation, controller-owned terminal summary commit, and
+  failure-only evidence replay. Compiler formation normalizes final syntactic-tail assertions only
+  at root completion or structural statement placement and
+  freezes the complete production prefix before appending the test-generated function/type/
+  non-database-descriptor/capability overlay; production interfaces exclude it, while production
+  MIR/links and optimization remarks use the prefix's span-erased semantic/codegen projection,
+  including structurally ordered ownership facts and semantic descriptor fields. Database
+  Query/command descriptors remain prefix-owned top-level declarations and tests consume their
+  ordinary prepared metadata offline. The harness alone owns literal `main`; source main uses its
+  encoded private identity, and four exact unkeyed runtime rows own child launch/fd/ack/completion
+  I/O. One CLI-bound native cwd is installed for every child; fd 0..3 are replaced and fd 4+
+  closed. All build-stage owners complete normal Drop before runner entry; only the executable
+  stage crosses that boundary. Test formation rejects every catalog-reachable `process.command`
+  before cache/capability/
+  artifact work, while unreachable production use is unchanged; no dynamic supervisor ABI ships.
+  An implicit entry `main` rejects against imported declared `main`, and `align-repl` rejects a
+  test-bearing submitted entry transactionally. Production modes and accepted test options have
+  closed terminal-consumer matrices, and owner/
+  CI commands retain terse success through the existing quiet wrapper. The
+  exact public ledger, control-protocol bytes, lifecycle state matrix, cache identity, and
+  one-capability implementation matrix are `core-design/test.md`; an in-language benchmark runner
+  remains a later consumer rather than part of this test capability.
 - **std.id** — one 128-bit Copy scalar; ULID / UUIDv7 / UUIDv4 differ only by generation rule +
   text form; monotonic ULID via an explicit Move generator; CSPRNG source; parse strict.
   **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,

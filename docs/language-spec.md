@@ -976,6 +976,7 @@ core.arena
 
 core.json
 core.template
+core.test
 
 core.hash
 core.math
@@ -1183,7 +1184,7 @@ per call; only the closed input-rejection set maps Invalid, while empty/unknown/
 fetch failures map `Error.Code(0)`. Every post-view signature mismatch is
 `Ok(false)`. Construction is trusted setup without a timing promise; signing an admitted key is
 constant-time for secret contents at fixed public lengths under the pointer-verified built-in
-OpenSSL default-provider dependency. The implementation is pending; the exact surface, formats,
+OpenSSL default-provider dependency. The implementation shipped on 2026-08-30; the exact surface, formats,
 bounds, secret cleanup, error precedence, ownership, ABI, timing boundary, and closure matrix are
 `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
@@ -1203,6 +1204,73 @@ boundaries. Invalid syntax/resource limits are `Error.Invalid`; an invalid `find
 programmer error and aborts. The engine guarantees automata-style predictable matching and excludes
 look-around/backreferences. No regex literal or implicit cache is part of the language. (`draft.md`
 §18.2.)
+
+## In-Language Tests
+
+A private top-level `test` declaration carries one ordinary string name and one block. Only the
+item-position lookahead `test` followed by a string commits to this declaration; `test {}` and
+`pub test {}` remain keyword-less types, while `pub test "..." {}` rejects. A test creates no
+callable or exported name. Its body is checked as a compiler-private
+`fn() -> Result<(), core.Error>` with one documented implicit `Ok(())` after a Unit fallthrough;
+ordinary `?`, Err, cleanup, and hard-error behavior are unchanged. Names are bounded, control-free,
+excluding exactly U+0000..U+001F and U+007F..U+009F, and unique per module. Canonical ids are
+`<module>::<name>`; the entry uses its declared module path, or `main` only when no module is
+declared. Discovery is limited to the explicit entry/import closure in deterministic
+dependency-first, then declaration order. If the entry omits its module declaration while an
+imported source explicitly declares `module main`, loading rejects before catalog construction;
+explicit entry paths retain the ordinary duplicate-module rule.
+
+With `import core.test`, `test.expect(bool)` and `test.expect_eq(left, right)` are standalone
+test-body assertions. Equality reuses the language's existing `==` rule, requires its result to be
+exact `bool`, and uses left-to-right eager evaluation. Vector/mask equality therefore rejects
+instead of acquiring an implicit all-lanes reduction. Failure reports the canonical id and
+one-based call location, then returns `Error.Invalid` through the test cleanup edge; no operand
+reflection or formatting is added. A final syntactic block-tail assertion is consumed as the final
+statement only at root test completion or structural statement placement; every Value edge rejects,
+even when its consumer expects Unit.
+
+`alignc test` links the closure once and launches that immutable test artifact in a fresh process
+group per test, sequentially. A compiler-private completion record distinguishes normal Ok/Err
+return from exit, exec, abort, and crash. Each row has bounded time from pre-spawn through launch,
+execution, group signalling, capture drain, and direct-child reap plus bounded per-stream capture;
+pre-ack timeout/output is infrastructure failure. Parent control and capture receives are
+nonblocking. One native suite cwd is snapshotted after CLI validation and installed for every row;
+the child receives exactly fd 0 `/dev/null`, fd 1/2 capture, and fd 3 control, with every fd 4 and
+above closed. Every verified terminal path signals the pinned group and then the still-unreaped
+direct PID before reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
+output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
+passing suite always has one summary line. No user `main` is required or automatically invoked. Production
+commands complete and freeze the ordinary-source prefix before forming a separate test overlay for
+roots and every generated helper, monomorph, type, descriptor, and capability. They validate both
+partitions but omit the overlay from production MIR, interfaces, links, and artifacts;
+`explain-opt` also omits it from located MIR/remarks. Database Query/command constructors remain
+ordinary named top-level descriptor functions and are therefore prefix-owned; tests reuse their
+prepared metadata offline, and `db prepare` needs no test mode. The generated harness alone owns
+literal `main`; every permitted source-main ABI is encoded as an ordinary internal function without
+its production wrapper. Four exact compiler-private runtime functions own launch receive, fd
+close-on-exec, acknowledgement, and completion encoding/send. Production prefix selection covers
+one-shot/watch, whole/per-unit, ThinLTO, and PGO routes, while each accepted test option has one
+fixed terminal consumer. The signal controller remains installed through
+summary publication. One lock-free permit prevents a new raw output syscall after a graceful signal
+is selected, and each handler preserves the interrupted thread's exact `errno`; the final blocked
+recheck uses raw `_exit(128 + signal)`, so the four handled signals
+produce numeric statuses 129/130/131/143 (`WIFEXITED`, not `WIFSIGNALED`). Production codegen/cache
+identity is the complete span-erased semantic projection; current spans and located output may
+shift after an earlier test edit. Structurally ordered expression-ownership facts and semantic
+descriptor fields remain in that identity even though their diagnostic spans do not. Test
+compilation has a separate versioned cache domain. The
+complete grammar, bounds, wire bytes, error precedence, CLI
+options, ownership, build-stage cleanup before runner entry, reporting, and
+acceptance matrix are in `docs/impl/core-design/test.md`.
+
+Before test cache lookup, native-capability collection, or artifact allocation, the validated
+catalog-root call graph rejects every reachable `process.command`, including direct, imported,
+function-value, lifted, and concrete-generic routes. An unreachable production helper remains
+valid and may remain inert in a frozen-prefix test object; the first capability adds no dynamic
+command supervisor.
+`process.spawn`, `process.exec`, `process.exit`, and `process.abort` retain their settled row-group
+behavior. `align-repl` parses the contextual declaration but rejects an entire submitted entry
+containing one before replacement resolution or session mutation; tests run through `alignc test`.
 
 ## Packages
 

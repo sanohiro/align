@@ -2359,6 +2359,7 @@ core.arena
 
 core.json
 core.template
+core.test
 
 core.hash
 core.math
@@ -2663,6 +2664,119 @@ hash128(data) -> (u64, u64)    // 128-bit result as a tuple (no u128 type)
 Deterministic for a given input within a build (fixed seed). **Non-cryptographic**: not
 DoS-resistant, not a stable on-disk/wire format, not for security. Cryptographic hashes are in
 std.crypto.
+
+### core.test
+
+A private top-level test declaration consists of the contextual word `test`, one ordinary string
+token, and a block. Only item-position `test` followed by a string commits to this declaration;
+`test {}` and `pub test {}` remain keyword-less type declarations, while `pub test "..." {}`
+rejects visibility on a test. A test creates no callable name or public interface entry. The decoded name is
+nonempty, at most 256 UTF-8 bytes, contains no C0/C1 control (U+0000..U+001F or
+U+007F..U+009F), and is unique within its module.
+The canonical test id is the canonical module path, `::`, and that name. An entry source uses its
+declared module path, or `main` only when it omits a module declaration. If such an entry imports a
+source that explicitly declares `module main`, loading rejects before catalog construction with
+`default entry module 'main' conflicts with imported module 'main'; declare the entry module
+explicitly`; an explicitly declared entry path uses the ordinary duplicate-module rule. Only tests
+in the explicit entry/import closure exist for a command.
+
+The body is checked as a compiler-private zero-parameter function returning
+`Result<(), core.Error>`. Completing its written Unit block supplies one documented `Ok(())` tail;
+ordinary `?` and explicit Err returns use the existing error model. Normal completion and Err run
+ordinary cleanup, while the existing hard-error, abort, and successful-exec behavior is unchanged.
+Tests are Impure and are not callable or exported.
+
+Semantic formation closes and freezes the complete ordinary-source program before checking test
+bodies. Test roots and every helper, monomorph, nominal or interned type, static descriptor, and
+native capability generated only by tests append to a separate test overlay. Production consumers
+validate the complete checked result but can select only the frozen prefix; test consumers select
+the validated prefix-plus-overlay closure. A test-only edit cannot reorder or mutate production
+identities or artifacts. Database Query/command constructors remain restricted to ordinary named
+top-level descriptor functions, so they are always prefix-owned; a test can use one but cannot form
+an overlay database descriptor. `alignc test` consumes the same prepared metadata offline.
+
+Before cache lookup, native-capability collection, object generation, or harness allocation,
+`alignc test` walks the validated catalog-root call graph in catalog order, then dependency-edge and
+structural HIR order. Direct/imported calls, function-value targets, lifted callbacks/destructors,
+and concrete generic monomorphs are all reachability edges. A reachable
+`process.command` constructor rejects with
+`process.command is not available from test code; run the external process in an owner test`; a
+shared site is diagnosed once at its first root. An unreachable production helper containing that
+constructor remains valid, stays in the frozen prefix, and may retain ordinary runtime selection
+in inert object code, but has no executable edge from the harness or a catalog root. The first
+capability provides no dynamic command supervisor or containment channel.
+Other settled process operations retain their row process-group behavior.
+
+`import core.test` admits exactly the qualified standalone assertion statements
+`test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
+ordinary nested blocks, excluding lambdas. The first requires exact bool. The second reuses the
+ordinary `==` admission/type rule, additionally requires that comparison to return exact bool, and
+evaluates left then right once. Vector/mask equality returns a mask and is therefore rejected rather
+than implicitly reduced. The ordinary parser may represent a final assertion before `}` as a block
+tail; test-context checking consumes it as the final statement only at root completion or when the
+enclosing block/control expression is itself a statement. Every value edge rejects, even when its
+consumer expects Unit. A false assertion identifies the canonical test id and one-based call
+location, then follows the test's Err cleanup edge with
+`Error.Invalid`; operand values and source text are not formatted or reflected.
+
+`alignc test <entry.align>` checks the explicit module closure, links one private test executable,
+and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
+group per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
+written only after a normal selected-test return prevents exit, exec, abort, or a crash from
+impersonating success. Each catalog row has a default 60-second deadline from pre-spawn through
+launch, execution, group signalling, capture drain, and direct-child reap (configurable through
+bounded `--timeout-ns`) and an independent bounded stdout/stderr capture (default 1 MiB each,
+configurable through bounded `--max-output-bytes`). Harness timeout/output before its fixed
+acknowledgement is infrastructure failure. The parent control endpoint is nonblocking before spawn,
+and both capture read endpoints are nonblocking too, so every control/stdout/stderr drain returns to
+deadline processing when its queue is empty. Immediately after CLI validation and before source or
+artifact work, the driver snapshots one native suite working directory; failure is
+`alignc: test runner working directory failed (os error <signed-i32>)`. Every child uses that same
+snapshot. Its spawn actions install the cwd, replace fd 0 with `/dev/null`, fd 1/2 with capture, and
+fd 3 with control, then close every fd numbered 4 or above; no ambient parent descriptor survives.
+Every verified
+terminal path signals the pinned child process group and then its still-unreaped direct PID before
+reaping; SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded graceful cleanup. One lock-free
+`Idle/Writing/Selected/WritingPending` state gives each raw report write an exclusive permit; a
+signal during one permitted syscall selects after its complete/partial prefix and prevents every
+later syscall. Each installed handler preserves the interrupted thread's exact `errno` across every
+arbitration and self-pipe path. The runner retains its signal controller while writing the final
+summary, then
+blocks and rechecks those signals and invokes raw `_exit(128 + signal)`. The resulting statuses are
+129/130/131/143 and are observed as `WIFEXITED`, never as re-raised `WIFSIGNALED`; restored prior
+handlers cannot change terminal output. Passing output is suppressed; a failure replays only that test's
+bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
+A zero-test command reports `alignc: no tests found` and builds no artifact. The generated harness
+alone owns literal `main`; every permitted source-main ABI uses the existing encoded internal
+identity and no ordinary main wrapper is emitted. Four exact compiler-private runtime functions own
+launch receive, fd close-on-exec, acknowledgement, and completion encoding/send. Test target,
+profile, and runtime-LTO options reach both unit and harness objects; jobs/cache statistics and
+timeout/output and suite cwd terminate at scheduling/diagnostics and runner state. After link and
+before signal-controller acquisition, every whole/per-unit/harness build-stage owner completes
+ordinary cleanup; only the final executable stage enters the runner. The exact grammar, bounds,
+record bytes, validation order, ownership, cache identity,
+reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
+
+Production commands parse and type-check test declarations, validate the prefix/overlay partition,
+and consume only the frozen production prefix for MIR, link capabilities, interfaces, and
+executables. This excludes the complete test-generated closure from `explain-opt` located
+MIR/remarks. All source-formable database descriptors are ordinary production declarations, so
+`db prepare` needs no test option and prepares the same metadata that tests consume offline. The
+prefix-only selector applies to one-shot/watch, whole/per-unit, ThinLTO, and PGO production routes.
+A test-only edit may miss the source-keyed frontend cache but leaves the production
+span-erased semantic HIR projection, semantic descriptor projection, MIR codegen graph, object key,
+link inputs, and executable bytes unchanged. Current HIR/descriptor spans and located metadata may
+shift after an earlier test edit and do not enter production codegen identity. The semantic
+projection records each expression's ownership fact in structural order and every non-location
+descriptor field, so omitting spans cannot create an ownership-sensitive memo collision. Test
+compilation uses a separate versioned cache domain.
+
+`align-repl` parses the same contextual top-level declaration but rejects an entire submitted entry
+containing any formed test before replacement resolution, session mutation, compilation, or
+execution. Its exact diagnostic is
+`error: test declarations are not available in align-repl; use 'alignc test <entry.align>'`;
+existing entries, the next ordinal, retained checked state, and the output snapshot remain
+unchanged.
 
 ---
 
@@ -3163,7 +3277,7 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 ```
 
 The asymmetric signature extension adds six algorithm-and-class-specific Move key types and the
-following exact surface. It is designed; implementation is pending.
+following exact surface. It shipped on 2026-08-30.
 
 ```text
 crypto.rs256_private_key_from_pem(pem: str) -> Result<rs256_private_key, Error>

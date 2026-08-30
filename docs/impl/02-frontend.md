@@ -140,7 +140,7 @@ import_decl = "import" path END
 path        = ident ("." ident)*
 END         = newline-inserted ";" | explicit ";"   // lexer-generated (operators & symbols §)
 
-item        = vis? ( fn_decl | type_decl | resource_decl | const_decl )
+item        = test_decl | vis? ( fn_decl | type_decl | resource_decl | const_decl )
 vis         = "pub"
 ```
 
@@ -211,6 +211,70 @@ as one mode, not as a mutable local declaration. The checking and return-provena
 `03-types.md` and `17-library-boundary-prerequisites.md` §2. Call checking compares recursive
 provenance for every argument mode, including distinct Copy/Move aggregate holders, so a
 `BorrowMut` operand cannot invalidate a peer argument delivered to the same call.
+
+### Test declarations (designed 2026-08-30; implementation pending)
+
+```ebnf
+test_decl = "test" string block
+```
+
+`test` remains an identifier token. At item position, only the two-token lookahead `test` followed
+by a string token commits to `test_decl`; after that commitment a missing block and every
+function-like near-shape receive test-specific recovery before the next top-level item. A `pub`
+followed by that same `test` + string lookahead commits to the explicitly rejected visible-test
+form so its diagnostic is stable. Bare `test {}` and `pub test {}` remain valid keyword-less type
+declarations, while `test` followed by any other non-string token follows the ordinary item/type
+grammar rather than test recovery. The AST gains `Item::Test(TestDecl { name, body, span })`; it
+does not reuse `FnDecl`, because it has no source name, visibility, parameters, generics, return
+annotation, or expression body.
+
+The decoded name is 1..=256 UTF-8 bytes and rejects exactly U+0000..U+001F and
+U+007F..U+009F before canonical-id construction. The sema catalog owner pins both boundary
+neighbors and the complete 1,024-byte id limit. Canonical identity retains the source's declared
+module path; only an entry source without a module declaration defaults to `main`. That default
+rejects before catalog construction if an imported source explicitly declares `module main`, using
+the exact diagnostic recorded in `core-design/test.md`; explicit entry paths retain ordinary
+duplicate-module validation.
+
+Depth capping visits the test block exactly as a function block. The formatter preserves the
+ordinary string token and formats the block with the same block rules; the contextual word is
+always spelled `test`. Sema supplies the compiler-private `Result<Unit, Error>` function shape and
+the documented implicit Ok tail. With `import core.test`, qualified `test.expect` and
+`test.expect_eq` remain ordinary call-shaped AST expressions; semantic context restricts them to
+standalone statements in the lexical test body and ordinary nested blocks, never a lambda. The
+equality form must produce exact `bool`; an ordinary vector/mask equality result is rejected rather
+than reduced. Because ordinary parsing stores the final expression before `}` in `Block::tail`,
+test-context sema normalizes an exact assertion there into the final statement only at root
+completion or structural statement placement. Every Value edge rejects, including expected Unit.
+Checked HIR therefore retains only `Stmt::Expr(TestAssert)` without changing ordinary block
+parsing.
+
+Normal commands parse and check tests after closing and freezing the complete ordinary-source HIR
+prefix. Test roots and every artifact generated only while checking them append to a checked-HIR
+overlay. Production lowering validates the partition but consumes only the prefix; `explain-opt`
+therefore forms no overlay MIR/remark. A database Query/command constructor remains an ordinary
+named top-level descriptor function formed in the prefix; test context cannot construct one, and a
+malformed database-consumer overlay descriptor rejects. `db prepare` needs no test mode and tests
+consume the same checked metadata offline. Catalog records retain canonical module/name identity and
+source ordinal independently from overlay function symbols. Test artifact formation reserves literal
+`main` for the harness, maps source `main` to the existing encoded identity, and maps catalog index
+`n` to hidden `align_test$<n-as-eight-lowercase-hex>`. Production cache/codegen identity uses the complete
+span-erased semantic prefix, but encodes the exact expression-ownership fact stream and semantic
+static-descriptor fields rather than dropping span-keyed side-table meaning. The checked prefix still
+retains current spans for diagnostics and located output. The exact grammar, name/catalog bounds,
+mode split, cache identity, and closure
+matrix are `core-design/test.md`; that document, not this representation summary, owns the public
+contract.
+
+Before test cache lookup, native-capability collection, or artifact allocation, the combined-view
+validator walks every function reachable from catalog roots through direct/imported calls,
+function-value targets, lifted callbacks/destructors, and concrete monomorphs. Reachable
+`ExprKind::ProcessCommand` rejects deterministically; unreachable production use remains valid and
+may remain inert in frozen-prefix test objects but has no path from a catalog root. `align-repl`
+closes its separate item match by rejecting a complete
+submitted entry containing any formed `Item::Test` before replacement resolution or session
+mutation. The exact diagnostics, traversal order, malformed-HIR rule, and owner matrices remain in
+`core-design/test.md` and `22-repl-plan.md`.
 
 ### Type declarations (keyword-less)
 
@@ -597,6 +661,7 @@ struct File { module: Option<Path>, imports: Vec<Path>, items: Vec<Item> }
 
 enum Item {
     Fn(FnDecl),
+    Test(TestDecl),
     Type(TypeDecl),
     Resource(ResourceDecl),
     Const(ConstDecl),
@@ -611,6 +676,7 @@ struct FnDecl {
     body: FnBody,            // Block | ExprEq
     span: Span,
 }
+struct TestDecl { name: String, body: Block, span: Span }
 enum ParamMode { ByValue, Out, Borrow, BorrowMut }
 struct Param { mode: ParamMode, name: Ident, ty: Type }
 struct FnTypeParam { mode: ParamMode, ty: Type }

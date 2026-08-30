@@ -1229,6 +1229,15 @@ catalogをtool action内で列挙する。`--query` は対象をさらに絞る�
 modeだけがmissing/stale artifactを許し、`--check` は何も書かない。normal buildは
 environmentを読まずDBへ接続しない。mutableなSQLite DB fileとPostgreSQL targetは
 non-empty/non-secret UTF-8かつU+0000なしの `--schema-id` を必須にする。
+
+planned `core.test` は `--tests` / `--include-tests` preparation modeを追加しない。static
+Query/command constructorはordinary named top-level descriptor functionのcomplete bodyだけで
+legalなので、sourceから作れるDB descriptorはtest body checking前に全てfrozen production
+prefixへ入る。testはそのdescriptorをcallできるがoverlay DB descriptorは作れず、malformed
+checked HIRが注入してもrejectする。したがって通常の`db prepare`がtestからconsume可能な
+metadataを全てprepareする。`alignc test`はofflineのまま、artifact作成前にpermitted driver
+ごとの同じ`DeclaredOnly` / `CheckedOptional` / `CheckedRequired` policyを適用する。
+
 PostgreSQL URLはnon-empty user/password、exactly one host、nonzero port、exactly one
 databaseを明示する。target override、service expansion、`client_encoding`、startup
 `options`を拒否し、toolが`PQconnectdbParams`でpackage-owned UTF-8とempty startup-option

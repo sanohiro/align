@@ -3,8 +3,10 @@
 `align-repl` is an AOT REPL for Align: an editor for one growing Align program,
 where every entry recompiles the whole session with the real compiler and runs
 the real binary. This document is the plan of record and the public-contract
-ledger for it. It adds no language surface, so `draft.md`,
-`docs/language-spec.md`, and `docs/open-questions.md` are unaffected.
+ledger for it. It owns no language surface. When the language adds a contextual
+top-level declaration, this ledger must nevertheless state whether a submitted
+entry accepts it; the planned `core.test` boundary below is synchronized with
+`draft.md`, `docs/language-spec.md`, and `docs/impl/core-design/test.md`.
 
 ## Settled direction
 
@@ -16,6 +18,7 @@ ledger for it. It adds no language surface, so `draft.md`,
 | S4 | A learning tool, but behavior byte-identical to a production compile. | §4.1, §7 |
 | S5 | Benchmarking (`:time`) is a wanted use. | §8 |
 | S6 | Not inside `alignc`. New crate `crates/align_repl`, binary `align-repl`. | §9, §10 |
+| S7 | A submitted entry containing a `test` declaration rejects transactionally; tests run only through `alignc test`. | §3.0, §3.3, §11 |
 
 ## 1. Model
 
@@ -78,16 +81,17 @@ twice and no later stage feeds back into an earlier one.
 
 ```text
 0  lex-only triage      no significant tokens            -> NO-OP, prompt again
-1  classify             §3.3  -> region + entry kind
-2  region-conflict check §3.5 -> reject before any compilation
-3  replacement resolve  §3.5  -> which existing ordinals this entry displaces
-4  echo form            §3.4  -> the exact text spliced into the program
-5  build                §4.1  -> the alignc build path
-6  run                  §4.2 / §6
+1  contextual-item gate reject any parsed Item::Test, transactionally
+2  classify             §3.3  -> region + entry kind
+3  region-conflict check §3.5 -> reject before any compilation
+4  replacement resolve  §3.5  -> which existing ordinals this entry displaces
+5  echo form            §3.4  -> the exact text spliced into the program
+6  build                §4.1  -> the alignc build path
+7  run                  §4.2 / §6
 ```
 
-Stages 3 and 4 both need a checked candidate and use **the same one**: stage 4's
-accepted candidate *is* the program stage 3 resolved. Concretely, stages 3–4 are
+Stages 4 and 5 both need a checked candidate and use **the same one**: stage 5's
+accepted candidate *is* the program stage 4 resolved. Concretely, stages 4–5 are
 one loop of at most three candidate checks (§3.4), and the replacement decision
 (§3.5.1) is taken from the first candidate whose failure is duplicate-only. Any
 failure at any stage rolls the session back completely (§3.7.2); nothing is
@@ -141,6 +145,19 @@ later without rewriting `main`. Exit codes are N8. The signature is visible in
 `:list` and `:save`.
 
 ### 3.3 Classification
+
+The contextual-item gate parses the complete submitted entry with the ordinary
+item grammar before any route below mutates state. If the parsed item list
+contains one or more `Item::Test`, the entire entry returns
+`Outcome::CompileFailed` with exactly
+`error: test declarations are not available in align-repl; use 'alignc test <entry.align>'`.
+It creates no entry, consumes no ordinal or paste-group id, changes no retained
+checked program or output snapshot, and executes nothing. This applies equally
+to a lone test and to a mixed paste containing imports or ordinary declarations;
+the first test does not permit a partial prefix commit. A malformed contextual
+test that does not produce `Item::Test` retains the parser's ordinary diagnostic.
+After this gate, the existing classification is exhaustive over the remaining
+item variants:
 
 ```text
 0. The entry has no significant token (blank, or comments only)
@@ -725,8 +742,8 @@ abandon.
 | R1 | `Session::new` | `fn new(cfg: Config) -> Result<Session, StartupError>` | `Config { profile: Profile::Release, rt_lto: true, target: BuildTarget::Baseline, jobs: 1 on aarch64 and available_parallelism() otherwise (a positive ALIGNC_JOBS overrides either), memo_budget_bytes: 256<<20, time_default_n: 10, output_cap_bytes: 8<<20 }` | Owns the `ArtifactStage`, the entry `Vec`, and the retained HIR. | `StartupError::{BackendUnavailable, InvalidJobs(String), RuntimeArchiveStale(String), Stage(io::Error), FloorBuild(String)}` — `RuntimeArchiveStale` is a real failure (`libalign_runtime.a is stale: … run cargo build`) a library consumer hits exactly as `alignc` does; reported once at startup with the driver's own message. | `session.rs::startup_creates_and_removes_stage` |
 | R2 | `Session::feed` | `fn feed(&mut self, line: &str) -> Feed` | one raw input line | borrows | — | `session.rs::continuation_*` |
 | R3 | `Feed` | `enum Feed { NeedMore, Ready(Outcome) }` | — | owned | — | — |
-| R4 | `Session::submit` | `fn submit(&mut self, entry: &str) -> Outcome` | a complete entry | transactional (§3.7.2) | see `Outcome` | the whole `session.rs` matrix |
-| R5 | `Outcome` | `enum Outcome { NoOp, Applied { ordinals: Vec<u32>, replaced: Vec<u32>, echo: Echo, out: RunOutput }, CompileFailed { rendered: String, replacing: Vec<u32> }, RegionConflict { name: String, ordinal: u32 }, RanAndFailed { status: ExitStatus, out: RunOutput }, Command(CmdResult) }` | — | owned | — | — |
+| R4 | `Session::submit` | `fn submit(&mut self, entry: &str) -> Outcome` | a complete entry; any parsed `Item::Test` rejects before replacement resolution | transactional (§3.7.2) | exact test diagnostic in §3.3 through `Outcome::CompileFailed` | the whole `session.rs` matrix plus lone/mixed-test rollback and next-ordinal twins |
+| R5 | `Outcome` | `enum Outcome { NoOp, Applied { ordinals: Vec<u32>, replaced: Vec<u32>, echo: Echo, out: RunOutput }, CompileFailed { rendered: String, replacing: Vec<u32> }, RegionConflict { name: String, ordinal: u32 }, RanAndFailed { status: ExitStatus, out: RunOutput }, Command(CmdResult) }` | — | owned | test declarations use existing `CompileFailed` with `replacing: []`; no new variant | test-item gate owner |
 | R6 | `Echo` | `enum Echo { None, Printed, TypeOnly { rendered: String }, ResultBound { rendered: String } }`; `fn render(&self) -> Option<String>` | `ResultBound` is §3.4 case 3 and drives the `note:` line | owned | — | `session.rs::echo_matrix` |
 | R7 | `RunOutput` | `struct RunOutput { stdout_shown: Vec<u8>, stderr_shown: Vec<u8>, diverged: bool, truncated: bool }` | `*_shown` is the suffix or the full raw bytes per §6; no UTF-8 conversion | owned | — | `build.rs::output_matrix` plus `session.rs::child_output_remains_byte_exact_for_invalid_utf8` and replacement/removal owners |
 | R8 | `Session::render` | `fn render(&self) -> String` | — | owned; the exact bytes compiled and `:save`d | — | `session.rs::render_is_what_alignc_builds` |
@@ -778,7 +795,7 @@ semantics. `docs/guide/` gains a REPL page in v2 with its `ja/` mirror.
 | Axis | Cells | Closed by |
 |---|---|---|
 | **Synthetic-code consumption** — every path on which the REPL emits text the user did not type | `print(E)` where E is: a Copy local; a **Move local** (owned `string`) — next entry must still use it; a `.field` of a Move struct; a call returning a temporary. (`box` cannot be a cross-entry local because N11's arena scope cannot span entries.) `_ := (E)` where E is: a fallible **call** (nothing named, no consumption); a **Result-typed place expression** — next entry naming it **must** fail with `use of moved value`, and the echo **must** have printed the `note:` line. Verbatim `E` where E is: a bare Move aggregate — next entry must still use it; a nested-scope binding. Plus the negative: **no other emission path exists** — asserted structurally by a test that walks every `Entry.emitted` in a scripted session and requires it to equal `text`, `print({text})`, or `_ := ({text})`. | `session.rs::synthetic_consumption_matrix`, `::emitted_forms_are_exhaustive` |
-| Classification (§3.3) | **step 0:** blank line, whitespace-only, comment-only, comment-then-blank — each a NO-OP that does **not** rebuild or re-run. keyword-first: `import` / `fn` / `extern` / `resource`. step 2 statement-only: `print(1)`, `x := 1`, `mut x := 1`, `x = 2`, `xs[0] = 1`, `p.f = 1`, `return`, `break`, `if`/`match`/`loop`/`arena`. step 3 decl-only: `P { a: slice<u8> }`, `P { a: array<i64>[3] }`. step 4 routing: `P { a: i64 }` with `P` undeclared -> DECL; `P { a: x }` with `x` a live local -> MAIN; both-non-dup-error -> MAIN + MAIN's diagnostics. **step 4 duplicate-tolerance — the traced cells:** (a) `x := 2` rebinding an existing local -> **MAIN**, then §3.5.1 replaces in place and the value changes on re-run; (b) `T { a: i64 }` redeclaring an existing struct -> **DECL**, then §3.5.1 replaces the type in place; (b′) the same with a sum, `S { A, B }`; (c) `Point{x: a, y: b}` with `Point` declared and `a`/`b` undefined -> **DECL**, §3.5.1 attempt 2 fails with `unknown type: 'a'` and the entry **rolls back with the replaced-ordinal note**; (c′) the same text after `a` and `b` exist as locals -> **MAIN, clean**. **overlap determinism:** MAIN-clean ∧ DECL-dup-only (`P { a: x }` with `x` both a type and a local) -> MAIN by first-wins; MAIN-dup-only ∧ DECL-clean asserted **unreachable**; both-clean asserted **impossible**. **threshold pinning:** step 4 rejects on one non-dup error while §3.5.1 attempt 1 accepts on one dup error — both thresholds asserted so collapsing them to one predicate fails. unparseable text. | `entry.rs` parameterized table, `session.rs::step4_duplicate_routing`, `::step4_overlap_determinism`, `::duplicate_thresholds_differ` |
+| Classification (§3.3) | **contextual-item gate:** lone test, test after import, test before/after ordinary declarations, multiple tests, and malformed test; every formed `Item::Test` rejects the whole paste with exact bytes, no replacement set, no ordinal/paste-group consumption, no state/output mutation, and no execution. **step 0:** blank line, whitespace-only, comment-only, comment-then-blank — each a NO-OP that does **not** rebuild or re-run. keyword-first: `import` / `fn` / `extern` / `resource`. step 2 statement-only: `print(1)`, `x := 1`, `mut x := 1`, `x = 2`, `xs[0] = 1`, `p.f = 1`, `return`, `break`, `if`/`match`/`loop`/`arena`. step 3 decl-only: `P { a: slice<u8> }`, `P { a: array<i64>[3] }`. step 4 routing: `P { a: i64 }` with `P` undeclared -> DECL; `P { a: x }` with `x` a live local -> MAIN; both-non-dup-error -> MAIN + MAIN's diagnostics. **step 4 duplicate-tolerance — the traced cells:** (a) `x := 2` rebinding an existing local -> **MAIN**, then §3.5.1 replaces in place and the value changes on re-run; (b) `T { a: i64 }` redeclaring an existing struct -> **DECL**, then §3.5.1 replaces the type in place; (b′) the same with a sum, `S { A, B }`; (c) `Point{x: a, y: b}` with `Point` declared and `a`/`b` undefined -> **DECL**, §3.5.1 attempt 2 fails with `unknown type: 'a'` and the entry **rolls back with the replaced-ordinal note**; (c′) the same text after `a` and `b` exist as locals -> **MAIN, clean**. **overlap determinism:** MAIN-clean ∧ DECL-dup-only (`P { a: x }` with `x` both a type and a local) -> MAIN by first-wins; MAIN-dup-only ∧ DECL-clean asserted **unreachable**; both-clean asserted **impossible**. **threshold pinning:** step 4 rejects on one non-dup error while §3.5.1 attempt 1 accepts on one dup error — both thresholds asserted so collapsing them to one predicate fails. unparseable text. | `entry.rs` parameterized table, `session.rs::test_items_reject_transactionally`, `session.rs::step4_duplicate_routing`, `::step4_overlap_determinism`, `::duplicate_thresholds_differ` |
 | Echo (§3.4) | P-clean printable (int, float, bool, char, `str`, owned `string`); P-fails/S-clean aggregate (struct, sum, tuple, array, slice, `Option`, `box`); S-clean statement-position non-expression (no echo); S-fails-with-`unhandled Result` -> D accepted, with the `note:` line; S-fails otherwise -> S's diagnostics, rollback; `Ty::Error` after a failed check | `session.rs::echo_matrix` |
 | Mixed paste (§3.7.1) | import + fn; two fns; import already present (dedup, ordinal preserved); second item fails (whole paste rolls back); `:undo` after a paste | `session.rs::paste_matrix` |
 | Name delta (§3.6) | `x := 1`; `mut x := 1`; `(a, b) := t`; `(a, _) := t` contributes exactly `a` (the `_` element is `None` in `LetTuple::locals` and creates no `Local`); two `_ := (…)` entries in one session coexist and contribute no names; `fn f`; struct; sum; resource; extern symbol; `:const`; multi-item paste; `$lambda` lifted fn excluded; `arena { p := … }` entry's `p` excluded by the entry-top-level filter, and a later `p := 9` must NOT displace it; `link_libs` never treated as a namespace | `session.rs::name_delta_matrix`, asserting the delta directly |

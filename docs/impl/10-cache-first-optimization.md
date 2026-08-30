@@ -450,10 +450,51 @@ program   whole-program sema (`check`)              ordered (unit path, is_entry
 unit      one per-unit frontend result              own path/entry/source + each interface-only
                                                     dependency's RENDERED source + the four
                                                     external fact maps
-lowering  HIR -> MIR (`lower_to_mir`, per-unit)     total `Debug` of the HIR + visibility variant
+lowering  HIR -> MIR (`lower_to_mir`, per-unit)     current: total `Debug` of the HIR + visibility
+                                                    variant; at `core.test` activation: the
+                                                    `align-production-codegen-v1` semantic HIR
+                                                    projection + visibility variant
 object    MIR -> object bytes                       `codegen_impl_hash` + target + profile +
                                                     exports + rt_lto
 ```
+
+The `core.test` design changes that lowering row atomically with the test overlay; until that
+implementation lands, the shipped total-`Debug` key remains active. The replacement is not filtered
+rendered text. It is the exhaustive stored-order HIR encoder in
+`core-design/test.md`: every non-`Span` field is encoded, and immediately after each expression the
+encoder emits the exact `absent | arena | individual` fact MIR obtains from that function's
+span-keyed `drop_individual_exprs` as u8 `00`, `01`, or `02` respectively. An orphan side-table key
+rejects before lookup or publication; raw map iteration and span bytes never enter the key. Thus a
+span-only shift can hit, while a changed
+cleanup fact must miss. Every HIR field, variant, or semantic side table is a compile-time projection
+update.
+
+The same activation adds the ordered semantic static-descriptor projection to production
+codegen/artifact identity: unit, item, descriptor id, visibility, consumer, driver, source tag plus
+the semantic file-path literal or decoded inline SQL, params/row types, complete reachable contracts,
+and static options. Constructor/options/source diagnostic spans are omitted. Source tags are u8 `00`
+File and `01` Inline before their existing canonical payload encodings. Descriptor-owning units
+retain the M13 no-memo rule for the lowering step, but descriptor semantics still enter the later
+production artifact identity; a descriptor's diagnostic-location-only shift cannot change object
+bytes. Program/unit frontend keys stay source-based and may miss after a test edit. No partial state
+uses a span-free HIR key with raw span-bearing semantic side tables or descriptors.
+Public interface identity keeps its existing public-surface encoder over the production prefix; it
+excludes the overlay but does not acquire private-body or descriptor inputs from these projections.
+
+Test-mode unit/object keys additionally include every local overlay suffix plus target, profile,
+resolved runtime-LTO state, imported interfaces, and the runtime ABI fingerprint. The separate
+harness key includes the ordered canonical-id-to-`align_test$<8hex>` map, the sole literal `main` and
+encoded source-main policy, all four child-control runtime ABI rows, and launch/ack/completion/final-
+commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
+artifact identity because they terminate at build scheduling, diagnostics, and runner state. A
+database descriptor never enters the overlay; tests consume its production descriptor identity and
+ordinary offline metadata.
+
+The combined-view validator rejects a catalog-reachable `ProcessCommand` before either unit or
+harness key lookup, so the first capability has no command-supervisor, containment-witness, or
+status-codec cache input. The existing test-mode version covers the static reachability policy;
+unreachable production command code retains its ordinary production identity and may retain its
+ordinary runtime selection in a frozen-prefix test object, but has no executable catalog-root edge.
 
 The program key's "seeded diagnostic sink" component is not defensive padding. `align_sema` READS
 the sink it is handed: `declaration_has_prior_error` suppresses static-descriptor discovery for a
@@ -498,8 +539,11 @@ across thousands of compilations, so the bound has to be denominated in memory. 
 their exact length; the three frontend maps are charged the length of a rendering the store site
 already holds — the HIR's own `Debug` for `program`, the HIR rendering the key already built for
 `lowering`, and the unit's key material (its full source plus every dependency interface) for
-`unit`. That is an estimate within a constant factor, not a measurement, and deliberately so: what
-must hold is that retention is bounded and stops at the bound. Insertion simply stops there — there
+`unit`. At `core.test` activation, the lowering charge becomes the exact byte length of the canonical
+semantic HIR key material the lookup already built; the program charge remains its retained HIR
+`Debug` estimate because that source-keyed memo is unchanged. These are estimates within a constant
+factor, not measurements, and deliberately so: what must hold is that retention is bounded and stops
+at the bound. Insertion simply stops there — there
 is no eviction, so a hit stays deterministic for the process's life and a refusal changes nothing
 but the counters. The default is 768 MiB of charge; measured scale is one whole-program `pkg.db` HIR
 rendering to 1.8 MB and one per-unit object set under a megabyte, so roughly two hundred distinct
@@ -561,6 +605,9 @@ Owners are in `crates/align_driver/tests/inprocess_memo.rs` unless stated otherw
 | M17 | retention and memory | retention is charged in bytes, the bound is reachable, and reaching it refuses further retention without changing any output | `a_spent_budget_refuses_retention_without_changing_output` |
 | M18 | sema's diagnostic sink | sema reads the sink it is handed, so the memoized step seeds it with the loader's diagnostics and folds them into the key; a parse error inside a descriptor-owning function suppresses discovery identically with the memo on and off | `parse_error_inside_a_descriptor_function_suppresses_discovery_on_both_paths` |
 | M19 | object read-back | retention reads back the file codegen wrote, so an overlapping emission to the same path makes BOTH emissions skip retention | `EmitGuard`; `cache_parallel.rs` (distinct per-unit paths) |
+| M20 | `core.test` span-free lowering identity (DESIGNED) | an earlier variable-width test edit may shift production spans yet hits the same production lowering/object identity; independently changing any `absent | arena | individual` expression fact misses, and an orphan ownership key rejects before lookup/publication | `test_only_width_shift_preserves_production_identity`, `ownership_fact_changes_lowering_key`, `orphan_ownership_fact_rejects` (land atomically with `core.test`) |
+| M21 | `core.test` semantic descriptor identity (DESIGNED) | every semantic descriptor-field mutation misses; changing only constructor/options/source diagnostic spans preserves the descriptor projection and production artifact identity | `descriptor_semantics_change_identity`, `descriptor_spans_do_not_change_identity` (land atomically with `core.test`) |
+| M22 | `core.test` artifact-mode identity (DESIGNED) | target/profile/resolved runtime LTO and every entry/root/runtime/protocol field miss the proper unit or harness key; jobs/cache-stats/timeout/output/suite-cwd twins preserve artifact keys and bytes; database consumers reject from the overlay | `test_artifact_option_consumer_matrix`, `test_harness_symbol_and_runtime_abi_key`, `test_overlay_rejects_database_descriptor` (land atomically with `core.test`) |
 
 Measured effect on the `pkg.db` owner suites (this machine, 4 test threads, debug compiler;
 wall / CPU seconds, before → after):
@@ -646,9 +693,11 @@ self-containment invariant a `pub` item may not name a non-`pub` type, so every 
 an interface is carried with its full definition. Deliberately excluded: the cwd, the project root,
 every absolute path, file mtimes, and the cache root itself.
 
-**No `Debug` rendering appears in any key or any stored byte.** The memo can key on a total `Debug`
-because the rendering is a constant of the process image; on disk it is not a stable format. Every
-component here is a scalar, a UTF-8 string, or a digest over an existing versioned canonical codec.
+**No `Debug` rendering appears in any key or any stored byte.** Before `core.test`, the in-process
+memo can key on total `Debug` because the rendering is a constant of the process image; its planned
+activation switches that memo to the versioned semantic projection in §6.6. On disk, `Debug` is not
+a stable format. Every component here is a scalar, a UTF-8 string, or a digest over an existing
+versioned canonical codec.
 
 #### Format
 

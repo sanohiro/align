@@ -2133,6 +2133,15 @@ SQLite `--migrations <dir>` catalog is a separate tool input governed by §16.6.
 project root plus `.align-db/`. A later tool-only config file may shorten these flags, but it is not
 a compiler manifest and is not required by the first implementation.
 
+The planned `core.test` capability adds no `--tests`/`--include-tests` preparation mode. A static
+Query or command constructor remains legal only as the complete body of an ordinary named
+top-level descriptor function, so every source-formable database descriptor belongs to the frozen
+production prefix before a test body is checked. A test may call that descriptor but cannot form an
+overlay database descriptor; malformed checked HIR that injects one rejects. Consequently the
+ordinary command above prepares all database metadata a test can consume. `alignc test` remains
+offline and applies the same `DeclaredOnly`/`CheckedOptional`/`CheckedRequired` policy for every
+permitted driver before creating its artifact.
+
 SQLite accepts exactly one schema environment: `--database <path> --schema-id <id>`, or `--memory`
 optionally initialized from the canonical migration sequence in `--migrations <dir>` (§16.6).
 PostgreSQL accepts `--url-env <name> --schema-id <id>`; the environment variable's value is read only
