@@ -109,8 +109,8 @@ compiler-provided nominal aliases. Bare type lookup checks the current module fi
 fallback and explicit spellings are exactly `Error` / `core.Error`, `argon2_params` /
 `crypto.argon2_params`; `rs256_private_key`, `rs256_public_key`, `es256_private_key`,
 `es256_public_key`, `ed25519_private_key`, and `ed25519_public_key` / the same names prefixed by
-`crypto.`; and `regex_match` / `regex.regex_match`. The six signature-key pairs are settled and
-activate atomically with their pending implementation. `core.Error` is always-in-scope
+`crypto.`; and `regex_match` / `regex.regex_match`. The six signature-key pairs shipped atomically
+with their implementation. `core.Error` is always-in-scope
 language-syntactic core. Crypto/regex explicit spellings require `import std.crypto` or
 `import std.regex` and count as uses of those imports; every bare fallback needs no import.
 `error(c)` is bound directly to
@@ -119,12 +119,12 @@ module-qualified local type (`pkg.db.Error`). An entry-module declaration whose 
 name collides with a table member remains a compile error. This follows the existing per-module type
 identity instead of adding a `pkg.db` exception or renaming its public structured error sum.
 
-The shipped Q2 owner is parameterized across its original three aliases and crosses same-module bare
+The shipped Q2 owner is parameterized across all nine aliases and crosses same-module bare
 construction/signatures, qualified importer construction and matching, explicit builtin use with
 the exact import rule, unchanged builtin fallback in a module without a local declaration,
 `error(c)` under a local `Error`, whole/per-unit identity, and entry-collision rejection. The
-asymmetric implementation expands that same data-driven owner to all nine aliases rather than
-adding a second resolution rule.
+asymmetric implementation expanded that same data-driven owner rather than adding a second
+resolution rule.
 
 Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/pkg-design/db.md`
@@ -5580,7 +5580,7 @@ optimized artifact. Full shipped-feature record in the roadmap's M11 section. De
 record: blake3, zeroize-on-drop key buffers (P6), nonce-generating seal convenience (P3),
 `OSSL_set_max_threads`, fixed-size `array<u8; N>` returns.
 
-**Status update (2026-08-30, post-pkg.db asymmetric design SETTLED; implementation pending):**
+**Status update (2026-08-30, post-pkg.db asymmetric suite IMPLEMENTED):**
 RS256, ES256, and Ed25519 use six distinct private/public Move key types plus per-algorithm
 construct/sign/verify functions, so algorithm and key-class confusion is closed statically. Private
 keys load only from one bounded canonical unencrypted PKCS#8 v1 `PrivateKeyInfo` version-zero

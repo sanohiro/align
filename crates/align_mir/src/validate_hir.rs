@@ -548,7 +548,7 @@ fn valid_span(span: Span) -> bool {
 }
 
 fn mode_is_valid(
-    _program: &hir::Program,
+    program: &hir::Program,
     mode: align_ast::ParamMode,
     ty: Ty,
     allow_out: bool,
@@ -557,7 +557,16 @@ fn mode_is_valid(
         align_ast::ParamMode::ByValue => true,
         align_ast::ParamMode::Out => allow_out && matches!(ty, Ty::Slice(_)),
         align_ast::ParamMode::Borrow => ty != Ty::ArenaHandle,
-        align_ast::ParamMode::BorrowMut => ty != Ty::ArenaHandle,
+        align_ast::ParamMode::BorrowMut => {
+            ty != Ty::ArenaHandle
+                && !align_sema::ty_contains_signature_key(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                )
+        }
     }
 }
 
@@ -1308,7 +1317,18 @@ impl<'a> PlacementValidator<'a> {
                     && self.program.resources.get(id as usize).is_some()
             }
             Scalar::ResourceRef(id) => self.program.resources.get(id as usize).is_some(),
-            Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
+            Scalar::SignatureKey(_) => !matches!(mode, ScalarPlacement::Collection),
+            Scalar::Enum(id) => {
+                self.program.enums.get(id as usize).is_some()
+                    && (!matches!(mode, ScalarPlacement::Collection)
+                        || !align_sema::ty_contains_signature_key(
+                            Ty::Enum(id),
+                            &self.program.structs,
+                            &self.program.tuples,
+                            &self.program.enums,
+                            &self.program.tagged_types,
+                        ))
+            }
             Scalar::Fn(id) => {
                 matches!(mode, ScalarPlacement::Collection)
                     && self.program.fn_types.get(id as usize).is_some()
@@ -1375,6 +1395,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Resource(id) | Scalar::ResourceRef(id) => {
                 self.program.resources.get(id as usize).is_some()
             }
+            Scalar::SignatureKey(_) => true,
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::ResponseBuilder => true,
@@ -1474,6 +1495,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::Regex
             | Ty::Captures
             | Ty::TcpConn
@@ -1958,6 +1980,7 @@ impl<'a> Validator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::File
             | Ty::Rng
             | Ty::Regex
@@ -2019,6 +2042,7 @@ impl<'a> Validator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Buffer
+            | Scalar::SignatureKey(_)
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -2981,6 +3005,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::File
             | Ty::Rng
             | Ty::Regex
@@ -3290,6 +3315,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Buffer
+            | Scalar::SignatureKey(_)
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::File
@@ -4090,7 +4116,12 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CryptoHmac { .. }
             | hir::ExprKind::CryptoHkdf { .. }
             | hir::ExprKind::CryptoAead { .. }
-            | hir::ExprKind::CryptoArgon2 { .. } => {
+            | hir::ExprKind::CryptoArgon2 { .. }
+            | hir::ExprKind::CryptoPrivateKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromJwk { .. }
+            | hir::ExprKind::CryptoSign { .. }
+            | hir::ExprKind::CryptoVerify { .. } => {
                 self.native_expression_envelope_ok(expression)
             }
             hir::ExprKind::FnValue(name) => valid_declaration_name(name),
@@ -4266,6 +4297,11 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CryptoHash { .. }
             | hir::ExprKind::CryptoAead { .. }
             | hir::ExprKind::CryptoArgon2 { .. }
+            | hir::ExprKind::CryptoPrivateKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromPem { .. }
+            | hir::ExprKind::CryptoPublicKeyFromJwk { .. }
+            | hir::ExprKind::CryptoSign { .. }
+            | hir::ExprKind::CryptoVerify { .. }
             | hir::ExprKind::RegexFind { .. }
             | hir::ExprKind::RegexReplace { .. }
             | hir::ExprKind::HttpServe { .. }
@@ -8557,6 +8593,43 @@ impl<'a> BodyValidator<'a> {
                     && self.argon2_params_ok(params.ty))
                     .then(|| result(Ty::Buffer, &[password, salt, params]))?
             }
+            hir::ExprKind::CryptoPrivateKeyFromPem { algorithm, pem } => {
+                (pem.ty == Ty::Str)
+                    .then(|| result(Ty::SignatureKey(algorithm.private_kind()), &[pem]))?
+            }
+            hir::ExprKind::CryptoPublicKeyFromPem { algorithm, pem } => {
+                (pem.ty == Ty::Str)
+                    .then(|| result(Ty::SignatureKey(algorithm.public_kind()), &[pem]))?
+            }
+            hir::ExprKind::CryptoPublicKeyFromJwk { algorithm, first, second } => {
+                let second_shape_ok = match algorithm {
+                    align_sema::SignatureAlgorithm::Ed25519 => second.is_none(),
+                    align_sema::SignatureAlgorithm::Rs256 | align_sema::SignatureAlgorithm::Es256 => {
+                        second.as_deref().is_some_and(|value| byte_view(value.ty))
+                    }
+                };
+                if !byte_view(first.ty) || !second_shape_ok {
+                    return None;
+                }
+                let mut children = vec![first.as_ref()];
+                if let Some(second) = second { children.push(second.as_ref()); }
+                result(Ty::SignatureKey(algorithm.public_kind()), &children)
+            }
+            hir::ExprKind::CryptoSign { algorithm, key, message } => {
+                let expected = Ty::SignatureKey(algorithm.private_kind());
+                (matches!(key.kind, hir::ExprKind::Local(_) | hir::ExprKind::Field { .. })
+                    && self.body_ty_matches(key.ty, expected)
+                    && byte_view(message.ty))
+                    .then(|| result(Ty::Buffer, &[key, message]))?
+            }
+            hir::ExprKind::CryptoVerify { algorithm, key, message, signature } => {
+                let expected = Ty::SignatureKey(algorithm.public_kind());
+                (matches!(key.kind, hir::ExprKind::Local(_) | hir::ExprKind::Field { .. })
+                    && self.body_ty_matches(key.ty, expected)
+                    && byte_view(message.ty)
+                    && byte_view(signature.ty))
+                    .then(|| result(Ty::Bool, &[key, message, signature]))?
+            }
             _ => None,
         }
     }
@@ -8640,6 +8713,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Buffer
+            | Ty::SignatureKey(_)
             | Ty::File
             | Ty::Rng
             | Ty::Regex

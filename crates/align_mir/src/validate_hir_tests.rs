@@ -5608,6 +5608,53 @@ fn malformed_hir_type_placement_fails_closed() {
         &with_return(Ty::DynArray(Scalar::HttpReadStream)),
     );
 
+    assert_placement_rejected(
+        "signature key collection element",
+        &with_return(Ty::DynArray(Scalar::SignatureKey(
+            align_sema::SignatureKeyKind::Ed25519Private,
+        ))),
+    );
+
+    let mut signature_key_sum_collection = with_return(Ty::DynArray(Scalar::Enum(0)));
+    signature_key_sum_collection.enums[0].variants[1].payload = vec![Scalar::SignatureKey(
+        align_sema::SignatureKeyKind::Ed25519Private,
+    )];
+    assert_placement_rejected(
+        "signature key hidden in a sum collection element",
+        &signature_key_sum_collection,
+    );
+
+    let mut signature_key_mutable_carrier = baseline_program();
+    let tagged_key = signature_key_mutable_carrier.tagged_types.len() as u32;
+    signature_key_mutable_carrier
+        .tagged_types
+        .push(TaggedType::Option(Scalar::SignatureKey(
+            align_sema::SignatureKeyKind::Ed25519Private,
+        )));
+    let mut mutable_carrier = imported_fn(
+        "dep$mutable_key_carrier",
+        vec![Ty::Tagged(tagged_key)],
+        Ty::Unit,
+    );
+    mutable_carrier.param_modes[0] = align_ast::ParamMode::BorrowMut;
+    signature_key_mutable_carrier
+        .imported_fns
+        .push(mutable_carrier);
+    assert_header_rejected(
+        "signature key hidden in a borrow-mut carrier",
+        &signature_key_mutable_carrier,
+    );
+
+    let mut signature_key_function_value = baseline_program();
+    signature_key_function_value.fn_types[0].params = vec![(
+        align_ast::ParamMode::BorrowMut,
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private),
+    )];
+    assert_header_rejected(
+        "signature key in a borrow-mut function-value parameter",
+        &signature_key_function_value,
+    );
+
     let mut stream_out = baseline_program();
     let mut out = imported_fn("dep$stream_out", vec![Ty::HttpReadStream], Ty::Unit);
     out.param_modes[0] = align_ast::ParamMode::Out;
@@ -6272,6 +6319,10 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
             ty: Ty::File,
         },
         FieldDef {
+            name: "signature_key".to_string(),
+            ty: Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private),
+        },
+        FieldDef {
             name: "direct_owned_array".to_string(),
             ty: Ty::DynArray(Scalar::String),
         },
@@ -6280,7 +6331,11 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
             ty: Ty::Option(Scalar::DynArray(PrimScalar::String)),
         },
     ];
-    program.enums[0].variants[1].payload = vec![Scalar::Fn(0), Scalar::ResponseBuilder];
+    program.enums[0].variants[1].payload = vec![
+        Scalar::Fn(0),
+        Scalar::ResponseBuilder,
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private),
+    ];
     program.tagged_types[0] = TaggedType::Result(Scalar::File, Scalar::String);
     program.tuples[0].elems = vec![Scalar::String, Scalar::DynArray(PrimScalar::Str)];
     program.fn_types[0].params = vec![
@@ -10851,7 +10906,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 276,
+        variants, 281,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -14817,6 +14872,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Buffer
+        | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
         | Scalar::CliParsed
@@ -14880,6 +14936,12 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::Reader,
         Scalar::Writer,
         Scalar::Buffer,
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Public),
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Es256Private),
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Es256Public),
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private),
+        Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public),
         Scalar::Regex,
         Scalar::Captures,
         Scalar::CliParsed,

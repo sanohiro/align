@@ -148,6 +148,15 @@ fn crypto_requests_crypto_and_the_compress_libs() {
 }
 
 #[test]
+fn asymmetric_crypto_uses_the_same_capability_link_boundary() {
+    let src = "import std.crypto\nfn main() -> Result<(), Error> {\n  key := crypto.ed25519_public_key_from_jwk(\"01234567890123456789012345678901\")?\n  print(crypto.ed25519_verify(key, \"message\", \"0123456789012345678901234567890123456789012345678901234567890123\")?)\n  return Ok(())\n}\n";
+    assert_eq!(
+        gated_link_libs("cap-crypto-asymmetric", src),
+        vec!["crypto".to_string(), "z".to_string(), "zstd".to_string()],
+    );
+}
+
+#[test]
 fn http_client_requests_the_full_tls_set() {
     // Any HTTP client use may hit the TLS path (the scheme is a runtime decision) → ssl + crypto,
     // transitively the compress libraries.

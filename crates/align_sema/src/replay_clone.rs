@@ -1404,6 +1404,27 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             salt: boxed!(salt),
             params: boxed!(params),
         },
+        ExprKind::CryptoPrivateKeyFromPem { algorithm, pem } =>
+            ExprKind::CryptoPrivateKeyFromPem { algorithm: *algorithm, pem: boxed!(pem) },
+        ExprKind::CryptoPublicKeyFromPem { algorithm, pem } =>
+            ExprKind::CryptoPublicKeyFromPem { algorithm: *algorithm, pem: boxed!(pem) },
+        ExprKind::CryptoPublicKeyFromJwk { algorithm, first, second } =>
+            ExprKind::CryptoPublicKeyFromJwk {
+                algorithm: *algorithm,
+                first: boxed!(first),
+                second: if second.is_some() { Some(take_boxed_expr(clones)?) } else { None },
+            },
+        ExprKind::CryptoSign { algorithm, key, message } => ExprKind::CryptoSign {
+            algorithm: *algorithm,
+            key: boxed!(key),
+            message: boxed!(message),
+        },
+        ExprKind::CryptoVerify { algorithm, key, message, signature } => ExprKind::CryptoVerify {
+            algorithm: *algorithm,
+            key: boxed!(key),
+            message: boxed!(message),
+            signature: boxed!(signature),
+        },
     })
 }
 
@@ -2557,6 +2578,23 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(password);
             one!(salt);
             one!(params);
+        }
+        ExprKind::CryptoPrivateKeyFromPem { pem, .. }
+        | ExprKind::CryptoPublicKeyFromPem { pem, .. } => one!(pem),
+        ExprKind::CryptoPublicKeyFromJwk { first, second, .. } => {
+            one!(first);
+            if let Some(second) = second {
+                one!(second);
+            }
+        }
+        ExprKind::CryptoSign { key, message, .. } => {
+            one!(key);
+            one!(message);
+        }
+        ExprKind::CryptoVerify { key, message, signature, .. } => {
+            one!(key);
+            one!(message);
+            one!(signature);
         }
         ExprKind::ResourceFromRaw { raw, parent, .. } => {
             one!(raw);

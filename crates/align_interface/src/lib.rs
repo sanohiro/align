@@ -1343,6 +1343,18 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("box", 1, BuiltinCapability::Opaque),
     ("array_builder", 1, BuiltinCapability::Opaque),
     ("buffer", 0, BuiltinCapability::Opaque),
+    ("rs256_private_key", 0, BuiltinCapability::Opaque),
+    ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
+    ("rs256_public_key", 0, BuiltinCapability::Opaque),
+    ("crypto.rs256_public_key", 0, BuiltinCapability::Opaque),
+    ("es256_private_key", 0, BuiltinCapability::Opaque),
+    ("crypto.es256_private_key", 0, BuiltinCapability::Opaque),
+    ("es256_public_key", 0, BuiltinCapability::Opaque),
+    ("crypto.es256_public_key", 0, BuiltinCapability::Opaque),
+    ("ed25519_private_key", 0, BuiltinCapability::Opaque),
+    ("crypto.ed25519_private_key", 0, BuiltinCapability::Opaque),
+    ("ed25519_public_key", 0, BuiltinCapability::Opaque),
+    ("crypto.ed25519_public_key", 0, BuiltinCapability::Opaque),
     ("file", 0, BuiltinCapability::Opaque),
     ("rng", 0, BuiltinCapability::Opaque),
     ("regex", 0, BuiltinCapability::Opaque),
@@ -1394,7 +1406,18 @@ fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
 }
 
 fn bare_nominal_alias_prefers_local(path: &str) -> bool {
-    matches!(path, "Error" | "argon2_params" | "regex_match")
+    matches!(
+        path,
+        "Error"
+            | "argon2_params"
+            | "regex_match"
+            | "rs256_private_key"
+            | "rs256_public_key"
+            | "es256_private_key"
+            | "es256_public_key"
+            | "ed25519_private_key"
+            | "ed25519_public_key"
+    )
 }
 
 fn builtin_capability_after_local(
@@ -2591,7 +2614,13 @@ pub fn summary_to_source(
             match ty {
                 IType::Named { path, args } => {
                     match path.as_str() {
-                        "crypto.argon2_params" => {
+                        "crypto.argon2_params"
+                        | "crypto.rs256_private_key"
+                        | "crypto.rs256_public_key"
+                        | "crypto.es256_private_key"
+                        | "crypto.es256_public_key"
+                        | "crypto.ed25519_private_key"
+                        | "crypto.ed25519_public_key" => {
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "regex.regex_match" => {

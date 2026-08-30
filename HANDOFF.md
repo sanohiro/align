@@ -374,7 +374,7 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **Latest convergence capability:** HTTP client streaming receive is implemented against
+- **HTTP streaming:** HTTP client streaming receive is implemented against
   `docs/impl/std-design/http.md`. The dependent `http_read_stream` carrier, caller-buffer
   de-framed raw read, consuming `http_sse_stream` transition, and caller-buffer WHATWG event read
   share one transport/framing owner. Exact completion may return the connection to its borrowed
@@ -383,6 +383,14 @@ facts must live in this repository.
   positive carrier grammar: bare or finite builtin Option/Result paths only; the exhaustive
   type-discriminator classifier rejects every other storage edge, including tuples, by default.
   SSE reconnect state commits atomically with its control block/event.
+- **Latest convergence capability:** The post-`pkg.db` asymmetric signature suite is implemented
+  against `docs/impl/std-design/crypto.md`: six nominal Move key types close RS256, ES256, and
+  Ed25519 construction/sign/verify across whole-program and per-unit compilation. Private input is
+  bounded canonical PKCS#8, public input is canonical SPKI or decoded JWK components, each shell
+  owns an isolated default-provider context, private wrapper storage is clear-freed, and the
+  runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
+  carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
+  optimized/unoptimized lowering, and the explicit resource probe.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

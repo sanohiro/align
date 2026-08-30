@@ -854,6 +854,30 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(&a.len),
             a.out
         ),
+        Rvalue::CryptoPrivateKeyFromPem { algorithm, pem, out } =>
+            format!("crypto_{algorithm:?}_private_key_from_pem({}, -> _{out})", operand_str(pem)),
+        Rvalue::CryptoPublicKeyFromPem { algorithm, pem, out } =>
+            format!("crypto_{algorithm:?}_public_key_from_pem({}, -> _{out})", operand_str(pem)),
+        Rvalue::CryptoPublicKeyFromJwk(a) => format!(
+            "crypto_{:?}_public_key_from_jwk({}, {}, -> _{})",
+            a.algorithm,
+            operand_str(&a.first),
+            a.second.as_ref().map_or("<absent>".to_string(), operand_str),
+            a.out
+        ),
+        Rvalue::CryptoSign { algorithm, key, message, out } => format!(
+            "crypto_{algorithm:?}_sign({}, {}, -> _{out})",
+            operand_str(key),
+            operand_str(message)
+        ),
+        Rvalue::CryptoVerify(a) => format!(
+            "crypto_{:?}_verify({}, {}, {}, -> _{})",
+            a.algorithm,
+            operand_str(&a.key),
+            operand_str(&a.message),
+            operand_str(&a.signature),
+            a.out
+        ),
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
         Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),

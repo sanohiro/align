@@ -3846,7 +3846,7 @@ pending. This section records their sequencing and status; it does not lock an u
 ```text
 1. HTTP client streaming receive (de-chunk + incremental read + SSE) — IMPLEMENTED 2026-08-30
      highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
-2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — DESIGNED 2026-08-30
+2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — IMPLEMENTED 2026-08-30
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
 3. Small pieces: std.xml (well-formed read-only) + std.time named formatters
      unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
@@ -3894,7 +3894,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 - **std.time formatters** — rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped
   i64-ns timeline; parse self-output + minimal compat; no strftime DSL, no locale/TZ (permanent
   non-goal). Plus `encoding.percent_encode_path`.
-- **std.crypto asymmetric — DESIGNED 2026-08-30, implementation pending** — six distinct
+- **std.crypto asymmetric — IMPLEMENTED 2026-08-30** — six distinct
   algorithm/class Move key types; per-alg RS256 / ES256 / Ed25519 sign+verify; bounded unencrypted
   canonical PKCS#8 v1 `PrivateKeyInfo` version-zero private PEM, canonical SPKI public PEM, and
   decoded-JWK public construction. The private decoder is PKCS#8-specific, cleanses wrapper-owned

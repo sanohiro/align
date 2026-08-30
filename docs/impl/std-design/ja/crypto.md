@@ -4,9 +4,8 @@
 
 > 🌐 [English](../crypto.md) · **日本語**
 
-> **ステータス:** M11 の symmetric/hash/KDF surface は完了済みです。post-pkg.db の asymmetric
-> signature suite は以下で設計済み、実装は pending です。文書に記載した BLAKE3 の例外も
-> 引き続き保留です。
+> **ステータス:** M11 の symmetric/hash/KDF surface と post-pkg.db の asymmetric signature
+> suite は完了済みです（2026-08-30 実装）。文書に記載した BLAKE3 の例外は引き続き保留です。
 
 ## Overview
 
@@ -456,7 +455,7 @@ new artifact/file format/CLI flag/environment variable/provider selector/package
 | Provider provenance | 各 shell は private ordinary libctx と explicit load した built-in default provider を所有。全 decode/import/signature/digest fetch は exact `provider=default`。key/operation provider pointer は owned pointer と一致。global ctx/config/search path/default property/provider を一切 consume しない | hostile `OPENSSL_CONF`/`OPENSSL_MODULES`、global null provider、incompatible global default property を持つ child-process owner、exact pointer assertion、independent-key overlap/teardown stress |
 | Constant-time boundary | public BN validation を含む constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。pointer-verified built-in default provider primitive が named dependency。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact `_ex` libctx/property/provider-pointer と EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
 | Compilation paths | direct/imported call、public key-bearing signature、function value、concrete key 周辺 generic monomorphization、whole/per-unit、object/frontend cache edit/revert、optimized/unoptimized LLVM、malformed HIR で identical algorithm/kind/effect/cleanup fact | `crypto_asymmetric` driver owner、interface/cache owner、checked-HIR validator matrix |
-| Resource claim | PEM exact limit、RSA size bound、live key ごとの private libctx/provider/PKEY shell 1つ、private construction 中だけの exact wrapper `SensitiveDer` 1つ + bounded OpenSSL-owned PKCS#8/import storage、fixed-count Ed public BN temporary、fixed ES/Ed operation temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation + private-construction peak/cleanse record + deterministic limit test |
+| Resource claim | PEM exact limit、RSA size bound、live key ごとの private libctx/provider/PKEY shell 1つ、private construction 中の exact decoded `SensitiveDer` 1つ + bounded clear-free canonical re-encoding scratch 1つ + bounded OpenSSL-owned PKCS#8/import storage、fixed-count Ed public BN temporary、fixed ES/Ed operation temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` live-key/peak-wrapper-allocation + private-construction peak/cleanse record + deterministic limit test |
 
 実装は hand-written changed lines が roughly 1,000 を超える見込みでも capability PR 1つとする。
 6 static type、constructor、runtime kind check、最初の sign/verify consumer は1つの proof boundary
