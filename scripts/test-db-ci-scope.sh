@@ -152,7 +152,8 @@ assert_scope true "$db_package" "$workflow"
 
 runner_parent="$workflow"
 for runner_dependency in \
-  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh; do
+  run-db-suites.sh run-gate-binaries.sh test-binaries-lib.sh dyld-env.sh \
+  run-quiet.sh; do
   printf '#!/usr/bin/env bash\n' > "$fixture/scripts/$runner_dependency"
   git -C "$fixture" add .
   git -C "$fixture" commit -qm "db-runner-$runner_dependency"
@@ -208,6 +209,9 @@ grep -Fq 'name: PostgreSQL integration (${{ matrix.db-shard }})' "$ci_workflow"
 grep -Fq 'run: scripts/run-db-suites.sh "${{ matrix.db-shard }}"' "$ci_workflow"
 grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
 test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
+test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' "$ci_workflow")" -eq 2
+test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' \
+  "$repo_root/scripts/db-verify-local.sh")" -eq 2
 
 expected_owners="$(printf '%s\n' \
   pkg_db_q1 pkg_db_q2 pkg_db_q3 pkg_db_q4a pkg_db_q4b pkg_db_q5a \

@@ -52,10 +52,18 @@ Those binaries are compiled in one `cargo test --no-run` build graph and then
 executed concurrently, because a few single-threaded stress tests own nearly all
 of the run time and separate `cargo test` invocations cannot overlap — cargo
 holds the target-directory lock across the test run, not only the build. The
-gate therefore reports every binary's result rather than stopping at the first
-failure, and prefixes each binary's output with its name, exit code, and
-duration. `ALIGN_GATE_JOBS` overrides the process count, which defaults to the
-host's CPU count.
+gate therefore runs every binary rather than stopping at the first failure. A
+successful run emits phase and aggregate summaries only. On failure, it replays
+the complete captured output of every failing binary with its name, exit code,
+and duration. `ALIGN_TB_VERBOSE=1` restores per-binary start lines and
+successful output for an investigation. `ALIGN_GATE_JOBS` overrides the process
+count, which defaults to the host's CPU count.
+
+By default, a run that remains active emits at most one bounded progress line
+per minute: completed and launched counts plus the
+at-most-`ALIGN_GATE_JOBS` active binary names. An interrupt replays captured
+complete and partial logs before cleanup. Thus routine success stays small
+while a job timeout still identifies its last active work.
 
 Each binary runs with `RUST_TEST_THREADS` set to the CPU count divided by that
 process count — 1 by default — so N concurrent binaries cannot start N libtest
@@ -67,6 +75,20 @@ single binary either way.
 CI additionally builds release compiler/runtime artifacts and compiles and runs
 `examples/hello.align` on Linux x86-64, Linux ARM64, and Apple Silicon. This is
 the cross-platform packaged-command smoke path.
+
+Routine PR and nightly Cargo build, Clippy, and test phases use
+`scripts/run-quiet.sh`: output is captured and a successful phase prints one
+elapsed-time summary, while a failed phase replays its complete log and
+preserves its exit status. Machine-readable Cargo stdout can be retained in an
+artifact file without printing it. `ALIGN_QUIET_VERBOSE=1` restores successful
+human output, and an interrupt replays the partial captured output before
+cleanup. This is an output-volume policy only; it changes no selected test,
+timeout, or verdict.
+
+An inverted self-test uses `--expect-failure`: a non-zero child status becomes
+one successful summary that includes the observed status, while an unexpected
+zero replays the captured output and fails the wrapper. This keeps expected-red
+configuration owners terse without weakening their verdict.
 
 The ordinary gate does not run:
 

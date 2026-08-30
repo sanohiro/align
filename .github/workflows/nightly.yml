@@ -250,7 +250,10 @@ jobs:
 
       - name: Build release compiler
         shell: bash
-        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver -p align_repl
+        run: >
+          scripts/run-quiet.sh "nightly build: release compiler" --
+          scripts/cargo.sh build --locked --release
+          -p align_runtime -p align_driver -p align_repl
 
       - name: Smoke test packaged command
         shell: bash

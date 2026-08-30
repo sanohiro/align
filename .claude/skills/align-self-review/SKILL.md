@@ -120,6 +120,12 @@ The same concept is encoded independently in 2–4 places; you update one and a 
   `PGRES_COMMAND_OK` and a `ROLLBACK` command tag (#727 P1). For
   commit/rollback-class operations, check the command tag (`PQcmdStatus`) or
   equivalent effect evidence, not only the result-status enum.
+- [ ] **A native security property needs evidence from the exact provider
+  operation.** Do not infer constant-time behavior, algorithm validation, or
+  implementation provenance from an ambient library version or a successful
+  generic decoder. Name the fetched provider implementation, the validating
+  operation, and a negative owner for the closest recognizable-but-invalid
+  encoding (#909).
 - [ ] **The exported surface is exactly the reviewed ledger.** Inventory every
   `pub` function and constructor in changed package modules. A cross-module
   implementation helper must live under the settled `internal` import boundary

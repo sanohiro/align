@@ -236,7 +236,9 @@ jobs:
 
       - name: Build compiler and runtime
         shell: bash
-        run: scripts/cargo.sh build --workspace --locked
+        run: >
+          scripts/run-quiet.sh "database CI build: workspace" --
+          scripts/cargo.sh build --workspace --locked
 
       - name: Print database evidence
         shell: bash
@@ -261,26 +263,16 @@ jobs:
         if: matrix.db-shard == 'catalog-stream'
         shell: bash
         run: |
-          set +e
-          env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
+          scripts/run-quiet.sh --expect-failure \
+            "database CI test: missing PostgreSQL URL" -- \
+            env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
             -p align_driver --test pkg_db_q2 postgres_required_mode_requires_configuration -- --exact
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "required PostgreSQL mode accepted a missing URL" >&2
-            exit 1
-          fi
 
-          set +e
-          env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
+          scripts/run-quiet.sh --expect-failure \
+            "database CI test: missing pgvector URL" -- \
+            env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
             -p align_driver --test pkg_db_vc1 \
             pgvector_required_mode_requires_configuration -- --exact
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "required pgvector mode accepted a missing URL" >&2
-            exit 1
-          fi
 
       - name: Required database owner suites
         shell: bash
@@ -483,7 +475,9 @@ jobs:
         if: matrix.lint
         env:
           CARGO_TARGET_DIR: target/clippy
-        run: scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
+        run: >
+          scripts/run-quiet.sh "CI lint: Clippy" --
+          scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 
       - name: Lint ratchet
         if: matrix.lint
@@ -491,11 +485,15 @@ jobs:
 
       - name: Build compiler and runtime
         if: ${{ !matrix.lint }}
-        run: scripts/cargo.sh build --workspace --locked
+        run: >
+          scripts/run-quiet.sh "CI build: workspace" --
+          scripts/cargo.sh build --workspace --locked
 
       - name: Owned-JSON boundary regressions (macOS)
         if: runner.os == 'macOS'
-        run: scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
+        run: >
+          scripts/run-quiet.sh "CI test: owned JSON" --
+          scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
 
       - name: Bounded PR test gate
         if: matrix.lint
@@ -506,7 +504,10 @@ jobs:
       # the release build and packaged smoke test on every PR.
       - name: Build release compiler
         if: ${{ !matrix.lint }}
-        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver -p align_repl
+        run: >
+          scripts/run-quiet.sh "CI build: release compiler" --
+          scripts/cargo.sh build --locked --release
+          -p align_runtime -p align_driver -p align_repl
 
       - name: Smoke test packaged command
         if: ${{ !matrix.lint }}

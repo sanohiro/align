@@ -11,7 +11,8 @@
 # time, so the serial sum was about twice the longest single binary.
 set -euo pipefail
 
-scripts/cargo.sh build --workspace --locked
+scripts/run-quiet.sh "gate build: workspace" -- \
+  scripts/cargo.sh build --workspace --locked
 
 artifacts="$(mktemp)"
 trap 'rm -f "$artifacts"' EXIT
@@ -21,7 +22,8 @@ trap 'rm -f "$artifacts"' EXIT
 # deterministic integration targets that protect cross-crate interface
 # soundness and formatter behavior are part of the gate as well; the `--test`
 # names here are what scripts/pr-tier.sh pins as bounded-gate content.
-scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics \
+scripts/run-quiet.sh --stdout "$artifacts" "gate build: test binaries" -- \
+  scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics \
   -p align_ast \
   -p align_codegen_llvm \
   -p align_diag \
@@ -38,8 +40,7 @@ scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics
   --test effect_fail_closed \
   --test examples \
   --test m0 \
-  --test summary \
-  >"$artifacts"
+  --test summary
 
 # Every binary that selection must produce: one per selected library plus each
 # named integration target. The runner fails when the compiled set differs in

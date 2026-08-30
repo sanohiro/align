@@ -11,7 +11,7 @@
 #
 # Discovery, the concurrency cap, and the run loop live in
 # scripts/test-binaries-lib.sh, shared with scripts/run-suite-binaries.sh; this
-# script owns the gate's declared-set check and its full-output report.
+# script owns the gate's declared-set check and its failure-detail report.
 set -euo pipefail
 
 [ $# -ge 2 ] || {
@@ -40,8 +40,8 @@ ALIGN_TB_TIMEOUT=0
 
 ALIGN_TB_LOGS="$(mktemp -d)"
 trap 'align_tb_cleanup' EXIT
-trap 'align_tb_cleanup; exit 130' INT
-trap 'align_tb_cleanup; exit 143' TERM
+trap 'align_tb_report_interrupted gate INT; align_tb_cleanup; exit 130' INT
+trap 'align_tb_report_interrupted gate TERM; align_tb_cleanup; exit 143' TERM
 
 align_tb_discover "$artifacts" || {
   echo "the gate build produced no test binaries (cargo artifact format changed?)" >&2
@@ -74,10 +74,11 @@ printf 'gate: %s\n' "$(printf '%s ' $found_names)"
 
 align_tb_run gate
 
-# Every binary's output is reported, in one deterministic C-collation order,
-# whichever of them failed. The gate's own exit code is 1 for any failure; a
-# binary's real exit code (and a child that died before recording one) is in
-# its header line.
+# Successful runs emit one aggregate result. On failure, every failing binary's
+# complete output is reported in deterministic C-collation order. The gate's
+# own exit code is 1 for any failure; a binary's real exit code (and a child
+# that died before recording one) is in its header line. ALIGN_TB_VERBOSE=1
+# restores per-binary start, header, and output lines for investigations.
 status=0
-align_tb_report_all || status=1
+align_tb_report_all gate || status=1
 exit "$status"

@@ -49,8 +49,9 @@ set -- -p align_driver
 for db_binary in $db_binaries; do
   set -- "$@" --test "$db_binary"
 done
-scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics \
-  "$@" >"$artifacts"
+scripts/run-quiet.sh --stdout "$artifacts" "database gate: test binaries" -- \
+  scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics \
+  "$@"
 
 # shellcheck disable=SC2086
 scripts/run-gate-binaries.sh "$artifacts" $db_binaries

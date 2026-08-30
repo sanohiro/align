@@ -735,12 +735,12 @@ cp "$repo_root/scripts/pr-tier.sh" "$tier_repo/scripts/pr-tier.sh"
 # without disturbing every other test in this file, which never sets them.
 printf '#!/usr/bin/env bash\nexit 0\n' >"$tier_repo/scripts/lint-ratchet.sh"
 chmod +x "$tier_repo/scripts/lint-ratchet.sh"
-printf '#!/usr/bin/env bash\nexit "${STUB_TEST_PR_EXIT:-0}"\n' >"$tier_repo/scripts/test-pr.sh"
+printf '#!/usr/bin/env bash\necho test-pr-success-payload\nexit "${STUB_TEST_PR_EXIT:-0}"\n' >"$tier_repo/scripts/test-pr.sh"
 chmod +x "$tier_repo/scripts/test-pr.sh"
 {
   printf '#!/usr/bin/env bash\n'
   printf 'case "$1" in\n'
-  printf '  clippy) exit "${STUB_CLIPPY_EXIT:-0}" ;;\n'
+  printf '  clippy) echo clippy-success-payload; exit "${STUB_CLIPPY_EXIT:-0}" ;;\n'
   printf '  *) exit 0 ;;\n'
   printf 'esac\n'
 } >"$tier_repo/scripts/cargo.sh"
@@ -826,13 +826,36 @@ code_log="$tmp_dir/code-review.log"
   printf 'ALIGN_REVIEW_BASE=%s\n' "$(git -C "$tier_repo" rev-parse 'main^{commit}')"
   printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
 } >"$code_log"
+code_preflight_out="$tmp_dir/code-preflight-out"
 tier_preflight --reviewer reviewer-1 --review-log "$code_log" --base main \
-  --owner-test tier -- true >/dev/null
+  --owner-test tier -- true >"$code_preflight_out"
+grep -Fq 'preflight: scripts/test-pr.sh passed' "$code_preflight_out" &&
+  grep -Fq 'preflight: Clippy passed' "$code_preflight_out" || {
+  echo "a successful code preflight omitted its terse phase summaries:" >&2
+  cat "$code_preflight_out" >&2
+  exit 1
+}
+if grep -Eq 'test-pr-success-payload|clippy-success-payload' "$code_preflight_out"; then
+  echo "a successful code preflight replayed captured command output:" >&2
+  cat "$code_preflight_out" >&2
+  exit 1
+fi
+code_preflight_verbose_out="$tmp_dir/code-preflight-verbose-out"
+ALIGN_QUIET_VERBOSE=1 \
+  tier_preflight --reviewer reviewer-1 --review-log "$code_log" --base main \
+  --owner-test tier -- true >"$code_preflight_verbose_out" 2>&1
+grep -Fq 'test-pr-success-payload' "$code_preflight_verbose_out" &&
+  grep -Fq 'clippy-success-payload' "$code_preflight_verbose_out" || {
+  echo "verbose code preflight did not replay both successful command logs:" >&2
+  cat "$code_preflight_verbose_out" >&2
+  exit 1
+}
 code_head="$(git -C "$tier_repo" rev-parse HEAD)"
 grep -Fqx 'kind=code' "$tier_repo/.git/align-preflight/$code_head"
 
-# The parallel scripts/test-pr.sh/Clippy block in the code tier must fail —
-# and show BOTH outputs — no matter which side actually fails.
+# The parallel scripts/test-pr.sh/Clippy block in the code tier must fail no
+# matter which side fails, replaying only the failed side while summarizing the
+# successful peer.
 parallel_case() {
   local label="$1" test_pr_exit="$2" clippy_exit="$3"
   tier_branch "parallel-${label}"
@@ -854,16 +877,36 @@ parallel_case() {
     cat "$out" >&2
     exit 1
   }
-  grep -q 'scripts/test-pr.sh output' "$out" || {
-    echo "parallel gate ($label) did not show the scripts/test-pr.sh output:" >&2
-    cat "$out" >&2
-    exit 1
-  }
-  grep -q 'Clippy output' "$out" || {
-    echo "parallel gate ($label) did not show the Clippy output:" >&2
-    cat "$out" >&2
-    exit 1
-  }
+  if [[ "$test_pr_exit" -ne 0 ]]; then
+    grep -q 'scripts/test-pr.sh output' "$out" &&
+      grep -q 'test-pr-success-payload' "$out" || {
+      echo "parallel gate ($label) did not show the failed scripts/test-pr.sh output:" >&2
+      cat "$out" >&2
+      exit 1
+    }
+  else
+    grep -q 'scripts/test-pr.sh passed' "$out" &&
+      ! grep -q 'test-pr-success-payload' "$out" || {
+      echo "parallel gate ($label) replayed the successful scripts/test-pr.sh log:" >&2
+      cat "$out" >&2
+      exit 1
+    }
+  fi
+  if [[ "$clippy_exit" -ne 0 ]]; then
+    grep -q 'Clippy output' "$out" &&
+      grep -q 'clippy-success-payload' "$out" || {
+      echo "parallel gate ($label) did not show the failed Clippy output:" >&2
+      cat "$out" >&2
+      exit 1
+    }
+  else
+    grep -q 'Clippy passed' "$out" &&
+      ! grep -q 'clippy-success-payload' "$out" || {
+      echo "parallel gate ($label) replayed the successful Clippy log:" >&2
+      cat "$out" >&2
+      exit 1
+    }
+  fi
 }
 parallel_case test-pr-fails 1 0
 parallel_case clippy-fails 0 1
@@ -1331,6 +1374,129 @@ grep -q 'already contains' "$absorbed_err" || {
   exit 1
 }
 
+# scripts/run-quiet.sh keeps routine command output out of successful logs but
+# replays complete diagnostics and preserves the child status on failure.
+quiet_runner="$repo_root/scripts/run-quiet.sh"
+quiet_dir="$tmp_dir/quiet-runner"
+mkdir -p "$quiet_dir"
+printf '#!/usr/bin/env bash\nprintf "routine line 1\\nroutine line 2\\n"\n' \
+  >"$quiet_dir/pass"
+printf '#!/usr/bin/env bash\necho partial-stdout\necho failure-stderr >&2\nexit 7\n' \
+  >"$quiet_dir/fail"
+printf '#!/usr/bin/env bash\necho partial-before-signal >&2\nkill -TERM "$PPID"\n' \
+  >"$quiet_dir/interrupt"
+chmod +x "$quiet_dir/pass" "$quiet_dir/fail" "$quiet_dir/interrupt"
+
+quiet_pass_out="$quiet_dir/pass-out"
+"$quiet_runner" "quiet fixture" -- "$quiet_dir/pass" >"$quiet_pass_out" 2>&1
+[[ "$(wc -l <"$quiet_pass_out" | tr -d '[:space:]')" -eq 1 ]] &&
+  grep -Eq '^quiet fixture: ok \([0-9]+s\)$' "$quiet_pass_out" || {
+  echo "the quiet wrapper did not reduce success to one summary line:" >&2
+  cat "$quiet_pass_out" >&2
+  exit 1
+}
+grep -Fq 'routine line' "$quiet_pass_out" && {
+  echo "the quiet wrapper leaked successful command output:" >&2
+  cat "$quiet_pass_out" >&2
+  exit 1
+}
+
+quiet_verbose_out="$quiet_dir/verbose-out"
+ALIGN_QUIET_VERBOSE=1 "$quiet_runner" "quiet fixture" -- "$quiet_dir/pass" \
+  >"$quiet_verbose_out" 2>&1
+grep -Fq 'routine line 1' "$quiet_verbose_out" || {
+  echo "the quiet wrapper's verbose mode did not restore successful output:" >&2
+  cat "$quiet_verbose_out" >&2
+  exit 1
+}
+
+quiet_fail_out="$quiet_dir/fail-out"
+quiet_fail_status=0
+"$quiet_runner" "quiet failure" -- "$quiet_dir/fail" \
+  >"$quiet_fail_out" 2>&1 || quiet_fail_status=$?
+[[ "$quiet_fail_status" -eq 7 ]] &&
+  grep -Fq 'quiet failure: FAILED (exit 7' "$quiet_fail_out" &&
+  grep -Fq 'partial-stdout' "$quiet_fail_out" &&
+  grep -Fq 'failure-stderr' "$quiet_fail_out" || {
+  echo "the quiet wrapper did not preserve and explain a failed command:" >&2
+  cat "$quiet_fail_out" >&2
+  exit 1
+}
+
+quiet_expected_out="$quiet_dir/expected-out"
+"$quiet_runner" --expect-failure "quiet expected failure" -- \
+  "$quiet_dir/fail" >"$quiet_expected_out" 2>&1
+[[ "$(wc -l <"$quiet_expected_out" | tr -d '[:space:]')" -eq 1 ]] &&
+  grep -Fq 'quiet expected failure: expected failure observed (exit 7' \
+    "$quiet_expected_out" &&
+  ! grep -Eq 'partial-stdout|failure-stderr' "$quiet_expected_out" || {
+  echo "the quiet wrapper did not summarize an expected failure:" >&2
+  cat "$quiet_expected_out" >&2
+  exit 1
+}
+quiet_expected_verbose_out="$quiet_dir/expected-verbose-out"
+ALIGN_QUIET_VERBOSE=1 \
+  "$quiet_runner" --expect-failure "quiet expected failure" -- \
+  "$quiet_dir/fail" >"$quiet_expected_verbose_out" 2>&1
+grep -Fq 'partial-stdout' "$quiet_expected_verbose_out" &&
+  grep -Fq 'failure-stderr' "$quiet_expected_verbose_out" || {
+  echo "verbose expected-failure mode did not restore captured output:" >&2
+  cat "$quiet_expected_verbose_out" >&2
+  exit 1
+}
+
+quiet_unexpected_pass_out="$quiet_dir/unexpected-pass-out"
+quiet_unexpected_pass_status=0
+"$quiet_runner" --expect-failure "quiet unexpected pass" -- \
+  "$quiet_dir/pass" >"$quiet_unexpected_pass_out" 2>&1 ||
+  quiet_unexpected_pass_status=$?
+[[ "$quiet_unexpected_pass_status" -eq 1 ]] &&
+  grep -Fq 'quiet unexpected pass: FAILED (expected a non-zero exit, got 0' \
+    "$quiet_unexpected_pass_out" &&
+  grep -Fq 'routine line 1' "$quiet_unexpected_pass_out" || {
+  echo "the quiet wrapper did not explain an unexpectedly passing command:" >&2
+  cat "$quiet_unexpected_pass_out" >&2
+  exit 1
+}
+
+quiet_artifact="$quiet_dir/artifact"
+quiet_artifact_out="$quiet_dir/artifact-out"
+"$quiet_runner" --stdout "$quiet_artifact" "quiet artifact" -- \
+  "$quiet_dir/pass" >"$quiet_artifact_out" 2>&1
+grep -Fq 'routine line 2' "$quiet_artifact" &&
+  ! grep -Fq 'routine line' "$quiet_artifact_out" || {
+  echo "the quiet wrapper did not retain machine stdout silently:" >&2
+  cat "$quiet_artifact_out" >&2
+  exit 1
+}
+
+quiet_failed_artifact="$quiet_dir/failed-artifact"
+quiet_failed_artifact_out="$quiet_dir/failed-artifact-out"
+quiet_failed_artifact_status=0
+"$quiet_runner" --stdout "$quiet_failed_artifact" "quiet artifact failure" -- \
+  "$quiet_dir/fail" >"$quiet_failed_artifact_out" 2>&1 ||
+  quiet_failed_artifact_status=$?
+[[ "$quiet_failed_artifact_status" -eq 7 ]] &&
+  grep -Fq 'partial-stdout' "$quiet_failed_artifact" &&
+  grep -Fq 'partial-stdout' "$quiet_failed_artifact_out" &&
+  grep -Fq 'failure-stderr' "$quiet_failed_artifact_out" || {
+  echo "the quiet wrapper did not replay both retained failure streams:" >&2
+  cat "$quiet_failed_artifact_out" >&2
+  exit 1
+}
+
+quiet_interrupt_out="$quiet_dir/interrupt-out"
+quiet_interrupt_status=0
+"$quiet_runner" "quiet interrupt" -- "$quiet_dir/interrupt" \
+  >"$quiet_interrupt_out" 2>&1 || quiet_interrupt_status=$?
+[[ "$quiet_interrupt_status" -eq 143 ]] &&
+  grep -Fq 'quiet interrupt: INTERRUPTED by TERM' "$quiet_interrupt_out" &&
+  grep -Fq 'partial-before-signal' "$quiet_interrupt_out" || {
+  echo "the quiet wrapper did not replay its log on interruption:" >&2
+  cat "$quiet_interrupt_out" >&2
+  exit 1
+}
+
 # scripts/run-gate-binaries.sh turns a cargo artifact stream into a set of
 # concurrently executed test binaries. Exercise discovery, the fail-closed set
 # check, and both failure paths against fixtures — no compilation involved, so
@@ -1388,24 +1554,45 @@ ALIGN_GATE_JOBS=2 "$gate_runner" "$gate_ok_json" pass_one pass_two \
   cat "$gate_ok_out" >&2
   exit 1
 }
-for expected_line in '--- pass_one (exit 0' '--- pass_two (exit 0' 'gate: start pass_one'; do
-  grep -Fq -e "$expected_line" "$gate_ok_out" || {
-    echo "the gate runner output lacks '$expected_line':" >&2
-    cat "$gate_ok_out" >&2
-    exit 1
-  }
-done
-# Cargo runs a test binary from its package directory; the runner must too.
-grep -Fq "cwd=$gate_dir/pkg" "$gate_ok_out" || {
-  echo "the gate runner did not run a binary from its package directory:" >&2
+grep -Fq 'gate: all 2 binaries passed' "$gate_ok_out" || {
+  echo "the clean gate did not emit its aggregate success summary:" >&2
   cat "$gate_ok_out" >&2
   exit 1
 }
+[[ "$(wc -l <"$gate_ok_out" | tr -d '[:space:]')" -le 4 ]] || {
+  echo "the clean gate emitted more than four summary lines:" >&2
+  cat "$gate_ok_out" >&2
+  exit 1
+}
+if grep -Eq '^gate: start |^--- |^cwd=' "$gate_ok_out"; then
+  echo "the clean gate leaked per-binary output in routine mode:" >&2
+  cat "$gate_ok_out" >&2
+  exit 1
+fi
 if grep -Fq 'not_a_test' "$gate_ok_out"; then
   echo "the gate runner ran a non-test artifact:" >&2
   cat "$gate_ok_out" >&2
   exit 1
 fi
+
+# Verbose mode restores the detailed report used to inspect scheduling and
+# working-directory parity without making it the default CI transcript.
+gate_verbose_out="$tmp_dir/gate-verbose-out"
+ALIGN_GATE_JOBS=2 ALIGN_TB_VERBOSE=1 \
+  "$gate_runner" "$gate_ok_json" pass_one pass_two \
+  >"$gate_verbose_out" 2>&1 || {
+  echo "the gate runner's verbose clean fixture failed:" >&2
+  cat "$gate_verbose_out" >&2
+  exit 1
+}
+for expected_line in '--- pass_one (exit 0' '--- pass_two (exit 0' \
+  'gate: start pass_one' "cwd=$gate_dir/pkg"; do
+  grep -Fq -e "$expected_line" "$gate_verbose_out" || {
+    echo "the verbose gate output lacks '$expected_line':" >&2
+    cat "$gate_verbose_out" >&2
+    exit 1
+  }
+done
 
 # The declared set is fail-closed in both directions, on a multiset: a missing
 # binary, an extra one, and a duplicate target name all have to fail.
@@ -1470,15 +1657,43 @@ gate_slow="$(gate_binary slow 'sleep 3; exit 0')"
 gate_slow_json="$tmp_dir/gate-slow.json"
 gate_stream "$gate_slow_json" "$gate_slow"
 gate_slow_out="$tmp_dir/gate-slow-out"
-ALIGN_GATE_JOBS=2 ALIGN_TB_TIMEOUT=1 "$gate_runner" "$gate_slow_json" slow \
+ALIGN_GATE_JOBS=2 ALIGN_TB_TIMEOUT=1 ALIGN_TB_PROGRESS_INTERVAL=1 \
+  "$gate_runner" "$gate_slow_json" slow \
   >"$gate_slow_out" 2>&1 || {
   echo "an exported ALIGN_TB_TIMEOUT reached the gate and killed a slow binary:" >&2
   cat "$gate_slow_out" >&2
   exit 1
 }
-grep -Fq -- '--- slow (exit 0' "$gate_slow_out" || {
-  echo "the gate did not report the slow binary as a clean pass:" >&2
+grep -Fq -- 'gate: all 1 binaries passed' "$gate_slow_out" || {
+  echo "the gate did not aggregate the slow binary as a clean pass:" >&2
   cat "$gate_slow_out" >&2
+  exit 1
+}
+grep -Eq '^gate: progress 0 complete, 1 running \(slow\), 1 launched$' \
+  "$gate_slow_out" || {
+  echo "the slow gate emitted no bounded active-binary progress record:" >&2
+  cat "$gate_slow_out" >&2
+  exit 1
+}
+
+# An external timeout/cancellation exits before the ordinary report. Its signal
+# trap must replay partial logs before cleanup removes the temporary directory.
+gate_interrupted="$(gate_binary interrupted 'echo partial-before-interrupt; sleep 30')"
+gate_interrupted_json="$tmp_dir/gate-interrupted.json"
+gate_stream "$gate_interrupted_json" "$gate_interrupted"
+gate_interrupted_out="$tmp_dir/gate-interrupted-out"
+ALIGN_GATE_JOBS=1 "$gate_runner" "$gate_interrupted_json" interrupted \
+  >"$gate_interrupted_out" 2>&1 &
+gate_interrupted_pid=$!
+sleep 1
+kill -TERM "$gate_interrupted_pid"
+gate_interrupted_status=0
+wait "$gate_interrupted_pid" || gate_interrupted_status=$?
+[[ "$gate_interrupted_status" -eq 143 ]] &&
+  grep -Fq 'gate: interrupted by TERM' "$gate_interrupted_out" &&
+  grep -Fq 'partial-before-interrupt' "$gate_interrupted_out" || {
+  echo "the interrupted gate did not preserve its partial binary log:" >&2
+  cat "$gate_interrupted_out" >&2
   exit 1
 }
 
@@ -1599,13 +1814,35 @@ grep -Fq 'matches' "$suite_match_out" || {
   cat "$suite_match_out" >&2
   exit 1
 }
-# A known-failing binary is not silently trusted: its own result line is still
-# in the report, and a passing binary is summarised rather than dumped.
+# Exact matches are routine success: the manifest verdict remains visible while
+# every captured per-binary line stays out of the default transcript.
+[[ "$(wc -l <"$suite_match_out" | tr -d '[:space:]')" -le 4 ]] || {
+  echo "an exact suite match emitted more than four summary lines:" >&2
+  cat "$suite_match_out" >&2
+  exit 1
+}
+if grep -Eq '^suite: start |^--- |^test result:' "$suite_match_out"; then
+  echo "an exact suite match leaked per-binary output:" >&2
+  cat "$suite_match_out" >&2
+  exit 1
+fi
+
+# Verbose mode keeps known failures auditable and restores passing summaries
+# when an investigation needs the old per-binary transcript.
+suite_match_verbose_out="$tmp_dir/suite-match-verbose-out"
+ALIGN_GATE_JOBS=2 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_KNOWN_FAILURES="$match_manifest" \
+  "$suite_runner" "$tmp_dir/suite-match.json" \
+  >"$suite_match_verbose_out" 2>&1 || {
+  echo "the verbose exact-match suite failed:" >&2
+  cat "$suite_match_verbose_out" >&2
+  exit 1
+}
 for expected_line in '--- pkg::test::suite_red (exit 101' \
   '--- pkg::test::suite_green (exit 0' 'test result: ok.'; do
-  grep -Fq -e "$expected_line" "$suite_match_out" || {
-    echo "the suite report lacks '$expected_line':" >&2
-    cat "$suite_match_out" >&2
+  grep -Fq -e "$expected_line" "$suite_match_verbose_out" || {
+    echo "the verbose suite report lacks '$expected_line':" >&2
+    cat "$suite_match_verbose_out" >&2
     exit 1
   }
 done
@@ -1844,7 +2081,8 @@ identity_stream="$tmp_dir/suite-qualified-identities.json"
   suite_artifact "$identity_kind_bin" kinds bin shared-kind
 } >"$identity_stream"
 identity_out="$tmp_dir/suite-qualified-identities-out"
-ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$empty_manifest" \
+ALIGN_GATE_JOBS=2 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
   "$suite_runner" "$identity_stream" >"$identity_out" 2>&1 || {
   echo "qualified Cargo target identities still collided:" >&2
   cat "$identity_out" >&2
@@ -1877,7 +2115,8 @@ schedule_stream="$tmp_dir/suite-priority-order.json"
   suite_artifact "$suite_green" align_driver test inprocess_memo
 } >"$schedule_stream"
 schedule_out="$tmp_dir/suite-priority-order-out"
-ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$empty_manifest" \
+ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
   "$suite_runner" "$schedule_stream" >"$schedule_out" 2>&1 || {
   echo "the prioritized suite fixture failed:" >&2
   cat "$schedule_out" >&2
@@ -1907,7 +2146,8 @@ suite_build_root="$tmp_dir/suite-build"
 mkdir -p "$suite_build_root/scripts"
 cp "$repo_root/scripts/run-suite-binaries.sh" \
   "$repo_root/scripts/test-binaries-lib.sh" \
-  "$repo_root/scripts/dyld-env.sh" "$suite_build_root/scripts/"
+  "$repo_root/scripts/dyld-env.sh" \
+  "$repo_root/scripts/run-quiet.sh" "$suite_build_root/scripts/"
 suite_build_artifacts="$tmp_dir/suite-build-artifacts.json"
 suite_stream "$suite_build_artifacts" "$suite_green"
 suite_build_cargo_log="$tmp_dir/suite-build-cargo-log"
@@ -2022,6 +2262,11 @@ awk -F'\t' '
 # and the per-binary cap documented where someone tempted to raise the job
 # timeout will read it.
 nightly_workflow="$repo_root/.github/workflows/nightly.yml"
+if grep -Eq '^ *run: scripts/run-quiet\.sh ".*: ' \
+  "$ci_workflow" "$nightly_workflow"; then
+  echo "a quiet workflow command contains an unquoted YAML mapping colon" >&2
+  exit 1
+fi
 grep -Fq 'timeout-minutes: 30' "$nightly_workflow" || {
   echo "nightly.yml no longer carries the 30-minute suite budget" >&2
   exit 1
@@ -2204,6 +2449,7 @@ for script in \
   scripts/pre-pr.sh \
   scripts/review-bounded.sh \
   scripts/run-gate-binaries.sh \
+  scripts/run-quiet.sh \
   scripts/run-suite-binaries.sh \
   scripts/test-apt-llvm.sh \
   scripts/test-binaries-lib.sh \

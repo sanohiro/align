@@ -107,25 +107,17 @@ fi
 echo "pgvector $vector_version"
 
 # Step 1 (inverted, as in CI): required mode with a missing URL must FAIL.
-set +e
-env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
-  -p align_driver --test pkg_db_q2 postgres_required_mode_requires_configuration -- --exact
-status=$?
-set -e
-if [ "$status" -eq 0 ]; then
-  echo "required PostgreSQL mode accepted a missing URL" >&2
-  exit 1
-fi
+scripts/run-quiet.sh --expect-failure \
+  "database gate: missing PostgreSQL URL" -- \
+  env -u ALIGN_DB_POSTGRES_URL scripts/cargo.sh test --locked \
+  -p align_driver --test pkg_db_q2 \
+  postgres_required_mode_requires_configuration -- --exact
 
-set +e
-env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
-  -p align_driver --test pkg_db_vc1 pgvector_required_mode_requires_configuration -- --exact
-status=$?
-set -e
-if [ "$status" -eq 0 ]; then
-  echo "required pgvector mode accepted a missing URL" >&2
-  exit 1
-fi
+scripts/run-quiet.sh --expect-failure \
+  "database gate: missing pgvector URL" -- \
+  env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
+  -p align_driver --test pkg_db_vc1 \
+  pgvector_required_mode_requires_configuration -- --exact
 
 # Steps 3-16: build the same fourteen required integration suites once, then
 # run their binaries concurrently exactly as CI does.
