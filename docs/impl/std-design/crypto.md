@@ -13,10 +13,13 @@ module.
 ## Overview
 
 crypto.random, sha256/sha512, blake3, hmac, hkdf, argon2id, aes_gcm, chacha20_poly1305,
-constant_time_equal (draft §18.2). **The hard requirement: every secret-dependent path MUST be
-constant-time** (open-questions std.crypto — no secret-dependent branch or memory index;
-CMOV/bitwise only). This is the one domain where Align's branchless machinery is a CORRECTNESS
-requirement, not a perf choice.
+constant_time_equal (draft §18.2). **The hard requirement: every cryptographic primitive path over
+already-admitted secret material MUST be constant-time with respect to secret contents**
+(open-questions std.crypto — no secret-dependent wrapper branch or memory index; CMOV/bitwise
+only). Public lengths, algorithm identifiers, formats, allocation outcomes, and setup-validation
+results are outside that guarantee. In particular, key import/parser/provider-validation is a
+trusted setup operation, not an attacker-queryable timing oracle. This is the one domain where
+Align's branchless machinery is a CORRECTNESS requirement, not a perf choice.
 
 **Strategy**: **borrow the vetted engine**. AEAD (aes_gcm, chacha20_poly1305), hashes (sha256/512),
 KDF (hkdf, argon2id), hmac → FFI-wrap a constant-time-audited C library — inheriting its
@@ -189,12 +192,12 @@ es256_private_key       es256_public_key
 ed25519_private_key     ed25519_public_key
 ```
 
-Each bare spelling is available after `import std.crypto`. Its explicit builtin spelling prefixes
-`crypto.`, for example `crypto.rs256_private_key`; that spelling requires and counts as a use of
-the same import. A same-module declaration wins bare lookup, while the explicit spelling always
-names the builtin. The entry module cannot declare a colliding bare name. Public interface
-production and import validation recognize both spellings and retain the required `std.crypto`
-source import.
+Each bare spelling is the existing no-import builtin fallback unless a same-module declaration wins
+bare lookup. Its explicit builtin spelling prefixes `crypto.`, for example
+`crypto.rs256_private_key`; only that qualified type spelling requires and counts as a use of
+`import std.crypto`. The value operations below also require that import. The entry module cannot
+declare a colliding bare name. Public interface production and import validation recognize both
+spellings, and reconstruct `std.crypto` as a source import only for a qualified spelling.
 
 These are the exact constructors and operations; there are no defaults or optional arguments.
 `bytes` has the existing borrowed byte-view meaning. The explicit `borrow` mode requires a stable
@@ -267,10 +270,16 @@ Each successful constructor returns a fresh one-word opaque owner of one provide
 `EVP_PKEY`. Move transfers copy the pointer then null the complete source; replacement and every
 active aggregate Drop call the one null-safe `align_rt_crypto_key_free` exactly once. The types use
 the ordinary independent builtin-Move carrier rules: locals, by-value/shared-borrow parameters,
-returns, and recursively admitted struct/sum/Option/Result fields are valid; fixed/dynamic arrays
-and every other placement that already rejects an owned handle remain invalid. Keys have no
-borrowed input lifetime and no process-global registration. A borrowed signing or verification
-call keeps the owner usable afterward and cannot retain the message or signature view.
+returns, and recursively admitted struct/sum/Option/Result fields are valid. A fixed or dynamic AoS
+array of a Move struct that contains a key remains valid through that struct's recursive Drop plan;
+whole-element reads retain the existing Move-element restriction. Direct key or tagged/sum-key
+elements in fixed/dynamic scalar arrays, slices, vectors/masks, array builders, or pipelines reject.
+So do tuple/box placement, closure or task/parallel capture, `out`/`borrow mut` parameters,
+global/constant storage, user-native/`layout(C)` exposure, and print/equality/order/hash. One
+structural carrier classifier owns this closed positive/negative inventory and fails closed for a
+future carrier. Keys have no borrowed input lifetime and no process-global registration. A borrowed
+signing or verification call keeps the owner usable afterward and cannot retain the message or
+signature view.
 
 Private scalar material stays inside the provider-owned key and is released by `EVP_PKEY_free`;
 the runtime does not copy it into an Align `buffer`. The caller-owned PEM `str` remains the caller's
@@ -297,24 +306,45 @@ terminal, network, or clock. ES256 signing may consume provider randomness; RS25
 not promise an observable determinism contract even where their standard construction is
 deterministic.
 
+Constant-time scope is exact. Algorithm, key class, all lengths, formats, allocation outcomes, and
+success/error class are public. A constructor handles secret private-key bytes, but PEM/DER parsing
+and provider key validation make no timing promise and are restricted to trusted setup; callers must
+not expose construction as a remote or repeated timing oracle. After successful construction, sign
+is constant-time with respect to private-key and message contents for fixed public lengths: wrapper
+code never extracts private components or branches/indexes on them, uses only the named high-level
+EVP signature operation, and leaves RSA blinding enabled. The OpenSSL default provider's
+constant-time primitive implementation is an explicit dependency assumption. Verification handles
+public material and has no constant-time promise. Evidence audits wrapper source/LLVM and linked EVP
+APIs/parameters; functional vectors or noisy wall-clock statistics are not constant-time evidence.
+
 ### Errors and deterministic precedence
 
-Public validation/format/key rejection is `Error.Invalid`. Provider fetch/context/allocation or a
-non-verification engine failure is the existing opaque `Error.Code(0)`; no OpenSSL error-stack
-number or text is exposed. Signature mismatch is data (`Ok(false)`), not an error. Allocation
-failure, parse failure, and signing failure never publish a partial key or signature.
+Constructor format/key rejection and any malformed internal ABI tag/view are `Error.Invalid`.
+Provider fetch/context/allocation or a non-verification engine failure is the existing opaque
+`Error.Code(0)`; no OpenSSL error-stack number or text is exposed. After the key and byte views are
+valid, every signature length, encoding, or mathematical mismatch is data (`Ok(false)`), not an
+error. Allocation failure, parse failure, and signing failure never publish a partial key or
+signature.
 
 For a multi-invalid runtime call, validation order is exact:
 
-1. validate and zero the ABI output slot, then validate the closed algorithm/key-kind tag (malformed
-   checked HIR only);
-2. validate all public lengths and structural rules left-to-right (`pem`; `n` then `e`; `x` then
-   `y`; or signature length);
-3. validate PEM envelope/base64/complete decoded object, or JWK numeric/point encoding;
-4. require the exact key algorithm/class/size/group, then run the applicable complete provider key
+1. require a non-null, naturally aligned ABI output slot and zero it, then validate the closed
+   algorithm tag; an invalid output slot returns `AL_INVALID` without a write;
+2. for key-taking operations require a non-null, naturally aligned shell and validate its repeated
+   key kind/class before inspecting a byte view;
+3. validate every `(ptr, i64)` input pair left-to-right without forming a slice: reject a negative or
+   non-`usize` length and a null pointer with positive length; length zero accepts null and uses an
+   internal non-null empty sentinel without dereferencing the input pointer. The order is `pem`;
+   `n` then `e`; `x` then `y`; `message`; or `message` then `signature`. Ed25519's synthetic absent
+   second JWK pair must be exactly null/zero;
+4. validate public structural lengths. PEM is `1..=65,536`; JWK uses the exact component bounds
+   above; an empty message is valid. Once both verify views are valid, a wrong signature length
+   publishes `false` before reading message contents;
+5. validate PEM envelope/base64/complete decoded object, or JWK numeric/point encoding;
+6. require the exact key algorithm/class/size/group, then run the applicable complete provider key
    check;
-5. create the operation context, set the exact digest/padding/group parameters, and run the engine;
-6. validate the produced length/ES256 conversion and only then publish the owner or result.
+7. create the operation context, set the exact digest/padding/group parameters, and run the engine;
+8. validate the produced length/ES256 conversion and only then publish the owner or result.
 
 A verification signature-length failure returns `Ok(false)` after the typed key handle is checked
 and before the message is processed. An invalid key cannot be masked by an invalid signature in
@@ -343,16 +373,21 @@ void @align_rt_crypto_key_free(ptr)
 The JWK ABI passes Ed25519's absent second component as null/zero. Constructor/sign result slots are
 pointer-sized handle slots initialized to null; verify's final slot is an `i32` initialized to zero.
 Status `0` is success, `AL_INVALID` maps to `Error.Invalid`, and `AL_CODE` maps to `Error.Code(0)`.
+The pointer/length and output-slot rules in the ordered validation contract apply to the five
+fallible operation rows; `key_free` is separately null-safe. No Rust slice, shell dereference, BIO,
+or EVP call precedes validation. Non-null input storage validity is an invariant of this
+compiler-internal ABI after checked-HIR validation.
 
 Checked HIR and MIR use one payloaded key type rather than six unrelated enum arms. Canonical type
 record version 3 assigns `Scalar::SignatureKey(kind)` leaf tag 39 followed by the exact one-byte
 kind, and `Ty::SignatureKey(kind)` leaf tag 63 followed by that byte. The next tags 40/64 remain
 unknown because the kind is payload, not another leaf family. Interface format 8 remains unchanged:
 these nominal paths use its existing length-prefixed UTF-8 type record. The producer and importer
-recognize all twelve bare/qualified paths, preserve `std.crypto` as a required source import, and
-reconstruct Move/return-cleanup identity. Each key fingerprint is nominal — the exact closed kind,
-not the `EVP_PKEY` layout or a structural definition graph. There are no runtime inspection fields,
-descriptor thunks, or source/artifact reads. Operation and helper discriminants enter the compiler
+recognize all twelve bare/qualified paths, add `std.crypto` to reconstructed source only for the six
+qualified paths, and reconstruct Move/return-cleanup identity for both forms. Each key fingerprint
+is nominal — the exact closed kind, not the `EVP_PKEY` layout or a structural definition graph.
+There are no runtime inspection fields, descriptor thunks, or source/artifact reads. Operation and
+helper discriminants enter the compiler
 build fingerprint, in-process memo, frontend/object cache keys, and whole/per-unit parity once;
 an exact source edit/revert restores the prior key.
 
@@ -367,11 +402,13 @@ reviewer's later discovery.
 
 | Axis | Required closure | Owner evidence |
 |---|---|---|
-| Type formation and interface | six bare plus six qualified names; local-shadow/entry-collision/import-use rules; Copy rejected; Move and return-cleanup reconstruction; canonical kind/tag round-trip and exact next-unknown rejection | `align_interface::summary` builtin sweep; `align_mir::canonical_graph` exact goldens; `crypto_asymmetric::type_identity_matrix` whole/per-unit |
+| Type formation and interface | six no-import bare fallbacks plus six import-required qualified names; local-shadow/entry-collision/import-use rules; Copy rejected; Move and return-cleanup reconstruction; canonical kind/tag round-trip and exact next-unknown rejection | `align_interface::summary` builtin/source-import sweep; `align_mir::canonical_graph` exact goldens; `crypto_asymmetric::type_identity_matrix` whole/per-unit |
+| Carrier closure | Admit local, by-value/return/shared-borrow, struct/sum/Option/Result, and recursively dropped fixed/dynamic AoS Move-struct arrays. Reject direct or tagged/sum key elements in fixed/dynamic scalar arrays, slices, vectors/masks, builders, and pipelines; tuple/box; closure/task/parallel capture; `out`/`borrow mut`; global/constant; user-native/`layout(C)`; print/equality/order/hash. A future carrier fails closed. | one parameterized sema/checked-HIR `signature_key_carrier_matrix`, recursive DropPlan/codegen owner, malformed future-kind negative |
 | Construction | three private PEM, three public PEM, and three decoded-JWK constructors; success initializes one owner, failure leaves null; wrong label/algorithm/class/curve/size/component and exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vectors plus `crypto_asymmetric::constructor_matrix` |
 | Move-in/out and cleanup | local bind, by-value parameter/return, shared borrow, struct/sum/Option/Result construction, `?`, `else`, `match`, `map_err`, branch/loop joins, replacement, early return, and ordinary/malformed Drop each preserve one kind and exactly-one free; source nulling precedes any later Drop | parameterized `crypto_asymmetric::ownership_matrix`; runtime free counter/failpoints; checked-HIR one-field negatives |
 | Sign/verify semantics | empty/binary/large messages; RS256 padding+digest and modulus-width result; ES256 DER/raw conversion including leading zeros and invalid r/s; Ed25519 one-shot no-digest; valid/wrong-message/wrong-key/wrong-length signatures; key remains usable | RFC 7515/7518, RFC 8032/8410, and OpenSSL-cross-checked vectors in runtime and `crypto_asymmetric` |
-| FFI/allocation/cleanup | every length uses checked conversion; output slots zero before work; ctx/key/BIO/BIGNUM/signature storage frees on every injected failure; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime failpoint sweep, ABI declaration golden, capability-linking twins |
+| FFI/allocation/cleanup | every output slot is validated/aligned then zeroed; every input pair covers negative/non-`usize`, null/zero, non-null/zero, null/positive, and positive valid storage before slice/shell/EVP work; Ed25519 absent JWK is exact null/zero; ctx/key/BIO/BIGNUM/signature storage frees on every injected failure; no partial publication; runtime kind recheck; libcrypto link retained only when reachable | runtime ABI view/slot and failpoint sweeps, ABI declaration golden, capability-linking twins |
+| Constant-time boundary | Constructor parsing/checking is explicitly trusted setup with no timing promise. For admitted private keys at fixed public lengths, sign wrapper code never extracts or branches/indexes on secret key/message contents, uses the exact high-level EVP operation, and leaves RSA blinding enabled; the default provider primitive is the named dependency assumption. Verification is public-data and outside the promise. | wrapper source/LLVM secret-flow audit, forbidden low-level/private-component API guard, exact EVP algorithm/parameter/blinding inspection; no timing benchmark as correctness evidence |
 | Compilation paths | direct/imported calls, public key-bearing signatures, function values, generic monomorphization around a concrete key, whole-program/per-unit compilation, object/frontend cache edit/revert, optimized/unoptimized LLVM, and malformed HIR carry identical algorithm/kind/effect/cleanup facts | `crypto_asymmetric` driver owner, interface/cache owners, checked-HIR validator matrix |
 | Resource claim | PEM exact limit, RSA size bound, fixed ES/Ed temporaries, and no Align-side message copy hold for 1-byte and 8-MiB messages; benchmark is local evidence, not a correctness gate | `bench/crypto_asymmetric` peak-wrapper-allocation record plus deterministic limit tests |
 
@@ -389,8 +426,20 @@ implementation continues.
 
 Acceptance requires the complete matrix above, `scripts/cargo.sh test -p align_runtime`, the focused
 `crypto_asymmetric` driver owner, interface/canonical/ABI goldens, capability-linking twins, the
-bounded PR gate, and Clippy. The local benchmark runs only because this ledger makes an explicit
-message-copy/resource claim; it is not a correctness gate and sets no latency target.
+constant-time boundary audit, bounded PR gate, and Clippy. The local benchmark runs only because
+this ledger makes an explicit message-copy/resource claim; it is not a correctness or
+constant-time gate and sets no latency target.
+
+### Design-review finding-to-fix ledger
+
+| Finding | Closure |
+|---|---|
+| P1 forbidden key carriers lacked negative ownership | Added the closed positive/negative carrier inventory, a fail-closed structural classifier, recursive AoS positive, and parameterized sema/checked-HIR/codegen owner. |
+| P1 byte-view null/length behavior was unspecified | Fixed every input/output pointer, signed-length, zero-length, alignment, slice-formation, and multi-invalid rule plus the ABI sweep. |
+| P1 private-key constant-time boundary had no closure | Distinguished trusted constructor setup from the fixed-public-length signing promise, named the provider assumption, and added wrapper/API audit evidence. |
+| P2 malformed signature conflicted with format rejection | Restricted `Error.Invalid` to constructor/internal-ABI rejection and made every post-view signature mismatch `Ok(false)`. |
+| P2 bare key alias import rule conflicted with the nominal model | Restored no-import bare fallback; only qualified type spellings and value operations require `std.crypto`. |
+| P2 HTTP streaming implementation status drifted | Synchronized the roadmap, settled record, draft, and language digest to implemented 2026-08-30. |
 
 This section is the source of truth. Its public types/signatures and algorithm/error/ownership
 contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-questions.md`,

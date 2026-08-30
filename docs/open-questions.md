@@ -107,18 +107,24 @@ compile-cost profile). The library API is unchanged — every `emit_*` entry poi
 **Decision:** a non-entry module may declare a local type whose bare name is also one of the closed
 compiler-provided nominal aliases. Bare type lookup checks the current module first; builtin
 fallback and explicit spellings are exactly `Error` / `core.Error`, `argon2_params` /
-`crypto.argon2_params`, and `regex_match` / `regex.regex_match`. `core.Error` is always-in-scope
-language-syntactic core. The other explicit spellings require `import std.crypto` or
-`import std.regex` and count as uses of those imports. `error(c)` is bound directly to
+`crypto.argon2_params`; `rs256_private_key`, `rs256_public_key`, `es256_private_key`,
+`es256_public_key`, `ed25519_private_key`, and `ed25519_public_key` / the same names prefixed by
+`crypto.`; and `regex_match` / `regex.regex_match`. The six signature-key pairs are settled and
+activate atomically with their pending implementation. `core.Error` is always-in-scope
+language-syntactic core. Crypto/regex explicit spellings require `import std.crypto` or
+`import std.regex` and count as uses of those imports; every bare fallback needs no import.
+`error(c)` is bound directly to
 `core.Error.Code(c)`, independent of local declarations. Importers use the ordinary
 module-qualified local type (`pkg.db.Error`). An entry-module declaration whose unmangled canonical
 name collides with a table member remains a compile error. This follows the existing per-module type
 identity instead of adding a `pkg.db` exception or renaming its public structured error sum.
 
-Owner closure is parameterized across all three aliases and crosses same-module bare
+The shipped Q2 owner is parameterized across its original three aliases and crosses same-module bare
 construction/signatures, qualified importer construction and matching, explicit builtin use with
 the exact import rule, unchanged builtin fallback in a module without a local declaration,
-`error(c)` under a local `Error`, whole/per-unit identity, and entry-collision rejection.
+`error(c)` under a local `Error`, whole/per-unit identity, and entry-collision rejection. The
+asymmetric implementation expands that same data-driven owner to all nine aliases rather than
+adding a second resolution rule.
 
 Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/pkg-design/db.md`
@@ -240,7 +246,7 @@ connection. Independently, `next` counts all de-framed source bytes, including i
 input, against an exact output-capacity-plus-262,144 work guard; excess is `Error.Invalid`. The
 authoritative ledger, native envelope, validation precedence, connection matrix, two-PR
 implementation boundary, and acceptance matrix are in `docs/impl/std-design/http.md` “Client
-streaming receive,” with synchronized Japanese mirror. Implementation is pending.
+streaming receive,” with synchronized Japanese mirror. Implementation completed 2026-08-30.
 
 ### Bounded HTTP client receive — two scoped setters and `Error.Code(-1)` (SETTLED 2026-08-14)
 **Decision:** `http.client` and `http.request` each expose
@@ -5532,10 +5538,13 @@ direction; implementation is next.
 
 ### std.crypto (Future)
 
-**Hard requirement (recorded 2026-07-04, external design-note review adoption):** all secret-dependent
-code paths MUST be constant-time (no secret-dependent branches or memory addressing; CMOV/bitwise
-only) regardless of speed — the one domain where Align's branchless-for-vectorization machinery
-becomes a correctness requirement, not a perf choice.
+**Hard requirement (recorded 2026-07-04, scoped exactly 2026-08-30):** cryptographic primitive paths
+over already-admitted secret material MUST be constant-time with respect to secret contents (no
+secret-dependent wrapper branches or memory addressing; CMOV/bitwise only) regardless of speed —
+the one domain where Align's branchless-for-vectorization machinery becomes a correctness
+requirement, not a perf choice. Public lengths, algorithm identifiers, formats, allocation
+outcomes, and setup-validation results are outside the guarantee. Key import/parser/provider
+validation is trusted setup and must not be exposed as an attacker-queryable timing oracle.
 
 **Status update (2026-07-04, M10 scope decision):** stays deferred to M11+ — out of M10 scope
 specifically because the constant-time requirement above needs verification, not just
@@ -5577,8 +5586,11 @@ construct/sign/verify functions, so algorithm and key-class confusion is closed 
 keys load only from one bounded unencrypted PKCS#8 `PRIVATE KEY` PEM; public keys load from SPKI
 `PUBLIC KEY` PEM or already-base64url-decoded JWK fields. RS256 is PKCS#1 v1.5 + SHA-256, ES256 is
 P-256 + SHA-256 with exact raw 64-byte `r || s`, and Ed25519 is pure Ed25519 with no digest/context/
-prehash selector. Sign/verify borrow the key and message; format/key rejection is `Error.Invalid`,
-provider/allocation failure is opaque `Error.Code(0)`, and signature mismatch is `Ok(false)`.
+prehash selector. Sign/verify borrow the key and message; constructor/key-format or malformed
+internal-ABI rejection is `Error.Invalid`, provider/allocation failure is opaque `Error.Code(0)`,
+and every signature mismatch after valid byte views is `Ok(false)`. Constructors carry no timing
+promise; signing an admitted key is constant-time for private-key/message contents at fixed public
+lengths under the named OpenSSL-provider assumption.
 Encrypted/traditional/certificate/OpenSSH PEM, private JWK, key generation/export, RSA-PSS, generic
 algorithm selectors, and a second provider are excluded. Exact input grammar, resource bounds,
 validation order, ABI, cache identity, and implementation closure matrix are locked by

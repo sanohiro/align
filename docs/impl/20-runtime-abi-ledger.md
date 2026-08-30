@@ -107,12 +107,17 @@ are excluded from the exact current counts and the shipped A00–A105 table belo
 
 `algorithm` is the closed `i32` ABI form of `0=RS256`, `1=ES256`, `2=Ed25519`; the runtime validates
 it before narrowing. The JWK row passes Ed25519's absent second component as null/zero. Constructor
-and sign output slots are null-initialized handle slots; verify's final `i32` slot is zero-initialized.
-Every handle repeats the closed key-kind byte and each operation checks algorithm, public/private
-class, and kind before EVP. Status and cleanup follow the exact crypto design ledger: zero success,
-`AL_INVALID` input/key rejection, `AL_CODE` opaque provider/allocation failure, and null-safe one-time
-free. Implementation moves these rows into the main keyed inventory, increases the keyed/base/max
-counts by six, and changes the table's shipped ABI range to A00–A109 in the same commit.
+and sign output slots must be non-null/aligned and are null-initialized; verify's final `i32` slot must
+be non-null/aligned and is zero-initialized. An invalid slot returns `AL_INVALID` without writing.
+Every input length is nonnegative and `usize`-representable before slice formation; zero length may
+carry null and uses an internal empty sentinel, while positive length requires non-null. Ed25519's
+absent second JWK pair is exactly null/zero. Every handle repeats the closed key-kind byte and each
+operation checks algorithm, public/private class, and kind before EVP. Status and cleanup follow the
+exact crypto design ledger: zero success; `AL_INVALID` for constructor/key or malformed internal ABI
+rejection; `AL_CODE` for opaque provider/allocation failure; post-view signature mismatch publishes
+false; and free is null-safe and one-time. Implementation moves these rows into the main keyed
+inventory, increases the keyed/base/max counts by six, and changes the table's shipped ABI range to
+A00–A109 in the same commit.
 
 ## Request 9 owned JSON extension
 

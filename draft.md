@@ -3189,10 +3189,14 @@ digest, context, or prehash. The PEM constructors accept one bounded unencrypted
 `PRIVATE KEY` or SPKI `PUBLIC KEY`; encrypted/traditional/certificate/OpenSSH forms reject without
 a password or ambient I/O. The JWK constructors take already-base64url-decoded public fields and
 perform complete algorithm/size/point validation. Keys are independent Move owners of one EVP key;
-sign/verify borrow them and the complete message. Invalid input/key format is `Error.Invalid`, a
-provider/allocation failure is `Error.Code(0)`, and a signature mismatch is `Ok(false)`. The exact
-PEM grammar, RSA bounds, validation order, ownership/allocation rules, ABI, cache identity, and
-closure matrix are authoritative in `docs/impl/std-design/crypto.md`.
+sign/verify borrow them and the complete message. Constructor/key-format or malformed internal ABI
+input is `Error.Invalid`, a provider/allocation failure is `Error.Code(0)`, and every signature
+length/encoding/mathematical mismatch after valid byte views is `Ok(false)`. Key construction is a
+trusted setup operation with no timing promise. Signing an admitted key is constant-time with
+respect to private-key/message contents at fixed public lengths under the named OpenSSL-provider
+assumption. The exact PEM grammar, RSA bounds, validation order, ownership/allocation rules, ABI,
+cache identity, timing boundary, and closure matrix are authoritative in
+`docs/impl/std-design/crypto.md`.
 
 `argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a builtin struct
 (reserved name, ordinary struct literal): memory cost in KiB, iterations, lanes, and output
@@ -3223,7 +3227,7 @@ bytes: body cap + 262,144-byte cumulative head allowance + one 32,768-byte read 
 framing, allocation, cleanup, batch, TLS, and error-precedence contract is the Request 5 ledger in
 `docs/impl/std-design/http.md`.
 
-The designed post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
+The implemented post-`pkg.db` streaming receive surface keeps that whole-body terminal unchanged:
 
 ```text
 cl.request_stream(req: request) -> Result<http_read_stream, Error>

@@ -1021,9 +1021,9 @@ merely because its `Ty` matches.
 | `CryptoPublicKeyFromPem` *(designed; pending)* | `env[algorithm]`; `child[pem]`; `Str; result ERR(SignatureKey(algorithm,Public)); pem borrowed, fresh validated independent Move owner on success; Impure`. |
 | `CryptoPublicKeyFromJwk` *(designed; pending)* | `env[algorithm]`; `child[first,second?]`; RS256/ES256 require exactly two byte views and Ed25519 exactly one; `result ERR(SignatureKey(algorithm,Public)); inputs borrowed, fresh validated independent Move owner; Impure`. |
 | `CryptoSign` *(designed; pending)* | `env[algorithm]`; `child[key,message]`; exact shared-borrow place `SignatureKey(algorithm,Private)`, byte-view; `result ERR(Buffer); key/message borrowed, fresh exact-width signature on success; Impure`. |
-| `CryptoVerify` *(designed; pending)* | `env[algorithm]`; `child[key,message,signature]`; exact shared-borrow place `SignatureKey(algorithm,Public)`, byte-view, byte-view; `result ERR(Bool); all borrowed; mismatch is Ok(false), engine failure is Err; Impure`. |
+| `CryptoVerify` *(designed; pending)* | `env[algorithm]`; `child[key,message,signature]`; exact shared-borrow place `SignatureKey(algorithm,Public)`, byte-view, byte-view; `result ERR(Bool); all borrowed; every signature length/encoding/mathematical mismatch after valid views is Ok(false), malformed ABI/key is Invalid, engine failure is Err; Impure`. |
 
-### am-b3 helper discriminators
+### am-b3 helper discriminators and classifiers
 
 | Discriminator | Exact contract |
 |---|---|
@@ -1036,6 +1036,7 @@ merely because its `Ty` matches.
 | `SignatureAlgorithm::Rs256` *(designed; pending)* | Stable byte 0; RSASSA-PKCS1-v1_5 with SHA-256; private/public key kinds 0/1. |
 | `SignatureAlgorithm::Es256` *(designed; pending)* | Stable byte 1; P-256 ECDSA with SHA-256 and raw 64-byte `r || s`; private/public key kinds 2/3. |
 | `SignatureAlgorithm::Ed25519` *(designed; pending)* | Stable byte 2; pure Ed25519 with no digest/context/prehash; private/public key kinds 4/5. |
+| `signature_key_carrier_class` *(designed; pending)* | One recursive, cycle-safe owner admits local/by-value/return/shared-borrow and struct/sum/Option/Result paths, including AoS Move-struct arrays whose recursive Drop reaches the key. It rejects direct/tagged/sum key collection elements, tuple/box, closure/task/parallel capture, `out`/`borrow mut`, global/constant/native/`layout(C)`, and print/equality/order/hash. Unknown future carrier and kind reject. |
 | `CliFlagKind::Bool` | No default child; parsed result Bool. |
 | `CliFlagKind::I64` | Exactly one i64 default child; parsed result i64. |
 | `CliFlagKind::Str` | Exactly one Str default child; parsed result Str view. |

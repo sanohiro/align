@@ -10,7 +10,7 @@
 
 ## Overview
 
-`crypto.random`、`sha256` / `sha512`、`blake3`、`hmac`、`hkdf`、`argon2id`、`aes_gcm`、`chacha20_poly1305`、`constant_time_equal`（draft §18.2）。**譲れない要件: 秘密情報に依存する処理経路はすべて constant-time（定数時間）でなければならない**（open-questions std.crypto — 秘密情報に依存する分岐やメモリのインデックスアクセスは禁止。CMOV やビット演算のみに制限する）。この領域は、Align の分岐なし機構がパフォーマンスのためだけでなく、**正しさの要件** そのものになる唯一の領域である。
+`crypto.random`、`sha256` / `sha512`、`blake3`、`hmac`、`hkdf`、`argon2id`、`aes_gcm`、`chacha20_poly1305`、`constant_time_equal`（draft §18.2）。**譲れない要件: admission 済み secret material を扱う cryptographic primitive path は、secret content に関してすべて constant-time でなければならない**（open-questions std.crypto — wrapper に secret-dependent branch/memory index を置かず、CMOV/bitwise のみ）。public length、algorithm identifier、format、allocation outcome、setup-validation result はこの保証外である。特に key import/parser/provider-validation は trusted setup operation であり、attacker-queryable timing oracle ではない。この領域は、Align の分岐なし機構がパフォーマンスのためだけでなく、**正しさの要件** そのものになる唯一の領域である。
 
 **戦略**: **検証済みの計算エンジンを外部から借りる**。AEAD（aes_gcm、chacha20_poly1305）、ハッシュ（sha256/512）、KDF（hkdf、argon2id）、hmac は、constant-time 性が監査済みの C ライブラリを FFI でラップする — 暗号処理を自前で実装して constant-time を証明し直すよりも、実績あるライブラリの constant-time 保証をそのまま継承するほうがはるかに安全だからである。自前実装するのは `constant_time_equal` ただ一つである（分岐なしのバイト単位の差分 OR 縮約であり、Align の `where` / mask 機構に素直に乗るうえ、容易に監査できるほど単純であるため）。`crypto.random` は OS の CSPRNG（getrandom / getentropy — `rand.seed` のソースと同じものだが、ここでは鍵材料向けの crypto グレードとして公開する）。
 
@@ -113,11 +113,12 @@ es256_private_key       es256_public_key
 ed25519_private_key     ed25519_public_key
 ```
 
-各 bare spelling は `import std.crypto` 後に利用できる。explicit builtin spelling は
-`crypto.rs256_private_key` のように `crypto.` を前置し、同じ import を require し use として
-count する。同一 module の declaration は bare lookup で勝ち、explicit spelling は常に builtin
-を指す。entry module は衝突する bare name を宣言できない。public interface producer/import
-validator は bare/qualified の両方を認識し、required source import `std.crypto` を保持する。
+各 bare spelling は、同一 module の declaration が bare lookup で勝つ場合を除き、import 不要の
+builtin fallback である。explicit builtin spelling は `crypto.rs256_private_key` のように
+`crypto.` を前置し、この qualified type spelling だけが `import std.crypto` を require し use
+として count する。下記 value operation も同じ import を要求する。entry module は衝突する bare
+name を宣言できない。public interface producer/import validator は bare/qualified の両方を認識し、
+qualified spelling に限って reconstructed source に `std.crypto` import を追加する。
 
 以下が exact constructor/operation であり、default/optional argument はない。`bytes` は既存の
 borrowed byte-view meaning を持つ。明示した `borrow` mode は stable bound key place を要求し、
@@ -189,10 +190,15 @@ match、bounds、complete key validation が成功するまで handle を publis
 owner を返す。Move transfer は pointer を copy して complete source を null にする。replacement
 と active aggregate Drop は null-safe な `align_rt_crypto_key_free` を exact once 呼ぶ。type は
 ordinary independent builtin-Move carrier rule を使う。local、by-value/shared-borrow parameter、
-return、recursively admitted struct/sum/Option/Result field は valid。fixed/dynamic array と、既存
-owned handle rule が reject する他の placement は invalid のままである。key は input borrow
-lifetime や process-global registration を持たない。borrowed sign/verify 後も owner は利用でき、
-message/signature view を retain しない。
+return、recursively admitted struct/sum/Option/Result field は valid。key を含む Move struct の
+fixed/dynamic AoS array はその struct の recursive Drop plan により引き続き valid であり、whole
+element read は既存 Move-element restriction に従う。direct key または tagged/sum-key を
+fixed/dynamic scalar array、slice、vector/mask、array builder、pipeline の element にする形は reject
+する。tuple/box placement、closure または task/parallel capture、`out`/`borrow mut` parameter、
+global/constant storage、user-native/`layout(C)` exposure、print/equality/order/hash も reject する。
+closed positive/negative inventory は structural carrier classifier 1つが所有し、future carrier は
+fail closed する。key は input borrow lifetime や process-global registration を持たない。borrowed
+sign/verify 後も owner は利用でき、message/signature view を retain しない。
 
 private scalar material は provider-owned key 内に留まり `EVP_PKEY_free` で release される。
 runtime は Align `buffer` へ copy しない。caller-owned PEM `str` は caller storage のままで
@@ -218,23 +224,44 @@ algorithm parameter を渡し、それ自身は configuration/path/environment/t
 を読まない。ES256 sign は provider randomness を消費し得る。RS256/Ed25519 も標準構成が
 deterministic な場合を含め observable determinism contract を約束しない。
 
+constant-time scope は exact である。algorithm、key class、全 length、format、allocation outcome、
+success/error class は public。constructor は secret private-key bytes を扱うが、PEM/DER parsing と
+provider key validation は timing を約束せず trusted setup に限定する。caller は construction を
+remote/repeated timing oracle として公開してはならない。successful construction 後の sign は、
+fixed public length における private-key/message content に関して constant-time である。wrapper
+code は private component を extract せず、それに branch/index せず、named high-level EVP
+signature operation だけを使い、RSA blinding を enabled のまま保つ。OpenSSL default provider の
+constant-time primitive implementation は明示した dependency assumption である。verification は
+public material を扱い constant-time promise を持たない。evidence は wrapper source/LLVM と linked
+EVP API/parameter を audit する。functional vector や noisy wall-clock statistic は constant-time
+evidence ではない。
+
 ### Errors and deterministic precedence
 
-public validation/format/key rejection は `Error.Invalid`。provider fetch/context/allocation または
-non-verification engine failure は既存の opaque `Error.Code(0)`。OpenSSL error-stack number/text
-は公開しない。signature mismatch は error でなく data (`Ok(false)`)。allocation/parse/sign
-failure は partial key/signature を publish しない。
+constructor format/key rejection と malformed internal ABI tag/view は `Error.Invalid`。provider
+fetch/context/allocation または non-verification engine failure は既存の opaque
+`Error.Code(0)`。OpenSSL error-stack number/text は公開しない。key と byte view が valid になった
+後の signature length/encoding/mathematical mismatch はすべて error でなく data (`Ok(false)`)。
+allocation/parse/sign failure は partial key/signature を publish しない。
 
 multi-invalid runtime call の validation order は exact に次のとおり。
 
-1. ABI output slot を validate/zero し、closed algorithm/key-kind tag を validate する
-   （malformed checked HIR のみ）。
-2. public length/structure rule を left-to-right に validate する（`pem`、`n` then `e`、`x` then
-   `y`、または signature length）。
-3. PEM envelope/base64/complete decoded object、または JWK numeric/point encoding を validate。
-4. exact key algorithm/class/size/group を要求し、applicable complete provider key check を実行。
-5. operation context を作り exact digest/padding/group parameter を設定して engine を実行。
-6. produced length/ES256 conversion を validate し、その後だけ owner/result を publish。
+1. non-null かつ naturally aligned な ABI output slot を要求して zero し、closed algorithm tag を
+   validate する。invalid output slot は write せず `AL_INVALID`。
+2. key-taking operation は byte view を見る前に non-null/naturally aligned shell を要求し、そこに
+   repeat された key kind/class を validate する。
+3. slice を形成せず全 `(ptr, i64)` input pair を left-to-right に validate する。negative または
+   `usize` に収まらない length と positive-length/null pointer を reject。zero length は null を許し、
+   input pointer を dereference せず internal non-null empty sentinel を使う。順序は `pem`、`n` then
+   `e`、`x` then `y`、`message`、または `message` then `signature`。Ed25519 の synthetic absent
+   second JWK pair は exact null/zero。
+4. public structural length を validate。PEM は `1..=65,536`、JWK は上記 exact component bound、
+   empty message は valid。verify view 2つが valid になった後の wrong signature length は message
+   content を読む前に `false` を publish する。
+5. PEM envelope/base64/complete decoded object、または JWK numeric/point encoding を validate。
+6. exact key algorithm/class/size/group を要求し、applicable complete provider key check を実行。
+7. operation context を作り exact digest/padding/group parameter を設定して engine を実行。
+8. produced length/ES256 conversion を validate し、その後だけ owner/result を publish。
 
 verify の signature-length failure は typed key handle check 後、message 処理前に
 `Ok(false)`。malformed HIR でも invalid key を invalid signature で mask できない。cleanup は
@@ -264,14 +291,18 @@ JWK ABI は Ed25519 の absent second component を null/zero で渡す。constr
 slot は null initialize する pointer-sized handle slot、verify final slot は zero initialize する
 `i32`。status `0` は success、`AL_INVALID` は `Error.Invalid`、`AL_CODE` は
 `Error.Code(0)` に map する。
+ordered validation contract の pointer/length/output-slot rule は5つの fallible operation row に
+適用し、`key_free` は別に null-safe とする。Rust slice、shell dereference、BIO、EVP call は
+validation 後だけ実行する。non-null input storage validity は checked-HIR validation 後の
+compiler-internal ABI invariant である。
 
 checked HIR/MIR は6つの unrelated enum arm でなく payloaded key type 1つを使う。canonical
 type record version 3 は `Scalar::SignatureKey(kind)` に leaf tag 39 + exact one-byte kind、
 `Ty::SignatureKey(kind)` に leaf tag 63 +同 byte を割り当てる。kind は payload なので next
 tag 40/64 は unknown のまま。interface format 8 は不変で、nominal path は既存の
 length-prefixed UTF-8 type record を使う。producer/importer は12個の bare/qualified path を認識し、
-required source import `std.crypto` と Move/return-cleanup identity を再構築する。各 key
-fingerprint は `EVP_PKEY` layout/structural definition graph
+6個の qualified path に限って reconstructed source へ `std.crypto` を追加し、両方で
+Move/return-cleanup identity を再構築する。各 key fingerprint は `EVP_PKEY` layout/structural definition graph
 ではなく exact closed kind という nominal identity である。runtime inspection field、descriptor
 thunk、source/artifact read はない。operation/helper discriminant は compiler build fingerprint、
 in-process memo、frontend/object cache key、
@@ -286,11 +317,13 @@ new artifact/file format/CLI flag/environment variable/provider selector/package
 
 | Axis | Required closure | Owner evidence |
 |---|---|---|
-| Type formation and interface | bare 6 + qualified 6 name、local-shadow/entry-collision/import-use、Copy reject、Move/return-cleanup reconstruction、canonical kind/tag round-trip と exact next-unknown reject | `align_interface::summary` builtin sweep、`align_mir::canonical_graph` exact golden、`crypto_asymmetric::type_identity_matrix` whole/per-unit |
+| Type formation and interface | no-import bare fallback 6 + import-required qualified name 6、local-shadow/entry-collision/import-use、Copy reject、Move/return-cleanup reconstruction、canonical kind/tag round-trip と exact next-unknown reject | `align_interface::summary` builtin/source-import sweep、`align_mir::canonical_graph` exact golden、`crypto_asymmetric::type_identity_matrix` whole/per-unit |
+| Carrier closure | local、by-value/return/shared-borrow、struct/sum/Option/Result、recursive Drop される fixed/dynamic AoS Move-struct array を admit。direct または tagged/sum key の fixed/dynamic scalar array、slice、vector/mask、builder、pipeline element、tuple/box、closure/task/parallel capture、`out`/`borrow mut`、global/constant、user-native/`layout(C)`、print/equality/order/hash を reject。future carrier は fail closed | parameterized sema/checked-HIR `signature_key_carrier_matrix`、recursive DropPlan/codegen owner、malformed future-kind negative |
 | Construction | private PEM 3、public PEM 3、decoded-JWK 3 constructor。success は owner 1つを initialize、failure は null。wrong label/algorithm/class/curve/size/component と exact 65,536/65,537 PEM boundary | runtime RFC/PEM/JWK vector + `crypto_asymmetric::constructor_matrix` |
 | Move-in/out and cleanup | local bind、by-value parameter/return、shared borrow、struct/sum/Option/Result construction、`?`、`else`、`match`、`map_err`、branch/loop join、replacement、early return、ordinary/malformed Drop が kind 1つと exactly-one free を保持。source nulling は later Drop より先 | parameterized `crypto_asymmetric::ownership_matrix`、runtime free counter/failpoint、checked-HIR one-field negative |
 | Sign/verify semantics | empty/binary/large message、RS256 padding+digest/modulus-width result、leading zero/invalid r/s を含む ES256 DER/raw、Ed25519 one-shot no-digest、valid/wrong-message/wrong-key/wrong-length signature、key reusable | runtime と `crypto_asymmetric` の RFC 7515/7518、RFC 8032/8410、OpenSSL cross-check vector |
-| FFI/allocation/cleanup | 全 length checked conversion、work 前 output zero、injected failure ごとの ctx/key/BIO/BIGNUM/signature storage free、partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime failpoint sweep、ABI declaration golden、capability-linking twin |
+| FFI/allocation/cleanup | 全 output slot を validate/alignment check 後 zero。全 input pair で negative/non-`usize`、null/zero、non-null/zero、null/positive、positive valid storage を slice/shell/EVP 前に cover。Ed25519 absent JWK は exact null/zero。injected failure ごとの ctx/key/BIO/BIGNUM/signature storage free、partial publish なし、runtime kind recheck、reachable 時だけ libcrypto retain | runtime ABI view/slot + failpoint sweep、ABI declaration golden、capability-linking twin |
+| Constant-time boundary | constructor parse/check は timing promise のない trusted setup。admitted private key と fixed public length では sign wrapper は secret key/message content を extract/branch/index せず exact high-level EVP operation を使い RSA blinding を enabled に保つ。default provider primitive は named dependency assumption。verification は public-data で promise 外 | wrapper source/LLVM secret-flow audit、forbidden low-level/private-component API guard、exact EVP algorithm/parameter/blinding inspection。timing benchmark は correctness evidence にしない |
 | Compilation paths | direct/imported call、public key-bearing signature、function value、concrete key 周辺 generic monomorphization、whole/per-unit、object/frontend cache edit/revert、optimized/unoptimized LLVM、malformed HIR で identical algorithm/kind/effect/cleanup fact | `crypto_asymmetric` driver owner、interface/cache owner、checked-HIR validator matrix |
 | Resource claim | PEM exact limit、RSA size bound、fixed ES/Ed temporary、1-byte/8-MiB message で Align-side message copy なし。benchmark は local evidence で correctness gate ではない | `bench/crypto_asymmetric` peak-wrapper-allocation record + deterministic limit test |
 
@@ -307,9 +340,21 @@ review 前に author は applicable matrix cell を implementation/regression �
 ### Acceptance and synchronized sources
 
 acceptance は complete matrix、`scripts/cargo.sh test -p align_runtime`、focused
-`crypto_asymmetric` driver owner、interface/canonical/ABI golden、capability-linking twin、bounded
-PR gate、Clippy を要求する。local benchmark は ledger が explicit message-copy/resource claim を
-持つためだけに実行し、correctness gate でも latency target でもない。
+`crypto_asymmetric` driver owner、interface/canonical/ABI golden、capability-linking twin、
+constant-time boundary audit、bounded PR gate、Clippy を要求する。local benchmark は ledger が
+explicit message-copy/resource claim を持つためだけに実行し、correctness/constant-time gate でも
+latency target でもない。
+
+### Design-review finding-to-fix ledger
+
+| Finding | Closure |
+|---|---|
+| P1 forbidden key carrier に negative ownership owner がなかった | closed positive/negative carrier inventory、fail-closed structural classifier、recursive AoS positive、parameterized sema/checked-HIR/codegen owner を追加。 |
+| P1 byte-view null/length behavior が未指定だった | 全 input/output pointer、signed length、zero length、alignment、slice formation、multi-invalid rule と ABI sweep を固定。 |
+| P1 private-key constant-time boundary が閉じていなかった | trusted constructor setup と fixed-public-length sign promise を分け、provider assumption と wrapper/API audit evidence を明記。 |
+| P2 malformed signature と format rejection が矛盾した | `Error.Invalid` を constructor/internal-ABI rejection に限定し、post-view signature mismatch をすべて `Ok(false)` に固定。 |
+| P2 bare key alias の import rule が nominal model と矛盾した | no-import bare fallback を復元し、qualified type spelling と value operation だけが `std.crypto` を要求。 |
+| P2 HTTP streaming implementation status が drift した | roadmap、Settled record、draft、language digest を 2026-08-30 implemented に同期。 |
 
 この節が source of truth である。public type/signature と algorithm/error/ownership contract は
 `draft.md` §18.2、`docs/language-spec.md`、`docs/open-questions.md`、

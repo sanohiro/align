@@ -1114,7 +1114,7 @@ response, and closes the connection. Bodyless `HEAD`/`204`/`304` metadata is val
 compared with the payload cap. With a 262,144-byte cap, live Align-owned response storage is bounded
 to 557,056 bytes. The exact framing/error/allocation matrix is in
 `docs/impl/std-design/http.md`.
-The designed post-`pkg.db` client streaming surface adds only
+The implemented post-`pkg.db` client streaming surface adds only
 `cl.request_stream(req) -> Result<http_read_stream, Error>`: the Move result borrows its client,
 retains the final status/header views, and fills a caller-owned fixed-capacity `buffer` with
 de-framed body bytes through `read` (`0` = complete). Exact self-delimited completion may return the
@@ -1171,9 +1171,12 @@ and returns `Error.Code` when it is unavailable. The designed asymmetric extensi
 Move private/public key types for RS256, ES256, and Ed25519; unencrypted PKCS#8 private PEM, SPKI
 public PEM, and already-decoded JWK public constructors; and per-algorithm sign/verify functions.
 RS256 is PKCS#1 v1.5 with SHA-256, ES256 is P-256/SHA-256 with raw 64-byte `r || s`, and Ed25519 is
-pure Ed25519. Sign/verify borrow the key; malformed input is `Error.Invalid`, an engine failure is
-`Error.Code(0)`, and a signature mismatch is `Ok(false)`. The implementation is pending; the exact
-surface, formats, bounds, ownership, ABI, and closure matrix are `impl/std-design/crypto.md`.
+pure Ed25519. Sign/verify borrow the key; malformed constructor/internal-ABI input is
+`Error.Invalid`, an engine failure is `Error.Code(0)`, and every post-view signature mismatch is
+`Ok(false)`. Construction is trusted setup without a timing promise; signing an admitted key is
+constant-time for secret contents at fixed public lengths under the named OpenSSL-provider
+assumption. The implementation is pending; the exact surface, formats, bounds, ownership, ABI,
+timing boundary, and closure matrix are `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every

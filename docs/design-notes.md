@@ -1196,8 +1196,10 @@ converge on this:
   reserve the same word across every vendored module: that would make ordinary qualified APIs such
   as `pkg.db.Error` impossible even though user types already have canonical module identities.
   Non-entry modules therefore resolve a same-module declaration before a builtin alias. The closed
-  explicit table is `core.Error` (always in scope), `crypto.argon2_params` (`std.crypto` import), and
-  `regex.regex_match` (`std.regex` import). The entry namespace
+  explicit table is `core.Error` (always in scope), `crypto.argon2_params` plus the six settled
+  `crypto.{rs256,es256,ed25519}_{private,public}_key` spellings (`std.crypto` import), and
+  `regex.regex_match` (`std.regex` import). The signature-key entries activate atomically with the
+  pending asymmetric implementation. The entry namespace
   remains unmangled and rejects a true canonical collision. This preserves one lookup rule and does
   not weaken the no-shadowing rule for values.
 
@@ -1259,6 +1261,14 @@ Ed25519. Separate public functions retain the one-way surface while one payloade
 kind and one checked runtime shell share the implementation proof. The authoritative exact
 surface, validation precedence, ABI, resource bounds, and implementation closure matrix are in
 `docs/impl/std-design/crypto.md` “Asymmetric signature suite.”
+
+The timing boundary is deliberately honest about the borrowed engine. Key parsing and provider
+validation are trusted setup and make no timing promise; exposing them as a repeated remote oracle
+is outside the contract. After admission, the signing wrapper never extracts private components or
+branches/indexes on their contents, uses only the high-level EVP signature operation, and relies on
+the OpenSSL default provider's constant-time primitive implementation with RSA blinding retained.
+Signature verification uses public material. Functional vectors establish cryptographic semantics,
+while wrapper/API inspection — not noisy timing statistics — owns the constant-time boundary.
 
 ---
 
