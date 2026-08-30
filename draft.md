@@ -2668,7 +2668,9 @@ std.crypto.
 ### core.test
 
 A private top-level test declaration consists of the contextual word `test`, one ordinary string
-token, and a block. It creates no callable name or public interface entry. The decoded name is
+token, and a block. Only item-position `test` followed by a string commits to this declaration;
+`test {}` and `pub test {}` remain keyword-less type declarations, while `pub test "..." {}`
+rejects visibility on a test. A test creates no callable name or public interface entry. The decoded name is
 nonempty, at most 256 UTF-8 bytes, contains no C0/C1 control (U+0000..U+001F or
 U+007F..U+009F), and is unique within its module.
 The canonical test id is the canonical module path, `::`, and that name; the entry module path is

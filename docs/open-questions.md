@@ -21,8 +21,9 @@ this file and the design gate in `CLAUDE.md`.
 
 ### In-language tests are private Result blocks with process isolation (SETTLED 2026-08-30)
 
-**Decision:** one private top-level `test` declaration carries a bounded string name and a block,
-creates no callable/exported name, and is checked as a compiler-private
+**Decision:** one private top-level `test` declaration carries a bounded string name and a block.
+Only item-position `test` + string lookahead commits to it, so `test {}` and `pub test {}` remain
+keyword-less types while `pub test "..." {}` rejects. It creates no callable/exported name and is checked as a compiler-private
 `fn() -> Result<(), core.Error>` with a documented implicit successful tail. With
 `import core.test`, exactly the standalone `test.expect(bool)` and
 `test.expect_eq(left, right)` assertions may early-return `Error.Invalid` from the lexical test

@@ -523,35 +523,50 @@ with parent-plus-first-child and first-child-plus-later-child pairs.
 ### Planned `core.test` records (designed 2026-08-30; inactive until implementation)
 
 The accepted `core.test` capability adds one optional `TestMeta` envelope to `hir::Fn`; it does not
-infer test identity from a generated function name. `None` is an ordinary function. `Some(meta)`
-requires zero parameters and type parameters, exact `Result<Unit,builtin Error>` return, private
-source origin, Impure effect, no public/interface record, and a body whose reachable fallthrough is
-the producer-inserted `Ok(Unit)` tail. `meta.canonical_id` is valid UTF-8, 1..=1,024 bytes, equals
-the checked module path plus `::` plus the decoded bounded source name, and is unique. Its
-`source_ordinal: u32` is dense from zero in source declaration order within that module. At most
-65,535 `Some` records exist in the driver-selected closure.
+infer test identity from a generated function name. The exact private record is
+`TestMeta { source_module: String, source_name: String, canonical_id: String, source_ordinal: u32 }`.
+`None` is an ordinary function. `Some(meta)` requires zero parameters and type parameters, exact
+`Result<Unit,builtin Error>` return, private source origin, Impure effect, no public/interface
+record, and a body whose reachable fallthrough is the producer-inserted `Ok(Unit)` tail.
+`source_module` is the producer-retained canonical module path: it is valid UTF-8, every component
+repasses the ordinary identifier grammar, and it is `main` exactly for the entry source origin.
+`source_name` is the independently retained decoded declaration string, valid UTF-8 and 1..=256
+bytes with U+0000..U+001F and U+007F..U+009F rejected. `canonical_id` is valid UTF-8,
+1..=1,024 bytes, and byte-equals `source_module + "::" + source_name`; the pair and id are unique.
+`source_ordinal` is dense from zero in source declaration order within each `source_module`. At
+most 65,535 `Some` records exist in the driver-selected closure. The HIR owner holds these three
+strings independently through validation and frees them with the function record; none is rebuilt
+from the hidden symbol.
 
 The HIR expression discriminator is
 `TestAssert { condition, kind, line, column }`, where `kind` is the closed
 `True | Equal` byte, `condition` is exact Bool, and line/column are positive `u32` coordinates of
-the source assertion call. It is valid only in a `Some(TestMeta)` root and outside every nested
-lambda function; the complete expression is Unit. `Equal` is emitted only after sema has checked
-the original two operands with the ordinary `BinOp::Eq` rule, proved its result is exact Bool rather
-than vector/mask, and built one left-to-right Eq child;
+the source assertion call. It is valid only in a `Some(TestMeta)` root, outside every nested lambda
+function, and as the complete expression directly stored in `Stmt::Expr` of the test body or one
+of its ordinary nested blocks. The validator passes an explicit `Statement | Value` placement
+context through every expression edge: block values, let/assignment initializers, return/break
+payloads, call operands, and all other children are `Value` and reject `TestAssert`, while a nested
+block's own `Stmt::Expr` roots are `Statement`. The complete assertion expression is Unit. `Equal`
+is emitted only after sema has checked the original two operands with the ordinary `BinOp::Eq`
+rule, proved its result is exact Bool rather than vector/mask, and built one left-to-right Eq child;
 the validator does not reconstruct the unavailable two source operands from a bool. MIR lowers a
 false condition to the bounded diagnostic followed by the exact function Err cleanup edge and a
 true condition to Unit fallthrough.
 
-Validation order is function envelope, `TestMeta` presence/tag, id bytes, ordinal, header
-correlation, body children, assertion envelope/kind/location/condition, then the ordinary function
-completion and ownership records. Production lowering validates these records and omits every
+Validation order is function envelope, `TestMeta` presence/tag, source-module bytes, source-name
+bytes, canonical-id correlation, ordinal, header correlation, body children, assertion
+envelope/placement/kind/location/condition, then the ordinary function completion and ownership
+records. Production lowering validates these records and omits every
 `Some` function; test lowering validates and includes them. The lowering mode is an explicit API
 and cache input, never inferred from whether a Program happens to contain a test. An assertion in
 an ordinary function, a test marked public/Pure, a missing synthetic Ok, duplicate/sparse ordinal,
 or any future metadata/assertion kind fails before MIR construction.
 
 This section activates atomically with the implementation and its parameterized valid/malformed
-owners. The public grammar, runner, cache, and process protocol remain owned by
+owners. Metadata owners mutate each identity string independently and together, entry/module
+correlation, every control boundary, ordinal, and duplicate relation; assertion owners place each
+kind in every `Stmt::Expr` depth plus every rejected value-position family. The public grammar,
+runner, cache, and process protocol remain owned by
 `core-design/test.md`.
 
 ## Header-adjacent records

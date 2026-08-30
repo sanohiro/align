@@ -140,7 +140,7 @@ import_decl = "import" path END
 path        = ident ("." ident)*
 END         = newline-inserted ";" | explicit ";"   // lexer-generated (operators & symbols §)
 
-item        = vis? ( fn_decl | type_decl | resource_decl | const_decl )
+item        = test_decl | vis? ( fn_decl | type_decl | resource_decl | const_decl )
 vis         = "pub"
 ```
 
@@ -218,11 +218,15 @@ provenance for every argument mode, including distinct Copy/Move aggregate holde
 test_decl = "test" string block
 ```
 
-`test` remains an identifier token and is contextual only at item position when followed by one
-string token and a block. The AST gains `Item::Test(TestDecl { name, body, span })`; it does not
-reuse `FnDecl`, because it has no source name, visibility, parameters, generics, return annotation,
-or expression body. `pub test`, attributes, a missing string/block, and function-like near-shapes
-receive test-specific recovery before the next top-level item.
+`test` remains an identifier token. At item position, only the two-token lookahead `test` followed
+by a string token commits to `test_decl`; after that commitment a missing block and every
+function-like near-shape receive test-specific recovery before the next top-level item. A `pub`
+followed by that same `test` + string lookahead commits to the explicitly rejected visible-test
+form so its diagnostic is stable. Bare `test {}` and `pub test {}` remain valid keyword-less type
+declarations, while `test` followed by any other non-string token follows the ordinary item/type
+grammar rather than test recovery. The AST gains `Item::Test(TestDecl { name, body, span })`; it
+does not reuse `FnDecl`, because it has no source name, visibility, parameters, generics, return
+annotation, or expression body.
 
 The decoded name is 1..=256 UTF-8 bytes and rejects exactly U+0000..U+001F and
 U+007F..U+009F before canonical-id construction. The sema catalog owner pins both boundary

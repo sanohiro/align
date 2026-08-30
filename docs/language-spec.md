@@ -1207,7 +1207,9 @@ look-around/backreferences. No regex literal or implicit cache is part of the la
 
 ## In-Language Tests
 
-A private top-level `test` declaration carries one ordinary string name and one block. It creates no
+A private top-level `test` declaration carries one ordinary string name and one block. Only the
+item-position lookahead `test` followed by a string commits to this declaration; `test {}` and
+`pub test {}` remain keyword-less types, while `pub test "..." {}` rejects. A test creates no
 callable or exported name. Its body is checked as a compiler-private
 `fn() -> Result<(), core.Error>` with one documented implicit `Ok(())` after a Unit fallthrough;
 ordinary `?`, Err, cleanup, and hard-error behavior are unchanged. Names are bounded, control-free,

@@ -1306,15 +1306,16 @@ masquerade as a returned Ok. A fixed launch/acknowledgement exchange distinguish
 from user termination, and one deadline covers both states through cleanup. One dedicated runner
 state machine owns signals, polling, capture, and wait status: every terminal path keeps the leader
 unreaped while it signals the pinned group, then reaps only its direct child and continues only after
-cleanup succeeds. Descendants are signalled but not reaped by this parent. A scoped process-global
-controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM while children may exist, with explicit prior
-handler restoration on ordinary return.
+cleanup succeeds. A second control drain after non-reaping terminal observation closes the fast-exit
+race between completion send and status observation. Descendants are signalled but not reaped by
+this parent. A scoped process-global controller owns SIGHUP, SIGINT, SIGQUIT, and SIGTERM while
+children may exist, with explicit prior handler restoration on ordinary return.
 
-Passing stdout and stderr are retained only while the child is live, then discarded. A failure
-replays just that test's bounded evidence. This makes a thousand passing tests produce the same
-one-line result as one passing test, without sacrificing the diagnostic bytes at the failure site.
-Terse success is therefore part of the runner contract, not an optional CI convention layered over
-an inherently noisy tool.
+Capture moves from a live row to an immutable quiesced row after child cleanup. A pass consumes and
+discards it; a failure retains it through the last direct reporting write and only then releases it.
+This makes a thousand passing tests produce the same one-line result as one passing test, without
+sacrificing the diagnostic bytes at the failure site. Terse success is therefore part of the runner
+contract, not an optional CI convention layered over an inherently noisy tool.
 
 ---
 
