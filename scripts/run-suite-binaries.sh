@@ -66,8 +66,8 @@ suite_cleanup() {
   rm -rf "$work" 2>/dev/null || true
 }
 trap 'suite_cleanup' EXIT
-trap 'suite_cleanup; exit 130' INT
-trap 'suite_cleanup; exit 143' TERM
+trap 'align_tb_report_interrupted suite INT; suite_cleanup; exit 130' INT
+trap 'align_tb_report_interrupted suite TERM; suite_cleanup; exit 143' TERM
 
 tab="$align_tb_tab"
 

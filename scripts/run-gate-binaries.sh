@@ -40,8 +40,8 @@ ALIGN_TB_TIMEOUT=0
 
 ALIGN_TB_LOGS="$(mktemp -d)"
 trap 'align_tb_cleanup' EXIT
-trap 'align_tb_cleanup; exit 130' INT
-trap 'align_tb_cleanup; exit 143' TERM
+trap 'align_tb_report_interrupted gate INT; align_tb_cleanup; exit 130' INT
+trap 'align_tb_report_interrupted gate TERM; align_tb_cleanup; exit 143' TERM
 
 align_tb_discover "$artifacts" || {
   echo "the gate build produced no test binaries (cargo artifact format changed?)" >&2

@@ -59,6 +59,12 @@ and duration. `ALIGN_TB_VERBOSE=1` restores per-binary start lines and
 successful output for an investigation. `ALIGN_GATE_JOBS` overrides the process
 count, which defaults to the host's CPU count.
 
+By default, a run that remains active emits at most one bounded progress line
+per minute: completed and launched counts plus the
+at-most-`ALIGN_GATE_JOBS` active binary names. An interrupt replays captured
+complete and partial logs before cleanup. Thus routine success stays small
+while a job timeout still identifies its last active work.
+
 Each binary runs with `RUST_TEST_THREADS` set to the CPU count divided by that
 process count — 1 by default — so N concurrent binaries cannot start N libtest
 threads apiece and multiply the runnable-thread count and peak memory by the
@@ -75,8 +81,9 @@ Routine PR and nightly Cargo build, Clippy, and test phases use
 elapsed-time summary, while a failed phase replays its complete log and
 preserves its exit status. Machine-readable Cargo stdout can be retained in an
 artifact file without printing it. `ALIGN_QUIET_VERBOSE=1` restores successful
-human output. This is an output-volume policy only; it changes no selected
-test, timeout, or verdict.
+human output, and an interrupt replays the partial captured output before
+cleanup. This is an output-volume policy only; it changes no selected test,
+timeout, or verdict.
 
 The ordinary gate does not run:
 

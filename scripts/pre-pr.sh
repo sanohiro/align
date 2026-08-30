@@ -302,16 +302,33 @@ if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
   clippy_status=0
   wait "$test_pr_pid" || test_pr_status=$?
   wait "$clippy_pid" || clippy_status=$?
+  preflight_verbose=false
+  if [[ "${ALIGN_QUIET_VERBOSE:-0}" == 1 || "${ALIGN_TB_VERBOSE:-0}" == 1 ]]; then
+    preflight_verbose=true
+  fi
   if [[ "$test_pr_status" -ne 0 || "$clippy_status" -ne 0 ]]; then
-    echo "--- scripts/test-pr.sh output (exit $test_pr_status) ---" >&2
-    cat "$test_pr_log" >&2
-    echo "--- Clippy output (exit $clippy_status) ---" >&2
-    cat "$clippy_log" >&2
+    if [[ "$test_pr_status" -ne 0 || "$preflight_verbose" == true ]]; then
+      echo "--- scripts/test-pr.sh output (exit $test_pr_status) ---" >&2
+      cat "$test_pr_log" >&2
+    else
+      echo "preflight: scripts/test-pr.sh passed" >&2
+    fi
+    if [[ "$clippy_status" -ne 0 || "$preflight_verbose" == true ]]; then
+      echo "--- Clippy output (exit $clippy_status) ---" >&2
+      cat "$clippy_log" >&2
+    else
+      echo "preflight: Clippy passed" >&2
+    fi
     echo "preflight: scripts/test-pr.sh exited $test_pr_status, Clippy exited $clippy_status" >&2
     exit 1
   fi
-  echo "preflight: scripts/test-pr.sh passed"
-  echo "preflight: Clippy passed"
+  if [[ "$preflight_verbose" == true ]]; then
+    cat "$test_pr_log"
+    cat "$clippy_log"
+  else
+    echo "preflight: scripts/test-pr.sh passed"
+    echo "preflight: Clippy passed"
+  fi
   trap - EXIT
   rm -f "$test_pr_log" "$clippy_log"
 fi

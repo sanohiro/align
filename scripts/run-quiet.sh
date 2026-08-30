@@ -44,8 +44,25 @@ log="$(mktemp)" || {
   echo "could not create a temporary command log" >&2
   exit 2
 }
-trap 'rm -f "$log"' EXIT
+quiet_cleanup() {
+  rm -f "$log"
+}
+quiet_interrupted() {
+  local code="$1" signal_name="$2" interrupted_elapsed
+  trap - INT TERM
+  interrupted_elapsed="$(($(date +%s) - started))"
+  printf '%s: INTERRUPTED by %s (%ss)\n' \
+    "$label" "$signal_name" "$interrupted_elapsed" >&2
+  [ ! -s "$log" ] || cat "$log" >&2
+  if [ -n "$stdout_file" ] && [ -s "$stdout_file" ]; then
+    cat "$stdout_file" >&2
+  fi
+  exit "$code"
+}
+trap quiet_cleanup EXIT
 started="$(date +%s)"
+trap 'quiet_interrupted 130 INT' INT
+trap 'quiet_interrupted 143 TERM' TERM
 status=0
 if [ -n "$stdout_file" ]; then
   "$@" >"$stdout_file" 2>"$log" || status=$?

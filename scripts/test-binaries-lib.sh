@@ -28,7 +28,11 @@ ALIGN_TB_LOGS=""
 ALIGN_TB_RUNNING=""
 ALIGN_TB_JOBS=1
 ALIGN_TB_THREADS=1
+ALIGN_TB_LAUNCHED=0
 ALIGN_TB_VERBOSE="${ALIGN_TB_VERBOSE:-0}"
+# Long runs retain one bounded progress record per minute even in terse mode,
+# so an external job timeout cannot erase every clue with the temporary logs.
+ALIGN_TB_PROGRESS_INTERVAL="${ALIGN_TB_PROGRESS_INTERVAL:-60}"
 # Per-binary wall-clock budget in seconds; 0 disables it. A hung binary
 # otherwise consumes the whole job budget and reports nothing at all, which is
 # the one failure mode a nightly detector cannot afford.
@@ -109,6 +113,12 @@ align_tb_configure_jobs() {
       return 2
       ;;
   esac
+  case "$ALIGN_TB_PROGRESS_INTERVAL" in
+    '' | *[!0-9]* | 0)
+      echo "ALIGN_TB_PROGRESS_INTERVAL must be a positive whole number of seconds" >&2
+      return 2
+      ;;
+  esac
   ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
   case "$ncpu" in
     '' | *[!0-9]*) ncpu=4 ;;
@@ -170,6 +180,26 @@ align_tb_count_running() {
   echo $#
 }
 
+# At most one progress line per configured interval. It names only the bounded
+# active set (at most ALIGN_TB_JOBS) and counts completed/launched binaries, so
+# a long clean run remains terse while a timeout transcript identifies the
+# work that was active when progress stopped.
+align_tb_maybe_report_progress() {
+  local label="$1" now running completed slots="" entry slot
+  now="$(date +%s)"
+  [ "$now" -ge "$ALIGN_TB_NEXT_PROGRESS" ] || return 0
+  running="$(align_tb_count_running)"
+  [ "$running" -gt 0 ] || return 0
+  completed=$((ALIGN_TB_LAUNCHED - running))
+  for entry in $ALIGN_TB_RUNNING; do
+    slot="${entry#*:}"
+    slots="${slots}${slots:+,}$slot"
+  done
+  printf '%s: progress %s complete, %s running (%s), %s launched\n' \
+    "$label" "$completed" "$running" "$slots" "$ALIGN_TB_LAUNCHED"
+  ALIGN_TB_NEXT_PROGRESS=$((now + ALIGN_TB_PROGRESS_INTERVAL))
+}
+
 # Per-binary watchdog: wait out the budget, then mark and kill. It polls rather
 # than sleeping the whole budget in one call so that cancelling it (the normal
 # case, on every binary that finishes in time) leaves at most a few seconds of
@@ -200,7 +230,10 @@ align_tb_watchdog() {
 # Launch every discovered binary, at most ALIGN_TB_JOBS at a time, and return
 # once all of them have recorded a result. $1 labels the progress lines.
 align_tb_run() {
-  local label="$1" manifest target_kind target_name executable name slot suffix
+  local label="$1" manifest target_kind target_name executable name slot suffix now
+  now="$(date +%s)"
+  ALIGN_TB_NEXT_PROGRESS=$((now + ALIGN_TB_PROGRESS_INTERVAL))
+  ALIGN_TB_LAUNCHED=0
   while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
     [ -n "$executable" ] || continue
     if [ "${ALIGN_TB_QUALIFIED_NAMES:-0}" = 1 ]; then
@@ -225,6 +258,7 @@ align_tb_run() {
     while [ "$(align_tb_count_running)" -ge "$ALIGN_TB_JOBS" ]; do
       sleep 0.2
       align_tb_reap_completed
+      align_tb_maybe_report_progress "$label"
     done
     # Verbose mode announces before launching, so an interactive investigation
     # can identify a hung binary. Routine CI keeps these per-binary lines out
@@ -264,8 +298,13 @@ align_tb_run() {
       printf '%s %s\n' "$binary_status" "$(($(date +%s) - started))" >"$ALIGN_TB_LOGS/$slot.status"
     ) </dev/null &
     ALIGN_TB_RUNNING="$ALIGN_TB_RUNNING $!:$slot"
+    ALIGN_TB_LAUNCHED=$((ALIGN_TB_LAUNCHED + 1))
   done <<<"$ALIGN_TB_BINARIES"
-  wait
+  while [ "$(align_tb_count_running)" -gt 0 ]; do
+    sleep 0.2
+    align_tb_reap_completed
+    align_tb_maybe_report_progress "$label"
+  done
   ALIGN_TB_RUNNING=""
 }
 
@@ -284,6 +323,28 @@ align_tb_slot_record() {
   else
     printf '%s\n' "$record"
   fi
+}
+
+# A signal path never reaches the ordinary report and cleanup removes the
+# temporary directory. Replay every complete or partial log first so an
+# external timeout/cancellation remains a diagnosable failure.
+align_tb_report_interrupted() {
+  local label="$1" signal_name="$2" slot record binary_status elapsed
+  printf '%s: interrupted by %s; replaying captured binary logs\n' \
+    "$label" "$signal_name" >&2
+  for slot in $(align_tb_slots); do
+    if [ -e "$ALIGN_TB_LOGS/$slot.status" ]; then
+      record="$(align_tb_slot_record "$slot")"
+      binary_status="${record%% *}"
+      elapsed="${record#* }"
+    else
+      binary_status=incomplete
+      elapsed=?
+    fi
+    printf -- '--- %s (exit %s, %ss) ---\n' \
+      "$slot" "$binary_status" "$elapsed" >&2
+    cat "$ALIGN_TB_LOGS/$slot.log" >&2
+  done
 }
 
 # libtest names every failed test in the indented list under the final
