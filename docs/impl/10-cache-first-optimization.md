@@ -481,6 +481,15 @@ uses a span-free HIR key with raw span-bearing semantic side tables or descripto
 Public interface identity keeps its existing public-surface encoder over the production prefix; it
 excludes the overlay but does not acquire private-body or descriptor inputs from these projections.
 
+Test-mode unit/object keys additionally include every local overlay suffix plus target, profile,
+resolved runtime-LTO state, imported interfaces, and the runtime ABI fingerprint. The separate
+harness key includes the ordered canonical-id-to-`align_test$<8hex>` map, the sole literal `main` and
+encoded source-main policy, all four child-control runtime ABI rows, and launch/ack/completion/final-
+commit protocol versions. Jobs, cache-statistics display, timeout, and output bounds do not enter
+artifact identity because they terminate at build scheduling, diagnostics, and runner state. A
+database descriptor never enters the overlay; tests consume its production descriptor identity and
+ordinary offline metadata.
+
 The program key's "seeded diagnostic sink" component is not defensive padding. `align_sema` READS
 the sink it is handed: `declaration_has_prior_error` suppresses static-descriptor discovery for a
 function the loader already reported a lexer/parser error inside. The memoized step therefore hands
@@ -592,6 +601,7 @@ Owners are in `crates/align_driver/tests/inprocess_memo.rs` unless stated otherw
 | M19 | object read-back | retention reads back the file codegen wrote, so an overlapping emission to the same path makes BOTH emissions skip retention | `EmitGuard`; `cache_parallel.rs` (distinct per-unit paths) |
 | M20 | `core.test` span-free lowering identity (DESIGNED) | an earlier variable-width test edit may shift production spans yet hits the same production lowering/object identity; independently changing any `absent | arena | individual` expression fact misses, and an orphan ownership key rejects before lookup/publication | `test_only_width_shift_preserves_production_identity`, `ownership_fact_changes_lowering_key`, `orphan_ownership_fact_rejects` (land atomically with `core.test`) |
 | M21 | `core.test` semantic descriptor identity (DESIGNED) | every semantic descriptor-field mutation misses; changing only constructor/options/source diagnostic spans preserves the descriptor projection and production artifact identity | `descriptor_semantics_change_identity`, `descriptor_spans_do_not_change_identity` (land atomically with `core.test`) |
+| M22 | `core.test` artifact-mode identity (DESIGNED) | target/profile/resolved runtime LTO and every entry/root/runtime/protocol field miss the proper unit or harness key; jobs/cache-stats/timeout/output twins preserve artifact keys and bytes; database consumers reject from the overlay | `test_artifact_option_consumer_matrix`, `test_harness_symbol_and_runtime_abi_key`, `test_overlay_rejects_database_descriptor` (land atomically with `core.test`) |
 
 Measured effect on the `pkg.db` owner suites (this machine, 4 test threads, debug compiler;
 wall / CPU seconds, before → after):

@@ -3875,9 +3875,14 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   failure-only evidence replay. Compiler formation normalizes final syntactic-tail assertions only
   at root completion or structural statement placement and
   freezes the complete production prefix before appending the test-generated function/type/
-  descriptor/capability overlay; production interfaces exclude it, while production MIR/links,
-  optimization remarks, and database preparation descriptors use its span-erased semantic/codegen
-  projection, including structurally ordered ownership facts and semantic descriptor fields. The
+  non-database-descriptor/capability overlay; production interfaces exclude it, while production
+  MIR/links and optimization remarks use the prefix's span-erased semantic/codegen projection,
+  including structurally ordered ownership facts and semantic descriptor fields. Database
+  Query/command descriptors remain prefix-owned top-level declarations and tests consume their
+  ordinary prepared metadata offline. The harness alone owns literal `main`; source main uses its
+  encoded private identity, and four exact unkeyed runtime rows own child launch/fd/ack/completion
+  I/O. Production modes and accepted test options have closed terminal-consumer matrices, and owner/
+  CI commands retain terse success through the existing quiet wrapper. The
   exact public ledger, control-protocol bytes, lifecycle state matrix, cache identity, and
   one-capability implementation matrix are `core-design/test.md`; an in-language benchmark runner
   remains a later consumer rather than part of this test capability.

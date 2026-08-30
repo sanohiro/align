@@ -249,9 +249,13 @@ parsing.
 Normal commands parse and check tests after closing and freezing the complete ordinary-source HIR
 prefix. Test roots and every artifact generated only while checking them append to a checked-HIR
 overlay. Production lowering validates the partition but consumes only the prefix; `explain-opt`
-therefore forms no overlay MIR/remark, while `db prepare` retains test diagnostics but forms no
-overlay static descriptor. Catalog records retain canonical module/name identity and source ordinal
-independently from overlay function symbols. Production cache/codegen identity uses the complete
+therefore forms no overlay MIR/remark. A database Query/command constructor remains an ordinary
+named top-level descriptor function formed in the prefix; test context cannot construct one, and a
+malformed database-consumer overlay descriptor rejects. `db prepare` needs no test mode and tests
+consume the same checked metadata offline. Catalog records retain canonical module/name identity and
+source ordinal independently from overlay function symbols. Test artifact formation reserves literal
+`main` for the harness, maps source `main` to the existing encoded identity, and maps catalog index
+`n` to hidden `align_test$<n-as-eight-lowercase-hex>`. Production cache/codegen identity uses the complete
 span-erased semantic prefix, but encodes the exact expression-ownership fact stream and semantic
 static-descriptor fields rather than dropping span-keyed side-table meaning. The checked prefix still
 retains current spans for diagnostics and located output. The exact grammar, name/catalog bounds,

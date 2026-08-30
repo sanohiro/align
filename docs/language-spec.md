@@ -1235,12 +1235,18 @@ pre-ack timeout/output is infrastructure failure. Parent control and capture rec
 nonblocking. Every verified terminal path signals the pinned group and then the still-unreaped
 direct PID before reap. SIGHUP, SIGINT, SIGQUIT, and SIGTERM receive bounded cleanup. Passing
 output is suppressed, while failure replays only the bounded stdout/stderr for that test, so a fully
-passing suite always has one summary line. No user `main` is required or invoked. Production
+passing suite always has one summary line. No user `main` is required or automatically invoked. Production
 commands complete and freeze the ordinary-source prefix before forming a separate test overlay for
 roots and every generated helper, monomorph, type, descriptor, and capability. They validate both
 partitions but omit the overlay from production MIR, interfaces, links, and artifacts;
-`explain-opt` also omits it from located MIR/remarks, and `db prepare` omits its queries from
-production static descriptors/native preparation. The signal controller remains installed through
+`explain-opt` also omits it from located MIR/remarks. Database Query/command constructors remain
+ordinary named top-level descriptor functions and are therefore prefix-owned; tests reuse their
+prepared metadata offline, and `db prepare` needs no test mode. The generated harness alone owns
+literal `main`; every permitted source-main ABI is encoded as an ordinary internal function without
+its production wrapper. Four exact compiler-private runtime functions own launch receive, fd
+close-on-exec, acknowledgement, and completion encoding/send. Production prefix selection covers
+one-shot/watch, whole/per-unit, ThinLTO, and PGO routes, while each accepted test option has one
+fixed terminal consumer. The signal controller remains installed through
 summary publication and a final blocked recheck before direct exit. Production codegen/cache
 identity is the complete span-erased semantic projection; current spans and located output may
 shift after an earlier test edit. Structurally ordered expression-ownership facts and semantic

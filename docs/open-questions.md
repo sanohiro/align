@@ -41,7 +41,12 @@ successful suite output is one summary line independent of test count. Productio
 test bodies only after closing and freezing an ordinary-source prefix; test roots and every
 generated helper, monomorph, type, descriptor, and capability live in a separate overlay. Production
 commands validate both partitions but consume only the frozen prefix, including for
-optimization remarks and database preparation descriptors. Its codegen/cache identity is the
+optimization remarks. Database Query/command descriptors remain ordinary named top-level
+production declarations, so tests reuse their prepared metadata offline and no test preparation
+mode exists. The harness is the sole literal `main`; all permitted source-main ABIs use the existing
+encoded internal identity without a production wrapper. Four exact compiler-private runtime
+functions close child launch/fd/acknowledgement/completion I/O. Production mode and accepted test
+option products each have explicit terminal-consumer owners. Its codegen/cache identity is the
 complete span-erased semantic projection; current spans/located metadata may shift. The fixed
 launch/acknowledgement ABI separates bounded harness setup failure from user termination, and the
 parent control and capture endpoints are nonblocking. The projection preserves structurally ordered

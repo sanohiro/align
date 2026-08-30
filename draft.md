@@ -2688,7 +2688,9 @@ bodies. Test roots and every helper, monomorph, nominal or interned type, static
 native capability generated only by tests append to a separate test overlay. Production consumers
 validate the complete checked result but can select only the frozen prefix; test consumers select
 the validated prefix-plus-overlay closure. A test-only edit cannot reorder or mutate production
-identities or artifacts.
+identities or artifacts. Database Query/command constructors remain restricted to ordinary named
+top-level descriptor functions, so they are always prefix-owned; a test can use one but cannot form
+an overlay database descriptor. `alignc test` consumes the same prepared metadata offline.
 
 `import core.test` admits exactly the qualified standalone assertion statements
 `test.expect(condition)` and `test.expect_eq(left, right)` within the lexical test body and its
@@ -2704,7 +2706,7 @@ location, then follows the test's Err cleanup edge with
 
 `alignc test <entry.align>` checks the explicit module closure, links one private test executable,
 and runs the deterministic dependency-first/source-order catalog sequentially, one fresh process
-group per test. It requires no user `main` and never invokes one. A compiler-owned completion record
+group per test. It requires no user `main` and never invokes one automatically. A compiler-owned completion record
 written only after a normal selected-test return prevents exit, exec, abort, or a crash from
 impersonating success. Each catalog row has a default 60-second deadline from pre-spawn through
 launch, execution, group signalling, capture drain, and direct-child reap (configurable through
@@ -2719,15 +2721,22 @@ exit. The runner retains its signal controller while writing the final
 summary, then blocks and rechecks those signals and exits directly, so restored prior handlers
 cannot change terminal output. Passing output is suppressed; a failure replays only that test's
 bounded evidence. A fully passing suite therefore emits one summary line regardless of test count.
-A zero-test command reports `alignc: no tests found` and builds no artifact. The exact grammar, bounds, record
-bytes, validation order, ownership, cache identity,
+A zero-test command reports `alignc: no tests found` and builds no artifact. The generated harness
+alone owns literal `main`; every permitted source-main ABI uses the existing encoded internal
+identity and no ordinary main wrapper is emitted. Four exact compiler-private runtime functions own
+launch receive, fd close-on-exec, acknowledgement, and completion encoding/send. Test target,
+profile, and runtime-LTO options reach both unit and harness objects; jobs/cache statistics and
+timeout/output terminate at scheduling/diagnostics and runner state. The exact grammar, bounds,
+record bytes, validation order, ownership, cache identity,
 reporting bytes, exclusions, and acceptance matrix are in `docs/impl/core-design/test.md`.
 
 Production commands parse and type-check test declarations, validate the prefix/overlay partition,
 and consume only the frozen production prefix for MIR, link capabilities, interfaces, and
 executables. This excludes the complete test-generated closure from `explain-opt` located
-MIR/remarks and excludes test-only queries from `db prepare` static descriptors and native
-preparation. A test-only edit may miss the source-keyed frontend cache but leaves the production
+MIR/remarks. All source-formable database descriptors are ordinary production declarations, so
+`db prepare` needs no test option and prepares the same metadata that tests consume offline. The
+prefix-only selector applies to one-shot/watch, whole/per-unit, ThinLTO, and PGO production routes.
+A test-only edit may miss the source-keyed frontend cache but leaves the production
 span-erased semantic HIR projection, semantic descriptor projection, MIR codegen graph, object key,
 link inputs, and executable bytes unchanged. Current HIR/descriptor spans and located metadata may
 shift after an earlier test edit and do not enter production codegen identity. The semantic

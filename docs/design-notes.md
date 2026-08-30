@@ -1311,7 +1311,10 @@ Codegen/cache identity projects that prefix without source spans: diagnostics an
 retain current offsets, while an earlier test edit cannot perturb production objects. The projection
 still encodes each expression's ownership fact in structural order and every semantic descriptor
 field, so span erasure cannot merge different cleanup or static-artifact meaning. Test mode has a
-separate cache identity and links the explicit import closure once.
+separate cache identity and links the explicit import closure once. Database descriptors are not an
+overlay exception requiring a second preparation workflow: their constructors remain ordinary
+named top-level descriptor functions formed in the prefix, and tests reuse that metadata offline.
+The prefix selector is exercised across one-shot/watch, whole/per-unit, ThinLTO, and PGO modes.
 
 Each catalog row runs that same immutable artifact in a fresh process group. Process isolation is
 the smallest boundary that contains a hard error, abort, exec, exit, or native crash without adding
@@ -1330,11 +1333,22 @@ acquisition through summary publication. Returning error paths restore prior han
 suite paths retain the controller, block and recheck those signals after the last write, then exit
 directly. A prior ignored or custom handler therefore cannot change a published terminal result.
 
+The test artifact also has one entry and one child-control boundary. Its generated harness alone
+owns literal `main`; every source-main ABI uses the existing encoded private identity and loses its
+ordinary production wrapper. Four exact unkeyed runtime functions own launch receive, fd
+close-on-exec, acknowledgement, and completion encoding/send, while the driver implements the
+independent peer codecs. Target/profile/runtime LTO reach unit and harness objects; jobs, cache
+statistics, timeout, and capture bounds each stop at their named scheduling, diagnostic, or runner
+consumer.
+
 Capture moves from a live row to an immutable quiesced row after child cleanup. A pass consumes and
 discards it; a failure retains it through the last direct reporting write and only then releases it.
 This makes a thousand passing tests produce the same one-line result as one passing test, without
 sacrificing the diagnostic bytes at the failure site. Terse success is therefore part of the runner
 contract, not an optional CI convention layered over an inherently noisy tool.
+Repository owner and CI commands preserve the same property with the existing quiet wrapper:
+success is phase/aggregate summaries, while failure or interruption replays the captured diagnostic
+log without changing selection or verdict.
 
 ---
 

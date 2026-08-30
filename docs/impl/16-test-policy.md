@@ -90,6 +90,14 @@ one successful summary that includes the observed status, while an unexpected
 zero replays the captured output and fails the wrapper. This keeps expected-red
 configuration owners terse without weakening their verdict.
 
+The planned `core.test` implementation follows the same output-volume boundary. Its focused owner
+commands and any CI phase that invokes them run through `scripts/run-quiet.sh` or the existing
+bounded-binary wrapper: success emits one phase/aggregate line, while failure or interruption
+replays the complete captured owner log. `ALIGN_QUIET_VERBOSE=1` remains the explicit investigation
+mode. This wrapper changes no test selection, timeout, concurrency, or verdict; the language
+runner's own one-line successful suite and failure-only bounded child evidence remain independently
+tested.
+
 The ordinary gate does not run:
 
 - the full driver regression corpus;

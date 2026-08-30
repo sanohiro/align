@@ -565,9 +565,13 @@ and freezes that complete production prefix. Only then does it check test bodies
 read-only prefix. A test reuses an identical production monomorph already in the prefix; otherwise
 the test demand and every transitive lifted/monomorph/type/resource product append only to the
 overlay. Test analyses may read validated production facts but publish their own mutable facts in
-the overlay. Test static descriptors stay in `test_static_descriptors`; `db prepare` and every
-production consumer see only `production_static_descriptors`. Native capability collection runs
-after selecting the production view or combined test view, never while checking a test body.
+the overlay. Permitted non-database test static descriptors stay in `test_static_descriptors`; a
+database Query/command descriptor cannot be source-formed there because its constructor remains the
+complete body of an ordinary named top-level descriptor function, and the combined validator
+rejects a handcrafted database consumer in the overlay. `db prepare` therefore sees every
+source-formable database descriptor in `production_static_descriptors`; `alignc test` reuses the
+same offline policy/driver metadata. Native capability collection runs after selecting the
+production view or combined test view, never while checking a test body.
 
 The validator proves the partition rather than trusting storage location alone. The production
 program validates independently and has no test back-reference. The combined validator resolves
@@ -577,7 +581,8 @@ suffix, and test static descriptors—must equal the closure reachable from the 
 through every checked-HIR reference or generation edge, including direct calls, function values,
 callback/destructor descriptors, lifted targets, nominal field/variant/resource types, interned
 type members, and transitive function/type/resource monomorph demands. It rejects any
-production-prefix edge to an overlay suffix. Owner matrices cover a test lambda, a test-only generic
+production-prefix edge to an overlay suffix and any database-consumer overlay descriptor. Owner
+matrices cover a test lambda, a test-only generic
 monomorph, the same monomorph demanded by production and test, every test-only nominal/interned type
 class, capability library use, and static descriptor. Adding or editing only tests must leave the
 canonical span-erased semantic/codegen projection of the production Program, semantic descriptor
