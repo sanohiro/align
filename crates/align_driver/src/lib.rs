@@ -2654,6 +2654,45 @@ fn direct_user_dependencies(loaded: &[LoadedUnit]) -> HashMap<String, Vec<String
         .collect()
 }
 
+fn test_catalog_reachable_modules(
+    loaded: &[LoadedUnit],
+    direct: &HashMap<String, Vec<String>>,
+) -> std::collections::HashSet<String> {
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (module, dependencies) in direct {
+        for dependency in dependencies {
+            dependents
+                .entry(dependency.as_str())
+                .or_default()
+                .push(module.as_str());
+        }
+    }
+
+    let mut reachable = loaded
+        .iter()
+        .filter(|unit| {
+            unit.ast
+                .items
+                .iter()
+                .any(|item| matches!(item, align_ast::Item::Test(_)))
+        })
+        .map(|unit| unit.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut pending = reachable.iter().cloned().collect::<Vec<_>>();
+    while let Some(dependency) = pending.pop() {
+        for dependent in dependents
+            .get(dependency.as_str())
+            .into_iter()
+            .flat_map(|modules| modules.iter())
+        {
+            if reachable.insert((*dependent).to_owned()) {
+                pending.push((*dependent).to_owned());
+            }
+        }
+    }
+    reachable
+}
+
 fn dependency_first_unit_paths(
     loaded: &[LoadedUnit],
     direct: &HashMap<String, Vec<String>>,
@@ -3059,6 +3098,11 @@ fn walk_inner(
         .collect();
     // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
     let direct_deps = direct_user_dependencies(&loaded);
+    let test_catalog_modules = if test_mode {
+        test_catalog_reachable_modules(&loaded, &direct_deps)
+    } else {
+        Default::default()
+    };
 
     // Bottom-up (dependency-first) order: DFS post-order from the entry unit. All loaded units are
     // reachable from the entry (they were loaded by following its imports). A `visited` guard makes
@@ -3421,12 +3465,7 @@ fn walk_inner(
                         direct_deps
                             .get(&u.path)
                             .is_some_and(|imports| imports.iter().any(|path| path == dependency))
-                            && by_path.get(dependency).is_some_and(|unit| {
-                                unit.ast
-                                    .items
-                                    .iter()
-                                    .any(|item| matches!(item, align_ast::Item::Test(_)))
-                            })
+                            && test_catalog_modules.contains(dependency)
                     });
             if test_catalog_import {
                 continue;

@@ -1179,7 +1179,7 @@ fn drain_control(
             Ok(count) => {
                 let record = &record[..count];
                 if !*acknowledged {
-                    if decode_ack(record, ordinal) {
+                    if record_detail.is_none() && decode_ack(record, ordinal) {
                         *acknowledged = true;
                     } else {
                         record_detail.get_or_insert("order");
@@ -2294,6 +2294,24 @@ mod tests {
             .expect("control drain");
         assert!(acknowledged);
         assert_eq!(completion, Some(Completion::Ok));
+        assert_eq!(detail, Some("order"));
+
+        let (parent, child) = UnixDatagram::pair().expect("control pair");
+        parent.set_nonblocking(true).expect("nonblocking parent");
+        child.send(b"invalid").expect("malformed pre-ack record");
+        child
+            .send(b"ALTESTA\x01\x07\0\0\0\0\0\0\0")
+            .expect("late ack");
+        let mut acknowledged = false;
+        let mut completion = None;
+        let mut detail = None;
+        drain_control(&parent, 7, &mut acknowledged, &mut completion, &mut detail)
+            .expect("malformed pre-ack drain");
+        assert!(
+            !acknowledged,
+            "a later acknowledgement cannot erase a launch error"
+        );
+        assert_eq!(completion, None);
         assert_eq!(detail, Some("order"));
     }
 

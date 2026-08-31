@@ -84,11 +84,12 @@ fn catalog_harness_assertion_and_source_main_boundaries_execute_end_to_end() {
         "dep.align",
         "module dep\nimport core.test\ntest \"dependency\" { test.expect(true) }\n",
     );
+    scratch.write("bridge.align", "module bridge\nimport dep\n");
     scratch.write(
         "main.align",
         concat!(
             "module app\n",
-            "import dep\n",
+            "import bridge\n",
             "import core.test\n",
             "fn main() { print(999) }\n",
             "test \"passes\" { test.expect_eq(2 + 2, 4) }\n",
