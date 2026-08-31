@@ -503,8 +503,10 @@ compiler-internal ABI after checked-HIR validation.
 
 Checked HIR and MIR use one payloaded key type rather than six unrelated enum arms. Canonical type
 record version 3 assigns `Scalar::SignatureKey(kind)` leaf tag 39 followed by the exact one-byte
-kind, and `Ty::SignatureKey(kind)` leaf tag 63 followed by that byte. The next tags 40/64 remain
-unknown because the kind is payload, not another leaf family. Interface format 8 remains unchanged:
+kind, and `Ty::SignatureKey(kind)` leaf tag 63 followed by that byte. The kind is payload, not
+another leaf family. These were the next unknown tags at this capability boundary; the later
+accepted `std.log` design reserves 40/64 for `Scalar::Logger`/`Ty::Logger`. Interface format 8
+remains unchanged:
 these nominal paths use its existing length-prefixed UTF-8 type record. The producer and importer
 recognize all twelve bare/qualified paths, add `std.crypto` to reconstructed source only for the six
 qualified paths, and reconstruct Move/return-cleanup identity for both forms. Each key fingerprint

@@ -685,6 +685,30 @@ vary every descriptor-only span without changing the semantic descriptor project
 grammar, runner, cache, and process protocol remain owned by
 `core-design/test.md`.
 
+### Planned `std.log` type records (designed 2026-08-31; inactive until implementation)
+
+The accepted logging capability adds `Ty::Logger` and `Scalar::Logger` as one nominal Move-handle
+family. It does not give `log.level` a scalar shortcut: the closed tag-only type remains the ordinary
+`Ty::Enum`/`Scalar::Enum` aggregate `{ i32 tag }` through checked HIR and MIR. Each `LogNew`,
+`LogEnabled`, `LogLine`, and `LogLineBuilder` level child has that exact enum id and aggregate type;
+LLVM native-call lowering alone extracts validated field 0 for the runtime i32 argument.
+
+Canonical type record version 3 already reserves payloaded asymmetric-key tags
+`Ty::SignatureKey=63` and `Scalar::SignatureKey=39`. Logging reserves the next append-only leaf tags
+`Ty::Logger=64` and `Scalar::Logger=40`; 65 and 41 remain the next unknown Ty and Scalar tags.
+`Ty::Logger` encodes exactly as `[3, 0, 0, 0, 0, 64]`, while
+`Ty::Option(Scalar::Logger)` encodes exactly as `[3, 0, 0, 0, 0, 4, 40]`. Decoding either vector
+must return the identical semantic root. `[3, 0, 0, 0, 0, 65]` and
+`[3, 0, 0, 0, 0, 4, 41]` reject as unknown tags; a missing root tag, a missing payload, and a
+trailing byte reject before cache publication. Interface format 8 remains unchanged because both
+public logging types use the existing nominal named-type/enum grammar.
+
+The logging implementation activates the two type variants, all expression records, canonical
+encoder/decoder arms, compiler fingerprint, and exact bidirectional/malformed goldens atomically.
+The parameterized type-class and expression-envelope owners in `std-design/log.md` must fail on a
+missing variant, wrong enum id, wrong result type, lost writer region, unknown/truncated/trailing
+canonical byte, or native extraction before checked validation.
+
 ## Header-adjacent records
 
 | Record | Exact contract |

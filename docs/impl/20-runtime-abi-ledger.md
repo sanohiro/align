@@ -78,8 +78,9 @@ production `process.command` continues to select its shipped runtime entries unc
 | `TestAckV1` | A112: `i32 @align_rt_test_ack_v1(i32, i32)` | `extern "C" fn(i32, u32) -> i32` |
 | `TestReportV1` | A113: `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
-These declarations occupy A110 through A113; a later shape must start at A114. All four declarations
-carry the existing generated `nounwind` function attribute and no curated
+These declarations occupy A110 through A113. The accepted `std.log` design reserves A114 through
+A117 below, so A118 is the next unreserved shape. All four declarations carry the existing
+generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
 before I/O, performs one blocking datagram receive with a fixed 17-byte capacity and EINTR retry,
 requires the exact 16-byte `ALTESTL` v1 envelope with zero reserved bytes, and stores the decoded
@@ -98,6 +99,27 @@ successful `process.exec` closes it through close-on-exec or process termination
 harness returns. The independent driver codecs and the runtime codecs both pin the three semantic
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
+
+## Planned std.log extension (designed 2026-08-31; inactive until implementation)
+
+The accepted logging design reserves four new shapes and two existing-shape keyed rows atomically:
+
+| Planned runtime key | Exact symbol | Reserved ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `LogNew` | `align_rt_log_new` | A114: `ptr @SYM(ptr, i32)` | `unsafe extern "C" fn(*mut Writer, i32) -> *mut Logger` |
+| `LogEnabled` | `align_rt_log_enabled` | A115: `i32 @SYM(ptr, i32)` | `unsafe extern "C" fn(*mut Logger, i32) -> i32` |
+| `LogLine` | `align_rt_log_line` | A116: `i32 @SYM(ptr, i32, ptr, i64)` | `unsafe extern "C" fn(*mut Logger, i32, *const u8, i64) -> i32` |
+| `LogLineBuilder` | `align_rt_log_line_builder` | A117: `i32 @SYM(ptr, i32, ptr)` | `unsafe extern "C" fn(*mut Logger, i32, *mut Builder) -> i32` |
+| `LogFlush` | `align_rt_log_flush` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut Logger) -> i32` |
+| `LogFree` | `align_rt_log_free` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut Logger)` |
+
+None of these six keys, symbols, declarations, or definitions is active yet. The current shipped
+inventories therefore remain exactly 314 keyed, 331 base, and 339 maximum optional-probe records,
+and the current implemented shape range remains A00 through A113. Implementation activates all six
+rows together, changes those inventories to 320/337/345, and extends the implemented range through
+A117; A118 remains the next unreserved shape. No curated attribute, optional feature, or
+target-dependent row is promised. The public/runtime ownership and validation contract stays in
+`std-design/log.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 
