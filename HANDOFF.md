@@ -400,7 +400,8 @@ facts must live in this repository.
   rejection.
 - **Next language capability:** implement the accepted `std.log` ledger as the next self-hosting
   layer. Its explicit Move logger, level gate, first-error checkpoint, line transform, ABI delta,
-  and cross-layer closure matrix are fixed in `docs/impl/std-design/log.md`. The completed
+  writer-derived region provenance, and cross-layer closure matrix are fixed in
+  `docs/impl/std-design/log.md`. The completed
   align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

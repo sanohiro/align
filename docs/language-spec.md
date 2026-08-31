@@ -1207,16 +1207,19 @@ future declarative flag-spec can move `get_*` validation to compile time. (`draf
 
 `std.log` is a designed, not-yet-implemented explicit line sink. `log.level` is the Copy closed
 order `Debug < Info < Warn < Error < Off`; `log.new(writer, minimum) -> log.logger` consumes the
-writer into one nominal Move owner. A bound logger exposes `enabled(level) -> bool`,
-`line(level, str|string|builder) -> ()`, and `flush() -> Result<(), Error>`. Arguments are eager, so
+writer into one nominal Move owner while preserving its exact descriptor provenance and region. An
+owning writer still closes its fd, a static standard-stream writer still borrows its process fd,
+and a connection-derived logger cannot outlive its `tcp_conn`. A bound logger exposes
+`enabled(level) -> bool`, `line(level, str|string|builder) -> ()`, and
+`flush() -> Result<(), Error>`. Arguments are eager, so
 an `enabled` guard is the explicit way to skip template/builder construction. Enabled records use
 the exact prefixes `[DEBUG] ` / `[INFO] ` / `[WARN] ` / `[ERROR] `, escape backslash, LF, and CR as
 `\\`, `\n`, and `\r`, retain every other UTF-8 byte, and end with one LF. The allocation-free
 O(n) scan makes no atomicity, durability, terminal-safety, or cross-logger ordering promise.
 The first writer failure is retained: `line` stops and returns Unit, later lines are suppressed,
 and `flush` exposes that first failure through the fixed std `Error` mapping without another write.
-Logger Drop delegates to the writer's best-effort cleanup. There is no global logger, hidden clock
-or source metadata, structured-field/JSON mode, file constructor, dynamic level setter, async queue,
+Logger Drop delegates to the writer's best-effort flush/close-if-owned cleanup. There is no global
+logger, hidden clock or source metadata, structured-field/JSON mode, file constructor, dynamic level setter, async queue,
 fatal action, variadic formatter, or new `write_hex`; ordinary templates and builders are the one
 formatting path. The exact ledger is `docs/impl/std-design/log.md`. (`draft.md` §18.2.)
 

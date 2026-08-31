@@ -3900,9 +3900,10 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,
   no interior structure, total byte order, O(1), no allocation — admits `id`, rejects decimal).**
 - **std.log — DESIGNED 2026-08-31** — level-gated line logger; explicit Move logger consuming one
-  writer (no global state); best-effort lines with the first sink failure exposed by explicit
-  `flush`; allocation-free CR/LF/backslash line escaping; formatting stays the shipped
-  template/builder `write`/`write_int`/`write_bool`/`write_char`/`write_float` surface. `write_hex`
+  writer while preserving its descriptor region (no global state); best-effort lines with the first
+  sink failure exposed by explicit `flush`; allocation-free CR/LF/backslash line escaping;
+  formatting stays the shipped template/builder
+  `write`/`write_int`/`write_bool`/`write_char`/`write_float` surface. `write_hex`
   is not shipped and is not part of this capability. Exact contract and implementation closure
   matrix: `std-design/log.md`.
 - **core.codec** — columnar wire format, **data only, NOT RPC**; `codec.open` validates once then

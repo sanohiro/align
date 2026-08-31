@@ -1300,6 +1300,11 @@ threshold, lifetime, and cleanup owner. Moving the writer into a nominal logger 
 code from bypassing the level and first-error state, while the existing handle rules provide
 exactly-once Drop without a logging-specific ownership model.
 
+The transfer owns the writer handle, not every descriptor behind it. File writers retain owned-fd
+cleanup, standard streams retain their static process-fd borrow, and a logger made from a connection
+writer retains the connection-derived region. That distinction prevents the wrapper from laundering
+a borrowed descriptor into an owned or static one.
+
 The first release has one operation, `line`, instead of one method per level or a reflection-based
 structured-record API. Its explicit `log.level` argument keeps filtering data-driven without adding
 dynamic global configuration. `Off` is both the complete disabling threshold and a suppressed

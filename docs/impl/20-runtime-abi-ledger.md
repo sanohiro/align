@@ -73,12 +73,13 @@ production `process.command` continues to select its shipped runtime entries unc
 
 | Unkeyed key | Exact symbol and LLVM declaration | Exact Rust ABI |
 |---|---|---|
-| `TestLaunchRecvV1` | `i32 @align_rt_test_launch_recv_v1(i32, ptr)` | `extern "C" fn(i32, *mut u32) -> i32` |
-| `TestFdCloexecV1` | `i32 @align_rt_test_fd_cloexec_v1(i32)` | `extern "C" fn(i32) -> i32` |
-| `TestAckV1` | `i32 @align_rt_test_ack_v1(i32, i32)` | `extern "C" fn(i32, u32) -> i32` |
-| `TestReportV1` | `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
+| `TestLaunchRecvV1` | A110: `i32 @align_rt_test_launch_recv_v1(i32, ptr)` | `extern "C" fn(i32, *mut u32) -> i32` |
+| `TestFdCloexecV1` | A111: `i32 @align_rt_test_fd_cloexec_v1(i32)` | `extern "C" fn(i32) -> i32` |
+| `TestAckV1` | A112: `i32 @align_rt_test_ack_v1(i32, i32)` | `extern "C" fn(i32, u32) -> i32` |
+| `TestReportV1` | A113: `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
-All four declarations carry the existing generated `nounwind` function attribute and no curated
+These declarations occupy A110 through A113; a later shape must start at A114. All four declarations
+carry the existing generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
 before I/O, performs one blocking datagram receive with a fixed 17-byte capacity and EINTR retry,
 requires the exact 16-byte `ALTESTL` v1 envelope with zero reserved bytes, and stores the decoded

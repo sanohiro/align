@@ -3200,10 +3200,14 @@ l.flush() -> Result<(), Error>
 `Debug < Info < Warn < Error < Off`. A record is enabled when its level is not `Off` and is at
 least the logger's minimum; minimum `Off` disables all records. `log.new` consumes one existing
 `writer`, performs no I/O, and returns a nominal Move `log.logger` that solely owns that writer.
+It preserves the writer's descriptor provenance and exact region: an owning writer still closes its
+fd, a standard-stream writer still borrows its static process fd, and a connection-derived logger
+remains tied to its `tcp_conn`. Wrapping a writer never turns a borrowed fd into an owned or static
+fd.
 The logger follows the ordinary single-owner handle rules: it must be bound before a method call,
 may move through parameters, returns, fields, and scalar tagged payloads, and is rejected from
 collections, tuples, boxes, parallel transport, captures, globals, and native signatures. Logger
-Drop delegates once to the writer's best-effort flush/close cleanup.
+Drop delegates once to the writer's best-effort flush/close-if-owned cleanup.
 
 `line` evaluates receiver, level, and message eagerly and exactly once, then gates internally.
 Use `if l.enabled(level) { ... }` when construction of a disabled template or builder must also be

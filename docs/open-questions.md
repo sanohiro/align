@@ -27,6 +27,11 @@ explicit writer plus a minimum level. There is no process-global/default logger,
 configuration, file-opening shortcut, dynamic setter, or second ownership path. A bound logger has
 only `enabled(level)`, `line(level, str|string|builder)`, and `flush()`.
 
+Construction preserves the writer's exact descriptor provenance and region. Owning writers remain
+responsible for closing their fds, standard-stream writers keep their static process-fd borrow, and
+connection-derived loggers remain region-bound to their `tcp_conn`; wrapping cannot launder a
+borrowed descriptor into an owned or static one.
+
 Arguments remain eager; callers use the pure `enabled` predicate to guard material formatting work.
 An enabled record has one fixed level prefix, an allocation-free message transform that renders
 backslash/LF/CR as `\\`/`\n`/`\r`, and one final LF. Other UTF-8 bytes remain unchanged, so this is
