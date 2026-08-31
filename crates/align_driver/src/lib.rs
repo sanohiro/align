@@ -2151,6 +2151,134 @@ pub fn lower_to_mir_with_static_descriptors(
     Ok(mir)
 }
 
+fn dropped_resource_ids(program: &align_mir::Program, root: align_sema::Ty) -> Vec<u32> {
+    use align_sema::Ty;
+
+    let mut found = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    let mut structs = std::collections::HashSet::new();
+    let mut tuples = std::collections::HashSet::new();
+    let mut enums = std::collections::HashSet::new();
+    let mut tagged = std::collections::HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !align_sema::ty_mentions_resource(
+            ty,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        ) {
+            continue;
+        }
+        match ty {
+            Ty::Resource(id) => {
+                found.insert(id);
+            }
+            Ty::ResourceRef(_) | Ty::HttpReadStream | Ty::HttpSseStream => {}
+            Ty::Array(value, _)
+            | Ty::DynArray(value)
+            | Ty::Option(value)
+            | Ty::Task(value)
+            | Ty::Box(value)
+            | Ty::ArrayBuilder(value) => work.push(align_sema::scalar_to_ty(value)),
+            Ty::Result(ok, err) => {
+                work.push(align_sema::scalar_to_ty(err));
+                work.push(align_sema::scalar_to_ty(ok));
+            }
+            Ty::Struct(id) if structs.insert(id) => {
+                if let Some(definition) = program.structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if tuples.insert(id) => {
+                if let Some(definition) = program.tuples.get(id as usize) {
+                    work.extend(
+                        definition
+                            .elems
+                            .iter()
+                            .rev()
+                            .copied()
+                            .map(align_sema::scalar_to_ty),
+                    );
+                }
+            }
+            Ty::Enum(id) if enums.insert(id) => {
+                if let Some(definition) = program.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(align_sema::scalar_to_ty),
+                    );
+                }
+            }
+            Ty::Tagged(id) if tagged.insert(id) => {
+                if let Some(definition) = program.tagged_types.get(id as usize) {
+                    match *definition {
+                        align_sema::hir::TaggedType::Option(value) => {
+                            work.push(align_sema::scalar_to_ty(value));
+                        }
+                        align_sema::hir::TaggedType::Result(ok, err) => {
+                            work.push(align_sema::scalar_to_ty(err));
+                            work.push(align_sema::scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _) => work.push(Ty::Struct(id)),
+            // The shared classifier is exhaustive over every resource-bearing type. If a future
+            // owning carrier reaches here before this exact-id traversal learns its shape, include
+            // every hook rather than silently permitting an implicit process edge.
+            _ => found.extend(
+                program
+                    .resources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, _)| u32::try_from(id).ok()),
+            ),
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn test_function_targets(
+    program: &align_mir::Program,
+    function: &align_mir::Function,
+) -> Option<(
+    std::collections::BTreeSet<align_mir::ProgramCall>,
+    std::collections::BTreeSet<align_mir::ProgramCall>,
+)> {
+    use align_mir::Stmt;
+
+    let mut targets = referenced_program_calls(function);
+    let mut resource_hooks = std::collections::BTreeSet::new();
+    for block in &function.blocks {
+        for statement in &block.stmts {
+            let dropped = match statement {
+                Stmt::Drop(slot) => function.slots.get(*slot as usize).copied(),
+                Stmt::DropValue(operand) => Some(function.operand_ty(operand)),
+                Stmt::DropElem(_, _, struct_id) => Some(align_sema::Ty::Struct(*struct_id)),
+                _ => None,
+            };
+            let Some(dropped) = dropped else { continue };
+            for resource_id in dropped_resource_ids(program, dropped) {
+                let resource = program.resources.get(resource_id as usize)?;
+                let target =
+                    align_mir::ProgramCall::try_from_logical(&resource.drop_hook).ok()?;
+                resource_hooks.insert(target.clone());
+                targets.insert(target);
+            }
+        }
+    }
+    Some((targets, resource_hooks))
+}
+
 fn test_reachable_process_command(
     program: &align_mir::Program,
     roots: &[align_sema::CheckedTest],
@@ -2181,7 +2309,12 @@ fn test_reachable_process_command(
                 }
             }
         }
-        let targets = referenced_program_calls(function);
+        let Some((targets, resource_hooks)) = test_function_targets(program, function) else {
+            return true;
+        };
+        if resource_hooks.iter().any(|target| !functions.contains_key(target)) {
+            return true;
+        }
         pending.extend(targets.into_iter().rev());
     }
     false
@@ -2212,9 +2345,9 @@ pub fn lower_test_to_mir_with_static_descriptors(
         .as_ref()
         .ok_or_else(|| "no tests found".to_owned())?;
     validate_test_overlay_descriptors(&overlay.static_descriptors)?;
-    let mut mir = lower_memoized(
+    let mut mir = align_mir::lower_test_program_checked(
         &overlay.program,
-        "whole-program-test-located",
+        &overlay.tests,
         false,
         Some(source_map),
     )
@@ -3452,8 +3585,12 @@ fn walk_inner(
                 let test = if test_mode {
                     let (mut test_mir, tests) = match test_overlay {
                         Some(overlay) => {
-                            let lowered =
-                                try_lower_to_mir_per_unit_located(&overlay.program, source_map);
+                            let lowered = align_mir::lower_test_program_checked(
+                                &overlay.program,
+                                &overlay.tests,
+                                true,
+                                Some(source_map),
+                            );
                             let test_mir = match lowered {
                                 Ok(mir) => mir,
                                 Err(rejected) => {
@@ -4443,6 +4580,44 @@ fn test_units_reach_process_command(units: &[TestPerUnitArtifact]) -> bool {
             definitions.entry(name.clone()).or_insert(unit_index);
         }
     }
+    // An interface-only consumer carries a compiler-private surrogate resource hook. Resolve that
+    // imported identity back to the declaring unit's real hook before walking the call graph; the
+    // backend performs the same ownership-preserving substitution when it forms the resource
+    // thunk. Any malformed or contradictory alias fails the closed test boundary.
+    let mut declared_resource_hooks = HashMap::new();
+    for unit in units {
+        for resource in &unit.mir.resources {
+            if resource.declaring_module != unit.unit {
+                continue;
+            }
+            let Ok(hook) = align_mir::ProgramCall::try_from_logical(&resource.drop_hook) else {
+                return true;
+            };
+            if declared_resource_hooks
+                .insert(resource.name.as_str(), hook.clone())
+                .is_some_and(|existing| existing != hook)
+            {
+                return true;
+            }
+        }
+    }
+    let mut resource_hook_aliases = HashMap::new();
+    for unit in units {
+        for resource in &unit.mir.resources {
+            let Some(actual) = declared_resource_hooks.get(resource.name.as_str()) else {
+                continue;
+            };
+            let Ok(alias) = align_mir::ProgramCall::try_from_logical(&resource.drop_hook) else {
+                return true;
+            };
+            if resource_hook_aliases
+                .insert(alias, actual.clone())
+                .is_some_and(|existing| existing != *actual)
+            {
+                return true;
+            }
+        }
+    }
     let mut pending = Vec::new();
     for (unit_index, unit) in units.iter().enumerate().rev() {
         pending.extend(unit.tests.iter().rev().filter_map(|test| {
@@ -4471,7 +4646,23 @@ fn test_units_reach_process_command(units: &[TestPerUnitArtifact]) -> bool {
         }) {
             return true;
         }
-        for target in referenced_program_calls(function).into_iter().rev() {
+        let Some((targets, resource_hooks)) =
+            test_function_targets(&units[unit_index].mir, function)
+        else {
+            return true;
+        };
+        for target in targets
+            .into_iter()
+            .rev()
+        {
+            let implicit_resource_hook = resource_hooks.contains(&target);
+            let target = resource_hook_aliases.get(&target).cloned().unwrap_or(target);
+            if implicit_resource_hook
+                && !local[unit_index].contains_key(&target)
+                && !definitions.contains_key(&target)
+            {
+                return true;
+            }
             let target_unit = if local[unit_index].contains_key(&target) {
                 unit_index
             } else {

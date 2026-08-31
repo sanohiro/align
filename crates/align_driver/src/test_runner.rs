@@ -755,6 +755,17 @@ fn cleanup_deadline() -> Instant {
     now.checked_add(CLEANUP_TIMEOUT).unwrap_or(now)
 }
 
+fn row_deadlines(started: Instant, timeout_ns: u64) -> (Instant, Instant) {
+    let timeout = Duration::from_nanos(timeout_ns);
+    let row_deadline = started.checked_add(timeout).unwrap_or(started);
+    // The public timeout bounds launch, execution, and cleanup together. Stop ordinary work before
+    // the one terminal deadline so signalling and reap do not need a second budget. Very short
+    // rows retain half their budget; normal rows retain at most the established cleanup bound.
+    let cleanup_reserve = CLEANUP_TIMEOUT.min(timeout / 2);
+    let work_deadline = row_deadline.checked_sub(cleanup_reserve).unwrap_or(started);
+    (work_deadline, row_deadline)
+}
+
 fn cleanup_timed_out() -> io::Error {
     io::Error::from_raw_os_error(libc::ETIMEDOUT)
 }
@@ -1267,11 +1278,11 @@ fn quiesce_child(
     stderr_eof: &mut bool,
     stdout_exceeded: &mut bool,
     stderr_exceeded: &mut bool,
+    cleanup_deadline: Instant,
     mut interrupted: Option<i32>,
 ) -> Quiesced {
     let mut cleanup_error = None;
     let verified_group = child_guard.verified_group;
-    let cleanup_deadline = cleanup_deadline();
     if interrupted.is_none() {
         interrupted = controller.selected();
     }
@@ -1448,10 +1459,7 @@ fn run_row(
         stderr,
         stderr_write,
     )?;
-    let deadline = child
-        .started
-        .checked_add(Duration::from_nanos(limits.timeout_ns))
-        .unwrap_or(child.started);
+    let (deadline, row_deadline) = row_deadlines(child.started, limits.timeout_ns);
     let pid = child.pid;
     let mut child_guard = ChildGuard::new(pid);
     let mut stdout = child.stdout;
@@ -1646,6 +1654,7 @@ fn run_row(
         &mut stderr_eof,
         &mut stdout_exceeded,
         &mut stderr_exceeded,
+        row_deadline,
         interrupted,
     );
 
@@ -2152,6 +2161,84 @@ mod tests {
         let error =
             wait_process_group_empty(group, group_deadline).expect_err("live group disappeared");
         assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+    }
+
+    #[test]
+    #[ignore = "spawned by row_cleanup_reuses_original_deadline in an isolated process"]
+    fn row_cleanup_deadline_process_probe() {
+        let mut controller = SignalController::acquire().expect("signal controller");
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn cleanup deadline probe");
+        let pid = i32::try_from(child.id()).expect("child pid fits i32");
+        let mut child_guard = ChildGuard::new(pid);
+        let (parent_control, _child_control) = UnixDatagram::pair().expect("control pair");
+        parent_control
+            .set_nonblocking(true)
+            .expect("nonblocking control");
+        let stdout = File::open("/dev/null").expect("open null stdout");
+        let stderr = File::open("/dev/null").expect("open null stderr");
+        let mut acknowledged = true;
+        let mut completion = None;
+        let mut record_detail = None;
+        let mut stdout_bytes = reserve_capture(0).expect("stdout capture");
+        let mut stderr_bytes = reserve_capture(0).expect("stderr capture");
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut stdout_exceeded = false;
+        let mut stderr_exceeded = false;
+        let deadline = Instant::now();
+        let started = Instant::now();
+        let quiesced = quiesce_child(
+            &mut controller,
+            &mut child_guard,
+            parent_control,
+            stdout,
+            stderr,
+            0,
+            &mut acknowledged,
+            &mut completion,
+            &mut record_detail,
+            &mut stdout_bytes,
+            &mut stderr_bytes,
+            &mut stdout_eof,
+            &mut stderr_eof,
+            &mut stdout_exceeded,
+            &mut stderr_exceeded,
+            deadline,
+            Some(libc::SIGTERM),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "cleanup reset the expired row deadline and waited a new grace period"
+        );
+        if quiesced.status.is_none() {
+            reap_child(pid, cleanup_deadline()).expect("reap cleanup deadline probe");
+        }
+        assert_eq!(quiesced.interrupted, Some(libc::SIGTERM));
+        drop(child);
+    }
+
+    #[test]
+    fn row_cleanup_reuses_original_deadline() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "test_runner::tests::row_cleanup_deadline_process_probe",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("spawn cleanup deadline owner");
+        assert!(
+            output.status.success(),
+            "cleanup deadline probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -2783,6 +2783,8 @@ pub enum ValidationPass {
     DeclarationHeaders,
     /// `validate_hir::json_scan_validation_reason`.
     JsonScan,
+    /// `align_sema::checked_hir_test_catalog_is_valid` at the test-only lowering boundary.
+    TestCatalog,
     /// `validate_hir::body_only_metadata_is_valid`; carries the rejected function name.
     Bodies,
     /// `align_sema::checked_hir_body_facts_are_valid`.
@@ -2801,6 +2803,7 @@ impl ValidationPass {
             Self::NominalLink => "nominal_link_metadata_is_valid",
             Self::DeclarationHeaders => "declaration_header_metadata_is_valid",
             Self::JsonScan => "json_scan_validation_reason",
+            Self::TestCatalog => "checked_hir_test_catalog_is_valid",
             Self::Bodies => "body_only_metadata_is_valid",
             Self::BodyFacts => "checked_hir_body_facts_are_valid",
             Self::LoweringProducedNothing => "lowering",
@@ -2841,6 +2844,15 @@ pub fn lower_program_checked(
     per_unit: bool,
     source_map: Option<&SourceMap>,
 ) -> Result<Program, LoweringRejected> {
+    lower_program_checked_with_catalog(program, None, per_unit, source_map)
+}
+
+fn lower_program_checked_with_catalog(
+    program: &hir::Program,
+    tests: Option<&[align_sema::CheckedTest]>,
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<Program, LoweringRejected> {
     let rejected = |pass: ValidationPass, function: Option<String>| LoweringRejected {
         checked_fns: program.fns.len(),
         checked_structs: program.structs.len(),
@@ -2854,6 +2866,9 @@ pub fn lower_program_checked(
         }
         return Err(rejected(pass, function));
     }
+    if tests.is_some_and(|tests| !align_sema::checked_hir_test_catalog_is_valid(program, tests)) {
+        return Err(rejected(ValidationPass::TestCatalog, None));
+    }
     let lines = source_map.map(|sm| Rc::new(SourceLines::from_map(sm)));
     let mir = lower_program_unchecked(program, lines, per_unit);
     // Validation is not the only way a checked program can vanish: lowering itself must publish a
@@ -2864,6 +2879,18 @@ pub fn lower_program_checked(
         return Err(rejected(ValidationPass::LoweringProducedNothing, None));
     }
     Ok(mir)
+}
+
+/// Lower a compiler-produced combined test view after correlating its external catalog with the
+/// checked-HIR test roots and assertion identities. Production lowering deliberately has no catalog
+/// input and continues through [`lower_program_checked`].
+pub fn lower_test_program_checked(
+    program: &hir::Program,
+    tests: &[align_sema::CheckedTest],
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<Program, LoweringRejected> {
+    lower_program_checked_with_catalog(program, Some(tests), per_unit, source_map)
 }
 
 /// typed HIR -> MIR.
@@ -5228,7 +5255,7 @@ fn stmt_span(s: &hir::Stmt) -> Option<Span> {
         hir::Stmt::AssignElem { value, .. } => Some(value.span),
         hir::Stmt::Return(e) => e.as_ref().map(|e| e.span),
         hir::Stmt::Break { value, .. } => value.as_ref().map(|e| e.span),
-        hir::Stmt::TestAssert { condition, .. } => Some(condition.span),
+        hir::Stmt::TestAssert { span, .. } => Some(*span),
         hir::Stmt::Expr(e) => Some(e.span),
     }
 }
@@ -5682,6 +5709,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             kind,
             condition,
             canonical_id,
+            span,
         } => {
             let condition = lower_required!(b, lower_expr(b, condition), ());
             let passed = b.new_block();
@@ -5689,6 +5717,9 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             b.terminate(Term::Branch(condition, passed, failed));
 
             b.cur = failed;
+            // Lowering the condition updates the current debug span to its innermost expression.
+            // Restore the complete qualified call before publishing the user-visible location.
+            b.set_span(*span);
             let (line, column) = b.cur_line();
             let expected = match kind {
                 hir::TestAssertionKind::Expect => "true",

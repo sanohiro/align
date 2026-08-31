@@ -3686,8 +3686,9 @@ impl<'a> BodyValidator<'a> {
                         matches!(local.ty, Ty::StructArray(id, _) if id == *struct_id)
                     }
                 }
-                hir::Stmt::TestAssert { canonical_id, .. } => {
-                    !canonical_id.is_empty()
+                hir::Stmt::TestAssert { canonical_id, span, .. } => {
+                    valid_span(*span)
+                        && !canonical_id.is_empty()
                         && canonical_id.len() <= 1_024
                         && !canonical_id.chars().any(
                             |ch| matches!(ch, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}'),

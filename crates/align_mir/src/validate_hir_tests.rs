@@ -190,7 +190,7 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
-fn checked_test_program(source: &str) -> Result<hir::Program, &'static str> {
+fn checked_test_overlay(source: &str) -> Result<align_sema::TestOverlay, &'static str> {
     let mut diagnostics = Diagnostics::new();
     let tokens = tokenize(0, source, &mut diagnostics);
     let file = parse_file(tokens, &mut diagnostics);
@@ -206,10 +206,11 @@ fn checked_test_program(source: &str) -> Result<hir::Program, &'static str> {
     if diagnostics.has_errors() {
         return Err("test fixture must check");
     }
-    checked
-        .test_overlay
-        .map(|overlay| overlay.program)
-        .ok_or("test fixture must produce an overlay")
+    checked.test_overlay.ok_or("test fixture must produce an overlay")
+}
+
+fn checked_test_program(source: &str) -> Result<hir::Program, &'static str> {
+    checked_test_overlay(source).map(|overlay| overlay.program)
 }
 
 #[test]
@@ -1600,6 +1601,124 @@ fn test_function_origin_requires_the_exact_private_abi() -> Result<(), &'static 
     wrong_error.enums.push(definition);
     wrong_error.fns[test].ret = Ty::Result(Scalar::Unit, Scalar::Enum(other));
     assert_header_rejected("test function non-builtin Error", &wrong_error);
+    Ok(())
+}
+
+#[test]
+fn test_catalog_back_reference_and_assertion_identity_fail_closed() -> Result<(), &'static str> {
+    let overlay = checked_test_overlay(concat!(
+        "module app\nimport core.test\ntest \"shape\" { test.",
+        "expect(true) }\n",
+    ))?;
+    let source_map = SourceMap::new();
+    for per_unit in [false, true] {
+        assert!(
+            lower_test_program_checked(
+                &overlay.program,
+                &overlay.tests,
+                per_unit,
+                Some(&source_map),
+            )
+            .is_ok(),
+            "compiler-produced test view rejected"
+        );
+    }
+    let assert_catalog_rejected =
+        |program: &hir::Program,
+         tests: &[align_sema::CheckedTest],
+         per_unit,
+         accepted: &'static str|
+         -> Result<(), &'static str> {
+            let rejected = match lower_test_program_checked(
+                program,
+                tests,
+                per_unit,
+                Some(&source_map),
+            ) {
+                Err(rejected) => rejected,
+                Ok(_) => return Err(accepted),
+            };
+            assert_eq!(rejected.pass, ValidationPass::TestCatalog);
+            Ok(())
+        };
+
+    let mut wrong_root = overlay.tests.clone();
+    wrong_root[0].function.push_str("$stale");
+    for per_unit in [false, true] {
+        assert_catalog_rejected(
+            &overlay.program,
+            &wrong_root,
+            per_unit,
+            "stale catalog root published MIR",
+        )?;
+    }
+
+    let mut malformed_before_catalog = overlay.program.clone();
+    let malformed_root = malformed_before_catalog
+        .fns
+        .iter_mut()
+        .find(|function| function.origin == hir::FnOrigin::Test)
+        .ok_or("test fixture must contain a test function")?;
+    malformed_root.ret = Ty::Unit;
+    for per_unit in [false, true] {
+        let rejected = match lower_test_program_checked(
+            &malformed_before_catalog,
+            &wrong_root,
+            per_unit,
+            Some(&source_map),
+        ) {
+            Err(rejected) => rejected,
+            Ok(_) => return Err("malformed test HIR published before catalog validation"),
+        };
+        assert_eq!(rejected.pass, ValidationPass::DeclarationHeaders);
+    }
+
+    let mut sparse_ordinal = overlay.tests.clone();
+    sparse_ordinal[0].source_ordinal = 1;
+    for per_unit in [false, true] {
+        assert_catalog_rejected(
+            &overlay.program,
+            &sparse_ordinal,
+            per_unit,
+            "sparse catalog ordinal published MIR",
+        )?;
+    }
+
+    let mut invalid_catalog_span = overlay.tests.clone();
+    invalid_catalog_span[0].span.lo = invalid_catalog_span[0].span.hi.saturating_add(1);
+    for per_unit in [false, true] {
+        assert_catalog_rejected(
+            &overlay.program,
+            &invalid_catalog_span,
+            per_unit,
+            "invalid catalog span published MIR",
+        )?;
+    }
+
+    let mut wrong_assertion = overlay.program.clone();
+    let root = wrong_assertion
+        .fns
+        .iter_mut()
+        .find(|function| function.origin == hir::FnOrigin::Test)
+        .ok_or("test fixture must contain a test function")?;
+    let assertion = root
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|statement| match statement {
+            hir::Stmt::TestAssert { canonical_id, .. } => Some(canonical_id),
+            _ => None,
+        })
+        .ok_or("test fixture must contain an assertion")?;
+    assertion.push_str("$stale");
+    for per_unit in [false, true] {
+        assert_catalog_rejected(
+            &wrong_assertion,
+            &overlay.tests,
+            per_unit,
+            "assertion with another catalog identity published MIR",
+        )?;
+    }
     Ok(())
 }
 

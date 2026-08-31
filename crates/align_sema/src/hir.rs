@@ -499,6 +499,10 @@ pub enum Stmt {
         kind: TestAssertionKind,
         condition: Expr,
         canonical_id: String,
+        /// Span of the complete qualified `test.expect*` call. The condition has its own span and
+        /// may be multiline, so it cannot stand in for the user-visible assertion location.
+        #[serde(skip)]
+        span: Span,
     },
     Expr(Expr),
 }

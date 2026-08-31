@@ -4865,6 +4865,86 @@ pub struct CheckedTest {
     pub span: Span,
 }
 
+/// Validate the compiler-private catalog back-reference carried beside a combined test HIR view.
+///
+/// Ordinary checked-HIR validation can prove that an assertion occurs only in a test-origin
+/// function, but the public catalog identity intentionally lives outside [`hir::Program`]. Test
+/// lowering must therefore supply the catalog and close the remaining relation explicitly: every
+/// catalog root names one exact test-origin function, every test-origin function has one root, and
+/// every assertion in that body repeats that root's canonical id.
+pub fn checked_hir_test_catalog_is_valid(program: &hir::Program, tests: &[CheckedTest]) -> bool {
+    if tests.len() > 65_535 {
+        return false;
+    }
+    let mut roots = HashMap::with_capacity(tests.len());
+    let mut canonical_ids = HashSet::with_capacity(tests.len());
+    let mut completed_modules = HashSet::with_capacity(tests.len());
+    let mut current_module = None;
+    let mut expected_ordinal = 0u32;
+    for test in tests {
+        if current_module != Some(test.module.as_str()) {
+            if !completed_modules.insert(test.module.as_str()) {
+                return false;
+            }
+            current_module = Some(test.module.as_str());
+            expected_ordinal = 0;
+        }
+        if test.module.is_empty()
+            || test.module.len() > 1_021
+            || test.name.is_empty()
+            || test.name.len() > 256
+            || test.canonical_id.is_empty()
+            || test.canonical_id.len() > 1_024
+            || test.canonical_id.chars().any(|ch| {
+                matches!(ch as u32, 0x00..=0x1f | 0x7f..=0x9f)
+            })
+            || test.function.is_empty()
+            || test.function.as_bytes().contains(&0)
+            || test.span.lo > test.span.hi
+            || test.source_ordinal != expected_ordinal
+        {
+            return false;
+        }
+        let expected_id = format!("{}::{}", test.module, test.name);
+        let synthetic_name = test_synthetic_source_name(&test.canonical_id);
+        let imported_name = format!("{}${synthetic_name}", test.module);
+        if test.canonical_id != expected_id
+            || (test.function != synthetic_name && test.function != imported_name)
+            || !canonical_ids.insert(test.canonical_id.as_str())
+            || roots
+                .insert(test.function.as_str(), test.canonical_id.as_str())
+                .is_some()
+        {
+            return false;
+        }
+        let Some(next) = expected_ordinal.checked_add(1) else {
+            return false;
+        };
+        expected_ordinal = next;
+    }
+
+    for function in &program.fns {
+        if function.origin != hir::FnOrigin::Test {
+            continue;
+        }
+        let Some(expected) = roots.remove(function.name.as_str()) else {
+            return false;
+        };
+        if hir_depth::body_events(&function.body).into_iter().any(|event| {
+            matches!(
+                event,
+                hir_depth::BodyEvent::StmtEnter(hir::Stmt::TestAssert {
+                    canonical_id,
+                    ..
+                }) if canonical_id != expected
+            )
+        }) {
+            return false;
+        }
+    }
+    roots.is_empty()
+}
+
 /// The validated combined test view. Production consumers never receive this record.
 #[derive(Clone, Debug)]
 pub struct TestOverlay {
@@ -43029,6 +43109,7 @@ impl<'a, 't> Checker<'a, 't> {
             },
             condition,
             canonical_id,
+            span: expression.span,
         })
     }
 

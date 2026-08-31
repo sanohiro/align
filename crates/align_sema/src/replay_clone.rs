@@ -257,11 +257,12 @@ fn clone_stmt(clones: &mut ChildValues, stmt: &Stmt) -> Option<Stmt> {
             accepted: *accepted,
         },
         Stmt::TestAssert {
-            kind, canonical_id, ..
+            kind, canonical_id, span, ..
         } => Stmt::TestAssert {
             kind: *kind,
             condition: clones.expr()?,
             canonical_id: canonical_id.clone(),
+            span: *span,
         },
         Stmt::Expr(_) => Stmt::Expr(clones.expr()?),
     })
@@ -1842,6 +1843,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     kind: _,
                     condition,
                     canonical_id,
+                    span: _,
                 } => {
                     drop(canonical_id);
                     work.push(DropWork::Expr(condition));

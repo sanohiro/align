@@ -23,6 +23,9 @@ impl Scratch {
 
     fn write(&self, name: &str, source: &str) -> PathBuf {
         let path = self.0.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create Align source parent");
+        }
         std::fs::write(&path, source).expect("write Align source");
         path
     }
@@ -72,6 +75,10 @@ fn catalog_harness_assertion_and_source_main_boundaries_execute_end_to_end() {
             "fn main() { print(999) }\n",
             "test \"passes\" { test.expect_eq(2 + 2, 4) }\n",
             "test \"fails\" { test.expect(false) }\n",
+            "test \"multiline\" {\n",
+            "  test.expect(true\n",
+            "    && false)\n",
+            "}\n",
         ),
     );
     let output = scratch.run(&["test", "main.align"]);
@@ -86,10 +93,14 @@ fn catalog_harness_assertion_and_source_main_boundaries_execute_end_to_end() {
             "FAIL app::fails\n",
             "reason: returned Error.Invalid\n",
             "--- stderr ---\n",
-            "assertion failed: app::fails:6:28: expected true\n",
-            "test result: FAILED. 2 passed; 1 failed\n",
+            "assertion failed: app::fails:6:16: expected true\n",
+            "FAIL app::multiline\n",
+            "reason: returned Error.Invalid\n",
+            "--- stderr ---\n",
+            "assertion failed: app::multiline:8:3: expected true\n",
+            "test result: FAILED. 2 passed; 2 failed\n",
         ),
-        "dependency-first catalog, assertion location, or source-main suppression drifted"
+        "dependency-first catalog, assertion location, or source-main suppression drifted: {output:?}"
     );
     assert!(
         output.stderr.is_empty(),
@@ -236,6 +247,85 @@ fn zero_tests_and_reachable_process_command_fail_before_artifact_formation() {
         imported.stderr,
         b"process.command is not available from test code; run the external process in an owner test\n"
     );
+
+    for (label, binding) in [
+        ("direct-resource-drop", "owner := test.resource.open()"),
+        ("nested-resource-drop", "owner := test.resource.boxed()"),
+    ] {
+        let scratch = Scratch::new(label);
+        scratch.write(
+            "test/resource/internal.align",
+            concat!(
+                "module test.resource.internal\n",
+                "import std.process\n",
+                "pub fn drop_handle(handle: raw) {\n",
+                "  unsafe {\n",
+                "    command := process.command(\"/bin/echo\", [\"/bin/echo\", \"no\"])\n",
+                "    raw.free(handle)\n",
+                "  }\n",
+                "}\n",
+            ),
+        );
+        scratch.write(
+            "test/resource.align",
+            concat!(
+                "module test.resource\n",
+                "import test.resource.internal\n",
+                "pub resource Handle<T> = test.resource.internal.drop_handle\n",
+                "pub Owner { handle: Handle<i32> }\n",
+                "pub fn open() -> Handle<i32> { unsafe { return resource.from_raw(raw.alloc(8)) } }\n",
+                "pub fn boxed() -> Owner = Owner { handle: open() }\n",
+            ),
+        );
+        let entry = scratch.write(
+            "main.align",
+            &format!(
+                "module app\nimport core.test\nimport test.resource\ntest \"drop hook boundary\" {{ {binding} }}\n"
+            ),
+        );
+        let source = std::fs::read_to_string(&entry).expect("read resource Drop entry");
+        let mut source_map = align_span::SourceMap::new();
+        let checked = align_driver::check(
+            &mut source_map,
+            entry.to_str().expect("UTF-8 scratch path"),
+            &source,
+        );
+        assert!(!checked.diags.has_errors(), "{label}: frontend rejected fixture");
+        let whole_error = align_driver::lower_test_to_mir_with_static_descriptors(
+            &checked,
+            &mut source_map,
+            &scratch.0,
+        )
+        .expect_err("whole-program lowering permitted an implicit process edge");
+        assert_eq!(
+            whole_error,
+            "process.command is not available from test code; run the external process in an owner test",
+            "{label}: whole-program boundary"
+        );
+        let mut per_unit_source_map = align_span::SourceMap::new();
+        let per_unit = align_driver::build_test_per_unit_at(
+            &mut per_unit_source_map,
+            entry.to_str().expect("UTF-8 scratch path"),
+            &source,
+            &entry,
+        );
+        assert!(!per_unit.diags.has_errors(), "{label}: per-unit fixture rejected");
+        assert_eq!(
+            per_unit.boundary_error.as_deref(),
+            Some(
+                "process.command is not available from test code; run the external process in an owner test"
+            ),
+            "{label}: per-unit implicit resource Drop bypassed the process boundary"
+        );
+        let output = scratch.run(&["test", "main.align"]);
+        assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+        assert!(output.stdout.is_empty(), "{label}: {output:?}");
+        assert_eq!(
+            output.stderr,
+            b"process.command is not available from test code; run the external process in an owner test\n",
+            "{label}: implicit resource Drop bypassed the process boundary"
+        );
+    }
 }
 
 #[test]
