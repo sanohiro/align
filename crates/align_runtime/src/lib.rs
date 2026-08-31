@@ -14513,8 +14513,7 @@ fn test_send_record_v1(fd: i32, record: &[u8]) -> i32 {
 /// `out_ordinal` must be null or point to a writable, four-byte-aligned `u32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_test_launch_recv_v1(fd: i32, out_ordinal: *mut u32) -> i32 {
-    if out_ordinal.is_null() || !(out_ordinal as usize).is_multiple_of(core::mem::align_of::<u32>())
-    {
+    if out_ordinal.is_null() || !out_ordinal.is_aligned() {
         return libc::EINVAL;
     }
     unsafe { *out_ordinal = 0 };
@@ -14523,7 +14522,10 @@ pub unsafe extern "C" fn align_rt_test_launch_recv_v1(fd: i32, out_ordinal: *mut
     let received = loop {
         let received = test_recv_syscall(fd, &mut record);
         if received >= 0 {
-            break received as usize;
+            let Ok(received) = usize::try_from(received) else {
+                return libc::EIO;
+            };
+            break received;
         }
         if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             continue;

@@ -190,7 +190,7 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
-fn checked_test_program(source: &str) -> hir::Program {
+fn checked_test_program(source: &str) -> Result<hir::Program, &'static str> {
     let mut diagnostics = Diagnostics::new();
     let tokens = tokenize(0, source, &mut diagnostics);
     let file = parse_file(tokens, &mut diagnostics);
@@ -203,8 +203,13 @@ fn checked_test_program(source: &str) -> hir::Program {
         }],
         &mut diagnostics,
     );
-    assert!(!diagnostics.has_errors(), "test fixture must check");
-    checked.test_overlay.expect("test overlay").program
+    if diagnostics.has_errors() {
+        return Err("test fixture must check");
+    }
+    checked
+        .test_overlay
+        .map(|overlay| overlay.program)
+        .ok_or("test fixture must produce an overlay")
 }
 
 #[test]
@@ -1551,17 +1556,18 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
 }
 
 #[test]
-fn test_function_origin_requires_the_exact_private_abi() {
-    let base = checked_test_program("test \"shape\" {}\n");
+fn test_function_origin_requires_the_exact_private_abi() -> Result<(), &'static str> {
+    let base = checked_test_program("test \"shape\" {}\n")?;
     assert!(validate_hir::declaration_header_metadata_is_valid(&base));
     let test = base
         .fns
         .iter()
         .position(|function| function.origin == hir::FnOrigin::Test)
-        .expect("test function");
+        .ok_or("test fixture must contain a test function")?;
 
     let mut parameter = base.clone();
-    let local = parameter.fns[test].locals.len() as u32;
+    let local = u32::try_from(parameter.fns[test].locals.len())
+        .map_err(|_| "test fixture local count must fit u32")?;
     parameter.fns[test].params.push(local);
     parameter.fns[test]
         .param_modes
@@ -1581,18 +1587,20 @@ fn test_function_origin_requires_the_exact_private_abi() {
     assert_header_rejected("test function result", &result);
 
     let mut wrong_error = base.clone();
-    let other = wrong_error.enums.len() as u32;
+    let other = u32::try_from(wrong_error.enums.len())
+        .map_err(|_| "test fixture enum count must fit u32")?;
     let mut definition = wrong_error
         .enums
         .iter()
         .find(|definition| definition.name == "Error")
-        .expect("builtin Error")
-        .clone();
+        .cloned()
+        .ok_or("test fixture must contain builtin Error")?;
     definition.name = "OtherError".to_string();
     definition.source_name = "OtherError".to_string();
     wrong_error.enums.push(definition);
     wrong_error.fns[test].ret = Ty::Result(Scalar::Unit, Scalar::Enum(other));
     assert_header_rejected("test function non-builtin Error", &wrong_error);
+    Ok(())
 }
 
 #[test]

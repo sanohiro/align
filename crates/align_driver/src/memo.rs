@@ -48,7 +48,8 @@ const KEY_FORMAT_VERSION: u32 = 2;
 /// are charged a *proxy*: the length of the canonical rendering the store site already holds.
 ///
 /// ```text
-/// program    the HIR's `Debug` rendering        the retained artifact itself
+/// program    the production HIR plus optional   the retained production artifact and private
+///            test overlay `Debug` renderings    combined test view
 /// lowering   the HIR rendering built for the    the MIR is derived from it and of the same order
 ///            key (free)
 /// unit       the unit's key material (free)     contains the unit's full source and every
@@ -456,15 +457,21 @@ pub(crate) fn program_lookup(key: Hash128) -> Option<CachedProgram> {
 /// Retain one whole-program sema result. The caller must have established the canonical file-id
 /// assignment and that the program checked without errors.
 ///
-/// The retention charge is the HIR's own `Debug` length. Rendering it costs about 4 ms for the
-/// eight-module `pkg.db` program — 0.3% of the ~1.5 s sema step this insertion follows — and unlike
-/// the source length (which the retained HIR exceeds sevenfold) it tracks the artifact actually
-/// held.
+/// The retention charge is the production HIR's own `Debug` length plus the private test overlay's
+/// rendering when present. Rendering the production HIR costs about 4 ms for the eight-module
+/// `pkg.db` program — 0.3% of the ~1.5 s sema step this insertion follows — and unlike the source
+/// length (which the retained HIR exceeds sevenfold) it tracks the artifacts actually held. The
+/// overlay owns a second combined program, descriptors, and catalog, so omitting it would let test
+/// compilations exceed the configured retention budget without accounting.
 pub(crate) fn program_store(key: Hash128, program: CachedProgram) {
     if !enabled() {
         return;
     }
-    let charge = format!("{:?}", program.program).len() as u64;
+    let charge = u64::try_from(format!("{:?}", program.program).len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(program.test_overlay.as_ref().map_or(0, |overlay| {
+            u64::try_from(format!("{overlay:?}").len()).unwrap_or(u64::MAX)
+        }));
     let mut guard = store();
     if guard.programs.contains_key(&key) || !reserve(&mut guard, charge) {
         return;

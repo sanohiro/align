@@ -17,6 +17,7 @@ use super::signal_lease::DriverSignalLease;
 compile_error!("the test signal controller requires lock-free 32-bit atomics");
 
 const GRACEFUL_SIGNALS: [i32; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const ARBITRATION_IDLE: i32 = 0;
 const ARBITRATION_WRITING: i32 = -1;
 const ARBITRATION_PENDING_BASE: i32 = -1024;
@@ -140,8 +141,7 @@ impl SignalController {
 
         let setup = (|| {
             let (read, write) = signal_pipe()?;
-            let mut installed = 0usize;
-            for signal in GRACEFUL_SIGNALS {
+            for (installed, signal) in GRACEFUL_SIGNALS.into_iter().enumerate() {
                 let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
                 action.sa_sigaction = graceful_signal_handler as *const () as usize;
                 action.sa_flags = 0;
@@ -168,7 +168,6 @@ impl SignalController {
                     }
                     return Err(error);
                 }
-                installed += 1;
             }
             SIGNAL_STATE.store(ARBITRATION_IDLE, Ordering::Release);
             SIGNAL_PIPE_WRITE.store(write.as_raw_fd(), Ordering::Release);
@@ -717,16 +716,16 @@ fn signal_dispatch_error(attempt: SignalDispatch, terminal: bool) -> Option<io::
     }
 }
 
-fn kill_direct(pid: i32) -> io::Result<()> {
+fn kill_direct(pid: i32, deadline: Instant) -> io::Result<()> {
     match send_signal(pid, libc::SIGKILL) {
         TargetSignal::Sent => Ok(()),
-        TargetSignal::Missing if child_is_terminal(pid)? => Ok(()),
+        TargetSignal::Missing if child_is_terminal_until(pid, deadline)? => Ok(()),
         TargetSignal::Missing => Err(io::Error::from_raw_os_error(libc::ESRCH)),
         TargetSignal::Failed(error) => Err(error),
     }
 }
 
-fn child_is_terminal(pid: i32) -> io::Result<bool> {
+fn child_is_terminal_until(pid: i32, deadline: Instant) -> io::Result<bool> {
     let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
     loop {
         let result = unsafe {
@@ -745,28 +744,60 @@ fn child_is_terminal(pid: i32) -> io::Result<bool> {
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+        if Instant::now() >= deadline {
+            return Err(cleanup_timed_out());
+        }
     }
 }
 
-fn reap_child(pid: i32) -> io::Result<ExitStatus> {
+fn cleanup_deadline() -> Instant {
+    let now = Instant::now();
+    now.checked_add(CLEANUP_TIMEOUT).unwrap_or(now)
+}
+
+fn cleanup_timed_out() -> io::Error {
+    io::Error::from_raw_os_error(libc::ETIMEDOUT)
+}
+
+fn reap_child(pid: i32, deadline: Instant) -> io::Result<ExitStatus> {
     let mut status = 0;
     loop {
-        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if result == pid {
             return Ok(ExitStatus::from_raw(status));
+        }
+        if result == 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(cleanup_timed_out());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            continue;
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+        if Instant::now() >= deadline {
+            return Err(cleanup_timed_out());
+        }
     }
 }
 
-fn wait_process_group_empty(pid: i32) -> io::Result<()> {
+fn wait_process_group_empty(pid: i32, deadline: Instant) -> io::Result<()> {
     loop {
         match send_signal(-pid, 0) {
             TargetSignal::Missing => return Ok(()),
-            TargetSignal::Sent => std::thread::sleep(Duration::from_millis(1)),
+            TargetSignal::Sent => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(cleanup_timed_out());
+                }
+                // The leader is reaped immediately before this check. Keep the observation window
+                // finite so a persistent zombie or a subsequently reused PGID fails the row closed
+                // instead of hanging the runner or being followed into the next catalog row.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
             TargetSignal::Failed(error) => return Err(error),
         }
     }
@@ -791,28 +822,34 @@ impl ChildGuard {
         self.verified_group = true;
     }
 
-    fn kill(&self) -> io::Result<()> {
+    fn kill(&self, deadline: Instant) -> io::Result<()> {
         if self.verified_group {
             let attempt = signal_verified_targets(self.pid, libc::SIGKILL);
-            let terminal = child_is_terminal(self.pid)?;
+            let terminal = child_is_terminal_until(self.pid, deadline)?;
             target_signal_error(attempt, terminal).map_or(Ok(()), Err)
         } else {
-            kill_direct(self.pid)
+            kill_direct(self.pid, deadline)
         }
     }
 
-    fn reap(&mut self) -> io::Result<ExitStatus> {
-        let status = reap_child(self.pid)?;
+    fn reap(&mut self, deadline: Instant) -> io::Result<ExitStatus> {
+        let status = reap_child(self.pid, deadline)?;
         self.armed = false;
         Ok(status)
+    }
+
+    fn abandon(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.kill();
-            let _ = reap_child(self.pid);
+            let deadline = cleanup_deadline();
+            let _ = self.kill(deadline);
+            let _ = reap_child(self.pid, deadline);
+            self.armed = false;
         }
     }
 }
@@ -864,6 +901,9 @@ fn poll_row(
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Ok(());
         }
     }
 }
@@ -1231,6 +1271,7 @@ fn quiesce_child(
 ) -> Quiesced {
     let mut cleanup_error = None;
     let verified_group = child_guard.verified_group;
+    let cleanup_deadline = cleanup_deadline();
     if interrupted.is_none() {
         interrupted = controller.selected();
     }
@@ -1240,22 +1281,28 @@ fn quiesce_child(
         let grace_started = Instant::now();
         let grace_deadline = grace_started
             .checked_add(Duration::from_millis(250))
-            .unwrap_or(grace_started);
+            .unwrap_or(grace_started)
+            .min(cleanup_deadline);
         std::thread::sleep(grace_deadline.saturating_duration_since(Instant::now()));
         attempt
     });
     let kill_attempt = signal_child(child_guard.pid, verified_group, libc::SIGKILL);
 
     let terminal = loop {
-        match child_is_terminal(child_guard.pid) {
+        match child_is_terminal_until(child_guard.pid, cleanup_deadline) {
             Ok(true) => break true,
             Ok(false) => {
+                if Instant::now() >= cleanup_deadline {
+                    remember_cleanup_error(&mut cleanup_error, "wait", cleanup_timed_out());
+                    break false;
+                }
                 if interrupted.is_none() {
                     interrupted = controller.selected();
                 }
                 let wake = Instant::now()
                     .checked_add(Duration::from_millis(10))
-                    .unwrap_or_else(Instant::now);
+                    .unwrap_or_else(Instant::now)
+                    .min(cleanup_deadline);
                 if let Err(error) = poll_row(
                     controller.descriptor(),
                     parent_control.as_raw_fd(),
@@ -1340,17 +1387,25 @@ fn quiesce_child(
             remember_cleanup_error(&mut cleanup_error, "close", error);
         }
     }
-    let status = match child_guard.reap() {
-        Ok(status) => {
-            if verified_group && let Err(error) = wait_process_group_empty(child_guard.pid) {
-                remember_cleanup_error(&mut cleanup_error, "process group", error);
+    let status = if terminal {
+        match child_guard.reap(cleanup_deadline) {
+            Ok(status) => {
+                if verified_group
+                    && let Err(error) = wait_process_group_empty(child_guard.pid, cleanup_deadline)
+                {
+                    remember_cleanup_error(&mut cleanup_error, "process group", error);
+                }
+                Some(status)
             }
-            Some(status)
+            Err(error) => {
+                child_guard.abandon();
+                remember_cleanup_error(&mut cleanup_error, "reap", error);
+                None
+            }
         }
-        Err(error) => {
-            remember_cleanup_error(&mut cleanup_error, "reap", error);
-            None
-        }
+    } else {
+        child_guard.abandon();
+        None
     };
     if interrupted.is_none() {
         interrupted = controller.selected();
@@ -1362,6 +1417,9 @@ fn quiesce_child(
     }
 }
 
+// A row error deliberately retains both preallocated capture stores through terminal reporting.
+// Boxing it would add another allocation after child cleanup, outside that fixed evidence budget.
+#[allow(clippy::result_large_err)]
 fn run_row(
     controller: &mut SignalController,
     executable: &Path,
@@ -1536,9 +1594,13 @@ fn run_row(
         if stdout_exceeded || stderr_exceeded {
             break;
         }
-        match child_is_terminal(pid) {
+        match child_is_terminal_until(pid, deadline) {
             Ok(true) => break,
             Ok(false) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ETIMEDOUT) => {
+                timed_out = true;
+                break;
+            }
             Err(error) => {
                 event_error = Some(infrastructure("wait", &error));
                 break;
@@ -1937,6 +1999,159 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn set_sigpipe_mask(blocked: bool) {
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+        }
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(
+                    if blocked {
+                        libc::SIG_BLOCK
+                    } else {
+                        libc::SIG_UNBLOCK
+                    },
+                    &set,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+
+    fn sigpipe_is_blocked() -> bool {
+        let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut empty) };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &empty, &mut current) },
+            0
+        );
+        unsafe { libc::sigismember(&current, libc::SIGPIPE) == 1 }
+    }
+
+    fn sigpipe_is_pending() -> bool {
+        let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
+        unsafe { libc::sigismember(&pending, libc::SIGPIPE) == 1 }
+    }
+
+    #[test]
+    #[ignore = "spawned by controlled_write_sigpipe_process_owner in an isolated process"]
+    fn controlled_write_sigpipe_process_probe() {
+        let case = std::env::var("ALIGN_TEST_SIGPIPE_CASE").expect("SIGPIPE case");
+        let (initially_blocked, pre_pending, closed) = match case.as_str() {
+            "success-unblocked" => (false, false, false),
+            "success-blocked-pending" => (true, true, false),
+            "closed-unblocked" => (false, false, true),
+            "closed-blocked-pending" => (true, true, true),
+            _ => panic!("unknown SIGPIPE case `{case}`"),
+        };
+
+        let _original_action = install_action(libc::SIGPIPE, libc::SIG_DFL);
+        set_sigpipe_mask(initially_blocked);
+        if pre_pending {
+            assert_eq!(unsafe { libc::raise(libc::SIGPIPE) }, 0);
+            assert!(sigpipe_is_pending());
+        }
+
+        let controller = SignalController::acquire().expect("signal controller");
+        let (read, write) = capture_pipe().expect("writer pipe");
+        let mut read = Some(read);
+        if closed {
+            drop(read.take());
+        }
+        let result = controlled_write(&controller, write.as_raw_fd(), b"x");
+        if closed {
+            match result {
+                Err(TerminalWrite::Io(error)) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+                }
+                Err(TerminalWrite::Signal(signal)) => {
+                    panic!("closed sink selected signal {signal}")
+                }
+                Ok(()) => panic!("closed sink write succeeded"),
+            }
+            assert!(
+                sigpipe_is_blocked(),
+                "terminal EPIPE path restored the mask"
+            );
+            assert!(sigpipe_is_pending(), "terminal EPIPE path lost SIGPIPE");
+        } else {
+            match result {
+                Ok(()) => {}
+                Err(TerminalWrite::Io(error)) => panic!("successful sink failed: {error}"),
+                Err(TerminalWrite::Signal(signal)) => {
+                    panic!("successful sink selected signal {signal}")
+                }
+            }
+            assert_eq!(sigpipe_is_blocked(), initially_blocked);
+            assert_eq!(sigpipe_is_pending(), pre_pending);
+            let mut byte = [0_u8; 1];
+            read.as_mut()
+                .expect("open reader")
+                .read_exact(&mut byte)
+                .expect("read controlled byte");
+            assert_eq!(byte, [b'x']);
+        }
+        drop(controller);
+    }
+
+    #[test]
+    fn controlled_write_sigpipe_process_owner() {
+        for case in [
+            "success-unblocked",
+            "success-blocked-pending",
+            "closed-unblocked",
+            "closed-blocked-pending",
+        ] {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--ignored",
+                "--exact",
+                "test_runner::tests::controlled_write_sigpipe_process_probe",
+                "--test-threads=1",
+            ])
+            .env("ALIGN_TEST_SIGPIPE_CASE", case)
+            .output()
+            .expect("spawn SIGPIPE probe");
+            assert!(
+                output.status.success(),
+                "SIGPIPE probe `{case}` failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_waits_honor_deadlines() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn cleanup probe");
+        let child_pid = i32::try_from(child.id()).expect("child pid fits i32");
+        let child_deadline = Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .expect("child deadline");
+        let error = reap_child(child_pid, child_deadline).expect_err("live child reaped");
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        child.kill().expect("kill cleanup probe");
+        reap_child(child_pid, cleanup_deadline()).expect("reap cleanup probe");
+
+        let group = unsafe { libc::getpgrp() };
+        let group_deadline = Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .expect("group deadline");
+        let error =
+            wait_process_group_empty(group, group_deadline).expect_err("live group disappeared");
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
     }
 
     #[test]

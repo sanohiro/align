@@ -2342,9 +2342,11 @@ fn form_test_artifact(
         eprintln!("alignc: {error}");
         return Err(ExitCode::FAILURE);
     }
-    let cache_report = cache_stats
-        .then(|| cache_stats_text(&cache_outcomes, cache_enabled).into_bytes())
-        .unwrap_or_default();
+    let cache_report = if cache_stats {
+        cache_stats_text(&cache_outcomes, cache_enabled).into_bytes()
+    } else {
+        Vec::new()
+    };
 
     drop(object_inputs);
     drop(test_walk);

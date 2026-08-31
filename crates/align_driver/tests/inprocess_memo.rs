@@ -264,6 +264,77 @@ fn whole_program_check_and_lowering_replay() {
     );
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WholeTestView {
+    production: String,
+    overlay: String,
+    catalog: Vec<String>,
+}
+
+fn check_whole_test_view(tag: &str) -> WholeTestView {
+    let dependency = "module dep\ntest \"dependency\" {}\n";
+    let entry = "module app\nimport dep\ntest \"entry\" {}\n";
+    let proj = Proj::new(
+        tag,
+        &[("dep.align", dependency), ("main.align", entry)],
+        "main.align",
+    );
+    let path = proj.dir.join("main.align");
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, &path.display().to_string(), entry);
+    assert!(
+        !checked.diags.has_errors(),
+        "test fixture must check: {}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let overlay = checked.test_overlay.as_ref().expect("test overlay");
+    WholeTestView {
+        production: format!("{:?}", checked.hir),
+        overlay: format!("{overlay:?}"),
+        catalog: overlay
+            .tests
+            .iter()
+            .map(|test| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    test.module, test.name, test.canonical_id, test.source_ordinal, test.function
+                )
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn whole_program_memo_replays_and_charges_the_complete_test_overlay() {
+    let _guard = memo_guard(true);
+    let cold = check_whole_test_view("memo-whole-test-cold");
+    let cold_stats = memo::stats();
+    assert_eq!(cold_stats.program_hits, 0);
+    assert_eq!(cold_stats.program_misses, 1);
+    assert_eq!(
+        cold_stats.retained_bytes,
+        u64::try_from(cold.production.len() + cold.overlay.len()).expect("charge fits u64"),
+        "the retained combined test program and catalog must count against the budget"
+    );
+    assert_eq!(
+        cold.catalog
+            .iter()
+            .map(|record| record.split('|').nth(2).expect("canonical id"))
+            .collect::<Vec<_>>(),
+        ["dep::dependency", "app::entry"]
+    );
+
+    let warm = check_whole_test_view("memo-whole-test-warm");
+    let warm_stats = memo::stats();
+    assert_eq!(
+        warm, cold,
+        "a program memo hit must replay the complete test view"
+    );
+    assert_eq!(warm_stats.program_hits - cold_stats.program_hits, 1);
+    assert_eq!(warm_stats.program_misses, cold_stats.program_misses);
+    assert_eq!(warm_stats.retained_bytes, cold_stats.retained_bytes);
+}
+
 /// M1 fail-closed. The program memo's replayed HIR and diagnostics carry `FileId`s, so it is used
 /// only under the canonical `unit i owns FileId i` assignment. A walk handed a `SourceMap` that
 /// already holds files still compiles correctly — it simply does not consult the memo.
