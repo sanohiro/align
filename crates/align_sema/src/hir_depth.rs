@@ -458,6 +458,14 @@ fn walk_body_records<'a>(
                     arg: rhs,
                     ..
                 }
+                | ExprKind::LogNew {
+                    output: lhs,
+                    minimum: rhs,
+                }
+                | ExprKind::LogEnabled {
+                    logger: lhs,
+                    level: rhs,
+                }
                 | ExprKind::IoCopy {
                     reader: lhs,
                     writer: rhs,
@@ -666,6 +674,16 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(lhs), child_depth));
                     work.push((BodyRecord::Expr(rhs), child_depth));
                 }
+                ExprKind::LogLine {
+                    logger,
+                    level,
+                    message,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(message), child_depth));
+                    work.push((BodyRecord::Expr(level), child_depth));
+                    work.push((BodyRecord::Expr(logger), child_depth));
+                }
                 ExprKind::RawPointerLoad { ptr, offset } => {
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(ptr), child_depth));
@@ -770,6 +788,7 @@ fn walk_body_records<'a>(
                 | ExprKind::ReaderBuffered { reader: recv }
                 | ExprKind::BytesAsStr { bytes: recv }
                 | ExprKind::WriterFlush { writer: recv }
+                | ExprKind::LogFlush { logger: recv }
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
                 | ExprKind::FileLen { file: recv }

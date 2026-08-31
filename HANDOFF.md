@@ -11,7 +11,8 @@ _Last updated: 2026-08-31._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation and owner-test closure are complete against the accepted ledger. `std.log` is
-designed in `docs/impl/std-design/log.md`; implement it next as one cross-cutting capability.
+implemented against `docs/impl/std-design/log.md`; design `core.codec` next as the next
+self-hosting capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -390,18 +391,15 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `core.test` is implemented against
-  `docs/impl/core-design/test.md`. Private top-level Result tests, explicit Bool assertions,
-  production-prefix/test-overlay isolation, exact compiler-private child-control ABI, distinct
-  cache identity, one immutable linked artifact, and the bounded sequential process-group runner
-  ship together. The owner set fixes production artifact/interface identity, checked-HIR and
-  runtime ABI shape, catalog and harness bytes, timeout/output cleanup, graceful-signal numeric
-  exit, source-main isolation, reachable-`process.command` rejection, and transactional REPL
-  rejection.
-- **Next language capability:** implement the accepted `std.log` ledger as the next self-hosting
-  layer. Its explicit Move logger, level gate, first-error checkpoint, line transform, ABI delta,
-  writer-derived region provenance, and cross-layer closure matrix are fixed in
-  `docs/impl/std-design/log.md`. The completed
+- **Latest language capability:** `std.log` is implemented against
+  `docs/impl/std-design/log.md`. Its explicit Move logger consumes one writer without erasing the
+  writer's descriptor region, gates exact escaped line records through the closed five-level enum,
+  latches the first sink failure for explicit `flush` observation, and crosses whole-program and
+  per-unit compilation through six keyed runtime rows. The owner set closes checked-HIR, canonical
+  type identity, interface/generic carriers, runtime ABI/export parity, exact output, malformed
+  native inputs, and aggregate-to-native level-tag extraction.
+- **Next language capability:** author the `core.codec` public-contract ledger as the next
+  self-hosting layer before implementation. The completed
   align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

@@ -1360,6 +1360,7 @@ impl<'a> PlacementValidator<'a> {
             ),
             Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -1413,7 +1414,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::SignatureKey(_) => true,
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Scalar::ResponseBuilder => true,
+            Scalar::ResponseBuilder | Scalar::Logger => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
             Scalar::DynArray(_) => true,
@@ -1509,6 +1510,7 @@ impl<'a> PlacementValidator<'a> {
             }
             Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::Regex
@@ -1994,6 +1996,7 @@ impl<'a> Validator<'a> {
             | Ty::Builder
             | Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File
@@ -2056,6 +2059,7 @@ impl<'a> Validator<'a> {
             | Scalar::JsonDoc
             | Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3020,6 +3024,7 @@ impl<'a> BodyValidator<'a> {
                 .is_some_and(|field| field.ty == Ty::Str),
             Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File
@@ -3330,6 +3335,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::JsonDoc
             | Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -4017,6 +4023,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BytesAsStr { .. }
             | hir::ExprKind::WriterWrite { .. }
             | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::LogNew { .. }
+            | hir::ExprKind::LogEnabled { .. }
+            | hir::ExprKind::LogLine { .. }
+            | hir::ExprKind::LogFlush { .. }
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
@@ -4359,6 +4369,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderReadLine { .. }
             | hir::ExprKind::BytesAsStr { .. }
             | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::LogNew { .. }
+            | hir::ExprKind::LogEnabled { .. }
+            | hir::ExprKind::LogLine { .. }
+            | hir::ExprKind::LogFlush { .. }
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
@@ -4846,6 +4860,28 @@ impl<'a> BodyValidator<'a> {
                     buffered: false,
                 }
             ) && expression.ty == Ty::Writer
+    }
+
+    fn logger_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        self.local_handle_place(context, expression, Ty::Logger)
+    }
+
+    /// The runtime ABI accepts an i32 level, but checked HIR retains the ordinary nominal enum.
+    /// Validate the producer-owned builtin definition before any logger envelope can reach MIR.
+    fn log_level_ty(&self, ty: Ty) -> bool {
+        let Ty::Enum(id) = ty else {
+            return false;
+        };
+        let Some(definition) = self.program.enums.get(id as usize) else {
+            return false;
+        };
+        const NAMES: [&str; 5] = ["Debug", "Info", "Warn", "Error", "Off"];
+        definition.name == "log.level"
+            && definition.source_name == "log.level"
+            && definition.variants.len() == NAMES.len()
+            && definition.variants.iter().zip(NAMES).all(|(variant, expected)| {
+                variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
+            })
     }
 
     fn http_response_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -7887,6 +7923,39 @@ impl<'a> BodyValidator<'a> {
                 (self.writer_place(writer, context) && writer.ty == Ty::Writer)
                     .then(|| result(Ty::Unit, &[writer]))?
             }
+            hir::ExprKind::LogNew { output, minimum } => {
+                if output.ty != Ty::Writer
+                    || self.expr_flow(output)?.ty != Ty::Writer
+                    || !self.log_level_ty(minimum.ty)
+                {
+                    return None;
+                }
+                strict(Ty::Logger, &[output, minimum])
+            }
+            hir::ExprKind::LogEnabled { logger, level } => {
+                if !self.logger_place(logger, context)
+                    || logger.ty != Ty::Logger
+                    || !self.log_level_ty(level.ty)
+                {
+                    return None;
+                }
+                strict(Ty::Bool, &[logger, level])
+            }
+            hir::ExprKind::LogLine { logger, level, message, builder } => {
+                if !self.logger_place(logger, context)
+                    || logger.ty != Ty::Logger
+                    || !self.log_level_ty(level.ty)
+                    || (*builder && message.ty != Ty::Builder)
+                    || (!*builder && !matches!(message.ty, Ty::Str))
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[logger, level, message])
+            }
+            hir::ExprKind::LogFlush { logger } => {
+                (self.logger_place(logger, context) && logger.ty == Ty::Logger)
+                    .then(|| result(Ty::Unit, &[logger]))?
+            }
             hir::ExprKind::IoCopy { reader, writer } => {
                 if !self.reader_place(reader, context)
                     || !self.writer_place(writer, context)
@@ -8750,6 +8819,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::DictEncoded(_, _)
             | Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File

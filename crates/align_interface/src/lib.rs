@@ -1326,6 +1326,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("region", 0, BuiltinCapability::BorrowLeaf),
     ("reader", 0, BuiltinCapability::BorrowLeaf),
     ("writer", 0, BuiltinCapability::BorrowLeaf),
+    ("log.logger", 0, BuiltinCapability::BorrowLeaf),
     ("http_read_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_sse_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_sse_event", 0, BuiltinCapability::BorrowLeaf),
@@ -1367,6 +1368,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("response_builder", 0, BuiltinCapability::Opaque),
     ("http_stream", 0, BuiltinCapability::Opaque),
     ("json.kind", 0, BuiltinCapability::Opaque),
+    ("log.level", 0, BuiltinCapability::Opaque),
     ("Error", 0, BuiltinCapability::Opaque),
     ("core.Error", 0, BuiltinCapability::Opaque),
     ("argon2_params", 0, BuiltinCapability::Opaque),
@@ -2628,6 +2630,9 @@ pub fn summary_to_source(
                         "http_sse_event" | "http.http_sse_event" => {
                             builtin_type_imports.insert("std.http".to_string());
                         }
+                        "log.level" | "log.logger" => {
+                            builtin_type_imports.insert("std.log".to_string());
+                        }
                         _ => {}
                     }
                     work.extend(args);
@@ -2811,6 +2816,7 @@ mod builtin_spelling_tests {
             "json.scanner",
             "resource_ref",
             "json.kind",
+            "log.level",
             "Error",
             "core.Error",
             "argon2_params",

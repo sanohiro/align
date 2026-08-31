@@ -223,6 +223,9 @@ pub enum Scalar {
     /// A `writer` payload (`Result<writer, Error>` from `fs.create`). An owned **Move** handle (an fd
     /// + buffer); the enclosing `Result`'s `Drop` flushes + closes it. Opaque pointer.
     Writer,
+    /// A `log.logger` payload. The Move handle owns one writer and preserves that writer's region;
+    /// aggregate storage therefore carries the same borrowed-descriptor provenance.
+    Logger,
     /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
@@ -332,7 +335,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -607,6 +610,10 @@ pub enum Ty {
     /// writes are I/O-effecting (Impure). Polymorphism lives in the constructors, not the type
     /// ("one way").
     Writer,
+    /// `log.logger` (`std.log`) — a Move handle owning exactly one consumed [`Ty::Writer`]. The
+    /// logger preserves the writer's descriptor provenance and region, latches its first sink
+    /// failure, and is Drop-freed through the writer's ordinary flush/close path.
+    Logger,
     /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
     /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
     /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
@@ -895,6 +902,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::ResourceRef { .. }
         | Ty::Builder
         | Ty::Writer
+        | Ty::Logger
         | Ty::Reader
         | Ty::Buffer
         | Ty::SignatureKey(_)
@@ -959,6 +967,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Param { .. }
         | Scalar::Reader
         | Scalar::Writer
+        | Scalar::Logger
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -1016,6 +1025,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `reader`/`writer` owned handle as a `Result` Ok payload (`fs.open`/`fs.create`).
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
+        Ty::Logger => Some(Scalar::Logger),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
         Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
@@ -1149,6 +1159,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Param(i) => Ty::Param(i),
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
+        Scalar::Logger => Ty::Logger,
         Scalar::Buffer => Ty::Buffer,
         Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
@@ -2408,6 +2419,7 @@ pub fn drop_plan(
                         | Ty::Builder
                         | Ty::StrFinder
                         | Ty::Writer
+                        | Ty::Logger
                         | Ty::Reader
                         | Ty::Buffer
                         | Ty::SignatureKey(_)
@@ -2867,6 +2879,7 @@ pub fn ty_contains_signature_key(
             | Ty::ResourceRef(_)
             | Ty::Builder
             | Ty::Writer
+            | Ty::Logger
             | Ty::Reader
             | Ty::Buffer
             | Ty::StrFinder
@@ -2930,6 +2943,7 @@ pub fn ty_may_borrow(
             | Ty::ArenaHandle
             | Ty::Reader
             | Ty::Writer
+            | Ty::Logger
             | Ty::Soa(_)
             | Ty::SoaParam(_)
             // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
@@ -3056,6 +3070,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::Param(_)
             | Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3182,6 +3197,7 @@ fn ty_contains_http_receive_stream(
             | Ty::ResourceRef(_)
             | Ty::Builder
             | Ty::Writer
+            | Ty::Logger
             | Ty::Reader
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3256,6 +3272,7 @@ pub fn http_stream_carrier_class(
             | Scalar::Param(_)
             | Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3381,6 +3398,7 @@ pub fn http_stream_carrier_class(
             | Ty::ResourceRef(_)
             | Ty::Builder
             | Ty::Writer
+            | Ty::Logger
             | Ty::Reader
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -4013,6 +4031,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("http_headers", Ty::HttpHeaders),
     ("reader", Ty::Reader),
     ("writer", Ty::Writer),
+    ("log.logger", Ty::Logger),
     ("buffer", Ty::Buffer),
     ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
     ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
@@ -7708,6 +7727,25 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         });
     }
 
+    // The builtin `log.level` enum (`std.log`). It remains an ordinary one-field enum aggregate
+    // through checked HIR and MIR; only native-call lowering extracts its validated tag.
+    {
+        let log_level_id = enums.len() as u32;
+        enum_ids.insert("log.level".to_string(), log_level_id);
+        enums.push(hir::EnumDef {
+            name: "log.level".to_string(),
+            source_name: "log.level".to_string(),
+            variants: ["Debug", "Info", "Warn", "Error", "Off"]
+                .into_iter()
+                .map(|variant| hir::EnumVariant {
+                    name: variant.to_string(),
+                    payload: Vec::new(),
+                    field_base: 1,
+                })
+                .collect(),
+        });
+    }
+
     // The builtin `regex_match` struct (`std.regex`) — a plain Copy pair of UTF-8 byte offsets.
     // Visible everywhere and reserved, like `argon2_params`, so `find` can return an ordinary
     // `Option<regex_match>` without adding another special aggregate representation.
@@ -7749,6 +7787,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     enum_source_spellings.extend([
         (*enum_ids.get("Error").expect("builtin Error id"), "Error".to_string()),
         (*enum_ids.get("json.kind").expect("builtin json.kind id"), "json.kind".to_string()),
+        (*enum_ids.get("log.level").expect("builtin log.level id"), "log.level".to_string()),
     ]);
 
     // Build the generic templates: resolve each template's fields / payloads with its type
@@ -8081,6 +8120,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // pkg.web middleware's short-circuit verdict. A response builder is an owned
                     // opaque handle; the enum's tag-switched drop calls its null-safe free routine.
                     Ty::ResponseBuilder => payload.push(Scalar::ResponseBuilder),
+                    // `log.logger` may cross a sum-type boundary as an owned tagged carrier.
+                    // The enum's tag-switched drop forwards the active handle to `log_free`.
+                    Ty::Logger => payload.push(Scalar::Logger),
                     Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
                         &mut tagged_types,
                         hir::TaggedType::Option(value),
@@ -14673,6 +14715,23 @@ impl EffectScan<'_> {
                 walk!(writer);
                 self.impure_direct = true;
             }
+            // Construction and threshold checks are pure in-memory operations. Writing and
+            // flushing still reach the owned writer, so those logger operations are impure.
+            ExprKind::LogNew { output, minimum }
+            | ExprKind::LogEnabled { logger: output, level: minimum } => {
+                walk!(output);
+                walk!(minimum);
+            }
+            ExprKind::LogLine { logger, level, message, .. } => {
+                walk!(logger);
+                walk!(level);
+                walk!(message);
+                self.impure_direct = true;
+            }
+            ExprKind::LogFlush { logger } => {
+                walk!(logger);
+                self.impure_direct = true;
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 walk!(reader);
                 walk!(buffer);
@@ -18485,6 +18544,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::UdpSocket
             | Ty::Reader
             | Ty::Writer
+            | Ty::Logger
             | Ty::Child
             | Ty::HttpRequest
             | Ty::HttpResponse
@@ -20544,6 +20604,7 @@ impl<'a> EscapeCheck<'a> {
             // so it is deliberately NOT here.)
             Ty::Reader
             | Ty::Writer
+            | Ty::Logger
             | Ty::Fn(_)
             | Ty::ArenaHandle
             | Ty::ArrayBuilder(_)
@@ -22029,6 +22090,9 @@ impl<'a> EscapeCheck<'a> {
             // owned/`Static`). A plain `read_line` result is a Copy `i64` (not region-tracked → the
             // explicitly `Static`), so no provenance arm is needed for it.
             ExprKind::ReaderBuffered { reader } => work.push(Work::Eval(reader, depth)),
+            // `log.new` transfers the writer and therefore inherits its exact region. An owned
+            // writer is Static; a writer borrowed from a connection remains connection-bound.
+            ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
             // frame. Without this explicit arm a `Static` classification would let the view
@@ -22449,6 +22513,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderReadLine { .. }
             | ExprKind::WriterWrite { .. }
             | ExprKind::WriterFlush { .. }
+            | ExprKind::LogEnabled { .. }
+            | ExprKind::LogLine { .. }
+            | ExprKind::LogFlush { .. }
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
@@ -22861,6 +22928,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BytesAsStr { .. }
             | ExprKind::WriterWrite { .. }
             | ExprKind::WriterFlush { .. }
+            | ExprKind::LogNew { .. }
+            | ExprKind::LogEnabled { .. }
+            | ExprKind::LogLine { .. }
+            | ExprKind::LogFlush { .. }
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
@@ -26477,6 +26548,17 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(arg, depth);
             }
             ExprKind::WriterFlush { writer } => self.walk(writer, depth),
+            ExprKind::LogNew { output, minimum }
+            | ExprKind::LogEnabled { logger: output, level: minimum } => {
+                self.walk(output, depth);
+                self.walk(minimum, depth);
+            }
+            ExprKind::LogLine { logger, level, message, .. } => {
+                self.walk(logger, depth);
+                self.walk(level, depth);
+                self.walk(message, depth);
+            }
+            ExprKind::LogFlush { logger } => self.walk(logger, depth),
             ExprKind::ReaderRead { reader, buffer } => {
                 self.walk(reader, depth);
                 self.walk(buffer, depth);
@@ -28403,6 +28485,10 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::BytesAsStr { .. }
         | ExprKind::WriterWrite { .. }
         | ExprKind::WriterFlush { .. }
+        | ExprKind::LogNew { .. }
+        | ExprKind::LogEnabled { .. }
+        | ExprKind::LogLine { .. }
+        | ExprKind::LogFlush { .. }
         | ExprKind::IoCopy { .. }
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
@@ -35257,6 +35343,8 @@ impl<'a> MoveCheck<'a> {
             // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
             // (notably `c.reader().buffered()` still borrows `c`).
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
+            // Logger construction transfers the writer without widening or severing its region.
+            ExprKind::LogNew { output, .. } => self.borrow_sources(output),
             ExprKind::BytesAsStr { bytes }
             | ExprKind::StrTrim { recv: bytes, .. }
             | ExprKind::PathComponent { path: bytes, .. } => self.storage_roots(bytes),
@@ -35538,7 +35626,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Len(..) | ExprKind::JsonDecodeScalar { .. } | ExprKind::JsonDocKind { .. }
             | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
-            | ExprKind::WriterFlush { .. } | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
+            | ExprKind::WriterFlush { .. } | ExprKind::LogEnabled { .. } | ExprKind::LogLine { .. }
+            | ExprKind::LogFlush { .. } | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
@@ -41088,6 +41177,22 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, arg, moved, false, false);
             }
             ExprKind::WriterFlush { writer } => move_expr!(self, writer, moved, false, false),
+            // `log.new` transfers the sole writer ownership after both operands type-check. Logger
+            // methods borrow the logger, level, and message; the logger remains usable afterward.
+            ExprKind::LogNew { output, minimum } => {
+                move_expr!(self, output, moved, true, true);
+                move_expr!(self, minimum, moved, false, false);
+            }
+            ExprKind::LogEnabled { logger, level } => {
+                move_expr!(self, logger, moved, false, false);
+                move_expr!(self, level, moved, false, false);
+            }
+            ExprKind::LogLine { logger, level, message, .. } => {
+                move_expr!(self, logger, moved, false, false);
+                move_expr!(self, level, moved, false, false);
+                move_expr!(self, message, moved, false, false);
+            }
+            ExprKind::LogFlush { logger } => move_expr!(self, logger, moved, false, false),
             ExprKind::ReaderRead { reader, buffer } => {
                 move_expr!(self, reader, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
@@ -42131,6 +42236,8 @@ struct Checker<'a, 't> {
     error_enum_id: u32,
     /// The id of the builtin `json.kind` enum (the result of `d.kind()` on a `json.doc`, J4).
     json_kind_enum_id: u32,
+    /// The id of the builtin `log.level` enum. Runtime calls receive only its validated field 0.
+    log_level_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
     /// resolution (mutable, like the other interners). Field access reads it.
     structs: &'t mut Vec<StructDef>,
@@ -42355,6 +42462,7 @@ impl<'a, 't> Checker<'a, 't> {
             // The builtin `json.kind` enum is registered before any `Checker` is built (right after
             // `Error`), so its id is always present in `enum_ids`.
             json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
+            log_level_enum_id: *enum_ids.get("log.level").expect("builtin log.level enum registered"),
             structs,
             struct_templates,
             struct_mono,
@@ -45133,6 +45241,16 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
+        if flat == "log.level" {
+            if !self.imports.contains("std.log") {
+                self.diags.error(
+                    "`log.level` requires `import std.log` — the capability is not imported".to_string(),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some("log.level".to_string()));
+        }
         if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
             if let Some(required) = alias.required_import
                 && !self.imports.contains(required)
@@ -47565,6 +47683,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("core.json", "json.encode", span);
                 return self.check_json_encode(args, span);
             }
+            if module == "log" && method == "new" {
+                self.require_import("std.log", "log.new", span);
+                return self.check_log_new(args, span);
+            }
             if module == "json" && method == "encode_bounded" {
                 self.require_import("core.json", "json.encode_bounded", span);
                 return self.check_json_encode_bounded(args, span);
@@ -47978,6 +48100,24 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
+        }
+        // `log.logger` methods borrow one bound logger handle. Keep this dispatch ahead of the
+        // shared writer `.flush()` lane so the receiver is checked exactly once.
+        if matches!(method, "enabled" | "line" | "flush") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Logger {
+                return self.check_logger_method(recv_expr, method, args, span);
+            }
+            if method == "flush" && recv_expr.ty == Ty::Writer {
+                return self.check_writer_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
         }
         // Sink/source methods: a `builder`'s typed `write*` / `to_string`, a `writer`'s `write` /
         // `flush`, a `reader`'s `read`, a `buffer`'s `bytes`. `.write` is shared, so evaluate the
@@ -58820,6 +58960,121 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::WriterStd { fd, buffered: true }, ty: Ty::Writer, span }
     }
 
+    /// `log.new(output, minimum)` transfers one writer into a region-identical logger. Both
+    /// arguments are checked before move analysis consumes `output`.
+    fn check_log_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags.error(
+                format!("'log.new' expects 2 arguments (output, minimum), got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let output = self.check_expr(&args[0], Some(Ty::Writer));
+        let minimum = self.check_expr(&args[1], Some(Ty::Enum(self.log_level_enum_id)));
+        if output.ty == Ty::Error || minimum.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::LogNew { output: Box::new(output), minimum: Box::new(minimum) },
+            ty: Ty::Logger,
+            span,
+        }
+    }
+
+    /// Borrowing methods on a bound `log.logger`. `line` accepts text or a builder by borrow and
+    /// deliberately returns Unit; `flush` is the sole public observation of the first error latch.
+    fn check_logger_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        self.require_import("std.log", &format!("log.logger.{method}"), span);
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the logger to a local first, then call the method (`l := <expr>` then `l.line(...)`) — temporary Move handles are not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let level_ty = Ty::Enum(self.log_level_enum_id);
+        match method {
+            "enabled" => {
+                if args.len() != 1 {
+                    self.diags.error(
+                        format!("'.enabled()' takes 1 argument (level), got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let level = self.check_expr(&args[0], Some(level_ty));
+                if level.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::LogEnabled { logger: Box::new(recv_expr), level: Box::new(level) },
+                    ty: Ty::Bool,
+                    span,
+                }
+            }
+            "line" => {
+                if args.len() != 2 {
+                    self.diags.error(
+                        format!("'.line()' takes 2 arguments (level, message), got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let level = self.check_expr(&args[0], Some(level_ty));
+                let mut message = self.check_expr(&args[1], None);
+                if level.ty == Ty::Error || message.ty == Ty::Error {
+                    return err;
+                }
+                let builder = message.ty == Ty::Builder;
+                if message.ty == Ty::String {
+                    let message_span = message.span;
+                    message = Expr {
+                        kind: ExprKind::StrBorrow(Box::new(message)),
+                        ty: Ty::Str,
+                        span: message_span,
+                    };
+                }
+                if !builder && message.ty != Ty::Str {
+                    self.diags.error(
+                        format!("'.line()' expects a str, string, or builder message, got {}", ty_name(message.ty)),
+                        message.span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::LogLine {
+                        logger: Box::new(recv_expr),
+                        level: Box::new(level),
+                        message: Box::new(message),
+                        builder,
+                    },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
+            "flush" => {
+                if !args.is_empty() {
+                    self.diags.error(
+                        format!("'.flush()' takes no arguments, got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::LogFlush { logger: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
+            _ => unreachable!("logger method dispatch is closed"),
+        }
+    }
+
     /// `w.write(x)` / `w.flush()` on a `writer` ([`Ty::Writer`]), the receiver already evaluated.
     /// `write` appends a `str` / owned `string` (auto-borrowed) / `bytes` (`slice<u8>`) / a
     /// `builder`'s bytes; `flush` drains to the OS. Both yield `Result<(), Error>` and borrow the
@@ -61386,6 +61641,20 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(arg);
             }
             ExprKind::WriterFlush { writer } => self.finalize_expr(writer),
+            ExprKind::LogNew { output, minimum } => {
+                self.finalize_expr(output);
+                self.finalize_expr(minimum);
+            }
+            ExprKind::LogEnabled { logger, level } => {
+                self.finalize_expr(logger);
+                self.finalize_expr(level);
+            }
+            ExprKind::LogLine { logger, level, message, .. } => {
+                self.finalize_expr(logger);
+                self.finalize_expr(level);
+                self.finalize_expr(message);
+            }
+            ExprKind::LogFlush { logger } => self.finalize_expr(logger),
             ExprKind::ReaderRead { reader, buffer } => {
                 self.finalize_expr(reader);
                 self.finalize_expr(buffer);
@@ -62069,6 +62338,7 @@ const BUILTIN_MODULES: &[&str] = &[
     // std — the OS boundary
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
     "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
+    "std.log",
 ];
 
 /// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
@@ -62397,6 +62667,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::StrFinder => "str_finder".to_string(),
         // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::Writer => "writer".to_string(),
+        Ty::Logger => "log.logger".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
@@ -62796,6 +63067,7 @@ fn resolved_type_source_spelling(
             Ty::Raw => "raw".to_string(),
             Ty::Builder => "builder".to_string(),
             Ty::Writer => "writer".to_string(),
+            Ty::Logger => "log.logger".to_string(),
             Ty::Reader => "reader".to_string(),
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
@@ -63915,7 +64187,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -64004,6 +64276,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::Command
             | Ty::Reader
             | Ty::Writer
+            | Ty::Logger
             | Ty::Regex
             | Ty::Captures
             | Ty::CliParsed
@@ -64471,6 +64744,31 @@ fn resolve_type(
                 }
             };
         }
+    }
+    // `std.log` exposes only qualified type names. Both require the capability import; `level` is
+    // the ordinary builtin enum registered above and `logger` is the opaque Move handle.
+    if path.segments.len() == 2 && path.segments[0].name == "log"
+        && matches!(name, "level" | "logger")
+    {
+        if !cx.builtin_imports.contains("std.log") {
+            diags.error(
+                format!("`log.{name}` requires `import std.log` — the capability is not imported"),
+                span,
+            );
+            return Ty::Error;
+        }
+        if !args.is_empty() {
+            diags.error(format!("`log.{name}` takes no type arguments"), span);
+            return Ty::Error;
+        }
+        return if name == "logger" {
+            Ty::Logger
+        } else {
+            cx.enum_ids
+                .get("log.level")
+                .map(|&id| Ty::Enum(id))
+                .unwrap_or(Ty::Error)
+        };
     }
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
     // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
@@ -65264,6 +65562,7 @@ pub fn is_move_handle(ty: Ty) -> bool {
 /// its runtime free symbol fails that sweep rather than silently leaking at every drop site.
 pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Writer,
+    Ty::Logger,
     Ty::Reader,
     Ty::Buffer,
     Ty::SignatureKey(SignatureKeyKind::Rs256Private),
@@ -66921,7 +67220,7 @@ mod tests {
             }
         }
         assert_eq!(
-            variants, 281,
+            variants, 285,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

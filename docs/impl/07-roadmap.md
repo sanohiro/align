@@ -3899,7 +3899,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   text form; monotonic ULID via an explicit Move generator; CSPRNG source; parse strict.
   **Requires a settled decision: scalar-family `==`/`Ord` admission criterion (fixed-size,
   no interior structure, total byte order, O(1), no allocation — admits `id`, rejects decimal).**
-- **std.log — DESIGNED 2026-08-31** — level-gated line logger; explicit Move logger consuming one
+- **std.log — IMPLEMENTED 2026-08-31** — level-gated line logger; explicit Move logger consuming one
   writer while preserving its descriptor region (no global state); best-effort lines with the first
   sink failure exposed by explicit `flush`; allocation-free CR/LF/backslash line escaping;
   formatting stays the shipped template/builder

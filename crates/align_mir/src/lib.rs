@@ -1459,6 +1459,18 @@ pub enum Rvalue {
     WriterWriteBuilder(Operand, Operand),
     /// `w.flush()` — drain a `writer` to the OS, borrowing it. `i32` errno-status (0 = ok).
     WriterFlush(Operand),
+    /// `log.new(output, minimum)` — transfer one writer into an owned logger. `minimum` remains the
+    /// ordinary `log.level` aggregate; LLVM lowering alone extracts its field-0 tag for the ABI.
+    LogNew(Operand, Operand),
+    /// `l.enabled(level)` — threshold/latch predicate. The runtime i32 result is normalized to bool
+    /// by LLVM lowering; `level` remains an enum aggregate in MIR.
+    LogEnabled(Operand, Operand),
+    /// `l.line(level, text)` — best-effort line emission. Returns the private i32 latch status.
+    LogLine(Operand, Operand, Operand),
+    /// Builder-backed sibling of [`Self::LogLine`], borrowing the builder without materialization.
+    LogLineBuilder(Operand, Operand, Operand),
+    /// `l.flush()` — expose the first latched or current writer flush status as i32.
+    LogFlush(Operand),
     /// `io.copy(r, w)` — stream all of the `reader` operand into the `writer` operand through a
     /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
     /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
@@ -6974,6 +6986,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
             | hir::ExprKind::BytesAsStr { .. } => lower_reader_line_expr(b, e),
+            // All logger operations share one out-of-line lowering dispatcher so the recursive
+            // expression frame stays flat.
+            hir::ExprKind::LogNew { .. }
+            | hir::ExprKind::LogEnabled { .. }
+            | hir::ExprKind::LogLine { .. }
+            | hir::ExprKind::LogFlush { .. } => lower_log_expr(b, e),
             // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
             // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
             hir::ExprKind::IoCopy { reader, writer } => {
@@ -14481,6 +14499,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Param(_)
         | Scalar::Reader
         | Scalar::Writer
+        | Scalar::Logger
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16817,6 +16836,50 @@ fn lower_reader_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::BytesAsStr { bytes } => lower_bytes_as_str(b, bytes, e.ty),
         _ => unreachable!("lower_reader_line_expr on a non-A7 op"),
+    }
+}
+
+/// Lower the complete `std.log` surface. Logger construction lowers both operands before clearing
+/// the writer's source ownership flag, so a failing/diverging minimum expression never consumes it.
+/// Level operands deliberately remain ordinary enum aggregates until backend ABI lowering.
+#[inline(never)]
+fn lower_log_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::LogNew { output, minimum } => {
+            let output_operand = lower_required!(b, lower_expr(b, output), Operand::Const(Const::Unit));
+            let minimum_operand = lower_required!(b, lower_expr(b, minimum), Operand::Const(Const::Unit));
+            null_moved_source(b, output);
+            let value = b.fresh_value(Ty::Logger);
+            b.push(Stmt::Let(value, Rvalue::LogNew(output_operand, minimum_operand)));
+            Operand::Value(value)
+        }
+        hir::ExprKind::LogEnabled { logger, level } => {
+            let logger_operand = lower_required!(b, lower_expr(b, logger), Operand::Const(Const::Unit));
+            let level_operand = lower_required!(b, lower_expr(b, level), Operand::Const(Const::Unit));
+            let value = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(value, Rvalue::LogEnabled(logger_operand, level_operand)));
+            Operand::Value(value)
+        }
+        hir::ExprKind::LogLine { logger, level, message, builder } => {
+            let logger_operand = lower_required!(b, lower_expr(b, logger), Operand::Const(Const::Unit));
+            let level_operand = lower_required!(b, lower_expr(b, level), Operand::Const(Const::Unit));
+            let message_operand = lower_required!(b, lower_expr(b, message), Operand::Const(Const::Unit));
+            let status = b.fresh_value(status_ty());
+            let rvalue = if *builder {
+                Rvalue::LogLineBuilder(logger_operand, level_operand, message_operand)
+            } else {
+                Rvalue::LogLine(logger_operand, level_operand, message_operand)
+            };
+            b.push(Stmt::Let(status, rvalue));
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::LogFlush { logger } => {
+            let logger_operand = lower_required!(b, lower_expr(b, logger), Operand::Const(Const::Unit));
+            let status = b.fresh_value(status_ty());
+            b.push(Stmt::Let(status, Rvalue::LogFlush(logger_operand)));
+            lower_status_result(b, status, e.ty)
+        }
+        _ => unreachable!("lower_log_expr on a non-logger operation"),
     }
 }
 
@@ -20032,6 +20095,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::StrFinder => "str_finder".to_string(),
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
+        Ty::Logger => "log.logger".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {

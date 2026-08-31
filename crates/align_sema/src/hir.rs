@@ -1152,6 +1152,16 @@ pub enum ExprKind {
     /// `w.flush()` — flush a `writer`'s buffered bytes to the OS, borrowing it. The `ty` is
     /// `Result<(), Error>`. Impure.
     WriterFlush { writer: Box<Expr> },
+    /// `log.new(output, minimum)` — consume one writer and preserve its exact region in a new
+    /// `log.logger` Move handle. Pure: allocation only, no writer I/O.
+    LogNew { output: Box<Expr>, minimum: Box<Expr> },
+    /// `l.enabled(level)` — pure threshold/failure-latch predicate over a borrowed logger.
+    LogEnabled { logger: Box<Expr>, level: Box<Expr> },
+    /// `l.line(level, message)` — best-effort deterministic record emission. `builder` selects the
+    /// borrowed builder entry; otherwise `message` is a `str` view. Public result is Unit.
+    LogLine { logger: Box<Expr>, level: Box<Expr>, message: Box<Expr>, builder: bool },
+    /// `l.flush()` — expose the first latched or current writer flush error as `Result<(), Error>`.
+    LogFlush { logger: Box<Expr> },
     /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer
     /// (memory is O(buffer), never O(file size)), borrowing **both** (neither consumed — the fd
     /// ownership does not move, so `r`/`w` remain usable after the call, like `print`'s argument).

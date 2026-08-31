@@ -1498,6 +1498,20 @@ fn decode_float(cursor: &mut DecodeCursor<'_>) -> Result<align_sema::FloatTy, Ca
     Ok(align_sema::FloatTy { bits })
 }
 
+fn decode_signature_key_kind(
+    cursor: &mut DecodeCursor<'_>,
+) -> Result<align_sema::SignatureKeyKind, CanonicalCodecError> {
+    match cursor.byte()? {
+        0 => Ok(align_sema::SignatureKeyKind::Rs256Private),
+        1 => Ok(align_sema::SignatureKeyKind::Rs256Public),
+        2 => Ok(align_sema::SignatureKeyKind::Es256Private),
+        3 => Ok(align_sema::SignatureKeyKind::Es256Public),
+        4 => Ok(align_sema::SignatureKeyKind::Ed25519Private),
+        5 => Ok(align_sema::SignatureKeyKind::Ed25519Public),
+        _ => Err(CanonicalCodecError::UnknownTag),
+    }
+}
+
 fn decode_prim(cursor: &mut DecodeCursor<'_>) -> Result<PrimScalar, CanonicalCodecError> {
     match cursor.byte()? {
         0 => Ok(PrimScalar::Int(decode_int(cursor)?)),
@@ -1552,6 +1566,8 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         36 => Ok(Scalar::RunBytes),
         37 => Ok(Scalar::HttpReadStream),
         38 => Ok(Scalar::HttpSseStream),
+        39 => Ok(Scalar::SignatureKey(decode_signature_key_kind(cursor)?)),
+        40 => Ok(Scalar::Logger),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1695,6 +1711,8 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         60 => Ok(Ty::RunBytes),
         61 => Ok(Ty::HttpReadStream),
         62 => Ok(Ty::HttpSseStream),
+        63 => Ok(Ty::SignatureKey(decode_signature_key_kind(cursor)?)),
+        64 => Ok(Ty::Logger),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2497,6 +2515,7 @@ fn scalar(
                 out.push(kind as u8);
                 Ok(())
             }
+            Scalar::Logger => leaf!(40),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2725,6 +2744,7 @@ fn ty(
                 out.push(kind as u8);
                 Ok(())
             }
+            Ty::Logger => leaf!(64),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -3542,6 +3562,7 @@ mod tests {
             Ty::Raw,
             Ty::Builder,
             Ty::Writer,
+            Ty::Logger,
             Ty::Reader,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Bool),
@@ -3578,6 +3599,7 @@ mod tests {
             Ty::HttpStream,
             Ty::HttpReadStream,
             Ty::HttpSseStream,
+            Ty::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
             Ty::HttpHeaders,
             Ty::JsonDoc,
             Ty::JsonScanner(0),
@@ -3614,6 +3636,7 @@ mod tests {
             Scalar::JsonDoc,
             Scalar::Reader,
             Scalar::Writer,
+            Scalar::Logger,
             Scalar::Buffer,
             Scalar::Regex,
             Scalar::Captures,
@@ -3630,6 +3653,7 @@ mod tests {
             Scalar::HttpStream,
             Scalar::HttpReadStream,
             Scalar::HttpSseStream,
+            Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
             Scalar::RunOutput,
             Scalar::RunBytes,
             Scalar::Fn(0),
@@ -3639,6 +3663,13 @@ mod tests {
             let encoded = CanonicalTy::from_program(Ty::Option(scalar), &program).unwrap();
             assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
         }
+
+        let logger = CanonicalTy::from_program(Ty::Logger, &program).unwrap();
+        assert_eq!(logger.as_bytes(), [3, 0, 0, 0, 0, 64]);
+        assert_eq!(CanonicalTy::decode(logger.as_bytes()).unwrap(), logger);
+        let optional = CanonicalTy::from_program(Ty::Option(Scalar::Logger), &program).unwrap();
+        assert_eq!(optional.as_bytes(), [3, 0, 0, 0, 0, 4, 40]);
+        assert_eq!(CanonicalTy::decode(optional.as_bytes()).unwrap(), optional);
     }
 
     #[test]
@@ -3692,8 +3723,10 @@ mod tests {
         error(&[], CanonicalCodecError::Truncated);
         error(&[2], CanonicalCodecError::UnsupportedVersion);
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
+        error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
+        error(&[3, 0, 0, 0, 0, 65], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 41], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 26, 2], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 26, 1, 4], CanonicalCodecError::UnknownTag);
@@ -4042,6 +4075,7 @@ mod tests {
             Scalar::SignatureKey(align_sema::SignatureKeyKind::Es256Public) => [39, 3],
             Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [39, 4],
             Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [39, 5],
+            Scalar::Logger => [40],
         );
     }
 
@@ -4094,6 +4128,7 @@ mod tests {
             Ty::SignatureKey(align_sema::SignatureKeyKind::Es256Public) => [63, 3],
             Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [63, 4],
             Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [63, 5],
+            Ty::Logger => [64],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );

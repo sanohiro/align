@@ -918,6 +918,28 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::WriterFlush { writer } => ExprKind::WriterFlush {
             writer: boxed!(writer),
         },
+        ExprKind::LogNew { output, minimum } => ExprKind::LogNew {
+            output: boxed!(output),
+            minimum: boxed!(minimum),
+        },
+        ExprKind::LogEnabled { logger, level } => ExprKind::LogEnabled {
+            logger: boxed!(logger),
+            level: boxed!(level),
+        },
+        ExprKind::LogLine {
+            logger,
+            level,
+            message,
+            builder,
+        } => ExprKind::LogLine {
+            logger: boxed!(logger),
+            level: boxed!(level),
+            message: boxed!(message),
+            builder: *builder,
+        },
+        ExprKind::LogFlush { logger } => ExprKind::LogFlush {
+            logger: boxed!(logger),
+        },
         ExprKind::IoCopy { reader, writer } => ExprKind::IoCopy {
             reader: boxed!(reader),
             writer: boxed!(writer),
@@ -2035,6 +2057,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             arg: rhs,
             ..
         }
+        | ExprKind::LogNew {
+            output: lhs,
+            minimum: rhs,
+        }
+        | ExprKind::LogEnabled {
+            logger: lhs,
+            level: rhs,
+        }
         | ExprKind::IoCopy {
             reader: lhs,
             writer: rhs,
@@ -2243,6 +2273,16 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(lhs);
             one!(rhs);
         }
+        ExprKind::LogLine {
+            logger,
+            level,
+            message,
+            ..
+        } => {
+            one!(logger);
+            one!(level);
+            one!(message);
+        }
         ExprKind::RawStore { ptr, offset, value }
         | ExprKind::Select {
             mask: ptr,
@@ -2370,6 +2410,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ReaderBuffered { reader: recv }
         | ExprKind::BytesAsStr { bytes: recv }
         | ExprKind::WriterFlush { writer: recv }
+        | ExprKind::LogFlush { logger: recv }
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
         | ExprKind::FileLen { file: recv }
