@@ -219,8 +219,11 @@ pub fn main() -> Result<(), Error> {
     let function = wrong_enum
         .fns
         .iter_mut()
-        .find(|function| function.name == "main")
-        .expect("main");
+        .find(|function| function.name == "main");
+    assert!(function.is_some(), "checked fixture must contain main");
+    let Some(function) = function else {
+        return;
+    };
     let log_new = function
         .body
         .stmts
@@ -230,14 +233,19 @@ pub fn main() -> Result<(), Error> {
                 Some(init)
             }
             _ => None,
-        })
-        .expect("logger initializer");
+        });
+    assert!(log_new.is_some(), "checked fixture must contain a logger initializer");
+    let Some(log_new) = log_new else {
+        return;
+    };
+    assert!(matches!(&log_new.kind, hir::ExprKind::LogNew { .. }));
     let hir::ExprKind::LogNew { minimum, .. } = &mut log_new.kind else {
-        unreachable!()
+        return;
     };
     minimum.ty = Ty::Enum(other_id);
+    assert!(matches!(&minimum.kind, hir::ExprKind::EnumValue { .. }));
     let hir::ExprKind::EnumValue { enum_id, .. } = &mut minimum.kind else {
-        panic!("minimum is an enum value")
+        return;
     };
     *enum_id = other_id;
     assert!(!body_core_metadata_is_valid(&wrong_enum));
@@ -246,8 +254,11 @@ pub fn main() -> Result<(), Error> {
     let function = bad_variant
         .fns
         .iter_mut()
-        .find(|function| function.name == "main")
-        .expect("main");
+        .find(|function| function.name == "main");
+    assert!(function.is_some(), "checked fixture must contain main");
+    let Some(function) = function else {
+        return;
+    };
     let minimum = function
         .body
         .stmts
@@ -258,10 +269,14 @@ pub fn main() -> Result<(), Error> {
                 _ => None,
             },
             _ => None,
-        })
-        .expect("minimum");
+        });
+    assert!(minimum.is_some(), "checked fixture must contain a log.new minimum");
+    let Some(minimum) = minimum else {
+        return;
+    };
+    assert!(matches!(&minimum.kind, hir::ExprKind::EnumValue { .. }));
     let hir::ExprKind::EnumValue { variant, .. } = &mut minimum.kind else {
-        panic!("minimum is an enum value")
+        return;
     };
     *variant = 5;
     assert!(!body_core_metadata_is_valid(&bad_variant));

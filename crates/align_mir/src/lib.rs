@@ -16879,7 +16879,10 @@ fn lower_log_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(status, Rvalue::LogFlush(logger_operand)));
             lower_status_result(b, status, e.ty)
         }
-        _ => unreachable!("lower_log_expr on a non-logger operation"),
+        _ => {
+            debug_assert!(false, "lower_log_expr dispatcher admitted a non-logger operation");
+            Operand::Const(Const::Unit)
+        }
     }
 }
 

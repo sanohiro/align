@@ -3664,12 +3664,22 @@ mod tests {
             assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
         }
 
-        let logger = CanonicalTy::from_program(Ty::Logger, &program).unwrap();
+        let logger = CanonicalTy::from_program(Ty::Logger, &program);
+        assert!(logger.is_ok(), "logger canonical type must encode");
+        let Some(logger) = logger.ok() else {
+            return;
+        };
         assert_eq!(logger.as_bytes(), [3, 0, 0, 0, 0, 64]);
-        assert_eq!(CanonicalTy::decode(logger.as_bytes()).unwrap(), logger);
-        let optional = CanonicalTy::from_program(Ty::Option(Scalar::Logger), &program).unwrap();
+        let decoded = CanonicalTy::decode(logger.as_bytes());
+        assert_eq!(decoded.as_ref().ok(), Some(&logger));
+        let optional = CanonicalTy::from_program(Ty::Option(Scalar::Logger), &program);
+        assert!(optional.is_ok(), "optional logger canonical type must encode");
+        let Some(optional) = optional.ok() else {
+            return;
+        };
         assert_eq!(optional.as_bytes(), [3, 0, 0, 0, 0, 4, 40]);
-        assert_eq!(CanonicalTy::decode(optional.as_bytes()).unwrap(), optional);
+        let decoded = CanonicalTy::decode(optional.as_bytes());
+        assert_eq!(decoded.as_ref().ok(), Some(&optional));
     }
 
     #[test]

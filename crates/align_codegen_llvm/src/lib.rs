@@ -19631,7 +19631,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("log_new returns a pointer")
+                    .ok_or_else(|| self.err("log_new must return a pointer"))?
             }
             Rvalue::LogEnabled(logger, level) => {
                 let logger = self.operand(logger)?.into();
@@ -19642,7 +19642,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("log_enabled returns i32")
+                    .ok_or_else(|| self.err("log_enabled must return i32"))?
                     .into_int_value();
                 self.builder
                     .build_int_compare(
@@ -19667,7 +19667,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("log_line returns i32")
+                    .ok_or_else(|| self.err("log_line must return i32"))?
             }
             Rvalue::LogLineBuilder(logger, level, message) => {
                 let logger = self.operand(logger)?.into();
@@ -19682,7 +19682,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("log_line_builder returns i32")
+                    .ok_or_else(|| self.err("log_line_builder must return i32"))?
             }
             Rvalue::LogFlush(logger) => {
                 let logger = self.operand(logger)?.into();
@@ -19691,7 +19691,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("log_flush returns i32")
+                    .ok_or_else(|| self.err("log_flush must return i32"))?
             }
             _ => return Err(self.err("gen_log_rvalue on a non-logger operation")),
         };
