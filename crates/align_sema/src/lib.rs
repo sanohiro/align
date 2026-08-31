@@ -55462,9 +55462,10 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `recv[index]` — element access. M5/MMv2 cut: a scalar `array`/`slice`/owned `array<T>`
-    /// (the element is a scalar, copied out); the bounds check + abort is emitted in MIR. Indexing
-    /// a struct array (whole-element load) and `str` byte indexing are deferred.
+    /// `recv[index]` — element access. A scalar `array`/`slice`/owned `array<T>` copies its
+    /// element, except that an owned `array<string>` projects the selected owned element to its
+    /// non-consuming `str` view. The bounds check + abort is emitted in MIR. Indexing a struct
+    /// array (whole-element load) and `str` byte indexing are deferred.
     fn check_index(&mut self, recv: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let r = self.check_expr(recv, None);
@@ -55507,6 +55508,10 @@ impl<'a, 't> Checker<'a, 't> {
             return elems[v as usize].clone();
         }
         let elem = match r.ty {
+            // The array remains the sole owner of the selected string. `string` and `str` share
+            // the same `{ptr,len}` representation, but the logical result carries no Drop and its
+            // region/storage roots are inherited from the receiver below.
+            Ty::DynArray(Scalar::String) => Ty::Str,
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             ty if let Some(elem) = ty.dyn_aggregate_array_element() => elem.ty(),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
@@ -55538,10 +55543,9 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        // A Move-only element (e.g. `array<string>`, `array<array<T>>`) cannot be indexed yet:
-        // the load copies the element's `{ptr,len}` without transferring ownership, so the array
-        // and the copy would both free the same buffer (double-free). Such element reads need a
-        // borrow / move-out design (a later slice) — reject cleanly until then.
+        // A Move-only element other than the `array<string>` → `str` projection above cannot be
+        // indexed: the load would copy the element's representation without transferring
+        // ownership, so the array and copy would both release the same resource.
         if self.collection_element_is_unsupported_move(elem) {
             self.diags.error(
                 format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", self.ty_display(elem)),

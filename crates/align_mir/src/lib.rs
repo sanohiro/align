@@ -20145,6 +20145,77 @@ mod tests {
     }
 
     #[test]
+    fn checked_hir_recomputes_borrowed_string_index_projection() {
+        fn checked(source: &str) -> hir::Program {
+            let mut diagnostics = Diagnostics::new();
+            let tokens = tokenize(0, source, &mut diagnostics);
+            let file = parse_file(tokens, &mut diagnostics);
+            let program = check_file(&file, &mut diagnostics);
+            assert!(
+                !diagnostics.has_errors(),
+                "test source failed to check: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>()
+            );
+            program
+        }
+
+        fn index_mut(program: &mut hir::Program) -> &mut hir::Expr {
+            program.fns[0]
+                .body
+                .value
+                .as_deref_mut()
+                .unwrap_or_else(|| panic!("string index expression body"))
+        }
+
+        let source = "fn first(borrow values: array<string>) -> str = values[0]\n";
+        let program = checked(source);
+        assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+        assert!(
+            lower_program_checked(&program, false, None).is_ok(),
+            "producer-valid DynArray(String) -> Str HIR must lower"
+        );
+
+        let mut owned_result = program.clone();
+        index_mut(&mut owned_result).ty = Ty::String;
+        assert!(
+            lower_program_checked(&owned_result, false, None).is_err(),
+            "a forged DynArray(String) -> String result must fail the checked-HIR boundary"
+        );
+
+        let mut wrong_source = program.clone();
+        let i64_scalar = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        wrong_source.fns[0].locals[0].ty = Ty::DynArray(i64_scalar);
+        let hir::ExprKind::Index { recv, .. } = &mut index_mut(&mut wrong_source).kind else {
+            panic!("string index expression kind")
+        };
+        recv.ty = Ty::DynArray(i64_scalar);
+        assert!(
+            lower_program_checked(&wrong_source, false, None).is_err(),
+            "a forged DynArray(i64) -> Str result must fail the checked-HIR boundary"
+        );
+
+        let mut wrong_index = program;
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let hir::ExprKind::Index { index, .. } = &mut index_mut(&mut wrong_index).kind else {
+            panic!("string index expression kind")
+        };
+        index.ty = i32_ty;
+        assert!(
+            lower_program_checked(&wrong_index, false, None).is_err(),
+            "a reachable non-i64 index must fail the checked-HIR boundary"
+        );
+    }
+
+    #[test]
     fn owned_json_encoders_use_stack_safe_dispatch() {
         let span = align_span::Span::new(0, 0, 0);
         let i64_ty = Ty::Int(IntTy {

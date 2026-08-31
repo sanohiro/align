@@ -844,6 +844,9 @@ fn borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts() {
         "pub fn make() -> array<Record> { mut b: array_builder<Record> := array_builder()\n",
         "  b.push(Record { value: \"align\".clone() })\n",
         "  return b.build() }\n",
+        "pub fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"cached\".clone())\n",
+        "  return b.build() }\n",
     );
     let records_v2 = concat!(
         "module records\n",
@@ -853,6 +856,9 @@ fn borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts() {
         "pub fn make() -> array<Record> { mut b: array_builder<Record> := array_builder()\n",
         "  b.push(Record { value: \"align\".clone(), marker: 1 })\n",
         "  return b.build() }\n",
+        "pub fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"cached\".clone())\n",
+        "  return b.build() }\n",
     );
     let records_private_edit = records_v1.replace(
         "fn adjustment() -> i64 = 1",
@@ -861,8 +867,8 @@ fn borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts() {
     let main = concat!(
         "module main\n",
         "import records\n",
-        "fn main() -> i32 { values := records.make()\n",
-        "  return records.inspect(values[0]) as i32 }\n",
+        "fn main() -> i32 { values := records.make(); names := records.names()\n",
+        "  return (records.inspect(values[0]) + names[0].len()) as i32 }\n",
     );
     let project = Project::new(
         "borrowed-element-graph",

@@ -1,6 +1,6 @@
 # Borrowed string-array indexing
 
-Status: **ACCEPTED after independent review; implementation pending.**
+Status: **IMPLEMENTED against the accepted contract.**
 
 This document owns the Align answer to align-llm Request 22. The first blocked consumer is the R7
 Qwen2 tokenizer: it materializes `tokenizer.ggml.tokens` and `tokenizer.ggml.merges` as
@@ -20,7 +20,7 @@ add a reference type, or create another indexing spelling.
 
 | Surface | Exact input, result, and validation order | Ownership, lifetime, allocation, and cleanup | Compiler and identity owner | Acceptance evidence |
 | --- | --- | --- | --- | --- |
-| `texts[index]` where `texts: array<string>` | Existing index syntax. The receiver is any expression already admitted as an ordinary dynamic array source; `index` receives the existing `i64` context and is evaluated once after the receiver. Static checking validates the receiver before the index. A reachable non-integer index is the existing type error. Runtime uses the existing signed `0 <= index < len` hard bounds failure. A terminating receiver or index forms no later bounds action, load, or result. The result type is `str`, never `string`. | The array remains the sole owner of every element buffer. The result is one `{ptr,len}` view into the selected element: no allocation, clone, transfer, source null, cleanup bit, independent `Drop`, or element mutation. Its borrow fact and region contain the complete array storage generation and every region root already contained by that array. Moving, dropping, replacing, or mutably borrowing the source invalidates the view under existing rules. An unbound owned receiver uses the existing synthetic temporary owner and is at most frame-lived. | `align_sema` recognizes exactly `DynArray(String)` and emits ordinary `Index` with logical result `Str`; checked HIR recomputes the physical-`String`/logical-`Str` projection and eager lifetime facts. MIR emits the existing receiver/index order, bounds CFG, and `SliceIndex`; LLVM loads the representation-compatible two-word view. No HIR/MIR discriminator, interface field/version, runtime helper/ABI, emitted symbol, or persisted format is added. The changed body participates in ordinary MIR/cache identity. | Direct/local/field/projected/temporary receivers; zero/last/out-of-range index; generic index inference; all terminating receiver/index forms; repeated reads and `.clone()`; return and `borrow mut` retention roots; source invalidation; whole/per-unit/cache parity; exact R7 tokenizer owner after pin adoption. |
+| `texts[index]` where `texts: array<string>` | Existing index syntax. The receiver is any expression already admitted as an ordinary dynamic array source; `index` receives the existing `i64` context and is evaluated once after the receiver. Static checking validates the receiver before the index. A reachable non-integer index is the existing type error. Runtime uses the existing signed `0 <= index < len` hard bounds failure. A terminating receiver or index forms no later bounds action, load, or result. The result type is `str`, never `string`. | The array remains the sole owner of every element buffer. The result is one `{ptr,len}` view into the selected element: no allocation, clone, transfer, source null, cleanup bit, independent `Drop`, or element mutation. Its borrow fact and region contain the complete array storage generation and every region root already contained by that array. Moving, dropping, replacing, or mutably borrowing the source invalidates the view under existing rules. An unbound owned receiver uses the existing synthetic temporary owner and is at most frame-lived. | `align_sema` recognizes exactly `DynArray(String)` and emits ordinary `Index` with logical result `Str`; checked HIR recomputes the physical-`String`/logical-`Str` projection and eager lifetime facts. MIR emits the existing receiver/index order, bounds CFG, and `SliceIndex`; LLVM loads the representation-compatible two-word view. No HIR/MIR discriminator, interface field/version, runtime helper/ABI, emitted symbol, or persisted format is added. The changed body participates in ordinary MIR/cache identity. | Direct/local/field/projected/temporary receivers; zero/last/out-of-range index; generic-wrapper monomorphization and generic owned-result rejection; all terminating receiver/index forms; repeated reads and `.clone()`; return and `borrow mut` retention roots; source invalidation; whole/per-unit/cache parity; exact R7 tokenizer owner after pin adoption. |
 | `rows[index].field` for an AoS `array<MoveRecord>` | Existing `ElemField` surface remains unchanged. It reads only the selected field; an owned `string` leaf is a `str`, Copy leaves remain Copy, and other Move leaves remain rejected. | Existing array ownership, view provenance, bounds, no-copy, and cleanup rules remain unchanged. | Existing `ElemField` HIR/MIR/LLVM path. | A regression beside the new string-array cases proves that the already-shipped record half still satisfies Request 22 without widening whole-record values. |
 | `inspect(rows[index])` for `fn inspect(borrow row: MoveRecord)` | Existing plan-28 `BorrowedIndex` call place remains unchanged. A whole Move element is addressable only for the dynamic extent of an explicit shared-borrow call. | Existing root reservation, later-argument revalidation, call-time pointer, returned-view substitution, and no-copy/no-cleanup rules remain unchanged. | Existing `BorrowedIndex` HIR/MIR validation and borrowed parameter ABI. | Existing `borrowed_params` owner remains green. |
 
@@ -89,19 +89,25 @@ place remain admitted under their current rules. A forged `DynArray(String) -> S
 MIR lowers the accepted node through the existing dynamic `SliceIndex` path. The destination value
 is typed `Str`; the source buffer element is layout-compatible `String`. Both are the same two-word
 `{ptr,len}` representation, but the result carries no cleanup. MIR bounds behavior and source
-borrow-owner inheritance are unchanged. LLVM uses the result view type for the GEP/load and emits
-no element Drop, array nulling, allocation, or runtime call. A focused IR assertion proves one
-`SliceIndex` and no `StrClone`, source null, or element cleanup.
+borrow-owner inheritance are unchanged. LLVM recovers the physical `String` element type for the
+GEP/load, whose two-word value is representation-compatible with the logical `Str` destination,
+and emits no element Drop, array nulling, allocation, or runtime call. A focused IR assertion
+proves one `SliceIndex` and no `StrClone`, source null, or element cleanup.
 
 MIR validation and the codegen preflight independently recover the `SliceIndex` source collection's
-physical element type before LLVM pointer construction. They admit every existing exact
-source/result pair plus only `DynArray(String) -> Str`; a forged `DynArray(i64) -> Str`, another
-physical/logical mismatch, or an untyped source rejects before GEP/load construction.
+physical element type before LLVM pointer construction. They admit existing readable exact
+source/result pairs, the existing response method-place pair, and only
+`DynArray(String) -> Str` as a physical/logical mismatch. A forged `DynArray(i64) -> Str`, an
+exact-but-Move nested-array load, another mismatch, or an untyped source rejects before GEP/load
+construction.
 
-Generic bodies are reparsed and checked after concrete substitution. Non-generic interfaces carry
-only the unchanged signatures and reachable structural types. Whole-program and per-unit
-compilation must accept the same source and produce the same output. No interface version or ABI
-fingerprint changes; ordinary body/MIR fingerprints change when the expression changes.
+Generic bodies that declare a concrete `array<string>` receiver retain the projection after
+monomorphization. A generic `array<T> -> T` index instantiated with `T=string` is rejected: its
+declared owned `string` result cannot disguise the logical borrowed `str` result. Non-generic
+interfaces carry only the unchanged signatures and reachable structural types. Whole-program and
+per-unit compilation must accept the same source and produce the same output. No interface
+version or ABI fingerprint changes; ordinary body/MIR fingerprints change when the expression
+changes.
 
 ## 4. Implementation closure matrix
 
@@ -114,8 +120,8 @@ fingerprint changes; ordinary body/MIR fingerprints change when the expression c
 | Move-in, move-out, nulling, replacement, Drop | Indexing performs none; explicit `.clone()` is the only owned result. Source move/drop/replacement/`borrow mut` invalidates a retained view, while unrelated mutation remains valid. | MoveCheck invalidation matrix, repeated source use, clone/drop counter or repeated-cycle control, unrelated-root positive. |
 | Borrow roots and escape | Direct, field, borrowed-projection, and temporary receivers carry complete storage generations and contained input/arena roots through local binding, return, `if`, `match`, `else`, Result `?`, `map_err`, loop joins, and exact/fallback `borrow mut` retention. | `borrowed_params::owned_string_array_index_views_preserve_control_provenance` covers every named wrapper for direct/field/projection/temporary inputs, return, exact named and imported/indirect fallback retention, and frame/input/arena/source-invalidation negatives. |
 | Checked HIR | Recompute the one physical/logical mismatch, child order, termination, retained-storage snapshot, and provenance. No new variant or metadata can bypass exhaustive validation. | Producer-valid HIR plus wrong receiver/result/index, forced fallthrough/action after termination, and stale/missing/extra source-fact mutations; existing variant-sweep tripwire unchanged. |
-| MIR and LLVM | Reuse bounds-checked `SliceIndex`; validation recovers the physical source element and admits ordinary exact pairs plus only `DynArray(String) -> Str`; load only `{ptr,len}` as `Str`; inherit borrow owners; emit no clone, owner copy, cleanup, null, allocation, or runtime helper. | MIR print/shape assertion, LLVM type/one-load assertion, malformed checked-HIR rejection, and a forged `DynArray(i64) -> Str` MIR mutation rejected before LLVM GEP/load construction. |
-| Generic, interface, cache | Concrete generic `array<T>` accepts only `T=string`; whole/per-unit behavior agrees; exact body/type edits invalidate dependents and revert restores hits. | Generic/imported driver owner, whole/per-unit executable parity, focused cache edit/revert owner. |
+| MIR and LLVM | Reuse bounds-checked `SliceIndex`; validation recovers the physical source element and admits readable exact pairs, the response method-place pair, and only `DynArray(String) -> Str` as a mismatch; load only the two-word physical element as logical `Str`; inherit borrow owners; emit no clone, owner copy, cleanup, null, allocation, or runtime helper. | MIR print/shape assertion, LLVM type/one-load assertion, malformed checked-HIR rejection, and forged `DynArray(i64) -> Str`, `DynArray(String) -> String`, and nested-Move MIR mutations rejected before LLVM GEP/load construction. |
+| Generic, interface, cache | A generic wrapper with a concrete `array<string>` receiver preserves the view; generic `array<T> -> T` rejects `T=string` rather than disguising `str` as owned `string`; whole/per-unit behavior agrees; exact body/type edits invalidate dependents and revert restores hits. | Generic/imported return and retention owner, owned-result negative, whole/per-unit executable parity, focused cache edit/revert owner. |
 | Existing Move-record surfaces | `rows[i].string_field` and explicit `borrow` call remain the only non-consuming record-element reads; `row := rows[i]` and by-value calls still reject. | Existing `ElemField` and `BorrowedIndex` owners plus explicit whole-record ordinary-value negative. |
 | Existing tensor-render migration | `src/gguf.align::render_tensors` replaces its NUL-separated prefix stream and parallel offset arrays with an indexed `array<TensorRow>` or equivalent, using the already-shipped Move-record field view. | The first registered Request 22 target and `make gguf-smoke` after pin adoption. |
 | Existing producer migrations | `GgufTable`, `BlockPlan`, and `model_forward.StepColumns` migrate their stream-plus-column internals together to indexable record arrays without changing their accessor signatures. | The second registered Request 22 target and its R1-QWEN-MODEL-IR, R1B-GPTOSS-MOE-IR, and R6-STEP-N focused owners after pin adoption. |
@@ -167,3 +173,6 @@ The 2026-08-31 author pass verified:
 5. No example implies a whole Move record value, hidden clone, or new reference/storage state.
 6. The design consumes only shipped plan-28 mechanisms and introduces no later evaluator,
    tokenizer, runtime, or package capability.
+7. The implementation closure maps the source surface to `align_sema`, checked HIR, existing MIR
+   `SliceIndex`, and LLVM physical-element preflight; the focused ownership, control-flow,
+   malformed-HIR/MIR, whole/per-unit, cache, and borrow-transparent-scope owners pass.
