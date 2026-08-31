@@ -1292,6 +1292,50 @@ primitive implementation with RSA blinding retained. Signature verification uses
 Functional vectors establish cryptographic semantics, while wrapper/API/provider-provenance
 inspection — not noisy timing statistics — owns the constant-time boundary.
 
+## Why logging is an explicit Move sink
+
+Logging is application output, so Align makes its policy an ordinary owned value rather than a
+process-global singleton. `log.new(writer, minimum)` visibly selects the destination, buffering,
+threshold, lifetime, and cleanup owner. Moving the writer into a nominal logger prevents unrelated
+code from bypassing the level and first-error state, while the existing handle rules provide
+exactly-once Drop without a logging-specific ownership model.
+
+The transfer owns the writer handle, not every descriptor behind it. File writers retain owned-fd
+cleanup, standard streams retain their static process-fd borrow, and a logger made from a connection
+writer retains the connection-derived region. That distinction prevents the wrapper from laundering
+a borrowed descriptor into an owned or static one.
+
+The first release has one operation, `line`, instead of one method per level or a reflection-based
+structured-record API. Its explicit `log.level` argument keeps filtering data-driven without adding
+dynamic global configuration. `Off` is both the complete disabling threshold and a suppressed
+record value. The severity tags have a fixed order, so `enabled` and `line` share one comparison
+instead of parallel per-level behavior.
+
+Best effort is compatible with the one `Result` model because failure is deferred, not erased.
+`line` retains the first writer status and returns Unit so logging does not add a branch to every
+work path. `flush()` is the explicit observation point and maps that same status through std's
+existing error table. Retaining the first failure both identifies the original cause and prevents
+later writes from turning one broken sink into repeated I/O. A caller that omits the checkpoint
+chooses the ordinary writer-Drop behavior, whose cleanup error is already unobservable.
+
+Argument evaluation stays ordinary and eager. A lazy logging closure would introduce a logging-only
+evaluation rule and a new capture/effect/ownership surface. `enabled(level)` instead gives callers
+one explicit guard when template or builder construction is material. Formatting itself remains the
+shipped template/builder path; the logger adds no variadic formatter, reflection, or formatter
+registry.
+
+The record transform escapes only backslash, LF, and CR, then appends one LF. This is the smallest
+allocation-free rule that makes every completed record one physical line and distinguishes an
+escaped line break from literal escape text. It is deliberately not terminal sanitization: tabs,
+NUL, bidi controls, and other valid UTF-8 remain data. Security-sensitive output uses an explicit
+encoder above the logger instead of silently changing text here.
+
+Time, source location, process/thread identity, fields, JSON, rotation, file opening, dynamic
+threshold mutation, asynchronous queues, and fatal behavior are absent for the same reason: each
+would add an effect, allocation, ambient input, or policy that the caller did not spell. They can be
+ordinary packages or explicit values if real consumers establish their contracts. The complete
+surface and closure matrix are in `impl/std-design/log.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private

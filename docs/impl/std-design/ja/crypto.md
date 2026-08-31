@@ -424,8 +424,10 @@ compiler-internal ABI invariant である。
 
 checked HIR/MIR は6つの unrelated enum arm でなく payloaded key type 1つを使う。canonical
 type record version 3 は `Scalar::SignatureKey(kind)` に leaf tag 39 + exact one-byte kind、
-`Ty::SignatureKey(kind)` に leaf tag 63 +同 byte を割り当てる。kind は payload なので next
-tag 40/64 は unknown のまま。interface format 8 は不変で、nominal path は既存の
+`Ty::SignatureKey(kind)` に leaf tag 63 +同 byte を割り当てる。kind は payload であり、別の
+leaf family ではない。この capability boundary では next unknown tag だったが、後の accepted
+`std.log` design は 40/64 を `Scalar::Logger`/`Ty::Logger` に予約する。interface format 8 は
+不変で、nominal path は既存の
 length-prefixed UTF-8 type record を使う。producer/importer は12個の bare/qualified path を認識し、
 6個の qualified path に限って reconstructed source へ `std.crypto` を追加し、両方で
 Move/return-cleanup identity を再構築する。各 key fingerprint は `EVP_PKEY` layout/structural definition graph
