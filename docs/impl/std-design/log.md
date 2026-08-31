@@ -102,6 +102,10 @@ The implementation must close this matrix author-side before its one preflight r
 parameterized owner may close multiple cells; a cell needs a new test only when existing regression
 coverage would not fail for the defect.
 
+Design review reopened the `writer-region-provenance` axis. Its construction, transfer, HIR,
+interface, and regression cells below must preserve one exact region fact from the consumed writer
+through every logger carrier and reject each escape from the descriptor owner.
+
 | Axis | Required implementation closure | Exact regression owner |
 |---|---|---|
 | Type formation and import | Register `log.level`, `log.logger`, `std.log`, qualified type/variant lookup, spelling, shadowing guard, and builtin capability. Reject every unimported/wrong-arity/wrong-type/collision edge before HIR. | Sema unit matrix plus driver import/interface tests. |

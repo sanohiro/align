@@ -101,6 +101,10 @@ reflection table、environment input、package artifact は導入しない。
 1 個の parameterized owner が複数 cell を閉じてよい。既存 regression coverage がその defect
 で failure しない場合にだけ、新しい test が必要である。
 
+design review は `writer-region-provenance` axis を reopen した。下記の construction、transfer、
+HIR、interface、regression cell は consume した writer の 1 個の exact region fact を全 logger
+carrier で保持し、descriptor owner からの全 escape を拒否しなければならない。
+
 | axis | 必須の実装 closure | 正確な regression owner |
 |---|---|---|
 | Type formation と import | `log.level`、`log.logger`、`std.log`、qualified type/variant lookup、spelling、shadowing guard、builtin capability を登録する。unimported/wrong-arity/wrong-type/collision edge を HIR 前にすべて拒否する。 | sema unit matrix と driver import/interface test。 |
