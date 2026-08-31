@@ -382,8 +382,12 @@ fn run_captured(
     let mut pump_failed = false;
 
     while !observed_exit && panic_payload.is_none() {
-        match verify_group(pid) {
-            Ok(()) => {}
+        match verify_group_or_observe_exit(pid) {
+            Ok(true) => {
+                observed_exit = true;
+                break;
+            }
+            Ok(false) => {}
             Err(error) => {
                 first_error.get_or_insert(error);
                 break;
@@ -687,6 +691,14 @@ fn cleanup_child(pid: i32, first_error: &mut Option<String>) {
             if error.raw_os_error() == Some(libc::ESRCH) {
                 break;
             }
+            #[cfg(target_os = "macos")]
+            match darwin_empty_group_after_exit(target, pid, &error) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(wait_error) => {
+                    first_error.get_or_insert(format!("child wait: {wait_error}"));
+                }
+            }
             first_error.get_or_insert(format!("child group cleanup: {error}"));
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -694,14 +706,21 @@ fn cleanup_child(pid: i32, first_error: &mut Option<String>) {
 }
 
 fn wait_grace(pid: i32, duration: Duration) -> io::Result<()> {
+    child_exited_within(pid, duration).map(|_| ())
+}
+
+fn child_exited_within(pid: i32, duration: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
+    loop {
         if child_exited_without_reap(pid)? {
-            break;
+            return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10).min(deadline - now));
     }
-    Ok(())
 }
 
 fn child_exited_without_reap(pid: i32) -> io::Result<bool> {
@@ -732,15 +751,36 @@ fn child_exited_without_reap(pid: i32) -> io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-fn verify_group(pid: i32) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn darwin_empty_group_after_exit(target: i32, pid: i32, error: &io::Error) -> io::Result<bool> {
+    if target != -pid || error.raw_os_error() != Some(libc::EPERM) {
+        return Ok(false);
+    }
+    child_exited_without_reap(pid)
+}
+
+fn verify_group_or_observe_exit(pid: i32) -> Result<bool, String> {
     // SAFETY: getpgid is read-only for a retained child pid.
     let group = unsafe { libc::getpgid(pid) };
     if group == pid {
-        Ok(())
+        Ok(false)
     } else if group >= 0 {
         Err("child group changed".to_string())
     } else {
-        Err(format!("child group check: {}", io::Error::last_os_error()))
+        let error = io::Error::last_os_error();
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return child_exited_within(pid, Duration::from_millis(POLL_MILLIS as u64))
+                .map_err(|wait_error| format!("child wait: {wait_error}"))
+                .and_then(|exited| {
+                    if exited {
+                        Ok(true)
+                    } else {
+                        Err(format!("child group check: {error}"))
+                    }
+                });
+        }
+        Err(format!("child group check: {error}"))
     }
 }
 
@@ -1287,6 +1327,51 @@ mod tests {
         assert!(status.success());
         assert_eq!(sink.stdout, b"done");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_empty_group_eperm_requires_terminal_unreaped_child() {
+        use std::os::unix::process::CommandExt;
+
+        let _serial = CAPTURE_TEST.lock().expect("capture test lock");
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        // SAFETY: the closure performs only the async-signal-safe `setpgid` syscall between fork
+        // and exec, matching the production captured-child setup.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn private-group child");
+        let pid = i32::try_from(child.id()).expect("child pid fits i32");
+        let eperm = io::Error::from_raw_os_error(libc::EPERM);
+        assert!(
+            !darwin_empty_group_after_exit(-pid, pid, &eperm)
+                .expect("observe live direct child")
+        );
+        // SAFETY: `pid` is the retained direct child owned by this test.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !darwin_empty_group_after_exit(-pid, pid, &eperm)
+            .expect("observe terminal direct child")
+        {
+            assert!(Instant::now() < deadline, "child must become waitable");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !darwin_empty_group_after_exit(pid, pid, &eperm)
+                .expect("direct target is never an empty-group classification")
+        );
+
+        let mut first_error = None;
+        cleanup_child(pid, &mut first_error);
+        assert!(first_error.is_none(), "cleanup error: {first_error:?}");
+        child.wait().expect("reap direct child");
     }
 
     #[test]

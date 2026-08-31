@@ -3319,7 +3319,9 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    // Darwin filesystems reject invalid UTF-8 path components with EILSEQ; Linux owns the raw-byte
+    // filename case while every Unix target still exercises ordinary raw defining paths elsewhere.
+    #[cfg(target_os = "linux")]
     #[test]
     fn raw_defining_path_resolves_static_siblings_without_lossy_source_names() {
         use std::os::unix::ffi::OsStringExt;
