@@ -5078,6 +5078,19 @@ fn drop_borrow_owners(b: &mut Builder, operand: &Operand) {
     }
 }
 
+/// Whether a call can retain a borrowed argument in caller-owned storage. MIR does not carry the
+/// sema retention summary, so keep hidden owners through the current scope for every mutable
+/// destination mode. `new_synthetic_owner` also registers loop-iteration cleanup, preserving the
+/// existing rule that a retained view cannot cross the iteration edge.
+fn call_may_retain_borrowed_owners(modes: &[align_ast::ParamMode]) -> bool {
+    modes.iter().any(|mode| {
+        matches!(
+            mode,
+            align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out
+        )
+    })
+}
+
 /// Transfer a hidden temporary owner's buffer into another MIR value without dropping it. The
 /// receiving value now owns the same allocation and its ordinary Drop is the single release.
 fn disarm_borrow_owners(b: &mut Builder, operand: &Operand) {
@@ -9442,6 +9455,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
     };
+    let may_retain_borrowed_owners = call_may_retain_borrowed_owners(&signature.param_modes);
     // The function type for the indirect call comes from the (sema-checked) arg types and the
     // call's result type — no signature table is threaded into MIR.
     let mut param_tys = Vec::with_capacity(args.len());
@@ -9488,14 +9502,18 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         b.set_drop_flag(owner, false);
     }
     let result = emit_indirect_call(b, c.clone(), ops.clone(), param_tys, e.ty, signature);
-    if let Operand::Value(v) = &result {
-        inherit_borrow_owners(b, *v, std::iter::once(&c).chain(ops.iter()));
-    } else {
-        // Unit has no MIR value to carry borrowed temporary owners. The call has completed and a
-        // Unit result cannot borrow from its callee or arguments, so release them here.
-        drop_borrow_owners(b, &c);
-        for op in &ops {
-            drop_borrow_owners(b, op);
+    // A mutable destination may now hold a view into any argument. Leave hidden owners under their
+    // normal scope/iteration cleanup instead of tying them to the scalar call result.
+    if !may_retain_borrowed_owners {
+        if let Operand::Value(v) = &result {
+            inherit_borrow_owners(b, *v, std::iter::once(&c).chain(ops.iter()));
+        } else {
+            // Unit has no MIR value to carry borrowed temporary owners. The call has completed and
+            // a Unit result cannot borrow from its callee or arguments, so release them here.
+            drop_borrow_owners(b, &c);
+            for op in &ops {
+                drop_borrow_owners(b, op);
+            }
         }
     }
     result
@@ -9901,6 +9919,9 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     };
     let borrows_args = matches!(func.as_str(), "print" | "hash64" | "hash128");
     let param_modes = b.ctx.named_param_modes.get(func).cloned();
+    let may_retain_borrowed_owners = param_modes
+        .as_deref()
+        .is_some_and(call_may_retain_borrowed_owners);
     let mut ops = Vec::with_capacity(args.len());
     let mut arg_owners = Vec::with_capacity(args.len());
     for (index, arg) in args.iter().enumerate() {
@@ -9965,20 +9986,30 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
         }
     };
-    if let Operand::Value(v) = &result {
-        inherit_borrow_owners(b, *v, &ops);
-        if borrows_args
-            && !align_sema::ty_may_borrow(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
-        {
+    // A mutable destination may now hold a view into any argument. Its owners remain scope-owned,
+    // including iteration cleanup when this call appears in a loop.
+    if !may_retain_borrowed_owners {
+        if let Operand::Value(v) = &result {
+            inherit_borrow_owners(b, *v, &ops);
+            if borrows_args
+                && !align_sema::ty_may_borrow(
+                    e.ty,
+                    &b.structs,
+                    &b.tuples,
+                    &b.enums,
+                    &b.tagged_types,
+                )
+            {
+                for op in &ops {
+                    drop_borrow_owners(b, op);
+                }
+            }
+        } else {
+            // `emit_named_call` canonicalizes a void ABI result to Const::Unit, which cannot retain
+            // owners from borrowed fresh arguments.
             for op in &ops {
                 drop_borrow_owners(b, op);
             }
-        }
-    } else {
-        // `emit_named_call` canonicalizes a void ABI result to Const::Unit, which cannot retain
-        // owners from borrowed fresh arguments.
-        for op in &ops {
-            drop_borrow_owners(b, op);
         }
     }
     result
@@ -25352,6 +25383,40 @@ fn main() -> i32 = 0
             first_call < first_drop && first_drop < second_call,
             "the first borrowed temporary must be released before the second Unit call:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn request22_mutable_retention_keeps_temporary_owners_through_destination_use(
+    ) -> Result<(), String> {
+        let p = lower(
+            "View { text: str }\nfn strings() -> array<string> {\n  mut values: array_builder<string> := array_builder()\n  values.push(\"forty-two\".clone())\n  return values.build()\n}\nfn retain(value: str, borrow mut destination: View) { destination.text = value }\nfn direct() -> i64 {\n  mut output := View { text: \"\" }\n  retain(strings()[0], output)\n  return output.text.len()\n}\nfn indirect() -> i64 {\n  mut output := View { text: \"\" }\n  callback := retain\n  callback(strings()[0], output)\n  return output.text.len()\n}\nfn main() -> i32 = 0\n",
+        );
+        for name in ["direct", "indirect"] {
+            let function = p
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == name)
+                .ok_or_else(|| format!("missing {name} retention caller MIR"))?;
+            let rendered = print::function_to_string(function);
+            let call = rendered
+                .find(if name == "direct" {
+                    "call program retain"
+                } else {
+                    "call_indirect"
+                })
+                .ok_or_else(|| format!("missing {name} retention call"))?;
+            let retained_use = rendered
+                .rfind("slice_len")
+                .ok_or_else(|| format!("missing {name} retained field use"))?;
+            let drop = rendered
+                .rfind("drop ")
+                .ok_or_else(|| format!("missing {name} temporary owner drop"))?;
+            assert!(
+                call < retained_use && retained_use < drop,
+                "{name} must keep the temporary owner live through the retained destination use:\n{rendered}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

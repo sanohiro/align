@@ -176,3 +176,9 @@ The 2026-08-31 author pass verified:
 7. The implementation closure maps the source surface to `align_sema`, checked HIR, existing MIR
    `SliceIndex`, and LLVM physical-element preflight; the focused ownership, control-flow,
    malformed-HIR/MIR, whole/per-unit, cache, and borrow-transparent-scope owners pass.
+8. The retention repair is owned by
+   `borrowed_params::owned_string_array_index_views_preserve_control_provenance`, which covers
+   direct and function-value retention from bound and temporary arrays plus direct, block,
+   `unsafe`, and `if` rejection across an iteration edge.
+   `align_mir::tests::request22_mutable_retention_keeps_temporary_owners_through_destination_use`
+   pins the corresponding hidden-owner lifetime through destination use.

@@ -32547,6 +32547,26 @@ impl<'a> MoveCheck<'a> {
         mut completed: BorrowFact,
         backing: &MutableBackingFact,
     ) -> BorrowFact {
+        // A retained view into an unbound Move expression depends on MIR's hidden owner. Ordinary
+        // completion facts describe the value contained by the expression and can therefore omit
+        // that borrowing-only owner. Restore only the iteration-scoped root here; named roots must
+        // remain frozen at argument completion so a later eager argument cannot retarget them.
+        let iteration_depth = self.loop_iter_drops.len() as u32;
+        if iteration_depth > 0
+            && let ExprKind::Index { recv, .. } = &argument.kind
+            && needs_drop_flag(
+                recv.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            && may_need_synthetic_owner(recv)
+        {
+            completed
+                .direct
+                .insert(BorrowRoot::IterTemp(iteration_depth));
+        }
         let invalid = self
             .borrows
             .invalid_value_sources
@@ -39849,35 +39869,6 @@ impl<'a> MoveCheck<'a> {
                             true,
                             true,
                             Post::LoopBreak(Some(child)),
-                        )
-                    }
-                    ExprKind::Loop {
-                        body,
-                        body_locals,
-                        ..
-                    } if body_locals.is_empty()
-                        && body.value.is_none()
-                        && matches!(
-                            body.stmts.as_slice(),
-                            [Stmt::Expr(_), Stmt::Break {
-                                value: None,
-                                accepted: true,
-                            }]
-                        ) =>
-                    {
-                        let [Stmt::Expr(child), Stmt::Break {
-                            value: None,
-                            accepted: true,
-                        }] = body.stmts.as_slice()
-                        else {
-                            unreachable!("single-expression break loop guard")
-                        };
-                        (
-                            child,
-                            false,
-                            false,
-                            false,
-                            Post::LoopBreak(None),
                         )
                     }
                     ExprKind::Loop {
