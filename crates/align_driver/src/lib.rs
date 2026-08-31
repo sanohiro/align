@@ -3082,6 +3082,7 @@ fn walk_inner(
     let mut publication_lock = None;
     let mut publication_lock_attempted = false;
     let mut publication_lock_span = None;
+    let mut test_boundary_error = None;
     // The DIGEST path's per-MODULE memos (`docs/impl/10` §6.7 §2.2.4). Never per importer: the
     // shipped walk is already O(N) in renders and closures, and these must not introduce a
     // quadratic term. A summary is inserted into `summaries` once and never changes afterwards, so
@@ -3512,6 +3513,67 @@ fn walk_inner(
                         continue;
                     }
                 }
+                // Test mode has a package-wide validation boundary: catalog cardinality and every
+                // reachable process edge must be known before ANY producer resolves static input,
+                // acquires the publication lock, or forms an artifact. Retain the pure production
+                // and test MIR here; the package-level pass below installs descriptor data only
+                // after that boundary closes.
+                let test = if test_mode {
+                    let (test_mir, tests) = match test_overlay {
+                        Some(overlay) => {
+                            let lowered = align_mir::lower_test_program_checked(
+                                &overlay.program,
+                                &overlay.tests,
+                                true,
+                                Some(source_map),
+                            );
+                            let test_mir = match lowered {
+                                Ok(mir) => mir,
+                                Err(rejected) => {
+                                    diags.error(
+                                        vanished_lowering_message(&u.path, rejected),
+                                        align_span::Span::new(0, 0, 0),
+                                    );
+                                    continue;
+                                }
+                            };
+                            (test_mir, overlay.tests)
+                        }
+                        None => (mir.clone(), Vec::new()),
+                    };
+                    Some(PendingTestArtifact {
+                        mir: test_mir,
+                        tests,
+                    })
+                } else {
+                    None
+                };
+                if test_mode {
+                    // `impl_hash` is not consumed by the private test projection. Keep the pure
+                    // production MIR identity available while dependency interfaces use the
+                    // already-final `interface_hash`; descriptor-dependent implementation identity
+                    // remains owned by ordinary production walks.
+                    s.impl_hash = resolution_digest;
+                    summaries.insert(u.path.clone(), s.clone());
+                    let pending = PendingPerUnitArtifact {
+                        summary: s,
+                        body: UnitBody::Lowered(mir),
+                        is_entry: u.is_entry,
+                        static_descriptors,
+                        static_inputs: StaticInputManifest::empty(resolution_digest),
+                        static_artifacts: Vec::new(),
+                        test,
+                    };
+                    store_ready_unit(
+                        &mut mirs,
+                        &mut ready_index,
+                        &u.path,
+                        hset,
+                        pending,
+                        &mut on_ready,
+                    );
+                    continue;
+                }
                 if !static_descriptors.is_empty() && !publication_lock_attempted {
                     publication_lock_attempted = true;
                     publication_lock_span = static_descriptors
@@ -3582,53 +3644,6 @@ fn walk_inner(
                     );
                     continue;
                 }
-                let test = if test_mode {
-                    let (mut test_mir, tests) = match test_overlay {
-                        Some(overlay) => {
-                            let lowered = align_mir::lower_test_program_checked(
-                                &overlay.program,
-                                &overlay.tests,
-                                true,
-                                Some(source_map),
-                            );
-                            let test_mir = match lowered {
-                                Ok(mir) => mir,
-                                Err(rejected) => {
-                                    diags.error(
-                                        vanished_lowering_message(&u.path, rejected),
-                                        align_span::Span::new(0, 0, 0),
-                                    );
-                                    continue;
-                                }
-                            };
-                            (test_mir, overlay.tests)
-                        }
-                        None => (mir.clone(), Vec::new()),
-                    };
-                    if let Err(reason) = install_static_descriptor_data(
-                        &mut test_mir,
-                        u.is_entry.then_some(u.path.as_str()),
-                        &static_descriptors,
-                        &static_artifacts,
-                    ) {
-                        diags.error(
-                            format!(
-                                "cannot generate test static descriptor runtime data: {reason}"
-                            ),
-                            static_descriptors.first().map_or_else(
-                                || align_span::Span::new(0, 0, 0),
-                                |descriptor| descriptor.constructor_span,
-                            ),
-                        );
-                        continue;
-                    }
-                    Some(PendingTestArtifact {
-                        mir: test_mir,
-                        tests,
-                    })
-                } else {
-                    None
-                };
                 // Cache soundness boundary: hash the exact structural MIR program that a miss hands
                 // to codegen, including generated descriptor bodies and producer-owned data.
                 s.impl_hash = align_interface::codegen_impl_hash(&mir);
@@ -3695,7 +3710,7 @@ fn walk_inner(
                     static_descriptors,
                     static_inputs: resolved.manifest,
                     static_artifacts,
-                    test,
+                    test: None,
                 };
                 store_ready_unit(
                     &mut mirs,
@@ -3705,6 +3720,143 @@ fn walk_inner(
                     pending,
                     &mut on_ready,
                 );
+            }
+        }
+    }
+
+    if test_mode && !diags.has_errors() {
+        let test_units = order
+            .iter()
+            .filter_map(|unit| {
+                let pending = mirs.get(unit)?;
+                let test = pending.test.as_ref()?;
+                Some(TestUnitView {
+                    unit,
+                    mir: &test.mir,
+                    tests: &test.tests,
+                })
+            })
+            .collect::<Vec<_>>();
+        let test_count = test_units.iter().map(|unit| unit.tests.len()).sum::<usize>();
+        if test_count > 65_535 {
+            diags.error(
+                "a test package may contain at most 65,535 tests".to_owned(),
+                align_span::Span::new(0, 0, 0),
+            );
+        } else if test_count > 0 && test_unit_views_reach_process_command(&test_units) {
+            test_boundary_error = Some(
+                "process.command is not available from test code; run the external process in an owner test"
+                    .to_owned(),
+            );
+        }
+
+        // Static resolution is the first input/artifact boundary in this walk. It is deliberately
+        // unreachable for an empty catalog, an invalid catalog, or a process-reachable test graph.
+        if test_count > 0 && !diags.has_errors() && test_boundary_error.is_none() {
+            let first_descriptor = order.iter().find_map(|unit| {
+                mirs.get(unit)
+                    .and_then(|pending| pending.static_descriptors.first())
+            });
+            if let Some(descriptor) = first_descriptor {
+                publication_lock_span = Some(descriptor.constructor_span);
+                match lock_metadata_publication_shared(&project_root) {
+                    Ok(lock) => publication_lock = Some(lock),
+                    Err(error) => {
+                        let message = if entry_access_path.is_some() {
+                            error.watch_message()
+                        } else {
+                            error.to_string()
+                        };
+                        diags.error(message, descriptor.constructor_span);
+                    }
+                }
+            }
+
+            if !diags.has_errors() {
+                for unit in &order {
+                    let Some(pending) = mirs.get_mut(unit) else { continue };
+                    if pending.static_descriptors.is_empty() {
+                        continue;
+                    }
+                    let resolution_digest = match &pending.body {
+                        UnitBody::Lowered(mir) => align_interface::codegen_impl_hash(mir),
+                        UnitBody::Reused { .. } | UnitBody::Consumed { .. } => {
+                            diags.error(
+                                format!(
+                                    "internal error: test unit `{unit}` has no production MIR before static resolution"
+                                ),
+                                align_span::Span::new(0, 0, 0),
+                            );
+                            continue;
+                        }
+                    };
+                    let resolved = match static_inputs::resolve_static_descriptors_at(
+                        &project_root,
+                        source_map,
+                        &pending.static_descriptors,
+                        resolution_digest,
+                        &defining_paths,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let message = if entry_access_path.is_some() {
+                                error.watch_message()
+                            } else {
+                                error.to_string()
+                            };
+                            diags.error(message, error.span);
+                            continue;
+                        }
+                    };
+                    let static_artifacts = match build_static_artifacts(
+                        &pending.static_descriptors,
+                        &resolved,
+                    ) {
+                        Ok(artifacts) => artifacts,
+                        Err(error) => {
+                            let span = pending
+                                .static_descriptors
+                                .iter()
+                                .find(|descriptor| {
+                                    descriptor.descriptor_id == error.descriptor_id
+                                })
+                                .map_or_else(
+                                    || align_span::Span::new(0, 0, 0),
+                                    |descriptor| descriptor.constructor_span,
+                                );
+                            diags.error(error.to_string(), span);
+                            continue;
+                        }
+                    };
+                    let Some(test) = pending.test.as_mut() else {
+                        diags.error(
+                            format!(
+                                "internal error: test unit `{unit}` has no test MIR before static resolution"
+                            ),
+                            align_span::Span::new(0, 0, 0),
+                        );
+                        continue;
+                    };
+                    if let Err(reason) = install_static_descriptor_data(
+                        &mut test.mir,
+                        pending.is_entry.then_some(unit.as_str()),
+                        &pending.static_descriptors,
+                        &static_artifacts,
+                    ) {
+                        diags.error(
+                            format!(
+                                "cannot generate test static descriptor runtime data: {reason}"
+                            ),
+                            pending.static_descriptors.first().map_or_else(
+                                || align_span::Span::new(0, 0, 0),
+                                |descriptor| descriptor.constructor_span,
+                            ),
+                        );
+                        continue;
+                    }
+                    pending.static_inputs = resolved.manifest;
+                    pending.static_artifacts = static_artifacts;
+                }
             }
         }
     }
@@ -3779,7 +3931,13 @@ fn walk_inner(
         located,
         loaded,
     };
-    PackageWalk { units, dep_interface_hashes, diags, rehydrate }
+    PackageWalk {
+        units,
+        dep_interface_hashes,
+        diags,
+        rehydrate,
+        test_boundary_error,
+    }
 }
 
 /// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
@@ -3886,6 +4044,7 @@ struct PackageWalk {
     dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)>,
     diags: Diagnostics,
     rehydrate: RehydrateCtx,
+    test_boundary_error: Option<String>,
 }
 
 impl PackageWalk {
@@ -3956,7 +4115,10 @@ impl PackageWalk {
 
     fn into_test(self) -> TestPerUnitWalk {
         let PackageWalk {
-            units, mut diags, ..
+            units,
+            mut diags,
+            test_boundary_error,
+            ..
         } = self;
         let mut test_units = Vec::with_capacity(units.len());
         for unit in units {
@@ -3980,7 +4142,7 @@ impl PackageWalk {
         TestPerUnitWalk {
             units: test_units,
             diags,
-            boundary_error: None,
+            boundary_error: test_boundary_error,
         }
     }
 }
@@ -4540,28 +4702,16 @@ pub fn build_test_per_unit_at(
         Some(entry_access_path),
         true,
     );
-    let mut walk = walk.into_test();
-    if !walk.diags.has_errors() && test_units_reach_process_command(&walk.units) {
-        walk.boundary_error = Some(
-            "process.command is not available from test code; run the external process in an owner test"
-                .to_owned(),
-        );
-    }
-    let test_count = walk
-        .units
-        .iter()
-        .map(|unit| unit.tests.len())
-        .sum::<usize>();
-    if test_count > 65_535 {
-        walk.diags.error(
-            "a test package may contain at most 65,535 tests".to_owned(),
-            align_span::Span::new(0, 0, 0),
-        );
-    }
-    walk
+    walk.into_test()
 }
 
-fn test_units_reach_process_command(units: &[TestPerUnitArtifact]) -> bool {
+struct TestUnitView<'a> {
+    unit: &'a str,
+    mir: &'a align_mir::Program,
+    tests: &'a [align_sema::CheckedTest],
+}
+
+fn test_unit_views_reach_process_command(units: &[TestUnitView<'_>]) -> bool {
     use align_mir::{Rvalue, Stmt};
 
     let local = units
@@ -4647,7 +4797,7 @@ fn test_units_reach_process_command(units: &[TestPerUnitArtifact]) -> bool {
             return true;
         }
         let Some((targets, resource_hooks)) =
-            test_function_targets(&units[unit_index].mir, function)
+            test_function_targets(units[unit_index].mir, function)
         else {
             return true;
         };

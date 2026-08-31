@@ -56,6 +56,24 @@ fn available() -> bool {
             .is_ok_and(|status| status.success())
 }
 
+fn install_pkg_db(scratch: &Scratch) {
+    let package_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/db");
+    for path in [
+        "pkg/db.align",
+        "pkg/db/sqlite.align",
+        "pkg/db/postgres.align",
+        "pkg/db/internal.align",
+        "pkg/db/internal/resource.align",
+        "pkg/db/internal/descriptor.align",
+        "pkg/db/internal/sqlite.align",
+        "pkg/db/internal/postgres.align",
+        "pkg/db/internal/postgres_status.align",
+    ] {
+        let source = std::fs::read_to_string(package_root.join(path)).expect("read pkg.db fixture");
+        scratch.write(path, &source);
+    }
+}
+
 #[test]
 fn catalog_harness_assertion_and_source_main_boundaries_execute_end_to_end() {
     if !available() {
@@ -247,6 +265,54 @@ fn zero_tests_and_reachable_process_command_fail_before_artifact_formation() {
         imported.stderr,
         b"process.command is not available from test code; run the external process in an owner test\n"
     );
+
+    let descriptor = Scratch::new("pre-artifact-static-descriptor");
+    install_pkg_db(&descriptor);
+    descriptor.write(
+        "app/query.align",
+        concat!(
+            "module app.query\n",
+            "import pkg.db\n",
+            "import pkg.db.sqlite\n",
+            "pub Params { id: i64 }\n",
+            "pub Row { id: i64 }\n",
+            "pub fn query() -> pkg.db.query<Params, Row> = ",
+            "pkg.db.sqlite.query_file(\n",
+            "  [pkg.db.QueryOption.Check(pkg.db.CheckPolicy.CheckedRequired)],\n",
+            "  [],\n",
+            ")\n",
+        ),
+    );
+    for (entry, source, expected) in [
+        (
+            "no_tests.align",
+            "module no_tests\nimport app.query\nfn keep() -> i64 = 1\n",
+            "alignc: no tests found",
+        ),
+        (
+            "process.align",
+            concat!(
+                "module process_test\n",
+                "import app.query\n",
+                "import std.process\n",
+                "test \"closed before static input\" {\n",
+                "  command := process.command(\"/bin/echo\", [\"/bin/echo\", \"no\"])\n",
+                "}\n",
+            ),
+            "process.command is not available from test code",
+        ),
+    ] {
+        descriptor.write(entry, source);
+        let output = descriptor.run(&["test", entry]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{entry}: {output:?}");
+        assert!(output.stdout.is_empty(), "{entry}: {output:?}");
+        assert!(stderr.contains(expected), "{entry}: {stderr}");
+        assert!(
+            !stderr.contains("query.sql"),
+            "{entry}: static input resolution masked the test boundary: {stderr}"
+        );
+    }
 
     for (label, binding) in [
         ("direct-resource-drop", "owner := test.resource.open()"),
