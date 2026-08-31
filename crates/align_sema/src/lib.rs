@@ -32547,6 +32547,26 @@ impl<'a> MoveCheck<'a> {
         mut completed: BorrowFact,
         backing: &MutableBackingFact,
     ) -> BorrowFact {
+        // A retained view into an unbound Move expression depends on MIR's hidden owner. Ordinary
+        // completion facts describe the value contained by the expression and can therefore omit
+        // that borrowing-only owner. Restore only the iteration-scoped root here; named roots must
+        // remain frozen at argument completion so a later eager argument cannot retarget them.
+        let iteration_depth = self.loop_iter_drops.len() as u32;
+        if iteration_depth > 0
+            && let ExprKind::Index { recv, .. } = &argument.kind
+            && needs_drop_flag(
+                recv.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            && may_need_synthetic_owner(recv)
+        {
+            completed
+                .direct
+                .insert(BorrowRoot::IterTemp(iteration_depth));
+        }
         let invalid = self
             .borrows
             .invalid_value_sources
@@ -39872,6 +39892,36 @@ impl<'a> MoveCheck<'a> {
                         else {
                             unreachable!("single-expression break loop guard")
                         };
+                        let mutates_destination = match &child.kind {
+                            ExprKind::Call { func, .. } => self
+                                .named_param_modes
+                                .get(func)
+                                .is_some_and(|modes| {
+                                    modes.iter().any(|mode| {
+                                        matches!(
+                                            mode,
+                                            ast::ParamMode::BorrowMut | ast::ParamMode::Out
+                                        )
+                                    })
+                                }),
+                            ExprKind::CallFnValue { callee, .. } => match callee.ty {
+                                Ty::Fn(id) => self.fn_types.get(id as usize).is_some_and(
+                                    |signature| {
+                                        signature.params.iter().any(|(mode, _)| {
+                                            matches!(
+                                                mode,
+                                                ast::ParamMode::BorrowMut | ast::ParamMode::Out
+                                            )
+                                        })
+                                    },
+                                ),
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if mutates_destination {
+                            break;
+                        }
                         (
                             child,
                             false,

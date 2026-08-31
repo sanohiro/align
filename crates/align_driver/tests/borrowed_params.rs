@@ -1332,7 +1332,7 @@ fn retain_indirect(borrow values: array<string>, borrow mut output: View) { f :=
 fn consume(values: array<string>) -> i64 = values.len()
 "#;
     let positive = format!(
-        "{prefix}fn main() -> i32 {{ values := strings(); mut direct := View {{ text: \"\" }}; mut indirect := View {{ text: \"\" }}; retain_direct(values, direct); retain_indirect(values, indirect); tried := match via_try(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; mapped := match via_map_err(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; if choose_if(values, true).len() == 5 && choose_if(values, false).len() == 6 && choose_match(values, true).len() == 5 && choose_match(values, false).len() == 6 && choose_else(values, true).len() == 5 && choose_else(values, false).len() == 6 && via_loop(values).len() == 6 && tried == 5 && mapped == 5 && direct.text.len() == 5 && indirect.text.len() == 6 && values.len() == 2 {{ return 42 }}; return 0 }}\n"
+        "{prefix}fn main() -> i32 {{ values := strings(); mut direct := View {{ text: \"\" }}; mut indirect := View {{ text: \"\" }}; mut temporary_direct := View {{ text: \"\" }}; mut temporary_indirect := View {{ text: \"\" }}; retain_direct(values, direct); retain_indirect(values, indirect); retain(strings()[0], temporary_direct); callback := retain; callback(strings()[1], temporary_indirect); tried := match via_try(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; mapped := match via_map_err(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; if choose_if(values, true).len() == 5 && choose_if(values, false).len() == 6 && choose_match(values, true).len() == 5 && choose_match(values, false).len() == 6 && choose_else(values, true).len() == 5 && choose_else(values, false).len() == 6 && via_loop(values).len() == 6 && tried == 5 && mapped == 5 && direct.text.len() == 5 && indirect.text.len() == 6 && temporary_direct.text.len() == 5 && temporary_indirect.text.len() == 6 && values.len() == 2 {{ return 42 }}; return 0 }}\n"
     );
     assert!(
         !check_errs("owned-string-index-control-provenance", &positive),
@@ -1372,6 +1372,18 @@ fn consume(values: array<string>) -> i64 = values.len()
             "{name} must retain the indexed array generation:\n{diagnostics}"
         );
     }
+
+    let retained_across_iteration = format!(
+        "{prefix}fn main() -> i32 {{ mut output := View {{ text: \"\" }}; loop {{ retain(strings()[0], output); break }}; return output.text.len() as i32 }}\n"
+    );
+    let diagnostics = check_diagnostics(
+        "owned-string-index-temporary-retention-loop",
+        &retained_across_iteration,
+    );
+    assert!(
+        diagnostics.contains("temporary value created inside the loop"),
+        "a retained view must not outlive its iteration-scoped array owner:\n{diagnostics}"
+    );
 }
 
 #[test]
