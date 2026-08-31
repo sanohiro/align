@@ -958,6 +958,7 @@ impl FileActions {
         posix_result(unsafe { spawn_actions_addchdir(&mut self.0, path.as_ptr()) })
     }
 
+    #[cfg(target_os = "linux")]
     fn close_from(&mut self, descriptor: RawFd) -> io::Result<()> {
         posix_result(unsafe { spawn_actions_addclosefrom(&mut self.0, descriptor) })
     }
@@ -986,11 +987,6 @@ unsafe extern "C" {
         actions: *mut libc::posix_spawn_file_actions_t,
         path: *const libc::c_char,
     ) -> i32;
-    #[link_name = "posix_spawn_file_actions_addclosefrom_np"]
-    fn macos_spawn_actions_addclosefrom(
-        actions: *mut libc::posix_spawn_file_actions_t,
-        descriptor: RawFd,
-    ) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -999,14 +995,6 @@ unsafe fn spawn_actions_addchdir(
     path: *const libc::c_char,
 ) -> i32 {
     unsafe { macos_spawn_actions_addchdir(actions, path) }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn spawn_actions_addclosefrom(
-    actions: *mut libc::posix_spawn_file_actions_t,
-    descriptor: RawFd,
-) -> i32 {
-    unsafe { macos_spawn_actions_addclosefrom(actions, descriptor) }
 }
 
 impl Drop for FileActions {
@@ -1030,6 +1018,14 @@ impl SpawnAttributes {
             )
         })?;
         Ok(attributes)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_ambient(mut self) -> io::Result<Self> {
+        let flags =
+            (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as libc::c_short;
+        posix_result(unsafe { libc::posix_spawnattr_setflags(&mut self.0, flags) })?;
+        Ok(self)
     }
 }
 
@@ -1131,10 +1127,17 @@ fn spawn_child(
         .and_then(|()| actions.dup2(stdout_source.as_raw_fd(), 1))
         .and_then(|()| actions.dup2(stderr_source.as_raw_fd(), 2))
         .and_then(|()| actions.dup2(control_source.as_raw_fd(), 3))
-        .and_then(|()| actions.close_from(4))
+        .map_err(|error| infrastructure("descriptor mapping", &error))?;
+    #[cfg(target_os = "linux")]
+    actions
+        .close_from(4)
         .map_err(|error| infrastructure("descriptor mapping", &error))?;
     let attributes = SpawnAttributes::process_group()
         .map_err(|error| infrastructure("process group", &error))?;
+    #[cfg(target_os = "macos")]
+    let attributes = attributes
+        .close_ambient()
+        .map_err(|error| infrastructure("descriptor mapping", &error))?;
     let mut pid = 0;
     let mut argv = [
         executable_c.as_ptr() as *mut libc::c_char,
@@ -1907,6 +1910,21 @@ pub fn run_and_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_spawn_attributes_close_ambient_descriptors_by_default() {
+        let attributes = SpawnAttributes::process_group()
+            .expect("process-group attributes")
+            .close_ambient()
+            .expect("close-on-exec-default attributes");
+        let mut flags = 0;
+        posix_result(unsafe { libc::posix_spawnattr_getflags(&attributes.0, &mut flags) })
+            .expect("read spawn flags");
+        let expected =
+            (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as libc::c_short;
+        assert_eq!(flags, expected);
+    }
 
     extern "C" fn prior_signal_handler(_: i32) {}
 
