@@ -348,40 +348,50 @@ fn borrowed_scope_temporaries_lower_their_scope_exactly_once() {
         ("named-arena", "arena scope {", "arena_begin", 1),
         ("task-group", "task_group {", "tg_begin", 1),
     ];
-    for (cell, opener, framing, framings) in cells {
-        let src = format!(
-            r#"fn probe() -> i64 {{
+    for (mode, prelude, tail) in [
+        ("string-borrow", "", "\" tmp \".clone()\n  }).trim().len()"),
+        (
+            "string-index",
+            "fn strings() -> array<string> { mut b: array_builder<string> := array_builder(); b.push(\"tmp\".clone()); return b.build() }\n",
+            "strings()\n  })[0].len()",
+        ),
+    ] {
+        for (cell, opener, framing, framings) in cells {
+            let src = format!(
+                r#"{prelude}fn probe() -> i64 {{
   mut n := 0
   s := ({opener}
     n = 41
-    " tmp ".clone()
-  }}).trim().len()
+    {tail}
   return s + n
 }}
 fn main() -> i32 = probe() as i32
 "#
-        );
-        let mir = mir_text(&src);
-        let probe = function(&mir, "probe");
-        assert_eq!(
-            probe.matches("<- 41_i64").count(),
-            1,
-            "{cell}: the scope's statements must be lowered exactly once:\n{probe}"
-        );
-        if !framing.is_empty() {
-            assert_eq!(
-                probe.matches(framing).count(),
-                framings,
-                "{cell}: the scope must open exactly once — a second empty {framing} pair is a \
-                 spurious runtime region:\n{probe}"
             );
-        }
-        if backend_available() {
+            let mir = mir_text(&src);
+            let probe = function(&mir, "probe");
             assert_eq!(
-                build_and_run(&format!("owned-temp-scope-{cell}"), &src).status.code(),
-                Some(44),
-                "{cell}: the borrowed scope temporary must still compute 3 + 41"
+                probe.matches("<- 41_i64").count(),
+                1,
+                "{mode}/{cell}: the scope's statements must be lowered exactly once:\n{probe}"
             );
+            if !framing.is_empty() {
+                assert_eq!(
+                    probe.matches(framing).count(),
+                    framings,
+                    "{mode}/{cell}: the scope must open exactly once — a second empty {framing} \
+                     pair is a spurious runtime region:\n{probe}"
+                );
+            }
+            if backend_available() {
+                assert_eq!(
+                    build_and_run(&format!("owned-temp-scope-{mode}-{cell}"), &src)
+                        .status
+                        .code(),
+                    Some(44),
+                    "{mode}/{cell}: the borrowed scope temporary must still compute 3 + 41"
+                );
+            }
         }
     }
 }

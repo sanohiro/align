@@ -10,9 +10,8 @@ neither is a source of current status.
 _Last updated: 2026-08-31._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
-reviewed implementation and owner-test closure are preserved on
-`agent/request22-string-index-impl` at `88ef17c9`. Refresh that branch against current `main` and
-publish it next; then design `std.log` as the next self-hosting layer.
+implementation and owner-test closure are complete against the accepted ledger. Design `std.log`
+as the next self-hosting layer.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -399,10 +398,10 @@ facts must live in this repository.
   runtime ABI shape, catalog and harness bytes, timeout/output cleanup, graceful-signal numeric
   exit, source-main isolation, reachable-`process.command` rejection, and transactional REPL
   rejection.
-- **Next language capability:** refresh and publish the completed align-llm Request 22 implementation
-  from `agent/request22-string-index-impl` against
-  `docs/impl/30-borrowed-string-array-index-plan.md`, then design `std.log` as the next self-hosting
-  layer. `std.id` remains blocked on the settled scalar equality rule and friction-ledger evidence.
+- **Next language capability:** design `std.log` as the next self-hosting layer. The completed
+  align-llm Request 22 implementation follows
+  `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
+  equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align
   surface, ownership model, limit, exact pin, focused adoption owner, and final capable integration
   evidence is recorded there. The latest closure wave covers Request 14 through align-llm PR #100,

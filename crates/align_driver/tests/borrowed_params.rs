@@ -982,6 +982,26 @@ fn copy_view_index_termination_family_forms_no_load_or_result_fact() {
             "diverge",
             "fn run(borrow values: array<str>) -> str { return values[loop {}] }\n",
         ),
+        (
+            "owned-string-index-return",
+            "fn run(borrow values: array<string>) -> str { return values[{ return \"done\" }] }\n",
+        ),
+        (
+            "owned-string-index-break",
+            "fn run(borrow values: array<string>) -> str { return loop { values[{ break \"done\" }] } }\n",
+        ),
+        (
+            "owned-string-index-exit",
+            "fn run(borrow values: array<string>) -> str { return values[process.exit(7)] }\n",
+        ),
+        (
+            "owned-string-index-abort",
+            "fn run(borrow values: array<string>) -> str { return values[process.abort()] }\n",
+        ),
+        (
+            "owned-string-index-diverge",
+            "fn run(borrow values: array<string>) -> str { return values[loop {}] }\n",
+        ),
     ];
     for (name, body) in cases {
         let source = format!("{prefix}{body}fn main() -> i32 = 0\n");
@@ -1062,6 +1082,294 @@ fn main(args: array<str>) -> Result<(), Error> { view := first(args); print(cons
         assert!(
             diagnostics.contains("invalidated") || diagnostics.contains("moved"),
             "{name} mutable retention must preserve the indexed array root:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn owned_string_array_index_is_a_non_consuming_str_view() {
+    let source = r#"
+StringHolder { values: array<string> }
+fn strings() -> array<string> {
+  mut values: array_builder<string> := array_builder()
+  values.push("alpha".clone())
+  values.push("beta".clone())
+  return values.build()
+}
+fn first(borrow values: array<string>) -> str = values[0]
+fn from_holder(borrow holder: StringHolder) -> str = holder.values[1]
+fn projected(borrow values: Option<array<string>>) -> str = match values {
+  Some(items) => items[0]
+  None => ""
+}
+fn main() -> i32 {
+  values := strings()
+  zero: str := values[0]
+  last := values[1]
+  again := values[0]
+  owned := values[1].clone()
+  holder := StringHolder { values: strings() }
+  wrapped: Option<array<string>> := Some(strings())
+  temporary_len := strings()[0].len()
+  if zero == "alpha"
+    && last == "beta"
+    && again == "alpha"
+    && owned.len() == 4
+    && first(values) == "alpha"
+    && from_holder(holder) == "beta"
+    && projected(wrapped) == "alpha"
+    && temporary_len == 5
+    && values.len() == 2 { return 42 }
+  return 0
+}
+"#;
+    assert!(
+        !check_errs("owned-string-array-index", source),
+        "{}",
+        check_diagnostics("owned-string-array-index", source)
+    );
+
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "owned-string-array-index-mir", source);
+    assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
+    let mir = align_mir::lower_program_checked(&checked.hir, false, None)
+        .expect("borrowed string element HIR must validate");
+    let string_views = mir
+        .fns
+        .iter()
+        .flat_map(|function| {
+            function.blocks.iter().flat_map(move |block| {
+                block.stmts.iter().filter(move |statement| {
+                    matches!(
+                        statement,
+                        align_mir::Stmt::Let(value, align_mir::Rvalue::SliceIndex(..))
+                            if function.value_tys.get(*value as usize) == Some(&align_sema::Ty::Str)
+                    )
+                })
+            })
+        })
+        .count();
+    assert!(
+        string_views >= 8,
+        "every ordinary owned-string element read must lower directly to a str SliceIndex"
+    );
+
+    if backend_available() {
+        assert_eq!(
+            build_and_run("owned-string-array-index", source)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn owned_string_array_index_views_follow_source_invalidation() {
+    let prefix = r#"
+fn strings(value: str) -> array<string> {
+  mut values: array_builder<string> := array_builder()
+  values.push(value.clone())
+  return values.build()
+}
+fn consume(values: array<string>) -> i64 = values.len()
+fn replace(borrow mut values: array<string>) { values = strings("replacement") }
+fn observe_mut(borrow mut values: array<string>) -> i64 = values.len()
+"#;
+    for (name, action) in [
+        ("move", "_ := consume(values)"),
+        ("replace", "replace(values)"),
+        ("borrow-mut", "_ := observe_mut(values)"),
+    ] {
+        let source = format!(
+            "{prefix}fn main() -> i32 {{ mut values := strings(\"original\"); view := values[0]; {action}; print(view); return 0 }}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("owned-string-array-index-invalidated-{name}"),
+            &source,
+        );
+        assert!(
+            diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+            "{name} must invalidate the selected string view:\n{diagnostics}"
+        );
+    }
+
+    let unrelated = format!(
+        "{prefix}fn main() -> i32 {{ values := strings(\"forty-two\"); other := strings(\"other\"); view := values[0]; _ := consume(other); if view.len() == 9 && values.len() == 1 {{ return 42 }}; return 0 }}\n"
+    );
+    assert!(
+        !check_errs("owned-string-array-index-unrelated", &unrelated),
+        "{}",
+        check_diagnostics("owned-string-array-index-unrelated", &unrelated)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("owned-string-array-index-unrelated", &unrelated)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+
+    let temporary_escape = format!(
+        "{prefix}fn bad() -> str = strings(\"temporary\")[0]\nfn main() -> i32 = 0\n"
+    );
+    let diagnostics = check_diagnostics(
+        "owned-string-array-index-temporary-escape",
+        &temporary_escape,
+    );
+    assert!(
+        diagnostics.contains("cannot return") || diagnostics.contains("cannot escape"),
+        "a view into a temporary string array must remain frame-limited:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn owned_string_array_index_preserves_order_and_bounds() {
+    let ordered = r#"
+fn strings() -> array<string> {
+  print(1)
+  mut values: array_builder<string> := array_builder()
+  values.push("x".clone())
+  return values.build()
+}
+fn index() -> i64 { print(2); return 0 }
+fn main() -> i32 { print(strings()[index()]); return 42 }
+"#;
+    assert!(
+        !check_errs("owned-string-index-order", ordered),
+        "{}",
+        check_diagnostics("owned-string-index-order", ordered)
+    );
+    if backend_available() {
+        let output = build_and_run("owned-string-index-order", ordered);
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "1\n2\nx\n",
+            "receiver and index must each run once, in source order"
+        );
+
+        let terminating_receiver = r#"
+fn fail() -> Result<array<string>, Error> = Err(Error.Invalid)
+fn index() -> i64 { print(99); return 0 }
+fn run() -> Result<i64, Error> = Ok(fail()?[index()].len())
+fn main() -> Result<(), Error> { print(run()?); return Ok(()) }
+"#;
+        assert!(
+            !check_errs("owned-string-index-terminating-receiver", terminating_receiver),
+            "{}",
+            check_diagnostics(
+                "owned-string-index-terminating-receiver",
+                terminating_receiver
+            )
+        );
+        let output = build_and_run(
+            "owned-string-index-terminating-receiver",
+            terminating_receiver,
+        );
+        assert_ne!(output.status.code(), Some(0));
+        assert!(
+            output.stdout.is_empty(),
+            "a terminating receiver must form no index or result action: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        for (name, index) in [("negative", "-1"), ("at-len", "1")] {
+            let source = format!(
+                "fn strings() -> array<string> {{ mut values: array_builder<string> := array_builder(); values.push(\"x\".clone()); return values.build() }}\nfn main() -> i32 {{ print(strings()[{index}]); print(99); return 0 }}\n"
+            );
+            assert!(
+                !check_errs(&format!("owned-string-index-bounds-{name}"), &source),
+                "{}",
+                check_diagnostics(&format!("owned-string-index-bounds-{name}"), &source)
+            );
+            let output = build_and_run(&format!("owned-string-index-bounds-{name}"), &source);
+            assert_ne!(
+                output.status.code(),
+                Some(0),
+                "{name} index must take the existing hard bounds failure"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{name} index must form no view or later action: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_string_array_index_views_preserve_control_provenance() {
+    let prefix = r#"
+View { text: str }
+fn strings() -> array<string> {
+  mut values: array_builder<string> := array_builder()
+  values.push("first".clone())
+  values.push("second".clone())
+  return values.build()
+}
+fn choose_if(borrow values: array<string>, flag: bool) -> str = if flag { values[0] } else { values[1] }
+fn choose_match(borrow values: array<string>, flag: bool) -> str {
+  choice: Option<bool> := if flag { Some(true) } else { None }
+  return match choice { Some(_) => values[0], None => values[1] }
+}
+fn choose_else(borrow values: array<string>, flag: bool) -> str {
+  choice: Option<str> := if flag { Some(values[0]) } else { None }
+  return choice else values[1]
+}
+fn load(borrow values: array<string>, ok: bool) -> Result<str, Error> {
+  if ok { return Ok(values[0]) }
+  return Err(Error.Invalid)
+}
+fn via_try(borrow values: array<string>) -> Result<str, Error> { view := load(values, true)?; return Ok(view) }
+fn keep_error(error: Error) -> Error = error
+fn via_map_err(borrow values: array<string>) -> Result<str, Error> = load(values, true).map_err(keep_error)
+fn via_loop(borrow values: array<string>) -> str = loop { break values[1] }
+fn retain(value: str, borrow mut output: View) { output.text = value }
+fn retain_direct(borrow values: array<string>, borrow mut output: View) { retain(values[0], output) }
+fn retain_indirect(borrow values: array<string>, borrow mut output: View) { f := retain; f(values[1], output) }
+fn consume(values: array<string>) -> i64 = values.len()
+"#;
+    let positive = format!(
+        "{prefix}fn main() -> i32 {{ values := strings(); mut direct := View {{ text: \"\" }}; mut indirect := View {{ text: \"\" }}; retain_direct(values, direct); retain_indirect(values, indirect); tried := match via_try(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; mapped := match via_map_err(values) {{ Ok(view) => view.len(), Err(_) => 0 }}; if choose_if(values, true).len() == 5 && choose_if(values, false).len() == 6 && choose_match(values, true).len() == 5 && choose_match(values, false).len() == 6 && choose_else(values, true).len() == 5 && choose_else(values, false).len() == 6 && via_loop(values).len() == 6 && tried == 5 && mapped == 5 && direct.text.len() == 5 && indirect.text.len() == 6 && values.len() == 2 {{ return 42 }}; return 0 }}\n"
+    );
+    assert!(
+        !check_errs("owned-string-index-control-provenance", &positive),
+        "{}",
+        check_diagnostics("owned-string-index-control-provenance", &positive)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("owned-string-index-control-provenance", &positive)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+
+    for (name, setup, use_after) in [
+        (
+            "returned-if",
+            "view := choose_if(values, true)",
+            "print(view)",
+        ),
+        (
+            "retained-indirect",
+            "mut output := View { text: \"\" }; retain_indirect(values, output)",
+            "print(output.text)",
+        ),
+    ] {
+        let source = format!(
+            "{prefix}fn main() -> i32 {{ values := strings(); {setup}; _ := consume(values); {use_after}; return 0 }}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("owned-string-index-control-invalidated-{name}"),
+            &source,
+        );
+        assert!(
+            diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+            "{name} must retain the indexed array generation:\n{diagnostics}"
         );
     }
 }
@@ -1359,6 +1667,65 @@ fn indexed_shared_borrow_matches_imported_whole_and_per_unit_modes() {
             Some(42)
         );
     }
+}
+
+#[test]
+fn owned_string_array_generic_index_matches_whole_and_per_unit_modes() {
+    let files = &[
+        (
+            "texts.align",
+            "module texts\npub View { text: str }\npub fn at<T>(borrow values: array<string>, index: i64, marker: T) -> str = values[index]\npub fn retain_at<T>(borrow values: array<string>, index: i64, marker: T, borrow mut output: View) { output.text = values[index] }\npub fn make() -> array<string> { mut builder: array_builder<string> := array_builder(); builder.push(\"forty-two\".clone()); return builder.build() }\n",
+        ),
+        (
+            "main.align",
+            "module main\nimport texts\nfn main() -> i32 { values := texts.make(); mut output := texts.View { text: \"\" }; texts.retain_at(values, 0, true, output); if texts.at(values, 0, true).len() == 9 && output.text.len() == 9 && values[0] == \"forty-two\" { return 42 }; return 0 }\n",
+        ),
+    ];
+    let differential = diff_check_multi("owned-string-index-import", files, "main.align");
+    assert_eq!(
+        differential.whole_errors,
+        differential.per_unit_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    assert!(
+        !differential.whole_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("owned-string-index-import-whole", files, "main.align")
+                .status
+                .code(),
+            Some(42)
+        );
+        assert_eq!(
+            build_per_unit_multi(
+                "owned-string-index-import-per-unit",
+                files,
+                "main.align"
+            )
+            .link_and_run()
+            .status
+            .code(),
+            Some(42)
+        );
+    }
+
+    let rejected = "fn at(borrow values: array<i64>, index: i64) -> str = values[index]\nfn main() -> i32 { values := [1, 2].to_array(); print(at(values, 0)); return 0 }\n";
+    assert!(
+        check_errs("owned-string-index-generic-non-string", rejected),
+        "a non-string specialization must not acquire a str projection"
+    );
+
+    let owned_result = "fn at<T>(borrow values: array<T>, index: i64) -> T = values[index]\nfn strings() -> array<string> { mut builder: array_builder<string> := array_builder(); builder.push(\"x\".clone()); return builder.build() }\nfn main() -> i32 { values := strings(); owned := at(values, 0); return owned.len() as i32 }\n";
+    assert!(
+        check_errs("owned-string-index-generic-owned-result", owned_result),
+        "a generic T=string specialization must not disguise the logical str result as owned T"
+    );
 }
 
 #[test]

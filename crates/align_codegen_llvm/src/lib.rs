@@ -975,6 +975,7 @@ pub fn validate_thin_partition_program(
     validate_tagged_program(program)?;
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
+    validate_slice_index_rvalues(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
     Ok(())
@@ -3043,6 +3044,7 @@ fn build_module<'c>(
     }
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
+    validate_slice_index_rvalues(program)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -6279,6 +6281,88 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
             .map(|_| place.element_ty),
         Operand::BorrowedCleanupArg(_) => Some(Ty::Bool),
     }
+}
+
+/// Recover the physical element addressed by a pointer-backed MIR collection. This is deliberately
+/// derived from the source operand rather than the result value: `array<string>[i]` is the one
+/// legal case where the buffer physically stores `string` while the logical result is `str`.
+fn slice_index_physical_element(source: Ty) -> Option<Ty> {
+    let u8_ty = Ty::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    match source {
+        Ty::Str => Some(u8_ty),
+        Ty::Slice(element) | Ty::DynArray(element) => Some(scalar_to_ty(element)),
+        Ty::DynSliceArray(element) => Some(Ty::Slice(align_sema::prim_to_scalar(element))),
+        Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
+        Ty::DynResponseArray => Some(Ty::HttpResponse),
+        ty @ (Ty::DynVecArray(..)
+        | Ty::DynMaskArray(..)
+        | Ty::DynFixedArray(..)
+        | Ty::DynFixedStructArray(..)) => ty.dyn_aggregate_array_element().map(|element| element.ty()),
+        _ => None,
+    }
+}
+
+fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noalias: bool) -> bool {
+    let Some(physical) = slice_index_physical_element(source) else {
+        return false;
+    };
+    if source == Ty::DynArray(Scalar::String) {
+        return !noalias && result == Ty::Str;
+    }
+    if source == Ty::DynResponseArray {
+        return !noalias && result == Ty::HttpResponse;
+    }
+    physical == result
+        && align_sema::collection_element_read_ok(
+            physical,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        )
+}
+
+/// Reject malformed or cached MIR before LLVM constructs a GEP/load. Existing `SliceIndex`
+/// producers require their exact physical result type; the sole representation-compatible
+/// projection is ordinary `DynArray(String) -> Str` indexing. The vectorizer-only noalias form
+/// remains exact.
+fn validate_slice_index_rvalues(program: &Program) -> Result<(), CodegenError> {
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let Stmt::Let(value, rvalue) = statement else {
+                    continue;
+                };
+                let (source, index, noalias) = match rvalue {
+                    Rvalue::SliceIndex(source, index) => (source, index, false),
+                    Rvalue::SliceIndexNoalias { slice, index, .. } => (slice, index, true),
+                    _ => continue,
+                };
+                let source_ty = preflight_operand_ty(function, source);
+                let index_ty = preflight_operand_ty(function, index);
+                let result_ty = function.value_tys.get(*value as usize).copied();
+                if source_ty.is_none_or(|source_ty| {
+                    result_ty.is_none_or(|result_ty| {
+                        !slice_index_result_matches(program, source_ty, result_ty, noalias)
+                    })
+                }) || index_ty != Some(i64_ty)
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "slice-index MIR in function '{}' has a physical source/result contract mismatch",
+                        function.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bounded_json_piece_is_type_safe(
@@ -16875,13 +16959,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::SliceIndex(s, idx) => {
+                let source_ty = self.checked_operand_ty(s)?;
+                if !slice_index_result_matches(self.program, source_ty, result_ty, false) {
+                    return Err(self.err("slice-index physical source/result contract mismatch"));
+                }
+                let physical_ty = slice_index_physical_element(source_ty)
+                    .ok_or_else(|| self.err("slice-index source is not pointer-backed"))?;
                 let agg = self.operand(s)?.into_struct_value();
                 let ptr = self
                     .builder
                     .build_extract_value(agg, 0, "ptr")
                     .map_err(|e| self.err(e))?
                     .into_pointer_value();
-                let ty = self.llvm_type(result_ty);
+                let ty = self.llvm_type(physical_ty);
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -16894,19 +16984,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // Like `SliceIndex`, plus the `map_into` loop's `in` alias scope so the vectorizer
                 // knows this source load can't overlap the (`out`-scoped) `dst` store.
                 // `alias.scope = {in}`, `noalias = {out}`.
+                let source_ty = self.checked_operand_ty(slice)?;
+                if !slice_index_result_matches(self.program, source_ty, result_ty, true) {
+                    return Err(self.err("noalias slice-index physical source/result contract mismatch"));
+                }
+                let physical_ty = slice_index_physical_element(source_ty)
+                    .ok_or_else(|| self.err("noalias slice-index source is not pointer-backed"))?;
                 let agg = self.operand(slice)?.into_struct_value();
                 let ptr = self
                     .builder
                     .build_extract_value(agg, 0, "ptr")
                     .map_err(|e| self.err(e))?
                     .into_pointer_value();
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(physical_ty);
                 let idx = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -23484,6 +23574,127 @@ fn main() -> i32 = 0
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+    }
+
+    #[test]
+    fn slice_index_preflight_recovers_physical_string_elements() {
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let emit = |source: Ty, result: Ty, index: Ty| {
+            codegen_program(
+                vec![
+                    Stmt::Let(0, Rvalue::Load(0)),
+                    Stmt::Let(
+                        1,
+                        Rvalue::SliceIndex(
+                            Operand::Value(0),
+                            Operand::Const(Const::Int(0, index)),
+                        ),
+                    ),
+                ],
+                vec![source, result],
+                vec![source],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+
+        let ir = emit(Ty::DynArray(Scalar::String), Ty::Str, i64_ty).unwrap_or_else(|error| {
+            panic!("owned string element may lower as a borrowed str view: {error}")
+        });
+        assert_eq!(
+            ir.matches("getelementptr inbounds { ptr, i64 }").count(),
+            1,
+            "the projection must emit exactly one element address:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call { ptr, i64 } @align_rt_str_clone"),
+            "the borrowed element load must not clone its buffer:\n{ir}"
+        );
+        assert!(
+            emit(Ty::DynArray(Scalar::Str), Ty::Str, i64_ty).is_ok(),
+            "the existing borrowed-str array relation must remain exact"
+        );
+        assert!(
+            emit(Ty::DynResponseArray, Ty::HttpResponse, i64_ty).is_ok(),
+            "the existing response method-place load must remain admitted"
+        );
+
+        for (name, source, result, index) in [
+            (
+                "forged-copy-source",
+                Ty::DynArray(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                })),
+                Ty::Str,
+                i64_ty,
+            ),
+            (
+                "owned-result",
+                Ty::DynArray(Scalar::String),
+                Ty::String,
+                i64_ty,
+            ),
+            (
+                "borrowed-source-owned-result",
+                Ty::DynArray(Scalar::Str),
+                Ty::String,
+                i64_ty,
+            ),
+            (
+                "wrong-index-width",
+                Ty::DynArray(Scalar::String),
+                Ty::Str,
+                i32_ty,
+            ),
+            (
+                "nested-move-element",
+                Ty::DynArray(Scalar::DynArray(align_sema::PrimScalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }))),
+                Ty::DynArray(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                })),
+                i64_ty,
+            ),
+        ] {
+            let error = emit(source, result, index)
+                .expect_err(&format!("{name} must fail before LLVM pointer construction"));
+            assert_lowering(
+                error,
+                "slice-index MIR in function 'main' has a physical source/result contract mismatch",
+            );
+        }
+
+        let untyped = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::SliceIndex(
+                    Operand::Value(99),
+                    Operand::Const(Const::Int(0, i64_ty)),
+                ),
+            )],
+            vec![Ty::Str],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("an untyped slice source must fail before LLVM pointer construction");
+        assert_lowering(
+            untyped,
+            "slice-index MIR in function 'main' has a physical source/result contract mismatch",
+        );
     }
 
     fn test_struct(name: &str, fields: &[Ty]) -> StructDef {

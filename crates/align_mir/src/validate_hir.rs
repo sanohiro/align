@@ -9423,7 +9423,10 @@ impl<'a> BodyValidator<'a> {
                 if index_flow.falls && index_flow.ty != i64_ty() {
                     return None;
                 }
-                let result = match receiver.ty {
+                // Recover the physical element independently of the producer's stored result.
+                // Exactly one ordinary index changes its logical type: an owned string-array
+                // element is viewed as `str` while the array retains ownership of the `string`.
+                let physical_result = match receiver.ty {
                     Ty::Vec(scalar, lanes) => {
                         let hir::ExprKind::Int(lane) = &index.kind else { return None };
                         if *lane < 0 || (*lane as u128) >= lanes as u128 {
@@ -9455,6 +9458,11 @@ impl<'a> BodyValidator<'a> {
                     }
                     _ => return None,
                 };
+                let result = if receiver.ty == Ty::DynArray(Scalar::String) {
+                    Ty::Str
+                } else {
+                    physical_result
+                };
                 if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
                     && !matches!(
                         recv.kind,
@@ -9464,8 +9472,13 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let response_element_borrow =
-                    receiver.ty == Ty::DynResponseArray && result == Ty::HttpResponse;
-                if !response_element_borrow && !self.collection_element_read_ok(result) {
+                    receiver.ty == Ty::DynResponseArray && physical_result == Ty::HttpResponse;
+                let borrowed_string_element =
+                    receiver.ty == Ty::DynArray(Scalar::String) && result == Ty::Str;
+                if !response_element_borrow
+                    && !borrowed_string_element
+                    && !self.collection_element_read_ok(physical_result)
+                {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
