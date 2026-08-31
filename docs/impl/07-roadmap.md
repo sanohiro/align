@@ -4,14 +4,15 @@ Milestones. The principle is as in `00-overview.md` — **fix the whole design f
 
 ---
 
-## Current forward plan — `pkg.db`
+## Completed `pkg.db` capability plan (historical DAG)
 
-`HANDOFF.md` is the live implementation-status record. The exact prerequisite
-contracts are in `17-library-boundary-prerequisites.md`; the product contract and
-delivery dependencies are in `pkg-design/db.md` §23. The long milestone record
-below is historical evidence, not a second backlog.
+`HANDOFF.md` is the live implementation-status record. `pkg.db`'s exact
+prerequisite contracts are in `17-library-boundary-prerequisites.md`; the
+product contract and delivery dependencies are in `pkg-design/db.md` §23. This
+completed DAG and the long milestone record below are historical evidence, not
+a second backlog.
 
-The current plan is a consumer-capability DAG, not one PR per acceptance label:
+The completed plan was a consumer-capability DAG, not one PR per acceptance label:
 
 ```text
 L1a + L1b complete
@@ -3832,6 +3833,36 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
                                 -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
                                 io_uring); no DB-specific frontend shortcut
 ```
+
+## Execution, storage, and startup optimization track (UMBRELLA DESIGNED; slices unapproved)
+
+`31-execution-storage-startup-plan.md` is the plan of record for the separate
+measure-first optimization track. It approves the direction of reducing byte
+movement, materialization, owner-local working sets, runtime wakes, loaded
+pages, and hot-code footprint while adding no language or library surface.
+
+This track consumes no language milestone and does not replace the live queue.
+`HANDOFF.md` still names the `core.codec` public-contract ledger as the next
+language capability. Promotion of an optimization slice is a separate explicit
+scheduling decision.
+
+```text
+S0A  parent-measured startup baseline       eligible for an exact slice ledger
+S0B  current-plan explanation               waits for the exact explain-opt contract
+S1   extend shipped virtual chunks          first generated-code candidate; measure-first
+S2   straight-line fixed region frames      consumer/evidence-gated
+S3   runtime capability partition           existing deployment/closure trigger-gated
+S4   CPU versus blocking domain             transitive-fact and workload-gated
+S5   first zero-parse static artifact        belongs to its explicit consumer
+S6   shape input and hot/cold guidance       schema/corpus-gated
+S7+  multiversion/layout/I/O/minimal target  independently deferred
+```
+
+Only S0A and S0B are candidates for initial promotion. Their benchmark and
+reporting failure domains remain independently mergeable. S1 and later do not
+become implementation work from their position in this list; each first closes
+the public/safety boundary, implementation closure matrix, owner tests, and any
+explicit evidence gate required by the plan.
 
 ## Post-pkg.db library waves (planned; each item gated independently)
 
