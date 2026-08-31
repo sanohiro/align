@@ -9818,6 +9818,237 @@ pub unsafe extern "C" fn align_rt_io_writer_free(w: *mut Writer) {
     }
 }
 
+// --- log --------------------------------------------------------------------------------------
+
+/// A `log.logger` owns exactly one consumed writer. The writer retains its original descriptor
+/// ownership; this shell adds only the threshold and first-error latch.
+pub struct Logger {
+    writer: *mut Writer,
+    minimum: i32,
+    first_error: i32,
+}
+
+#[inline]
+fn log_level_valid(level: i32) -> bool {
+    (0..=4).contains(&level)
+}
+
+#[inline]
+unsafe fn logger_write(logger: &mut Logger, bytes: &[u8]) -> i32 {
+    let status = unsafe {
+        align_rt_io_writer_write(logger.writer, bytes.as_ptr(), bytes.len() as i64)
+    };
+    if status != 0 && logger.first_error == 0 {
+        logger.first_error = status;
+    }
+    status
+}
+
+/// Consume `writer` into one logger shell. Invalid inputs fail before allocation or ownership
+/// transfer; source-formed calls have already proved both conditions.
+///
+/// # Safety
+///
+/// A non-null `writer` must be a live, uniquely owned runtime writer. On success ownership passes
+/// to the returned logger, so the caller must not use or free the writer separately afterward.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_new(writer: *mut Writer, minimum: i32) -> *mut Logger {
+    if writer.is_null() || !log_level_valid(minimum) {
+        return core::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(Logger {
+        writer,
+        minimum,
+        first_error: 0,
+    }))
+}
+
+/// Return 1 exactly when `level` is enabled and no sink failure has latched. Null/invalid inputs
+/// fail closed without dereference.
+///
+/// # Safety
+///
+/// A non-null `logger` must point to a live logger returned by [`align_rt_log_new`], and no call
+/// may mutate or free that logger concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_enabled(logger: *mut Logger, level: i32) -> i32 {
+    if logger.is_null() || !log_level_valid(level) {
+        return 0;
+    }
+    let logger = unsafe { &*logger };
+    i32::from(logger.first_error == 0 && level != 4 && level >= logger.minimum)
+}
+
+/// Emit one exact log record from a UTF-8 text view. The complete enabled input is validated before
+/// the first write; transformation is allocation-free and stops at the first sink error.
+///
+/// # Safety
+///
+/// `logger` must point to a live, exclusively accessed logger. When the record is enabled and
+/// `len > 0`, `ptr` must be readable for `len` bytes for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_line(
+    logger: *mut Logger,
+    level: i32,
+    ptr: *const u8,
+    len: i64,
+) -> i32 {
+    if logger.is_null() {
+        return AL_INVALID;
+    }
+    let logger = unsafe { &mut *logger };
+    if logger.first_error != 0 {
+        return logger.first_error;
+    }
+    if !log_level_valid(level) {
+        logger.first_error = AL_INVALID;
+        return AL_INVALID;
+    }
+    if level == 4 || level < logger.minimum {
+        return 0;
+    }
+    let Ok(length) = safe_len(len) else {
+        logger.first_error = AL_INVALID;
+        return AL_INVALID;
+    };
+    if length > 0 && ptr.is_null() {
+        logger.first_error = AL_INVALID;
+        return AL_INVALID;
+    }
+    let bytes = if length == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(ptr, length) }
+    };
+    if !validate_utf8(bytes) {
+        logger.first_error = AL_INVALID;
+        return AL_INVALID;
+    }
+
+    let prefix: &[u8] = match level {
+        0 => b"[DEBUG] ",
+        1 => b"[INFO] ",
+        2 => b"[WARN] ",
+        3 => b"[ERROR] ",
+        _ => unreachable!("validated enabled log level"),
+    };
+    if unsafe { logger_write(logger, prefix) } != 0 {
+        return logger.first_error;
+    }
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let escaped: &[u8] = match byte {
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            _ => continue,
+        };
+        if start < index && unsafe { logger_write(logger, &bytes[start..index]) } != 0 {
+            return logger.first_error;
+        }
+        if unsafe { logger_write(logger, escaped) } != 0 {
+            return logger.first_error;
+        }
+        start = index + 1;
+    }
+    if start < bytes.len() && unsafe { logger_write(logger, &bytes[start..]) } != 0 {
+        return logger.first_error;
+    }
+    if unsafe { logger_write(logger, b"\n") } != 0 {
+        return logger.first_error;
+    }
+    0
+}
+
+/// Builder-source sibling of [`align_rt_log_line`]. The builder remains owned by the caller.
+///
+/// # Safety
+///
+/// `logger` must point to a live, exclusively accessed logger. When the record is enabled,
+/// `builder` must point to a live builder that is not mutated or freed for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_line_builder(
+    logger: *mut Logger,
+    level: i32,
+    builder: *mut Builder,
+) -> i32 {
+    if logger.is_null() {
+        return AL_INVALID;
+    }
+    // Preserve the same validation order as the text-view sibling: an existing latch wins, then
+    // level validity, then threshold gating. A suppressed record never inspects its message.
+    let live = unsafe { &mut *logger };
+    if live.first_error != 0 {
+        return live.first_error;
+    }
+    if !log_level_valid(level) {
+        live.first_error = AL_INVALID;
+        return AL_INVALID;
+    }
+    if level == 4 || level < live.minimum {
+        return 0;
+    }
+    if builder.is_null() {
+        live.first_error = AL_INVALID;
+        return AL_INVALID;
+    }
+    let builder = unsafe { &*builder };
+    unsafe {
+        align_rt_log_line(
+            logger,
+            level,
+            builder.buf.as_ptr(),
+            builder.buf.len() as i64,
+        )
+    }
+}
+
+/// Expose an existing latch, or flush the writer and latch the first new failure.
+///
+/// # Safety
+///
+/// A non-null `logger` must point to a live, exclusively accessed logger returned by
+/// [`align_rt_log_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_flush(logger: *mut Logger) -> i32 {
+    if logger.is_null() {
+        return AL_INVALID;
+    }
+    let logger = unsafe { &mut *logger };
+    if logger.first_error != 0 {
+        return logger.first_error;
+    }
+    let status = unsafe { align_rt_io_writer_flush(logger.writer) };
+    if status != 0 {
+        logger.first_error = status;
+    }
+    status
+}
+
+/// Free the consumed writer through its ordinary best-effort flush/close path, then the shell.
+///
+/// # Safety
+///
+/// A non-null `logger` must be the unique live pointer returned by [`align_rt_log_new`]. This call
+/// consumes it; the pointer and its consumed writer must not be used or freed afterward.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_log_free(logger: *mut Logger) {
+    if logger.is_null() {
+        return;
+    }
+    let logger = unsafe { Box::from_raw(logger) };
+    unsafe { align_rt_io_writer_free(logger.writer) };
+}
+
+// Keep the native definitions pinned to the six compiler-owned ABI rows. A signature drift must
+// fail in this crate rather than survive until an emitted program reaches the dynamic linker.
+const _: unsafe extern "C" fn(*mut Writer, i32) -> *mut Logger = align_rt_log_new;
+const _: unsafe extern "C" fn(*mut Logger, i32) -> i32 = align_rt_log_enabled;
+const _: unsafe extern "C" fn(*mut Logger, i32, *const u8, i64) -> i32 = align_rt_log_line;
+const _: unsafe extern "C" fn(*mut Logger, i32, *mut Builder) -> i32 = align_rt_log_line_builder;
+const _: unsafe extern "C" fn(*mut Logger) -> i32 = align_rt_log_flush;
+const _: unsafe extern "C" fn(*mut Logger) = align_rt_log_free;
+
 /// `io.copy(r, w)` — stream all of `r` into `w` through a fixed 64 KiB buffer (memory is
 /// O(buffer), never O(file size)), returning the number of bytes transferred, or `-(status)` on
 /// error (the errno mapped through [`io_error_to_status`], sign-encoded like
@@ -23708,6 +23939,7 @@ mod tests {
 
         let mut runtime = function_symbols(include_str!("lib.rs"));
         runtime.extend(function_symbols(include_str!("str_prims.rs")));
+        runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
@@ -23720,6 +23952,12 @@ mod tests {
             "align_rt_test_par_pool_initialized",
             "align_rt_test_par_pool_wait_idle",
             "align_rt_hash64_boundaries_and_determinism",
+            "align_rt_crypto_probe_live_keys",
+            "align_rt_crypto_probe_live_sensitive",
+            "align_rt_crypto_probe_peak_keys",
+            "align_rt_crypto_probe_peak_sensitive",
+            "align_rt_crypto_probe_reset",
+            "align_rt_crypto_probe_sensitive_cleanses",
         ] {
             assert!(runtime.remove(non_base), "missing feature/test-only runtime function {non_base}");
         }
@@ -23743,8 +23981,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 315);
-        assert_eq!(registry.len(), 315);
+        assert_eq!(runtime.len(), 337);
+        assert_eq!(registry.len(), 337);
         assert_eq!(runtime, registry);
     }
 
@@ -24064,6 +24302,120 @@ mod tests {
             wr.buf.clear(); // so the drop-flush below emits nothing
         }
         unsafe { align_rt_io_writer_free(w) };
+    }
+
+    #[test]
+    fn logger_emits_exact_records_gates_before_message_inspection_and_borrows_builders() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_logger_test_{}", std::process::id()));
+        let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+        let mut writer = core::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                align_rt_io_writer_create(
+                    path_bytes.as_ptr(),
+                    path_bytes.len() as i64,
+                    &mut writer,
+                )
+            },
+            0,
+        );
+        let logger = unsafe { align_rt_log_new(writer, 0) }; // Debug
+        assert!(!logger.is_null());
+        assert_eq!(unsafe { align_rt_log_enabled(logger, 0) }, 1);
+        assert_eq!(unsafe { align_rt_log_enabled(logger, 1) }, 1);
+        assert_eq!(unsafe { align_rt_log_enabled(logger, 4) }, 0);
+        // Suppression precedes message validation: this negative length is never inspected.
+        assert_eq!(unsafe { align_rt_log_line(logger, 4, core::ptr::null(), -1) }, 0);
+        assert_eq!(unsafe { align_rt_log_line(logger, 0, core::ptr::null(), 0) }, 0);
+
+        let message = "a\\b\nc\rdé".as_bytes();
+        assert_eq!(
+            unsafe { align_rt_log_line(logger, 1, message.as_ptr(), message.len() as i64) },
+            0,
+        );
+        let builder = align_rt_builder_new(core::ptr::null_mut(), 0);
+        unsafe { align_rt_builder_write(builder, b"built\nline".as_ptr(), 10) };
+        assert_eq!(unsafe { align_rt_log_line_builder(logger, 2, builder) }, 0);
+        assert_eq!(unsafe { align_rt_log_line(logger, 3, b"\0\t".as_ptr(), 2) }, 0);
+        // The builder is borrowed and remains independently owned by its caller.
+        unsafe { align_rt_builder_free(builder) };
+        assert_eq!(unsafe { align_rt_log_flush(logger) }, 0);
+        unsafe { align_rt_log_free(logger) };
+
+        let bytes = std::fs::read(&path).expect("read logger output");
+        assert_eq!(
+            bytes,
+            b"[DEBUG] \n[INFO] a\\\\b\\nc\\rd\xc3\xa9\n[WARN] built\\nline\n[ERROR] \0\t\n",
+        );
+        std::fs::remove_file(path).expect("remove logger output");
+    }
+
+    #[test]
+    fn logger_latches_the_first_validation_or_sink_failure() {
+        let invalid_writer = Box::into_raw(Box::new(Writer {
+            fd: -1,
+            owns_fd: false,
+            buffered: false,
+            buf: Vec::new(),
+        }));
+        let logger = unsafe { align_rt_log_new(invalid_writer, 0) };
+        let sink_status = unsafe { align_rt_log_line(logger, 3, b"x".as_ptr(), 1) };
+        assert_ne!(sink_status, 0);
+        for level in 0..=4 {
+            assert_eq!(unsafe { align_rt_log_enabled(logger, level) }, 0);
+        }
+        assert_eq!(
+            unsafe { align_rt_log_line_builder(logger, 99, core::ptr::null_mut()) },
+            sink_status,
+        );
+        assert_eq!(unsafe { align_rt_log_flush(logger) }, sink_status);
+        unsafe { align_rt_log_free(logger) };
+
+        let writer = align_rt_io_writer_std(2, 0);
+        let logger = unsafe { align_rt_log_new(writer, 0) };
+        assert_eq!(unsafe { align_rt_log_line(logger, 9, core::ptr::null(), -1) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_log_line(logger, 1, b"ignored".as_ptr(), 7) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_log_flush(logger) }, AL_INVALID);
+        unsafe { align_rt_log_free(logger) };
+    }
+
+    #[test]
+    fn logger_enabled_covers_the_closed_five_by_five_level_matrix() {
+        for minimum in 0..=4 {
+            let writer = align_rt_io_writer_std(2, 0);
+            let logger = unsafe { align_rt_log_new(writer, minimum) };
+            for level in 0..=4 {
+                let expected = i32::from(level != 4 && level >= minimum);
+                assert_eq!(
+                    unsafe { align_rt_log_enabled(logger, level) },
+                    expected,
+                    "minimum={minimum}, level={level}",
+                );
+            }
+            assert_eq!(unsafe { align_rt_log_enabled(logger, -1) }, 0);
+            assert_eq!(unsafe { align_rt_log_enabled(logger, 5) }, 0);
+            unsafe { align_rt_log_free(logger) };
+        }
+    }
+
+    #[test]
+    fn logger_abi_rejects_null_and_invalid_constructor_inputs_without_consuming_the_writer() {
+        let writer = align_rt_io_writer_std(2, 0);
+        assert!(unsafe { align_rt_log_new(writer, -1) }.is_null());
+        unsafe { align_rt_io_writer_free(writer) };
+        assert!(unsafe { align_rt_log_new(core::ptr::null_mut(), 0) }.is_null());
+        assert_eq!(unsafe { align_rt_log_enabled(core::ptr::null_mut(), 0) }, 0);
+        assert_eq!(
+            unsafe { align_rt_log_line(core::ptr::null_mut(), 0, core::ptr::null(), 0) },
+            AL_INVALID,
+        );
+        assert_eq!(
+            unsafe { align_rt_log_line_builder(core::ptr::null_mut(), 0, core::ptr::null_mut()) },
+            AL_INVALID,
+        );
+        assert_eq!(unsafe { align_rt_log_flush(core::ptr::null_mut()) }, AL_INVALID);
+        unsafe { align_rt_log_free(core::ptr::null_mut()) };
     }
 
     #[test]

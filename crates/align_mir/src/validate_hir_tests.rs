@@ -190,6 +190,98 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+#[test]
+fn logger_hir_requires_the_builtin_level_id_and_closed_variant_set() {
+    let source = r#"
+import std.io
+import std.log
+pub fn main() -> Result<(), Error> {
+  output := io.stdout
+  logger := log.new(output, log.level.Info)
+  logger.flush()?
+  return Ok(())
+}
+"#;
+    let program = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut wrong_enum = program.clone();
+    let other_id = wrong_enum.enums.len() as u32;
+    wrong_enum.enums.push(EnumDef {
+        name: "OtherLevel".to_string(),
+        source_name: "OtherLevel".to_string(),
+        variants: vec![EnumVariant {
+            name: "Info".to_string(),
+            payload: Vec::new(),
+            field_base: 1,
+        }],
+    });
+    let function = wrong_enum
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "main");
+    assert!(function.is_some(), "checked fixture must contain main");
+    let Some(function) = function else {
+        return;
+    };
+    let log_new = function
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|statement| match statement {
+            hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::LogNew { .. }) => {
+                Some(init)
+            }
+            _ => None,
+        });
+    assert!(log_new.is_some(), "checked fixture must contain a logger initializer");
+    let Some(log_new) = log_new else {
+        return;
+    };
+    assert!(matches!(&log_new.kind, hir::ExprKind::LogNew { .. }));
+    let hir::ExprKind::LogNew { minimum, .. } = &mut log_new.kind else {
+        return;
+    };
+    minimum.ty = Ty::Enum(other_id);
+    assert!(matches!(&minimum.kind, hir::ExprKind::EnumValue { .. }));
+    let hir::ExprKind::EnumValue { enum_id, .. } = &mut minimum.kind else {
+        return;
+    };
+    *enum_id = other_id;
+    assert!(!body_core_metadata_is_valid(&wrong_enum));
+
+    let mut bad_variant = program.clone();
+    let function = bad_variant
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "main");
+    assert!(function.is_some(), "checked fixture must contain main");
+    let Some(function) = function else {
+        return;
+    };
+    let minimum = function
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|statement| match statement {
+            hir::Stmt::Let { init, .. } => match &mut init.kind {
+                hir::ExprKind::LogNew { minimum, .. } => Some(minimum.as_mut()),
+                _ => None,
+            },
+            _ => None,
+        });
+    assert!(minimum.is_some(), "checked fixture must contain a log.new minimum");
+    let Some(minimum) = minimum else {
+        return;
+    };
+    assert!(matches!(&minimum.kind, hir::ExprKind::EnumValue { .. }));
+    let hir::ExprKind::EnumValue { variant, .. } = &mut minimum.kind else {
+        return;
+    };
+    *variant = 5;
+    assert!(!body_core_metadata_is_valid(&bad_variant));
+}
+
 fn checked_test_overlay(source: &str) -> Result<align_sema::TestOverlay, &'static str> {
     let mut diagnostics = Diagnostics::new();
     let tokens = tokenize(0, source, &mut diagnostics);
@@ -11095,7 +11187,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 281,
+        variants, 285,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -15060,6 +15152,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::Param { .. }
         | Scalar::Reader
         | Scalar::Writer
+        | Scalar::Logger
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -15124,6 +15217,7 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::Param(0),
         Scalar::Reader,
         Scalar::Writer,
+        Scalar::Logger,
         Scalar::Buffer,
         Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
         Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Public),

@@ -369,6 +369,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::JsonDoc
             | Scalar::Reader
             | Scalar::Writer
+            | Scalar::Logger
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -508,6 +509,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::Builder
             | Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::StrFinder

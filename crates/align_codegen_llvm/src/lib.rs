@@ -4881,6 +4881,7 @@ fn validate_tagged_program_inner(
                 | Scalar::JsonDoc
                 | Scalar::Reader
                 | Scalar::Writer
+                | Scalar::Logger
                 | Scalar::Buffer
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -5013,6 +5014,7 @@ fn validate_tagged_program_inner(
                         | Ty::Builder
                         | Ty::Writer
                         | Ty::Reader
+                        | Ty::Logger
                         | Ty::Buffer
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -8084,6 +8086,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::Param(_)
         | Scalar::Reader
         | Scalar::Writer
+        | Scalar::Logger
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -8287,6 +8290,7 @@ fn abi_type<'c>(
         | Ty::StrFinder
         | Ty::Writer
         | Ty::Reader
+        | Ty::Logger
         | Ty::Buffer
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -8648,7 +8652,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
-        Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
+        Scalar::Reader | Scalar::Writer | Scalar::Logger => {
+            unreachable!("an I/O/logger handle is not a box/array payload")
+        }
         Scalar::Buffer | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
@@ -8748,6 +8754,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
     Some(match ty {
         Ty::Writer => RuntimeKey::IoWriterFree,
         Ty::Reader => RuntimeKey::IoReaderFree,
+        Ty::Logger => RuntimeKey::LogFree,
         Ty::Buffer => RuntimeKey::BufferFree,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
@@ -15367,6 +15374,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::ReaderBuffered(_) | Rvalue::ReaderReadLine(..) | Rvalue::BytesAsStr { .. } => {
                 return self.gen_reader_line_rvalue(rv);
             }
+            Rvalue::LogNew(..)
+            | Rvalue::LogEnabled(..)
+            | Rvalue::LogLine(..)
+            | Rvalue::LogLineBuilder(..)
+            | Rvalue::LogFlush(..) => return self.gen_log_rvalue(rv),
             Rvalue::IoCopy(r, w) => {
                 let rp = self.operand(r)?.into();
                 let wp = self.operand(w)?.into();
@@ -17558,6 +17570,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::StrFinder
             | Ty::Writer
             | Ty::Reader
+            | Ty::Logger
             | Ty::Buffer
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -19597,6 +19610,92 @@ impl<'c, 'a> FnGen<'c, 'a> {
             _ => return Err(self.err("gen_reader_line_rvalue on a non-A7 op")),
         };
         Ok(Some(v))
+    }
+
+    /// The only `log.level` ABI boundary. MIR carries the nominal enum aggregate; extract field 0
+    /// here and nowhere earlier so HIR/MIR validation retains the ordinary enum contract.
+    #[inline(never)]
+    fn gen_log_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let level_tag = |this: &mut Self, level: &Operand, name: &str| {
+            let aggregate = this.operand(level)?.into_struct_value();
+            this.builder
+                .build_extract_value(aggregate, 0, name)
+                .map_err(|error| this.err(error))
+        };
+        let value = match rv {
+            Rvalue::LogNew(output, minimum) => {
+                let output = self.operand(output)?.into();
+                let minimum = level_tag(self, minimum, "log_min")?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::LogNew), &[output, minimum.into()], "logger")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("log_new must return a pointer"))?
+            }
+            Rvalue::LogEnabled(logger, level) => {
+                let logger = self.operand(logger)?.into();
+                let level = level_tag(self, level, "log_level")?;
+                let enabled = self
+                    .builder
+                    .build_call(self.runtime(RuntimeKey::LogEnabled), &[logger, level.into()], "log_enabled")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("log_enabled must return i32"))?
+                    .into_int_value();
+                self.builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        enabled,
+                        self.ctx.i32_type().const_zero(),
+                        "log_enabled_bool",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into()
+            }
+            Rvalue::LogLine(logger, level, message) => {
+                let logger = self.operand(logger)?.into();
+                let level = level_tag(self, level, "log_level")?;
+                let (pointer, length) = self.split_str(message)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::LogLine),
+                        &[logger, level.into(), pointer.into(), length.into()],
+                        "log_line",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("log_line must return i32"))?
+            }
+            Rvalue::LogLineBuilder(logger, level, message) => {
+                let logger = self.operand(logger)?.into();
+                let level = level_tag(self, level, "log_level")?;
+                let message = self.operand(message)?.into();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::LogLineBuilder),
+                        &[logger, level.into(), message],
+                        "log_line_builder",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("log_line_builder must return i32"))?
+            }
+            Rvalue::LogFlush(logger) => {
+                let logger = self.operand(logger)?.into();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::LogFlush), &[logger], "log_flush")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("log_flush must return i32"))?
+            }
+            _ => return Err(self.err("gen_log_rvalue on a non-logger operation")),
+        };
+        Ok(Some(value))
     }
 
     /// All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len). `#[inline(never)]` so the

@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/log.md)
 
-> **Status:** designed. Implementation is the next post-`core.test` capability.
+> **Status:** implemented 2026-08-31.
 
 ## Authoritative public-contract ledger
 

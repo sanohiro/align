@@ -226,6 +226,12 @@ key|JsonEncodeStructArray|json_encode_struct_array|declare void @align_rt_json_e
 key|JsonEncodeUnion|json_encode_union|declare void @align_rt_json_encode_union(ptr, ptr, ptr)
 key|JsonScanNext|json_scan_next|declare i32 @align_rt_json_scan_next(ptr, i64, ptr, ptr, i64, ptr, i64, ptr, i64, i64)
 key|LenMismatchFail|len_mismatch_fail|declare void @align_rt_len_mismatch_fail(i64, i64) #1
+key|LogEnabled|log_enabled|declare i32 @align_rt_log_enabled(ptr, i32)
+key|LogFlush|log_flush|declare i32 @align_rt_log_flush(ptr)
+key|LogFree|log_free|declare void @align_rt_log_free(ptr)
+key|LogLine|log_line|declare i32 @align_rt_log_line(ptr, i32, ptr, i64)
+key|LogLineBuilder|log_line_builder|declare i32 @align_rt_log_line_builder(ptr, i32, ptr)
+key|LogNew|log_new|declare ptr @align_rt_log_new(ptr, i32)
 key|ParMap|par_map|declare noalias ptr @align_rt_par_map(ptr, ptr, i64, i64, i64, i64, ptr)
 key|ParMapFilter|par_map_filter|declare { ptr, i64 } @align_rt_par_map_filter(ptr, ptr, i64, i64, i64, i64, ptr, ptr)
 key|ParMapReduce|par_map_reduce|declare i64 @align_rt_par_map_reduce(ptr, ptr, i64, i64, i64, i64, ptr)
