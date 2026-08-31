@@ -23,8 +23,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 audit_target="$work_dir/audit-target"
 archive="$audit_target/debug/libalign_runtime.a"
 sed -nE 's/.*@(align_rt_[A-Za-z0-9_]+)\(.*/\1/p' "$golden" | sort -u > "$work_dir/base"
-if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 327 ]]; then
-  echo "test-runtime-abi-exports: declaration golden does not contain 327 base symbols" >&2
+if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 331 ]]; then
+  echo "test-runtime-abi-exports: declaration golden does not contain 331 base symbols" >&2
   exit 1
 fi
 
@@ -47,7 +47,7 @@ perl -ne '
   sub native_type {
     my ($text) = @_;
     return "pair64" if $text =~ /\[2 x i64\]|\{\s*(?:ptr|i64)\s*,\s*i64\s*\}/;
-    my @types = ($text =~ /\b(void|ptr|i64|i32|float|double)\b/g);
+    my @types = ($text =~ /\b(void|ptr|i64|i32|i8|float|double)\b/g);
     die "no native type in golden: $text\n" unless @types;
     return $types[-1];
   }
@@ -62,7 +62,7 @@ perl -ne '
   sub native_type {
     my ($text) = @_;
     return "pair64" if $text =~ /\[2 x i64\]|\{\s*(?:ptr|i64)\s*,\s*i64\s*\}/;
-    my @types = ($text =~ /\b(void|ptr|i64|i32|float|double)\b/g);
+    my @types = ($text =~ /\b(void|ptr|i64|i32|i8|float|double)\b/g);
     die "no native type in runtime IR: $text\n" unless @types;
     return $types[-1];
   }
@@ -73,13 +73,13 @@ perl -ne '
   print join("|", $symbol, native_type($ret), @params), "\n";
 ' "$runtime_ir" | sort > "$work_dir/runtime-abi"
 
-if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 327 ]] \
-  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 327 ]]; then
-  echo "test-runtime-abi-exports: normalized base ABI does not contain 327 rows" >&2
+if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 331 ]] \
+  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 331 ]]; then
+  echo "test-runtime-abi-exports: normalized base ABI does not contain 331 rows" >&2
   exit 1
 fi
 diff -u "$work_dir/golden-abi" "$work_dir/runtime-abi"
-printf 'runtime-abi-signatures base 327\n'
+printf 'runtime-abi-signatures base 331\n'
 
 audit_case() {
   local label=$1
@@ -138,8 +138,8 @@ audit_case() {
   printf 'runtime-abi-exports %s %s\n' "$label" "$expected_count"
 }
 
-audit_case base "" 327
-audit_case alloc alloc-count 331
-audit_case par par-map-probe 331
-audit_case task task-group-probe 327
-audit_case all alloc-count,par-map-probe,task-group-probe 335
+audit_case base "" 331
+audit_case alloc alloc-count 335
+audit_case par par-map-probe 335
+audit_case task task-group-probe 331
+audit_case all alloc-count,par-map-probe,task-group-probe 339

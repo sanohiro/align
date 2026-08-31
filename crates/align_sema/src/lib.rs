@@ -25,7 +25,7 @@ mod type_layout;
 pub use type_layout::{TypeLayoutCache, ty_abi_layout};
 
 /// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct IntTy {
     pub bits: u8,
     pub signed: bool,
@@ -38,7 +38,7 @@ impl IntTy {
 }
 
 /// Floating-point width. `f64` = `FloatTy { bits: 64 }`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct FloatTy {
     pub bits: u8,
 }
@@ -50,7 +50,7 @@ impl FloatTy {
 }
 
 /// The closed asymmetric-signature algorithms exposed by `std.crypto`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[repr(u8)]
 pub enum SignatureAlgorithm {
     Rs256 = 0,
@@ -79,7 +79,7 @@ impl SignatureAlgorithm {
 /// The six nominal asymmetric-key owners. The kind is repeated in the runtime shell and checked
 /// at every native operation boundary, so malformed HIR/MIR cannot turn a static type mismatch
 /// into an EVP type confusion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[repr(u8)]
 pub enum SignatureKeyKind {
     Rs256Private = 0,
@@ -138,7 +138,7 @@ pub fn signature_key_kind_from_name(name: &str) -> Option<SignatureKeyKind> {
 
 /// A variable-free scalar type — the only payloads M2 allows inside `Option`/`Result`.
 /// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Scalar {
     Int(IntTy),
     Float(FloatTy),
@@ -339,7 +339,7 @@ impl Scalar {
 /// The element of an owned-`array<T>` payload ([`Scalar::DynArray`]). A primitive scalar only —
 /// a deliberately small, `Copy`, **non-recursive** subset of [`Scalar`] so an `array` can sit
 /// inside an `Option`/`Result` payload without making [`Scalar`]/[`Ty`] recursive (MMv2 slice 8b).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum PrimScalar {
     Int(IntTy),
     Float(FloatTy),
@@ -432,7 +432,7 @@ pub fn scan_accumulator_scalar(acc: Ty) -> Option<Scalar> {
 /// (column-oriented, `soa array<T>`) joins at M6. Keeping it in the type **now** means adding
 /// `Soa` later turns every place that must handle the new layout into a compile error — the
 /// layout decision can never be silently forgotten.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Layout {
     /// Array-of-structs: elements are contiguous whole structs (`[... %Struct ...]`). Field access
     /// GEPs `element, field`.
@@ -446,7 +446,7 @@ pub enum Layout {
 /// A concrete non-scalar element of a dynamic array built in an explicit region. Keeping this
 /// descriptor non-recursive preserves [`Ty`]'s compact `Copy` representation while carrying the
 /// exact LLVM layout that a region builder must copy and expose through indexing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum AggregateArrayElem {
     Vec(Scalar, u32),
     Mask(Scalar, u32),
@@ -469,7 +469,7 @@ impl AggregateArrayElem {
 /// owned-string, and nominal-record elements in the established heap-builder/dynamic-array
 /// representation; aggregate descriptors are admitted only by the explicit-region form and freeze
 /// to the corresponding dynamic aggregate-array `Ty` variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ArrayBuilderElem {
     Scalar(Scalar),
     Aggregate(AggregateArrayElem),
@@ -489,7 +489,7 @@ impl ArrayBuilderElem {
 }
 
 /// sema-internal type representation (`03-types.md` §1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Ty {
     Int(IntTy),
     /// A generic type parameter, by its index in the enclosing function's `<...>` list
@@ -4426,6 +4426,10 @@ enum Place {
 /// up by one whenever a payload-less category is inserted before it (the `Timeout` variant did).
 pub const ERROR_VARIANT_CODE: u32 = 4;
 
+/// The tag of the builtin `Error.Invalid` variant. Test assertions use the same ordinary error
+/// category when their compiler-private condition fails.
+pub const ERROR_VARIANT_INVALID: u32 = 1;
+
 /// The tag of the builtin `Error` enum's `Timeout` variant (no payload) — a run/transport timeout,
 /// distinguishable from a nonzero exit (`Code`) and a transport failure. Surfaced by the runtime
 /// returning `AL_TIMEOUT` explicitly at a timeout site (never inferred from an errno). Recorded here
@@ -4459,7 +4463,7 @@ pub struct Module<'f> {
 /// This record is deliberately separate from [`Program`]: the frontend publishes the validated
 /// request, then D1's driver-owned post-lowering pass builds the artifact and installs the runtime
 /// descriptor body. Static input bytes never enter semantic body checking.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StaticDescriptor {
     pub unit: String,
     pub item: String,
@@ -4468,8 +4472,11 @@ pub struct StaticDescriptor {
     pub consumer: StaticDescriptorConsumer,
     pub driver: StaticDescriptorDriver,
     pub source: StaticDescriptorSource,
+    #[serde(skip)]
     pub constructor_span: Span,
+    #[serde(skip)]
     pub common_options_span: Span,
+    #[serde(skip)]
     pub native_options_span: Option<Span>,
     /// The concrete `P` in `db.query<P, R>` / `db.command<P>`. This is remapped together with HIR
     /// nominal ids when abstract generic instances are compacted.
@@ -4530,14 +4537,14 @@ pub fn static_descriptor_struct_is_valid(definition: &hir::StructDef) -> bool {
         && !definition.c_repr
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticCheckPolicy {
     DeclaredOnly,
     CheckedOptional,
     CheckedRequired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticDescriptorOption {
     Check(StaticCheckPolicy),
     SQLiteRequireVersionAtLeast {
@@ -4551,7 +4558,7 @@ pub enum StaticDescriptorOption {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum StaticContractType {
     Named {
         path: String,
@@ -4568,19 +4575,19 @@ pub enum StaticContractType {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StaticContractField {
     pub name: String,
     pub ty: StaticContractType,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StaticContractVariant {
     pub name: String,
     pub payload: Vec<StaticContractType>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticContractDefinitionBody {
     Struct {
         fields: Vec<StaticContractField>,
@@ -4590,14 +4597,14 @@ pub enum StaticContractDefinitionBody {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StaticContractDefinition {
     pub path: String,
     pub args: Vec<StaticContractType>,
     pub kind: StaticContractDefinitionBody,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StaticContract {
     pub root: StaticContractType,
     pub definitions: Vec<StaticContractDefinition>,
@@ -4818,35 +4825,139 @@ impl StaticContractCx<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticDescriptorConsumer {
     Query,
     Command,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticDescriptorDriver {
     AnySupportedDriver,
     SQLiteOnly,
     PostgreSQLOnly,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StaticDescriptorSource {
     File {
         path_literal: Option<String>,
+        #[serde(skip)]
         path_span: Option<Span>,
     },
     Inline {
         decoded_sql: String,
+        #[serde(skip)]
         literal_span: Span,
     },
 }
 
-/// The ordinary checked HIR plus the additive L5c descriptor inventory.
+/// One checked in-language test root. `function` is a compiler-private, unspellable source
+/// identity in [`TestOverlay::program`]; the driver assigns the public catalog ordinal and exact
+/// `align_test$<8hex>` backend symbol after dependency-first ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedTest {
+    pub module: String,
+    pub name: String,
+    pub canonical_id: String,
+    pub source_ordinal: u32,
+    pub function: String,
+    pub span: Span,
+}
+
+/// Validate the compiler-private catalog back-reference carried beside a combined test HIR view.
+///
+/// Ordinary checked-HIR validation can prove that an assertion occurs only in a test-origin
+/// function, but the public catalog identity intentionally lives outside [`hir::Program`]. Test
+/// lowering must therefore supply the catalog and close the remaining relation explicitly: every
+/// catalog root names one exact test-origin function, every test-origin function has one root, and
+/// every assertion in that body repeats that root's canonical id.
+pub fn checked_hir_test_catalog_is_valid(program: &hir::Program, tests: &[CheckedTest]) -> bool {
+    if tests.len() > 65_535 {
+        return false;
+    }
+    let mut roots = HashMap::with_capacity(tests.len());
+    let mut canonical_ids = HashSet::with_capacity(tests.len());
+    let mut completed_modules = HashSet::with_capacity(tests.len());
+    let mut current_module = None;
+    let mut expected_ordinal = 0u32;
+    for test in tests {
+        if current_module != Some(test.module.as_str()) {
+            if !completed_modules.insert(test.module.as_str()) {
+                return false;
+            }
+            current_module = Some(test.module.as_str());
+            expected_ordinal = 0;
+        }
+        if test.module.is_empty()
+            || test.module.len() > 1_021
+            || test.name.is_empty()
+            || test.name.len() > 256
+            || test.canonical_id.is_empty()
+            || test.canonical_id.len() > 1_024
+            || test.canonical_id.chars().any(|ch| {
+                matches!(ch as u32, 0x00..=0x1f | 0x7f..=0x9f)
+            })
+            || test.function.is_empty()
+            || test.function.as_bytes().contains(&0)
+            || test.span.lo > test.span.hi
+            || test.source_ordinal != expected_ordinal
+        {
+            return false;
+        }
+        let expected_id = format!("{}::{}", test.module, test.name);
+        let synthetic_name = test_synthetic_source_name(&test.canonical_id);
+        let imported_name = format!("{}${synthetic_name}", test.module);
+        if test.canonical_id != expected_id
+            || (test.function != synthetic_name && test.function != imported_name)
+            || !canonical_ids.insert(test.canonical_id.as_str())
+            || roots
+                .insert(test.function.as_str(), test.canonical_id.as_str())
+                .is_some()
+        {
+            return false;
+        }
+        let Some(next) = expected_ordinal.checked_add(1) else {
+            return false;
+        };
+        expected_ordinal = next;
+    }
+
+    for function in &program.fns {
+        if function.origin != hir::FnOrigin::Test {
+            continue;
+        }
+        let Some(expected) = roots.remove(function.name.as_str()) else {
+            return false;
+        };
+        if hir_depth::body_events(&function.body).into_iter().any(|event| {
+            matches!(
+                event,
+                hir_depth::BodyEvent::StmtEnter(hir::Stmt::TestAssert {
+                    canonical_id,
+                    ..
+                }) if canonical_id != expected
+            )
+        }) {
+            return false;
+        }
+    }
+    roots.is_empty()
+}
+
+/// The validated combined test view. Production consumers never receive this record.
+#[derive(Clone, Debug)]
+pub struct TestOverlay {
+    pub program: Program,
+    pub static_descriptors: Vec<StaticDescriptor>,
+    pub tests: Vec<CheckedTest>,
+}
+
+/// The ordinary checked HIR plus the additive L5c descriptor inventory and optional test overlay.
 pub struct CheckedProgram {
     pub program: Program,
     pub static_descriptors: Vec<StaticDescriptor>,
+    pub test_overlay: Option<TestOverlay>,
 }
 
 #[derive(Clone, Copy)]
@@ -6855,6 +6966,358 @@ pub fn check_program_with_all_interface_facts(
     .program
 }
 
+const TEST_SYNTHETIC_PREFIX: &str = "__align$test$";
+
+fn test_synthetic_source_name(canonical_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(TEST_SYNTHETIC_PREFIX.len() + canonical_id.len() * 2);
+    name.push_str(TEST_SYNTHETIC_PREFIX);
+    for byte in canonical_id.as_bytes() {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
+fn test_id_from_synthetic_source_name(name: &str) -> Option<String> {
+    let encoded = name.strip_prefix(TEST_SYNTHETIC_PREFIX)?;
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        bytes.push(digit(pair[0])? << 4 | digit(pair[1])?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn ast_named_type(name: &str, args: Vec<ast::Type>, span: Span) -> ast::Type {
+    let ident = ast::Ident {
+        name: name.to_owned(),
+        span,
+    };
+    ast::Type::Named {
+        path: ast::Path {
+            segments: vec![ident],
+            span,
+        },
+        args,
+        span,
+    }
+}
+
+fn ast_unit_type(span: Span) -> ast::Type {
+    ast_named_type("()", Vec::new(), span)
+}
+
+fn ast_unit_expr(span: Span) -> ast::Expr {
+    ast::Expr {
+        kind: ast::ExprKind::Unit,
+        span,
+    }
+}
+
+fn ast_ok_unit_expr(span: Span) -> ast::Expr {
+    let ok = ast::Ident {
+        name: "Ok".to_owned(),
+        span,
+    };
+    ast::Expr {
+        kind: ast::ExprKind::Call {
+            callee: Box::new(ast::Expr {
+                kind: ast::ExprKind::Path(ast::Path {
+                    segments: vec![ok],
+                    span,
+                }),
+                span,
+            }),
+            args: vec![ast_unit_expr(span)],
+        },
+        span,
+    }
+}
+
+/// Convert a source test into the ordinary function-shaped input used by the existing checker.
+/// The impossible `$` identity creates no source binding. Its body first proves the written block
+/// completes with exact Unit, then supplies the compiler-owned `Ok(())` tail.
+fn synthetic_test_function(test: &ast::TestDecl, canonical_id: &str) -> ast::FnDecl {
+    let mut body = test.body.clone();
+    normalize_test_assertion_block(&mut body, true);
+    if let Some(tail) = body.tail.take() {
+        body.stmts.push(ast::Stmt::Let {
+            is_mut: false,
+            name: ast::Ident {
+                name: "__align$test$unit".to_owned(),
+                span: tail.span,
+            },
+            ty: Some(ast_unit_type(tail.span)),
+            init: *tail,
+            align: None,
+        });
+    }
+    body.tail = Some(Box::new(ast_ok_unit_expr(test.span)));
+    ast::FnDecl {
+        vis: ast::Vis::Private,
+        name: ast::Ident {
+            name: test_synthetic_source_name(canonical_id),
+            span: test.name_span,
+        },
+        type_params: Vec::new(),
+        params: Vec::new(),
+        ret: Some(ast_named_type(
+            "Result",
+            vec![
+                ast_unit_type(test.span),
+                ast_named_type("Error", Vec::new(), test.span),
+            ],
+            test.span,
+        )),
+        body: ast::FnBody::Block(body),
+        span: test.span,
+    }
+}
+
+fn collect_checked_tests(modules: &[Module], diags: &mut Diagnostics) -> Vec<CheckedTest> {
+    let mut tests = Vec::new();
+    for module in modules.iter().filter(|module| !module.interface_only) {
+        let mut names = HashSet::new();
+        let mut source_ordinal = 0u32;
+        for item in &module.file.items {
+            let ast::Item::Test(test) = item else {
+                continue;
+            };
+            let byte_len = test.name.len();
+            if !(1..=256).contains(&byte_len) {
+                diags.error(
+                    format!("a test name must contain 1..=256 UTF-8 bytes, found {byte_len}"),
+                    test.name_span,
+                );
+            }
+            if test
+                .name
+                .chars()
+                .any(|ch| matches!(ch as u32, 0x00..=0x1f | 0x7f..=0x9f))
+            {
+                diags.error(
+                    "a test name cannot contain a Unicode C0 or C1 control character".to_owned(),
+                    test.name_span,
+                );
+            }
+            if !names.insert(test.name.as_str()) {
+                diags.error(
+                    format!(
+                        "duplicate test name '{}' in module '{}'",
+                        test.name, module.path
+                    ),
+                    test.name_span,
+                );
+            }
+            let canonical_id = format!("{}::{}", module.path, test.name);
+            if canonical_id.len() > 1_024 {
+                diags.error(
+                    format!(
+                        "a canonical test id must contain at most 1,024 UTF-8 bytes, found {}",
+                        canonical_id.len()
+                    ),
+                    test.name_span,
+                );
+            }
+            let source_name = test_synthetic_source_name(&canonical_id);
+            tests.push(CheckedTest {
+                module: module.path.clone(),
+                name: test.name.clone(),
+                canonical_id,
+                source_ordinal,
+                function: mangle_fn(&module.path, module.is_entry, &source_name),
+                span: test.span,
+            });
+            source_ordinal = source_ordinal.saturating_add(1);
+        }
+    }
+    if tests.len() > 65_535 {
+        let span = tests
+            .last()
+            .map_or_else(|| Span::new(0, 0, 0), |test| test.span);
+        diags.error(
+            format!(
+                "a test catalog may contain at most 65,535 entries, found {}",
+                tests.len()
+            ),
+            span,
+        );
+    }
+    tests
+}
+
+fn synthetic_test_files(modules: &[Module], tests: &[CheckedTest]) -> Vec<ast::File> {
+    modules
+        .iter()
+        .map(|module| {
+            let mut items = module
+                .file
+                .items
+                .iter()
+                .filter(|item| !matches!(item, ast::Item::Test(_)))
+                .cloned()
+                .collect::<Vec<_>>();
+            for item in &module.file.items {
+                let ast::Item::Test(test) = item else {
+                    continue;
+                };
+                let canonical_id = format!("{}::{}", module.path, test.name);
+                // `tests` is an independently validated record; retain this lookup as a structural
+                // assertion that synthesis cannot manufacture an uncatalogued root.
+                if tests.iter().any(|entry| entry.canonical_id == canonical_id) {
+                    items.push(ast::Item::Fn(synthetic_test_function(test, &canonical_id)));
+                }
+            }
+            ast::File {
+                module: module.file.module.clone(),
+                imports: module.file.imports.clone(),
+                items,
+            }
+        })
+        .collect()
+}
+
+fn ast_test_assertion(expression: &ast::Expr) -> Option<(&str, &[ast::Expr])> {
+    let ast::ExprKind::Call { callee, args } = &expression.kind else {
+        return None;
+    };
+    let ast::ExprKind::FieldAccess { recv, field } = &callee.kind else {
+        return None;
+    };
+    let ast::ExprKind::Path(path) = &recv.kind else {
+        return None;
+    };
+    (single_name(path) == Some("test") && matches!(field.name.as_str(), "expect" | "expect_eq"))
+        .then_some((field.name.as_str(), args.as_slice()))
+}
+
+/// Reclassify only syntactic assertion tails whose parent position is already known to discard a
+/// value. Ordinary AST statement expressions always establish that placement; a value-producing
+/// parent never does, even when type inference later happens to expect Unit.
+fn normalize_test_assertion_block(block: &mut ast::Block, completion_is_statement: bool) {
+    for statement in &mut block.stmts {
+        match statement {
+            ast::Stmt::Let { init, .. } => normalize_test_assertion_expr(init, false),
+            ast::Stmt::LetTuple { init, .. } => normalize_test_assertion_expr(init, false),
+            ast::Stmt::Assign { place, value } => {
+                normalize_test_assertion_expr(place, false);
+                normalize_test_assertion_expr(value, false);
+            }
+            ast::Stmt::Return(value) | ast::Stmt::Break { value, .. } => {
+                if let Some(value) = value {
+                    normalize_test_assertion_expr(value, false);
+                }
+            }
+            ast::Stmt::Expr(expression) => normalize_test_assertion_expr(expression, true),
+        }
+    }
+    let Some(tail) = block.tail.as_mut() else {
+        return;
+    };
+    normalize_test_assertion_expr(tail, completion_is_statement);
+    if completion_is_statement
+        && ast_test_assertion(tail).is_some()
+        && let Some(assertion) = block.tail.take()
+    {
+        block.stmts.push(ast::Stmt::Expr(*assertion));
+    }
+}
+
+fn normalize_test_assertion_expr(expression: &mut ast::Expr, is_statement: bool) {
+    use ast::ExprKind as K;
+    match &mut expression.kind {
+        K::Unary { expr, .. } | K::Cast { expr, .. } | K::Try(expr) => {
+            normalize_test_assertion_expr(expr, false);
+        }
+        K::Binary { lhs, rhs, .. } => {
+            normalize_test_assertion_expr(lhs, false);
+            normalize_test_assertion_expr(rhs, false);
+        }
+        K::Call { callee, args } => {
+            normalize_test_assertion_expr(callee, false);
+            for argument in args {
+                normalize_test_assertion_expr(argument, false);
+            }
+        }
+        K::FieldAccess { recv, .. } | K::TupleIndex { recv, .. } => {
+            normalize_test_assertion_expr(recv, false);
+        }
+        K::If { cond, then, els } => {
+            normalize_test_assertion_expr(cond, false);
+            normalize_test_assertion_block(then, is_statement);
+            if let Some(els) = els {
+                normalize_test_assertion_expr(els, is_statement);
+            }
+        }
+        K::Block(block) | K::Arena(block) | K::Unsafe(block) | K::TaskGroup(block) => {
+            normalize_test_assertion_block(block, is_statement)
+        }
+        K::NamedArena { block, .. } => normalize_test_assertion_block(block, is_statement),
+        K::StructLit { fields, .. } => {
+            for field in fields {
+                normalize_test_assertion_expr(&mut field.value, false);
+            }
+        }
+        K::ElseUnwrap { opt, fallback } => {
+            normalize_test_assertion_expr(opt, false);
+            normalize_test_assertion_expr(fallback, is_statement);
+        }
+        // A loop body is not the loop result (only `break` carries that), so its completion is a
+        // discarded statement position regardless of whether the loop expression is consumed.
+        K::Loop(body) => normalize_test_assertion_block(body, true),
+        K::ArrayLit(elements) | K::Tuple(elements) => {
+            for element in elements {
+                normalize_test_assertion_expr(element, false);
+            }
+        }
+        K::Index { recv, index } => {
+            normalize_test_assertion_expr(recv, false);
+            normalize_test_assertion_expr(index, false);
+        }
+        K::SliceRange { recv, start, end } => {
+            normalize_test_assertion_expr(recv, false);
+            if let Some(start) = start {
+                normalize_test_assertion_expr(start, false);
+            }
+            if let Some(end) = end {
+                normalize_test_assertion_expr(end, false);
+            }
+        }
+        // A lambda has its own function completion and assertion context; its statements are still
+        // walked so nested uses receive their normal placement diagnostics after `test_id` clears.
+        K::Lambda { body, .. } => normalize_test_assertion_block(body, true),
+        K::Match { scrutinee, arms } => {
+            normalize_test_assertion_expr(scrutinee, false);
+            for arm in arms {
+                normalize_test_assertion_expr(&mut arm.body, is_statement);
+            }
+        }
+        K::Template(parts) => {
+            for part in parts {
+                if let ast::TemplatePart::Hole(hole) = part {
+                    normalize_test_assertion_expr(hole, false);
+                }
+            }
+        }
+        K::Unit
+        | K::Int(_)
+        | K::Float(_)
+        | K::Char(_)
+        | K::Str(_)
+        | K::Bool(_)
+        | K::Path(_)
+        | K::FieldShorthand(_) => {}
+    }
+}
+
 /// Per-unit-capable checking with all producer facts and the L5c descriptor inventory.
 pub fn check_program_with_all_interface_facts_and_static_descriptors(
     modules: &[Module],
@@ -6890,7 +7353,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ast::Item::Struct(s) => (&s.name.name, s.vis, s.type_params.len(), s.span),
                 ast::Item::Enum(e) => (&e.name.name, e.vis, e.type_params.len(), e.span),
                 ast::Item::Resource(r) => (&r.name.name, r.vis, r.type_params.len(), r.span),
-                ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
+                ast::Item::Fn(_) | ast::Item::Test(_)
+                | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
             if m.is_entry && builtin_nominal_alias_by_bare(bare).is_some() {
                 diags.error(
@@ -6945,7 +7409,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     resource_decls.push((m.path.as_str(), m.is_entry, r));
                 }
                 ast::Item::Resource(r) => generic_resource_decls.push((m.path.as_str(), m.is_entry, r)),
-                ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => unreachable!(),
+                ast::Item::Fn(_) | ast::Item::Test(_)
+                | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             }
         }
     }
@@ -6964,7 +7429,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ast::Item::Struct(structure) => &structure.type_params,
                 ast::Item::Enum(enumeration) => &enumeration.type_params,
                 ast::Item::Resource(resource) => &resource.type_params,
-                ast::Item::Const(_) | ast::Item::Extern(_) => continue,
+                ast::Item::Test(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
             validate_declared_type_parameters(parameters, local_types, diags);
         }
@@ -7757,6 +8222,35 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
     }
 
+    // An import also owns test discovery for its complete transitive source closure. Propagate the
+    // modules whose subtree contains a test so an otherwise-unreferenced import required solely to
+    // select those tests is not mislabeled unused.
+    let mut test_reachable = modules
+        .iter()
+        .filter(|module| {
+            module
+                .file
+                .items
+                .iter()
+                .any(|item| matches!(item, ast::Item::Test(_)))
+        })
+        .map(|module| module.path.clone())
+        .collect::<HashSet<_>>();
+    loop {
+        let mut changed = false;
+        for module in modules {
+            if module.file.imports.iter().any(|import| {
+                let path = path_str(import);
+                known_modules.contains(path.as_str()) && test_reachable.contains(path.as_str())
+            }) {
+                changed |= test_reachable.insert(module.path.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     // Unused-import lint (warning): an `import` whose module is never referenced in the file. A
     // builtin (`core.json`) is matched by its `json.*` namespace; a user module by its dotted path.
     for m in modules {
@@ -7792,7 +8286,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 } else {
                     continue; // an unknown import already errored above
                 };
-                used(namespace)
+                used(namespace) || test_reachable.contains(p.as_str())
             };
             if !is_used {
                 diags.push(align_diag::Diagnostic::warning(format!("unused import `{p}`"), imp.span));
@@ -8805,7 +9299,109 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     static_descriptors.sort_by(|left, right| {
         left.descriptor_id.as_bytes().cmp(right.descriptor_id.as_bytes())
     });
-    CheckedProgram { program, static_descriptors }
+    let tests = collect_checked_tests(modules, diags);
+    let test_overlay = if tests.is_empty() {
+        None
+    } else {
+        // Formation is deliberately two-phase. The ordinary program above has reached its complete
+        // analysis fixed point before a synthetic test root exists. Rechecking an immutable source
+        // twin plus unspellable roots yields the combined view without giving production consumers
+        // a body-discard selector or allowing a test-only monomorph/type/capability to mutate the
+        // prefix record they already received.
+        let files = synthetic_test_files(modules, &tests);
+        let combined_modules = modules
+            .iter()
+            .zip(&files)
+            .map(|(module, file)| Module {
+                path: module.path.clone(),
+                file,
+                is_entry: module.is_entry,
+                interface_only: module.interface_only,
+            })
+            .collect::<Vec<_>>();
+        let existing = diags
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.severity,
+                    diagnostic.message.clone(),
+                    diagnostic.span,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut combined_diags = Diagnostics::new();
+        for diagnostic in diags.iter() {
+            combined_diags.push(diagnostic.clone());
+        }
+        let seeded = combined_diags.len();
+        let mut combined = check_program_with_all_interface_facts_and_static_descriptors(
+            &combined_modules,
+            external_effects,
+            external_return_provenance,
+            external_resources,
+            external_resource_hooks,
+            &mut combined_diags,
+        );
+        debug_assert!(combined.test_overlay.is_none());
+        for diagnostic in combined_diags.iter().skip(seeded) {
+            // The internal source twin replaces test declarations with unspellable functions. Its
+            // import-use lint must not reinterpret a user import that the original test-bearing
+            // source already classified (notably an import whose only purpose is catalog
+            // discovery). Test-body diagnostics still flow below.
+            if diagnostic.severity == align_diag::Severity::Warning
+                && diagnostic.message.starts_with("unused import `")
+            {
+                continue;
+            }
+            let key = (
+                diagnostic.severity,
+                diagnostic.message.clone(),
+                diagnostic.span,
+            );
+            if !existing.contains(&key) {
+                diags.push(diagnostic.clone());
+            }
+        }
+        for test in &tests {
+            if let Some(function) = combined
+                .program
+                .fns
+                .iter_mut()
+                .find(|function| function.name == test.function)
+            {
+                function.origin = hir::FnOrigin::Test;
+            } else {
+                diags.error(
+                    "a checked test root is absent from the combined test overlay".to_owned(),
+                    test.span,
+                );
+            }
+        }
+        let test_static_descriptors = combined
+            .static_descriptors
+            .iter()
+            .filter(|descriptor| !static_descriptors.contains(descriptor))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(descriptor) = test_static_descriptors.iter().find(|descriptor| {
+            matches!(
+                descriptor.consumer,
+                StaticDescriptorConsumer::Query | StaticDescriptorConsumer::Command
+            )
+        }) {
+            diags.error(
+                "a database static descriptor cannot be formed in the test overlay".to_owned(),
+                descriptor.constructor_span,
+            );
+        }
+        Some(TestOverlay {
+            program: combined.program,
+            static_descriptors: test_static_descriptors,
+            tests,
+        })
+    };
+    CheckedProgram { program, static_descriptors,
+        test_overlay}
 }
 
 #[derive(Default)]
@@ -9267,7 +9863,9 @@ fn compact_abstract_nominal_instances(
                     remap_expr_tree(value, remap, valid);
                 }
             }
-            hir::Stmt::Expr(expr) => remap_expr_tree(expr, remap, valid),
+            hir::Stmt::TestAssert { condition, .. } | hir::Stmt::Expr(condition) => {
+                remap_expr_tree(condition, remap, valid)
+            }
         }
     }
 
@@ -9748,6 +10346,79 @@ pub fn checked_hir_body_facts_are_valid(program: &hir::Program) -> bool {
     .unwrap_or(false)
 }
 
+/// Versioned, span-erased semantic identity for production HIR lowering and codegen.
+///
+/// Body reconstruction is the same exhaustive, stack-bounded variant sweep used by checked-HIR
+/// replay. Expression ownership is emitted separately in stored traversal order, so the
+/// span-keyed side table cannot leak source offsets or hash-map iteration into the identity. An
+/// ownership key that matches no expression rejects the projection.
+pub fn production_codegen_projection(program: &hir::Program) -> Option<Vec<u8>> {
+    let (projection, ownership) = replay_clone::clone_program_with_projection(program)?;
+    struct ProjectionOwner(Option<hir::Program>);
+    impl Drop for ProjectionOwner {
+        fn drop(&mut self) {
+            if let Some(program) = self.0.take() {
+                replay_clone::drop_program(program);
+            }
+        }
+    }
+
+    // Serde's derived field/variant sweep is exhaustive, but recursively enters the bounded HIR
+    // tree. Keep that implementation detail off the caller's 2 MiB owner stack: the checked-HIR
+    // limit is fixed, so one fixed 64 MiB worker stack is a closed bound rather than input-driven
+    // growth. `ProjectionOwner` preserves stack-bounded teardown even when spawning or encoding
+    // fails. A failed worker merely declines this pure optimization.
+    let encoded = std::thread::scope(|scope| {
+        let owner = ProjectionOwner(Some(projection));
+        let worker = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                let program = owner.0.as_ref()?;
+                bincode::serde::encode_to_vec(
+                    program,
+                    bincode::config::standard()
+                        .with_fixed_int_encoding()
+                        .with_little_endian(),
+                )
+                .ok()
+            })
+            .ok()?;
+        worker.join().ok().flatten()
+    })?;
+    let mut bytes = Vec::with_capacity(encoded.len() + 64);
+    bytes.extend_from_slice(b"align-production-codegen-v1\0");
+    bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(&(ownership.len() as u64).to_le_bytes());
+    for function in ownership {
+        bytes.extend_from_slice(&(function.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&function);
+    }
+    Some(bytes)
+}
+
+/// Ordered, span-erased semantic identity for production static descriptors.
+///
+/// Descriptor discovery already fixes stored order. The derived serializer is exhaustive over the
+/// semantic record, while the explicit `serde(skip)` annotations on constructor, option, and
+/// source-location spans keep diagnostic movement out of codegen identity.
+pub fn production_static_descriptor_projection(
+    descriptors: &[StaticDescriptor],
+) -> Option<Vec<u8>> {
+    let encoded = bincode::serde::encode_to_vec(
+        descriptors,
+        bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_little_endian(),
+    )
+    .ok()?;
+    let mut bytes = Vec::with_capacity(encoded.len() + 48);
+    bytes.extend_from_slice(b"align-production-static-descriptors-v1\0");
+    bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    Some(bytes)
+}
+
 fn borrowed_match_variants(
     ty: Ty,
     program: &hir::Program,
@@ -10204,6 +10875,7 @@ fn borrowed_element_live_root_uses(function: &hir::Fn) -> Option<HashSet<usize>>
                         | hir::Stmt::AssignElem { .. }
                         | hir::Stmt::Return(_)
                         | hir::Stmt::Break { .. }
+                        | hir::Stmt::TestAssert { .. }
                         | hir::Stmt::Expr(_),
                     )
                     | Frame::Other => {}
@@ -11208,7 +11880,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
 
             let capture_count = match function.origin {
                 hir::FnOrigin::Lifted { capture_count } => capture_count,
-                hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => 0,
+                hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph | hir::FnOrigin::Test => 0,
             };
             let explicit_params = (function.params.len() as u32).saturating_sub(capture_count);
             // Storage-generation roots are useful inside MoveCheck even for non-borrowing Move
@@ -11476,7 +12148,7 @@ fn effect_reachable(
 /// target is not statically known (the #433 unknown-HOF case); [`FnEffect::Pure`] = neither. At a
 /// `par_map`/parallel boundary both `Impure` and `Unknown` are rejected (fail-closed); the split is
 /// kept because the interface summary records it verbatim and the diagnostics differ.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum FnEffect {
     Pure,
     Impure,
@@ -11778,7 +12450,8 @@ fn compute_effect_sets(
             fallthrough_expressions: std::collections::HashSet::new(),
         };
         scan.block(&f.body);
-        direct.insert(f.name.as_str(), scan.impure_direct);
+        direct.insert(f.name.as_str(), scan.impure_direct || matches!(f.origin, hir::FnOrigin::Test),
+        );
         direct_unknown.insert(f.name.as_str(), scan.unknown_indirect);
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(
@@ -12943,6 +13616,7 @@ impl EffectScan<'_> {
                 }
             }
             Stmt::AssignVecLane { .. }
+            | Stmt::TestAssert { .. }
             | Stmt::Expr(_)
             | Stmt::Return(None)
             | Stmt::Break { value: None, .. } => {}
@@ -22676,6 +23350,9 @@ impl<'a> EscapeCheck<'a> {
                         | Stmt::Assign { value, .. }
                         | Stmt::AssignField { value, .. }
                         | Stmt::Return(Some(value))
+                        | Stmt::TestAssert {
+                            condition: value, ..
+                        }
                         | Stmt::Expr(value) => {
                             work.push(EscapeWalkItem::Expr(value, depth));
                         }
@@ -24873,7 +25550,7 @@ impl<'a> EscapeCheck<'a> {
                 self.check_return_escape(e, depth);
             }
             Stmt::Return(None) => {}
-            Stmt::Expr(_) => {}
+            Stmt::TestAssert { .. } | Stmt::Expr(_) => {}
             // A tuple destructure binds each element to a local. If the tuple is region-tracked
             // (holds a `str` view, or owned arrays allocated in an arena), each bound local inherits
             // the tuple's region — else an arena-allocated destructured array would default to
@@ -25925,6 +26602,7 @@ impl UnnecessaryHeapScan {
                     Stmt::LetTuple { .. }
                     | Stmt::Return(_)
                     | Stmt::Break { .. }
+                    | Stmt::TestAssert { .. }
                     | Stmt::Expr(_) => {}
                 },
                 hir_depth::BodyEvent::ExprEnter(expr) => match &expr.kind {
@@ -26059,6 +26737,9 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                     work.push(HirDivergenceWork::Any(2));
                     work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(value)));
                     work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(index)));
+                }
+                Stmt::TestAssert { condition, .. } => {
+                    work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(condition)));
                 }
                 Stmt::Expr(expression) => {
                     work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(expression)));
@@ -34432,6 +35113,7 @@ impl<'a> MoveCheck<'a> {
             | Stmt::AssignElem { index, value, .. } => {
                 expression_falls(index) && expression_falls(value)
             }
+            Stmt::TestAssert { condition, .. } => expression_falls(condition),
             Stmt::Expr(expression) => expression_falls(expression),
         }
     }
@@ -36579,7 +37261,7 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                 }
-                Stmt::Expr(e) => {
+                Stmt::TestAssert { condition: e, .. } | Stmt::Expr(e) => {
                     move_expr!(self, e, moved, false, false);
                     self.end_expression_staging_releases(e, BorrowEnd::Dropped);
                     self.clear_expression_value_snapshots(e);
@@ -41487,6 +42169,9 @@ struct Checker<'a, 't> {
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
     ret_hint: Ty,
+    /// Canonical id only while checking a compiler-synthesized test root. Lambdas clear it because
+    /// they are separate functions and cannot inherit lexical assertion authority.
+    test_id: Option<String>,
     /// Public source spelling of the scanner row type supplied by the active return or binding
     /// annotation. The AST spelling is captured before type resolution erases it into `Ty`; it is
     /// used only for the producer-owned `json.scan` diagnostic and never enters HIR.
@@ -41687,6 +42372,7 @@ impl<'a, 't> Checker<'a, 't> {
             borrowed_projection_places: HashMap::new(),
             scope: Vec::new(),
             ret_hint: Ty::Unit,
+            test_id: None,
             json_scan_source_spelling: None,
             json_scan_local_spellings: HashMap::new(),
             arena_depth: 0,
@@ -42080,6 +42766,7 @@ impl<'a, 't> Checker<'a, 't> {
         // modules (two modules may each have `fn run` with a lambda).
         let mangled = self.resolve_local_fn(&f.name.name).unwrap_or_else(|| f.name.name.clone());
         self.cur_fn = mangled.clone();
+        self.test_id = test_id_from_synthetic_source_name(&f.name.name);
         // A Checker is currently created per function, but keep this boundary explicit so future
         // reuse cannot carry producer-owned scanner identity across LocalId reuse.
         self.json_scan_source_spelling = None;
@@ -42356,6 +43043,76 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn check_test_assertion_statement(&mut self, expression: &ast::Expr) -> Option<Stmt> {
+        let (method, args) = ast_test_assertion(expression)?;
+        self.require_import("core.test", &format!("test.{method}"), expression.span);
+        let Some(canonical_id) = self.test_id.clone() else {
+            self.diags.error(
+                "test assertions are available only as standalone statements in a test declaration"
+                    .to_owned(),
+                expression.span,
+            );
+            for argument in args {
+                let _ = self.check_expr(argument, None);
+            }
+            return Some(Stmt::Expr(Expr {
+                kind: ExprKind::Unit,
+                ty: Ty::Error,
+                span: expression.span,
+            }));
+        };
+        let expected_arity = if method == "expect" { 1 } else { 2 };
+        if args.len() != expected_arity {
+            self.diags.error(
+                format!(
+                    "'test.{method}' takes {expected_arity} argument(s), got {}",
+                    args.len()
+                ),
+                expression.span,
+            );
+            for argument in args {
+                let _ = self.check_expr(argument, None);
+            }
+            return Some(Stmt::Expr(Expr {
+                kind: ExprKind::Unit,
+                ty: Ty::Error,
+                span: expression.span,
+            }));
+        }
+        let condition = if method == "expect" {
+            self.check_expr(&args[0], Some(Ty::Bool))
+        } else {
+            let comparison = ast::Expr {
+                kind: ast::ExprKind::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(args[0].clone()),
+                    rhs: Box::new(args[1].clone()),
+                },
+                span: expression.span,
+            };
+            self.check_expr(&comparison, Some(Ty::Bool))
+        };
+        if !matches!(self.resolve(condition.ty), Ty::Bool | Ty::Error) {
+            self.diags.error(
+                format!(
+                    "'test.{method}' requires a comparison whose result is exact bool, found {}",
+                    self.ty_display(self.resolve(condition.ty))
+                ),
+                expression.span,
+            );
+        }
+        Some(Stmt::TestAssert {
+            kind: if method == "expect" {
+                hir::TestAssertionKind::Expect
+            } else {
+                hir::TestAssertionKind::ExpectEq
+            },
+            condition,
+            canonical_id,
+            span: expression.span,
+        })
+    }
+
     /// Check a block. `expected` is the expected type of its trailing value (if any).
     fn check_block(&mut self, b: &ast::Block, expected: Option<Ty>) -> Block {
         let scope_mark = self.scope.len();
@@ -42559,6 +43316,10 @@ impl<'a, 't> Checker<'a, 't> {
                     stmts.push(Stmt::Break { value, accepted });
                 }
                 ast::Stmt::Expr(e) => {
+                    if let Some(assertion) = self.check_test_assertion_statement(e) {
+                        stmts.push(assertion);
+                        continue;
+                    }
                     let te = self.check_expr(e, None);
                     // Unhandled `Result` lint (`draft.md` §16): discarding a `Result` as a statement
                     // silently drops a possible error — against "errors are visible / handled". It is
@@ -42667,7 +43428,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         let prefix_diverges = stmts.iter().any(hir_stmt_diverges);
-        let tail_expected = if prefix_diverges { None } else { expected };
+        // A source block normally drops the expected type after a diverging prefix so dead code
+        // does not inherit an artificial constraint. A compiler-synthesized test tail is
+        // different: it is always `Ok(())` and needs the private `Result<(), Error>` context even
+        // after `return`, `process.exit`, or `process.abort` made the written body diverge.
+        let tail_expected = if prefix_diverges && self.test_id.is_none() { None } else { expected };
         let value = b.tail.as_ref().map(|e| {
             self.reject_bare_array_value(e, tail_expected, "a block value");
             Box::new(self.check_completion_expr(e, tail_expected))
@@ -46750,6 +47515,26 @@ impl<'a, 't> Checker<'a, 't> {
             && let Some(module) = single_name(p)
             && !self.name_in_scope(module)
         {
+            if module == "test" && matches!(method, "expect" | "expect_eq") {
+                self.require_import("core.test", &format!("test.{method}"), span);
+                for argument in args {
+                    let _ = self.check_expr(argument, None);
+                }
+                self.diags.error(
+                    if self.test_id.is_some() {
+                        "a test assertion is valid only as a standalone statement, never as a value"
+                    } else {
+                        "test assertions are available only as standalone statements in a test declaration"
+                    }
+                    .to_owned(),
+                    span,
+                );
+                return Expr {
+                    kind: ExprKind::Unit,
+                    ty: Ty::Error,
+                    span,
+                };
+            }
             // `heap.new(...)` — `heap` is a module name, not a value.
             if module == "heap" && method == "new" {
                 return self.check_heap_new(args, expected, span);
@@ -50603,6 +51388,7 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_borrowed_projection_places =
             std::mem::take(&mut self.borrowed_projection_places);
         let saved_ret = self.ret_hint;
+        let saved_test_id = self.test_id.take();
         let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
         let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
         let saved_arena = self.arena_depth;
@@ -50693,6 +51479,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.current_param_modes = saved_current_param_modes;
                 self.borrowed_projection_places = saved_borrowed_projection_places;
                 self.ret_hint = saved_ret;
+                self.test_id = saved_test_id;
                 self.json_scan_source_spelling = saved_json_scan_source_spelling;
                 self.json_scan_local_spellings = saved_json_scan_local_spellings;
                 self.arena_depth = saved_arena;
@@ -50760,6 +51547,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.current_param_modes = saved_current_param_modes;
         self.borrowed_projection_places = saved_borrowed_projection_places;
         self.ret_hint = saved_ret;
+        self.test_id = saved_test_id;
         self.json_scan_source_spelling = saved_json_scan_source_spelling;
         self.json_scan_local_spellings = saved_json_scan_local_spellings;
         self.arena_depth = saved_arena;
@@ -59733,6 +60521,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Stmt::AssignVecLane { value, .. } => self.finalize_expr(value),
                 Stmt::Return(Some(e))
                 | Stmt::Break { value: Some(e), .. }
+                | Stmt::TestAssert { condition: e, .. }
                 | Stmt::Expr(e) => self.finalize_expr(e),
                 Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),
@@ -61057,6 +61846,7 @@ fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>
                     ast::FnBody::Expr(e) => walk_expr(e, out),
                 }
             }
+            ast::Item::Test(test) => walk_block(&test.body, out),
             ast::Item::Struct(s) => {
                 for fd in &s.fields {
                     walk_type(&fd.ty, out);
@@ -61271,6 +62061,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "core.mask", "core.bitset", "core.map", "core.reduce", "core.scan", "core.partition",
     "core.sort", "core.str", "core.string", "core.bytes", "core.buffer", "core.builder",
     "core.arena", "core.json", "core.template", "core.hash", "core.math",
+    "core.test",
     // std — the OS boundary
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
     "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
@@ -68477,6 +69268,148 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn tests_form_only_in_the_combined_overlay_with_an_implicit_ok_tail() {
+        let (checked, diagnostics) = check_modules(&[(
+            "app",
+            "module app\nfn helper() -> i64 = 42\ntest \"works\" { value := helper() }\n",
+            true,
+        )]);
+        assert!(
+            !diagnostics.has_errors(),
+            "valid test overlay rejected: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            checked.program.fns.len(),
+            1,
+            "production prefix gained a test root"
+        );
+        let overlay = checked.test_overlay.expect("test overlay");
+        assert_eq!(overlay.tests.len(), 1);
+        assert_eq!(overlay.tests[0].canonical_id, "app::works");
+        let root = overlay
+            .program
+            .fns
+            .iter()
+            .find(|function| function.name == overlay.tests[0].function)
+            .expect("combined test root");
+        assert!(matches!(
+            root.ret,
+            Ty::Result(Scalar::Unit, Scalar::Enum(_))
+        ));
+        assert!(root.params.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_ok_tail_remains_typed_after_a_diverging_prefix() {
+        let (checked, diagnostics) = check_modules(&[(
+            "app",
+            concat!(
+                "module app\n",
+                "import std.process\n",
+                "test \"exit\" { process.exit(7) }\n",
+                "test \"abort\" { process.abort() }\n",
+                "test \"error\" { return Err(Error.Code(-9)) }\n",
+            ),
+            true,
+        )]);
+        assert!(
+            !diagnostics.has_errors(),
+            "a diverging written test body lost the private Result context: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            checked
+                .test_overlay
+                .as_ref()
+                .map(|overlay| overlay.tests.len()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_catalog_and_written_unit_completion_are_validated() {
+        let (_, duplicate) = check_modules(&[(
+            "app",
+            "module app\ntest \"same\" {}\ntest \"same\" {}\n",
+            true,
+        )]);
+        assert!(
+            duplicate
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("duplicate test name"))
+        );
+
+        let (_, control) =
+            check_modules(&[("app", "module app\ntest \"bad\\u{0080}\" {}\n", true)]);
+        assert!(
+            control
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("C0 or C1"))
+        );
+
+        let (_, non_unit) = check_modules(&[("app", "module app\ntest \"value\" { 1 }\n", true)]);
+        assert!(
+            non_unit.has_errors(),
+            "a non-Unit written test tail was accepted"
+        );
+    }
+
+    #[test]
+    fn test_assertions_are_statement_only_and_normalize_structural_tails() {
+        let (checked, valid) = check_modules(&[(
+            "app",
+            concat!(
+                "module app\n",
+                "import core.test\n",
+                "test \"placement\" {\n",
+                "  test.expect(true)\n",
+                "  if true {\n",
+                "    test.expect_eq(1, 1)\n",
+                "  } else {\n",
+                "    { test.expect(true) }\n",
+                "  }\n",
+                "}\n",
+            ),
+            true,
+        )]);
+        assert!(
+            !valid.has_errors(),
+            "valid structural assertion tails rejected: {:?}",
+            valid.iter().collect::<Vec<_>>()
+        );
+        let overlay = checked.test_overlay.expect("test overlay");
+        let root = overlay
+            .program
+            .fns
+            .iter()
+            .find(|function| function.name == overlay.tests[0].function)
+            .expect("test root");
+        let assertions = hir_depth::body_events(&root.body)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    hir_depth::BodyEvent::StmtEnter(hir::Stmt::TestAssert { .. })
+                )
+            })
+            .count();
+        assert_eq!(assertions, 3);
+
+        for source in [
+            "module app\nimport core.test\ntest \"value\" { x: () := test.expect(true) }\n",
+            "module app\nimport core.test\nfn helper() { test.expect(true) }\n",
+            "module app\ntest \"missing import\" { test.expect(true) }\n",
+        ] {
+            let (_, diagnostics) = check_modules(&[("app", source, true)]);
+            assert!(
+                diagnostics.has_errors(),
+                "invalid assertion placement/import accepted"
+            );
+        }
+    }
+
+    #[test]
     fn generic_resource_application_materializes_inside_result() {
         let internal = concat!(
             "module pkg.db.internal\n",
@@ -68533,6 +69466,144 @@ fn main() -> i32 = 0
             !diagnostics.has_errors(),
             "an aggregate's own resource transfer must not look like later eager invalidation: {:?}",
             diagnostics.iter().collect::<Vec<_>>()
+        );
+    }
+
+    fn descriptor_projection_fixture() -> StaticDescriptor {
+        let span = Span::new(1, 10, 20);
+        let named = |path: &str| StaticContractType::Named {
+            path: path.to_owned(),
+            args: Vec::new(),
+        };
+        StaticDescriptor {
+            unit: "app.queries".to_owned(),
+            item: "lookup".to_owned(),
+            descriptor_id: "app.queries.lookup".to_owned(),
+            is_public: true,
+            consumer: StaticDescriptorConsumer::Query,
+            driver: StaticDescriptorDriver::PostgreSQLOnly,
+            source: StaticDescriptorSource::Inline {
+                decoded_sql: "SELECT :id".to_owned(),
+                literal_span: span,
+            },
+            constructor_span: span,
+            common_options_span: Span::new(1, 21, 22),
+            native_options_span: Some(Span::new(1, 23, 24)),
+            params_ty: Ty::Struct(3),
+            row_ty: Some(Ty::Struct(4)),
+            params_contract: StaticContract {
+                root: named("app.Params"),
+                definitions: vec![StaticContractDefinition {
+                    path: "app.Params".to_owned(),
+                    args: Vec::new(),
+                    kind: StaticContractDefinitionBody::Struct {
+                        fields: vec![StaticContractField {
+                            name: "id".to_owned(),
+                            ty: named("i64"),
+                        }],
+                    },
+                }],
+            },
+            row_contract: Some(StaticContract {
+                root: named("app.Row"),
+                definitions: Vec::new(),
+            }),
+            static_options: vec![StaticDescriptorOption::Check(
+                StaticCheckPolicy::CheckedRequired,
+            )],
+        }
+    }
+
+    #[test]
+    fn descriptor_semantics_change_identity() {
+        let descriptor = descriptor_projection_fixture();
+        let baseline = production_static_descriptor_projection(std::slice::from_ref(&descriptor));
+        let mut mutations = Vec::new();
+        let mut changed = descriptor.clone();
+        changed.unit.push_str(".other");
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.item.push_str("_other");
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.descriptor_id.push_str(".other");
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.is_public = false;
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.consumer = StaticDescriptorConsumer::Command;
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.driver = StaticDescriptorDriver::SQLiteOnly;
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.source = StaticDescriptorSource::Inline {
+            decoded_sql: "SELECT :other".to_owned(),
+            literal_span: Span::new(1, 10, 20),
+        };
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.params_ty = Ty::Struct(30);
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.row_ty = None;
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.params_contract.definitions[0]
+            .path
+            .push_str("Other");
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.row_contract = None;
+        mutations.push(changed);
+        let mut changed = descriptor.clone();
+        changed.static_options = vec![StaticDescriptorOption::Check(
+            StaticCheckPolicy::DeclaredOnly,
+        )];
+        mutations.push(changed);
+        for (index, changed) in mutations.iter().enumerate() {
+            assert_ne!(
+                baseline,
+                production_static_descriptor_projection(std::slice::from_ref(changed)),
+                "semantic descriptor mutation {index} shared the production identity"
+            );
+        }
+        assert_ne!(
+            baseline,
+            production_static_descriptor_projection(&[descriptor.clone(), descriptor]),
+            "descriptor sequence cardinality did not enter production identity"
+        );
+    }
+
+    #[test]
+    fn descriptor_spans_do_not_change_identity() {
+        let descriptor = descriptor_projection_fixture();
+        let baseline = production_static_descriptor_projection(std::slice::from_ref(&descriptor));
+        let mut shifted = descriptor.clone();
+        shifted.constructor_span = Span::new(9, 100, 200);
+        shifted.common_options_span = Span::new(9, 201, 202);
+        shifted.native_options_span = None;
+        if let StaticDescriptorSource::Inline { literal_span, .. } = &mut shifted.source {
+            *literal_span = Span::new(9, 300, 400);
+        }
+        assert_eq!(
+            baseline,
+            production_static_descriptor_projection(std::slice::from_ref(&shifted))
+        );
+
+        let mut file = descriptor;
+        file.source = StaticDescriptorSource::File {
+            path_literal: Some("queries/lookup.sql".to_owned()),
+            path_span: Some(Span::new(1, 30, 50)),
+        };
+        let baseline = production_static_descriptor_projection(std::slice::from_ref(&file));
+        if let StaticDescriptorSource::File { path_span, .. } = &mut file.source {
+            *path_span = Some(Span::new(7, 300, 500));
+        }
+        assert_eq!(
+            baseline,
+            production_static_descriptor_projection(std::slice::from_ref(&file))
         );
     }
 

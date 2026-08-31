@@ -2783,6 +2783,8 @@ pub enum ValidationPass {
     DeclarationHeaders,
     /// `validate_hir::json_scan_validation_reason`.
     JsonScan,
+    /// `align_sema::checked_hir_test_catalog_is_valid` at the test-only lowering boundary.
+    TestCatalog,
     /// `validate_hir::body_only_metadata_is_valid`; carries the rejected function name.
     Bodies,
     /// `align_sema::checked_hir_body_facts_are_valid`.
@@ -2801,6 +2803,7 @@ impl ValidationPass {
             Self::NominalLink => "nominal_link_metadata_is_valid",
             Self::DeclarationHeaders => "declaration_header_metadata_is_valid",
             Self::JsonScan => "json_scan_validation_reason",
+            Self::TestCatalog => "checked_hir_test_catalog_is_valid",
             Self::Bodies => "body_only_metadata_is_valid",
             Self::BodyFacts => "checked_hir_body_facts_are_valid",
             Self::LoweringProducedNothing => "lowering",
@@ -2841,6 +2844,15 @@ pub fn lower_program_checked(
     per_unit: bool,
     source_map: Option<&SourceMap>,
 ) -> Result<Program, LoweringRejected> {
+    lower_program_checked_with_catalog(program, None, per_unit, source_map)
+}
+
+fn lower_program_checked_with_catalog(
+    program: &hir::Program,
+    tests: Option<&[align_sema::CheckedTest]>,
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<Program, LoweringRejected> {
     let rejected = |pass: ValidationPass, function: Option<String>| LoweringRejected {
         checked_fns: program.fns.len(),
         checked_structs: program.structs.len(),
@@ -2854,6 +2866,9 @@ pub fn lower_program_checked(
         }
         return Err(rejected(pass, function));
     }
+    if tests.is_some_and(|tests| !align_sema::checked_hir_test_catalog_is_valid(program, tests)) {
+        return Err(rejected(ValidationPass::TestCatalog, None));
+    }
     let lines = source_map.map(|sm| Rc::new(SourceLines::from_map(sm)));
     let mir = lower_program_unchecked(program, lines, per_unit);
     // Validation is not the only way a checked program can vanish: lowering itself must publish a
@@ -2864,6 +2879,18 @@ pub fn lower_program_checked(
         return Err(rejected(ValidationPass::LoweringProducedNothing, None));
     }
     Ok(mir)
+}
+
+/// Lower a compiler-produced combined test view after correlating its external catalog with the
+/// checked-HIR test roots and assertion identities. Production lowering deliberately has no catalog
+/// input and continues through [`lower_program_checked`].
+pub fn lower_test_program_checked(
+    program: &hir::Program,
+    tests: &[align_sema::CheckedTest],
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<Program, LoweringRejected> {
+    lower_program_checked_with_catalog(program, Some(tests), per_unit, source_map)
 }
 
 /// typed HIR -> MIR.
@@ -5228,6 +5255,7 @@ fn stmt_span(s: &hir::Stmt) -> Option<Span> {
         hir::Stmt::AssignElem { value, .. } => Some(value.span),
         hir::Stmt::Return(e) => e.as_ref().map(|e| e.span),
         hir::Stmt::Break { value, .. } => value.as_ref().map(|e| e.span),
+        hir::Stmt::TestAssert { span, .. } => Some(*span),
         hir::Stmt::Expr(e) => Some(e.span),
     }
 }
@@ -5676,6 +5704,68 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     }
                 }
             }
+        }
+        hir::Stmt::TestAssert {
+            kind,
+            condition,
+            canonical_id,
+            span,
+        } => {
+            let condition = lower_required!(b, lower_expr(b, condition), ());
+            let passed = b.new_block();
+            let failed = b.new_block();
+            b.terminate(Term::Branch(condition, passed, failed));
+
+            b.cur = failed;
+            // Lowering the condition updates the current debug span to its innermost expression.
+            // Restore the complete qualified call before publishing the user-visible location.
+            b.set_span(*span);
+            let (line, column) = b.cur_line();
+            let expected = match kind {
+                hir::TestAssertionKind::Expect => "true",
+                hir::TestAssertionKind::ExpectEq => "equality",
+            };
+            let diagnostic =
+                format!("assertion failed: {canonical_id}:{line}:{column}: expected {expected}\n");
+            let writer = b.fresh_value(Ty::Writer);
+            b.push(Stmt::Let(
+                writer,
+                Rvalue::WriterStd {
+                    fd: 2,
+                    buffered: false,
+                },
+            ));
+            let message = b.fresh_value(Ty::Str);
+            b.push(Stmt::Let(message, Rvalue::StrLit(diagnostic)));
+            let status = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                status,
+                Rvalue::WriterWrite(Operand::Value(writer), Operand::Value(message)),
+            ));
+            b.push(Stmt::DropValue(Operand::Value(writer)));
+            let error_id = match b.ret {
+                Ty::Result(Scalar::Unit, Scalar::Enum(error_id)) => error_id,
+                _ => {
+                    b.terminate(Term::Unreachable);
+                    b.cur = passed;
+                    return;
+                }
+            };
+            let error = b.fresh_value(Ty::Enum(error_id));
+            b.push(Stmt::Let(
+                error,
+                Rvalue::MakeEnum {
+                    enum_id: error_id,
+                    variant: align_sema::ERROR_VARIANT_INVALID,
+                    payload: Vec::new(),
+                },
+            ));
+            let result = b.fresh_value(b.ret);
+            b.push(Stmt::Let(result, Rvalue::ResultErr(Operand::Value(error))));
+            b.emit_exit_cleanup();
+            b.terminate_return(Some(Operand::Value(result)), None, b.ret);
+
+            b.cur = passed;
         }
         hir::Stmt::Expr(e) => {
             // An otherwise-unused fresh Move value still owns resources. Route it through the same
@@ -22633,7 +22723,7 @@ fn main() -> i32 = 0
             let bound_source = (case.first == First::Bound).then(|| {
                 let source = exact_bound_source_load(function, owner);
                 assert!(
-                    location_precedes(function, arm, source.0),
+                    location_precedes(function, arm, source. 0),
                     "{} must make the bound source live before reading the exact parent operand:\n{rendered}",
                     case.name
                 );
@@ -22651,7 +22741,7 @@ fn main() -> i32 = 0
                 .map(|&(block_id, index)| {
                     let block = &function.blocks[block_id as usize];
                     let entry = block_id == function.entry
-                        && (arm.0 != function.entry || index < arm.1);
+                        && (arm. 0 != function.entry || index < arm. 1);
                     let cleanup = index > 0
                         && matches!(block.stmts[index - 1], Stmt::Drop(slot) if slot == owner);
                     let action = !entry
@@ -22958,7 +23048,7 @@ fn main() -> i32 = 0
                     assert!(
                         action_clear.1 == 0
                             || !matches!(
-                                function.blocks[action_clear.0 as usize].stmts[action_clear.1 - 1],
+                                function.blocks[action_clear. 0 as usize].stmts[action_clear. 1 - 1],
                                 Stmt::DropFlagInit(slot) if slot == owner
                             ),
                         "{} must not invent bound-source nulling for a fresh staged value:\n{rendered}",
@@ -23625,9 +23715,9 @@ fn main() -> i32 = 0
             let call_block = &function.blocks[call.0 as usize];
             assert!(
                 call.1 >= 2
-                    && matches!(call_block.stmts[call.1 - 2], Stmt::DropFlagInit(slot) if slot == state.owner)
+                    && matches!(call_block.stmts[call. 1 - 2], Stmt::DropFlagInit(slot) if slot == state.owner)
                     && matches!(
-                        call_block.stmts[call.1 - 1],
+                        call_block.stmts[call. 1 - 1],
                         Stmt::Store(slot, Operand::Const(Const::Bool(false))) if slot == state.flag
                     ),
                 "the successful parent action must null the exact bound source and its flag immediately before the call:\n{rendered}"
@@ -23725,14 +23815,14 @@ fn main() -> i32 = 0
                     let second_field = second_fields[0];
                     assert!(
                         matches!(
-                            function.blocks[first_field.0 as usize].stmts[first_field.1],
+                            function.blocks[first_field. 0 as usize].stmts[first_field. 1],
                             Stmt::StoreField(_, _, Operand::Value(value)) if value == source_value
                         ),
                         "aggregate field zero must receive the exact bound-source load:\n{rendered}"
                     );
                     assert!(
                         matches!(
-                            function.blocks[second_field.0 as usize].stmts[second_field.1],
+                            function.blocks[second_field. 0 as usize].stmts[second_field. 1],
                             Stmt::StoreField(_, _, Operand::Value(value)) if value == index_value
                         ),
                         "aggregate field one must receive the exact guarded index result:\n{rendered}"
@@ -24178,7 +24268,7 @@ fn main() -> i32 = 0
                     );
                     assert!(
                         matches!(
-                            function.blocks[first_fields[0].0 as usize].stmts[first_fields[0].1],
+                            function.blocks[first_fields[0]. 0 as usize].stmts[first_fields[0]. 1],
                             Stmt::StoreField(_, _, Operand::Value(value)) if value == source_value
                         ),
                         "aggregate field zero must retain the exact bound-source identity:\n{rendered}"

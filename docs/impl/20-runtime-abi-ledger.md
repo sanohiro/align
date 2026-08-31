@@ -15,16 +15,17 @@ raw/SSE receive streaming, and asymmetric signatures, there are 314 `RuntimeKey`
 variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
-ordinary typed keys; they may no longer bypass the registry. Thirteen always-built
-runtime records have no `RuntimeKey` and instead use the thirteen-variant
+ordinary typed keys; they may no longer bypass the registry. Seventeen always-built
+runtime records have no `RuntimeKey` and instead use the seventeen-variant
 `UnkeyedRuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
 `align_rt_http_serialize`, and eight package-internal PostgreSQL codec helpers:
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
-`align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 327 records. Request 12 adds the keyed bounded-builder stack
+`align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
+`core.test` child-control rows recorded below. The base native registry
+therefore has 331 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -35,10 +36,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 327 base records.
+The compiler-visible native registry is always exactly the 331 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 335.
+records extend only the verification-time maximum runtime-export table to 339.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -52,17 +53,16 @@ added the two bounded-HTTP setters, and Request 9 then added `BuilderWriteUint`.
 The raw HTTP receive-stream capability subsequently added six keyed rows for buffer-capacity
 inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
-six keyed rows. Their runtime definitions and registry entries activated atomically: the current
-exact counts are 314 keyed records, 327 base records, and 335 records in the
-maximum optional-probe export table. No unkeyed or probe category changed.
+six keyed rows. The `core.test` child-control extension then added four unkeyed rows. Their runtime
+definitions and registry entries activated atomically: the current exact counts are 314 keyed
+records, 331 base records, and 339 records in the maximum optional-probe export table. No probe
+category changed.
 
-## Proposed core.test child-control extension (not implemented)
+## core.test child-control extension
 
-The accepted `core.test` design reserves four compiler-private unkeyed rows. They are not part of
-the shipped counts above until the implementation lands; activation will leave the keyed count at
-314, increase `UnkeyedRuntimeKey` from 13 to 17, the base registry from 327 to 331, and the maximum
-optional-probe table from 335 to 339. The registry keys, LLVM declarations, Rust exports, collision
-reservation, runtime ABI fingerprint, and test-mode selectors activate atomically. Only a generated
+The accepted `core.test` design adds four compiler-private unkeyed rows while leaving the keyed
+count at 314. The registry keys, LLVM declarations, Rust exports, collision reservation, runtime
+ABI fingerprint, and test-mode selectors activate atomically. Only a generated
 test harness may select them; they receive no language-callable `RuntimeKey` or compatible user
 extern reuse.
 
@@ -71,7 +71,7 @@ The first-capability test-callgraph validator rejects every catalog-reachable
 containment descriptor, supervisor-status codec, or fifth child-control ABI row; ordinary
 production `process.command` continues to select its shipped runtime entries unchanged.
 
-| Planned unkeyed key | Exact symbol and LLVM declaration | Exact Rust ABI |
+| Unkeyed key | Exact symbol and LLVM declaration | Exact Rust ABI |
 |---|---|---|
 | `TestLaunchRecvV1` | `i32 @align_rt_test_launch_recv_v1(i32, ptr)` | `extern "C" fn(i32, *mut u32) -> i32` |
 | `TestFdCloexecV1` | `i32 @align_rt_test_fd_cloexec_v1(i32)` | `extern "C" fn(i32) -> i32` |
@@ -521,21 +521,21 @@ Tests compare:
 - all 314 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 327 base native symbols against default-feature `align_runtime` exports,
+- the 331 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 331 `alloc-count` and 331 `par-map-probe` native symbols against
+- the 335 `alloc-count` and 335 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 335 maximum native symbols against `align_runtime` built with
+- the 339 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 327 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  327 exact registry function types through the production compatibility
+- all 331 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  331 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

@@ -3,16 +3,12 @@
 //! Exposes the `source.align` -> lexer -> parser -> sema -> MIR -> (codegen)
 //! pipeline as library functions. Both the `alignc` binary (`main.rs`) and the
 //! integration tests call this.
-
-use align_diag::{Diagnostics, Severity};
-use align_watch as watch_inputs;
-use align_span::SourceMap;
-use std::io::Read as _;
 pub use align_codegen_llvm::{
-    target_object_format, BuildTarget, DebugInfo, ObjectFormat, PartitionCodegenView,
-    PartitionSharedCodegenView, Profile, SupportThunkOwner, SupportThunkRecord,
-    ThinFunctionLinkage, ThinPeerDeclaration,
+    BuildTarget, DebugInfo, ObjectFormat, PartitionCodegenView, PartitionSharedCodegenView,
+    Profile, SupportThunkOwner, SupportThunkRecord, TestRoot, ThinFunctionLinkage,
+    ThinPeerDeclaration, target_object_format,
 };
+use align_diag::{Diagnostics, Severity};
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
 pub use align_mir::Program as MirProgram;
@@ -22,6 +18,10 @@ pub use align_interface::{Hash128, InterfaceSummary};
 pub use align_sema::{
     StaticDescriptor, StaticDescriptorConsumer, StaticDescriptorDriver, StaticDescriptorSource,
 };
+use align_span::SourceMap;
+use align_watch as watch_inputs;
+use std::collections::HashMap;
+use std::io::Read as _;
 
 pub mod cache;
 pub mod db_prepare;
@@ -113,6 +113,9 @@ fn postgres_parameter_type_matches(
 pub struct Checked {
     pub hir: align_sema::Program,
     pub static_descriptors: Vec<StaticDescriptor>,
+    /// Compiler-private combined test view. Production lowering and interface consumers must use
+    /// `hir` above and cannot obtain this record accidentally.
+    pub test_overlay: Option<align_sema::TestOverlay>,
     /// The source-level module path that owns the entry function. Whole-program descriptor
     /// installation uses it to distinguish the entry's plain symbols from non-entry mangled ones.
     pub entry_unit: String,
@@ -220,11 +223,18 @@ fn static_interface_hash(
 
 fn static_implementation_hash(
     base: Hash128,
+    descriptors: &[StaticDescriptor],
     manifest: &StaticInputManifest,
     artifacts: &[BuiltStaticArtifact],
 ) -> Result<Hash128, String> {
+    let descriptor_projection = align_sema::production_static_descriptor_projection(descriptors)
+        .ok_or_else(|| "cannot encode the static descriptor semantic projection".to_owned())?;
     let manifest_digest = manifest.action_key().map_err(|error| error.to_string())?;
     let mut encoded = b"ALIGNSTP\0".to_vec();
+    let projection_len = u32::try_from(descriptor_projection.len())
+        .map_err(|_| "static descriptor projection exceeds u32::MAX")?;
+    encoded.extend_from_slice(&projection_len.to_le_bytes());
+    encoded.extend_from_slice(&descriptor_projection);
     encoded.extend_from_slice(&manifest_digest.lo.to_le_bytes());
     encoded.extend_from_slice(&manifest_digest.hi.to_le_bytes());
     let mut ordered = artifacts.iter().collect::<Vec<_>>();
@@ -2141,6 +2151,259 @@ pub fn lower_to_mir_with_static_descriptors(
     Ok(mir)
 }
 
+fn dropped_resource_ids(program: &align_mir::Program, root: align_sema::Ty) -> Vec<u32> {
+    use align_sema::Ty;
+
+    let mut found = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    let mut structs = std::collections::HashSet::new();
+    let mut tuples = std::collections::HashSet::new();
+    let mut enums = std::collections::HashSet::new();
+    let mut tagged = std::collections::HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !align_sema::ty_mentions_resource(
+            ty,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        ) {
+            continue;
+        }
+        match ty {
+            Ty::Resource(id) => {
+                found.insert(id);
+            }
+            Ty::ResourceRef(_) | Ty::HttpReadStream | Ty::HttpSseStream => {}
+            Ty::Array(value, _)
+            | Ty::DynArray(value)
+            | Ty::Option(value)
+            | Ty::Task(value)
+            | Ty::Box(value)
+            | Ty::ArrayBuilder(value) => work.push(align_sema::scalar_to_ty(value)),
+            Ty::Result(ok, err) => {
+                work.push(align_sema::scalar_to_ty(err));
+                work.push(align_sema::scalar_to_ty(ok));
+            }
+            Ty::Struct(id) if structs.insert(id) => {
+                if let Some(definition) = program.structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if tuples.insert(id) => {
+                if let Some(definition) = program.tuples.get(id as usize) {
+                    work.extend(
+                        definition
+                            .elems
+                            .iter()
+                            .rev()
+                            .copied()
+                            .map(align_sema::scalar_to_ty),
+                    );
+                }
+            }
+            Ty::Enum(id) if enums.insert(id) => {
+                if let Some(definition) = program.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(align_sema::scalar_to_ty),
+                    );
+                }
+            }
+            Ty::Tagged(id) if tagged.insert(id) => {
+                if let Some(definition) = program.tagged_types.get(id as usize) {
+                    match *definition {
+                        align_sema::hir::TaggedType::Option(value) => {
+                            work.push(align_sema::scalar_to_ty(value));
+                        }
+                        align_sema::hir::TaggedType::Result(ok, err) => {
+                            work.push(align_sema::scalar_to_ty(err));
+                            work.push(align_sema::scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _) => work.push(Ty::Struct(id)),
+            // The shared classifier is exhaustive over every resource-bearing type. If a future
+            // owning carrier reaches here before this exact-id traversal learns its shape, include
+            // every hook rather than silently permitting an implicit process edge.
+            _ => found.extend(
+                program
+                    .resources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, _)| u32::try_from(id).ok()),
+            ),
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn test_function_targets(
+    program: &align_mir::Program,
+    function: &align_mir::Function,
+) -> Option<(
+    std::collections::BTreeSet<align_mir::ProgramCall>,
+    std::collections::BTreeSet<align_mir::ProgramCall>,
+)> {
+    use align_mir::Stmt;
+
+    let mut targets = referenced_program_calls(function);
+    let mut resource_hooks = std::collections::BTreeSet::new();
+    for block in &function.blocks {
+        for statement in &block.stmts {
+            let dropped = match statement {
+                Stmt::Drop(slot) => function.slots.get(*slot as usize).copied(),
+                Stmt::DropValue(operand) => Some(function.operand_ty(operand)),
+                Stmt::DropElem(_, _, struct_id) => Some(align_sema::Ty::Struct(*struct_id)),
+                _ => None,
+            };
+            let Some(dropped) = dropped else { continue };
+            for resource_id in dropped_resource_ids(program, dropped) {
+                let resource = program.resources.get(resource_id as usize)?;
+                let target =
+                    align_mir::ProgramCall::try_from_logical(&resource.drop_hook).ok()?;
+                resource_hooks.insert(target.clone());
+                targets.insert(target);
+            }
+        }
+    }
+    Some((targets, resource_hooks))
+}
+
+fn test_reachable_process_command(
+    program: &align_mir::Program,
+    roots: &[align_sema::CheckedTest],
+) -> bool {
+    use align_mir::{Rvalue, Stmt};
+    let functions = program
+        .fns
+        .iter()
+        .map(|function| (&function.name, function))
+        .collect::<HashMap<_, _>>();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = roots
+        .iter()
+        .rev()
+        .filter_map(|root| align_mir::ProgramCall::try_from_logical(&root.function).ok())
+        .collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(function) = functions.get(&name) else {
+            continue;
+        };
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                if matches!(statement, Stmt::Let(_, Rvalue::Command { .. })) {
+                    return true;
+                }
+            }
+        }
+        let Some((targets, resource_hooks)) = test_function_targets(program, function) else {
+            return true;
+        };
+        if resource_hooks.iter().any(|target| !functions.contains_key(target)) {
+            return true;
+        }
+        pending.extend(targets.into_iter().rev());
+    }
+    false
+}
+
+fn validate_test_overlay_descriptors(descriptors: &[StaticDescriptor]) -> Result<(), String> {
+    if descriptors.iter().any(|descriptor| {
+        matches!(
+            descriptor.consumer,
+            StaticDescriptorConsumer::Query | StaticDescriptorConsumer::Command
+        )
+    }) {
+        return Err("a database static descriptor cannot be formed in the test overlay".to_owned());
+    }
+    Ok(())
+}
+
+/// Lower the validated combined test view with source locations, reject the closed
+/// `process.command` boundary, then install the same offline production descriptor artifacts.
+/// This performs no cache lookup, object allocation, or external process launch.
+pub fn lower_test_to_mir_with_static_descriptors(
+    checked: &Checked,
+    source_map: &mut SourceMap,
+    project_root: &std::path::Path,
+) -> Result<align_mir::Program, String> {
+    let overlay = checked
+        .test_overlay
+        .as_ref()
+        .ok_or_else(|| "no tests found".to_owned())?;
+    validate_test_overlay_descriptors(&overlay.static_descriptors)?;
+    let mut mir = align_mir::lower_test_program_checked(
+        &overlay.program,
+        &overlay.tests,
+        false,
+        Some(source_map),
+    )
+    .map_err(|rejected| format!("internal error: {rejected}"))?;
+    if test_reachable_process_command(&mir, &overlay.tests) {
+        return Err(
+            "process.command is not available from test code; run the external process in an owner test"
+                .to_owned(),
+        );
+    }
+    if checked.static_descriptors.is_empty() && overlay.static_descriptors.is_empty() {
+        return Ok(mir);
+    }
+
+    let mut descriptors = checked.static_descriptors.clone();
+    let mut artifacts = Vec::new();
+    if !checked.static_descriptors.is_empty() {
+        let production = try_lower_to_mir(&checked.hir)
+            .map_err(|rejected| format!("internal error: {rejected}"))?;
+        let resolution_digest = align_interface::codegen_impl_hash(&production);
+        let resolved = resolve_static_descriptors(
+            project_root,
+            source_map,
+            &checked.static_descriptors,
+            resolution_digest,
+        )
+        .map_err(|error| error.to_string())?;
+        artifacts.extend(
+            build_static_artifacts(&checked.static_descriptors, &resolved)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    if !overlay.static_descriptors.is_empty() {
+        let resolution_digest = align_interface::codegen_impl_hash(&mir);
+        let resolved = resolve_static_descriptors(
+            project_root,
+            source_map,
+            &overlay.static_descriptors,
+            resolution_digest,
+        )
+        .map_err(|error| error.to_string())?;
+        artifacts.extend(
+            build_static_artifacts(&overlay.static_descriptors, &resolved)
+                .map_err(|error| error.to_string())?,
+        );
+        descriptors.extend(overlay.static_descriptors.iter().cloned());
+    }
+    install_static_descriptor_data(
+        &mut mir,
+        Some(checked.entry_unit.as_str()),
+        &descriptors,
+        &artifacts,
+    )?;
+    Ok(mir)
+}
+
 /// lexer -> parser -> sema for the entry file plus its transitively-imported **user** modules
 /// (multi-file, slice B1). User modules resolve by filename convention: `import geom` →
 /// `<entry-dir>/geom.align`, which must declare `module geom`. Builtin imports (`core.*`/`std.*`)
@@ -2232,11 +2495,18 @@ fn load_units(
     let entry_fid = source_map.add_file(name, src);
     let entry_tokens = align_lexer::tokenize(entry_fid, src, diags);
     let entry_ast = align_parser::parse_file(entry_tokens, diags);
+    let entry_uses_default_main = entry_ast.module.is_none();
     let entry_path = entry_ast
         .module
         .as_ref()
-        .and_then(|m| m.segments.last())
-        .map(|s| s.name.clone())
+        .map(|module| {
+            module
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
         .unwrap_or_else(|| "main".to_string());
 
     let mut loaded = vec![LoadedUnit {
@@ -2270,7 +2540,17 @@ fn load_units(
             // directory (`util/math.align`): each segment is a directory, the last names the file.
             let segs: Vec<&str> = imp.segments.iter().map(|s| s.name.as_str()).collect();
             let modpath = segs.join(".");
-            edges.entry(cur_path.clone()).or_default().push((modpath.clone(), imp.span));
+            edges
+                .entry(cur_path.clone())
+                .or_default()
+                .push((modpath.clone(), imp.span));
+            if entry_uses_default_main && modpath == "main" {
+                diags.error(
+                    "default entry module 'main' conflicts with imported module 'main'; declare the entry module explicitly".to_owned(),
+                    imp.span,
+                );
+                continue;
+            }
             // pkg-foundation import-edge rules (F0): the `internal` path rule + pkg-layering. Checked
             // per edge (before the `seen` dedup) so an illegal importer is caught even when the target
             // module was already loaded via a legal edge.
@@ -2347,6 +2627,109 @@ fn load_units(
     loaded
 }
 
+fn direct_user_dependencies(loaded: &[LoadedUnit]) -> HashMap<String, Vec<String>> {
+    let paths = loaded
+        .iter()
+        .map(|unit| unit.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    loaded
+        .iter()
+        .map(|unit| {
+            let dependencies = unit
+                .ast
+                .imports
+                .iter()
+                .filter(|path| user_import(path))
+                .map(|path| {
+                    path.segments
+                        .iter()
+                        .map(|segment| segment.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .filter(|dependency| paths.contains(dependency.as_str()))
+                .collect();
+            (unit.path.clone(), dependencies)
+        })
+        .collect()
+}
+
+fn test_catalog_reachable_modules(
+    loaded: &[LoadedUnit],
+    direct: &HashMap<String, Vec<String>>,
+) -> std::collections::HashSet<String> {
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (module, dependencies) in direct {
+        for dependency in dependencies {
+            dependents
+                .entry(dependency.as_str())
+                .or_default()
+                .push(module.as_str());
+        }
+    }
+
+    let mut reachable = loaded
+        .iter()
+        .filter(|unit| {
+            unit.ast
+                .items
+                .iter()
+                .any(|item| matches!(item, align_ast::Item::Test(_)))
+        })
+        .map(|unit| unit.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut pending = reachable.iter().cloned().collect::<Vec<_>>();
+    while let Some(dependency) = pending.pop() {
+        for dependent in dependents
+            .get(dependency.as_str())
+            .into_iter()
+            .flat_map(|modules| modules.iter())
+        {
+            if reachable.insert((*dependent).to_owned()) {
+                pending.push((*dependent).to_owned());
+            }
+        }
+    }
+    reachable
+}
+
+fn dependency_first_unit_paths(
+    loaded: &[LoadedUnit],
+    direct: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    fn post(
+        node: &str,
+        direct: &HashMap<String, Vec<String>>,
+        visited: &mut std::collections::HashSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if !visited.insert(node.to_owned()) {
+            return;
+        }
+        if let Some(dependencies) = direct.get(node) {
+            for dependency in dependencies {
+                post(dependency, direct, visited, order);
+            }
+        }
+        order.push(node.to_owned());
+    }
+
+    let entry = loaded
+        .iter()
+        .find(|unit| unit.is_entry)
+        .map(|unit| unit.path.as_str())
+        .unwrap_or_default();
+    let mut visited = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    post(entry, direct, &mut visited, &mut order);
+    for unit in loaded {
+        if !visited.contains(&unit.path) {
+            post(&unit.path, direct, &mut visited, &mut order);
+        }
+    }
+    order
+}
+
 /// The whole-program sema step, memoized in-process (`memo.rs`;
 /// `docs/impl/10-cache-first-optimization.md` §6.6).
 ///
@@ -2380,6 +2763,7 @@ fn check_program_memoized(
         return align_sema::CheckedProgram {
             program: hit.program,
             static_descriptors: hit.static_descriptors,
+            test_overlay: hit.test_overlay,
         };
     }
     // Sema READS the sink it is given: `declaration_has_prior_error` suppresses static-descriptor
@@ -2409,6 +2793,7 @@ fn check_program_memoized(
             memo::CachedProgram {
                 program: checked.program.clone(),
                 static_descriptors: checked.static_descriptors.clone(),
+                test_overlay: checked.test_overlay.clone(),
                 diagnostics: own.clone(),
             },
         );
@@ -2426,11 +2811,29 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
-    let checked = check_program_memoized(&loaded, &modules, &mut diags);
+    let mut checked = check_program_memoized(&loaded, &modules, &mut diags);
+    if let Some(overlay) = &mut checked.test_overlay {
+        let direct = direct_user_dependencies(&loaded);
+        let order = dependency_first_unit_paths(&loaded, &direct);
+        let rank = order
+            .iter()
+            .enumerate()
+            .map(|(index, module)| (module.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        overlay.tests.sort_by_key(|test| {
+            (
+                rank.get(test.module.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                test.source_ordinal,
+            )
+        });
+    }
 
     Checked {
         hir: checked.program,
         static_descriptors: checked.static_descriptors,
+        test_overlay: checked.test_overlay,
         entry_unit: loaded
             .iter()
             .find(|unit| unit.is_entry)
@@ -2540,6 +2943,12 @@ struct PendingPerUnitArtifact {
     static_descriptors: Vec<StaticDescriptor>,
     static_inputs: StaticInputManifest,
     static_artifacts: Vec<BuiltStaticArtifact>,
+    test: Option<PendingTestArtifact>,
+}
+
+struct PendingTestArtifact {
+    mir: MirProgram,
+    tests: Vec<align_sema::CheckedTest>,
 }
 
 type ReadyUnitHook<'a> = dyn FnMut(
@@ -2640,6 +3049,7 @@ fn walk_per_unit_at(
         UnitReuse::Forbidden,
         None,
         entry_access_path,
+        false,
     );
     walk.into_per_unit()
 }
@@ -2660,6 +3070,7 @@ fn walk_inner(
     reuse: UnitReuse,
     mut on_ready: Option<&mut ReadyUnitHook<'_>>,
     entry_access_path: Option<&std::path::Path>,
+    test_mode: bool,
 ) -> PackageWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
@@ -2686,52 +3097,17 @@ fn walk_inner(
         .map(|unit| (unit.fid, unit.access_path.clone()))
         .collect();
     // Each unit's direct user-module dependencies, in import-declaration order (deterministic).
-    let direct_deps: HashMap<String, Vec<String>> = loaded
-        .iter()
-        .map(|l| {
-            let deps: Vec<String> = l
-                .ast
-                .imports
-                .iter()
-                .filter(|p| user_import(p))
-                .map(|p| p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."))
-                .filter(|d| by_path.contains_key(d.as_str()))
-                .collect();
-            (l.path.clone(), deps)
-        })
-        .collect();
+    let direct_deps = direct_user_dependencies(&loaded);
+    let test_catalog_modules = if test_mode {
+        test_catalog_reachable_modules(&loaded, &direct_deps)
+    } else {
+        Default::default()
+    };
 
     // Bottom-up (dependency-first) order: DFS post-order from the entry unit. All loaded units are
     // reachable from the entry (they were loaded by following its imports). A `visited` guard makes
     // this terminate even if S0's cycle check already flagged a cycle (a best-effort order then).
-    let entry = loaded.iter().find(|l| l.is_entry).map(|l| l.path.clone()).unwrap_or_default();
-    let mut order: Vec<String> = Vec::new();
-    {
-        let mut visited = std::collections::HashSet::new();
-        fn post(
-            node: &str,
-            direct: &HashMap<String, Vec<String>>,
-            visited: &mut std::collections::HashSet<String>,
-            order: &mut Vec<String>,
-        ) {
-            if !visited.insert(node.to_string()) {
-                return;
-            }
-            if let Some(deps) = direct.get(node) {
-                for d in deps {
-                    post(d, direct, visited, order);
-                }
-            }
-            order.push(node.to_string());
-        }
-        post(&entry, &direct_deps, &mut visited, &mut order);
-        // Include any unit not reachable from the entry (defensive; normally none).
-        for l in &loaded {
-            if !visited.contains(&l.path) {
-                post(&l.path, &direct_deps, &mut visited, &mut order);
-            }
-        }
-    }
+    let order = dependency_first_unit_paths(&loaded, &direct_deps);
 
     let mut summaries: HashMap<String, align_interface::InterfaceSummary> = HashMap::new();
     // Per-unit compilation artifacts keyed by unit path. Populated only for cleanly-checked units;
@@ -2750,6 +3126,7 @@ fn walk_inner(
     let mut publication_lock = None;
     let mut publication_lock_attempted = false;
     let mut publication_lock_span = None;
+    let mut test_boundary_error = None;
     // The DIGEST path's per-MODULE memos (`docs/impl/10` §6.7 §2.2.4). Never per importer: the
     // shipped walk is already O(N) in renders and closures, and these must not introduce a
     // quadratic term. A summary is inserted into `summaries` once and never changes afterwards, so
@@ -2848,15 +3225,17 @@ fn walk_inner(
                         .insert(u.path.clone(), unit_cache::outcome(&u.path, true, None));
                     unit_keys.insert(u.path.clone(), key.clone());
                     summaries.insert(u.path.clone(), hit.summary.clone());
-                    let pending =
-                        PendingPerUnitArtifact {
-                            summary: hit.summary,
-                            body: UnitBody::Reused { link_libs: hit.entry.link_libs },
-                            is_entry: u.is_entry,
-                            static_descriptors: Vec::new(),
-                            static_inputs,
-                            static_artifacts: Vec::new(),
-                        };
+                    let pending = PendingPerUnitArtifact {
+                        summary: hit.summary,
+                        body: UnitBody::Reused {
+                            link_libs: hit.entry.link_libs,
+                        },
+                        is_entry: u.is_entry,
+                        static_descriptors: Vec::new(),
+                        static_inputs,
+                        static_artifacts: Vec::new(),
+                        test: None,
+                    };
                     store_ready_unit(
                         &mut mirs,
                         &mut ready_index,
@@ -2946,7 +3325,10 @@ fn walk_inner(
         // `SourceMap`, so its MIR is a function of the project's file paths and line tables as well
         // as of the sema input keyed here. That mode is the `explain-opt` reporting lens, not a
         // build path, so it opts out entirely rather than growing the key to cover a source map.
-        let memo_keyed = (!located && memo::enabled()).then(|| {
+        // A production memo record deliberately owns only the frozen prefix. Test mode must form
+        // the combined overlay in this walk; serving a prefix-only hit would leave `test: None`
+        // and make the private test projection depend on which API ran first in this process.
+        let memo_keyed = (!located && !test_mode && memo::enabled()).then(|| {
             memo::unit_key(
                 &u.path,
                 u.is_entry,
@@ -3015,15 +3397,15 @@ fn walk_inner(
                 );
             }
             summaries.insert(u.path.clone(), hit.summary.clone());
-            let pending =
-                PendingPerUnitArtifact {
-                    summary: hit.summary,
-                    body: UnitBody::Lowered(hit.mir),
-                    is_entry: u.is_entry,
-                    static_descriptors: Vec::new(),
-                    static_inputs: hit.static_inputs,
-                    static_artifacts: Vec::new(),
-                };
+            let pending = PendingPerUnitArtifact {
+                summary: hit.summary,
+                body: UnitBody::Lowered(hit.mir),
+                is_entry: u.is_entry,
+                static_descriptors: Vec::new(),
+                static_inputs: hit.static_inputs,
+                static_artifacts: Vec::new(),
+                test: None,
+            };
             store_ready_unit(
                 &mut mirs,
                 &mut ready_index,
@@ -3062,8 +3444,11 @@ fn walk_inner(
             &external_resource_hooks,
             &mut u_diags,
         );
-        let program = checked.program;
-        let static_descriptors = checked.static_descriptors;
+        let align_sema::CheckedProgram {
+            program,
+            static_descriptors,
+            test_overlay,
+        } = checked;
         let had_errors = u_diags.has_errors();
         // The unit's diagnostics in replayable form, or `None` when one of them cannot be
         // reattached in another walk (see `memo::unit_diagnostics`). A clean unit routinely warns —
@@ -3071,6 +3456,20 @@ fn walk_inner(
         // used to disqualify the unit, which would exclude exactly the expensive modules.
         let replayable_diags = unit_cache::replayable_diagnostics(&u_diags, u.fid);
         for d in u_diags.iter() {
+            let test_catalog_import = test_mode
+                && d.severity == align_diag::Severity::Warning
+                && d.message
+                    .strip_prefix("unused import `")
+                    .and_then(|message| message.strip_suffix('`'))
+                    .is_some_and(|dependency| {
+                        direct_deps
+                            .get(&u.path)
+                            .is_some_and(|imports| imports.iter().any(|path| path == dependency))
+                            && test_catalog_modules.contains(dependency)
+                    });
+            if test_catalog_import {
+                continue;
+            }
             diags.push(d.clone());
         }
 
@@ -3153,6 +3552,67 @@ fn walk_inner(
                         continue;
                     }
                 }
+                // Test mode has a package-wide validation boundary: catalog cardinality and every
+                // reachable process edge must be known before ANY producer resolves static input,
+                // acquires the publication lock, or forms an artifact. Retain the pure production
+                // and test MIR here; the package-level pass below installs descriptor data only
+                // after that boundary closes.
+                let test = if test_mode {
+                    let (test_mir, tests) = match test_overlay {
+                        Some(overlay) => {
+                            let lowered = align_mir::lower_test_program_checked(
+                                &overlay.program,
+                                &overlay.tests,
+                                true,
+                                Some(source_map),
+                            );
+                            let test_mir = match lowered {
+                                Ok(mir) => mir,
+                                Err(rejected) => {
+                                    diags.error(
+                                        vanished_lowering_message(&u.path, rejected),
+                                        align_span::Span::new(0, 0, 0),
+                                    );
+                                    continue;
+                                }
+                            };
+                            (test_mir, overlay.tests)
+                        }
+                        None => (mir.clone(), Vec::new()),
+                    };
+                    Some(PendingTestArtifact {
+                        mir: test_mir,
+                        tests,
+                    })
+                } else {
+                    None
+                };
+                if test_mode {
+                    // `impl_hash` is not consumed by the private test projection. Keep the pure
+                    // production MIR identity available while dependency interfaces use the
+                    // already-final `interface_hash`; descriptor-dependent implementation identity
+                    // remains owned by ordinary production walks.
+                    s.impl_hash = resolution_digest;
+                    summaries.insert(u.path.clone(), s.clone());
+                    let pending = PendingPerUnitArtifact {
+                        summary: s,
+                        body: UnitBody::Lowered(mir),
+                        is_entry: u.is_entry,
+                        static_descriptors,
+                        static_inputs: StaticInputManifest::empty(resolution_digest),
+                        static_artifacts: Vec::new(),
+                        test,
+                    };
+                    store_ready_unit(
+                        &mut mirs,
+                        &mut ready_index,
+                        &u.path,
+                        hset,
+                        pending,
+                        &mut on_ready,
+                    );
+                    continue;
+                }
                 if !static_descriptors.is_empty() && !publication_lock_attempted {
                     publication_lock_attempted = true;
                     publication_lock_span = static_descriptors
@@ -3229,6 +3689,7 @@ fn walk_inner(
                 if !static_descriptors.is_empty() {
                     match static_implementation_hash(
                         s.impl_hash,
+                        &static_descriptors,
                         &resolved.manifest,
                         &static_artifacts,
                     ) {
@@ -3281,15 +3742,15 @@ fn walk_inner(
                     );
                 }
                 summaries.insert(u.path.clone(), s.clone());
-                let pending =
-                    PendingPerUnitArtifact {
-                        summary: s,
-                        body: UnitBody::Lowered(mir),
-                        is_entry: u.is_entry,
-                        static_descriptors,
-                        static_inputs: resolved.manifest,
-                        static_artifacts,
-                    };
+                let pending = PendingPerUnitArtifact {
+                    summary: s,
+                    body: UnitBody::Lowered(mir),
+                    is_entry: u.is_entry,
+                    static_descriptors,
+                    static_inputs: resolved.manifest,
+                    static_artifacts,
+                    test: None,
+                };
                 store_ready_unit(
                     &mut mirs,
                     &mut ready_index,
@@ -3298,6 +3759,143 @@ fn walk_inner(
                     pending,
                     &mut on_ready,
                 );
+            }
+        }
+    }
+
+    if test_mode && !diags.has_errors() {
+        let test_units = order
+            .iter()
+            .filter_map(|unit| {
+                let pending = mirs.get(unit)?;
+                let test = pending.test.as_ref()?;
+                Some(TestUnitView {
+                    unit,
+                    mir: &test.mir,
+                    tests: &test.tests,
+                })
+            })
+            .collect::<Vec<_>>();
+        let test_count = test_units.iter().map(|unit| unit.tests.len()).sum::<usize>();
+        if test_count > 65_535 {
+            diags.error(
+                "a test package may contain at most 65,535 tests".to_owned(),
+                align_span::Span::new(0, 0, 0),
+            );
+        } else if test_count > 0 && test_unit_views_reach_process_command(&test_units) {
+            test_boundary_error = Some(
+                "process.command is not available from test code; run the external process in an owner test"
+                    .to_owned(),
+            );
+        }
+
+        // Static resolution is the first input/artifact boundary in this walk. It is deliberately
+        // unreachable for an empty catalog, an invalid catalog, or a process-reachable test graph.
+        if test_count > 0 && !diags.has_errors() && test_boundary_error.is_none() {
+            let first_descriptor = order.iter().find_map(|unit| {
+                mirs.get(unit)
+                    .and_then(|pending| pending.static_descriptors.first())
+            });
+            if let Some(descriptor) = first_descriptor {
+                publication_lock_span = Some(descriptor.constructor_span);
+                match lock_metadata_publication_shared(&project_root) {
+                    Ok(lock) => publication_lock = Some(lock),
+                    Err(error) => {
+                        let message = if entry_access_path.is_some() {
+                            error.watch_message()
+                        } else {
+                            error.to_string()
+                        };
+                        diags.error(message, descriptor.constructor_span);
+                    }
+                }
+            }
+
+            if !diags.has_errors() {
+                for unit in &order {
+                    let Some(pending) = mirs.get_mut(unit) else { continue };
+                    if pending.static_descriptors.is_empty() {
+                        continue;
+                    }
+                    let resolution_digest = match &pending.body {
+                        UnitBody::Lowered(mir) => align_interface::codegen_impl_hash(mir),
+                        UnitBody::Reused { .. } | UnitBody::Consumed { .. } => {
+                            diags.error(
+                                format!(
+                                    "internal error: test unit `{unit}` has no production MIR before static resolution"
+                                ),
+                                align_span::Span::new(0, 0, 0),
+                            );
+                            continue;
+                        }
+                    };
+                    let resolved = match static_inputs::resolve_static_descriptors_at(
+                        &project_root,
+                        source_map,
+                        &pending.static_descriptors,
+                        resolution_digest,
+                        &defining_paths,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            let message = if entry_access_path.is_some() {
+                                error.watch_message()
+                            } else {
+                                error.to_string()
+                            };
+                            diags.error(message, error.span);
+                            continue;
+                        }
+                    };
+                    let static_artifacts = match build_static_artifacts(
+                        &pending.static_descriptors,
+                        &resolved,
+                    ) {
+                        Ok(artifacts) => artifacts,
+                        Err(error) => {
+                            let span = pending
+                                .static_descriptors
+                                .iter()
+                                .find(|descriptor| {
+                                    descriptor.descriptor_id == error.descriptor_id
+                                })
+                                .map_or_else(
+                                    || align_span::Span::new(0, 0, 0),
+                                    |descriptor| descriptor.constructor_span,
+                                );
+                            diags.error(error.to_string(), span);
+                            continue;
+                        }
+                    };
+                    let Some(test) = pending.test.as_mut() else {
+                        diags.error(
+                            format!(
+                                "internal error: test unit `{unit}` has no test MIR before static resolution"
+                            ),
+                            align_span::Span::new(0, 0, 0),
+                        );
+                        continue;
+                    };
+                    if let Err(reason) = install_static_descriptor_data(
+                        &mut test.mir,
+                        pending.is_entry.then_some(unit.as_str()),
+                        &pending.static_descriptors,
+                        &static_artifacts,
+                    ) {
+                        diags.error(
+                            format!(
+                                "cannot generate test static descriptor runtime data: {reason}"
+                            ),
+                            pending.static_descriptors.first().map_or_else(
+                                || align_span::Span::new(0, 0, 0),
+                                |descriptor| descriptor.constructor_span,
+                            ),
+                        );
+                        continue;
+                    }
+                    pending.static_inputs = resolved.manifest;
+                    pending.static_artifacts = static_artifacts;
+                }
             }
         }
     }
@@ -3327,6 +3925,7 @@ fn walk_inner(
                 static_descriptors,
                 static_inputs,
                 static_artifacts,
+                test,
             } = mirs.remove(p)?;
             Some(WalkUnit {
                 unit: p.clone(),
@@ -3342,6 +3941,7 @@ fn walk_inner(
                 static_inputs,
                 static_artifacts,
                 frontend: frontend_outcomes.remove(p),
+                test,
             })
         })
         .collect();
@@ -3370,7 +3970,13 @@ fn walk_inner(
         located,
         loaded,
     };
-    PackageWalk { units, dep_interface_hashes, diags, rehydrate }
+    PackageWalk {
+        units,
+        dep_interface_hashes,
+        diags,
+        rehydrate,
+        test_boundary_error,
+    }
 }
 
 /// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
@@ -3468,6 +4074,7 @@ struct WalkUnit {
     static_inputs: StaticInputManifest,
     static_artifacts: Vec<BuiltStaticArtifact>,
     frontend: Option<CacheOutcome>,
+    test: Option<PendingTestArtifact>,
 }
 
 /// The shared walk's raw result.
@@ -3476,6 +4083,7 @@ struct PackageWalk {
     dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)>,
     diags: Diagnostics,
     rehydrate: RehydrateCtx,
+    test_boundary_error: Option<String>,
 }
 
 impl PackageWalk {
@@ -3543,6 +4151,53 @@ impl PackageWalk {
             .collect();
         PackageBuild { units, diags, rehydrate }
     }
+
+    fn into_test(self) -> TestPerUnitWalk {
+        let PackageWalk {
+            units,
+            mut diags,
+            test_boundary_error,
+            ..
+        } = self;
+        let mut test_units = Vec::with_capacity(units.len());
+        for unit in units {
+            let Some(test) = unit.test else {
+                diags.error(
+                    format!(
+                        "internal error: unit `{}` has no test-mode artifact",
+                        unit.unit
+                    ),
+                    align_span::Span::new(0, 0, 0),
+                );
+                continue;
+            };
+            test_units.push(TestPerUnitArtifact {
+                unit: unit.unit,
+                mir: test.mir,
+                tests: test.tests,
+                dep_interface_hashes: unit.dep_interface_hashes,
+            });
+        }
+        TestPerUnitWalk {
+            units: test_units,
+            diags,
+            boundary_error: test_boundary_error,
+        }
+    }
+}
+
+/// One unit of the private per-unit test graph.
+pub struct TestPerUnitArtifact {
+    pub unit: String,
+    pub mir: MirProgram,
+    pub tests: Vec<align_sema::CheckedTest>,
+    pub dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
+}
+
+pub struct TestPerUnitWalk {
+    pub units: Vec<TestPerUnitArtifact>,
+    pub diags: Diagnostics,
+    pub boundary_error: Option<String>,
 }
 
 /// One unit of a package build (`build`/`run`/`size`). Additive: nothing that existed before this
@@ -4066,6 +4721,148 @@ pub fn build_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerU
     walk_per_unit(source_map, name, src, false)
 }
 
+/// Build the private test overlay as one separate-compilation object input per source unit.
+/// Production summaries are still formed from the frozen prefix; only this projection carries test
+/// roots and located assertion records.
+pub fn build_test_per_unit_at(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    entry_access_path: &std::path::Path,
+) -> TestPerUnitWalk {
+    let walk = walk_inner(
+        source_map,
+        name,
+        src,
+        false,
+        &CacheContext::Disabled,
+        UnitReuse::Forbidden,
+        None,
+        Some(entry_access_path),
+        true,
+    );
+    walk.into_test()
+}
+
+struct TestUnitView<'a> {
+    unit: &'a str,
+    mir: &'a align_mir::Program,
+    tests: &'a [align_sema::CheckedTest],
+}
+
+fn test_unit_views_reach_process_command(units: &[TestUnitView<'_>]) -> bool {
+    use align_mir::{Rvalue, Stmt};
+
+    let local = units
+        .iter()
+        .map(|unit| {
+            unit.mir
+                .fns
+                .iter()
+                .map(|function| (function.name.clone(), function))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let mut definitions = HashMap::new();
+    for (unit_index, functions) in local.iter().enumerate() {
+        for name in functions.keys() {
+            definitions.entry(name.clone()).or_insert(unit_index);
+        }
+    }
+    // An interface-only consumer carries a compiler-private surrogate resource hook. Resolve that
+    // imported identity back to the declaring unit's real hook before walking the call graph; the
+    // backend performs the same ownership-preserving substitution when it forms the resource
+    // thunk. Any malformed or contradictory alias fails the closed test boundary.
+    let mut declared_resource_hooks = HashMap::new();
+    for unit in units {
+        for resource in &unit.mir.resources {
+            if resource.declaring_module != unit.unit {
+                continue;
+            }
+            let Ok(hook) = align_mir::ProgramCall::try_from_logical(&resource.drop_hook) else {
+                return true;
+            };
+            if declared_resource_hooks
+                .insert(resource.name.as_str(), hook.clone())
+                .is_some_and(|existing| existing != hook)
+            {
+                return true;
+            }
+        }
+    }
+    let mut resource_hook_aliases = HashMap::new();
+    for unit in units {
+        for resource in &unit.mir.resources {
+            let Some(actual) = declared_resource_hooks.get(resource.name.as_str()) else {
+                continue;
+            };
+            let Ok(alias) = align_mir::ProgramCall::try_from_logical(&resource.drop_hook) else {
+                return true;
+            };
+            if resource_hook_aliases
+                .insert(alias, actual.clone())
+                .is_some_and(|existing| existing != *actual)
+            {
+                return true;
+            }
+        }
+    }
+    let mut pending = Vec::new();
+    for (unit_index, unit) in units.iter().enumerate().rev() {
+        pending.extend(unit.tests.iter().rev().filter_map(|test| {
+            align_mir::ProgramCall::try_from_logical(&test.function)
+                .ok()
+                .map(|function| (unit_index, function))
+        }));
+    }
+    let mut visited = std::collections::HashSet::new();
+    while let Some((unit_index, name)) = pending.pop() {
+        if !visited.insert((unit_index, name.clone())) {
+            continue;
+        }
+        let Some(function) = local[unit_index].get(&name) else {
+            let Some(target_unit) = definitions.get(&name).copied() else {
+                continue;
+            };
+            pending.push((target_unit, name));
+            continue;
+        };
+        if function.blocks.iter().any(|block| {
+            block
+                .stmts
+                .iter()
+                .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::Command { .. })))
+        }) {
+            return true;
+        }
+        let Some((targets, resource_hooks)) =
+            test_function_targets(units[unit_index].mir, function)
+        else {
+            return true;
+        };
+        for target in targets
+            .into_iter()
+            .rev()
+        {
+            let implicit_resource_hook = resource_hooks.contains(&target);
+            let target = resource_hook_aliases.get(&target).cloned().unwrap_or(target);
+            if implicit_resource_hook
+                && !local[unit_index].contains_key(&target)
+                && !definitions.contains_key(&target)
+            {
+                return true;
+            }
+            let target_unit = if local[unit_index].contains_key(&target) {
+                unit_index
+            } else {
+                definitions.get(&target).copied().unwrap_or(unit_index)
+            };
+            pending.push((target_unit, target));
+        }
+    }
+    false
+}
+
 fn observed_source(path: &std::path::Path) -> Result<String, BuildSourceError> {
     let bytes = watch_inputs::observe_consumed_read(
         path,
@@ -4196,7 +4993,10 @@ pub fn build_package(
     cache: &CacheContext,
     reuse: UnitReuse,
 ) -> PackageBuild {
-    walk_inner(source_map, name, src, false, cache, reuse, None, None).into_package()
+    walk_inner(
+        source_map, name, src, false, cache, reuse, None, None, false,
+    )
+    .into_package()
 }
 
 /// M15 S2b per-unit build with **source locations** — like [`build_per_unit`], but each unit's MIR is
@@ -4301,7 +5101,9 @@ fn lower_memoized(
 ) -> Result<align_mir::Program, align_mir::LoweringRejected> {
     // Only the unlocated variants are memoizable (see the note above); a located request skips the
     // cache entirely rather than keying MIR that also depends on the `SourceMap`.
-    let keyed = (source_map.is_none() && memo::enabled()).then(|| memo::lowering_key(hir, variant));
+    let keyed = (source_map.is_none() && memo::enabled())
+        .then(|| memo::lowering_key(hir, variant))
+        .flatten();
     if let Some((key, _)) = keyed
         && let Some(hit) = memo::lowering_lookup(key)
     {
@@ -4468,6 +5270,224 @@ pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target:
         memo::object_store(key, bytes);
     }
     Ok(())
+}
+
+/// Form the versioned identities for one per-unit test object and the sole-entry harness. The
+/// build-worker bound may overlap unit/harness LLVM emissions, but never catalog execution.
+fn push_test_key_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    let len = u32::try_from(bytes.len()).map_err(|_| "test cache-key field exceeds u32::MAX")?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn test_program_impl_hash(mir: &align_mir::Program, roots: &[TestRoot]) -> Result<Hash128, String> {
+    let mut bytes = b"align-test-program-object-v1\0".to_vec();
+    push_test_key_bytes(
+        &mut bytes,
+        &align_codegen_llvm::test_control_runtime_abi_fingerprint(),
+    )?;
+    let mir_hash = align_interface::codegen_impl_hash(mir);
+    bytes.extend_from_slice(&mir_hash.lo.to_le_bytes());
+    bytes.extend_from_slice(&mir_hash.hi.to_le_bytes());
+    bytes.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+    for root in roots {
+        push_test_key_bytes(&mut bytes, root.function.as_bytes())?;
+        push_test_key_bytes(&mut bytes, root.symbol.as_bytes())?;
+    }
+    Ok(Hash128::of(&bytes))
+}
+
+fn test_harness_impl_hash_with_abi(
+    roots: &[TestRoot],
+    catalog_ids: &[String],
+    runtime_abi: &[u8],
+) -> Result<Hash128, String> {
+    if roots.len() != catalog_ids.len() {
+        return Err("test harness catalog and root counts disagree".to_owned());
+    }
+    let mut bytes = b"align-test-harness-object-v1\0sole-main-v1\0source-main-encoded-v1\0launch-v1\0ack-v1\0completion-v1\0terminal-v1\0".to_vec();
+    push_test_key_bytes(&mut bytes, runtime_abi)?;
+    bytes.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+    for (root, canonical_id) in roots.iter().zip(catalog_ids) {
+        push_test_key_bytes(&mut bytes, canonical_id.as_bytes())?;
+        push_test_key_bytes(&mut bytes, root.function.as_bytes())?;
+        push_test_key_bytes(&mut bytes, root.symbol.as_bytes())?;
+    }
+    Ok(Hash128::of(&bytes))
+}
+
+fn test_harness_impl_hash(roots: &[TestRoot], catalog_ids: &[String]) -> Result<Hash128, String> {
+    test_harness_impl_hash_with_abi(
+        roots,
+        catalog_ids,
+        &align_codegen_llvm::test_control_runtime_abi_fingerprint(),
+    )
+}
+
+pub struct TestObjectInput<'a> {
+    pub unit: &'a str,
+    pub mir: &'a align_mir::Program,
+    pub roots: &'a [TestRoot],
+    pub dep_interface_hashes: &'a [(String, Hash128)],
+    pub object: &'a std::path::Path,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_test_objects(
+    inputs: &[TestObjectInput<'_>],
+    all_roots: &[TestRoot],
+    catalog_ids: &[String],
+    harness_object: &std::path::Path,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    cache: &CacheContext,
+) -> Result<Vec<CacheOutcome>, String> {
+    if all_roots.len() != catalog_ids.len() {
+        return Err("test catalog and root counts disagree".to_owned());
+    }
+    let root_symbols = all_roots
+        .iter()
+        .map(|root| root.symbol.clone())
+        .collect::<Vec<_>>();
+    let keys = inputs
+        .iter()
+        .map(|input| {
+            cache
+                .is_enabled()
+                .then(|| {
+                    build_codegen_key(
+                        &format!("@test/{}", input.unit),
+                        test_program_impl_hash(input.mir, input.roots)?,
+                        input.dep_interface_hashes,
+                        target,
+                        profile,
+                        &[],
+                        rt_lto,
+                        cache::PgoKey::Off,
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let harness_key = cache
+        .is_enabled()
+        .then(|| {
+            build_codegen_key(
+                "@test/harness",
+                test_harness_impl_hash(all_roots, catalog_ids)?,
+                &[],
+                target,
+                profile,
+                &[],
+                rt_lto,
+                cache::PgoKey::Off,
+            )
+        })
+        .transpose()?;
+
+    let mut hits = Vec::with_capacity(inputs.len());
+    let mut reasons = Vec::with_capacity(inputs.len());
+    for (input, key) in inputs.iter().zip(&keys) {
+        let (hit, reason) = match key {
+            Some(key) => match cache.lookup(key, input.object) {
+                CacheLookup::Hit(outcome) => (Some(outcome), None),
+                CacheLookup::Miss { reason } => (None, reason),
+            },
+            None => (None, None),
+        };
+        hits.push(hit);
+        reasons.push(reason);
+    }
+    let (harness_hit, harness_reason) = match &harness_key {
+        Some(key) => match cache.lookup(key, harness_object) {
+            CacheLookup::Hit(outcome) => (Some(outcome), None),
+            CacheLookup::Miss { reason } => (None, reason),
+        },
+        None => (None, None),
+    };
+
+    enum EmitTask {
+        Unit(usize),
+        Harness,
+    }
+    let mut tasks = inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| hits[index].is_none().then_some(EmitTask::Unit(index)))
+        .collect::<Vec<_>>();
+    if harness_hit.is_none() {
+        tasks.push(EmitTask::Harness);
+    }
+    let root_symbols = root_symbols.as_slice();
+    for batch in tasks.chunks(jobs.max(1)) {
+        let results = std::thread::scope(|scope| {
+            batch
+                .iter()
+                .map(|task| {
+                    scope.spawn(move || match task {
+                        EmitTask::Unit(index) => {
+                            let input = &inputs[*index];
+                            align_codegen_llvm::emit_test_object(
+                                input.mir,
+                                input.roots,
+                                input.object,
+                                target,
+                                profile,
+                                rt_lto_bytes(rt_lto),
+                            )
+                            .map_err(|error| error.to_string())
+                        }
+                        EmitTask::Harness => align_codegen_llvm::emit_test_harness_object(
+                            root_symbols,
+                            harness_object,
+                            target,
+                            profile,
+                        )
+                        .map_err(|error| error.to_string()),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join())
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            result.map_err(|_| "test object worker panicked".to_owned())??;
+        }
+    }
+
+    for ((input, key), hit) in inputs.iter().zip(&keys).zip(&hits) {
+        if let Some(key) = key
+            && hit.is_none()
+        {
+            cache.publish_after_miss(key, input.object);
+        }
+    }
+    if let Some(key) = &harness_key
+        && harness_hit.is_none()
+    {
+        cache.publish_after_miss(key, harness_object);
+    }
+
+    let mut outcomes = Vec::with_capacity(inputs.len() + 1);
+    for ((input, hit), reason) in inputs.iter().zip(hits).zip(reasons) {
+        outcomes.push(hit.unwrap_or(CacheOutcome {
+            stage: CacheStage::Codegen,
+            unit: format!("@test/{}", input.unit),
+            hit: false,
+            miss_reason: reason,
+        }));
+    }
+    outcomes.push(harness_hit.unwrap_or(CacheOutcome {
+        stage: CacheStage::Codegen,
+        unit: "@test/harness".to_owned(),
+        hit: false,
+        miss_reason: harness_reason,
+    }));
+    Ok(outcomes)
 }
 
 /// Build the S3 codegen cache key (`docs/impl/10-cache-first-optimization.md` §6.2) for one unit. The
@@ -5139,6 +6159,7 @@ fn build_package_pipelined_at(
             reuse,
             Some(&mut on_ready),
             entry_access_path,
+            false,
         )
     };
     let mut build = walk.into_package();
@@ -5469,6 +6490,7 @@ mod pipeline_tests {
             UnitReuse::Forbidden,
             Some(&mut noop),
             None,
+            false,
         )
         .into_per_unit();
         assert_eq!(
@@ -5536,6 +6558,7 @@ mod pipeline_tests {
             UnitReuse::Forbidden,
             Some(&mut noop),
             None,
+            false,
         )
         .into_package();
         assert_eq!(
@@ -8263,6 +9286,183 @@ mod tests {
         assert!(!default_rt_lto(Profile::Tiny));
     }
 
+    #[test]
+    fn test_overlay_rejects_database_descriptor() {
+        let span = align_span::Span::new(0, 0, 0);
+        let descriptor = StaticDescriptor {
+            unit: "app".to_owned(),
+            item: "lookup".to_owned(),
+            descriptor_id: "app.lookup".to_owned(),
+            is_public: false,
+            consumer: StaticDescriptorConsumer::Query,
+            driver: StaticDescriptorDriver::AnySupportedDriver,
+            source: StaticDescriptorSource::Inline {
+                decoded_sql: "SELECT 1".to_owned(),
+                literal_span: span,
+            },
+            constructor_span: span,
+            common_options_span: span,
+            native_options_span: None,
+            params_ty: align_sema::Ty::Unit,
+            row_ty: None,
+            params_contract: align_sema::StaticContract {
+                root: align_sema::StaticContractType::Named {
+                    path: "()".to_owned(),
+                    args: Vec::new(),
+                },
+                definitions: Vec::new(),
+            },
+            row_contract: None,
+            static_options: Vec::new(),
+        };
+        assert_eq!(
+            validate_test_overlay_descriptors(&[descriptor]),
+            Err("a database static descriptor cannot be formed in the test overlay".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_artifact_option_consumer_matrix() {
+        let roots = [TestRoot {
+            function: "main$test$0".to_string(),
+            symbol: "align_test$00000000".to_string(),
+        }];
+        let ids = ["main::case".to_string()];
+        let unit_hash =
+            test_program_impl_hash(&align_mir::Program::default(), &roots).expect("unit identity");
+        let harness_hash = test_harness_impl_hash(&roots, &ids).expect("harness identity");
+        assert_ne!(
+            unit_hash, harness_hash,
+            "unit and harness namespaces overlap"
+        );
+
+        let mut changed_mir = align_mir::Program::default();
+        changed_mir.link_libs.push("m".to_string());
+        assert_ne!(
+            unit_hash,
+            test_program_impl_hash(&changed_mir, &roots).expect("changed unit identity")
+        );
+        let changed_ids = ["main::other".to_string()];
+        assert_eq!(
+            unit_hash,
+            test_program_impl_hash(&align_mir::Program::default(), &roots)
+                .expect("catalog-independent unit identity")
+        );
+        assert_ne!(
+            harness_hash,
+            test_harness_impl_hash(&roots, &changed_ids).expect("changed harness identity")
+        );
+
+        let profiles = [
+            Profile::Dev,
+            Profile::Release,
+            Profile::Fast,
+            Profile::Small,
+            Profile::Tiny,
+        ];
+        let keys = profiles.map(|profile| {
+            build_codegen_key(
+                "@test/main",
+                unit_hash,
+                &[],
+                &BuildTarget::Baseline,
+                profile,
+                &[],
+                false,
+                cache::PgoKey::Off,
+            )
+            .expect("profile key")
+        });
+        for (index, key) in keys.iter().enumerate() {
+            assert!(
+                keys.iter().skip(index + 1).all(|other| other != key),
+                "two test profiles shared one artifact key"
+            );
+        }
+        let with_lto = build_codegen_key(
+            "@test/main",
+            unit_hash,
+            &[],
+            &BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            true,
+            cache::PgoKey::Off,
+        )
+        .expect("rt-lto key");
+        assert_ne!(keys[1], with_lto);
+        assert!(with_lto.rt_lto_digest.is_some());
+
+        let native = build_codegen_key(
+            "@test/main",
+            unit_hash,
+            &[],
+            &BuildTarget::Native,
+            Profile::Release,
+            &[],
+            false,
+            cache::PgoKey::Off,
+        )
+        .expect("native target key");
+        assert_ne!(keys[1], native);
+    }
+
+    #[test]
+    fn test_harness_symbol_and_runtime_abi_key() {
+        let roots = [TestRoot {
+            function: "main$test$0".to_owned(),
+            symbol: "align_test$00000000".to_owned(),
+        }];
+        let catalog = ["main::case".to_owned()];
+        let fingerprint = align_codegen_llvm::test_control_runtime_abi_fingerprint();
+        let symbols = [
+            b"align_rt_test_launch_recv_v1".as_slice(),
+            b"align_rt_test_fd_cloexec_v1".as_slice(),
+            b"align_rt_test_ack_v1".as_slice(),
+            b"align_rt_test_report_v1".as_slice(),
+        ];
+        let mut previous = 0usize;
+        for symbol in symbols {
+            let matches = fingerprint
+                .windows(symbol.len())
+                .enumerate()
+                .filter_map(|(index, candidate)| (candidate == symbol).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "runtime ABI symbol is not exact");
+            assert!(matches[0] >= previous, "runtime ABI rows are out of order");
+            previous = matches[0] + symbol.len();
+        }
+
+        let baseline = test_harness_impl_hash_with_abi(&roots, &catalog, &fingerprint)
+            .expect("baseline harness identity");
+        let mut changed = roots.clone();
+        changed[0].symbol = "align_test$00000001".to_owned();
+        assert_ne!(
+            baseline,
+            test_harness_impl_hash_with_abi(&changed, &catalog, &fingerprint)
+                .expect("root-symbol identity")
+        );
+        let mut changed = roots.clone();
+        changed[0].function.push_str("_other");
+        assert_ne!(
+            baseline,
+            test_harness_impl_hash_with_abi(&changed, &catalog, &fingerprint)
+                .expect("root-function identity")
+        );
+        assert_ne!(
+            baseline,
+            test_harness_impl_hash_with_abi(&roots, &["main::other".to_owned()], &fingerprint,)
+                .expect("catalog identity")
+        );
+        let mut changed_abi = fingerprint.clone();
+        changed_abi.push(0xff);
+        assert_ne!(
+            baseline,
+            test_harness_impl_hash_with_abi(&roots, &catalog, &changed_abi)
+                .expect("runtime ABI identity")
+        );
+    }
+
     // ---- fix #1 mechanism gate: the profdata snapshot ----------------------------------------------
     // The cache-poisoning fix routes libLLVM to a private snapshot, not the user's live path. These
     // assert the plumbing directly (an integration test cannot time a mid-build file rewrite):
@@ -8798,6 +9998,84 @@ mod walk_tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_catalog_uses_dependency_first_dfs_then_source_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "align-test-catalog-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test project");
+        std::fs::write(
+            dir.join("leaf.align"),
+            "module leaf\ntest \"leaf-a\" {}\ntest \"leaf-b\" {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("left.align"),
+            "module left\nimport leaf\ntest \"left\" {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("right.align"),
+            "module right\nimport leaf\ntest \"right\" {}\n",
+        )
+        .unwrap();
+        let entry_src = "module app\nimport left\nimport right\ntest \"entry\" {}\n";
+        let entry = dir.join("entry.align");
+        std::fs::write(&entry, entry_src).unwrap();
+
+        let mut source_map = SourceMap::new();
+        let checked = check(&mut source_map, &entry.display().to_string(), entry_src);
+        assert!(
+            !checked.diags.has_errors(),
+            "catalog fixture rejected: {}",
+            format_diagnostics(&source_map, &checked.diags)
+        );
+        let ids = checked
+            .test_overlay
+            .expect("test overlay")
+            .tests
+            .into_iter()
+            .map(|test| test.canonical_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "leaf::leaf-a",
+                "leaf::leaf-b",
+                "left::left",
+                "right::right",
+                "app::entry",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn implicit_entry_main_rejects_an_imported_declared_main_before_catalog() {
+        let dir = std::env::temp_dir().join(format!(
+            "align-default-main-conflict-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test project");
+        std::fs::write(dir.join("main.align"), "module main\ntest \"other\" {}\n").unwrap();
+        let entry_src = "import main\ntest \"entry\" {}\n";
+        let entry = dir.join("entry.align");
+        std::fs::write(&entry, entry_src).unwrap();
+
+        let mut source_map = SourceMap::new();
+        let checked = check(&mut source_map, &entry.display().to_string(), entry_src);
+        assert!(checked.diags.iter().any(|diagnostic| {
+            diagnostic.message
+                == "default entry module 'main' conflicts with imported module 'main'; declare the entry module explicitly"
+        }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// A process-private staging directory, shared by every artifact producer in this workspace.
@@ -8847,6 +10125,25 @@ impl ArtifactStage {
 
     pub fn path(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// Remove this complete stage now and report cleanup failure instead of deferring to Drop.
+    pub fn remove(mut self) -> std::io::Result<()> {
+        self.try_remove()
+    }
+
+    /// Attempt eager removal without surrendering ownership on failure. Terminal guards use this
+    /// form so the path remains owned through their last diagnostic and raw process exit.
+    pub fn try_remove(&mut self) -> std::io::Result<()> {
+        loop {
+            match std::fs::remove_dir_all(&self.dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            }
+            break;
+        }
+        self.owned = false;
+        Ok(())
     }
 
     pub(crate) fn into_owned_dir(mut self) -> std::path::PathBuf {

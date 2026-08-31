@@ -33,7 +33,7 @@ use align_interface::{Hash128, InterfaceSummary};
 
 /// Key-encoding version. Bump when the key material below changes meaning, so a stale in-memory
 /// encoding can never be confused with a new one within one process image.
-const KEY_FORMAT_VERSION: u32 = 1;
+const KEY_FORMAT_VERSION: u32 = 2;
 
 /// Default retention budget, in ESTIMATED retained bytes across all four maps
 /// ([`set_budget`] overrides it).
@@ -48,7 +48,8 @@ const KEY_FORMAT_VERSION: u32 = 1;
 /// are charged a *proxy*: the length of the canonical rendering the store site already holds.
 ///
 /// ```text
-/// program    the HIR's `Debug` rendering        the retained artifact itself
+/// program    the production HIR plus optional   the retained production artifact and private
+///            test overlay `Debug` renderings    combined test view
 /// lowering   the HIR rendering built for the    the MIR is derived from it and of the same order
 ///            key (free)
 /// unit       the unit's key material (free)     contains the unit's full source and every
@@ -144,6 +145,7 @@ pub struct MemoStats {
 pub(crate) struct CachedProgram {
     pub(crate) program: align_sema::hir::Program,
     pub(crate) static_descriptors: Vec<crate::StaticDescriptor>,
+    pub(crate) test_overlay: Option<align_sema::TestOverlay>,
     pub(crate) diagnostics: Vec<align_diag::Diagnostic>,
 }
 
@@ -309,18 +311,27 @@ pub(crate) fn program_key(
 /// The canonical key for one HIR-to-MIR lowering.
 ///
 /// `variant` distinguishes the whole-program and per-unit visibility models, which lower the same
-/// HIR differently. The HIR itself is fingerprinted with its total derived `Debug`, the same
-/// technique `align_interface::codegen_impl_hash` uses for MIR: a field added to any HIR node
-/// appears in the rendering automatically, so a new field cannot silently escape the key.
-pub(crate) fn lowering_key(hir: &align_sema::hir::Program, variant: &str) -> (Hash128, u64) {
+/// HIR differently. The HIR identity is the versioned span-erased production projection. It
+/// includes the ownership fact associated with each expression in stored traversal order and
+/// rejects orphan span-keyed facts before lookup.
+pub(crate) fn lowering_key(
+    hir: &align_sema::hir::Program,
+    variant: &str,
+) -> Option<(Hash128, u64)> {
     let mut material = String::with_capacity(64);
     material.push_str("align-inproc-lowering-v");
     material.push_str(&KEY_FORMAT_VERSION.to_string());
     material.push('\n');
     env_toggles(&mut material);
     field(&mut material, "variant", variant);
-    field(&mut material, "hir", &format!("{hir:?}"));
-    (Hash128::of(material.as_bytes()), material.len() as u64)
+    let projection = align_sema::production_codegen_projection(hir)?;
+    let mut projection_hex = String::with_capacity(projection.len() * 2);
+    for byte in projection {
+        use std::fmt::Write as _;
+        let _ = write!(projection_hex, "{byte:02x}");
+    }
+    field(&mut material, "hir", &projection_hex);
+    Some((Hash128::of(material.as_bytes()), material.len() as u64))
 }
 
 /// The canonical key for one per-unit frontend result.
@@ -436,6 +447,7 @@ pub(crate) fn program_lookup(key: Hash128) -> Option<CachedProgram> {
     let cloned = CachedProgram {
         program: hit.program.clone(),
         static_descriptors: hit.static_descriptors.clone(),
+        test_overlay: hit.test_overlay.clone(),
         diagnostics: hit.diagnostics.clone(),
     };
     guard.stats.program_hits += 1;
@@ -445,15 +457,21 @@ pub(crate) fn program_lookup(key: Hash128) -> Option<CachedProgram> {
 /// Retain one whole-program sema result. The caller must have established the canonical file-id
 /// assignment and that the program checked without errors.
 ///
-/// The retention charge is the HIR's own `Debug` length. Rendering it costs about 4 ms for the
-/// eight-module `pkg.db` program — 0.3% of the ~1.5 s sema step this insertion follows — and unlike
-/// the source length (which the retained HIR exceeds sevenfold) it tracks the artifact actually
-/// held.
+/// The retention charge is the production HIR's own `Debug` length plus the private test overlay's
+/// rendering when present. Rendering the production HIR costs about 4 ms for the eight-module
+/// `pkg.db` program — 0.3% of the ~1.5 s sema step this insertion follows — and unlike the source
+/// length (which the retained HIR exceeds sevenfold) it tracks the artifacts actually held. The
+/// overlay owns a second combined program, descriptors, and catalog, so omitting it would let test
+/// compilations exceed the configured retention budget without accounting.
 pub(crate) fn program_store(key: Hash128, program: CachedProgram) {
     if !enabled() {
         return;
     }
-    let charge = format!("{:?}", program.program).len() as u64;
+    let charge = u64::try_from(format!("{:?}", program.program).len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(program.test_overlay.as_ref().map_or(0, |overlay| {
+            u64::try_from(format!("{overlay:?}").len()).unwrap_or(u64::MAX)
+        }));
     let mut guard = store();
     if guard.programs.contains_key(&key) || !reserve(&mut guard, charge) {
         return;

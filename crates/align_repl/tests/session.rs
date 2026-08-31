@@ -84,6 +84,29 @@ fn failed_replacement_rolls_back_entries_and_ordinal_counter() {
 }
 
 #[test]
+fn test_declaration_rejection_is_transactional_and_does_not_consume_an_ordinal() {
+    let mut repl = session();
+    applied(repl.submit("x := 1"));
+    let before = repl.render();
+    match repl.submit("test \"not here\" { print(x) }") {
+        Outcome::CompileFailed {
+            rendered,
+            replacing,
+        } => {
+            assert_eq!(
+                rendered,
+                "error: test declarations are not available in align-repl; use 'alignc test <entry.align>'\n"
+            );
+            assert!(replacing.is_empty());
+        }
+        other => panic!("expected transactional test rejection, got {other:?}"),
+    }
+    assert_eq!(repl.render(), before);
+    let (ordinals, _, _, _) = applied(repl.submit("y := 2"));
+    assert_eq!(ordinals, [2]);
+}
+
+#[test]
 fn mixed_paste_is_split_and_undone_atomically() {
     let mut repl = session();
     let paste = "import core.math\nfn twice(x: i64) -> i64 = x * 2";

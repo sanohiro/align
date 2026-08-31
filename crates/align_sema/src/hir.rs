@@ -15,14 +15,14 @@ pub type LocalId = u32;
 
 /// Physical ownership result carried by an Align call. Copy returns have no extra ABI value;
 /// recursively Move returns carry the path-selected cleanup bit beside the returned value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ReturnCleanupAbi {
     None,
     DynamicBit,
 }
 
 /// The overflow handling of an explicit-overflow integer op ([`ExprKind::IntArith`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ArithMode {
     /// `saturating_*`: clamp to the type's MIN/MAX; result is the same int type.
     Saturating,
@@ -32,7 +32,7 @@ pub enum ArithMode {
 
 /// A scalar math builtin ([`ExprKind::MathOp`]) — a method on a numeric value (`core.math`).
 /// `Abs`/`Min`/`Max` accept any numeric type; the rest are **float-only**.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum MathFn {
     /// `x.abs()` — absolute value (signed int / float; identity on unsigned).
     Abs,
@@ -60,7 +60,7 @@ pub enum MathFn {
 /// A resolved foreign-function declaration (`extern "C" fn name(params) -> ret`). Bodyless: it
 /// carries only the C symbol and its FFI-safe signature types, which codegen turns into an external
 /// LLVM declaration. A call to it lowers to an ordinary [`ExprKind::Call`] keyed by `name`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ExternFn {
     /// The literal C symbol (never mangled).
     pub name: String,
@@ -75,7 +75,7 @@ pub struct ExternFn {
     pub return_cleanup: ReturnCleanupAbi,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Program {
     pub fns: Vec<Fn>,
     /// Foreign (C-ABI) function declarations, surfaced to codegen as external LLVM declarations.
@@ -116,7 +116,7 @@ pub struct Program {
 /// One concrete nominal native-resource type. Generic declarations contribute one entry per
 /// concrete instantiation; `source_name` retains the public nominal spelling while `name` is the
 /// collision-free backend identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ResourceDef {
     pub name: String,
     pub source_name: String,
@@ -133,7 +133,7 @@ pub struct ResourceDef {
     pub drop_abi_fingerprint: [u8; 16],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum TaggedType {
     Option(crate::Scalar),
     Result(crate::Scalar, crate::Scalar),
@@ -143,7 +143,7 @@ pub enum TaggedType {
 /// body. Codegen turns each into an external LLVM `declare` under the same Align ABI a defining unit
 /// would emit for the function, so the linker resolves the call against the unit that owns the
 /// definition. See [`Program::imported_fns`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ImportedFn {
     /// The already-mangled `module$name` symbol (collision-free across units).
     pub name: String,
@@ -168,7 +168,7 @@ pub struct ImportedFn {
     pub parallel_transfer_params: Vec<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FnTy {
     /// Parameter modes and types (scalar-only for now).
     pub params: Vec<(align_ast::ParamMode, crate::Scalar)>,
@@ -206,14 +206,14 @@ impl PartialEq for FnTy {
 impl Eq for FnTy {}
 
 /// Span-free return owner-generation provenance. Root vectors are canonical sorted unique indices.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ReturnBorrowSummary {
     None,
     Roots { params: Vec<u32>, captures: Vec<u32> },
 }
 
 /// Span-free return allocation-region provenance. Root vectors are canonical sorted unique indices.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ReturnRegionSummary {
     None,
     Roots { params: Vec<u32>, captures: Vec<u32> },
@@ -224,7 +224,7 @@ pub enum ReturnRegionSummary {
 /// `RootSlot` is explicit in the checked record even though MIR keeps the root slot in a separate
 /// field. Keeping it in the canonical path makes forged or stale records unambiguous at the HIR
 /// validation boundary.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub enum BorrowedPathSegment {
     RootSlot,
     StructField(u32),
@@ -235,14 +235,14 @@ pub enum BorrowedPathSegment {
 }
 
 /// One producer-owned borrow root fact attached to a checked borrowed sum place.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct BorrowedRootFact {
     pub kind: BorrowedRootKind,
     pub ordinal: u32,
     pub path: Vec<BorrowedPathSegment>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub enum BorrowedRootKind {
     Local,
     Param,
@@ -252,7 +252,7 @@ pub enum BorrowedRootKind {
 /// Exact checked metadata for a match scrutinee whose storage is already owned by a stable
 /// borrowed place. This is intentionally narrower than a general borrow expression: the producer
 /// records only a direct borrowed parameter or a checked struct-field path rooted in one.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct BorrowedMatchPlace {
     pub root_local: LocalId,
     pub root_struct_path: Vec<u32>,
@@ -263,7 +263,7 @@ pub struct BorrowedMatchPlace {
 
 /// One Move payload binding lowered as a read-only projection. The static type is retained for
 /// field/method checking; the runtime representation remains a pointer into the root place.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct BorrowedProjection {
     pub binding_local: LocalId,
     pub variant: u32,
@@ -275,7 +275,7 @@ pub struct BorrowedProjection {
 /// Exact checked base of an owning dynamic-array element that may be shared-borrowed only for one
 /// call action. The path is rooted by `RootSlot`; `owner_fact` is canonical source-generation and
 /// contained-region provenance independently replayed before MIR construction.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct BorrowedElementBase {
     pub root_local: LocalId,
     pub path: Vec<BorrowedPathSegment>,
@@ -289,7 +289,7 @@ pub struct BorrowedElementBase {
 /// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing. A non-empty
 /// `borrowed_bindings` list marks Move payload bindings that are read-only projections into the
 /// exact stable place recorded by the enclosing `ExprKind::Match`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MatchArm {
     pub variants: Vec<u32>,
     pub bindings: Vec<crate::LocalId>,
@@ -297,7 +297,7 @@ pub struct MatchArm {
     pub body: Expr,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TupleDef {
     /// Element types in positional order (`t.0`, `t.1`, …). The supported forms are primitive
     /// scalars, `str`, owned `string`/`array<T>`, and owned dynamic struct arrays. A tuple with a
@@ -305,7 +305,7 @@ pub struct TupleDef {
     pub elems: Vec<crate::Scalar>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EnumDef {
     /// Origin-aware internal identity. Generic instances that differ only in a concrete function
     /// value's inferred effect origin remain distinct for analysis.
@@ -317,7 +317,7 @@ pub struct EnumDef {
     pub variants: Vec<EnumVariant>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EnumVariant {
     pub name: String,
     /// Positional scalar payload (S1b); empty for a tag-only variant.
@@ -328,7 +328,7 @@ pub struct EnumVariant {
     pub field_base: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct StructDef {
     /// Origin-aware internal identity. Generic instances that differ only in a concrete function
     /// value's inferred effect origin remain distinct for analysis.
@@ -356,17 +356,23 @@ impl StructDef {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FieldDef {
     pub name: String,
     pub ty: Ty,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum FnOrigin {
-    Source { is_entry: bool, is_public: bool },
+    Source { is_entry: bool, is_public: bool,
+    },
     Monomorph,
-    Lifted { capture_count: u32 },
+    Lifted { capture_count: u32,
+    },
+    /// Compiler-private zero-parameter root synthesized from a top-level `test` declaration.
+    /// Catalog metadata owns its public identity; consumers must not infer this origin from the
+    /// encoded function spelling.
+    Test,
 }
 
 impl FnOrigin {
@@ -375,7 +381,7 @@ impl FnOrigin {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Fn {
     pub name: String,
     /// The producer origin of this stored function. This is HIR-only metadata: MIR derives its
@@ -395,6 +401,7 @@ pub struct Fn {
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,
+    #[serde(skip)]
     pub span: Span,
     /// Locals whose type owns resources and therefore needs a path-local MIR drop flag. The flag
     /// decides whether the value currently in the slot is individually owned or arena-owned;
@@ -407,10 +414,11 @@ pub struct Fn {
     /// Static allocation provenance for owned expressions, keyed by their source span. Control-flow
     /// lowering uses the per-branch facts to build a runtime ownership join; direct local moves
     /// still forward their path-local flag instead of consulting this conservative table.
+    #[serde(skip)]
     pub drop_individual_exprs: std::collections::HashMap<Span, bool>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Local {
     pub id: LocalId,
     pub name: String,
@@ -428,7 +436,7 @@ pub struct Local {
     pub align: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     /// Trailing expression = block value (`None` if the block has no value).
@@ -436,7 +444,7 @@ pub struct Block {
     pub value: Option<Box<Expr>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub enum Stmt {
     Let { local: LocalId, init: Expr },
     /// `(a, b, ...) := expr` — bind each tuple element to a local. A `None` entry is an
@@ -484,17 +492,36 @@ pub enum Stmt {
     /// retains its payload for nested diagnostics and is non-fallthrough, but no later analysis or
     /// lowering may treat it as a loop-exit edge.
     Break { value: Option<Expr>, accepted: bool },
+    /// Compiler-private statement-only assertion in a checked test root. `condition` is exact
+    /// `bool`; `expect_eq` has already become the ordinary equality expression, preserving
+    /// left-to-right single evaluation and the language's existing equality admission rule.
+    TestAssert {
+        kind: TestAssertionKind,
+        condition: Expr,
+        canonical_id: String,
+        /// Span of the complete qualified `test.expect*` call. The condition has its own span and
+        /// may be multiline, so it cannot stand in for the user-visible assertion location.
+        #[serde(skip)]
+        span: Span,
+    },
     Expr(Expr),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum TestAssertionKind {
+    Expect,
+    ExpectEq,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Expr {
     pub kind: ExprKind,
     pub ty: Ty,
+    #[serde(skip)]
     pub span: Span,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub enum ExprKind {
     Unit,
     Int(i128),
@@ -1854,7 +1881,7 @@ pub enum ExprKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ResourceViewKind {
     StrUtf8,
     Slice(crate::Scalar),
@@ -1864,7 +1891,7 @@ pub enum ResourceViewKind {
 /// with a 96-bit (12-byte) nonce and a 128-bit (16-byte) tag; the axis param-swaps the fetched
 /// `EVP_CIPHER` name only. The HIR-walking passes treat it opaquely (they match `..`); only sema
 /// dispatch and codegen distinguish the two (the runtime picks the cipher by its entry point).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum AeadCipher {
     /// AES-256-GCM (NIST SP 800-38D) — constant-time on AES-NI/PCLMULQDQ hardware. EVP name
     /// `"AES-256-GCM"`.
@@ -1876,7 +1903,7 @@ pub enum AeadCipher {
 /// Which direction an [`ExprKind::CryptoAead`] runs (M11 Slice 4): seal (authenticated encryption) or
 /// open (authenticated decryption). The direction is this `dir`, the cipher is [`AeadCipher`] — one
 /// node kind serves all four `{aes_gcm,chacha20_poly1305}_{seal,open}` surfaces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum AeadDir {
     /// `_seal(key, nonce, plaintext, aad)` — encrypt + authenticate → `ciphertext || tag`.
     Seal,
@@ -1888,7 +1915,7 @@ pub enum AeadDir {
 /// both — the algorithm is this `algo`, param-swapping the EVP digest name and the fixed output
 /// length (mirroring [`EncodingKind`] / [`CompressKind`]). The HIR-walking passes treat it opaquely
 /// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum HashAlgo {
     /// SHA-256 (FIPS 180-4) — a 32-byte digest. EVP name `"SHA256"`.
     Sha256,
@@ -1898,7 +1925,7 @@ pub enum HashAlgo {
 
 /// Which `std.cli` flag an [`ExprKind::CliFlag`] registers — the kind decides the value type and
 /// whether a default is carried (`Bool` defaults to `false` with no operand; `Str`/`I64` carry one).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum CliFlagKind {
     /// `c.flag_bool(name)` — a boolean flag, default `false`, set by a bare `--name`.
     Bool,
@@ -1911,7 +1938,7 @@ pub enum CliFlagKind {
 /// Which `std.encoding` transform an [`ExprKind::EncodingEncode`] / [`ExprKind::EncodingDecode`]
 /// performs — the alphabet is the only axis of variation, so one node kind serves encode and
 /// decode alike (the direction is the node, the alphabet is this `kind`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum EncodingKind {
     /// Standard Base64 (RFC 4648 §4): `A-Za-z0-9+/`, `=` padding on encode.
     Base64,
@@ -1938,7 +1965,7 @@ pub enum EncodingKind {
 /// is the M11 Slice 1 codec; zstd (libzstd) is Slice 2 — the direction is the node kind, the codec
 /// is this `kind` (mirroring [`EncodingKind`]). The HIR-walking passes treat the codec opaquely
 /// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum CompressKind {
     /// gzip framing (RFC 1952) over DEFLATE, via `libz` — windowBits 15+16 (the gzip wrapper).
     Gzip,
@@ -1948,7 +1975,7 @@ pub enum CompressKind {
 
 /// Which component `path.base` / `path.dir` / `path.ext` extracts — each a zero-copy `str` view
 /// (a substring) of the input path (`std.path`, view-safe POSIX lexical semantics).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum PathComponentKind {
     /// `path.base(p)` — the final path component (trailing `/` stripped; all-`/` → `/`).
     Base,
@@ -1961,7 +1988,7 @@ pub enum PathComponentKind {
 }
 
 /// The source/key path of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum GroupSource {
     /// `soa<Struct>`, contiguous columns, an **i64** key — the dense hash-aggregate path.
     SoaI64,
@@ -1979,14 +2006,14 @@ pub enum GroupSource {
 
 /// One aggregate of a fused multi-aggregate `group_by` ([`ExprKind::ArrayGroupAggMulti`]): an op and
 /// the i64 value field it folds (`None` for `count`, which reads no value column).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct GroupAgg1 {
     pub op: GroupOp,
     pub value_field: Option<u32>,
 }
 
 /// The aggregate of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum GroupOp {
     /// `sum(.value)` — per-group sum.
     Sum,
@@ -1999,7 +2026,7 @@ pub enum GroupOp {
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum BuilderWriteKind {
     /// `b.write(s)` — append a `str`/`string` value's bytes.
     Str,
@@ -2016,7 +2043,7 @@ pub enum BuilderWriteKind {
 /// Which byte-oriented `str` predicate a `StrPredicate` tests (`core.string`). All three are
 /// pure byte comparisons (UTF-8 is the representation, but the scan is byte-level) returning
 /// `bool`; the standard runtime backs them with `memchr::memmem` / slice prefix-suffix checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StrPredKind {
     /// `s.contains(needle)` — `needle`'s bytes occur somewhere in `s`.
     Contains,
@@ -2042,7 +2069,7 @@ pub enum StrPredKind {
 /// trim is byte-level over the WHATWG ASCII whitespace set (space, `\t`, `\n`, `\x0c`, `\r` — *not*
 /// vertical tab `\x0b`, matching Rust's `[u8]::trim_ascii`); Unicode whitespace trimming is
 /// deliberately package-level, not core.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StrTrimKind {
     /// `s.trim()` — strip leading and trailing ASCII whitespace.
     Both,
@@ -2054,25 +2081,25 @@ pub enum StrTrimKind {
 
 /// Checked, deterministic root-first record graph for the recursive owned-JSON route.
 /// Record ids are compiler-local; interface transport uses its independent structural V2 bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OwnedJsonGraphPlanV2 {
     pub root: u32,
     pub records: Vec<OwnedJsonGraphRecordV2>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OwnedJsonGraphRecordV2 {
     pub id: u32,
     pub fields: Vec<OwnedJsonGraphFieldV2>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OwnedJsonGraphFieldV2 {
     pub name: String,
     pub ty: crate::Ty,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub enum TemplatePart {
     Text(String),
     /// `{expr}` — interpolate the value of an expression (a printable scalar).
@@ -2113,7 +2140,7 @@ pub enum TemplatePart {
     UnionValue { access: Expr, enum_id: u32 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub enum StageKind {
     /// `.map(f)` — transform each element with `func`. `captures` are extra arguments passed after
     /// the element (a lifted lambda's captured enclosing values; empty for a named function).
@@ -2135,7 +2162,7 @@ pub enum StageKind {
     Project { field: u32 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Stage {
     pub kind: StageKind,
     /// The element type after this stage (for `Where`, unchanged from its input).

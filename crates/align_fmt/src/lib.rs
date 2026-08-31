@@ -120,6 +120,7 @@ impl Annotations {
                     FnBody::Expr(e) => self.visit_expr(e),
                 }
             }
+            Item::Test(d) => self.visit_block(&d.body),
             Item::Struct(d) => {
                 self.visit_generics(&d.type_params, src);
                 for f in &d.fields {
@@ -624,6 +625,17 @@ mod tests {
         assert_eq!(one, "fn f() -> i32 { return 1 }\n");
         let multi = fmt("fn f() -> i32 {\n  return 1\n}\n");
         assert_eq!(multi, "fn f() -> i32 {\n  return 1\n}\n");
+    }
+
+    #[test]
+    fn contextual_tests_preserve_layout_and_are_idempotent() {
+        let one = fmt("test\"one\"{test.expect(true)}\n");
+        assert_eq!(one, "test \"one\" { test.expect(true) }\n");
+        let multi = fmt("test \"two\" {
+ test.expect_eq(1,1)
+}\n");
+        assert_eq!(multi, "test \"two\" {\n  test.expect_eq(1, 1)\n}\n");
+        assert_eq!(fmt(&multi), multi);
     }
 
     #[test]

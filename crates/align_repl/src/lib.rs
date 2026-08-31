@@ -395,8 +395,22 @@ impl Session {
         // Stage 0.
         match entry::shape_of(text) {
             entry::Shape::Empty => return Outcome::NoOp,
-            entry::Shape::KeywordDecl => return self.submit_decl(text),
+            entry::Shape::KeywordDecl => {
+                if entry::contains_test_declaration(text) {
+                    return Outcome::CompileFailed {
+                        rendered: "error: test declarations are not available in align-repl; use 'alignc test <entry.align>'\n".to_owned(),
+                        replacing: Vec::new(),
+                    };
+                }
+                return self.submit_decl(text);
+            }
             entry::Shape::Other => {}
+        }
+        if entry::contains_test_declaration(text) {
+            return Outcome::CompileFailed {
+                rendered: "error: test declarations are not available in align-repl; use 'alignc test <entry.align>'\n".to_owned(),
+                replacing: Vec::new(),
+            };
         }
         // Stage 2 (§3.0): the one collision that crosses regions. Refused, never resolved —
         // deleting a `:const` because a `main` binding reused its name would destroy an entry the

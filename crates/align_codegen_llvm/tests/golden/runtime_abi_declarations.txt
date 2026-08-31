@@ -325,6 +325,10 @@ unkeyed|F32TextLen|declare i64 @align_rt_f32_text_len(float) #4
 unkeyed|F64TextLen|declare i64 @align_rt_f64_text_len(double) #4
 unkeyed|F32TextWrite|declare i64 @align_rt_f32_text_write(float, ptr, i64) #4
 unkeyed|F64TextWrite|declare i64 @align_rt_f64_text_write(double, ptr, i64) #4
+unkeyed|TestLaunchRecvV1|declare i32 @align_rt_test_launch_recv_v1(i32, ptr) #2
+unkeyed|TestFdCloexecV1|declare i32 @align_rt_test_fd_cloexec_v1(i32) #2
+unkeyed|TestAckV1|declare i32 @align_rt_test_ack_v1(i32, i32) #2
+unkeyed|TestReportV1|declare i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32) #2
 rt-lto-guarded|align_rt_str_ends_with,align_rt_str_eq,align_rt_str_eq_ignore_case,align_rt_str_starts_with
 attributes #0 = { nofree nounwind }
 attributes #1 = { noreturn }

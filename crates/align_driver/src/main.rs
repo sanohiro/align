@@ -11,13 +11,14 @@
 //!   alignc fmt       <file>   Format source (`--write` rewrites in place)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
+//!   alignc test      <file>   Build one private test executable and run its catalog sequentially
 //!   alignc size      <file>   Build then report the executable's size breakdown
 //!   alignc cache clear        Remove the resolved codegen cache
 //!   alignc db prepare <file>  Regenerate checked database metadata
 //!   alignc db migrate/status/check/repair  Operate an explicit SQL migration catalog
 //!
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
-//! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
+//! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release` (`test`: `dev`).
 //!
 //! A repeatable `--export <name>` flag (`emit-obj`/`emit-llvm` only) names an entry-file top-level
 //! function that keeps external linkage instead of the default whole-program `internal` (M13 Slice
@@ -44,7 +45,9 @@ use align_driver::{
 };
 use align_span::SourceMap;
 
+mod signal_lease;
 mod size;
+mod test_runner;
 mod watch;
 mod watch_native;
 
@@ -103,7 +106,10 @@ fn main() -> ExitCode {
     let (target, args) = parse_target(&args);
     // Pull `--profile <name>` next (also anywhere before the program's own args). A bad value is a
     // hard error here, not a silent fallback.
-    let (profile, args) = match parse_profile(&args) {
+    let profile_was_explicit = args
+        .iter()
+        .any(|argument| argument == "--profile" || argument.starts_with("--profile="));
+    let (mut profile, args) = match parse_profile(&args) {
         Ok(v) => v,
         Err(bad) => {
             eprintln!("alignc: unknown --profile '{bad}' (expected one of: {})", Profile::NAMES);
@@ -138,8 +144,26 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let (test_limits, args) = match parse_test_limits(&args) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    if cmd == Some("test") && !profile_was_explicit {
+        profile = Profile::Dev;
+    }
+    if test_limits.used && cmd != Some("test") {
+        eprintln!(
+            "alignc: --timeout-ns/--max-output-bytes are only valid for `test` (got `{}`)",
+            cmd.unwrap_or("<none>")
+        );
+        return ExitCode::FAILURE;
+    }
 
     if watch && cmd != Some("build") {
         eprintln!("alignc: --watch is only valid for `build` (got `{}`)", cmd.unwrap_or("<none>"));
@@ -151,13 +175,22 @@ fn main() -> ExitCode {
     }
 
     // `--cache-stats` / `-j` only mean something on the build-producing per-unit path.
-    let build_verb = matches!(cmd, Some("build") | Some("run") | Some("size"));
+    let build_verb = matches!(
+        cmd,
+        Some("build") | Some("run") | Some("size") | Some("test")
+    );
     if cache_stats && !build_verb {
-        eprintln!("alignc: --cache-stats is only valid for `build`/`run`/`size` (got `{}`)", cmd.unwrap_or("<none>"));
+        eprintln!(
+            "alignc: --cache-stats is only valid for `build`/`run`/`size`/`test` (got `{}`)",
+            cmd.unwrap_or("<none>")
+        );
         return ExitCode::FAILURE;
     }
     if jobs_flag.is_some() && !build_verb {
-        eprintln!("alignc: -j/--jobs is only valid for `build`/`run`/`size` (got `{}`)", cmd.unwrap_or("<none>"));
+        eprintln!(
+            "alignc: -j/--jobs is only valid for `build`/`run`/`size`/`test` (got `{}`)",
+            cmd.unwrap_or("<none>")
+        );
         return ExitCode::FAILURE;
     }
 
@@ -166,11 +199,16 @@ fn main() -> ExitCode {
     if rt_lto_flag.is_some()
         && !matches!(
             cmd,
-            Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm")
+            Some("build")
+                | Some("run")
+                | Some("emit-obj")
+                | Some("size")
+                | Some("emit-llvm")
+                | Some("test")
         )
     {
         eprintln!(
-            "alignc: --rt-lto/--no-rt-lto are only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
+            "alignc: --rt-lto/--no-rt-lto are only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`/`test` (got `{}`)",
             cmd.unwrap_or("<none>")
         );
         return ExitCode::FAILURE;
@@ -293,15 +331,203 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) if watch => {
-            watch::run_watch_build(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats)
+        (Some("build"), Some(p)) if watch => watch::run_watch_build(
+            p,
+            target,
+            profile,
+            rt_lto,
+            thin_lto,
+            &pgo,
+            jobs,
+            cache_stats,
+        ),
+        (Some("build"), Some(p)) => run_build(
+            p,
+            target,
+            profile,
+            rt_lto,
+            thin_lto,
+            &pgo,
+            jobs,
+            cache_stats,
+        ),
+        (Some("test"), Some(p)) if args.len() == 3 => run_test(
+            p,
+            target,
+            profile,
+            rt_lto,
+            jobs,
+            cache_stats,
+            test_limits.limits,
+        ),
+        (Some("test"), _) => {
+            eprintln!("alignc: test accepts exactly one entry path");
+            ExitCode::FAILURE
         }
-        (Some("build"), Some(p)) => run_build(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         _ => {
             usage();
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ParsedTestLimits {
+    limits: test_runner::Limits,
+    used: bool,
+}
+
+fn parse_test_limits(args: &[String]) -> Result<(ParsedTestLimits, Vec<String>), String> {
+    const DEFAULT_TIMEOUT_NS: u64 = 60_000_000_000;
+    const MAX_TIMEOUT_NS: u64 = 900_000_000_000;
+    const DEFAULT_OUTPUT_BYTES: usize = 1_048_576;
+    const MAX_OUTPUT_BYTES: usize = 16_777_216;
+
+    let mut timeout = None;
+    let mut output = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let (kind, value) = if let Some(value) = argument.strip_prefix("--timeout-ns=") {
+            (Some("--timeout-ns"), Some(value))
+        } else if argument == "--timeout-ns" {
+            index += 1;
+            (Some("--timeout-ns"), args.get(index).map(String::as_str))
+        } else if let Some(value) = argument.strip_prefix("--max-output-bytes=") {
+            (Some("--max-output-bytes"), Some(value))
+        } else if argument == "--max-output-bytes" {
+            index += 1;
+            (
+                Some("--max-output-bytes"),
+                args.get(index).map(String::as_str),
+            )
+        } else {
+            rest.push(argument.clone());
+            (None, None)
+        };
+
+        match kind {
+            Some("--timeout-ns") => {
+                if timeout.is_some() {
+                    return Err("--timeout-ns may be specified at most once".to_owned());
+                }
+                let raw = value.ok_or_else(|| "--timeout-ns requires a value".to_owned())?;
+                let parsed = raw.parse::<u64>().map_err(|_| {
+                    format!("invalid --timeout-ns `{raw}` (expected 1..={MAX_TIMEOUT_NS})")
+                })?;
+                if !(1..=MAX_TIMEOUT_NS).contains(&parsed) {
+                    return Err(format!(
+                        "invalid --timeout-ns `{raw}` (expected 1..={MAX_TIMEOUT_NS})"
+                    ));
+                }
+                timeout = Some(parsed);
+            }
+            Some("--max-output-bytes") => {
+                if output.is_some() {
+                    return Err("--max-output-bytes may be specified at most once".to_owned());
+                }
+                let raw = value.ok_or_else(|| "--max-output-bytes requires a value".to_owned())?;
+                let parsed = raw.parse::<usize>().map_err(|_| {
+                    format!("invalid --max-output-bytes `{raw}` (expected 0..={MAX_OUTPUT_BYTES})")
+                })?;
+                if parsed > MAX_OUTPUT_BYTES {
+                    return Err(format!(
+                        "invalid --max-output-bytes `{raw}` (expected 0..={MAX_OUTPUT_BYTES})"
+                    ));
+                }
+                output = Some(parsed);
+            }
+            Some(other) => {
+                return Err(format!(
+                    "internal test limit option `{other}` is not supported"
+                ));
+            }
+            None => {}
+        }
+        index += 1;
+    }
+    let used = timeout.is_some() || output.is_some();
+    Ok((
+        ParsedTestLimits {
+            limits: test_runner::Limits {
+                timeout_ns: timeout.unwrap_or(DEFAULT_TIMEOUT_NS),
+                max_output_bytes: output.unwrap_or(DEFAULT_OUTPUT_BYTES),
+            },
+            used,
+        },
+        rest,
+    ))
+}
+
+#[cfg(test)]
+mod test_limit_tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn defaults_and_both_spellings_preserve_only_positional_arguments() {
+        let (parsed, rest) =
+            parse_test_limits(&strings(&["alignc", "test", "main.align"])).expect("default limits");
+        assert!(!parsed.used);
+        assert_eq!(parsed.limits.timeout_ns, 60_000_000_000);
+        assert_eq!(parsed.limits.max_output_bytes, 1_048_576);
+        assert_eq!(rest, strings(&["alignc", "test", "main.align"]));
+
+        let (parsed, rest) = parse_test_limits(&strings(&[
+            "alignc",
+            "--timeout-ns=900000000000",
+            "test",
+            "main.align",
+            "--max-output-bytes",
+            "16777216",
+        ]))
+        .expect("explicit limits");
+        assert!(parsed.used);
+        assert_eq!(parsed.limits.timeout_ns, 900_000_000_000);
+        assert_eq!(parsed.limits.max_output_bytes, 16_777_216);
+        assert_eq!(rest, strings(&["alignc", "test", "main.align"]));
+    }
+
+    #[test]
+    fn exact_test_limit_bounds_and_duplicate_or_missing_values_reject() {
+        for (arguments, expected) in [
+            (
+                vec!["--timeout-ns=0"],
+                "invalid --timeout-ns `0` (expected 1..=900000000000)",
+            ),
+            (
+                vec!["--timeout-ns=900000000001"],
+                "invalid --timeout-ns `900000000001` (expected 1..=900000000000)",
+            ),
+            (
+                vec!["--max-output-bytes=16777217"],
+                "invalid --max-output-bytes `16777217` (expected 0..=16777216)",
+            ),
+            (
+                vec!["--timeout-ns=1", "--timeout-ns=2"],
+                "--timeout-ns may be specified at most once",
+            ),
+            (
+                vec!["--max-output-bytes=0", "--max-output-bytes=1"],
+                "--max-output-bytes may be specified at most once",
+            ),
+            (vec!["--timeout-ns"], "--timeout-ns requires a value"),
+            (
+                vec!["--max-output-bytes"],
+                "--max-output-bytes requires a value",
+            ),
+        ] {
+            let actual = match parse_test_limits(&strings(&arguments)) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid arguments accepted: {arguments:?}"),
+            };
+            assert_eq!(actual, expected, "arguments: {arguments:?}");
         }
     }
 }
@@ -1212,6 +1438,7 @@ fn usage() {
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
+           test       build one private executable and run all in-language tests sequentially\n  \
            size       build then report the executable's size breakdown\n  \
            cache clear  remove the codegen cache under the resolved ALIGNC_CACHE root\n  \
            db prepare regenerate checked SQLite/PostgreSQL metadata\n  \
@@ -1221,11 +1448,11 @@ fn usage() {
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
-         --profile     dev (O0), release (O2, default), fast (O3), small (Os), tiny (Oz)\n  \
+         --profile     dev (O0; test default), release (O2; other default), fast (O3), small (Os), tiny (Oz)\n  \
          --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
                        name's linkage external instead of the default internal, so a no-`main`\n  \
                        library/benchmark object exposes it to the linker\n  \
-         --rt-lto      (build/run/emit-obj/size/emit-llvm) force runtime-bitcode LTO ON — the\n  \
+         --rt-lto      (build/run/test/emit-obj/size/emit-llvm) force runtime-bitcode LTO ON — the\n  \
                        default at release/fast; explicit ON still requires release/fast\n  \
          --no-rt-lto   (same verbs) force runtime-bitcode LTO OFF on any profile\n  \
          --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — cached, parallel\n  \
@@ -1234,11 +1461,13 @@ fn usage() {
                        it to write a .profraw, `llvm-profdata-22 merge` it, then rebuild with --pgo-use\n  \
          --pgo-use F   (build/run/size; release/fast only) rebuild using merged profile data F\n  \
                        (.profdata); exclusive with --pgo-instrument; not combinable with --thin-lto\n  \
-         --cache-stats (build/run/size) print a per-unit codegen-cache hit/miss report\n  \
+         --cache-stats (build/run/size/test) print a codegen-cache hit/miss report\n  \
          --watch       (build only) rebuild on compiler-observed file changes; other toolchain/library\n  \
                        changes need another observed change or restart\n  \
-         -j, --jobs N  (build/run/size) codegen worker threads (default: available parallelism;\n  \
+         -j, --jobs N  (build/run/size/test) codegen worker threads (default: available parallelism;\n  \
                        overrides ALIGNC_JOBS)\n  \
+         --timeout-ns N       (test only) per-row launch/run/cleanup deadline; default 60000000000\n  \
+         --max-output-bytes N (test only) independent stdout/stderr bound; default 1048576\n  \
          \n\
          ALIGNC_CACHE  on | <path> | off — the codegen cache (default: on, at the XDG cache root)\n  \
          ALIGNC_JOBS   default codegen worker-thread count (the -j flag overrides it)\n  \
@@ -1803,22 +2032,34 @@ fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, th
 /// Silent on all-hit is the *default* (no flag); with the flag we always print. A disabled cache
 /// prints a single note (there are no per-unit lookups to report).
 fn render_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
+    eprint!("{}", cache_stats_text(outcomes, enabled));
+}
+
+fn cache_stats_text(outcomes: &[align_driver::CacheOutcome], enabled: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut report = String::new();
     if !enabled {
-        eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");
-        return;
+        report.push_str("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)\n");
+        return report;
     }
     let (mut hits, mut misses) = (0usize, 0usize);
     for o in outcomes {
         if o.hit {
             hits += 1;
-            eprintln!("alignc: cache: {} hit", o.unit);
+            let _ = writeln!(report, "alignc: cache: {} hit", o.unit);
         } else {
             misses += 1;
             let reason = o.miss_reason.map(|r| r.reason()).unwrap_or("miss");
-            eprintln!("alignc: cache: {} miss ({reason})", o.unit);
+            let _ = writeln!(report, "alignc: cache: {} miss ({reason})", o.unit);
         }
     }
-    eprintln!("alignc: cache: {} unit(s): {hits} hit, {misses} miss", outcomes.len());
+    let _ = writeln!(
+        report,
+        "alignc: cache: {} unit(s): {hits} hit, {misses} miss",
+        outcomes.len()
+    );
+    report
 }
 
 /// The `--cache-stats` FRONTEND block, printed before the unchanged codegen block. One line per
@@ -1925,7 +2166,209 @@ fn run_cache_clear() -> ExitCode {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
+fn run_test(
+    path: &str,
+    target: BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    cache_stats: bool,
+    limits: test_runner::Limits,
+) -> ExitCode {
+    let suite_cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            test_runner::RunnerError::Infrastructure {
+                operation: "working directory",
+                code: error.raw_os_error().unwrap_or(0),
+            }
+            .write();
+            return ExitCode::FAILURE;
+        }
+    };
+    let formation = form_test_artifact(path, target, profile, rt_lto, jobs, cache_stats);
+    let (executable, executable_stage, catalog, cache_report) = match formation {
+        Ok(formed) => formed,
+        Err(code) => return code,
+    };
+    test_runner::run_and_exit(
+        executable,
+        executable_stage,
+        catalog,
+        suite_cwd,
+        limits,
+        cache_report,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn form_test_artifact(
+    path: &str,
+    target: BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    cache_stats: bool,
+) -> Result<
+    (
+        PathBuf,
+        align_driver::ArtifactStage,
+        Vec<test_runner::CatalogEntry>,
+        Vec<u8>,
+    ),
+    ExitCode,
+> {
+    let Some(src) = read(path) else {
+        return Err(ExitCode::FAILURE);
+    };
+    let mut source_map = SourceMap::new();
+    let test_walk =
+        align_driver::build_test_per_unit_at(&mut source_map, path, &src, Path::new(path));
+    if !test_walk.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&source_map, &test_walk.diags));
+    }
+    if test_walk.diags.has_errors() {
+        return Err(ExitCode::FAILURE);
+    }
+    if let Some(error) = &test_walk.boundary_error {
+        eprintln!("{error}");
+        return Err(ExitCode::FAILURE);
+    }
+    let test_count = test_walk
+        .units
+        .iter()
+        .map(|unit| unit.tests.len())
+        .sum::<usize>();
+    if test_count == 0 {
+        eprintln!("alignc: no tests found");
+        return Err(ExitCode::FAILURE);
+    }
+
+    let mut roots = Vec::with_capacity(test_count);
+    let mut roots_by_unit = Vec::with_capacity(test_walk.units.len());
+    let mut catalog = Vec::with_capacity(test_count);
+    for unit in &test_walk.units {
+        let mut unit_roots = Vec::with_capacity(unit.tests.len());
+        for test in &unit.tests {
+            let root = align_driver::TestRoot {
+                function: test.function.clone(),
+                symbol: format!("align_test${:08x}", roots.len()),
+            };
+            unit_roots.push(root.clone());
+            roots.push(root);
+            catalog.push(test_runner::CatalogEntry {
+                canonical_id: test.canonical_id.clone(),
+            });
+        }
+        roots_by_unit.push(unit_roots);
+    }
+    let catalog_ids = catalog
+        .iter()
+        .map(|entry| entry.canonical_id.clone())
+        .collect::<Vec<_>>();
+    let executable_stage = match align_driver::ArtifactStage::temp("align-test-exe") {
+        Ok(stage) => stage,
+        Err(error) => {
+            test_runner::RunnerError::Infrastructure {
+                operation: "stage create",
+                code: error.raw_os_error().unwrap_or(0),
+            }
+            .write();
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let object_stage = match align_driver::ArtifactStage::temp("align-test-obj") {
+        Ok(stage) => stage,
+        Err(error) => {
+            test_runner::RunnerError::Infrastructure {
+                operation: "stage create",
+                code: error.raw_os_error().unwrap_or(0),
+            }
+            .write();
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let program_objects = (0..test_walk.units.len())
+        .map(|index| object_stage.path().join(format!("unit{index}.o")))
+        .collect::<Vec<_>>();
+    let harness_object = object_stage.path().join("harness.o");
+    let executable = executable_stage.path().join("tests");
+    let cache = CacheContext::from_env();
+    let cache_enabled = cache.codegen_is_enabled();
+    let object_inputs = test_walk
+        .units
+        .iter()
+        .zip(&roots_by_unit)
+        .zip(&program_objects)
+        .map(|((unit, roots), object)| align_driver::TestObjectInput {
+            unit: &unit.unit,
+            mir: &unit.mir,
+            roots,
+            dep_interface_hashes: &unit.dep_interface_hashes,
+            object,
+        })
+        .collect::<Vec<_>>();
+    let cache_outcomes = match align_driver::emit_test_objects(
+        &object_inputs,
+        &roots,
+        &catalog_ids,
+        &harness_object,
+        &target,
+        profile,
+        rt_lto,
+        jobs,
+        &cache,
+    ) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let mut link_objects_list = program_objects
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    link_objects_list.push(harness_object.as_path());
+    let mut link_libs = Vec::new();
+    for unit in &test_walk.units {
+        for library in &unit.mir.link_libs {
+            if !link_libs.contains(library) {
+                link_libs.push(library.clone());
+            }
+        }
+    }
+    if let Err(error) = link_objects(&link_objects_list, &executable, &link_libs, profile) {
+        eprintln!("alignc: {error}");
+        return Err(ExitCode::FAILURE);
+    }
+    let cache_report = if cache_stats {
+        cache_stats_text(&cache_outcomes, cache_enabled).into_bytes()
+    } else {
+        Vec::new()
+    };
+
+    drop(object_inputs);
+    drop(test_walk);
+    drop(source_map);
+    drop(cache);
+    drop(object_stage);
+
+    Ok((executable, executable_stage, catalog, cache_report))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_run(
+    path: &str,
+    prog_args: &[String],
+    target: BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    thin_lto: bool,
+    pgo: &align_driver::PgoMode,
+    jobs: usize,
+    cache_stats: bool,
+) -> ExitCode {
     let stage = match align_driver::ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
