@@ -624,6 +624,13 @@ The public contract is:
 
 | W15 | Registration churn | A W6 transition distinguishes one stable baseline generation from at most one retained tentative generation. From a stable baseline it keeps every old handle until one complete add/post-add-snapshot pass is stable. Desired additions are raw-path-sorted and each successful new handle is recorded in insertion order. If the prior pass retained a tentative old-plus-new union, the next transition performs no addition until a fresh graph/semantic snapshot matches installed state. A difference schedules one revision while retaining that same union. Equality forms desired registration keys from raw path plus W6 native identity, retains at most the newest installed matching handle for each key, removes every nonmatching or older duplicate in raw-path/generation order, marks that at-most-65,536 remainder as the new baseline, and only then may add a next generation. Expected removal loss is idempotent; another compaction failure follows W9. Compaction deliberately trades native-event coverage of obsolete paths for the universal W7 audit and pre/post total snapshots, but keeps every currently desired handle already present. The complete post-transition snapshot runs after compaction even when no addition is needed. Synchronous add `ENOENT`/`PathLost` is expected topology churn: remove only that pass's new handles in reverse order, treating removal `PathLost`/`WatchLost` as idempotent success, set `uncertain`, and rebuild graph plus total semantic state. A difference from the installed logical/repair state schedules one revision immediately; an unchanged rebuild retries the pass at most eight times. After the eighth unchanged path-loss race, old handles remain installed, obsolete removal does not start, and the shared poll arms one fixed 50-ms transition-retry deadline. The next timer/event comparison starts a fresh eight-attempt budget. There is no spin and the two-second audit remains armed after a completed no-change comparison. | A post-add snapshot that observes change retains that bounded old-plus-new superset as the sole tentative generation and schedules the revision; only a stable post-add snapshot permits ordinary obsolete removal. Because each desired generation has at most 65,536 registrations, compaction reduces a retained union to at most 65,536 before at most 65,536 additions, so repeated changed snapshots never exceed W8's 131,072 simultaneous-registration ceiling. Nofollow `ENOENT` forms a W6 `Missing` node, while removal `ENOENT`/`PathLost`/`WatchLost` means already absent. Other metadata/add/remove errors, rollback failure other than those idempotent classes, capacity/resource exhaustion, and backend-wide failure remain W9 errors. W7 callback `PathLost` and `WatchLost` likewise set `uncertain` and wake the shared pipe instead of setting the control word's fatal field. | One injectable registration owner covers disappearance/reappearance before each add, after every successful prefix, during rollback, at post-add snapshot, and before each obsolete removal; unchanged eight-attempt exhaustion, 50-ms retry, callback path/watch loss, alias repair removal, event-dropped audit recovery, stable eventual add-before-remove, three-or-more consecutive changed post-add snapshots with pre-add compaction and fixed peak count, compaction-race audit recovery, partial-handle Drop, unexpected rollback/remove failure, resource failure, signal/fatal precedence, and exact no-exit/no-spin behavior. |
 
+W13 Darwin amendment: the Darwin-only terminal proof below narrows the W13
+ledger's general `getpgid`-failure and non-`ESRCH`-signal clauses. After the
+bounded same-child `WNOWAIT` proof, `getpgid` `ESRCH` is completion rather than
+`child group check`. Group-target `EPERM` defers the retry until after the
+required direct signal and reap, then only a signal-zero `ESRCH` completes
+cleanup; no other target, errno, platform, or pre-reap ordering changes.
+
 Unless a line is explicitly a W2 terminal marker, every exact output string in
 W1–W15 names decoded record payload. W3 instability/alias text uses `notice`,
 W9 watcher failures use `watcher-error`, and graceful-stop text uses `stop`.
@@ -728,7 +735,28 @@ snapshot and emits the sole `stop` record.
 The matching group signal retries `EINTR`. An accepted send starts the 250-ms
 grace; `ESRCH` skips directly to the pinned-leader final group signal and reap,
 while another error records exact `child group cleanup: MESSAGE` and enters
-immediate SIGKILL cleanup. For an external sink without W9's pending signal,
+immediate SIGKILL cleanup. Darwin may report `ESRCH` from `getpgid` and `EPERM`
+from a signal to the now-empty private group after the direct leader has exited
+but before it is reaped. The status-first rule remains authoritative: a
+same-PID `waitid(P_PID, ..., WEXITED | WNOHANG | WNOWAIT)` terminal observation,
+retried only through the existing 50-ms pump interval when `getpgid` first
+returns `ESRCH`, turns that race into ordinary child completion and permits
+only that group-target `EPERM` to be deferred through direct-PID signalling and
+direct-child reap. After reap, the parent uses only `kill(-pgid, 0)` until
+`ESRCH` independently proves that no group remains; it sends no nonzero signal
+through the now-reusable numeric PGID. Immediate `ESRCH` completes the ordinary
+empty-group case without an error. Any other result records the original
+`EPERM` as `child group cleanup: MESSAGE` and retains the stage, lease, and
+caller until a later probe proves absence. A child that remains nonterminal
+through the bounded pre-reap interval retains the group error, and a failed
+observation retains `child wait: MESSAGE`.
+The leader therefore remains unreaped and pins both identities through the
+required group-then-direct signal order; the post-reap numeric query can delay
+release but cannot signal an unrelated reused group. The owner crosses fast
+direct exit, a post-reap surviving group member, descendant-held pipes,
+forwarded stop, pump failure, and panic cleanup on macOS as well as Linux, and
+a Darwin-specific probe pins both the empty-group and nonempty-group cases.
+For an external sink without W9's pending signal,
 that first cleanup error outranks the stop sentinel; under watch, W9's
 already-stored signal outranks both. Every stop path sends final SIGKILL to
 both the captured group and direct pid while the unreaped leader pins both

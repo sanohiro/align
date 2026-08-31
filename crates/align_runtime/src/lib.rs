@@ -33176,7 +33176,8 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    // Darwin filesystems reject invalid UTF-8 path components before read_dir can observe them.
+    #[cfg(target_os = "linux")]
     #[test]
     fn fs_read_dir_skips_non_utf8_names() {
         use std::os::unix::ffi::OsStrExt;

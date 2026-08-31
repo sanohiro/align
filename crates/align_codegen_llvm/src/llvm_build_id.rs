@@ -9,12 +9,17 @@ use std::sync::OnceLock;
 
 use align_interface::Hash128;
 
+#[cfg(target_os = "linux")]
 const PT_LOAD: u32 = 1;
+#[cfg(target_os = "linux")]
 const PT_NOTE: u32 = 4;
+#[cfg(any(target_os = "linux", test))]
 const NT_GNU_BUILD_ID: u32 = 3;
 #[cfg(any(target_os = "macos", test))]
 const LC_UUID: u32 = 0x1b;
+#[cfg(any(target_os = "linux", test))]
 const MAX_ELF_PROGRAM_HEADERS: usize = 1_024;
+#[cfg(any(target_os = "linux", test))]
 const MAX_ELF_NOTE_BYTES: usize = 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const MAX_DYLD_IMAGES: u32 = 4_096;
@@ -71,6 +76,7 @@ fn tagged_identity(tag: u8, raw: &[u8]) -> Hash128 {
 #[derive(Clone, Copy)]
 enum Endian {
     Little,
+    #[cfg(any(target_os = "linux", test))]
     Big,
 }
 
@@ -78,6 +84,7 @@ fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> Option<u32> {
     let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
     Some(match endian {
         Endian::Little => u32::from_le_bytes(raw),
+        #[cfg(any(target_os = "linux", test))]
         Endian::Big => u32::from_be_bytes(raw),
     })
 }
@@ -86,10 +93,12 @@ fn range(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
     bytes.get(offset..offset.checked_add(len)?)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn align4(value: usize) -> Option<usize> {
     value.checked_add(3).map(|n| n & !3)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_elf_notes(notes: &[u8], endian: Endian) -> Result<Option<&[u8]>, ()> {
     let mut cursor = 0usize;
     let mut found = None;
@@ -117,6 +126,7 @@ fn parse_elf_notes(notes: &[u8], endian: Endian) -> Result<Option<&[u8]>, ()> {
     Ok(found)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn elf_inventory_is_bounded(program_headers: usize, note_bytes: usize) -> bool {
     program_headers <= MAX_ELF_PROGRAM_HEADERS && note_bytes <= MAX_ELF_NOTE_BYTES
 }

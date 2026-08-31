@@ -7,20 +7,44 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-31._ align-llm Request 22 is active on
-`agent/request22-string-index`. `docs/impl/30-borrowed-string-array-index-plan.md` is the accepted
-design: ordinary `array<string>[i]` becomes the canonical non-consuming `str` view, while the
+_Last updated: 2026-08-31._ A macOS preflight-restoration prerequisite is active on
+`agent/restore-macos-preflight`. Request 22's reviewed implementation is preserved separately on
+`agent/request22-string-index-impl` at `88ef17c9`; its final preflight exposed three failures already
+present on `main`: Linux-only ELF helpers fail macOS Clippy, an invalid-UTF-8 filename owner assumes
+Linux filesystem behavior, and W13 retries Darwin's exited-leader empty-group `EPERM` forever.
+The accepted W13 contract and implementation now admit only terminal-proved Darwin group races;
+Linux-only ELF inventory code and the raw-byte filename owner are platform-gated. Focused LLVM
+identity tests passed 7/7, static-input tests 28/28, W13 tests 12/12, and the exact workspace
+Clippy gate passed with `-D warnings`. The comprehensive review of `61e9e4fd` found one valid P2:
+leader termination alone did not prove an `EPERM` group was empty. The consolidated repair defers
+that error through direct-child reap and then performs only signal-zero probes until `ESRCH`, so a
+surviving or unsignalable group cannot release the stage or lease and a reused PGID is never
+signalled. The expanded W13 owner passes 13/13 and exact Clippy still passes. Commit the repair,
+rerun affected verification, inspect the repair delta, run exact-head preflight, merge the
+prerequisite, then refresh and publish Request 22. The first repaired-head aggregate then exposed
+one more member of the already-owned invalid-UTF-8 filename class in the native response-file
+round-trip. The complete filesystem audit gates the runtime read-dir and watch-build raw-name owners
+to Linux and omits only that raw filename from the macOS response-path matrix; byte-only encoders and
+CLI arguments remain cross-platform, while Q3 already conditionally asserts only when the host
+creates the name. The previously failing response-file owner now passes and the two Linux owners are
+absent from the macOS test inventory. Amend this bounded preflight repair and rerun exact-head
+preflight.
+
+align-llm Request 22's accepted design is
+`docs/impl/30-borrowed-string-array-index-plan.md`: ordinary `array<string>[i]` becomes the canonical
+non-consuming `str` view, while the
 already-shipped `array<MoveRecord>[i].field` and explicit shared-borrow call paths retain the record
 half of the request. No general reference value, whole Move-record binding, clone, ABI, or runtime
 surface is added. The independent review of `d349700d` found four valid boundary, closure, and
 documentation issues; the consolidated repair preserves existing Index positives, enumerates every
 provenance control wrapper, synchronizes the English/Japanese array contract, and retains all three
-registered consumer targets. PR #913 is open. Because `main` advanced through provenance-adjacent
+registered consumer targets. PR #913 is merged. Because `main` advanced through provenance-adjacent
 Request 21 work, the fresh base-integration review of `93d23e8f` found three valid closure and
 coordination issues. The consolidated repair adds all five borrow-transparent exact-once cells,
 physical-source validation for malformed `SliceIndex`, and the required external Request 22
-`ACCEPTED` register update. Refresh exact-head preflight and PR evidence, merge the design, then
-implement its Rust and owner-test closure.
+`ACCEPTED` register update. The implementation and owner-test closure is complete on the preserved
+implementation branch; its comprehensive review found one bare-`count()` unused-load regression,
+repaired in the consolidated head above.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.

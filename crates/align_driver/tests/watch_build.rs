@@ -33,7 +33,8 @@ fn source(value: i32) -> String {
     format!("fn main() -> i32 {{\n  return {value}\n}}\n")
 }
 
-#[cfg(unix)]
+// Darwin filesystems reject invalid UTF-8 path components before observation can begin.
+#[cfg(target_os = "linux")]
 #[test]
 fn observed_api_resolves_imports_from_a_non_utf8_entry_directory() {
     use align_driver::{ObservedPerUnitBuild, build_path_per_unit_observed};
