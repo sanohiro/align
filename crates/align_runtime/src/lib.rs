@@ -9846,6 +9846,11 @@ unsafe fn logger_write(logger: &mut Logger, bytes: &[u8]) -> i32 {
 
 /// Consume `writer` into one logger shell. Invalid inputs fail before allocation or ownership
 /// transfer; source-formed calls have already proved both conditions.
+///
+/// # Safety
+///
+/// A non-null `writer` must be a live, uniquely owned runtime writer. On success ownership passes
+/// to the returned logger, so the caller must not use or free the writer separately afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_new(writer: *mut Writer, minimum: i32) -> *mut Logger {
     if writer.is_null() || !log_level_valid(minimum) {
@@ -9860,6 +9865,11 @@ pub unsafe extern "C" fn align_rt_log_new(writer: *mut Writer, minimum: i32) -> 
 
 /// Return 1 exactly when `level` is enabled and no sink failure has latched. Null/invalid inputs
 /// fail closed without dereference.
+///
+/// # Safety
+///
+/// A non-null `logger` must point to a live logger returned by [`align_rt_log_new`], and no call
+/// may mutate or free that logger concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_enabled(logger: *mut Logger, level: i32) -> i32 {
     if logger.is_null() || !log_level_valid(level) {
@@ -9871,6 +9881,11 @@ pub unsafe extern "C" fn align_rt_log_enabled(logger: *mut Logger, level: i32) -
 
 /// Emit one exact log record from a UTF-8 text view. The complete enabled input is validated before
 /// the first write; transformation is allocation-free and stops at the first sink error.
+///
+/// # Safety
+///
+/// `logger` must point to a live, exclusively accessed logger. When the record is enabled and
+/// `len > 0`, `ptr` must be readable for `len` bytes for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_line(
     logger: *mut Logger,
@@ -9946,6 +9961,11 @@ pub unsafe extern "C" fn align_rt_log_line(
 }
 
 /// Builder-source sibling of [`align_rt_log_line`]. The builder remains owned by the caller.
+///
+/// # Safety
+///
+/// `logger` must point to a live, exclusively accessed logger. When the record is enabled,
+/// `builder` must point to a live builder that is not mutated or freed for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_line_builder(
     logger: *mut Logger,
@@ -9984,6 +10004,11 @@ pub unsafe extern "C" fn align_rt_log_line_builder(
 }
 
 /// Expose an existing latch, or flush the writer and latch the first new failure.
+///
+/// # Safety
+///
+/// A non-null `logger` must point to a live, exclusively accessed logger returned by
+/// [`align_rt_log_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_flush(logger: *mut Logger) -> i32 {
     if logger.is_null() {
@@ -10001,6 +10026,11 @@ pub unsafe extern "C" fn align_rt_log_flush(logger: *mut Logger) -> i32 {
 }
 
 /// Free the consumed writer through its ordinary best-effort flush/close path, then the shell.
+///
+/// # Safety
+///
+/// A non-null `logger` must be the unique live pointer returned by [`align_rt_log_new`]. This call
+/// consumes it; the pointer and its consumed writer must not be used or freed afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_log_free(logger: *mut Logger) {
     if logger.is_null() {
