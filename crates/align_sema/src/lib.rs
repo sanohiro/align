@@ -38610,6 +38610,7 @@ impl<'a> MoveCheck<'a> {
 
     fn action_values(expression: &Expr) -> Vec<&Expr> {
         match &expression.kind {
+            ExprKind::LogNew { output, .. } => vec![output],
             ExprKind::StructLit { fields, .. } => fields.iter().collect(),
             ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
                 elems.iter().collect()
@@ -38969,6 +38970,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultOk(_)
             | ExprKind::ResultErr(_)
             | ExprKind::EnumValue { .. }
+            | ExprKind::LogNew { .. }
             | ExprKind::Closure { .. }
                 if !deferred_action =>
             {
@@ -39133,6 +39135,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::ResultOk(_)
                 | ExprKind::ResultErr(_)
                 | ExprKind::EnumValue { .. }
+                | ExprKind::LogNew { .. }
                 | ExprKind::Closure { .. }
         )
     }
@@ -41180,7 +41183,7 @@ impl<'a> MoveCheck<'a> {
             // `log.new` transfers the sole writer ownership after both operands type-check. Logger
             // methods borrow the logger, level, and message; the logger remains usable afterward.
             ExprKind::LogNew { output, minimum } => {
-                move_expr!(self, output, moved, true, true);
+                move_expr_deferred!(self, output, moved);
                 move_expr!(self, minimum, moved, false, false);
             }
             ExprKind::LogEnabled { logger, level } => {
@@ -58579,15 +58582,15 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// A response-body cursor advances on every successful read. An owned/by-value local may do so
-    /// without source-level `mut` (the opaque handle remains in the same slot), but a parameter that
-    /// belongs to the caller needs the exclusive `borrow mut` mode. Status/header inspection remains
-    /// valid through a shared borrow and therefore does not use this gate.
-    fn require_http_stream_cursor(
+    /// A mutating opaque-handle method may update an owned/by-value local without source-level
+    /// `mut` because the handle stays in the same slot. A parameter owned by the caller requires
+    /// the exclusive `borrow mut` mode; a shared `borrow` may use read-only methods only.
+    fn require_exclusive_handle_receiver(
         &mut self,
         receiver: &Expr,
-        stream_type: &str,
+        handle_type: &str,
         method: &str,
+        action: &str,
     ) -> bool {
         let ExprKind::Local(local) = receiver.kind else {
             return false;
@@ -58603,13 +58606,24 @@ impl<'a, 't> Checker<'a, 't> {
             let name = self.locals[local as usize].name.clone();
             self.diags.error(
                 format!(
-                    "cannot advance shared-borrowed {stream_type} '{name}' in '{method}' (declare the parameter as `borrow mut`)"
+                    "cannot {action} shared-borrowed {handle_type} '{name}' in '{method}' (declare the parameter as `borrow mut`)"
                 ),
                 receiver.span,
             );
             return false;
         }
         true
+    }
+
+    /// A response-body cursor advances on every successful read. Status/header inspection remains
+    /// valid through a shared borrow and therefore does not use this gate.
+    fn require_http_stream_cursor(
+        &mut self,
+        receiver: &Expr,
+        stream_type: &str,
+        method: &str,
+    ) -> bool {
+        self.require_exclusive_handle_receiver(receiver, stream_type, method, "advance")
     }
 
     /// `http.serve(host, port)` — bind a listening socket, yielding `Result<http_server, Error>`
@@ -59046,6 +59060,14 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return err;
                 }
+                if !self.require_exclusive_handle_receiver(
+                    &recv_expr,
+                    "log.logger",
+                    ".line()",
+                    "mutate",
+                ) {
+                    return err;
+                }
                 Expr {
                     kind: ExprKind::LogLine {
                         logger: Box::new(recv_expr),
@@ -59063,6 +59085,14 @@ impl<'a, 't> Checker<'a, 't> {
                         format!("'.flush()' takes no arguments, got {}", args.len()),
                         span,
                     );
+                    return err;
+                }
+                if !self.require_exclusive_handle_receiver(
+                    &recv_expr,
+                    "log.logger",
+                    ".flush()",
+                    "mutate",
+                ) {
                     return err;
                 }
                 Expr {
@@ -65950,9 +65980,9 @@ fn enum_payload_ok(
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
-        // `response_builder` is a payload-scalar in generic templates as well as a direct
-        // concrete sum payload. Keep generic monomorphization aligned with Pass 0c and am-p.
-        Scalar::ResponseBuilder => true,
+        // Opaque handles admitted by concrete Pass 0c must remain legal after generic
+        // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
+        Scalar::ResponseBuilder | Scalar::Logger => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its
         // per-element string Drop is not part of this enum payload contract. Struct arrays are
