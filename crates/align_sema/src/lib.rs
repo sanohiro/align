@@ -39877,65 +39877,6 @@ impl<'a> MoveCheck<'a> {
                         ..
                     } if body_locals.is_empty()
                         && body.value.is_none()
-                        && matches!(
-                            body.stmts.as_slice(),
-                            [Stmt::Expr(_), Stmt::Break {
-                                value: None,
-                                accepted: true,
-                            }]
-                        ) =>
-                    {
-                        let [Stmt::Expr(child), Stmt::Break {
-                            value: None,
-                            accepted: true,
-                        }] = body.stmts.as_slice()
-                        else {
-                            unreachable!("single-expression break loop guard")
-                        };
-                        let mutates_destination = match &child.kind {
-                            ExprKind::Call { func, .. } => self
-                                .named_param_modes
-                                .get(func)
-                                .is_some_and(|modes| {
-                                    modes.iter().any(|mode| {
-                                        matches!(
-                                            mode,
-                                            ast::ParamMode::BorrowMut | ast::ParamMode::Out
-                                        )
-                                    })
-                                }),
-                            ExprKind::CallFnValue { callee, .. } => match callee.ty {
-                                Ty::Fn(id) => self.fn_types.get(id as usize).is_some_and(
-                                    |signature| {
-                                        signature.params.iter().any(|(mode, _)| {
-                                            matches!(
-                                                mode,
-                                                ast::ParamMode::BorrowMut | ast::ParamMode::Out
-                                            )
-                                        })
-                                    },
-                                ),
-                                _ => false,
-                            },
-                            _ => false,
-                        };
-                        if mutates_destination {
-                            break;
-                        }
-                        (
-                            child,
-                            false,
-                            false,
-                            false,
-                            Post::LoopBreak(None),
-                        )
-                    }
-                    ExprKind::Loop {
-                        body,
-                        body_locals,
-                        ..
-                    } if body_locals.is_empty()
-                        && body.value.is_none()
                         && matches!(body.stmts.as_slice(), [Stmt::Expr(child)] if hir_expr_diverges(child)) =>
                     {
                         let [Stmt::Expr(child)] = body.stmts.as_slice()

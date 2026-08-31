@@ -24,10 +24,17 @@ The repair is integrated with `db53bac385f0f44eb43e9c706183851936bbfe8a`. Focuse
 passes: Request 22 MIR 1/1, `borrowed_params` 38/38, temporary iteration owners 5/5, and the
 ordinary Unit-call early-release control 1/1.
 
-Next, complete the fresh comprehensive review and exact preflight, update and merge PR #920, then
-stop as explicitly requested. Do not start pin adoption or another capability in this session.
-Afterward, `std.log` remains implemented against `docs/impl/std-design/log.md`; design `core.codec`
-next as the next self-hosting capability.
+The comprehensive review of `43d2e8df0852c8726906826147fb0ccb2b7e444e` found one valid P1: the
+single-expression/break loop fast path recognized only a direct retaining call, so a control
+wrapper could suppress the iteration root. The consolidated repair routes that entire loop shape
+through the normal loop checker. Direct, block, `unsafe`, and `if` retention regressions pass 1/1;
+the existing temporary iteration owners remain 5/5, Request 22 MIR remains 1/1, and the ordinary
+Unit-call control remains 1/1.
+
+Next, run exact preflight with the reviewed finding fixed, update and merge PR #920, then stop as
+explicitly requested. Do not start pin adoption or another capability in this session. Afterward,
+`std.log` remains implemented against `docs/impl/std-design/log.md`; design `core.codec` next as the
+next self-hosting capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.

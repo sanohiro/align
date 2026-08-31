@@ -1373,17 +1373,27 @@ fn consume(values: array<string>) -> i64 = values.len()
         );
     }
 
-    let retained_across_iteration = format!(
-        "{prefix}fn main() -> i32 {{ mut output := View {{ text: \"\" }}; loop {{ retain(strings()[0], output); break }}; return output.text.len() as i32 }}\n"
-    );
-    let diagnostics = check_diagnostics(
-        "owned-string-index-temporary-retention-loop",
-        &retained_across_iteration,
-    );
-    assert!(
-        diagnostics.contains("temporary value created inside the loop"),
-        "a retained view must not outlive its iteration-scoped array owner:\n{diagnostics}"
-    );
+    for (name, retain) in [
+        ("direct", "retain(strings()[0], output)"),
+        ("block", "{ retain(strings()[0], output) }"),
+        ("unsafe", "unsafe { retain(strings()[0], output) }"),
+        (
+            "if",
+            "if true { retain(strings()[0], output) } else { retain(strings()[1], output) }",
+        ),
+    ] {
+        let retained_across_iteration = format!(
+            "{prefix}fn main() -> i32 {{ mut output := View {{ text: \"\" }}; loop {{ {retain}; break }}; return output.text.len() as i32 }}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("owned-string-index-temporary-retention-loop-{name}"),
+            &retained_across_iteration,
+        );
+        assert!(
+            diagnostics.contains("temporary value created inside the loop"),
+            "a retained view in {name} must not outlive its iteration-scoped array owner:\n{diagnostics}"
+        );
+    }
 }
 
 #[test]
