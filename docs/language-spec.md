@@ -894,10 +894,12 @@ import core.json
 import std.fs
 ```
 
-Using `json.*` / `fs.*` / `io.stdout.write` without its `import`, or importing a non-existent
+Using `json.*` / `fs.*` / `io.*` / `log.*` without its `import`, or importing a non-existent
 module, is a compile error. The language-syntactic core (`Option`/`Result`/`?`/`else`, `arena`, the
 array pipeline, numeric methods, `template`) is always in scope and needs no import. `core` is
-language-intrinsic and `std` the OS boundary; both are compiler builtins today.
+language-intrinsic and `std` the OS boundary; both are compiler builtins today. FFI is shipped, but
+the remaining std-in-Align and distribution prerequisites keep that migration future work without
+changing these module contracts.
 
 A program also spans **user modules**: a non-entry file declares `module geom` and exports
 functions and types with `pub`; `import geom` resolves by filename to `geom.align` in the entry's
@@ -1029,6 +1031,7 @@ std.env
 std.time
 std.net
 std.cli
+std.log
 std.encoding
 std.regex
 std.compress
@@ -1201,6 +1204,21 @@ flag has a value or its default, like `json.decode`), but the lookup itself is c
 runtime (Align has no comptime evaluator to statically validate against the builder's registered
 flags); input errors surface from `parse` as `Error.Invalid`. A v1 provisional pending derive — a
 future declarative flag-spec can move `get_*` validation to compile time. (`draft.md` §18.2, M10.)
+
+`std.log` is a designed, not-yet-implemented explicit line sink. `log.level` is the Copy closed
+order `Debug < Info < Warn < Error < Off`; `log.new(writer, minimum) -> log.logger` consumes the
+writer into one nominal Move owner. A bound logger exposes `enabled(level) -> bool`,
+`line(level, str|string|builder) -> ()`, and `flush() -> Result<(), Error>`. Arguments are eager, so
+an `enabled` guard is the explicit way to skip template/builder construction. Enabled records use
+the exact prefixes `[DEBUG] ` / `[INFO] ` / `[WARN] ` / `[ERROR] `, escape backslash, LF, and CR as
+`\\`, `\n`, and `\r`, retain every other UTF-8 byte, and end with one LF. The allocation-free
+O(n) scan makes no atomicity, durability, terminal-safety, or cross-logger ordering promise.
+The first writer failure is retained: `line` stops and returns Unit, later lines are suppressed,
+and `flush` exposes that first failure through the fixed std `Error` mapping without another write.
+Logger Drop delegates to the writer's best-effort cleanup. There is no global logger, hidden clock
+or source metadata, structured-field/JSON mode, file constructor, dynamic level setter, async queue,
+fatal action, variadic formatter, or new `write_hex`; ordinary templates and builders are the one
+formatting path. The exact ledger is `docs/impl/std-design/log.md`. (`draft.md` §18.2.)
 
 `std.regex` is an explicitly compiled library facility: `regex.compile(pattern: str) ->
 Result<regex, Error>` creates an owned Move handle; `re.is_match(text)`, `re.find(text)`, and

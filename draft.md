@@ -2248,9 +2248,12 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-Using `json.*` / `fs.*` / `io.stdout.write` without the matching `import` is a compile error; an `import` naming a module that does not exist is a compile error. The **language-syntactic** core — `Option` / `Result` / `?` / `else`, `arena`, the array pipeline (`map` / `where` / `reduce` / `sum` / …), the numeric methods (`x.abs()`, `a.min(b)`), `template "…"` — is always in scope and needs no import (requiring one would be requiring an import for syntax).
+Using `json.*` / `fs.*` / `io.*` / `log.*` without the matching `import` is a compile error; an `import` naming a module that does not exist is a compile error. The **language-syntactic** core — `Option` / `Result` / `?` / `else`, `arena`, the array pipeline (`map` / `where` / `reduce` / `sum` / …), the numeric methods (`x.abs()`, `a.min(b)`), `template "…"` — is always in scope and needs no import (requiring one would be requiring an import for syntax).
 
-`core` is language-intrinsic and `std` is the OS boundary; both are compiler builtins today (std becomes real Align-over-FFI library code once FFI lands).
+`core` is language-intrinsic and `std` is the OS boundary; both are compiler builtins today. FFI is
+shipped, but moving std into Align still waits on the settled multiversioning, arena-allocation,
+native-SoA-access, and library-distribution prerequisites; that future implementation change must
+preserve these public module contracts.
 
 ### User modules (multi-file)
 
@@ -2802,6 +2805,7 @@ std.env
 std.time
 std.net
 std.cli
+std.log
 std.encoding
 std.regex
 std.compress
@@ -3178,6 +3182,51 @@ clustered bools, positionals) are deferred behind this same signature.
 **v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
 decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
 shape is a v1 provisional: builder vs. a declarative spec is revisited once derive lands.
+
+### std.log
+
+`std.log` is an explicit level-gated line sink, not global process policy. This surface is designed
+and remains unimplemented until its post-`core.test` capability lands:
+
+```text
+log.level { Debug, Info, Warn, Error, Off }
+log.new(output: writer, minimum: log.level) -> log.logger
+l.enabled(level: log.level) -> bool
+l.line(level: log.level, message: str|string|builder) -> ()
+l.flush() -> Result<(), Error>
+```
+
+`log.level` is a Copy tag-only sum with exact severity order
+`Debug < Info < Warn < Error < Off`. A record is enabled when its level is not `Off` and is at
+least the logger's minimum; minimum `Off` disables all records. `log.new` consumes one existing
+`writer`, performs no I/O, and returns a nominal Move `log.logger` that solely owns that writer.
+The logger follows the ordinary single-owner handle rules: it must be bound before a method call,
+may move through parameters, returns, fields, and scalar tagged payloads, and is rejected from
+collections, tuples, boxes, parallel transport, captures, globals, and native signatures. Logger
+Drop delegates once to the writer's best-effort flush/close cleanup.
+
+`line` evaluates receiver, level, and message eagerly and exactly once, then gates internally.
+Use `if l.enabled(level) { ... }` when construction of a disabled template or builder must also be
+skipped. An enabled record is exactly one of `[DEBUG] `, `[INFO] `, `[WARN] `, or `[ERROR] `;
+the message with backslash, LF, and CR bytes rendered respectively as `\\`, `\n`, and `\r`; then
+one LF byte. Other valid UTF-8 bytes, including NUL and tab, are unchanged. The transform scans in
+O(message bytes), uses O(1) extra memory, and allocates no owned value; caller-created templates,
+strings, and builders retain their visible allocation behavior. There is no record-atomicity,
+delivery, durability, cross-logger ordering, or terminal-safety promise.
+
+Writing is best effort: the first nonzero writer status stops the current record and is retained;
+`line` returns Unit, emits no fallback, and every later line is suppressed. `flush` returns that
+first status through the one fixed std `Error` mapping without another sink operation, or flushes
+the underlying writer once and retains/returns a new failure. Successful flush leaves the logger
+enabled. Drop errors remain unobservable, so a caller that needs delivery evidence uses an explicit
+`flush()?` checkpoint.
+
+There is no timestamp, source location, target, process/thread id, structured-field or JSON mode,
+multiline mode, rotation, file constructor, dynamic minimum setter, asynchronous queue, fatal level,
+or global/default logger. Formatting stays the existing `template`/`builder` mechanism and its
+shipped `write`/`write_int`/`write_bool`/`write_char`/`write_float` methods; `std.log` does not add
+variadic formatting or a `write_hex` method. The exact public, ABI, allocation, validation, and
+implementation closure ledger is `docs/impl/std-design/log.md`.
 
 ### std.encoding
 
