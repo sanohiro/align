@@ -15,8 +15,20 @@ Linux filesystem behavior, and W13 retries Darwin's exited-leader empty-group `E
 The accepted W13 contract and implementation now admit only terminal-proved Darwin group races;
 Linux-only ELF inventory code and the raw-byte filename owner are platform-gated. Focused LLVM
 identity tests passed 7/7, static-input tests 28/28, W13 tests 12/12, and the exact workspace
-Clippy gate passed with `-D warnings`. Commit and comprehensively review this candidate, run
-exact-head preflight, merge the prerequisite, then refresh and publish Request 22.
+Clippy gate passed with `-D warnings`. The comprehensive review of `61e9e4fd` found one valid P2:
+leader termination alone did not prove an `EPERM` group was empty. The consolidated repair defers
+that error through direct-child reap and then performs only signal-zero probes until `ESRCH`, so a
+surviving or unsignalable group cannot release the stage or lease and a reused PGID is never
+signalled. The expanded W13 owner passes 13/13 and exact Clippy still passes. Commit the repair,
+rerun affected verification, inspect the repair delta, run exact-head preflight, merge the
+prerequisite, then refresh and publish Request 22. The first repaired-head aggregate then exposed
+one more member of the already-owned invalid-UTF-8 filename class in the native response-file
+round-trip. The complete filesystem audit gates the runtime read-dir and watch-build raw-name owners
+to Linux and omits only that raw filename from the macOS response-path matrix; byte-only encoders and
+CLI arguments remain cross-platform, while Q3 already conditionally asserts only when the host
+creates the name. The previously failing response-file owner now passes and the two Linux owners are
+absent from the macOS test inventory. Amend this bounded preflight repair and rerun exact-head
+preflight.
 
 align-llm Request 22's accepted design is
 `docs/impl/30-borrowed-string-array-index-plan.md`: ordinary `array<string>[i]` becomes the canonical

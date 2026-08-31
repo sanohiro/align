@@ -627,9 +627,9 @@ The public contract is:
 W13 Darwin amendment: the Darwin-only terminal proof below narrows the W13
 ledger's general `getpgid`-failure and non-`ESRCH`-signal clauses. After the
 bounded same-child `WNOWAIT` proof, `getpgid` `ESRCH` is completion rather than
-`child group check`, and group-target `EPERM` is completion rather than a
-retrying `child group cleanup`; no other target, errno, platform, or ordering
-changes.
+`child group check`. Group-target `EPERM` defers the retry until after the
+required direct signal and reap, then only a signal-zero `ESRCH` completes
+cleanup; no other target, errno, platform, or pre-reap ordering changes.
 
 Unless a line is explicitly a W2 terminal marker, every exact output string in
 W1–W15 names decoded record payload. W3 instability/alias text uses `notice`,
@@ -741,14 +741,21 @@ but before it is reaped. The status-first rule remains authoritative: a
 same-PID `waitid(P_PID, ..., WEXITED | WNOHANG | WNOWAIT)` terminal observation,
 retried only through the existing 50-ms pump interval when `getpgid` first
 returns `ESRCH`, turns that race into ordinary child completion and permits
-only that group-target `EPERM` during final cleanup. A child that remains
-nonterminal through that bounded interval retains the group error, and a failed
+only that group-target `EPERM` to be deferred through direct-PID signalling and
+direct-child reap. After reap, the parent uses only `kill(-pgid, 0)` until
+`ESRCH` independently proves that no group remains; it sends no nonzero signal
+through the now-reusable numeric PGID. Immediate `ESRCH` completes the ordinary
+empty-group case without an error. Any other result records the original
+`EPERM` as `child group cleanup: MESSAGE` and retains the stage, lease, and
+caller until a later probe proves absence. A child that remains nonterminal
+through the bounded pre-reap interval retains the group error, and a failed
 observation retains `child wait: MESSAGE`.
-Direct-PID signalling and `Child::wait` still happen afterward, so the leader
-remains unreaped and pins both identities until the required group-then-direct
-cleanup order completes. The owner crosses fast direct exit, descendant-held
-pipes, forwarded stop, pump failure, and panic cleanup on macOS as well as
-Linux, and a Darwin-specific probe pins the empty-group `EPERM` classification.
+The leader therefore remains unreaped and pins both identities through the
+required group-then-direct signal order; the post-reap numeric query can delay
+release but cannot signal an unrelated reused group. The owner crosses fast
+direct exit, a post-reap surviving group member, descendant-held pipes,
+forwarded stop, pump failure, and panic cleanup on macOS as well as Linux, and
+a Darwin-specific probe pins both the empty-group and nonempty-group cases.
 For an external sink without W9's pending signal,
 that first cleanup error outranks the stop sentinel; under watch, W9's
 already-stored signal outranks both. Every stop path sends final SIGKILL to

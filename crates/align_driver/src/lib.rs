@@ -7083,15 +7083,20 @@ mod function_thin_unit_tests {
             assert!(status.success(), "cc failed to compile response fixture");
         }
 
-        let odd_names = [
+        let mut odd_names: Vec<&[u8]> = vec![
             b"space name.o".as_slice(),
             b"tab\tname.o".as_slice(),
             b"quote\"name.o".as_slice(),
             b"back\\slash.o".as_slice(),
-            b"invalid-\xff.o".as_slice(),
+        ];
+        // Darwin filesystems reject invalid UTF-8 path components with EILSEQ. Keep every native
+        // response-file quoting case on both release hosts and add the raw-byte filename on Linux.
+        #[cfg(target_os = "linux")]
+        odd_names.push(b"invalid-\xff.o".as_slice());
+        odd_names.extend([
             b"@leading-at.o".as_slice(),
             b"-option-shaped.o".as_slice(),
-        ];
+        ]);
         let mut objects = vec![main_object];
         for name in odd_names {
             let path = stage
