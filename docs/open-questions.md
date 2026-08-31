@@ -3678,7 +3678,8 @@ cargo features producing per-capability builds — the roadmap already flags thi
 slow/complex"; (c) forcing the compress/crypto/http modules into distinct codegen units. Revisit
 when a crypto/tls binary's extra compress `DT_NEEDED` actually matters (deployment-size or
 supply-chain-surface pressure), or fold into a build-profile/packaging slice. Recorded at the M13
-Slice 2 roadmap entry.
+Slice 2 roadmap entry. `impl/31-execution-storage-startup-plan.md` S3 owns the closure-report and
+evidence gate for any revival; it does not change this trigger.
 
 ### Side-effecting iteration & pipeline sinks — `each`/Sink terminal + `range(n)` source
 
@@ -5257,7 +5258,8 @@ around the string/JSON milestone (M5) and std build-out.
 **Status update (2026-07-03, M9 std design):** the v1/reference portable fixed-buffer loop for
 `io.copy` is scheduled as `impl/07-roadmap.md` M9 Slice 2 (memory-bounded, `O(buffer)`, tested).
 The fast paths above (`sendfile`/`splice`/`io_uring`/Direct I/O) stay **post-M9**, added later
-without an `io.copy` signature change.
+without an `io.copy` signature change. Their consumer and evidence admission rule is consolidated
+in `impl/31-execution-storage-startup-plan.md` S7; no mechanism is selected here.
 
 **Correctness correction (audit 2026-07-13, FIXED):** the v1 loop was memory-bounded but not a
 byte-exact oracle from every valid reader state. After `read_line`, a buffered reader could hold unread
@@ -5288,11 +5290,13 @@ quality. Rough scale: Python ~30ms, Go ~1–2ms, static C ~0.2ms; sub-millisecon
 target. Most of this is structural — Align wins by *not having* things rather than by
 optimizing them:
 ```text
-- Static link + thin runtime: no dynamic-loader resolution; output carries no LLVM, no GC.
+- Statically linked runtime archive + capability closure: clean capability cases omit unused areas;
+  known same-member co-location can retain dependency supersets until its evidence gate is met.
+  Ordinary system-libc/native dependencies may still use the platform loader. Output carries no LLVM or GC.
 - No hidden global init: "nothing hidden" means no startup-time global constructors /
   lazy statics to run.
-- Thread pool is created on demand at block scope, not at process start (06-runtime §5);
-  a CLI that uses no parallelism stays single-threaded and exits immediately.
+- The process-lifetime shared pool initializes lazily only after caller-only selection, not at process
+  start; a CLI that uses no pool-eligible parallel work stays single-threaded and exits immediately.
 - Small binary + hot-code locality (DCE / strip / LTO / section ordering or PGO) to cut
   page faults on cold start.
 - Lazy resource touch: argv / env / locale / timezone DB only when used.
@@ -5300,6 +5304,9 @@ optimizing them:
 Promote to `draft.md` §2/§3 as a non-functional goal once committed. Per-platform and
 opt-in only: `-march=native`, PGO, non-PIE (a few µs, security tradeoff) must not be the
 default — they break "predictable performance".
+
+`impl/31-execution-storage-startup-plan.md` S0A owns the future parent-observed launch-to-reap
+baseline. That plan adds no numeric startup promise and does not yet schedule implementation.
 
 ### Performance levers (data / build-time)
 
@@ -5594,7 +5601,8 @@ individual review entries. None block anything; pick up when the lint suite is a
 - Hot/cold field-split suggestion (external idea review, 2026-07-02, verified): when a struct mixes
   hot (scanned) and cold (rarely-read) fields under array/pipeline access, suggest `soa<T>` or a
   manual struct split — suggestion only, never an automatic layout change (explicit-layout is
-  Settled).
+  Settled). Exact corpus/firing admission is consolidated in
+  `impl/31-execution-storage-startup-plan.md` S6.
 ```
 
 ### Domain libraries belong to `std`/`pkg`, not core (placement note)
