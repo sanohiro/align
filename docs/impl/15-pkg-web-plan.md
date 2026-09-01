@@ -96,7 +96,7 @@ DONE   base64 / base64url / hex / utf8_valid    std.encoding
 DONE   sha256/512, hmac_sha256, argon2id,       std.crypto
        AEAD, constant_time_equal, random
 DONE   gzip / zstd                              std.compress
-DONE   JWT (HS256; alg-pinned, CT-compared)     pkg.jwt          (2026-07-20)
+DONE   auth (HS256; alg-pinned, CT-compared)    pkg.auth         (2026-09-01)
 DONE   URL/percent encode+decode (RFC 3986)     std.encoding     (2026-07-20)
 DONE   application/x-www-form-urlencoded        std.encoding     (2026-07-20)
 DONE   query-string lookup (zero-alloc, escaped   pkg.web.internal.query (2026-07-20)
@@ -127,7 +127,7 @@ client flows (authorization-code + PKCE)   BUILDABLE NOW — authorize URL (perc
                                            token exchange (std.http client + form_encode body),
                                            token JSON (core.json), PKCE S256 (sha256 + base64url),
                                            state/nonce (crypto.random)
-bearer-token parsing on the resource side  BUILDABLE NOW — header read + pkg.jwt
+bearer-token parsing on the resource side  BUILDABLE NOW — header read + pkg.auth
 validating a PUBLIC provider's token       BLOCKED on RS256: Google / Auth0 / Okta / Entra all sign
                                            with RS256, so this needs std.crypto RSA verification
                                            (EVP over the already-linked libssl — a bounded addition,

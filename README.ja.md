@@ -99,7 +99,7 @@ fn main() -> i32 {
 - `docs/little-aligner/` —— *The Little Schemer* スタイルの Q&A ドリル・ワークブック(英語 + 日本語)
 - `docs/` —— 設計の根拠、経緯、非目標、未解決の論点
 - `docs/impl/` —— コンパイラ実装計画 + 標準ライブラリのモジュール設計仕様
-- `apps/` —— `pkg.web`、`pkg.jwt` などの first-party パッケージ用ワークスペース
+- `apps/` —— `pkg.web`、`pkg.auth` などの first-party パッケージ用ワークスペース
 - `editors/` —— Vim / Emacs / VS Code 対応(シンタックスハイライト、スニペット)
 - `crates/` —— `alignc` コンパイラのワークスペース
 

@@ -1,8 +1,8 @@
-# Packages: vendored source, pkg.web, pkg.jwt, and pkg.db
+# Packages: vendored source, pkg.web, pkg.frame, pkg.auth, and pkg.db
 
 > 🌐 **English** · [Japanese](./ja/23-packages.md)
 
-`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.jwt`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
+`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.frame`, `pkg.auth`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
 
 ## A package is a source tree
 
@@ -12,7 +12,8 @@ A package root is `pkg/<name>.align`, with optional submodules below `pkg/<name>
 main.align
 pkg/
   db.align
-  jwt.align
+  auth.align
+  frame.align
   web.align
   db/
     sqlite.align
@@ -27,7 +28,7 @@ pkg/
 
 `import pkg.web` resolves to `pkg/web.align`; `import pkg.web.cookie` resolves to `pkg/web/cookie.align`. Calls and types remain fully qualified, such as `pkg.web.get(...)` and `pkg.web.types.Ctx`.
 
-Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/jwt/pkg](../../apps/jwt/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
+Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
 
 There is no package manifest, lockfile, registry, version solver, or download command. Imports plus the filesystem are the dependency graph, and one `pkg/<name>` exists per source tree. Updating or auditing a dependency means updating or auditing the vendored source.
 
@@ -35,7 +36,7 @@ There is no package manifest, lockfile, registry, version solver, or download co
 
 The compiler checks two path rules on every import:
 
-- An `internal` module is importable only from the subtree rooted at its parent. `pkg.web` may import `pkg.web.internal.router`; `main` and `pkg.jwt` may not.
+- An `internal` module is importable only from the subtree rooted at its parent. `pkg.web` may import `pkg.web.internal.router`; `main` and `pkg.auth` may not.
 - A module below `pkg/` may import only `core`, `std`, or another `pkg` module. It cannot reach back into the consuming project's modules.
 
 These rules keep package internals private and the dependency direction one-way without adding another visibility syntax or build language.
@@ -72,27 +73,38 @@ Public companion modules provide focused, composable pieces:
 
 There is no application-state parameter in the handler shape yet. That is a current limitation, not a hidden framework facility. Database access is a separate package, `pkg.db`, below.
 
-## `pkg.jwt`
+## `pkg.frame`
 
-`pkg.jwt` implements compact JSON Web Tokens with HS256. Claims remain JSON text: `core.json` owns their schema, while the package owns the signed envelope.
+`pkg.frame` performs bounded stable inner joins over validated `core.codec` i64 or string columns. It returns owned `RowPair { left, right }` source ordinals in left-major, right-ascending order, so it does not materialize or retain either input batch. The required `max_pairs` makes duplicate-key fanout and output allocation visible. Nullable/composite keys, outer joins, adaptive build-side selection, parallelism, and spill are deliberately absent; the exact surface is in [`pkg.frame`'s design](../impl/pkg-design/frame.md).
+
+## `pkg.auth`
+
+`pkg.auth` assembles three bounded authentication protocols from the audited `std.crypto` primitives: HS256 tokens, canonical Argon2id password records, and opaque 256-bit session tokens. Claims remain JSON text and all policy stays explicit at the call site.
 
 ```align
-import pkg.jwt
+import pkg.auth
+import std.encoding
 
-pub fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
+    key := encoding.hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")?
     claims := "{\"sub\":\"42\",\"exp\":2000}"
-    token := pkg.jwt.encode_hs256(claims, "secret")
-    decoded := pkg.jwt.decode_hs256(token, "secret")?
-    print(pkg.jwt.time_claims_valid(decoded, 1000))
+    token := pkg.auth.encode_hs256(claims, key.bytes())?
+    verified := pkg.auth.verify_hs256(token, key.bytes(), 1000000000000)?
+    print(verified)
+
+    policy := pkg.auth.Argon2Policy{m_cost: 65536, t_cost: 3, parallelism: 1}
+    phc := pkg.auth.password_hash("correct horse".bytes(), policy)?
+    print(pkg.auth.password_verify("correct horse".bytes(), phc, policy)?)
+    print(pkg.auth.session_token())
     return Ok(())
 }
 ```
 
-Verification pins the algorithm to HS256 instead of trusting the token's `alg` field, and compares signatures in constant time. `time_claims_valid` checks optional `exp` and `nbf` NumericDate claims separately from signature verification. HS384/512, RSA, ECDSA, and public-provider OIDC verification are not exposed until the corresponding audited crypto primitives exist.
+Verification authenticates the compact bytes before parsing JSON, pins the algorithm to HS256, and compares signatures in constant time. The required `now_ns` checks optional integer-form `exp` and `nbf` claims without a hidden clock read. Password verification enforces the caller's three work ceilings before Argon2 runs. There is no default password policy, key lookup, issuer/audience policy, cookie, or session store; the exact bounds and errors are recorded in [`pkg.auth`'s design](../impl/pkg-design/auth.md).
 
 ## `pkg.db` — complete committed roadmap
 
-`pkg.db` is the first-party database package, vendored the same way as the other two: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
+`pkg.db` is the first-party database package, vendored the same way as the other three: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
 
 Complete: the first public release scope. Typed static queries and commands are checked against real schema metadata at compile time, execute on both SQLite and PostgreSQL, and regenerate that metadata offline. Prepared statements, transactions, typed row streams with deadlines and cancellation, compound one-to-many and many-to-one outputs, migration lifecycle tooling, and read-only catalog inspection with `EXPLAIN` are all in.
 

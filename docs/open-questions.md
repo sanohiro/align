@@ -42,8 +42,8 @@ All five functions are Impure, borrow inputs only for the call, and return ordin
 They inherit the existing lack of zeroizing string/buffer Drop. Capability collection is
 module-wide, so every auth import retains the complete module set and libcrypto. Issuer/audience policy, asymmetric
 JWT/JWKS/OIDC, cookies/storage/revocation, pepper, rehash advice, other password KDFs, and secret
-owner types remain separate consumer-gated capabilities. The existing `pkg.jwt` prototype is
-replaced outright at implementation rather than retained as an alias.
+owner types remain separate consumer-gated capabilities. The former `pkg.jwt` prototype was
+replaced outright by `pkg.auth`; no alias remains.
 
 Record: `docs/impl/pkg-design/auth.md`, `draft.md` §18.3, `docs/language-spec.md`
 

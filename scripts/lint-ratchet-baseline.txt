@@ -2,4 +2,4 @@
 align_mir panics 370
 align_codegen_llvm panics 425
 align_runtime casts 289
-workspace fixture-bake 51
+workspace fixture-bake 50

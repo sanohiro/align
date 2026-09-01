@@ -3649,8 +3649,8 @@ native ABI, session store, password policy default, pepper, or ambient provider/
 Existing capability collection is module-wide, so every `pkg.auth` import retains the complete
 JSON/base64/HMAC/Argon2/random set and libcrypto, including session-only use.
 The exact contract and implementation closure matrix are
-`docs/impl/pkg-design/auth.md`. The existing `pkg.jwt` prototype is replaced outright when this
-accepted design implements; no compatibility alias is retained.
+`docs/impl/pkg-design/auth.md`. `pkg.auth` replaced the former `pkg.jwt` prototype outright; no
+compatibility alias is retained.
 
 **First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
 live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer

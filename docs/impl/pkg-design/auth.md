@@ -2,7 +2,7 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/auth.md`.
 >
-> **Status:** design accepted (2026-09-01); implementation pending.
+> **Status:** implemented (2026-09-01).
 
 ## Authoritative public-contract ledger
 
@@ -39,8 +39,8 @@ hidden time read.
 
 HS256 is the only JWT algorithm in v1. The asymmetric primitives now shipped in `std.crypto` are
 lower-level prerequisites for later issuer/JWKS work, not permission to add an algorithm selector,
-network fetch, key cache, or provider policy here. The existing `pkg.jwt` prototype is replaced
-outright when this capability implements; no deprecated alias or parallel old/new package remains.
+network fetch, key cache, or provider policy here. `pkg.auth` replaced the former `pkg.jwt`
+prototype outright; no deprecated alias or parallel old/new package remains.
 
 ## Public use
 
@@ -177,8 +177,10 @@ functions. It imports `core.json`, `std.crypto`, and `std.encoding`. There is no
 native declaration, compiler-recognized source shape, checked-HIR discriminator, runtime ABI row,
 reflection table, static artifact, schema input, or environment-derived option.
 
-Direct, imported, local/function-field, and control-joined function-value calls use ordinary Align
-function semantics. Whole-program compilation sees the bodies directly. Per-unit compilation
+Direct and imported calls use ordinary Align function semantics. The current function-value subset
+admits scalar parameters and results only, so these slice-taking and owned-`Result` signatures
+cannot form local, function-field, or control-joined function values; the package adds no exception.
+Whole-program compilation sees the bodies directly. Per-unit compilation
 serializes the public signatures and `Argon2Policy` definition, while the package object's ordinary
 implementation/dependency hashes retain the existing runtime capabilities. Capability collection
 is intentionally module-wide rather than call-reachability-based: every `pkg.auth` import retains
@@ -213,27 +215,47 @@ contract rather than merely calling a shipped signature primitive.
 
 ## Implementation closure matrix
 
-The implementation is one independently useful package capability and is expected to stay below
+The implementation is one independently useful package capability and stays below
 roughly 1,000 changed hand-written lines. Splitting its source from its owner tests would publish no
 separately useful consumer boundary, while no compiler/runtime producer chain is involved.
 
 | Axis | Required closure | Owner evidence |
 |---|---|---|
-| Public formation and identity | Exact module, record fields/order, five signatures, core `Error`, import/name/type/arity rules, ordinary direct/imported/local/function-field/joined-indirect calls, whole/per-unit definitions. | Package source compilation, negative import/signature fixtures, interface/hash and target-shape parity. |
-| JWT encode bytes | Fixed header, canonical unpadded segments, exact signing input/tag, 8192-byte claims and 11004-byte result arithmetic, no partial result. | Independent RFC HS256 vector plus external decoder; empty/exact/next bounds; output segment decode oracle. |
-| JWT authentication and policy | Key/time/token precedence; exact three segments; canonical signature; MAC before JSON; allocation-free C0/leading-zero precheck; unique header/payload keys; malformed-header `Invalid` versus alg/typ/crit `Denied`; exp then nbf boundaries; exact payload clone. | Parameterized mutation matrix, raw C0 and leading-zero encode/authenticated header/payload fixtures, duplicate escaped-key fixtures, HMAC/JSON call instrumentation, second/nanosecond edge and error-kind assertions. |
-| PHC construction and parser | Exact version/parameter grammar/order/decimal/base64/salt/tag; one random salt; fixed output; every policy boundary. | Independent Argon2id/PHC vectors and parser oracle; one-byte grammar mutations; deterministic injected-random fixture; real-random shape test. |
-| Password resource and comparison | Maximum validation before PHC; stored engine relation and three inclusive ceilings before one KDF; NUL/empty bytes; CT 32-byte true/false; exact native split of provider/context/output-reserve `Error.Code(0)` and derive-rejection `Error.Invalid`. | No-KDF over-limit probe, KDF call count, exact/next maxima product, wrong-password and injected provider/context/output-reserve/derive failure owners. |
+| Public formation and identity | Exact module, record fields/order, five signatures, core `Error`, import/name/type/arity rules, ordinary direct/imported calls, current scalar-only function-value rejection, whole/per-unit definitions. | Package source compilation, public-surface extraction, whole/per-unit parity, and existing function-value rejection owner. |
+| JWT encode bytes | Fixed header, canonical unpadded segments, exact signing input/tag, 8192-byte claims and 11004-byte result arithmetic, no partial result. | Independent RFC HS256 vector plus segment decoder; empty/exact/next claims bounds and exact result length. |
+| JWT authentication and policy | Key/time/token precedence; exact three segments; canonical signature; MAC before JSON; allocation-free C0/leading-zero precheck; unique header/payload keys; malformed-header `Invalid` versus alg/typ/crit `Denied`; exp then nbf boundaries; exact payload clone. | Parameterized mutation matrix, raw C0 and leading-zero encode/authenticated header/payload fixtures, duplicate escaped-key fixtures, an unauthenticated invalid-payload sentinel proving MAC-first behavior, second/nanosecond edges, and error-kind assertions. |
+| PHC construction and parser | Exact version/parameter grammar/order/decimal/base64/salt/tag; one random salt; fixed output; every policy boundary. | Independent Argon2id/PHC vector, one-byte grammar mutations, source-fixed 16-byte random buffer, and real-random shape/distinct-sample test. |
+| Password resource and comparison | Maximum validation before PHC; stored engine relation and three inclusive ceilings before one KDF; NUL/empty bytes; CT 32-byte true/false; exact native split of provider/context/output-reserve `Error.Code(0)` and derive-rejection `Error.Invalid`. | Source-order owner for maximum→PHC→KDF, exact/over-limit policy product, wrong-password result, and existing primitive provider/context/output-reserve/derive failure owners. |
 | Ownership and effects | Every temporary dropped on success/Invalid/Denied/Code; no retained borrow; return/control/move paths; all functions Impure; no secret-dependent package comparison. | Allocation/Drop parity, MIR effect/call checks, control-flow matrix, constant-time owner reuse. |
 | Capability, compatibility, and cache | Existing crypto/encoding/JSON/time semantics and ABI unchanged; every imported `pkg.auth` module retains its complete existing capability set and libcrypto, including session-only use; package absence unchanged; source/interface/dependency edits invalidate normal keys. | Module-wide capability-linking session/JWT/password positives and no-package negative, existing crypto/encoding/JSON controls, add/remove/edit/revert cache twins, optimized/unoptimized and whole/per-unit runs. |
 | Session token | Exactly 32 CSPRNG bytes to 43 canonical base64url characters; no clock/prefix/store; ordinary owned-string Drop. | Decode-to-32 oracle, alphabet/length, multi-sample inequality sanity check, random capability/effect/Drop checks. |
+
+## Implementation closure evidence
+
+The author-side matrix-to-diff pass closes the capability without a compiler/runtime change:
+
+| Matrix rows | Implementation and regression owner |
+|---|---|
+| Public formation, identity, whole/per-unit, and capability | `apps/auth/pkg/auth.align`; `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`; `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed`, including exact public-source extraction, scalar-only function-value rejection, and session-only libcrypto retention. Existing package-foundation and unit-cache owners continue to cover absence and ordinary source/interface/dependency invalidation. |
+| JWT bytes, authentication, policy, bounds, and precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`; `apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`; `apps_auth::jwt_claim_and_result_bounds_are_exact`. The mutation owner covers all three segments' alphabet, unpadded length, trailing-bit canonicality, and MAC-before-JSON precedence. The first vector is independently reproduced with OpenSSL HMAC-SHA256. Existing JSON and encoding owners retain the parser/base64 primitive contracts. |
+| PHC construction/parser, resource admission, and comparison | `apps_auth::password_phc_vector_policy_and_canonical_mutation_matrix_are_exact`, including an independently generated OpenSSL 3.5 Argon2id vector, canonical mutations, exact/invalid policy, NUL/empty passwords, and true/false comparison. Existing `m11_crypto` owners retain provider/context/output-reserve/derive classification, parameter bounds, random, constant-time equality, and primitive cleanup. |
+| Ownership and effects | `apps_auth::owned_results_escape_inputs_and_auth_operations_remain_impure` plus the whole/per-unit JWT owner; existing JSON/encoding/crypto control-flow and Drop owners cover their unchanged temporaries. |
+| Session token | `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed` decodes every result to 32 bytes, pins 43 output characters, checks two samples differ, and proves Impure/module-wide behavior. |
+
+## Implementation-review finding-to-fix ledger
+
+The fresh full-diff implementation review found one P1. The fix audits the complete segment class:
+
+| Finding | Class-wide resolution |
+|---|---|
+| P1: optional padding and malformed header/payload segment text could reach authentication | Added one allocation-free canonical base64url validator for all three nonempty segments before signature decode or HMAC. It rejects `=`, every non-URL byte, length modulo four equal to one, and nonzero unused trailing bits. The owner covers malformed header, payload, and signature spellings with a bad tag, preserves `Denied` for canonical bytes whose decoded JSON is invalid but unauthenticated, and rejects a padded otherwise-valid signature alias as `Invalid`. |
 
 ## Sources of truth and author consistency pass
 
 This English ledger, `docs/impl/pkg-design/ja/auth.md`, `draft.md`,
 `docs/language-spec.md`, `docs/design-notes.md`, `docs/history.md`,
-`docs/open-questions.md`, `docs/impl/07-roadmap.md`, and `HANDOFF.md` must agree before
-implementation. The HIR/runtime ledgers must remain unchanged unless implementation discovers a
+`docs/open-questions.md`, `docs/impl/07-roadmap.md`, and `HANDOFF.md` must agree. The HIR/runtime
+ledgers remain unchanged unless implementation discovers a
 genuine new compiler/native boundary, which would reopen this design.
 
 Author-side pass for the accepted design:

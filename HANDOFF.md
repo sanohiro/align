@@ -13,9 +13,9 @@ PR #915. align-llm Request 22's borrowed string-array indexing design is merged 
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
-`docs/impl/core-design/codec.md`; and `pkg.frame` is implemented against
-`docs/impl/pkg-design/frame.md`. `pkg.auth` has an accepted cross-source design and is the next
-implementation capability.
+`docs/impl/core-design/codec.md`; `pkg.frame` is implemented against
+`docs/impl/pkg-design/frame.md`; and `pkg.auth` is implemented against
+`docs/impl/pkg-design/auth.md`. `pkg.kv` design is the next language capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -394,18 +394,16 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `pkg.frame` is implemented against
-  `docs/impl/pkg-design/frame.md`. Its two bounded stable ordinal inner joins consume settled codec
-  columns, return ordinary owned `array<RowPair>` data, and activate checked operations plus
-  nounwind A121/A122. The owner set closes canonical package admission, whole/per-unit execution,
-  stable duplicate products, byte-exact strings, bounds, malformed checked HIR, ABI identity, and
-  runtime oracle/collision/unaligned-input behavior.
-- **Next language capability:** implement the accepted `pkg.auth` ledger over shipped JSON, crypto,
-  encoding, and explicit caller time. It fixes HS256 encode/verify, canonical bounded Argon2id PHC
-  hash/verify, one 256-bit session token, a narrow strict-JSON precheck, the shipped native Argon2
-  `Code(0)`/`Invalid` failure split, and module-wide libcrypto retention. No new compiler/runtime
-  ABI, clock read, provider/key source, identity policy, or session store is added. Exact closure matrix:
-  `docs/impl/pkg-design/auth.md`.
+- **Latest language capability:** `pkg.auth` is implemented against
+  `docs/impl/pkg-design/auth.md`. It replaces `pkg.jwt` outright with bounded HS256 encode/verify,
+  canonical bounded Argon2id PHC hash/verify, and one 256-bit session token over shipped JSON,
+  crypto, and encoding. The owner set closes strict JSON, authentication/error precedence,
+  independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
+  whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
+  new compiler/runtime ABI or ambient clock/provider/key/session owner.
+- **Next language capability:** author and review the exact public ledger for `pkg.kv`, the queued
+  RESP2 typed Redis client. The roadmap outline requires a Move client, owned-string values, and
+  fail-closed protocol handling; TLS remains deferred. No public surface is settled yet.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

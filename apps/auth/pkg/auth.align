@@ -1,0 +1,373 @@
+module pkg.auth
+
+import core.json
+import std.crypto
+import std.encoding
+
+pub Argon2Policy {
+  m_cost: i64,
+  t_cost: i64,
+  parallelism: i64,
+}
+
+HEADER_JSON := "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+
+fn decimal_digit(byte: u8) -> bool = byte >= 48 as u8 && byte <= 57 as u8
+
+fn base64url_value(byte: u8) -> Option<i64> {
+  if byte >= 65 as u8 && byte <= 90 as u8 { return Some((byte - 65 as u8) as i64) }
+  if byte >= 97 as u8 && byte <= 122 as u8 {
+    return Some((byte - 97 as u8) as i64 + 26)
+  }
+  if byte >= 48 as u8 && byte <= 57 as u8 {
+    return Some((byte - 48 as u8) as i64 + 52)
+  }
+  if byte == 45 as u8 { return Some(62) }
+  if byte == 95 as u8 { return Some(63) }
+  return None
+}
+
+// Validate the canonical unpadded spelling without decoding header or payload bytes before HMAC.
+fn canonical_base64url(text: str) -> bool {
+  if text.len() == 0 { return false }
+  remainder := text.len() % 4
+  if remainder == 1 { return false }
+  bytes := text.bytes()
+  mut index := 0
+  mut last_value := 0
+  loop {
+    if index >= bytes.len() { break }
+    value := base64url_value(bytes[index]) else { return false }
+    last_value = value
+    index = index + 1
+  }
+  if remainder == 2 { return last_value % 16 == 0 }
+  if remainder == 3 { return last_value % 4 == 0 }
+  return true
+}
+
+fn json_value_boundary(bytes: slice<u8>, index: i64) -> bool {
+  if index == 0 { return true }
+  previous := bytes[index - 1]
+  return previous == 32 as u8 || previous == 9 as u8 || previous == 10 as u8 ||
+    previous == 13 as u8 || previous == 91 as u8 || previous == 123 as u8 ||
+    previous == 44 as u8 || previous == 58 as u8
+}
+
+// Reject the two known lexical leniencies of the shipped JSON parser. All other grammar remains
+// owned by `json.doc`.
+fn strict_json_lexical(text: str) -> bool {
+  bytes := text.bytes()
+  mut index := 0
+  mut in_string := false
+  mut escaped := false
+  loop {
+    if index >= bytes.len() { break }
+    byte := bytes[index]
+    if in_string {
+      if escaped {
+        escaped = false
+      } else if byte == 92 as u8 {
+        escaped = true
+      } else if byte == 34 as u8 {
+        in_string = false
+      } else if byte <= 31 as u8 {
+        return false
+      }
+    } else if byte == 34 as u8 {
+      in_string = true
+    } else if json_value_boundary(bytes, index) {
+      if byte == 48 as u8 && index + 1 < bytes.len() && decimal_digit(bytes[index + 1]) {
+        return false
+      }
+      if byte == 45 as u8 && index + 2 < bytes.len() && bytes[index + 1] == 48 as u8 &&
+        decimal_digit(bytes[index + 2]) {
+        return false
+      }
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn unique_json_names(value: json.doc) -> bool {
+  return match value.kind() {
+    Object => {
+      mut index := 0
+      loop {
+        if index >= value.len() { break }
+        key := value.key(index) else { return false }
+        mut earlier := 0
+        loop {
+          if earlier >= index { break }
+          previous := value.key(earlier) else { return false }
+          if key == previous { return false }
+          earlier = earlier + 1
+        }
+        if !unique_json_names(value.at(index)) { return false }
+        index = index + 1
+      }
+      true
+    }
+    Array => {
+      mut index := 0
+      loop {
+        if index >= value.len() { break }
+        if !unique_json_names(value.at(index)) { return false }
+        index = index + 1
+      }
+      true
+    }
+    _ => true,
+  }
+}
+
+fn json_object(value: json.doc) -> bool = match value.kind() { Object => true, _ => false }
+
+fn json_missing(value: json.doc) -> bool = match value.kind() { Missing => true, _ => false }
+
+fn optional_string_equals(value: Option<str>, expected: str) -> bool = match value {
+  Some(actual) => actual == expected,
+  None => false,
+}
+
+fn claims_are_valid(document: json.doc) -> bool {
+  if !json_object(document) || !unique_json_names(document) { return false }
+  exp := document.get("exp")
+  if !json_missing(exp) {
+    match exp.as_i64() { Some(_) => {}, None => { return false } }
+  }
+  nbf := document.get("nbf")
+  if !json_missing(nbf) {
+    match nbf.as_i64() { Some(_) => {}, None => { return false } }
+  }
+  return true
+}
+
+fn claims_admit_time(document: json.doc, now_s: i64) -> bool {
+  exp := document.get("exp")
+  exp_ok := match exp.as_i64() { Some(expires) => now_s < expires, None => json_missing(exp) }
+  if !exp_ok { return false }
+  nbf := document.get("nbf")
+  return match nbf.as_i64() {
+    Some(not_before) => now_s >= not_before,
+    None => json_missing(nbf),
+  }
+}
+
+fn hash_policy_valid(policy: Argon2Policy) -> bool =
+  policy.parallelism >= 1 && policy.parallelism <= 16777215 &&
+  policy.t_cost >= 1 && policy.t_cost <= 4294967295 &&
+  policy.m_cost >= policy.parallelism * 8 && policy.m_cost <= 4194304
+
+fn maximum_policy_valid(policy: Argon2Policy) -> bool =
+  policy.parallelism >= 1 && policy.parallelism <= 16777215 &&
+  policy.t_cost >= 1 && policy.t_cost <= 4294967295 &&
+  policy.m_cost >= 1 && policy.m_cost <= 4194304
+
+fn parse_positive_decimal(text: str, maximum: i64) -> Option<i64> {
+  if text.len() == 0 { return None }
+  bytes := text.bytes()
+  if bytes[0] == 48 as u8 && bytes.len() != 1 { return None }
+  mut index := 0
+  mut value := 0
+  loop {
+    if index >= bytes.len() { break }
+    byte := bytes[index]
+    if !decimal_digit(byte) { return None }
+    digit := (byte - 48 as u8) as i64
+    if value > (maximum - digit) / 10 { return None }
+    value = value * 10 + digit
+    index = index + 1
+  }
+  if value == 0 { return None }
+  return Some(value)
+}
+
+pub fn encode_hs256(claims_json: str, key: slice<u8>) -> Result<string, Error> {
+  if key.len() < 32 || claims_json.len() > 8192 { return Err(Error.Invalid) }
+  if !strict_json_lexical(claims_json) { return Err(Error.Invalid) }
+  valid := arena {
+    document := json.doc(claims_json) else { return Err(Error.Invalid) }
+    claims_are_valid(document)
+  }
+  if !valid { return Err(Error.Invalid) }
+
+  header := encoding.base64url_encode(HEADER_JSON)
+  payload := encoding.base64url_encode(claims_json)
+  mut signing := builder()
+  signing.write(header)
+  signing.write(".")
+  signing.write(payload)
+  signing_input := signing.to_string()
+  tag := crypto.hmac_sha256(key, signing_input)
+
+  mut token := builder()
+  token.write(signing_input)
+  token.write(".")
+  token.write(encoding.base64url_encode(tag[0..tag.len()]))
+  return Ok(token.to_string())
+}
+
+pub fn verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, Error> {
+  if key.len() < 32 || now_ns < 0 || token.len() == 0 || token.len() > 16384 {
+    return Err(Error.Invalid)
+  }
+  first := match token.find(".") { Some(index) => index, None => -1 }
+  if first <= 0 { return Err(Error.Invalid) }
+  rest := token[first + 1..token.len()]
+  relative_second := match rest.find(".") { Some(index) => index, None => -1 }
+  if relative_second <= 0 { return Err(Error.Invalid) }
+  second := first + 1 + relative_second
+  third := match token[second + 1..token.len()].find(".") { Some(_) => true, None => false }
+  if second + 1 >= token.len() || third {
+    return Err(Error.Invalid)
+  }
+
+  header_segment := token[0..first]
+  payload_segment := token[first + 1..second]
+  signature_text := token[second + 1..token.len()]
+  if !canonical_base64url(header_segment) || !canonical_base64url(payload_segment) ||
+    !canonical_base64url(signature_text) {
+    return Err(Error.Invalid)
+  }
+  signature := encoding.base64url_decode(signature_text) else { return Err(Error.Invalid) }
+  if signature.len() != 32 { return Err(Error.Invalid) }
+  expected := crypto.hmac_sha256(key, token[0..second])
+  if !crypto.constant_time_equal(signature.bytes(), expected[0..expected.len()]) {
+    return Err(Error.Denied)
+  }
+
+  header_buffer := encoding.base64url_decode(header_segment) else { return Err(Error.Invalid) }
+  header_text := header_buffer.bytes().as_str() else { return Err(Error.Invalid) }
+  if !strict_json_lexical(header_text) { return Err(Error.Invalid) }
+  header_policy := arena {
+    document := json.doc(header_text) else { return Err(Error.Invalid) }
+    if !json_object(document) || !unique_json_names(document) {
+      return Err(Error.Invalid)
+    }
+    algorithm := document.get("alg").as_str()
+    if !optional_string_equals(algorithm, "HS256") { false } else {
+      typ := document.get("typ")
+      type_ok := json_missing(typ) || optional_string_equals(typ.as_str(), "JWT")
+      type_ok && json_missing(document.get("crit"))
+    }
+  }
+  if !header_policy { return Err(Error.Denied) }
+
+  payload_buffer := encoding.base64url_decode(payload_segment) else {
+    return Err(Error.Invalid)
+  }
+  if payload_buffer.len() > 8192 { return Err(Error.Invalid) }
+  payload_text := payload_buffer.bytes().as_str() else { return Err(Error.Invalid) }
+  if !strict_json_lexical(payload_text) { return Err(Error.Invalid) }
+  time_valid := arena {
+    document := json.doc(payload_text) else { return Err(Error.Invalid) }
+    if !claims_are_valid(document) { return Err(Error.Invalid) }
+    now_s := now_ns / 1000000000
+    claims_admit_time(document, now_s)
+  }
+  if !time_valid { return Err(Error.Denied) }
+  return Ok(payload_text.clone())
+}
+
+pub fn password_hash(password: slice<u8>, policy: Argon2Policy) -> Result<string, Error> {
+  if !hash_policy_valid(policy) { return Err(Error.Invalid) }
+  mut salt := buffer(16)
+  crypto.random(salt)
+  derived := crypto.argon2id(
+    password,
+    salt.bytes(),
+    argon2_params{
+      m_cost: policy.m_cost,
+      t_cost: policy.t_cost,
+      parallelism: policy.parallelism,
+      len: 32,
+    },
+  )?
+  salt_base64 := encoding.base64_encode(salt.bytes())
+  tag_base64 := encoding.base64_encode(derived.bytes())
+  mut phc := builder()
+  phc.write("$argon2id$v=19$m=")
+  phc.write_int(policy.m_cost)
+  phc.write(",t=")
+  phc.write_int(policy.t_cost)
+  phc.write(",p=")
+  phc.write_int(policy.parallelism)
+  phc.write("$")
+  phc.write(salt_base64[0..22])
+  phc.write("$")
+  phc.write(tag_base64[0..43])
+  return Ok(phc.to_string())
+}
+
+pub fn password_verify(
+  password: slice<u8>,
+  phc: str,
+  maximum: Argon2Policy,
+) -> Result<bool, Error> {
+  if !maximum_policy_valid(maximum) { return Err(Error.Invalid) }
+  if phc.len() < 15 || phc[0..15] != "$argon2id$v=19$" { return Err(Error.Invalid) }
+  parameters_and_tail := phc[15..phc.len()]
+  parameters_end := match parameters_and_tail.find("$") {
+    Some(index) => index,
+    None => -1,
+  }
+  if parameters_end <= 0 { return Err(Error.Invalid) }
+  parameters := parameters_and_tail[0..parameters_end]
+  salt_and_tag := parameters_and_tail[parameters_end + 1..parameters_and_tail.len()]
+  salt_end := match salt_and_tag.find("$") { Some(index) => index, None => -1 }
+  if salt_end <= 0 { return Err(Error.Invalid) }
+  salt_text := salt_and_tag[0..salt_end]
+  tag_text := salt_and_tag[salt_end + 1..salt_and_tag.len()]
+
+  if parameters.len() < 2 || parameters[0..2] != "m=" { return Err(Error.Invalid) }
+  after_m := parameters[2..parameters.len()]
+  m_end := match after_m.find(",t=") { Some(index) => index, None => -1 }
+  if m_end <= 0 { return Err(Error.Invalid) }
+  m_cost := parse_positive_decimal(after_m[0..m_end], 4194304) else {
+    return Err(Error.Invalid)
+  }
+  after_t := after_m[m_end + 3..after_m.len()]
+  t_end := match after_t.find(",p=") { Some(index) => index, None => -1 }
+  if t_end <= 0 { return Err(Error.Invalid) }
+  t_cost := parse_positive_decimal(after_t[0..t_end], 4294967295) else {
+    return Err(Error.Invalid)
+  }
+  parallelism := parse_positive_decimal(after_t[t_end + 3..after_t.len()], 16777215) else {
+    return Err(Error.Invalid)
+  }
+  stored := Argon2Policy{m_cost: m_cost, t_cost: t_cost, parallelism: parallelism}
+  if !hash_policy_valid(stored) || stored.m_cost > maximum.m_cost ||
+    stored.t_cost > maximum.t_cost || stored.parallelism > maximum.parallelism {
+    return Err(Error.Invalid)
+  }
+
+  if salt_text.len() != 22 || tag_text.len() != 43 { return Err(Error.Invalid) }
+  salt := encoding.base64_decode(salt_text) else { return Err(Error.Invalid) }
+  if salt.len() != 16 { return Err(Error.Invalid) }
+  salt_canonical := encoding.base64_encode(salt.bytes())
+  if salt_canonical[0..22] != salt_text { return Err(Error.Invalid) }
+  tag := encoding.base64_decode(tag_text) else { return Err(Error.Invalid) }
+  if tag.len() != 32 { return Err(Error.Invalid) }
+  tag_canonical := encoding.base64_encode(tag.bytes())
+  if tag_canonical[0..43] != tag_text { return Err(Error.Invalid) }
+
+  derived := crypto.argon2id(
+    password,
+    salt.bytes(),
+    argon2_params{
+      m_cost: stored.m_cost,
+      t_cost: stored.t_cost,
+      parallelism: stored.parallelism,
+      len: 32,
+    },
+  )?
+  return Ok(crypto.constant_time_equal(derived.bytes(), tag.bytes()))
+}
+
+pub fn session_token() -> string {
+  mut random := buffer(32)
+  crypto.random(random)
+  return encoding.base64url_encode(random.bytes())
+}
