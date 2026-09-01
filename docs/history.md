@@ -1,5 +1,19 @@
 # History of Align
 
+## 2026-09-01: auth composes fixed protocols over the one crypto substrate
+
+The first `pkg.auth` design settled HS256 JWT, Argon2id PHC password records, and 256-bit opaque
+session tokens as ordinary Align package code over shipped JSON, encoding, CSPRNG, HMAC, Argon2id,
+and constant-time comparison. It adds no crypto primitive, native ABI, algorithm registry, clock
+read, key fetch, session store, or identity policy.
+
+JWT verification takes explicit Unix `now_ns`, authenticates compact bytes before JSON parsing,
+pins HS256, and checks optional integer-form `exp`/`nbf`. Password hashing takes exact work policy;
+verification parses one canonical v19 PHC form and enforces caller-supplied cost ceilings before
+the KDF. Session tokens have one fixed 32-byte/43-character shape. The package borrows inputs and
+returns ordinary owned strings without claiming zeroization. Exact surface, formats, precedence,
+and implementation matrix: `docs/impl/pkg-design/auth.md`.
+
 ## 2026-09-01: frame joins are bounded ordinal products, not a query language
 
 The first `pkg.frame` capability settled one stable inner equi-join over exact typed codec columns.

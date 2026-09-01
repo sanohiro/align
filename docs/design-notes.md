@@ -1397,6 +1397,30 @@ f64 requires a separate `-0.0`/NaN hash-canonicalization decision, so neither is
 analogy. The complete contract and implementation closure matrix are in
 `impl/pkg-design/frame.md`.
 
+## Why `pkg.auth` is protocol assembly, not another crypto or identity system
+
+The sensitive primitives already have one owner in `std.crypto`: OS entropy, HMAC-SHA256,
+Argon2id, and constant-time comparison. JWT and password storage still invite repeated
+protocol-level mistakes—algorithm confusion, padded or alternate encodings, unauthenticated JSON
+parsing, unbounded stored work factors, and ad hoc PHC spellings—so `pkg.auth` owns exactly that
+assembly. Adding native JWT/PHC entry points would duplicate validation and cleanup across the
+package/compiler/runtime boundary without improving the cryptographic trust surface.
+
+Time and resource policy stay visible at the call site. JWT verification takes `now_ns` instead of
+reading a clock, and password verification takes an `Argon2Policy` interpreted as three inclusive
+maximum costs before it performs a KDF. Hash creation uses the same record as exact parameters;
+there is deliberately no recommended default hidden in library code. The session-token operation is
+fixed at 256 random bits because allowing a caller to select a weaker token length adds no useful
+authentication policy.
+
+Claims remain bounded JSON text and a verified token returns those exact bytes. The package does
+not infer issuer, audience, roles, cookies, storage, rotation, or revocation. Likewise, canonical
+Argon2id PHC owns no password rules, pepper, automatic rehash, or user database. These are
+application decisions, not alternate modes inside one auth helper. Ordinary borrowed byte inputs
+and owned string results also preserve the existing ownership model; V1 states the current lack of
+zeroizing string/buffer Drop instead of inventing a package-local secret type. Exact format,
+precedence, allocation, and closure rules are in `impl/pkg-design/auth.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private
