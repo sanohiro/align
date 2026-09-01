@@ -260,12 +260,19 @@ jobs:
               -e "s|{{URL_MACOS_ARM}}|file://$ARCHIVE|g" \
               -e "s|{{SHA_MACOS_ARM}}|$ARCHIVE_SHA|g" \
               .github/align.rb.template > "$RUNNER_TEMP/align.rb"
-          brew install --formula --build-from-source "$RUNNER_TEMP/align.rb"
+          RELEASE_TAP="align/release-test"
+          brew tap-new --no-git "$RELEASE_TAP"
+          RELEASE_TAP_ROOT="$(brew --repository "$RELEASE_TAP")"
+          cp "$RUNNER_TEMP/align.rb" "$RELEASE_TAP_ROOT/Formula/align.rb"
+          brew trust --formula "$RELEASE_TAP/align"
+          brew install --formula --build-from-source "$RELEASE_TAP/align"
           FORMULA_ROOT="$(brew --prefix align)/libexec"
           test "$(shasum -a 256 "$FORMULA_ROOT/alignc" | awk '{ print $1 }')" = \
             "$(cat "$RUNNER_TEMP/packaged-alignc.sha256")"
           scripts/verify-prebuilt-cache-layout.sh "$FORMULA_ROOT"
-          brew uninstall align
+          brew uninstall "$RELEASE_TAP/align"
+          brew untrust --formula "$RELEASE_TAP/align"
+          brew untap "$RELEASE_TAP"
 
       - name: Measure prebuilt cache
         shell: bash
