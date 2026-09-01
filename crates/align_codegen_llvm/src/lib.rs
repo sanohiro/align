@@ -15431,6 +15431,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::CodecEncoderNew { .. }
             | Rvalue::CodecEncoderPut { .. }
             | Rvalue::CodecEncoderFinish(_) => return self.gen_codec_rvalue(rv, result_ty),
+            Rvalue::FrameInnerJoin { .. } => return self.gen_frame_inner_join_rvalue(rv),
             Rvalue::IoCopy(r, w) => {
                 let rp = self.operand(r)?.into();
                 let wp = self.operand(w)?.into();
@@ -20062,6 +20063,105 @@ impl<'c, 'a> FnGen<'c, 'a> {
             _ => return Err(self.err("gen_codec_rvalue on a non-codec operation")),
         };
         Ok(Some(value))
+    }
+
+    #[inline(never)]
+    fn gen_frame_inner_join_rvalue(
+        &mut self,
+        rv: &Rvalue,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let Rvalue::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            kind,
+            out,
+        } = rv
+        else {
+            return Err(self.err("gen_frame_inner_join_rvalue on a non-frame operation"));
+        };
+        let left = self.operand_by_value(left)?.into_struct_value();
+        let right = self.operand_by_value(right)?.into_struct_value();
+        let max_pairs = self.operand(max_pairs)?.into_int_value();
+        let output = self.slots[out];
+        let (key, arguments) = match kind {
+            hir::FrameJoinKind::I64 => {
+                let left_data = self
+                    .builder
+                    .build_extract_value(left, 0, "frame.left.data")
+                    .map_err(|error| self.err(error))?;
+                let left_rows = self
+                    .builder
+                    .build_extract_value(left, 1, "frame.left.rows")
+                    .map_err(|error| self.err(error))?;
+                let right_data = self
+                    .builder
+                    .build_extract_value(right, 0, "frame.right.data")
+                    .map_err(|error| self.err(error))?;
+                let right_rows = self
+                    .builder
+                    .build_extract_value(right, 1, "frame.right.rows")
+                    .map_err(|error| self.err(error))?;
+                (
+                    RuntimeKey::FrameInnerJoinI64V1,
+                    vec![
+                        left_data.into(),
+                        left_rows.into(),
+                        right_data.into(),
+                        right_rows.into(),
+                        max_pairs.into(),
+                        output.into(),
+                    ],
+                )
+            }
+            hir::FrameJoinKind::Str => {
+                let left_offsets = self
+                    .builder
+                    .build_extract_value(left, 0, "frame.left.offsets")
+                    .map_err(|error| self.err(error))?;
+                let left_data = self
+                    .builder
+                    .build_extract_value(left, 1, "frame.left.data")
+                    .map_err(|error| self.err(error))?;
+                let left_rows = self
+                    .builder
+                    .build_extract_value(left, 2, "frame.left.rows")
+                    .map_err(|error| self.err(error))?;
+                let right_offsets = self
+                    .builder
+                    .build_extract_value(right, 0, "frame.right.offsets")
+                    .map_err(|error| self.err(error))?;
+                let right_data = self
+                    .builder
+                    .build_extract_value(right, 1, "frame.right.data")
+                    .map_err(|error| self.err(error))?;
+                let right_rows = self
+                    .builder
+                    .build_extract_value(right, 2, "frame.right.rows")
+                    .map_err(|error| self.err(error))?;
+                (
+                    RuntimeKey::FrameInnerJoinStrV1,
+                    vec![
+                        left_offsets.into(),
+                        left_data.into(),
+                        left_rows.into(),
+                        right_offsets.into(),
+                        right_data.into(),
+                        right_rows.into(),
+                        max_pairs.into(),
+                        output.into(),
+                    ],
+                )
+            }
+        };
+        let status = self
+            .builder
+            .build_call(self.runtime(key), &arguments, "frame.join")
+            .map_err(|error| self.err(error))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("frame join runtime must return i32"))?;
+        Ok(Some(status))
     }
 
     fn gen_codec_batch_name(

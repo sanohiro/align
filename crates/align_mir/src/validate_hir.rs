@@ -4049,6 +4049,9 @@ impl<'a> BodyValidator<'a> {
                 struct_id,
                 key_field,
             } => self.dictionary_envelope_ok(context, *base, *struct_id, *key_field),
+            hir::ExprKind::FrameInnerJoin { kind, .. } => {
+                self.frame_inner_join_envelope_ok(expression, context, *kind)
+            }
             hir::ExprKind::FsReadFile { .. }
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
@@ -5003,6 +5006,64 @@ impl<'a> BodyValidator<'a> {
             && definition.variants.iter().zip(NAMES).all(|(variant, expected)| {
                 variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
             })
+    }
+
+    fn frame_inner_join_envelope_ok(
+        &self,
+        expression: &hir::Expr,
+        context: &BodyContext,
+        kind: hir::FrameJoinKind,
+    ) -> bool {
+        let hir::ExprKind::FrameInnerJoin { left, right, max_pairs, .. } = &expression.kind else {
+            return false;
+        };
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let (wrapper, column_ty) = match kind {
+            hir::FrameJoinKind::I64 => ("pkg.frame$inner_join_i64", Ty::CodecI64Column),
+            hir::FrameJoinKind::Str => ("pkg.frame$inner_join_str", Ty::CodecStrColumn),
+        };
+        let Ty::Result(Scalar::DynStructArray(row_id), Scalar::Enum(error_id)) = expression.ty else {
+            return false;
+        };
+        let Some(row) = self.program.structs.get(row_id as usize) else {
+            return false;
+        };
+        let Some(error) = self.program.enums.get(error_id as usize) else {
+            return false;
+        };
+        let i64_ty = i64_ty();
+        let row_is_exact = row.name == "pkg.frame$RowPair"
+            && row.source_name == "pkg.frame$RowPair"
+            && row.align.is_none()
+            && !row.c_repr
+            && matches!(row.fields.as_slice(), [left, right]
+            if left.name == "left" && left.ty == i64_ty
+                && right.name == "right" && right.ty == i64_ty);
+        let error_is_exact = error.name == "pkg.frame$JoinError"
+            && error.source_name == "pkg.frame$JoinError"
+            && matches!(error.variants.as_slice(), [invalid, exceeded]
+            if invalid.name == "InvalidLimit" && invalid.payload.is_empty() && invalid.field_base == 1
+                && exceeded.name == "LimitExceeded" && exceeded.payload.is_empty() && exceeded.field_base == 1);
+        let params_are_exact = matches!(function.params.as_slice(), [left_id, right_id, max_id]
+        if function.param_modes == [align_ast::ParamMode::ByValue; 3]
+            && function.locals.get(*left_id as usize)
+                .is_some_and(|local| self.body_ty_matches(local.ty, column_ty))
+            && function.locals.get(*right_id as usize)
+                .is_some_and(|local| self.body_ty_matches(local.ty, column_ty))
+            && function.locals.get(*max_id as usize).is_some_and(|local| local.ty == i64_ty)
+            && matches!(left.kind, hir::ExprKind::Local(id) if id == *left_id)
+            && matches!(right.kind, hir::ExprKind::Local(id) if id == *right_id)
+            && matches!(max_pairs.kind, hir::ExprKind::Local(id) if id == *max_id));
+        function.name == wrapper
+            && matches!(function.origin, hir::FnOrigin::Source { is_entry: false, is_public: true })
+            && self.body_ty_matches(function.ret, expression.ty)
+            && function.body.stmts.is_empty()
+            && function.body.value.as_deref().is_some_and(|value| std::ptr::eq(value, expression))
+            && params_are_exact
+            && row_is_exact
+            && error_is_exact
     }
 
     fn http_response_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -6290,6 +6351,11 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::ArrayGroupAgg { .. }
             | hir::ExprKind::ArrayGroupAggMulti { .. }
             | hir::ExprKind::ArrayDictEncode { .. } => {}
+            hir::ExprKind::FrameInnerJoin { left, right, max_pairs, .. } => {
+                push_expr!(max_pairs, context.clone());
+                push_expr!(right, context.clone());
+                push_expr!(left, context.clone());
+            }
             _ if self.native_expression_envelope_ok(expression) => {
                 for child in align_sema::direct_expr_children(expression).into_iter().rev() {
                     push_expr!(child, context.clone());
@@ -8150,6 +8216,16 @@ impl<'a> BodyValidator<'a> {
                 (self.owned_codec_encoder_place(encoder, context)
                     && encoder.ty == Ty::CodecEncoder)
                     .then(|| strict(Ty::Buffer, &[encoder]))?
+            }
+            hir::ExprKind::FrameInnerJoin { left, right, max_pairs, kind } => {
+                let column = match kind {
+                    hir::FrameJoinKind::I64 => Ty::CodecI64Column,
+                    hir::FrameJoinKind::Str => Ty::CodecStrColumn,
+                };
+                (self.body_ty_matches(left.ty, column)
+                    && self.body_ty_matches(right.ty, column)
+                    && self.body_ty_matches(max_pairs.ty, i64))
+                    .then(|| strict(expression.ty, &[left, right, max_pairs]))?
             }
             hir::ExprKind::IoCopy { reader, writer } => {
                 if !self.reader_place(reader, context)

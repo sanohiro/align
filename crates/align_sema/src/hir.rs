@@ -1187,6 +1187,13 @@ pub enum ExprKind {
     },
     /// Consume the encoder into the existing owned `buffer` representation.
     CodecEncoderFinish { encoder: Box<Expr> },
+    /// Exact compiler-private bridge reached by an ordinary canonical `pkg.frame` wrapper.
+    FrameInnerJoin {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        max_pairs: Box<Expr>,
+        kind: FrameJoinKind,
+    },
     /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer
     /// (memory is O(buffer), never O(file size)), borrowing **both** (neither consumed — the fd
     /// ownership does not move, so `r`/`w` remain usable after the call, like `print`'s argument).
@@ -1921,6 +1928,12 @@ pub enum CodecPutKind {
     I64,
     F64,
     Bool,
+    Str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum FrameJoinKind {
+    I64,
     Str,
 }
 

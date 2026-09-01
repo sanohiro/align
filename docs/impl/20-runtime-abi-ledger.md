@@ -11,8 +11,8 @@ surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
-raw/SSE receive streaming, asymmetric signatures, `std.log`, and `core.codec`, there are 328 `RuntimeKey`
-variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, and `pkg.frame`, there
+are 330 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Seventeen always-built
@@ -25,7 +25,7 @@ runtime records have no `RuntimeKey` and instead use the seventeen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below. The base native registry
-therefore has 345 records. Request 12 adds the keyed bounded-builder stack
+therefore has 347 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -36,10 +36,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 345 base records.
+The compiler-visible native registry is always exactly the 347 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 353.
+records extend only the verification-time maximum runtime-export table to 355.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -54,9 +54,9 @@ The raw HTTP receive-stream capability subsequently added six keyed rows for buf
 inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
 six keyed rows. The `core.test` child-control extension then added four unkeyed rows, and `std.log`
-added six keyed rows, and `core.codec` then added eight. Their runtime definitions and registry
-entries activated atomically at their respective capability boundaries: the current exact counts
-are 328 keyed records, 345 base records, and 353 records in the maximum optional-probe export table.
+added six keyed rows, `core.codec` then added eight, and `pkg.frame` added two. Their runtime
+definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
+are 330 keyed records, 347 base records, and 355 records in the maximum optional-probe export table.
 No probe category changed.
 
 ## core.test child-control extension
@@ -80,7 +80,8 @@ production `process.command` continues to select its shipped runtime entries unc
 | `TestReportV1` | A113: `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
 These declarations occupy A110 through A113. The implemented `std.log` design occupies A114 through
-A117 and `core.codec` occupies A118 through A120 below, so A121 is the next unreserved shape. All
+A117, `core.codec` occupies A118 through A120, and `pkg.frame` occupies A121/A122 below, so A123 is
+the next unreserved shape. All
 four declarations carry the existing
 generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
@@ -124,9 +125,8 @@ target-dependent row was added. The public/runtime ownership and validation cont
 ## Implemented `core.codec` extension (2026-09-01)
 
 The codec implementation activates eight keyed rows atomically with their checked-HIR records and
-owner tests. They extend the inventories from 320/337/345 to the current 328/345/353
-keyed/base/maximum-optional-probe records and the implemented shape range through A120. A121 is the
-next unreserved shape.
+owner tests. They extend the inventories from 320/337/345 to 328/345/353
+keyed/base/maximum-optional-probe records and the implemented shape range through A120.
 
 | Runtime key | Exact symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
 |---|---|---|---|
@@ -169,13 +169,13 @@ hard-aborts because no source-valid call can form it. Free is null-safe and rele
 staging exactly once. Every row is C calling convention and `nounwind`. Open and all encoder rows
 carry no curated memory, parameter, or return attribute.
 
-## Planned `pkg.frame` extension (design accepted 2026-09-01; inactive until implementation)
+## Implemented `pkg.frame` extension (2026-09-01)
 
-The accepted design reserves two new shapes after implemented A120. They are documentation-only
-until one atomic implementation boundary; neither symbol, key, shape,
-collision reservation, declaration, definition, export, fingerprint input, or total is active.
+The implementation activates two new shapes after A120 in one atomic boundary. Both symbols, keys,
+shapes, collision reservations, declarations, definitions, exports, fingerprint inputs, and totals
+are active.
 
-| Candidate runtime key | Candidate symbol | Reserved ABI row and exact LLVM declaration | Exact Rust ABI |
+| Runtime key | Symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
 |---|---|---|---|
 | `FrameInnerJoinI64V1` | `align_rt_frame_inner_join_i64_v1` | A121: `i32 @SYM(ptr, i64, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const u8, i64, i64, *mut AlignStr) -> i32` |
 | `FrameInnerJoinStrV1` | `align_rt_frame_inner_join_str_v1` | A122: `i32 @SYM(ptr, ptr, i64, ptr, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, *const u8, i64, *const u8, *const u8, i64, i64, *mut AlignStr) -> i32` |
@@ -189,8 +189,8 @@ elements. It is not an Align source `str`. Empty output is `{ null, 0 }`; nonemp
 the ordinary runtime allocator with the target ABI alignment of `{ i64, i64 }` and must be freed by
 the existing dynamic-array owner.
 
-Both rows are C calling convention and `nounwind`. No curated memory, return, or parameter
-attribute is reserved before implementation proves it against the final bodies. Runtime first
+Both rows are C calling convention and `nounwind`. They carry no other curated memory, return, or
+parameter attribute. Runtime first
 requires and zeroes the output header, then validates negative limit before either input, left view
 before right view, right-table load-factor/capacity/byte arithmetic before allocation, and every
 output bound before output allocation. For positive right length `R`, the exact logical index uses
@@ -205,10 +205,9 @@ an error publishes no output.
 
 The right input is always indexed in ascending ordinal order. The runtime counts stable matches
 before one exact output allocation, probes again to fill left-major/right-ascending pairs, confirms
-equality after every hash match, and retains no input pointer. Activation would move the current
-keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and make A123 the next
-unreserved shape. Implementation must recompute all totals and collision sets rather than trust the
-reservation arithmetic here. Exact public semantics and owner matrix: `pkg-design/frame.md`.
+equality after every hash match, and retains no input pointer. Activation moves the
+keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and makes A123 the next
+unreserved shape. Exact public semantics and owner matrix: `pkg-design/frame.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 
@@ -633,24 +632,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 328 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 330 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 345 base native symbols against default-feature `align_runtime` exports,
+- the 347 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 349 `alloc-count` and 349 `par-map-probe` native symbols against
+- the 351 `alloc-count` and 351 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 353 maximum native symbols against `align_runtime` built with
+- the 355 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 345 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  345 exact registry function types through the production compatibility
+- all 347 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  347 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
