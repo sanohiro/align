@@ -10542,6 +10542,800 @@ fn buffer_from_vec(v: Vec<u8>) -> *mut Buffer {
     Box::into_raw(Box::new(Buffer { data: v, cap: n, len: n }))
 }
 
+// --- core.codec ------------------------------------------------------------------------------
+
+const CODEC_MAGIC: &[u8; 8] = b"ALNCOL01";
+const CODEC_HEADER_LEN: usize = 32;
+const CODEC_DESCRIPTOR_LEN: usize = 48;
+const CODEC_MAX_COLUMNS: usize = 1024;
+
+#[inline]
+fn codec_allocation(site: &str) {
+    #[cfg(test)]
+    if std::env::var_os("ALIGN_CODEC_ALLOC_FAIL_MODE").as_deref()
+        == Some(std::ffi::OsStr::new(site))
+    {
+        panic_abort("test-only codec allocation failure");
+    }
+    #[cfg(not(test))]
+    let _ = site;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CodecKind {
+    I64 = 0,
+    F64 = 1,
+    Bool = 2,
+    Str = 3,
+}
+
+impl CodecKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::I64),
+            1 => Some(Self::F64),
+            2 => Some(Self::Bool),
+            3 => Some(Self::Str),
+            _ => None,
+        }
+    }
+}
+
+enum CodecColumnData {
+    I64(Vec<u8>),
+    F64(Vec<u8>),
+    Bool(Vec<u8>),
+    Str { offsets: Vec<u8>, values: Vec<u8> },
+}
+
+struct CodecColumn {
+    name: Vec<u8>,
+    data: CodecColumnData,
+}
+
+impl CodecColumn {
+    fn kind(&self) -> CodecKind {
+        match self.data {
+            CodecColumnData::I64(_) => CodecKind::I64,
+            CodecColumnData::F64(_) => CodecKind::F64,
+            CodecColumnData::Bool(_) => CodecKind::Bool,
+            CodecColumnData::Str { .. } => CodecKind::Str,
+        }
+    }
+
+    fn buffers(&self) -> (&[u8], Option<&[u8]>) {
+        match &self.data {
+            CodecColumnData::I64(data) | CodecColumnData::F64(data) | CodecColumnData::Bool(data) => {
+                (data, None)
+            }
+            CodecColumnData::Str { offsets, values } => (offsets, Some(values)),
+        }
+    }
+}
+
+/// Runtime-owned staging for one canonical `core.codec` batch.
+pub struct CodecEncoder {
+    rows: i64,
+    columns: Vec<CodecColumn>,
+    /// Column ordinals sorted by byte-exact name. At most 1024 entries, so insertion movement is
+    /// bounded and no hash seed or ambient registry participates in canonical output.
+    names: Vec<u16>,
+}
+
+#[inline]
+fn codec_align8(value: usize) -> Option<usize> {
+    value.checked_add(7).map(|v| v & !7)
+}
+
+#[inline]
+fn codec_read_u32(input: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = input.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+#[inline]
+fn codec_read_u64(input: &[u8], offset: usize) -> Option<u64> {
+    let bytes: [u8; 8] = input.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+#[inline]
+fn codec_usize(value: u64) -> Option<usize> {
+    usize::try_from(value).ok().filter(|value| isize::try_from(*value).is_ok())
+}
+
+#[inline]
+fn codec_zero(input: &[u8], start: usize, end: usize) -> bool {
+    input.get(start..end).is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0))
+}
+
+#[derive(Clone, Copy)]
+struct CodecDescriptor {
+    name_offset: usize,
+    name_len: usize,
+    kind: CodecKind,
+    data_offset: usize,
+    data_len: usize,
+    aux_offset: usize,
+    aux_len: usize,
+}
+
+fn codec_descriptor(input: &[u8], ordinal: usize) -> Option<CodecDescriptor> {
+    let base = CODEC_HEADER_LEN.checked_add(ordinal.checked_mul(CODEC_DESCRIPTOR_LEN)?)?;
+    // Stage-3 precedence is tag, then flags/reserved, then scalar representability. The complete
+    // descriptor table was bounded before this helper is called, but keep every field read checked.
+    let kind = CodecKind::from_tag(*input.get(base + 12)?)?;
+    if *input.get(base + 13)? != 0 || !codec_zero(input, base + 14, base + 16) {
+        return None;
+    }
+    let name_offset = codec_usize(codec_read_u64(input, base)?)?;
+    let name_len = usize::try_from(codec_read_u32(input, base + 8)?).ok()?;
+    let data_offset = codec_usize(codec_read_u64(input, base + 16)?)?;
+    let data_len = codec_usize(codec_read_u64(input, base + 24)?)?;
+    let aux_offset = codec_usize(codec_read_u64(input, base + 32)?)?;
+    let aux_len = codec_usize(codec_read_u64(input, base + 40)?)?;
+    Some(CodecDescriptor { name_offset, name_len, kind, data_offset, data_len, aux_offset, aux_len })
+}
+
+fn codec_expected_lengths(kind: CodecKind, rows: usize) -> Option<(usize, Option<usize>)> {
+    match kind {
+        CodecKind::I64 | CodecKind::F64 => Some((rows.checked_mul(8)?, None)),
+        CodecKind::Bool => Some((rows.checked_add(7)? / 8, None)),
+        CodecKind::Str => Some((rows.checked_add(1)?.checked_mul(4)?, Some(0))),
+    }
+}
+
+/// Validate one complete `ALNCOL01` envelope without allocating or retaining input storage.
+///
+/// # Safety
+/// `ptr`/`len` must satisfy the compiler-private byte-view precondition: a nonnegative length and
+/// a readable range when the length is positive. The function additionally rejects a null pointer
+/// for every positive length and never forms a slice before that check.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_open_v1(ptr: *const u8, len: i64) -> i32 {
+    let Ok(input_len) = safe_len(len) else { return AL_INVALID };
+    if input_len > 0 && ptr.is_null() {
+        return AL_INVALID;
+    }
+    let input = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, input_len) }
+    };
+
+    // Stage 1: safe view, fixed header, magic/reserved, and exact total length.
+    if input.len() < CODEC_HEADER_LEN {
+        return AL_INVALID;
+    }
+    if input.get(..8) != Some(CODEC_MAGIC.as_slice()) {
+        return AL_INVALID;
+    }
+    if !codec_zero(input, 28, 32) {
+        return AL_INVALID;
+    }
+    let Some(total_len) = codec_read_u64(input, 8).and_then(codec_usize) else {
+        return AL_INVALID;
+    };
+    if total_len != input.len() {
+        return AL_INVALID;
+    }
+
+    // Stage 2: exposed counts and the complete descriptor table.
+    let Some(rows_wire) = codec_read_u64(input, 16).filter(|rows| i64::try_from(*rows).is_ok()) else {
+        return AL_INVALID;
+    };
+    let Some(column_count) = codec_read_u32(input, 24).and_then(|n| usize::try_from(n).ok()) else {
+        return AL_INVALID;
+    };
+    if column_count > CODEC_MAX_COLUMNS {
+        return AL_INVALID;
+    }
+    // A zero-column envelope has no row-sized buffer and therefore admits the complete wire-level
+    // i64 range even on a 32-bit host. Convert only when a descriptor needs native indexing.
+    let rows = if column_count == 0 {
+        0
+    } else {
+        let Some(rows) = codec_usize(rows_wire) else { return AL_INVALID };
+        rows
+    };
+    let Some(names_start) = column_count
+        .checked_mul(CODEC_DESCRIPTOR_LEN)
+        .and_then(|n| CODEC_HEADER_LEN.checked_add(n))
+        .filter(|end| *end <= input.len())
+    else {
+        return AL_INVALID;
+    };
+
+    // Stage 3: descriptor tags, reserved bytes, representability, and derived lengths.
+    for ordinal in 0..column_count {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else { return AL_INVALID };
+        let Some((data_len, aux)) = codec_expected_lengths(descriptor.kind, rows) else {
+            return AL_INVALID;
+        };
+        if descriptor.data_len != data_len {
+            return AL_INVALID;
+        }
+        match aux {
+            None if descriptor.aux_offset != 0 || descriptor.aux_len != 0 => return AL_INVALID,
+            Some(_) if i32::try_from(descriptor.aux_len).is_err() => return AL_INVALID,
+            _ => {}
+        }
+    }
+
+    // Stage 4: validate the complete packed topology before inspecting any name content, then
+    // validate every name before fixed-stack stable uniqueness sorting and name padding.
+    let mut name_cursor = names_start;
+    let mut sorted = [0_u16; CODEC_MAX_COLUMNS];
+    let mut scratch = [0_u16; CODEC_MAX_COLUMNS];
+    for ordinal in 0..column_count {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else { return AL_INVALID };
+        if descriptor.name_offset != name_cursor {
+            return AL_INVALID;
+        }
+        let Some(end) = name_cursor.checked_add(descriptor.name_len) else {
+            return AL_INVALID;
+        };
+        name_cursor = end;
+    }
+    for (ordinal, sorted_ordinal) in sorted.iter_mut().enumerate().take(column_count) {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else { return AL_INVALID };
+        if descriptor.name_len == 0 {
+            return AL_INVALID;
+        }
+        let Some(end) = descriptor
+            .name_offset
+            .checked_add(descriptor.name_len)
+            .filter(|end| *end <= input.len())
+        else {
+            return AL_INVALID;
+        };
+        if std::str::from_utf8(&input[descriptor.name_offset..end]).is_err() {
+            return AL_INVALID;
+        }
+        *sorted_ordinal = ordinal as u16;
+    }
+    let mut width = 1;
+    for _ in 0..10 {
+        let mut start = 0;
+        while start < column_count {
+            let mid = start.saturating_add(width).min(column_count);
+            let end = start.saturating_add(width.saturating_mul(2)).min(column_count);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                let left_ordinal = usize::from(sorted[left]);
+                let right_ordinal = usize::from(sorted[right]);
+                let Some(left_desc) = codec_descriptor(input, left_ordinal) else {
+                    return AL_INVALID;
+                };
+                let Some(right_desc) = codec_descriptor(input, right_ordinal) else {
+                    return AL_INVALID;
+                };
+                let left_name = &input[left_desc.name_offset..left_desc.name_offset + left_desc.name_len];
+                let right_name = &input[right_desc.name_offset..right_desc.name_offset + right_desc.name_len];
+                if left_name <= right_name {
+                    scratch[out] = sorted[left];
+                    left += 1;
+                } else {
+                    scratch[out] = sorted[right];
+                    right += 1;
+                }
+                out += 1;
+            }
+            while left < mid {
+                scratch[out] = sorted[left];
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                scratch[out] = sorted[right];
+                right += 1;
+                out += 1;
+            }
+            start = end;
+        }
+        sorted[..column_count].copy_from_slice(&scratch[..column_count]);
+        width *= 2;
+    }
+    for pair in sorted[..column_count].windows(2) {
+        let Some(left) = codec_descriptor(input, usize::from(pair[0])) else {
+            return AL_INVALID;
+        };
+        let Some(right) = codec_descriptor(input, usize::from(pair[1])) else {
+            return AL_INVALID;
+        };
+        if input[left.name_offset..left.name_offset + left.name_len]
+            == input[right.name_offset..right.name_offset + right.name_len]
+        {
+            return AL_INVALID;
+        }
+    }
+    let Some(mut data_cursor) = codec_align8(name_cursor).filter(|end| *end <= input.len()) else {
+        return AL_INVALID;
+    };
+    if !codec_zero(input, name_cursor, data_cursor) {
+        return AL_INVALID;
+    }
+
+    // Stage 5: exact buffers and all inter-buffer/final zero padding.
+    for ordinal in 0..column_count {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else {
+            return AL_INVALID;
+        };
+        if descriptor.data_offset != data_cursor {
+            return AL_INVALID;
+        }
+        let Some(data_end) = data_cursor.checked_add(descriptor.data_len).filter(|end| *end <= input.len()) else {
+            return AL_INVALID;
+        };
+        let Some(next) = codec_align8(data_end).filter(|end| *end <= input.len()) else {
+            return AL_INVALID;
+        };
+        if !codec_zero(input, data_end, next) {
+            return AL_INVALID;
+        }
+        data_cursor = next;
+        if descriptor.kind == CodecKind::Str {
+            if descriptor.aux_offset != data_cursor {
+                return AL_INVALID;
+            }
+            let Some(aux_end) = data_cursor.checked_add(descriptor.aux_len).filter(|end| *end <= input.len()) else {
+                return AL_INVALID;
+            };
+            let Some(next) = codec_align8(aux_end).filter(|end| *end <= input.len()) else {
+                return AL_INVALID;
+            };
+            if !codec_zero(input, aux_end, next) {
+                return AL_INVALID;
+            }
+            data_cursor = next;
+        }
+    }
+    if data_cursor != total_len {
+        return AL_INVALID;
+    }
+
+    // Stage 6: kind-specific canonical content.
+    for ordinal in 0..column_count {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else {
+            return AL_INVALID;
+        };
+        match descriptor.kind {
+            CodecKind::Bool if rows % 8 != 0 && descriptor.data_len != 0 => {
+                let used = rows % 8;
+                let tail = input[descriptor.data_offset + descriptor.data_len - 1];
+                if tail & (!0_u8 << used) != 0 {
+                    return AL_INVALID;
+                }
+            }
+            CodecKind::Str => {
+                let mut previous = 0_usize;
+                for row in 0..=rows {
+                    let offset = descriptor.data_offset + row * 4;
+                    let Some(value) = codec_read_u32(input, offset).and_then(|n| usize::try_from(n).ok()) else {
+                        return AL_INVALID;
+                    };
+                    if (row == 0 && value != 0) || value < previous || value > descriptor.aux_len {
+                        return AL_INVALID;
+                    }
+                    if row > 0
+                        && std::str::from_utf8(
+                            &input[descriptor.aux_offset + previous..descriptor.aux_offset + value],
+                        )
+                        .is_err()
+                    {
+                        return AL_INVALID;
+                    }
+                    previous = value;
+                }
+                if previous != descriptor.aux_len {
+                    return AL_INVALID;
+                }
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+fn codec_output_len_parts(
+    columns: &[CodecColumn],
+    candidate: Option<(usize, usize, Option<usize>)>,
+) -> Option<usize> {
+    let column_count = columns.len().checked_add(usize::from(candidate.is_some()))?;
+    let mut cursor = CODEC_HEADER_LEN.checked_add(column_count.checked_mul(CODEC_DESCRIPTOR_LEN)?)?;
+    for column in columns {
+        cursor = cursor.checked_add(column.name.len())?;
+    }
+    if let Some((name_len, _, _)) = candidate {
+        cursor = cursor.checked_add(name_len)?;
+    }
+    cursor = codec_align8(cursor)?;
+    for column in columns {
+        let (data, aux) = column.buffers();
+        cursor = codec_align8(cursor.checked_add(data.len())?)?;
+        if let Some(aux) = aux {
+            cursor = codec_align8(cursor.checked_add(aux.len())?)?;
+        }
+    }
+    if let Some((_, data_len, aux_len)) = candidate {
+        cursor = codec_align8(cursor.checked_add(data_len)?)?;
+        if let Some(aux_len) = aux_len {
+            cursor = codec_align8(cursor.checked_add(aux_len)?)?;
+        }
+    }
+    i64::try_from(cursor).ok().map(|_| cursor)
+}
+
+fn codec_output_len(columns: &[CodecColumn], candidate: Option<&CodecColumn>) -> Option<usize> {
+    let candidate = candidate.map(|column| {
+        let (data, aux) = column.buffers();
+        (column.name.len(), data.len(), aux.map(<[u8]>::len))
+    });
+    codec_output_len_parts(columns, candidate)
+}
+
+/// Borrow one compiler-formed string argument for the duration of a codec call.
+///
+/// # Safety
+/// A positive `len` requires `input` to name that many readable bytes. The returned reference must
+/// not outlive the source call; codec callers copy it before returning.
+unsafe fn codec_name<'a>(input: *const u8, len: i64) -> Result<&'a [u8], i32> {
+    let Ok(len) = safe_len(len) else { return Err(AL_INVALID) };
+    if len == 0 || input.is_null() || u32::try_from(len).is_err() {
+        return Err(AL_INVALID);
+    }
+    let name = unsafe { std::slice::from_raw_parts(input, len) };
+    if std::str::from_utf8(name).is_err() {
+        return Err(AL_INVALID);
+    }
+    Ok(name)
+}
+
+fn codec_insert(encoder: &mut CodecEncoder, column: CodecColumn) -> i32 {
+    if encoder.columns.len() >= CODEC_MAX_COLUMNS {
+        return AL_INVALID;
+    }
+    let name_position = match encoder
+        .names
+        .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(&column.name))
+    {
+        Ok(_) => return AL_INVALID,
+        Err(position) => position,
+    };
+    if codec_output_len(&encoder.columns, Some(&column)).is_none() {
+        return AL_INVALID;
+    }
+    let ordinal = encoder.columns.len() as u16;
+    codec_allocation("columns");
+    encoder.columns.push(column);
+    codec_allocation("name-index");
+    encoder.names.insert(name_position, ordinal);
+    0
+}
+
+/// Create one empty encoder and publish it only after all argument checks succeed.
+///
+/// # Safety
+/// `out` must be a nonnull, pointer-aligned writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_new_v1(rows: i64, out: *mut *mut CodecEncoder) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if rows < 0 {
+        return AL_INVALID;
+    }
+    codec_allocation("shell");
+    let encoder = Box::new(CodecEncoder { rows, columns: Vec::new(), names: Vec::new() });
+    unsafe { *out = Box::into_raw(encoder) };
+    0
+}
+
+fn codec_fixed_width_input(
+    encoder: *mut CodecEncoder,
+    name_ptr: *const u8,
+    name_len: i64,
+    values_ptr: *const u8,
+    values_len: i64,
+    kind: CodecKind,
+) -> i32 {
+    if encoder.is_null() {
+        return AL_INVALID;
+    }
+    let encoder = unsafe { &mut *encoder };
+    let Ok(name) = (unsafe { codec_name(name_ptr, name_len) }) else { return AL_INVALID };
+    if encoder.columns.len() >= CODEC_MAX_COLUMNS {
+        return AL_INVALID;
+    }
+    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
+    let Ok(rows) = usize::try_from(encoder.rows) else { return AL_INVALID };
+    if values_len != rows {
+        return AL_INVALID;
+    }
+    let byte_len = match kind {
+        CodecKind::I64 | CodecKind::F64 => values_len.checked_mul(8),
+        CodecKind::Bool => values_len.checked_add(7).map(|n| n / 8),
+        CodecKind::Str => None,
+    };
+    let Some(byte_len) = byte_len else { return AL_INVALID };
+    if values_len > 0 && values_ptr.is_null() {
+        return AL_INVALID;
+    }
+    if encoder
+        .names
+        .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(name))
+        .is_ok()
+    {
+        return AL_INVALID;
+    }
+    if codec_output_len_parts(&encoder.columns, Some((name.len(), byte_len, None))).is_none() {
+        return AL_INVALID;
+    }
+    let input = if values_len == 0 {
+        &[]
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(
+                values_ptr,
+                match kind {
+                    CodecKind::Bool => values_len,
+                    _ => byte_len,
+                },
+            )
+        }
+    };
+    let data = match kind {
+        CodecKind::I64 => {
+            codec_allocation("fixed-data");
+            let mut output = Vec::with_capacity(byte_len);
+            for bytes in input.chunks_exact(8) {
+                let Ok(bytes) = <[u8; 8]>::try_from(bytes) else {
+                    return AL_INVALID;
+                };
+                output.extend_from_slice(&i64::from_ne_bytes(bytes).to_le_bytes());
+            }
+            CodecColumnData::I64(output)
+        }
+        CodecKind::F64 => {
+            codec_allocation("fixed-data");
+            let mut output = Vec::with_capacity(byte_len);
+            for bytes in input.chunks_exact(8) {
+                let Ok(bytes) = <[u8; 8]>::try_from(bytes) else {
+                    return AL_INVALID;
+                };
+                output.extend_from_slice(&u64::from_ne_bytes(bytes).to_le_bytes());
+            }
+            CodecColumnData::F64(output)
+        }
+        CodecKind::Bool => {
+            codec_allocation("fixed-data");
+            let mut output = vec![0_u8; byte_len];
+            for (index, value) in input.iter().enumerate() {
+                output[index / 8] |= u8::from(*value != 0) << (index % 8);
+            }
+            CodecColumnData::Bool(output)
+        }
+        CodecKind::Str => return AL_INVALID,
+    };
+    codec_allocation("name-copy");
+    codec_insert(encoder, CodecColumn { name: name.to_vec(), data })
+}
+
+/// Stage one i64 column. All source bytes are copied before the encoder is mutated.
+///
+/// # Safety
+/// The encoder must be live and the name/value pointers must satisfy their compiler-private view
+/// preconditions. A zero value length permits a null value pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_put_i64_v1(
+    encoder: *mut CodecEncoder,
+    name: *const u8,
+    name_len: i64,
+    values: *const i64,
+    values_len: i64,
+) -> i32 {
+    codec_fixed_width_input(encoder, name, name_len, values.cast(), values_len, CodecKind::I64)
+}
+
+/// Stage one f64 column.
+///
+/// # Safety
+/// The encoder must be live and the name/value pointers must satisfy their compiler-private view
+/// preconditions. A zero value length permits a null value pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_put_f64_v1(
+    encoder: *mut CodecEncoder,
+    name: *const u8,
+    name_len: i64,
+    values: *const f64,
+    values_len: i64,
+) -> i32 {
+    codec_fixed_width_input(encoder, name, name_len, values.cast(), values_len, CodecKind::F64)
+}
+
+/// Stage one bool column. Source bools use the compiler-private one-byte representation.
+///
+/// # Safety
+/// The encoder must be live and the name/value pointers must satisfy their compiler-private view
+/// preconditions. A zero value length permits a null value pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_put_bool_v1(
+    encoder: *mut CodecEncoder,
+    name: *const u8,
+    name_len: i64,
+    values: *const u8,
+    values_len: i64,
+) -> i32 {
+    codec_fixed_width_input(encoder, name, name_len, values, values_len, CodecKind::Bool)
+}
+
+/// Stage one string column, copying headers' byte ranges into canonical offsets/value buffers.
+///
+/// # Safety
+/// The encoder must be live; `values` must be null only for zero rows or point to `values_len`
+/// compiler-formed valid `AlignStr` headers. Every positive cell length implies a readable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_put_str_v1(
+    encoder: *mut CodecEncoder,
+    name: *const u8,
+    name_len: i64,
+    values: *const AlignStr,
+    values_len: i64,
+) -> i32 {
+    if encoder.is_null() {
+        return AL_INVALID;
+    }
+    let encoder = unsafe { &mut *encoder };
+    let Ok(name) = (unsafe { codec_name(name, name_len) }) else { return AL_INVALID };
+    if encoder.columns.len() >= CODEC_MAX_COLUMNS {
+        return AL_INVALID;
+    }
+    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
+    let Ok(rows) = usize::try_from(encoder.rows) else { return AL_INVALID };
+    if values_len != rows {
+        return AL_INVALID;
+    }
+    if values_len > 0 && values.is_null() {
+        return AL_INVALID;
+    }
+    let headers = if values_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(values, values_len) } };
+    let mut total = 0_usize;
+    for value in headers {
+        let Ok(len) = safe_len(value.len) else { return AL_INVALID };
+        if len > 0 && value.ptr.is_null() {
+            return AL_INVALID;
+        }
+        let bytes = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(value.ptr, len) } };
+        if std::str::from_utf8(bytes).is_err() {
+            return AL_INVALID;
+        }
+        let Some(next) = total.checked_add(len).filter(|n| i32::try_from(*n).is_ok()) else {
+            return AL_INVALID;
+        };
+        total = next;
+    }
+    let Some(offset_capacity) = values_len.checked_add(1).and_then(|n| n.checked_mul(4)) else {
+        return AL_INVALID;
+    };
+    if encoder
+        .names
+        .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(name))
+        .is_ok()
+    {
+        return AL_INVALID;
+    }
+    if codec_output_len_parts(&encoder.columns, Some((name.len(), offset_capacity, Some(total)))).is_none() {
+        return AL_INVALID;
+    }
+    codec_allocation("str-offsets");
+    let mut offsets = Vec::with_capacity(offset_capacity);
+    codec_allocation("str-data");
+    let mut data = Vec::with_capacity(total);
+    offsets.extend_from_slice(&0_i32.to_le_bytes());
+    for value in headers {
+        let Ok(len) = safe_len(value.len) else {
+            return AL_INVALID;
+        };
+        if len > 0 {
+            data.extend_from_slice(unsafe { std::slice::from_raw_parts(value.ptr, len) });
+        }
+        let Ok(offset) = i32::try_from(data.len()) else {
+            return AL_INVALID;
+        };
+        offsets.extend_from_slice(&offset.to_le_bytes());
+    }
+    codec_allocation("name-copy");
+    codec_insert(
+        encoder,
+        CodecColumn { name: name.to_vec(), data: CodecColumnData::Str { offsets, values: data } },
+    )
+}
+
+fn codec_write_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn codec_write_u64(output: &mut [u8], offset: usize, value: usize) {
+    output[offset..offset + 8].copy_from_slice(&(value as u64).to_le_bytes());
+}
+
+/// Consume an encoder and publish its sole canonical owned `buffer`.
+///
+/// # Safety
+/// `encoder` must be a live pointer returned by [`align_rt_codec_encoder_new_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_finish_v1(encoder: *mut CodecEncoder) -> *mut Buffer {
+    if encoder.is_null() {
+        panic_abort("codec encoder finish: null encoder");
+    }
+    let encoder = unsafe { Box::from_raw(encoder) };
+    let Some(total_len) = codec_output_len(&encoder.columns, None) else {
+        panic_abort("codec encoder finish: invalid admitted length");
+    };
+    codec_allocation("finish-bytes");
+    let mut output = vec![0_u8; total_len];
+    output[..8].copy_from_slice(CODEC_MAGIC);
+    codec_write_u64(&mut output, 8, total_len);
+    output[16..24].copy_from_slice(&encoder.rows.to_le_bytes());
+    let Ok(column_count) = u32::try_from(encoder.columns.len()) else {
+        panic_abort("codec encoder finish: column count overflow");
+    };
+    codec_write_u32(&mut output, 24, column_count);
+
+    let mut name_cursor = CODEC_HEADER_LEN + encoder.columns.len() * CODEC_DESCRIPTOR_LEN;
+    for (ordinal, column) in encoder.columns.iter().enumerate() {
+        let descriptor = CODEC_HEADER_LEN + ordinal * CODEC_DESCRIPTOR_LEN;
+        codec_write_u64(&mut output, descriptor, name_cursor);
+        let Ok(name_len) = u32::try_from(column.name.len()) else {
+            panic_abort("codec encoder finish: name length overflow");
+        };
+        codec_write_u32(&mut output, descriptor + 8, name_len);
+        output[descriptor + 12] = column.kind() as u8;
+        output[name_cursor..name_cursor + column.name.len()].copy_from_slice(&column.name);
+        name_cursor += column.name.len();
+    }
+
+    let Some(mut data_cursor) = codec_align8(name_cursor) else {
+        panic_abort("codec encoder finish: name layout overflow");
+    };
+    for (ordinal, column) in encoder.columns.iter().enumerate() {
+        let descriptor = CODEC_HEADER_LEN + ordinal * CODEC_DESCRIPTOR_LEN;
+        let (data, aux) = column.buffers();
+        codec_write_u64(&mut output, descriptor + 16, data_cursor);
+        codec_write_u64(&mut output, descriptor + 24, data.len());
+        output[data_cursor..data_cursor + data.len()].copy_from_slice(data);
+        let Some(next) = data_cursor.checked_add(data.len()).and_then(codec_align8) else {
+            panic_abort("codec encoder finish: data layout overflow");
+        };
+        data_cursor = next;
+        if let Some(aux) = aux {
+            codec_write_u64(&mut output, descriptor + 32, data_cursor);
+            codec_write_u64(&mut output, descriptor + 40, aux.len());
+            output[data_cursor..data_cursor + aux.len()].copy_from_slice(aux);
+            let Some(next) = data_cursor.checked_add(aux.len()).and_then(codec_align8) else {
+                panic_abort("codec encoder finish: auxiliary layout overflow");
+            };
+            data_cursor = next;
+        }
+    }
+    debug_assert_eq!(data_cursor, total_len);
+    codec_allocation("finish-shell");
+    buffer_from_vec(output)
+}
+
+/// Drop an unfinished encoder. Null-safe for compiler-owned source nulling.
+///
+/// # Safety
+/// `encoder` must be null or one live pointer returned by [`align_rt_codec_encoder_new_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_codec_encoder_free_v1(encoder: *mut CodecEncoder) {
+    if !encoder.is_null() {
+        drop(unsafe { Box::from_raw(encoder) });
+    }
+}
+
 /// Exact Base64 output length. Every size operation is checked before allocation so a hostile ABI
 /// length cannot wrap into a smaller destination.
 fn base64_encoded_len(input_len: usize, pad: bool) -> Option<usize> {
@@ -23981,8 +24775,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 337);
-        assert_eq!(registry.len(), 337);
+        assert_eq!(runtime.len(), 345);
+        assert_eq!(registry.len(), 345);
         assert_eq!(runtime, registry);
     }
 
@@ -42347,5 +43141,482 @@ mod regex_tests {
         // captures_free is null-safe.
         unsafe { align_rt_regex_captures_free(core::ptr::null_mut()) };
         unsafe { align_rt_regex_free(re) };
+    }
+
+    fn codec_encoder(rows: i64) -> *mut CodecEncoder {
+        let mut encoder = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_codec_encoder_new_v1(rows, &mut encoder) }, 0);
+        assert!(!encoder.is_null());
+        encoder
+    }
+
+    fn codec_finish(encoder: *mut CodecEncoder) -> Vec<u8> {
+        let buffer = unsafe { align_rt_codec_encoder_finish_v1(encoder) };
+        assert!(!buffer.is_null());
+        let buffer = unsafe { Box::from_raw(buffer) };
+        assert_eq!(buffer.len, buffer.data.len());
+        buffer.data.clone()
+    }
+
+    fn codec_golden(hex: &str) -> Vec<u8> {
+        let compact = hex.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect::<Vec<_>>();
+        assert_eq!(compact.len() % 2, 0);
+        let bytes = compact
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => panic!("invalid golden hex"),
+                };
+                digit(pair[0]) << 4 | digit(pair[1])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), bytes.len() as i64) }, 0);
+        bytes
+    }
+
+    #[test]
+    fn codec_encoder_matches_all_six_independent_v1_goldens() {
+        let empty = codec_finish(codec_encoder(0));
+        assert_eq!(
+            empty,
+            codec_golden("414c4e434f4c3031200000000000000000000000000000000000000000000000"),
+        );
+
+        let encoder = codec_encoder(2);
+        let values = [-1_i64, 2];
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"i".as_ptr(), 1, values.as_ptr(), 2)
+        }, 0);
+        assert_eq!(codec_finish(encoder), codec_golden(
+            "414c4e434f4c3031680000000000000002000000000000000100000000000000
+             5000000000000000010000000000000058000000000000001000000000000000
+             000000000000000000000000000000006900000000000000ffffffffffffffff
+             0200000000000000"
+        ));
+
+        let encoder = codec_encoder(2);
+        let values = [1.5_f64, f64::from_bits(0x7ff8_0000_0000_0042)];
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_f64_v1(encoder, b"f".as_ptr(), 1, values.as_ptr(), 2)
+        }, 0);
+        assert_eq!(codec_finish(encoder), codec_golden(
+            "414c4e434f4c3031680000000000000002000000000000000100000000000000
+             5000000000000000010000000100000058000000000000001000000000000000
+             000000000000000000000000000000006600000000000000000000000000f83f
+             420000000000f87f"
+        ));
+
+        let encoder = codec_encoder(9);
+        let values = [1_u8, 0, 1, 1, 0, 0, 0, 1, 1];
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_bool_v1(encoder, b"b".as_ptr(), 1, values.as_ptr(), 9)
+        }, 0);
+        assert_eq!(codec_finish(encoder), codec_golden(
+            "414c4e434f4c3031600000000000000009000000000000000100000000000000
+             5000000000000000010000000200000058000000000000000200000000000000
+             0000000000000000000000000000000062000000000000008d01000000000000"
+        ));
+
+        let encoder = codec_encoder(3);
+        let cells = ["", "a\0", "あ\n"];
+        let headers = cells
+            .iter()
+            .map(|cell| AlignStr { ptr: cell.as_ptr(), len: cell.len() as i64 })
+            .collect::<Vec<_>>();
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_str_v1(encoder, b"s".as_ptr(), 1, headers.as_ptr(), 3)
+        }, 0);
+        assert_eq!(codec_finish(encoder), codec_golden(
+            "414c4e434f4c3031700000000000000003000000000000000100000000000000
+             5000000000000000010000000300000058000000000000001000000000000000
+             6800000000000000060000000000000073000000000000000000000000000000
+             02000000060000006100e381820a0000"
+        ));
+
+        let encoder = codec_encoder(2);
+        let i64s = [-1_i64, 2];
+        let f64s = [1.5_f64, -0.0];
+        let bools = [1_u8, 0];
+        let cells = ["x", ""];
+        let strings = cells
+            .iter()
+            .map(|cell| AlignStr { ptr: cell.as_ptr(), len: cell.len() as i64 })
+            .collect::<Vec<_>>();
+        assert_eq!(unsafe { align_rt_codec_encoder_put_i64_v1(encoder, b"i".as_ptr(), 1, i64s.as_ptr(), 2) }, 0);
+        assert_eq!(unsafe { align_rt_codec_encoder_put_f64_v1(encoder, b"f".as_ptr(), 1, f64s.as_ptr(), 2) }, 0);
+        assert_eq!(unsafe { align_rt_codec_encoder_put_bool_v1(encoder, b"b".as_ptr(), 1, bools.as_ptr(), 2) }, 0);
+        assert_eq!(unsafe { align_rt_codec_encoder_put_str_v1(encoder, b"s".as_ptr(), 1, strings.as_ptr(), 2) }, 0);
+        assert_eq!(codec_finish(encoder), codec_golden(
+            "414c4e434f4c3031280100000000000002000000000000000400000000000000
+             e0000000000000000100000000000000e8000000000000001000000000000000
+             00000000000000000000000000000000e1000000000000000100000001000000
+             f800000000000000100000000000000000000000000000000000000000000000
+             e200000000000000010000000200000008010000000000000100000000000000
+             00000000000000000000000000000000e3000000000000000100000003000000
+             10010000000000000c0000000000000020010000000000000100000000000000
+             6966627300000000ffffffffffffffff0200000000000000000000000000f83f
+             0000000000000080010000000000000000000000010000000100000000000000
+             7800000000000000"
+        ));
+    }
+
+    #[test]
+    fn codec_zero_column_golden_and_open_alignment_matrix() {
+        let bytes = codec_finish(codec_encoder(7));
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"ALNCOL01");
+        expected.extend_from_slice(&32_u64.to_le_bytes());
+        expected.extend_from_slice(&7_i64.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(bytes, expected);
+
+        for residue in 0..8 {
+            let mut shifted = vec![0xa5; residue];
+            shifted.extend_from_slice(&bytes);
+            assert_eq!(unsafe { align_rt_codec_open_v1(shifted.as_ptr().add(residue), bytes.len() as i64) }, 0);
+        }
+
+        let max_rows = codec_finish(codec_encoder(i64::MAX));
+        assert_eq!(&max_rows[16..24], &i64::MAX.to_le_bytes());
+        assert_eq!(unsafe { align_rt_codec_open_v1(max_rows.as_ptr(), max_rows.len() as i64) }, 0);
+    }
+
+    #[test]
+    fn codec_four_column_golden_round_trip() {
+        let encoder = codec_encoder(3);
+        let ids = [-1_i64, 0, i64::MAX];
+        let scores = [1.5_f64, f64::from_bits(0x7ff8_0000_0000_0042), f64::NEG_INFINITY];
+        let flags = [1_u8, 0, 1];
+        let cells = ["", "hi\0", "雪"];
+        let headers: Vec<AlignStr> = cells
+            .iter()
+            .map(|cell| AlignStr { ptr: cell.as_ptr(), len: cell.len() as i64 })
+            .collect();
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"id".as_ptr(), 2, ids.as_ptr(), ids.len() as i64)
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_f64_v1(
+                encoder,
+                b"score".as_ptr(),
+                5,
+                scores.as_ptr(),
+                scores.len() as i64,
+            )
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_bool_v1(
+                encoder,
+                b"active".as_ptr(),
+                6,
+                flags.as_ptr(),
+                flags.len() as i64,
+            )
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_str_v1(
+                encoder,
+                b"name".as_ptr(),
+                4,
+                headers.as_ptr(),
+                headers.len() as i64,
+            )
+        }, 0);
+        let bytes = codec_finish(encoder);
+        assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), bytes.len() as i64) }, 0);
+        assert_eq!(&bytes[..8], b"ALNCOL01");
+        assert_eq!(codec_read_u64(&bytes, 16), Some(3));
+        assert_eq!(codec_read_u32(&bytes, 24), Some(4));
+
+        let ids_desc = codec_descriptor(&bytes, 0).unwrap();
+        assert_eq!(ids_desc.kind, CodecKind::I64);
+        assert_eq!(&bytes[ids_desc.data_offset..ids_desc.data_offset + ids_desc.data_len],
+            &[(-1_i64).to_le_bytes(), 0_i64.to_le_bytes(), i64::MAX.to_le_bytes()].concat());
+        let bool_desc = codec_descriptor(&bytes, 2).unwrap();
+        assert_eq!(bytes[bool_desc.data_offset], 0b0000_0101);
+        let str_desc = codec_descriptor(&bytes, 3).unwrap();
+        assert_eq!(&bytes[str_desc.data_offset..str_desc.data_offset + str_desc.data_len],
+            &[0_i32.to_le_bytes(), 0_i32.to_le_bytes(), 3_i32.to_le_bytes(), 6_i32.to_le_bytes()].concat());
+        assert_eq!(&bytes[str_desc.aux_offset..str_desc.aux_offset + str_desc.aux_len], "hi\0雪".as_bytes());
+    }
+
+    #[test]
+    fn codec_open_rejects_truncation_and_noncanonical_mutations() {
+        let encoder = codec_encoder(1);
+        let value = [true as u8];
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_bool_v1(encoder, b"x".as_ptr(), 1, value.as_ptr(), 1)
+        }, 0);
+        let bytes = codec_finish(encoder);
+        for len in 0..bytes.len() {
+            assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), len as i64) }, AL_INVALID, "len={len}");
+        }
+        assert_eq!(unsafe { align_rt_codec_open_v1(core::ptr::null(), bytes.len() as i64) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), -1) }, AL_INVALID);
+
+        for offset in [0_usize, 28, 45, bytes.len() - 1] {
+            let mut changed = bytes.clone();
+            changed[offset] ^= 0x80;
+            assert_eq!(unsafe { align_rt_codec_open_v1(changed.as_ptr(), changed.len() as i64) }, AL_INVALID,
+                "offset={offset}");
+        }
+
+        let mut mutations = Vec::new();
+        for (label, offset) in [
+            ("total-length", 8_usize),
+            ("row-count", 16),
+            ("name-offset", 32),
+            ("name-length", 40),
+            ("kind", 44),
+            ("descriptor-reserved", 46),
+            ("data-offset", 48),
+            ("data-length", 56),
+            ("aux-offset", 64),
+            ("aux-length", 72),
+            ("name-utf8", 80),
+            ("bool-tail", 88),
+            ("data-padding", 89),
+        ] {
+            let mut changed = bytes.clone();
+            changed[offset] ^= 0x80;
+            mutations.push((label, changed));
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        mutations.push(("trailing", trailing));
+        for (label, changed) in mutations {
+            assert_eq!(
+                unsafe { align_rt_codec_open_v1(changed.as_ptr(), changed.len() as i64) },
+                AL_INVALID,
+                "{label}",
+            );
+        }
+
+        let duplicate = codec_encoder(0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(duplicate, b"x".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(duplicate, b"y".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        let mut duplicate = codec_finish(duplicate);
+        duplicate[CODEC_HEADER_LEN + 2 * CODEC_DESCRIPTOR_LEN + 1] = b'x';
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(duplicate.as_ptr(), duplicate.len() as i64) },
+            AL_INVALID,
+        );
+
+        let strings = codec_encoder(1);
+        let cell = AlignStr { ptr: b"x".as_ptr(), len: 1 };
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_str_v1(strings, b"s".as_ptr(), 1, &cell, 1)
+        }, 0);
+        let strings = codec_finish(strings);
+        let descriptor = codec_descriptor(&strings, 0).expect("encoder emits one descriptor");
+        let mut bad_offset = strings.clone();
+        bad_offset[descriptor.data_offset + 4..descriptor.data_offset + 8]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(bad_offset.as_ptr(), bad_offset.len() as i64) },
+            AL_INVALID,
+        );
+        let mut bad_cell = strings;
+        bad_cell[descriptor.aux_offset] = 0xff;
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(bad_cell.as_ptr(), bad_cell.len() as i64) },
+            AL_INVALID,
+        );
+
+        // The complete name topology precedes all name-content validation: the first name is
+        // invalid UTF-8 while the later descriptor breaks the packed-offset chain.
+        let topology = codec_encoder(0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(topology, b"x".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(topology, b"y".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        let mut topology = codec_finish(topology);
+        let first = codec_descriptor(&topology, 0).expect("first descriptor");
+        topology[first.name_offset] = 0xff;
+        let second_descriptor = CODEC_HEADER_LEN + CODEC_DESCRIPTOR_LEN;
+        topology[second_descriptor..second_descriptor + 8]
+            .copy_from_slice(&(first.name_offset as u64).to_le_bytes());
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(topology.as_ptr(), topology.len() as i64) },
+            AL_INVALID,
+        );
+    }
+
+    #[test]
+    fn codec_encoder_failures_are_transactional() {
+        let encoder = codec_encoder(2);
+        let values = [4_i64, 9];
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"x".as_ptr(), 1, values.as_ptr(), 1)
+        }, AL_INVALID);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"x".as_ptr(), 1, values.as_ptr(), 2)
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"x".as_ptr(), 1, values.as_ptr(), 2)
+        }, AL_INVALID);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(encoder, b"y".as_ptr(), 1, values.as_ptr(), 2)
+        }, 0);
+        let bytes = codec_finish(encoder);
+        assert_eq!(codec_read_u32(&bytes, 24), Some(2));
+        assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), bytes.len() as i64) }, 0);
+
+        let mut dirty = core::ptr::NonNull::<CodecEncoder>::dangling().as_ptr();
+        assert_eq!(unsafe { align_rt_codec_encoder_new_v1(-1, &mut dirty) }, AL_INVALID);
+        assert!(dirty.is_null());
+        assert_eq!(unsafe { align_rt_codec_encoder_new_v1(0, core::ptr::null_mut()) }, AL_INVALID);
+        unsafe { align_rt_codec_encoder_free_v1(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn codec_allocation_failpoints_abort_at_every_logical_acquisition() {
+        const MODE: &str = "ALIGN_CODEC_ALLOC_FAIL_MODE";
+        if let Some(mode) = std::env::var_os(MODE) {
+            let mode = mode.to_string_lossy();
+            match mode.as_ref() {
+                "shell" => {
+                    let mut encoder = core::ptr::null_mut();
+                    let _ = unsafe { align_rt_codec_encoder_new_v1(1, &mut encoder) };
+                }
+                "fixed-data" | "name-copy" | "columns" | "name-index" => {
+                    let encoder = codec_encoder(1);
+                    let value = [7_i64];
+                    let _ = unsafe {
+                        align_rt_codec_encoder_put_i64_v1(
+                            encoder,
+                            b"i".as_ptr(),
+                            1,
+                            value.as_ptr(),
+                            1,
+                        )
+                    };
+                }
+                "str-offsets" | "str-data" => {
+                    let encoder = codec_encoder(1);
+                    let cell = AlignStr { ptr: b"x".as_ptr(), len: 1 };
+                    let _ = unsafe {
+                        align_rt_codec_encoder_put_str_v1(
+                            encoder,
+                            b"s".as_ptr(),
+                            1,
+                            &cell,
+                            1,
+                        )
+                    };
+                }
+                "finish-bytes" | "finish-shell" => {
+                    let encoder = codec_encoder(0);
+                    let _ = unsafe { align_rt_codec_encoder_finish_v1(encoder) };
+                }
+                _ => {
+                    assert!(false, "unknown codec allocation failpoint: {mode}");
+                    return;
+                }
+            }
+            assert!(false, "{mode} allocation failpoint returned instead of aborting");
+            return;
+        }
+
+        let Ok(executable) = std::env::current_exe() else {
+            assert!(false, "resolve codec allocation failpoint test executable");
+            return;
+        };
+        for mode in [
+            "shell",
+            "fixed-data",
+            "name-copy",
+            "columns",
+            "name-index",
+            "str-offsets",
+            "str-data",
+            "finish-bytes",
+            "finish-shell",
+        ] {
+            let child = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "regex_tests::codec_allocation_failpoints_abort_at_every_logical_acquisition",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            assert!(child.is_ok(), "spawn {mode} codec allocation child");
+            let Some(mut child) = child.ok() else { return };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let polled = child.try_wait();
+                assert!(polled.is_ok(), "poll {mode} codec allocation child");
+                let Some(polled) = polled.ok() else { return };
+                if let Some(status) = polled {
+                    assert!(!status.success(), "{mode} allocation failure must abort");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    assert!(child.kill().is_ok(), "kill stalled {mode} codec allocation child");
+                    assert!(child.wait().is_ok(), "reap stalled {mode} codec allocation child");
+                    assert!(false, "{mode} codec allocation failpoint child exceeded watchdog");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn codec_exact_column_limit_closes_encoder_and_decoder_scratch_bounds() {
+        let encoder = codec_encoder(0);
+        for ordinal in 0..CODEC_MAX_COLUMNS {
+            let name = format!("column-{ordinal:04}");
+            assert_eq!(unsafe {
+                align_rt_codec_encoder_put_i64_v1(
+                    encoder,
+                    name.as_ptr(),
+                    name.len() as i64,
+                    core::ptr::null(),
+                    0,
+                )
+            }, 0, "ordinal={ordinal}");
+        }
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(
+                encoder,
+                b"overflow".as_ptr(),
+                8,
+                core::ptr::null(),
+                0,
+            )
+        }, AL_INVALID);
+        // Name validation precedes the cap, but neither invalidity allocates or mutates the full
+        // encoder. This multi-invalid call also has a mismatched negative value length.
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(
+                encoder,
+                core::ptr::null(),
+                1,
+                core::ptr::null(),
+                -1,
+            )
+        }, AL_INVALID);
+        let bytes = codec_finish(encoder);
+        assert_eq!(codec_read_u32(&bytes, 24), Some(1024_u32));
+        assert_eq!(unsafe { align_rt_codec_open_v1(bytes.as_ptr(), bytes.len() as i64) }, 0);
+
+        let mut over_limit = bytes;
+        over_limit[24..28].copy_from_slice(&1025_u32.to_le_bytes());
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(over_limit.as_ptr(), over_limit.len() as i64) },
+            AL_INVALID,
+        );
     }
 }

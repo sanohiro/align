@@ -370,6 +370,12 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -510,6 +516,12 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::StrFinder

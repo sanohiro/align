@@ -57,7 +57,7 @@ use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    ByteOrdering, CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{
     AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType,
@@ -4883,6 +4883,12 @@ fn validate_tagged_program_inner(
                 | Scalar::Writer
                 | Scalar::Logger
                 | Scalar::Buffer
+                | Scalar::CodecBatch
+                | Scalar::CodecI64Column
+                | Scalar::CodecF64Column
+                | Scalar::CodecBoolColumn
+                | Scalar::CodecStrColumn
+                | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
                 | Scalar::Captures
@@ -5016,6 +5022,12 @@ fn validate_tagged_program_inner(
                         | Ty::Reader
                         | Ty::Logger
                         | Ty::Buffer
+                        | Ty::CodecBatch
+                        | Ty::CodecI64Column
+                        | Ty::CodecF64Column
+                        | Ty::CodecBoolColumn
+                        | Ty::CodecStrColumn
+                        | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
                         | Ty::File
@@ -7921,7 +7933,9 @@ fn scalar_type<'c>(
         // array views) lowers to the slice struct. A `json.doc` is a `{tape,node}` = `{ptr,i64}` too.
         Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::DynArray(_)
         | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
-        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
+        | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
+        | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(ctx).into(),
+        Ty::CodecStrColumn => codec_str_column_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -8088,6 +8102,12 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::Writer
         | Scalar::Logger
         | Scalar::Buffer
+        | Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn
+        | Scalar::CodecStrColumn
+        | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
@@ -8251,6 +8271,13 @@ fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
 }
 
+/// The validated string-column view `{ offsets_ptr, data_ptr, row_len }`. Both pointers remain
+/// byte pointers because an envelope may begin at any alignment.
+fn codec_str_column_type<'c>(ctx: &'c Context) -> StructType<'c> {
+    let pointer = ctx.ptr_type(AddressSpace::default());
+    ctx.struct_type(&[pointer.into(), pointer.into(), ctx.i64_type().into()], false)
+}
+
 /// The LLVM representation of a `Ty::DictEncoded` value: three `{ptr,len}` slices `{ source (borrowed
 /// AoS), ids (owned i64 column), dict (owned str dictionary) }`. `Drop` frees `ids` + `dict`.
 fn dictenc_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
@@ -8292,6 +8319,7 @@ fn abi_type<'c>(
         | Ty::Reader
         | Ty::Logger
         | Ty::Buffer
+        | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
         | Ty::MaskArrayBuilder(..)
@@ -8311,7 +8339,9 @@ fn abi_type<'c>(
         Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_)
         | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
-        | Ty::DynFixedStructArray(..) => slice_struct_type(ctx).into(),
+        | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
+        | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(ctx).into(),
+        Ty::CodecStrColumn => codec_str_column_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
             slice_struct_type(ctx).into()
@@ -8655,9 +8685,14 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger => {
             unreachable!("an I/O/logger handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
+        Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn => 16,
+        Scalar::CodecStrColumn => 24,
         Scalar::Regex => unreachable!("a regex handle is not a box/array payload"),
         Scalar::Captures => unreachable!("a captures handle is not a box/array payload"),
         Scalar::File => unreachable!("a file handle is not a box/array payload"),
@@ -8756,6 +8791,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Reader => RuntimeKey::IoReaderFree,
         Ty::Logger => RuntimeKey::LogFree,
         Ty::Buffer => RuntimeKey::BufferFree,
+        Ty::CodecEncoder => RuntimeKey::CodecEncoderFreeV1,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
@@ -10014,6 +10050,10 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
         }
     }
     plan
+}
+
+fn codec_load_needs_swap(bit_width: u32, byte_ordering: ByteOrdering) -> bool {
+    bit_width > 8 && byte_ordering == ByteOrdering::BigEndian
 }
 
 impl<'c, 'a> FnGen<'c, 'a> {
@@ -15379,6 +15419,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..) => return self.gen_log_rvalue(rv),
+            Rvalue::CodecOpen(_)
+            | Rvalue::CodecBatchRows(_)
+            | Rvalue::CodecBatchColumns(_)
+            | Rvalue::CodecBatchName(..)
+            | Rvalue::CodecBatchKind(..)
+            | Rvalue::CodecBatchFind(..)
+            | Rvalue::CodecBatchColumn { .. }
+            | Rvalue::CodecColumnLen(_)
+            | Rvalue::CodecColumnAt { .. }
+            | Rvalue::CodecEncoderNew { .. }
+            | Rvalue::CodecEncoderPut { .. }
+            | Rvalue::CodecEncoderFinish(_) => return self.gen_codec_rvalue(rv, result_ty),
             Rvalue::IoCopy(r, w) => {
                 let rp = self.operand(r)?.into();
                 let wp = self.operand(w)?.into();
@@ -17572,6 +17624,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Reader
             | Ty::Logger
             | Ty::Buffer
+            | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
             | Ty::MaskArrayBuilder(..)
@@ -17601,7 +17654,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_)
             | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
-            | Ty::DynFixedStructArray(..) => slice_struct_type(self.ctx).into(),
+            | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
+            | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(self.ctx).into(),
+            Ty::CodecStrColumn => codec_str_column_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
@@ -19698,6 +19753,931 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(Some(value))
     }
 
+    fn codec_byte_ptr(
+        &mut self,
+        base: PointerValue<'c>,
+        offset: IntValue<'c>,
+        name: &str,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), base, &[offset], name)
+                .map_err(|error| self.err(error))
+        }
+    }
+
+    fn codec_load_le(
+        &mut self,
+        base: PointerValue<'c>,
+        offset: IntValue<'c>,
+        ty: IntType<'c>,
+        name: &str,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let pointer = self.codec_byte_ptr(base, offset, name)?;
+        let loaded = self
+            .builder
+            .build_load(ty, pointer, name)
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        loaded
+            .as_instruction()
+            .ok_or_else(|| self.err("codec field load is not an instruction"))?
+            .set_alignment(1)
+            .map_err(|error| self.err(error))?;
+        if codec_load_needs_swap(ty.get_bit_width(), self.target_data.get_byte_ordering()) {
+            Ok(self
+                .call_intrinsic("llvm.bswap", &[ty.into()], &[loaded.into()])?
+                .into_int_value())
+        } else {
+            Ok(loaded)
+        }
+    }
+
+    fn codec_batch_parts(
+        &mut self,
+        batch: &Operand,
+    ) -> Result<(PointerValue<'c>, IntValue<'c>), CodegenError> {
+        let batch = self.operand_by_value(batch)?.into_struct_value();
+        let pointer = self
+            .builder
+            .build_extract_value(batch, 0, "codec.batch.ptr")
+            .map_err(|error| self.err(error))?
+            .into_pointer_value();
+        let length = self
+            .builder
+            .build_extract_value(batch, 1, "codec.batch.len")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        Ok((pointer, length))
+    }
+
+    fn codec_descriptor_offset(
+        &mut self,
+        index: IntValue<'c>,
+        field: u64,
+        name: &str,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let i64_type = self.ctx.i64_type();
+        let descriptor = self
+            .builder
+            .build_int_mul(index, i64_type.const_int(48, false), name)
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_int_add(
+                descriptor,
+                i64_type.const_int(32 + field, false),
+                name,
+            )
+            .map_err(|error| self.err(error))
+    }
+
+    fn codec_option_if<F>(
+        &mut self,
+        condition: IntValue<'c>,
+        payload_scalar: Scalar,
+        name: &str,
+        payload: F,
+    ) -> Result<BasicValueEnum<'c>, CodegenError>
+    where
+        F: FnOnce(&mut Self) -> Result<BasicValueEnum<'c>, CodegenError>,
+    {
+        let option_type = option_struct_type(
+            self.ctx,
+            payload_scalar,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
+        let none_block = self.ctx.append_basic_block(self.func, &format!("{name}.none"));
+        let join_block = self.ctx.append_basic_block(self.func, &format!("{name}.join"));
+        self.builder
+            .build_conditional_branch(condition, some_block, none_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(some_block);
+        let payload = payload(self)?;
+        let some = self
+            .builder
+            .build_insert_value(
+                option_type.const_zero(),
+                self.ctx.i8_type().const_int(1, false),
+                0,
+                &format!("{name}.tag"),
+            )
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let some = self
+            .builder
+            .build_insert_value(some, payload, 1, name)
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|error| self.err(error))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("codec option some block is absent"))?;
+
+        self.builder.position_at_end(none_block);
+        let none = option_type.const_zero();
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|error| self.err(error))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("codec option none block is absent"))?;
+
+        self.builder.position_at_end(join_block);
+        let phi = self
+            .builder
+            .build_phi(option_type, name)
+            .map_err(|error| self.err(error))?;
+        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
+        Ok(phi.as_basic_value())
+    }
+
+    fn codec_valid_index(
+        &mut self,
+        index: IntValue<'c>,
+        length: IntValue<'c>,
+        name: &str,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let nonnegative = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                index,
+                self.ctx.i64_type().const_zero(),
+                &format!("{name}.nonnegative"),
+            )
+            .map_err(|error| self.err(error))?;
+        let below = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index, length, &format!("{name}.below"))
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_and(nonnegative, below, name)
+            .map_err(|error| self.err(error))
+    }
+
+    /// `core.codec` uses one runtime validator/encoder and otherwise emits byte-addressed,
+    /// alignment-1 little-endian view operations. No typed descriptor or element pointer is formed
+    /// before its ordinal/row guard succeeds.
+    #[inline(never)]
+    fn gen_codec_rvalue(
+        &mut self,
+        rv: &Rvalue,
+        result_ty: Ty,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let value = match rv {
+            Rvalue::CodecOpen(input) => {
+                let (pointer, length) = self.split_str(input)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CodecOpenV1),
+                        &[pointer.into(), length.into()],
+                        "codec.open",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("codec_open_v1 must return i32"))?
+            }
+            Rvalue::CodecBatchRows(batch) => {
+                let (base, _) = self.codec_batch_parts(batch)?;
+                self.codec_load_le(
+                    base,
+                    self.ctx.i64_type().const_int(16, false),
+                    self.ctx.i64_type(),
+                    "codec.rows",
+                )?
+                .into()
+            }
+            Rvalue::CodecBatchColumns(batch) => {
+                let (base, _) = self.codec_batch_parts(batch)?;
+                let count = self.codec_load_le(
+                    base,
+                    self.ctx.i64_type().const_int(24, false),
+                    self.ctx.i32_type(),
+                    "codec.columns",
+                )?;
+                self.builder
+                    .build_int_z_extend(count, self.ctx.i64_type(), "codec.columns.i64")
+                    .map_err(|error| self.err(error))?
+                    .into()
+            }
+            Rvalue::CodecBatchName(batch, index) => {
+                self.gen_codec_batch_name(batch, index, result_ty)?
+            }
+            Rvalue::CodecBatchKind(batch, index) => {
+                self.gen_codec_batch_kind(batch, index, result_ty)?
+            }
+            Rvalue::CodecBatchFind(batch, name) => self.gen_codec_batch_find(batch, name, result_ty)?,
+            Rvalue::CodecBatchColumn {
+                batch,
+                index,
+                kind,
+            } => self.gen_codec_batch_column(batch, index, *kind, result_ty)?,
+            Rvalue::CodecColumnLen(column) => {
+                let column_type = self.f.operand_ty(column);
+                let column = self.operand_by_value(column)?.into_struct_value();
+                let field = if column_type == Ty::CodecStrColumn { 2 } else { 1 };
+                self.builder
+                    .build_extract_value(column, field, "codec.column.len")
+                    .map_err(|error| self.err(error))?
+            }
+            Rvalue::CodecColumnAt {
+                column,
+                index,
+                kind,
+            } => self.gen_codec_column_at(column, index, *kind, result_ty)?,
+            Rvalue::CodecEncoderNew { rows, out } => {
+                let rows = self.operand(rows)?.into_int_value();
+                let output = self.slots[out];
+                self.builder
+                    .build_store(
+                        output,
+                        self.ctx.ptr_type(AddressSpace::default()).const_null(),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CodecEncoderNewV1),
+                        &[rows.into(), output.into()],
+                        "codec.encoder",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("codec_encoder_new_v1 must return i32"))?
+            }
+            Rvalue::CodecEncoderPut {
+                encoder,
+                name,
+                values,
+                kind,
+            } => {
+                let encoder = self.operand(encoder)?.into_pointer_value();
+                let (name_pointer, name_length) = self.split_str(name)?;
+                let (values_pointer, values_length) = self.split_str(values)?;
+                let key = match kind {
+                    hir::CodecPutKind::I64 => RuntimeKey::CodecEncoderPutI64V1,
+                    hir::CodecPutKind::F64 => RuntimeKey::CodecEncoderPutF64V1,
+                    hir::CodecPutKind::Bool => RuntimeKey::CodecEncoderPutBoolV1,
+                    hir::CodecPutKind::Str => RuntimeKey::CodecEncoderPutStrV1,
+                };
+                self.builder
+                    .build_call(
+                        self.runtime(key),
+                        &[
+                            encoder.into(),
+                            name_pointer.into(),
+                            name_length.into(),
+                            values_pointer.into(),
+                            values_length.into(),
+                        ],
+                        "codec.put",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("codec encoder put must return i32"))?
+            }
+            Rvalue::CodecEncoderFinish(encoder) => {
+                let encoder = self.operand(encoder)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::CodecEncoderFinishV1),
+                        &[encoder.into()],
+                        "codec.finish",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("codec_encoder_finish_v1 must return a buffer"))?
+            }
+            _ => return Err(self.err("gen_codec_rvalue on a non-codec operation")),
+        };
+        Ok(Some(value))
+    }
+
+    fn gen_codec_batch_name(
+        &mut self,
+        batch: &Operand,
+        index: &Operand,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Ty::Option(Scalar::Str) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+        else {
+            return Err(self.err("codec batch name result must be Option<str>"));
+        };
+        let (base, _) = self.codec_batch_parts(batch)?;
+        let index = self.operand(index)?.into_int_value();
+        let columns = self.codec_load_le(
+            base,
+            self.ctx.i64_type().const_int(24, false),
+            self.ctx.i32_type(),
+            "codec.name.columns",
+        )?;
+        let columns = self
+            .builder
+            .build_int_z_extend(columns, self.ctx.i64_type(), "codec.name.columns64")
+            .map_err(|error| self.err(error))?;
+        let valid = self.codec_valid_index(index, columns, "codec.name.valid")?;
+        self.codec_option_if(valid, Scalar::Str, "codec.name", |this| {
+            let offset_field = this.codec_descriptor_offset(index, 0, "codec.name.offset.field")?;
+            let offset = this.codec_load_le(
+                base,
+                offset_field,
+                this.ctx.i64_type(),
+                "codec.name.offset",
+            )?;
+            let length_field = this.codec_descriptor_offset(index, 8, "codec.name.length.field")?;
+            let length = this.codec_load_le(
+                base,
+                length_field,
+                this.ctx.i32_type(),
+                "codec.name.length",
+            )?;
+            let length = this
+                .builder
+                .build_int_z_extend(length, this.ctx.i64_type(), "codec.name.length64")
+                .map_err(|error| this.err(error))?;
+            let pointer = this.codec_byte_ptr(base, offset, "codec.name.pointer")?;
+            let string_type = slice_struct_type(this.ctx);
+            let string = this
+                .builder
+                .build_insert_value(string_type.const_zero(), pointer, 0, "codec.name.pointer")
+                .map_err(|error| this.err(error))?
+                .into_struct_value();
+            Ok(this
+                .builder
+                .build_insert_value(string, length, 1, "codec.name.length")
+                .map_err(|error| this.err(error))?
+                .into_struct_value()
+                .into())
+        })
+    }
+
+    fn gen_codec_batch_kind(
+        &mut self,
+        batch: &Operand,
+        index: &Operand,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Ty::Option(Scalar::Enum(enum_id)) =
+            align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+        else {
+            return Err(self.err("codec batch kind result must be an optional enum"));
+        };
+        let (base, _) = self.codec_batch_parts(batch)?;
+        let index = self.operand(index)?.into_int_value();
+        let columns = self.codec_load_le(
+            base,
+            self.ctx.i64_type().const_int(24, false),
+            self.ctx.i32_type(),
+            "codec.kind.columns",
+        )?;
+        let columns = self
+            .builder
+            .build_int_z_extend(columns, self.ctx.i64_type(), "codec.kind.columns64")
+            .map_err(|error| self.err(error))?;
+        let valid = self.codec_valid_index(index, columns, "codec.kind.valid")?;
+        self.codec_option_if(valid, Scalar::Enum(enum_id), "codec.kind", |this| {
+            let field = this.codec_descriptor_offset(index, 12, "codec.kind.field")?;
+            let tag = this.codec_load_le(base, field, this.ctx.i8_type(), "codec.kind.byte")?;
+            let tag = this
+                .builder
+                .build_int_z_extend(tag, this.ctx.i32_type(), "codec.kind.tag")
+                .map_err(|error| this.err(error))?;
+            Ok(this
+                .builder
+                .build_insert_value(
+                    this.enum_types[enum_id as usize].const_zero(),
+                    tag,
+                    0,
+                    "codec.kind.value",
+                )
+                .map_err(|error| this.err(error))?
+                .into_struct_value()
+                .into())
+        })
+    }
+
+    fn gen_codec_batch_column(
+        &mut self,
+        batch: &Operand,
+        index: &Operand,
+        kind: hir::CodecPutKind,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Ty::Option(payload_scalar) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+        else {
+            return Err(self.err("codec column projection result must be an Option"));
+        };
+        let expected_payload = match kind {
+            hir::CodecPutKind::I64 => Scalar::CodecI64Column,
+            hir::CodecPutKind::F64 => Scalar::CodecF64Column,
+            hir::CodecPutKind::Bool => Scalar::CodecBoolColumn,
+            hir::CodecPutKind::Str => Scalar::CodecStrColumn,
+        };
+        if payload_scalar != expected_payload {
+            return Err(self.err("codec column projection payload does not match its kind"));
+        }
+        let (base, _) = self.codec_batch_parts(batch)?;
+        let index = self.operand(index)?.into_int_value();
+        let columns = self.codec_load_le(
+            base,
+            self.ctx.i64_type().const_int(24, false),
+            self.ctx.i32_type(),
+            "codec.column.columns",
+        )?;
+        let columns = self
+            .builder
+            .build_int_z_extend(columns, self.ctx.i64_type(), "codec.column.columns64")
+            .map_err(|error| self.err(error))?;
+        let bounds = self.codec_valid_index(index, columns, "codec.column.bounds")?;
+
+        let option_type = option_struct_type(
+            self.ctx,
+            payload_scalar,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        let inspect_block = self.ctx.append_basic_block(self.func, "codec.column.inspect");
+        let some_block = self.ctx.append_basic_block(self.func, "codec.column.some");
+        let none_block = self.ctx.append_basic_block(self.func, "codec.column.none");
+        let join_block = self.ctx.append_basic_block(self.func, "codec.column.join");
+        self.builder
+            .build_conditional_branch(bounds, inspect_block, none_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(inspect_block);
+        let kind_field = self.codec_descriptor_offset(index, 12, "codec.column.kind.field")?;
+        let actual = self.codec_load_le(base, kind_field, self.ctx.i8_type(), "codec.column.kind")?;
+        let expected = match kind {
+            hir::CodecPutKind::I64 => 0,
+            hir::CodecPutKind::F64 => 1,
+            hir::CodecPutKind::Bool => 2,
+            hir::CodecPutKind::Str => 3,
+        };
+        let exact = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                actual,
+                self.ctx.i8_type().const_int(expected, false),
+                "codec.column.exact_kind",
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_conditional_branch(exact, some_block, none_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(some_block);
+        let data_field = self.codec_descriptor_offset(index, 16, "codec.column.data.field")?;
+        let data_offset =
+            self.codec_load_le(base, data_field, self.ctx.i64_type(), "codec.column.data.offset")?;
+        let data = self.codec_byte_ptr(base, data_offset, "codec.column.data")?;
+        let rows = self.codec_load_le(
+            base,
+            self.ctx.i64_type().const_int(16, false),
+            self.ctx.i64_type(),
+            "codec.column.rows",
+        )?;
+        let payload: BasicValueEnum<'c> = if kind == hir::CodecPutKind::Str {
+            let aux_field = self.codec_descriptor_offset(index, 32, "codec.column.aux.field")?;
+            let aux_offset =
+                self.codec_load_le(base, aux_field, self.ctx.i64_type(), "codec.column.aux.offset")?;
+            let aux = self.codec_byte_ptr(base, aux_offset, "codec.column.aux")?;
+            let column_type = codec_str_column_type(self.ctx);
+            let column = self
+                .builder
+                .build_insert_value(column_type.const_zero(), data, 0, "codec.column.offsets")
+                .map_err(|error| self.err(error))?
+                .into_struct_value();
+            let column = self
+                .builder
+                .build_insert_value(column, aux, 1, "codec.column.strings")
+                .map_err(|error| self.err(error))?
+                .into_struct_value();
+            self.builder
+                .build_insert_value(column, rows, 2, "codec.column.rows")
+                .map_err(|error| self.err(error))?
+                .into_struct_value()
+                .into()
+        } else {
+            let column_type = slice_struct_type(self.ctx);
+            let column = self
+                .builder
+                .build_insert_value(column_type.const_zero(), data, 0, "codec.column.data")
+                .map_err(|error| self.err(error))?
+                .into_struct_value();
+            self.builder
+                .build_insert_value(column, rows, 1, "codec.column.rows")
+                .map_err(|error| self.err(error))?
+                .into_struct_value()
+                .into()
+        };
+        let some = self
+            .builder
+            .build_insert_value(
+                option_type.const_zero(),
+                self.ctx.i8_type().const_int(1, false),
+                0,
+                "codec.column.some.tag",
+            )
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let some = self
+            .builder
+            .build_insert_value(some, payload, 1, "codec.column.some")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|error| self.err(error))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("codec column some block is absent"))?;
+
+        self.builder.position_at_end(none_block);
+        let none = option_type.const_zero();
+        self.builder
+            .build_unconditional_branch(join_block)
+            .map_err(|error| self.err(error))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("codec column none block is absent"))?;
+
+        self.builder.position_at_end(join_block);
+        let phi = self
+            .builder
+            .build_phi(option_type, "codec.column.option")
+            .map_err(|error| self.err(error))?;
+        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
+        Ok(phi.as_basic_value())
+    }
+
+    fn gen_codec_column_at(
+        &mut self,
+        column: &Operand,
+        index: &Operand,
+        kind: hir::CodecPutKind,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Ty::Option(payload_scalar) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+        else {
+            return Err(self.err("codec column at result must be an Option"));
+        };
+        let expected_payload = match kind {
+            hir::CodecPutKind::I64 => Scalar::Int(IntTy { bits: 64, signed: true }),
+            hir::CodecPutKind::F64 => Scalar::Float(FloatTy { bits: 64 }),
+            hir::CodecPutKind::Bool => Scalar::Bool,
+            hir::CodecPutKind::Str => Scalar::Str,
+        };
+        if payload_scalar != expected_payload {
+            return Err(self.err("codec column at payload does not match its kind"));
+        }
+        let column = self.operand_by_value(column)?.into_struct_value();
+        let index = self.operand(index)?.into_int_value();
+        let length_field = if kind == hir::CodecPutKind::Str { 2 } else { 1 };
+        let length = self
+            .builder
+            .build_extract_value(column, length_field, "codec.at.length")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let valid = self.codec_valid_index(index, length, "codec.at.valid")?;
+        self.codec_option_if(valid, payload_scalar, "codec.at", |this| {
+            let data = this
+                .builder
+                .build_extract_value(column, 0, "codec.at.data")
+                .map_err(|error| this.err(error))?
+                .into_pointer_value();
+            match kind {
+                hir::CodecPutKind::I64 | hir::CodecPutKind::F64 => {
+                    let offset = this
+                        .builder
+                        .build_int_mul(
+                            index,
+                            this.ctx.i64_type().const_int(8, false),
+                            "codec.at.offset",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let bits = this.codec_load_le(
+                        data,
+                        offset,
+                        this.ctx.i64_type(),
+                        "codec.at.bits",
+                    )?;
+                    if kind == hir::CodecPutKind::F64 {
+                        Ok(this
+                            .builder
+                            .build_bit_cast(bits, this.ctx.f64_type(), "codec.at.f64")
+                            .map_err(|error| this.err(error))?)
+                    } else {
+                        Ok(bits.into())
+                    }
+                }
+                hir::CodecPutKind::Bool => {
+                    let byte_index = this
+                        .builder
+                        .build_int_unsigned_div(
+                            index,
+                            this.ctx.i64_type().const_int(8, false),
+                            "codec.at.bool.byte_index",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let bit_index = this
+                        .builder
+                        .build_int_unsigned_rem(
+                            index,
+                            this.ctx.i64_type().const_int(8, false),
+                            "codec.at.bool.bit_index",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let pointer =
+                        this.codec_byte_ptr(data, byte_index, "codec.at.bool.pointer")?;
+                    let byte = this
+                        .builder
+                        .build_load(this.ctx.i8_type(), pointer, "codec.at.bool.byte")
+                        .map_err(|error| this.err(error))?
+                        .into_int_value();
+                    let shift = this
+                        .builder
+                        .build_int_truncate(bit_index, this.ctx.i8_type(), "codec.at.bool.shift")
+                        .map_err(|error| this.err(error))?;
+                    let shifted = this
+                        .builder
+                        .build_right_shift(byte, shift, false, "codec.at.bool.shifted")
+                        .map_err(|error| this.err(error))?;
+                    let bit = this
+                        .builder
+                        .build_and(
+                            shifted,
+                            this.ctx.i8_type().const_int(1, false),
+                            "codec.at.bool.bit",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    Ok(this
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            bit,
+                            this.ctx.i8_type().const_zero(),
+                            "codec.at.bool",
+                        )
+                        .map_err(|error| this.err(error))?
+                        .into())
+                }
+                hir::CodecPutKind::Str => {
+                    let strings = this
+                        .builder
+                        .build_extract_value(column, 1, "codec.at.strings")
+                        .map_err(|error| this.err(error))?
+                        .into_pointer_value();
+                    let start_offset = this
+                        .builder
+                        .build_int_mul(
+                            index,
+                            this.ctx.i64_type().const_int(4, false),
+                            "codec.at.str.start_offset",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let next_index = this
+                        .builder
+                        .build_int_add(
+                            index,
+                            this.ctx.i64_type().const_int(1, false),
+                            "codec.at.str.next_index",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let end_offset = this
+                        .builder
+                        .build_int_mul(
+                            next_index,
+                            this.ctx.i64_type().const_int(4, false),
+                            "codec.at.str.end_offset",
+                        )
+                        .map_err(|error| this.err(error))?;
+                    let start = this.codec_load_le(
+                        data,
+                        start_offset,
+                        this.ctx.i32_type(),
+                        "codec.at.str.start",
+                    )?;
+                    let end = this.codec_load_le(
+                        data,
+                        end_offset,
+                        this.ctx.i32_type(),
+                        "codec.at.str.end",
+                    )?;
+                    let start = this
+                        .builder
+                        .build_int_z_extend(start, this.ctx.i64_type(), "codec.at.str.start64")
+                        .map_err(|error| this.err(error))?;
+                    let end = this
+                        .builder
+                        .build_int_z_extend(end, this.ctx.i64_type(), "codec.at.str.end64")
+                        .map_err(|error| this.err(error))?;
+                    let pointer =
+                        this.codec_byte_ptr(strings, start, "codec.at.str.pointer")?;
+                    let cell_length = this
+                        .builder
+                        .build_int_sub(end, start, "codec.at.str.length")
+                        .map_err(|error| this.err(error))?;
+                    let string_type = slice_struct_type(this.ctx);
+                    let string = this
+                        .builder
+                        .build_insert_value(
+                            string_type.const_zero(),
+                            pointer,
+                            0,
+                            "codec.at.str.pointer",
+                        )
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value();
+                    Ok(this
+                        .builder
+                        .build_insert_value(string, cell_length, 1, "codec.at.str.length")
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value()
+                        .into())
+                }
+            }
+        })
+    }
+
+    fn gen_codec_batch_find(
+        &mut self,
+        batch: &Operand,
+        name: &Operand,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Ty::Option(payload_scalar) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
+        else {
+            return Err(self.err("codec find result must be an Option"));
+        };
+        let expected = Scalar::Int(IntTy { bits: 64, signed: true });
+        if payload_scalar != expected {
+            return Err(self.err("codec find result must be Option<i64>"));
+        }
+        let (base, _) = self.codec_batch_parts(batch)?;
+        let (needle_pointer, needle_length) = self.split_str(name)?;
+        let columns = self.codec_load_le(
+            base,
+            self.ctx.i64_type().const_int(24, false),
+            self.ctx.i32_type(),
+            "codec.find.columns",
+        )?;
+        let columns = self
+            .builder
+            .build_int_z_extend(columns, self.ctx.i64_type(), "codec.find.columns64")
+            .map_err(|error| self.err(error))?;
+        let option_type = option_struct_type(
+            self.ctx,
+            payload_scalar,
+            self.struct_types,
+            self.enum_types,
+            self.tagged_types,
+        );
+        let index_slot = self.alloca_at_entry(self.ctx.i64_type().into(), "codec.find.index")?;
+        let result_slot = self.alloca_at_entry(option_type.into(), "codec.find.result")?;
+        self.builder
+            .build_store(index_slot, self.ctx.i64_type().const_zero())
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_store(result_slot, option_type.const_zero())
+            .map_err(|error| self.err(error))?;
+
+        let header = self.ctx.append_basic_block(self.func, "codec.find.header");
+        let inspect = self.ctx.append_basic_block(self.func, "codec.find.inspect");
+        let next = self.ctx.append_basic_block(self.func, "codec.find.next");
+        let found = self.ctx.append_basic_block(self.func, "codec.find.found");
+        let done = self.ctx.append_basic_block(self.func, "codec.find.done");
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(header);
+        let index = self
+            .builder
+            .build_load(self.ctx.i64_type(), index_slot, "codec.find.index")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let remains = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index, columns, "codec.find.remains")
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_conditional_branch(remains, inspect, done)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(inspect);
+        let offset_field = self.codec_descriptor_offset(index, 0, "codec.find.offset.field")?;
+        let offset = self.codec_load_le(
+            base,
+            offset_field,
+            self.ctx.i64_type(),
+            "codec.find.offset",
+        )?;
+        let length_field = self.codec_descriptor_offset(index, 8, "codec.find.length.field")?;
+        let candidate_length = self.codec_load_le(
+            base,
+            length_field,
+            self.ctx.i32_type(),
+            "codec.find.length",
+        )?;
+        let candidate_length = self
+            .builder
+            .build_int_z_extend(
+                candidate_length,
+                self.ctx.i64_type(),
+                "codec.find.length64",
+            )
+            .map_err(|error| self.err(error))?;
+        let candidate_pointer = self.codec_byte_ptr(base, offset, "codec.find.pointer")?;
+        let equal = self
+            .builder
+            .build_call(
+                self.runtime(RuntimeKey::StrEq),
+                &[
+                    candidate_pointer.into(),
+                    candidate_length.into(),
+                    needle_pointer.into(),
+                    needle_length.into(),
+                ],
+                "codec.find.equal",
+            )
+            .map_err(|error| self.err(error))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("str_eq must return i32"))?
+            .into_int_value();
+        let equal = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                equal,
+                self.ctx.i32_type().const_zero(),
+                "codec.find.equal.bool",
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_conditional_branch(equal, found, next)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(next);
+        let next_index = self
+            .builder
+            .build_int_add(
+                index,
+                self.ctx.i64_type().const_int(1, false),
+                "codec.find.next.index",
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_store(index_slot, next_index)
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unconditional_branch(header)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(found);
+        let some = self
+            .builder
+            .build_insert_value(
+                option_type.const_zero(),
+                self.ctx.i8_type().const_int(1, false),
+                0,
+                "codec.find.some.tag",
+            )
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let some = self
+            .builder
+            .build_insert_value(some, index, 1, "codec.find.some.index")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        self.builder
+            .build_store(result_slot, some)
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unconditional_branch(done)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(done);
+        self.builder
+            .build_load(option_type, result_slot, "codec.find.result")
+            .map_err(|error| self.err(error))
+    }
+
     /// All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len). `#[inline(never)]` so the
     /// depth-recursive `gen_rvalue` gains one small arm, not five inline bodies (the #296 expr-depth
     /// frame lesson). Constructors mirror `fs.open` (write the handle into `out`, return i32 status);
@@ -21542,6 +22522,16 @@ mod tests {
     use align_mir::lower_program;
     use align_parser::parse_file;
     use align_sema::check_file;
+
+    #[test]
+    fn codec_little_endian_load_policy_covers_both_target_orders() {
+        for width in [32, 64] {
+            assert!(!codec_load_needs_swap(width, ByteOrdering::LittleEndian));
+            assert!(codec_load_needs_swap(width, ByteOrdering::BigEndian));
+        }
+        assert!(!codec_load_needs_swap(8, ByteOrdering::LittleEndian));
+        assert!(!codec_load_needs_swap(8, ByteOrdering::BigEndian));
+    }
 
     fn program_call(name: &str) -> ProgramCall {
         ProgramCall::try_from_logical(name).expect("valid test program call")

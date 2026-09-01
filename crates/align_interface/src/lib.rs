@@ -1327,6 +1327,11 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("reader", 0, BuiltinCapability::BorrowLeaf),
     ("writer", 0, BuiltinCapability::BorrowLeaf),
     ("log.logger", 0, BuiltinCapability::BorrowLeaf),
+    ("codec.batch", 0, BuiltinCapability::BorrowLeaf),
+    ("codec.i64_column", 0, BuiltinCapability::BorrowLeaf),
+    ("codec.f64_column", 0, BuiltinCapability::BorrowLeaf),
+    ("codec.bool_column", 0, BuiltinCapability::BorrowLeaf),
+    ("codec.str_column", 0, BuiltinCapability::BorrowLeaf),
     ("http_read_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_sse_stream", 0, BuiltinCapability::BorrowLeaf),
     ("http_sse_event", 0, BuiltinCapability::BorrowLeaf),
@@ -1343,6 +1348,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("box", 1, BuiltinCapability::Opaque),
     ("array_builder", 1, BuiltinCapability::Opaque),
     ("buffer", 0, BuiltinCapability::Opaque),
+    ("codec.encoder", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
     ("rs256_public_key", 0, BuiltinCapability::Opaque),
@@ -1369,6 +1375,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("http_stream", 0, BuiltinCapability::Opaque),
     ("json.kind", 0, BuiltinCapability::Opaque),
     ("log.level", 0, BuiltinCapability::Opaque),
+    ("codec.kind", 0, BuiltinCapability::Opaque),
     ("Error", 0, BuiltinCapability::Opaque),
     ("core.Error", 0, BuiltinCapability::Opaque),
     ("argon2_params", 0, BuiltinCapability::Opaque),
@@ -2633,6 +2640,15 @@ pub fn summary_to_source(
                         "log.level" | "log.logger" => {
                             builtin_type_imports.insert("std.log".to_string());
                         }
+                        "codec.kind"
+                        | "codec.batch"
+                        | "codec.i64_column"
+                        | "codec.f64_column"
+                        | "codec.bool_column"
+                        | "codec.str_column"
+                        | "codec.encoder" => {
+                            builtin_type_imports.insert("core.codec".to_string());
+                        }
                         _ => {}
                     }
                     work.extend(args);
@@ -2817,6 +2833,7 @@ mod builtin_spelling_tests {
             "resource_ref",
             "json.kind",
             "log.level",
+            "codec.kind",
             "Error",
             "core.Error",
             "argon2_params",

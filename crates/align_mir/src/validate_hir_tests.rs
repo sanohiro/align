@@ -282,6 +282,66 @@ pub fn main() -> Result<(), Error> {
     assert!(!body_core_metadata_is_valid(&bad_variant));
 }
 
+#[test]
+fn codec_hir_requires_exact_envelopes_discriminators_and_exclusive_encoder_places() {
+    let source = r#"
+import core.codec
+fn kind(batch: codec.batch) -> Option<codec.kind> = batch.kind(0)
+fn put(encoder: codec.encoder, values: slice<i64>) -> Result<(), Error> = encoder.put_i64("i", values)
+fn finish(encoder: codec.encoder) -> buffer = encoder.finish()
+fn main() -> i32 = 0
+"#;
+    let program = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut wrong_kind_enum = program.clone();
+    let other_id = wrong_kind_enum.enums.len() as u32;
+    wrong_kind_enum.enums.push(EnumDef {
+        name: "OtherKind".to_string(),
+        source_name: "OtherKind".to_string(),
+        variants: vec![EnumVariant {
+            name: "I64".to_string(),
+            payload: Vec::new(),
+            field_base: 1,
+        }],
+    });
+    let kind = wrong_kind_enum.fns.iter_mut().find(|function| function.name == "kind");
+    assert!(kind.is_some(), "checked fixture must contain kind");
+    let Some(kind) = kind else { return };
+    kind.ret = Ty::Option(Scalar::Enum(other_id));
+    let value = kind.body.value.as_deref_mut();
+    assert!(value.is_some(), "checked fixture must contain kind value");
+    let Some(value) = value else { return };
+    value.ty = kind.ret;
+    assert!(!body_core_metadata_is_valid(&wrong_kind_enum));
+
+    let mut wrong_put_discriminator = program.clone();
+    let put = body_value_expression_mut(&mut wrong_put_discriminator, "put");
+    let hir::ExprKind::CodecEncoderPut { kind, .. } = &mut put.kind else {
+        panic!("checked fixture must retain codec encoder put")
+    };
+    *kind = hir::CodecPutKind::F64;
+    assert!(!body_core_metadata_is_valid(&wrong_put_discriminator));
+
+    let mut shared_encoder = program.clone();
+    let put = shared_encoder.fns.iter_mut().find(|function| function.name == "put");
+    assert!(put.is_some(), "checked fixture must contain put");
+    let Some(put) = put else { return };
+    put.param_modes[0] = align_ast::ParamMode::Borrow;
+    assert!(!body_core_metadata_is_valid(&shared_encoder));
+
+    let mut wrong_finish_result = program.clone();
+    body_value_expression_mut(&mut wrong_finish_result, "finish").ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&wrong_finish_result));
+
+    let mut borrowed_finish = program.clone();
+    let finish = borrowed_finish.fns.iter_mut().find(|function| function.name == "finish");
+    assert!(finish.is_some(), "checked fixture must contain finish");
+    let Some(finish) = finish else { return };
+    finish.param_modes[0] = align_ast::ParamMode::BorrowMut;
+    assert!(!body_core_metadata_is_valid(&borrowed_finish));
+}
+
 fn checked_test_overlay(source: &str) -> Result<align_sema::TestOverlay, &'static str> {
     let mut diagnostics = Diagnostics::new();
     let tokens = tokenize(0, source, &mut diagnostics);
@@ -11187,7 +11247,9 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 285,
+        // core.codec adds 15 checked operations; keep this count synchronized with the exhaustive
+        // validation, source-shape, replay-clone, and canonical-graph matches.
+        variants, 300,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -15153,6 +15215,12 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn
+        | Scalar::CodecStrColumn
+        | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -15218,6 +15286,12 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::Reader,
         Scalar::Writer,
         Scalar::Logger,
+        Scalar::CodecBatch,
+        Scalar::CodecI64Column,
+        Scalar::CodecF64Column,
+        Scalar::CodecBoolColumn,
+        Scalar::CodecStrColumn,
+        Scalar::CodecEncoder,
         Scalar::Buffer,
         Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
         Scalar::SignatureKey(align_sema::SignatureKeyKind::Rs256Public),

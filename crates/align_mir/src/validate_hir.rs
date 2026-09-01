@@ -1354,13 +1354,16 @@ impl<'a> PlacementValidator<'a> {
                 !matches!(mode, ScalarPlacement::Collection) && valid_prim(element)
             }
             Scalar::Slice(element) => valid_prim(element),
-            Scalar::Buffer => !matches!(
-                mode,
-                ScalarPlacement::Payload { .. } | ScalarPlacement::Collection
-            ),
+            Scalar::Buffer => !matches!(mode, ScalarPlacement::Collection),
             Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Regex
             | Scalar::Captures
             | Scalar::CliParsed
@@ -1414,7 +1417,14 @@ impl<'a> PlacementValidator<'a> {
             Scalar::SignatureKey(_) => true,
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Scalar::ResponseBuilder | Scalar::Logger => true,
+            Scalar::ResponseBuilder
+            | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
             Scalar::DynArray(_) => true,
@@ -1511,6 +1521,12 @@ impl<'a> PlacementValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::Regex
@@ -1997,6 +2013,12 @@ impl<'a> Validator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File
@@ -2060,6 +2082,12 @@ impl<'a> Validator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3025,6 +3053,12 @@ impl<'a> BodyValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File
@@ -3336,6 +3370,12 @@ impl<'a> BodyValidator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -4027,6 +4067,21 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. }
+            | hir::ExprKind::CodecOpen { .. }
+            | hir::ExprKind::CodecBatchRows { .. }
+            | hir::ExprKind::CodecBatchColumns { .. }
+            | hir::ExprKind::CodecBatchName { .. }
+            | hir::ExprKind::CodecBatchKind { .. }
+            | hir::ExprKind::CodecBatchFind { .. }
+            | hir::ExprKind::CodecBatchI64s { .. }
+            | hir::ExprKind::CodecBatchF64s { .. }
+            | hir::ExprKind::CodecBatchBools { .. }
+            | hir::ExprKind::CodecBatchStrs { .. }
+            | hir::ExprKind::CodecColumnLen { .. }
+            | hir::ExprKind::CodecColumnAt { .. }
+            | hir::ExprKind::CodecEncoderNew { .. }
+            | hir::ExprKind::CodecEncoderPut { .. }
+            | hir::ExprKind::CodecEncoderFinish { .. }
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
@@ -4373,6 +4428,21 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. }
+            | hir::ExprKind::CodecOpen { .. }
+            | hir::ExprKind::CodecBatchRows { .. }
+            | hir::ExprKind::CodecBatchColumns { .. }
+            | hir::ExprKind::CodecBatchName { .. }
+            | hir::ExprKind::CodecBatchKind { .. }
+            | hir::ExprKind::CodecBatchFind { .. }
+            | hir::ExprKind::CodecBatchI64s { .. }
+            | hir::ExprKind::CodecBatchF64s { .. }
+            | hir::ExprKind::CodecBatchBools { .. }
+            | hir::ExprKind::CodecBatchStrs { .. }
+            | hir::ExprKind::CodecColumnLen { .. }
+            | hir::ExprKind::CodecColumnAt { .. }
+            | hir::ExprKind::CodecEncoderNew { .. }
+            | hir::ExprKind::CodecEncoderPut { .. }
+            | hir::ExprKind::CodecEncoderFinish { .. }
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
@@ -4866,6 +4936,41 @@ impl<'a> BodyValidator<'a> {
         self.local_handle_place(context, expression, Ty::Logger)
     }
 
+    fn codec_encoder_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        if !self.local_handle_place(context, expression, Ty::CodecEncoder) {
+            return false;
+        }
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+            return true;
+        };
+        matches!(
+            function.param_modes.get(position),
+            Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut)
+        )
+    }
+
+    fn owned_codec_encoder_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else {
+            return false;
+        };
+        if !self.local_handle_place(context, expression, Ty::CodecEncoder) {
+            return false;
+        }
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+            return true;
+        };
+        function.param_modes.get(position) == Some(&align_ast::ParamMode::ByValue)
+    }
+
     /// The runtime ABI accepts an i32 level, but checked HIR retains the ordinary nominal enum.
     /// Validate the producer-owned builtin definition before any logger envelope can reach MIR.
     fn log_level_ty(&self, ty: Ty) -> bool {
@@ -4878,6 +4983,22 @@ impl<'a> BodyValidator<'a> {
         const NAMES: [&str; 5] = ["Debug", "Info", "Warn", "Error", "Off"];
         definition.name == "log.level"
             && definition.source_name == "log.level"
+            && definition.variants.len() == NAMES.len()
+            && definition.variants.iter().zip(NAMES).all(|(variant, expected)| {
+                variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
+            })
+    }
+
+    fn codec_kind_ty(&self, ty: Ty) -> bool {
+        let Ty::Enum(id) = ty else {
+            return false;
+        };
+        let Some(definition) = self.program.enums.get(id as usize) else {
+            return false;
+        };
+        const NAMES: [&str; 4] = ["I64", "F64", "Bool", "Str"];
+        definition.name == "codec.kind"
+            && definition.source_name == "codec.kind"
             && definition.variants.len() == NAMES.len()
             && definition.variants.iter().zip(NAMES).all(|(variant, expected)| {
                 variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
@@ -7956,6 +8077,80 @@ impl<'a> BodyValidator<'a> {
                 (self.logger_place(logger, context) && logger.ty == Ty::Logger)
                     .then(|| result(Ty::Unit, &[logger]))?
             }
+            hir::ExprKind::CodecOpen { input } => {
+                (input.ty == Ty::Slice(u8_scalar)).then(|| result(Ty::CodecBatch, &[input]))?
+            }
+            hir::ExprKind::CodecBatchRows { batch }
+            | hir::ExprKind::CodecBatchColumns { batch } => {
+                (batch.ty == Ty::CodecBatch).then(|| strict(i64, &[batch]))?
+            }
+            hir::ExprKind::CodecBatchName { batch, index } => {
+                (batch.ty == Ty::CodecBatch && index.ty == i64)
+                    .then(|| strict(Ty::Option(Scalar::Str), &[batch, index]))?
+            }
+            hir::ExprKind::CodecBatchKind { batch, index } => {
+                let Ty::Option(payload @ Scalar::Enum(_)) = expression.ty else {
+                    return None;
+                };
+                (batch.ty == Ty::CodecBatch
+                    && index.ty == i64
+                    && self.codec_kind_ty(align_sema::scalar_to_ty(payload)))
+                    .then(|| strict(expression.ty, &[batch, index]))?
+            }
+            hir::ExprKind::CodecBatchFind { batch, name } => {
+                (batch.ty == Ty::CodecBatch && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true })), &[batch, name]))?
+            }
+            hir::ExprKind::CodecBatchI64s { batch, index } => {
+                (batch.ty == Ty::CodecBatch && index.ty == i64)
+                    .then(|| strict(Ty::Option(Scalar::CodecI64Column), &[batch, index]))?
+            }
+            hir::ExprKind::CodecBatchF64s { batch, index } => {
+                (batch.ty == Ty::CodecBatch && index.ty == i64)
+                    .then(|| strict(Ty::Option(Scalar::CodecF64Column), &[batch, index]))?
+            }
+            hir::ExprKind::CodecBatchBools { batch, index } => {
+                (batch.ty == Ty::CodecBatch && index.ty == i64)
+                    .then(|| strict(Ty::Option(Scalar::CodecBoolColumn), &[batch, index]))?
+            }
+            hir::ExprKind::CodecBatchStrs { batch, index } => {
+                (batch.ty == Ty::CodecBatch && index.ty == i64)
+                    .then(|| strict(Ty::Option(Scalar::CodecStrColumn), &[batch, index]))?
+            }
+            hir::ExprKind::CodecColumnLen { column } => {
+                matches!(column.ty, Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn)
+                    .then(|| strict(i64, &[column]))?
+            }
+            hir::ExprKind::CodecColumnAt { column, index } => {
+                let result_ty = match column.ty {
+                    Ty::CodecI64Column => Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true })),
+                    Ty::CodecF64Column => Ty::Option(Scalar::Float(align_sema::FloatTy { bits: 64 })),
+                    Ty::CodecBoolColumn => Ty::Option(Scalar::Bool),
+                    Ty::CodecStrColumn => Ty::Option(Scalar::Str),
+                    _ => return None,
+                };
+                (index.ty == i64).then(|| strict(result_ty, &[column, index]))?
+            }
+            hir::ExprKind::CodecEncoderNew { rows } => {
+                (rows.ty == i64).then(|| result(Ty::CodecEncoder, &[rows]))?
+            }
+            hir::ExprKind::CodecEncoderPut { encoder, name, values, kind } => {
+                let element = match kind {
+                    hir::CodecPutKind::I64 => Scalar::Int(align_sema::IntTy { bits: 64, signed: true }),
+                    hir::CodecPutKind::F64 => Scalar::Float(align_sema::FloatTy { bits: 64 }),
+                    hir::CodecPutKind::Bool => Scalar::Bool,
+                    hir::CodecPutKind::Str => Scalar::Str,
+                };
+                (self.codec_encoder_place(encoder, context)
+                    && name.ty == Ty::Str
+                    && values.ty == Ty::Slice(element))
+                    .then(|| result(Ty::Unit, &[encoder, name, values]))?
+            }
+            hir::ExprKind::CodecEncoderFinish { encoder } => {
+                (self.owned_codec_encoder_place(encoder, context)
+                    && encoder.ty == Ty::CodecEncoder)
+                    .then(|| strict(Ty::Buffer, &[encoder]))?
+            }
             hir::ExprKind::IoCopy { reader, writer } => {
                 if !self.reader_place(reader, context)
                     || !self.writer_place(writer, context)
@@ -8820,6 +9015,12 @@ impl<'a> BodyValidator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::File

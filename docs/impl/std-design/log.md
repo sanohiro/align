@@ -71,9 +71,10 @@ No curated return, parameter, or function attributes are promised for these rows
 A110 through A113; logging's other four exact declarations are new shapes A114 through A117. All
 six keys, symbols, declarations, definitions, collision reservations,
 export-parity rows, runtime ABI fingerprint, whole/per-unit selection, and checked-in declaration
-golden activate atomically. That implementation changes the current exact inventories from
-314/331/339 keyed/base/maximum records to 320/337/345 and extends the shape range through A117.
-A118 is the next unreserved shape. There is no optional feature or target-dependent row.
+golden activate atomically. At that capability boundary, the implementation changed the exact
+inventories from 314/331/339 keyed/base/maximum records to 320/337/345 and extended the shape range
+through A117. `core.codec` subsequently occupied A118 through A120; A121 is now the next unreserved
+shape. Logging adds no optional feature or target-dependent row.
 
 `LogNew` receives the only live writer pointer and a checked tag. A compiler-generated call always
 supplies non-null provenance from an initialized writer and `0..=4`; construction transfers the

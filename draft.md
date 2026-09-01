@@ -2397,7 +2397,7 @@ names := batch.strs(index) else { return Err(Error.Invalid) }
 first := names.at(0) else ""
 ```
 
-`codec.open(bytes) -> Result<codec.batch, Error>` validates the complete envelope exactly once,
+`codec.open(input: slice<u8>) -> Result<codec.batch, Error>` validates the complete envelope exactly once,
 allocation-free. A malformed or noncanonical input is `Error.Invalid`. The returned Copy batch,
 its names and `codec.i64_column` / `codec.f64_column` / `codec.bool_column` /
 `codec.str_column` projections are zero-copy
@@ -2405,7 +2405,7 @@ views region-bound to the input and its storage generation. Metadata and typed p
 total: a negative/out-of-range ordinal, absent name, or kind mismatch returns `None`; every typed
 column uses `len` and `at`, and `at` returns `None` out of range. Numeric and
 string-offset reads are alignment-1 little-endian loads, so wire validity never depends on the
-address of the enclosing `bytes`.
+address of the enclosing `slice<u8>`.
 
 Encoding is explicit owned construction. `codec.encoder(rows)` creates one Move accumulator;
 `put_i64` / `put_f64` / `put_bool` / `put_str` borrow and copy one exact-length named column, and

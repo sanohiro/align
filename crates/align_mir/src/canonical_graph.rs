@@ -1568,6 +1568,12 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         38 => Ok(Scalar::HttpSseStream),
         39 => Ok(Scalar::SignatureKey(decode_signature_key_kind(cursor)?)),
         40 => Ok(Scalar::Logger),
+        41 => Ok(Scalar::CodecBatch),
+        42 => Ok(Scalar::CodecI64Column),
+        43 => Ok(Scalar::CodecF64Column),
+        44 => Ok(Scalar::CodecBoolColumn),
+        45 => Ok(Scalar::CodecStrColumn),
+        46 => Ok(Scalar::CodecEncoder),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1713,6 +1719,12 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         62 => Ok(Ty::HttpSseStream),
         63 => Ok(Ty::SignatureKey(decode_signature_key_kind(cursor)?)),
         64 => Ok(Ty::Logger),
+        65 => Ok(Ty::CodecBatch),
+        66 => Ok(Ty::CodecI64Column),
+        67 => Ok(Ty::CodecF64Column),
+        68 => Ok(Ty::CodecBoolColumn),
+        69 => Ok(Ty::CodecStrColumn),
+        70 => Ok(Ty::CodecEncoder),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2516,6 +2528,12 @@ fn scalar(
                 Ok(())
             }
             Scalar::Logger => leaf!(40),
+            Scalar::CodecBatch => leaf!(41),
+            Scalar::CodecI64Column => leaf!(42),
+            Scalar::CodecF64Column => leaf!(43),
+            Scalar::CodecBoolColumn => leaf!(44),
+            Scalar::CodecStrColumn => leaf!(45),
+            Scalar::CodecEncoder => leaf!(46),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2745,6 +2763,12 @@ fn ty(
                 Ok(())
             }
             Ty::Logger => leaf!(64),
+            Ty::CodecBatch => leaf!(65),
+            Ty::CodecI64Column => leaf!(66),
+            Ty::CodecF64Column => leaf!(67),
+            Ty::CodecBoolColumn => leaf!(68),
+            Ty::CodecStrColumn => leaf!(69),
+            Ty::CodecEncoder => leaf!(70),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -3563,6 +3587,12 @@ mod tests {
             Ty::Builder,
             Ty::Writer,
             Ty::Logger,
+            Ty::CodecBatch,
+            Ty::CodecI64Column,
+            Ty::CodecF64Column,
+            Ty::CodecBoolColumn,
+            Ty::CodecStrColumn,
+            Ty::CodecEncoder,
             Ty::Reader,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Bool),
@@ -3637,6 +3667,12 @@ mod tests {
             Scalar::Reader,
             Scalar::Writer,
             Scalar::Logger,
+            Scalar::CodecBatch,
+            Scalar::CodecI64Column,
+            Scalar::CodecF64Column,
+            Scalar::CodecBoolColumn,
+            Scalar::CodecStrColumn,
+            Scalar::CodecEncoder,
             Scalar::Buffer,
             Scalar::Regex,
             Scalar::Captures,
@@ -3680,6 +3716,30 @@ mod tests {
         assert_eq!(optional.as_bytes(), [3, 0, 0, 0, 0, 4, 40]);
         let decoded = CanonicalTy::decode(optional.as_bytes());
         assert_eq!(decoded.as_ref().ok(), Some(&optional));
+
+        for (ordinal, (ty, scalar)) in [
+            (Ty::CodecBatch, Scalar::CodecBatch),
+            (Ty::CodecI64Column, Scalar::CodecI64Column),
+            (Ty::CodecF64Column, Scalar::CodecF64Column),
+            (Ty::CodecBoolColumn, Scalar::CodecBoolColumn),
+            (Ty::CodecStrColumn, Scalar::CodecStrColumn),
+            (Ty::CodecEncoder, Scalar::CodecEncoder),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let encoded = CanonicalTy::from_program(ty, &program);
+            assert!(encoded.is_ok(), "codec Ty must encode: {ty:?}");
+            let Some(encoded) = encoded.ok() else { return };
+            assert_eq!(encoded.as_bytes(), [3, 0, 0, 0, 0, 65 + ordinal as u8]);
+            assert_eq!(CanonicalTy::decode(encoded.as_bytes()).as_ref().ok(), Some(&encoded));
+
+            let optional = CanonicalTy::from_program(Ty::Option(scalar), &program);
+            assert!(optional.is_ok(), "codec Scalar must encode: {scalar:?}");
+            let Some(optional) = optional.ok() else { return };
+            assert_eq!(optional.as_bytes(), [3, 0, 0, 0, 0, 4, 41 + ordinal as u8]);
+            assert_eq!(CanonicalTy::decode(optional.as_bytes()).as_ref().ok(), Some(&optional));
+        }
     }
 
     #[test]
@@ -3735,8 +3795,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 65], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 41], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 71], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 47], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 26, 2], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 26, 1, 4], CanonicalCodecError::UnknownTag);

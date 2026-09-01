@@ -1021,11 +1021,11 @@ owner cannot outlive its explicit region and therefore retains its existing boun
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-
 resistant (crypto → `std.crypto`). `core.bitset` is the M6 SIMD layer (`vec`/`mask`), not built yet.
 
-`core.codec` is the designed canonical columnar data-batch format, not RPC. V1 uses the fixed
+`core.codec` is the implemented canonical columnar data-batch format, not RPC. V1 uses the fixed
 `ALNCOL01` envelope and at most 1024 ordered unique names over exactly `i64`, `f64`, `bool`, and `str` columns.
 Its non-null child buffers match Arrow physical layouts: contiguous little-endian 64-bit values,
 LSB-first bool bits, and signed i32 UTF-8 offsets plus data. The envelope is Align-specific, not
-Arrow IPC/C Data. `codec.open(bytes) -> Result<codec.batch, Error>` validates the complete canonical
+Arrow IPC/C Data. `codec.open(input: slice<u8>) -> Result<codec.batch, Error>` validates the complete canonical
 input once without allocation; malformed input is `Error.Invalid`. The Copy batch and every name or
 `codec.i64_column` / `codec.f64_column` / `codec.bool_column` / `codec.str_column` projection are
 zero-copy and region-bound to the input storage generation. Metadata/kind lookup and every typed

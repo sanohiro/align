@@ -1471,6 +1471,36 @@ pub enum Rvalue {
     LogLineBuilder(Operand, Operand, Operand),
     /// `l.flush()` — expose the first latched or current writer flush status as i32.
     LogFlush(Operand),
+    /// Validate a canonical `core.codec` envelope. The successful batch value is the unchanged
+    /// input `{ptr,len}` and is wrapped by MIR only after this status is zero.
+    CodecOpen(Operand),
+    CodecBatchRows(Operand),
+    CodecBatchColumns(Operand),
+    CodecBatchName(Operand, Operand),
+    CodecBatchKind(Operand, Operand),
+    CodecBatchFind(Operand, Operand),
+    CodecBatchColumn {
+        batch: Operand,
+        index: Operand,
+        kind: hir::CodecPutKind,
+    },
+    CodecColumnLen(Operand),
+    CodecColumnAt {
+        column: Operand,
+        index: Operand,
+        kind: hir::CodecPutKind,
+    },
+    CodecEncoderNew {
+        rows: Operand,
+        out: Slot,
+    },
+    CodecEncoderPut {
+        encoder: Operand,
+        name: Operand,
+        values: Operand,
+        kind: hir::CodecPutKind,
+    },
+    CodecEncoderFinish(Operand),
     /// `io.copy(r, w)` — stream all of the `reader` operand into the `writer` operand through a
     /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
     /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
@@ -7005,6 +7035,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. } => lower_log_expr(b, e),
+            hir::ExprKind::CodecOpen { .. }
+            | hir::ExprKind::CodecBatchRows { .. }
+            | hir::ExprKind::CodecBatchColumns { .. }
+            | hir::ExprKind::CodecBatchName { .. }
+            | hir::ExprKind::CodecBatchKind { .. }
+            | hir::ExprKind::CodecBatchFind { .. }
+            | hir::ExprKind::CodecBatchI64s { .. }
+            | hir::ExprKind::CodecBatchF64s { .. }
+            | hir::ExprKind::CodecBatchBools { .. }
+            | hir::ExprKind::CodecBatchStrs { .. }
+            | hir::ExprKind::CodecColumnLen { .. }
+            | hir::ExprKind::CodecColumnAt { .. }
+            | hir::ExprKind::CodecEncoderNew { .. }
+            | hir::ExprKind::CodecEncoderPut { .. }
+            | hir::ExprKind::CodecEncoderFinish { .. } => lower_codec_expr(b, e),
             // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
             // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
             hir::ExprKind::IoCopy { reader, writer } => {
@@ -14532,6 +14577,12 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Writer
         | Scalar::Logger
         | Scalar::Buffer
+        | Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn
+        | Scalar::CodecStrColumn
+        | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
         | Scalar::Captures
@@ -16915,6 +16966,138 @@ fn lower_log_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Const(Const::Unit)
         }
     }
+}
+
+#[inline(never)]
+fn lower_codec_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let unary = |b: &mut Builder, child: &hir::Expr, make: fn(Operand) -> Rvalue, ty: Ty| {
+        let operand = lower_required!(b, lower_expr(b, child), Operand::Const(Const::Unit));
+        let value = b.fresh_value(ty);
+        b.push(Stmt::Let(value, make(operand)));
+        Operand::Value(value)
+    };
+    match &e.kind {
+        hir::ExprKind::CodecOpen { input } => {
+            let input = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+            let status = b.fresh_value(status_ty());
+            b.push(Stmt::Let(status, Rvalue::CodecOpen(input.clone())));
+            lower_status_value_result(b, status, input, e.ty)
+        }
+        hir::ExprKind::CodecBatchRows { batch } => {
+            unary(b, batch, Rvalue::CodecBatchRows, e.ty)
+        }
+        hir::ExprKind::CodecBatchColumns { batch } => {
+            unary(b, batch, Rvalue::CodecBatchColumns, e.ty)
+        }
+        hir::ExprKind::CodecBatchName { batch, index }
+        | hir::ExprKind::CodecBatchKind { batch, index }
+        | hir::ExprKind::CodecBatchI64s { batch, index }
+        | hir::ExprKind::CodecBatchF64s { batch, index }
+        | hir::ExprKind::CodecBatchBools { batch, index }
+        | hir::ExprKind::CodecBatchStrs { batch, index } => {
+            let batch_operand = lower_required!(b, lower_expr(b, batch), Operand::Const(Const::Unit));
+            let index_operand = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
+            let rvalue = match &e.kind {
+                hir::ExprKind::CodecBatchName { .. } => Rvalue::CodecBatchName(batch_operand, index_operand),
+                hir::ExprKind::CodecBatchKind { .. } => Rvalue::CodecBatchKind(batch_operand, index_operand),
+                hir::ExprKind::CodecBatchI64s { .. } => Rvalue::CodecBatchColumn { batch: batch_operand, index: index_operand, kind: hir::CodecPutKind::I64 },
+                hir::ExprKind::CodecBatchF64s { .. } => Rvalue::CodecBatchColumn { batch: batch_operand, index: index_operand, kind: hir::CodecPutKind::F64 },
+                hir::ExprKind::CodecBatchBools { .. } => Rvalue::CodecBatchColumn { batch: batch_operand, index: index_operand, kind: hir::CodecPutKind::Bool },
+                hir::ExprKind::CodecBatchStrs { .. } => Rvalue::CodecBatchColumn { batch: batch_operand, index: index_operand, kind: hir::CodecPutKind::Str },
+                _ => return Operand::Const(Const::Unit),
+            };
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, rvalue));
+            Operand::Value(value)
+        }
+        hir::ExprKind::CodecBatchFind { batch, name } => {
+            let batch = lower_required!(b, lower_expr(b, batch), Operand::Const(Const::Unit));
+            let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::CodecBatchFind(batch, name)));
+            Operand::Value(value)
+        }
+        hir::ExprKind::CodecColumnLen { column } => {
+            unary(b, column, Rvalue::CodecColumnLen, e.ty)
+        }
+        hir::ExprKind::CodecColumnAt { column, index } => {
+            let kind = match column.ty {
+                Ty::CodecI64Column => hir::CodecPutKind::I64,
+                Ty::CodecF64Column => hir::CodecPutKind::F64,
+                Ty::CodecBoolColumn => hir::CodecPutKind::Bool,
+                Ty::CodecStrColumn => hir::CodecPutKind::Str,
+                _ => return Operand::Const(Const::Unit),
+            };
+            let column = lower_required!(b, lower_expr(b, column), Operand::Const(Const::Unit));
+            let index = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::CodecColumnAt { column, index, kind }));
+            Operand::Value(value)
+        }
+        hir::ExprKind::CodecEncoderNew { rows } => {
+            let rows = lower_required!(b, lower_expr(b, rows), Operand::Const(Const::Unit));
+            let out = b.new_slot(Ty::CodecEncoder);
+            let status = b.fresh_value(status_ty());
+            b.push(Stmt::Let(status, Rvalue::CodecEncoderNew { rows, out }));
+            emit_open_handle_result(b, status, out, Ty::CodecEncoder, e.ty)
+        }
+        hir::ExprKind::CodecEncoderPut { encoder, name, values, kind } => {
+            let encoder = lower_required!(b, lower_expr(b, encoder), Operand::Const(Const::Unit));
+            let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let values = lower_required!(b, lower_expr(b, values), Operand::Const(Const::Unit));
+            let status = b.fresh_value(status_ty());
+            b.push(Stmt::Let(status, Rvalue::CodecEncoderPut { encoder, name, values, kind: *kind }));
+            lower_status_result(b, status, e.ty)
+        }
+        hir::ExprKind::CodecEncoderFinish { encoder } => {
+            let operand = lower_required!(b, lower_expr(b, encoder), Operand::Const(Const::Unit));
+            null_moved_source(b, encoder);
+            let value = b.fresh_value(Ty::Buffer);
+            b.push(Stmt::Let(value, Rvalue::CodecEncoderFinish(operand)));
+            Operand::Value(value)
+        }
+        _ => Operand::Const(Const::Unit),
+    }
+}
+
+fn lower_status_value_result(
+    b: &mut Builder,
+    status: ValueId,
+    ok: Operand,
+    result_ty: Ty,
+) -> Operand {
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_block = b.new_block();
+    let error_block = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok_block, error_block));
+
+    b.cur = ok_block;
+    let wrapped = b.fresh_value(result_ty);
+    b.push(Stmt::Let(wrapped, Rvalue::ResultOk(ok)));
+    b.push(Stmt::Store(result, Operand::Value(wrapped)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = error_block;
+    let error = make_error_from_status(b, status, result_ty);
+    let wrapped = b.fresh_value(result_ty);
+    b.push(Stmt::Let(wrapped, Rvalue::ResultErr(error)));
+    b.push(Stmt::Store(result, Operand::Value(wrapped)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
 }
 
 /// `bytes.as_str()` → the runtime validates the `bytes` (`slice<u8>`) operand is UTF-8 and writes
@@ -20131,6 +20314,12 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Reader => "reader".to_string(),
         Ty::Logger => "log.logger".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::CodecBatch => "codec.batch".to_string(),
+        Ty::CodecI64Column => "codec.i64_column".to_string(),
+        Ty::CodecF64Column => "codec.f64_column".to_string(),
+        Ty::CodecBoolColumn => "codec.bool_column".to_string(),
+        Ty::CodecStrColumn => "codec.str_column".to_string(),
+        Ty::CodecEncoder => "codec.encoder".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(

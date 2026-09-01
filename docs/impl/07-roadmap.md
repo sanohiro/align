@@ -3842,8 +3842,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`HANDOFF.md` still names the accepted `core.codec` contract and implementation as the next
-language capability. Promotion of an optimization slice is a separate explicit
+`HANDOFF.md` names `pkg.frame` design as the next language capability after the implemented
+`core.codec` foundation. Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -3937,7 +3937,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `write`/`write_int`/`write_bool`/`write_char`/`write_float` surface. `write_hex`
   is not shipped and is not part of this capability. Exact contract and implementation closure
   matrix: `std-design/log.md`.
-- **core.codec — DESIGNED 2026-09-01** — canonical `ALNCOL01` columnar wire format, **data only,
+- **core.codec — IMPLEMENTED 2026-09-01** — canonical `ALNCOL01` columnar wire format, **data only,
   NOT RPC**; `codec.open` validates once allocation-free, then total metadata and typed column
   access is zero-copy and region/storage-generation-bound to input. V1 has at most 1024 ordered
   unique names, four symmetric alignment-independent typed column views over non-null
@@ -3945,7 +3945,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   transactional `put_*` calls, fixed-stack ten-pass name validation, and independent golden
   vectors in both directions. The Align
   envelope is not Arrow IPC/C Data. Exact public ledger and implementation closure matrix:
-  `core-design/codec.md`; implementation remains pending.
+  `core-design/codec.md`.
 - **pkg.frame** — dataframe over `soa-groupby` + codec batches; hash equi-join v1; reuses the
   array pipeline (no query DSL); built after codec settles.
 - **pkg.auth** — JWT HS256, argon2id PHC, session token; pure assembly over shipped

@@ -147,6 +147,9 @@ enum RuntimeAbiShape {
     A115,
     A116,
     A117,
+    A118,
+    A119,
+    A120,
 }
 
 #[derive(Clone, Copy)]
@@ -598,6 +601,46 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_chunks",
             shape: RuntimeAbiShape::A85,
+        },
+        RuntimeKey::CodecEncoderFinishV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_finish_v1",
+            shape: RuntimeAbiShape::A50,
+        },
+        RuntimeKey::CodecEncoderFreeV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_free_v1",
+            shape: RuntimeAbiShape::A62,
+        },
+        RuntimeKey::CodecEncoderNewV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_new_v1",
+            shape: RuntimeAbiShape::A119,
+        },
+        RuntimeKey::CodecEncoderPutBoolV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_put_bool_v1",
+            shape: RuntimeAbiShape::A120,
+        },
+        RuntimeKey::CodecEncoderPutF64V1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_put_f64_v1",
+            shape: RuntimeAbiShape::A120,
+        },
+        RuntimeKey::CodecEncoderPutI64V1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_put_i64_v1",
+            shape: RuntimeAbiShape::A120,
+        },
+        RuntimeKey::CodecEncoderPutStrV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_encoder_put_str_v1",
+            shape: RuntimeAbiShape::A120,
+        },
+        RuntimeKey::CodecOpenV1 => RuntimeAbi {
+            key,
+            symbol: "align_rt_codec_open_v1",
+            shape: RuntimeAbiShape::A118,
         },
         RuntimeKey::CliCommand => RuntimeAbi {
             key,
@@ -1936,15 +1979,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 320 || keyed_runtime_abis().len() != 320 {
+    if RuntimeKey::ALL.len() != 328 || keyed_runtime_abis().len() != 328 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 337 {
+    if runtime_abis().count() != 345 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(337);
+    let mut symbols = HashSet::with_capacity(345);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3494,6 +3537,36 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             memory_argmem_read: false,
             read_ptr_params: &[],
         },
+        RuntimeAbiShape::A118 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::Ptr, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A119 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::I64, NativeType::Ptr],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A120 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[
+                NativeType::Ptr,
+                NativeType::Ptr,
+                NativeType::I64,
+                NativeType::Ptr,
+                NativeType::I64,
+            ],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
     }
 }
 
@@ -3531,17 +3604,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 337);
+        assert_eq!(rows.len(), 345);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            337
+            345
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            337
+            345
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3571,7 +3644,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 337);
+        assert_eq!(rows.len(), 345);
 
         for row in rows {
             let symbol = row.symbol;

@@ -12,8 +12,8 @@ _Last updated: 2026-09-01._ `core.test` is implemented against the accepted
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
 owner-test closure against the accepted ledger. `std.log` is
-implemented against `docs/impl/std-design/log.md`; `core.codec` is designed against
-`docs/impl/core-design/codec.md` and is the next implementation capability.
+implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
+`docs/impl/core-design/codec.md`. `pkg.frame` is the next language design capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -392,15 +392,14 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `std.log` is implemented against
-  `docs/impl/std-design/log.md`. Its explicit Move logger consumes one writer without erasing the
-  writer's descriptor region, gates exact escaped line records through the closed five-level enum,
-  latches the first sink failure for explicit `flush` observation, and crosses whole-program and
-  per-unit compilation through six keyed runtime rows. The owner set closes checked-HIR, canonical
-  type identity, interface/generic carriers, runtime ABI/export parity, exact output, malformed
-  native inputs, and aggregate-to-native level-tag extraction.
-- **Next language capability:** implement the accepted `core.codec` public-contract ledger as the
-  next self-hosting layer. The completed
+- **Latest language capability:** `core.codec` is implemented against
+  `docs/impl/core-design/codec.md`. Its allocation-free validator admits one canonical `ALNCOL01`
+  batch, typed zero-copy views retain the input generation, and the explicit Move encoder emits
+  the same bytes transactionally through eight keyed runtime rows. The owner set closes exact
+  independent goldens, every input base alignment, the 1024-column boundary, checked-HIR and
+  canonical identity, whole/per-unit interfaces, and source-null/Drop behavior.
+- **Next language capability:** design `pkg.frame` over the settled codec batch and existing SoA
+  group-by substrate; no public contract is accepted yet. The completed
   align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.
