@@ -4,7 +4,7 @@
 >
 > **注意:** 英語版 (`../auth.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** 設計受理済み（2026-09-01）。実装待ち。
+> **ステータス:** 実装済み（2026-09-01）。
 
 ## 公開契約台帳
 
@@ -33,8 +33,8 @@ claim は JSON text のままで、schema、issuer、audience、subject、role�
 caller value で、`verify_hs256` は `time.now()` を呼ばない。
 
 JWT は HS256 だけ。出荷済み asymmetric primitive は将来の issuer/JWKS 能力の前提であって、algorithm
-selector、network fetch、key cache、provider policy を追加する理由ではない。実装時に既存 `pkg.jwt`
-prototype を outright replacement し、alias や old/new parallel path は残さない。
+selector、network fetch、key cache、provider policy を追加する理由ではない。`pkg.auth` は旧
+`pkg.jwt` prototype を outright replacement し、alias や old/new parallel path は残さない。
 
 ## 公開利用
 
@@ -134,8 +134,10 @@ vendor 可能な `pkg.auth` 1 module が public Copy record 1 個と public func
 `core.json`、`std.crypto`、`std.encoding` を import する。internal module、native declaration、compiler
 recognition、checked-HIR discriminator、runtime ABI row、reflection/static artifact/ambient option はない。
 
-全 call shape は通常 Align function semantics。whole-program は body を直接読み、per-unit interface は
-signature と `Argon2Policy` を serialize する。通常の source/interface/dependency hash が cache と既存
+direct/import call は通常 Align function semantics。現行 function-value subset は parameter/result が
+scalar の signature だけを許すため、slice parameter と owned `Result` を持つ本 surface は local、
+function-field、control-joined function value にならず、package は例外を加えない。whole-program は body を
+直接読み、per-unit interface は signature と `Argon2Policy` を serialize する。通常の source/interface/dependency hash が cache と既存
 runtime capability retention を所有する。collection は call reachability でなく module-wide なので、
 どの `pkg.auth` 関数を import しても JSON/base64/HMAC/Argon2/random と libcrypto を保持する。
 session-only consumer も同じである。同名の別 module 関数に特別な意味はない。`pkg.auth` がない
@@ -159,18 +161,30 @@ zeroizing string、user DB、HTTP middleware、clock read は含まない。
 
 ## 実装 closure matrix
 
-実装は約 1,000 hand-written 行未満を見込み、通常 package source と owner tests の 1 capability で閉じる。
+実装は約 1,000 hand-written 行未満で、通常 package source と owner tests の 1 capability で閉じる。
 
 | 軸 | 必須 closure / owner 証拠 |
 |---|---|
-| public formation/identity | exact module/record/5 signature/core Error/import/type、全 ordinary call target、whole/per-unit。package negative、interface/hash parity。 |
-| JWT encode | fixed header、canonical segment/signing/tag、claims/token bounds、partial result なし。独立 RFC vector と decoder、exact/next bound。 |
-| JWT verify | key/time/shape/auth/JSON/claim 順序、MAC before JSON、C0/leading-zero precheck、unique keys、malformed header `Invalid` と alg/typ/crit `Denied`、exp/nbf edge。raw C0/leading-zero encode/authenticated header/payload、mutation、escaped duplicate、call instrumentation。 |
-| PHC | exact grammar/version/order/decimal/base64/salt/tag/policy。独立 vector/parser、one-byte mutation、injected/real random。 |
-| password resource | KDF 前の maximum、engine relation、3 inclusive ceiling、NUL/empty、32-byte CT true/false、provider/context/output-reserve `Code(0)` と derive rejection `Invalid` の exact split。no-KDF probe、call count、injected provider/context/output-reserve/derive failure。 |
+| public formation/identity | exact module/record/5 signature/core Error/import/type、ordinary direct/import call、現行 scalar-only function-value rejection、whole/per-unit。package source/public surface extraction、既存 rejection owner。 |
+| JWT encode | fixed header、canonical segment/signing/tag、claims/token bounds、partial result なし。独立 RFC vector、segment decoder、empty/exact/next claims bound、exact result length。 |
+| JWT verify | key/time/shape/auth/JSON/claim 順序、MAC before JSON、C0/leading-zero precheck、unique keys、malformed header `Invalid` と alg/typ/crit `Denied`、exp/nbf edge。raw C0/leading-zero encode/authenticated header/payload、mutation、escaped duplicate、unauthenticated invalid-payload sentinel。 |
+| PHC | exact grammar/version/order/decimal/base64/salt/tag/policy。独立 vector、one-byte mutation、source-fixed 16-byte random buffer、real-random shape/distinct sample。 |
+| password resource | KDF 前の maximum、engine relation、3 inclusive ceiling、NUL/empty、32-byte CT true/false、provider/context/output-reserve `Code(0)` と derive rejection `Invalid` の exact split。maximum→PHC→KDF source-order owner、policy product、既存 primitive failure owner。 |
 | ownership/effect | 全 result path の Drop/非保持、全関数 Impure、package の secret-dependent compare なし。allocation parity、MIR/control owner。 |
 | capability/cache | 既存 ABI/semantics 不変、import 時は complete module capability/libcrypto retain、session-only positive、package absence negative、edit/revert cache、optimized/unoptimized、whole/per-unit。 |
 | session | 32 random byte、43 canonical character、clock/prefix/store なし、ordinary Drop。decode oracle、alphabet/length、multi-sample sanity。 |
+
+## 実装 closure evidence
+
+author-side matrix-to-diff pass は compiler/runtime 変更なしで次の owner に閉じる。
+
+| matrix row | implementation / regression owner |
+|---|---|
+| public/identity/whole-per-unit/capability | `apps/auth/pkg/auth.align`、`apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`、`apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed`。exact public source、現行 function-value rejection、session-only libcrypto retain を含む。既存 package-foundation/unit-cache owner が absence と通常 invalidation を保持。 |
+| JWT bytes/auth/policy/bounds/precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`、`apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`、`apps_auth::jwt_claim_and_result_bounds_are_exact`。OpenSSL HMAC-SHA256 独立 vector と既存 JSON/encoding owner を使用。 |
+| PHC/resource/comparison | `apps_auth::password_phc_vector_policy_and_canonical_mutation_matrix_are_exact`。OpenSSL 3.5 Argon2id 独立 vector、canonical mutation、policy、NUL/empty、true/false を閉じる。既存 `m11_crypto` owner が native status split、bounds、random、CT、cleanup を保持。 |
+| ownership/effect | `apps_auth::owned_results_escape_inputs_and_auth_operations_remain_impure` と whole/per-unit JWT owner。既存 JSON/encoding/crypto control/Drop owner を再利用。 |
+| session | `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed` が 32-byte decode、43-character output、2 sample inequality、Impure/module-wide behavior を閉じる。 |
 
 ## 正典と author consistency pass
 

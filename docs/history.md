@@ -2,7 +2,7 @@
 
 ## 2026-09-01: auth composes fixed protocols over the one crypto substrate
 
-The first `pkg.auth` design settled HS256 JWT, Argon2id PHC password records, and 256-bit opaque
+The first `pkg.auth` implementation shipped HS256 JWT, Argon2id PHC password records, and 256-bit opaque
 session tokens as ordinary Align package code over shipped JSON, encoding, CSPRNG, HMAC, Argon2id,
 and constant-time comparison. It adds no crypto primitive, native ABI, algorithm registry, clock
 read, key fetch, session store, or identity policy.

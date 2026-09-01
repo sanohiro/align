@@ -1,8 +1,8 @@
-# パッケージ: vendoring、pkg.web、pkg.jwt、pkg.db
+# パッケージ: vendoring、pkg.web、pkg.frame、pkg.auth、pkg.db
 
 > 🌐 [English](../23-packages.md) · **日本語**
 
-`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.jwt`、`pkg.db` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
+`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.frame`、`pkg.auth`、`pkg.db` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
 
 ## パッケージはソースツリー
 
@@ -12,7 +12,8 @@
 main.align
 pkg/
   db.align
-  jwt.align
+  auth.align
+  frame.align
   web.align
   db/
     sqlite.align
@@ -27,7 +28,7 @@ pkg/
 
 `import pkg.web` は `pkg/web.align`、`import pkg.web.cookie` は `pkg/web/cookie.align` に解決されます。呼び出しや型名は `pkg.web.get(...)`、`pkg.web.types.Ctx` のように常に完全修飾します。
 
-Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/jwt/pkg](../../../apps/jwt/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
+Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/frame/pkg](../../../apps/frame/pkg)、[apps/auth/pkg](../../../apps/auth/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
 
 パッケージ用のマニフェスト、lockfile、レジストリ、バージョンソルバ、ダウンロードコマンドはありません。依存グラフは `import` とファイルシステムから決まり、1つのソースツリーに存在できる `pkg/<name>` は1つです。依存関係の更新や監査は、vendoring したソース自体の更新や監査として行います。
 
@@ -35,7 +36,7 @@ Vendoring とは、このソースサブツリーを利用側プロジェクト�
 
 コンパイラは各 import に対して、次の2つのパス規則を検査します。
 
-- `internal` モジュールを import できるのは、その親をルートとするサブツリー内だけです。`pkg.web` は `pkg.web.internal.router` を import できますが、`main` や `pkg.jwt` からはできません。
+- `internal` モジュールを import できるのは、その親をルートとするサブツリー内だけです。`pkg.web` は `pkg.web.internal.router` を import できますが、`main` や `pkg.auth` からはできません。
 - `pkg/` 以下のモジュールが import できるのは `core`、`std`、または別の `pkg` モジュールだけです。利用側プロジェクトのモジュールへ逆向きに依存することはできません。
 
 新しい可視性構文やビルド言語を追加せず、これらの規則だけでパッケージ内部を隠し、依存方向を一方向に保ちます。
@@ -72,27 +73,38 @@ pub fn main() -> Result<(), Error> {
 
 ハンドラへアプリケーション状態を渡す引数はまだありません。これは現在の制限であり、フレームワークが裏側に隠している機能ではありません。データベースアクセスは別パッケージ `pkg.db` が担当します（後述）。
 
-## `pkg.jwt`
+## `pkg.frame`
 
-`pkg.jwt` は HS256 による compact JSON Web Token を実装します。claim は JSON テキストのまま扱い、そのスキーマは `core.json`、署名付き envelope はこのパッケージが担当します。
+`pkg.frame` は検証済み `core.codec` の i64 または string column に対して、上限付きで安定した inner join を行います。入力 batch を materialize/retain せず、source ordinal の owned `RowPair { left, right }` を left-major、right-ascending 順で返します。必須の `max_pairs` により、duplicate-key fanout と output allocation が可視になります。nullable/composite key、outer join、adaptive build-side selection、parallelism、spill は意図的に含みません。exact surface は [`pkg.frame` design](../../impl/pkg-design/ja/frame.md) にあります。
+
+## `pkg.auth`
+
+`pkg.auth` は監査済みの `std.crypto` primitive から、上限付き HS256 token、canonical Argon2id password record、opaque 256-bit session token の 3 protocol を組み立てます。claim は JSON テキストのまま扱い、policy はすべて call site に明示します。
 
 ```align
-import pkg.jwt
+import pkg.auth
+import std.encoding
 
-pub fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
+    key := encoding.hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")?
     claims := "{\"sub\":\"42\",\"exp\":2000}"
-    token := pkg.jwt.encode_hs256(claims, "secret")
-    decoded := pkg.jwt.decode_hs256(token, "secret")?
-    print(pkg.jwt.time_claims_valid(decoded, 1000))
+    token := pkg.auth.encode_hs256(claims, key.bytes())?
+    verified := pkg.auth.verify_hs256(token, key.bytes(), 1000000000000)?
+    print(verified)
+
+    policy := pkg.auth.Argon2Policy{m_cost: 65536, t_cost: 3, parallelism: 1}
+    phc := pkg.auth.password_hash("correct horse".bytes(), policy)?
+    print(pkg.auth.password_verify("correct horse".bytes(), phc, policy)?)
+    print(pkg.auth.session_token())
     return Ok(())
 }
 ```
 
-検証時はトークン自身の `alg` フィールドを信頼せず、アルゴリズムを HS256 に固定し、署名を定数時間で比較します。`time_claims_valid` は、署名検証とは分離して、任意の `exp` と `nbf` NumericDate claim を検査します。HS384/512、RSA、ECDSA、公開プロバイダの OIDC 検証は、それぞれに必要な監査済み暗号プリミティブが揃うまで公開しません。
+検証は JSON parse より先に compact bytes を認証し、algorithm を HS256 に固定して signature を定数時間で比較します。必須の `now_ns` は hidden clock read なしに optional integer-form `exp` / `nbf` を検査します。password verify は Argon2 実行前に caller の 3 work ceiling を強制します。default password policy、key lookup、issuer/audience policy、cookie、session store は含みません。exact bound/error は [`pkg.auth` design](../../impl/pkg-design/ja/auth.md) が正本です。
 
 ## `pkg.db` ― コミット済みロードマップ完了
 
-`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 2 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。
+`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 3 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。
 
 完了しているのは、公開初回リリースの範囲です。型付きの静的クエリとコマンドは、実際のスキーマメタデータに対してコンパイル時に検査され、SQLite と PostgreSQL の両方で実行でき、そのメタデータをオフラインで再生成できます。プリペアドステートメント、トランザクション、デッドラインとキャンセルを備えた型付き行ストリーム、一対多／多対一の複合出力、マイグレーションのライフサイクル管理、`EXPLAIN` を含む読み取り専用のカタログ検査も、すべて入っています。
 

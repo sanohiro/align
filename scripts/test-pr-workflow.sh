@@ -2370,7 +2370,8 @@ if [[ "$historical_guards" -ne 3 ]]; then
   exit 1
 fi
 corpus_links="$(
-  find "$repo_root/apps/web/pkg" "$repo_root/apps/jwt/pkg" "$repo_root/apps/db/pkg" \
+  find "$repo_root/apps/web/pkg" "$repo_root/apps/frame/pkg" "$repo_root/apps/auth/pkg" \
+    "$repo_root/apps/db/pkg" \
     -name '*.align' -type f -exec \
     sed -n 's/.*extern "C" link("\([^"]*\)").*/\1/p' '{}' + \
     | LC_ALL=C sort -u | paste -sd, -

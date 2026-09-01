@@ -31,7 +31,7 @@ trap cleanup EXIT
 PROJECT="$WORK_ROOT/project"
 mkdir -p "$PROJECT/pkg" "$WORK_ROOT/off" "$WORK_ROOT/hit" "$WORK_ROOT/emit-off" \
   "$WORK_ROOT/emit-hit" "$WORK_ROOT/timing-off" "$WORK_ROOT/timing-hit"
-for TREE in apps/web/pkg apps/jwt/pkg apps/db/pkg; do
+for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
 done
 cat > "$PROJECT/main.align" <<'ALIGN'
@@ -46,7 +46,8 @@ import pkg.web.types
 import pkg.web.cookie
 import pkg.web.cors
 import pkg.web.multipart
-import pkg.jwt
+import pkg.frame
+import pkg.auth
 
 fn main() -> i32 = 0
 ALIGN

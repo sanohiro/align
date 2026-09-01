@@ -57,7 +57,7 @@ installed real compiler with the warmed binary byte-for-byte, and requires
 packaged hits; a formula that rewrites or strips the compiler after warming
 cannot ship.
 
-The corpus is the byte-exact first-party `pkg.db`, `pkg.web`, and `pkg.jwt`
+The corpus is the byte-exact first-party `pkg.db`, `pkg.web`, `pkg.frame`, and `pkg.auth`
 source at the release tag. Those source trees remain separately vendored by
 users and are not added to compiler import search or to the release archive.
 Compiler-provided `core` and `std` imports have no file-backed compilation unit,
