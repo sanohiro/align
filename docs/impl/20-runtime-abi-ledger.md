@@ -136,19 +136,24 @@ the implementation activates all eight with their checked-HIR records and owner 
 | `CodecEncoderFinishV1` | `align_rt_codec_encoder_finish_v1` | existing A50: `ptr @SYM(ptr)` | `unsafe extern "C" fn(*mut CodecEncoder) -> *mut Buffer` |
 | `CodecEncoderFreeV1` | `align_rt_codec_encoder_free_v1` | existing A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut CodecEncoder)` |
 
-`CodecOpenV1` receives one compiler-formed valid byte view, performs the exact allocation-free six-
-stage `ALNCOL01` validation in `core-design/codec.md`, and returns zero or `AL_INVALID`; it retains
-nothing and has no output slot. MIR forms the batch scalar from the still-live input only after
-zero. Metadata, typed projection, bool/string element access, and `find` lower from that validated
-scalar without another runtime row; no per-element opaque call is introduced.
+`CodecOpenV1` receives one compiler-formed valid byte view at any base alignment, performs the exact
+owned/heap-allocation-free six-stage `ALNCOL01` validation in `core-design/codec.md`, rejects column
+count 1025 before descriptor access, and returns zero or `AL_INVALID`; name uniqueness uses exactly
+two `[u16; 1024]` stack arrays, ten stable merge passes, and at most 9,217 lexicographic comparisons.
+It retains nothing and has no output slot. MIR forms the batch scalar from the still-live input only
+after zero. Metadata, four typed projections, alignment-1 element access, and `find` lower from that
+validated scalar without another runtime row; no per-element opaque call is introduced.
 
 `CodecEncoderNewV1` stores null to its nonnull aligned output before validating rows or allocating,
 and publishes one allocator-provenanced shell only on zero. Each put requires a nonnull shell,
 nonnegative signed lengths, null only for a zero-length name/value range, and the compiler-private
-valid element/header range. It completes name/row/kind/duplicate/final-size validation and all
+valid element/header range. It rejects a 1025th successful column before allocation or mutation and
+completes name/row/kind/duplicate/final-size validation and all
 fallible staging allocation before committing one column; `AL_INVALID` leaves the shell byte-for-
 byte equivalent for future output. The str entry reads exact `{ ptr, i64 }` headers and copies no
-cell before the complete prospective call is admitted. OOM uses the hard-abort allocator path and
+cell before the complete prospective call is admitted. Successful columns are also kept in a
+sorted name index, so duplicate admission binary-searches byte-exact names; fixed-index movement is
+bounded by the 1024-column cap. OOM uses the hard-abort allocator path and
 never returns a status.
 
 Finish receives one live complete shell, allocates and fills the exact canonical final buffer,

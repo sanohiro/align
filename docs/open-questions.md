@@ -22,21 +22,23 @@ this file and the design gate in `CLAUDE.md`.
 ### Columnar interchange is one canonical validated batch format (SETTLED 2026-09-01)
 
 **Decision:** `core.codec` is a data-batch format, not RPC. V1 has the fixed `ALNCOL01` envelope,
-one row count, ordered byte-unique UTF-8 column names, and exactly four non-null kinds: `i64`,
+one row count, at most 1024 ordered byte-unique UTF-8 column names, and exactly four non-null kinds: `i64`,
 `f64`, `bool`, and `str`. Child buffers match Arrow's physical layouts—contiguous little-endian
 64-bit values, an LSB-first boolean bitmap, and signed i32 UTF-8 offsets plus bytes—but the
 canonical envelope is Align-owned and is neither Arrow IPC nor the Arrow C Data Interface.
 
 `codec.open(bytes)` validates the complete envelope once, allocation-free, under one deterministic
-arithmetic/topology/name/content precedence. Every malformed, noncanonical, unaligned, truncated,
-or trailing input returns `Error.Invalid` before publishing a batch. Its Copy batch, names, numeric
-slices, and bool/string column views borrow the input's exact region and storage generation;
+arithmetic/topology/name/content precedence. Every malformed, noncanonical, over-limit, truncated,
+or trailing input returns `Error.Invalid` before publishing a batch. Input base alignment does not
+affect validity: all four typed column views use inline alignment-1 little-endian access. Name
+uniqueness uses fixed 4096-byte stack scratch and ten stable merge passes, never a quadratic scan.
+Its Copy batch, names, and typed column views borrow the input's exact region and storage generation;
 mutation or owner replacement cannot invalidate the validation certificate while a derived view is
-live. Metadata/kind lookup and bool/string element access are total through `Option`, and no
+live. Metadata/kind lookup and every typed column's element access are total through `Option`, and no
 per-element runtime call hides in the hot path.
 
 Encoding uses one explicit Move `codec.encoder(rows)`. Four transactional `put_*` operations borrow
-and copy an exact-length named column; a negative row count, empty/duplicate name, length mismatch,
+and copy an exact-length named column; a negative row count, empty/duplicate name, 1025th column, length mismatch,
 or v1 representability limit returns `Error.Invalid` before mutation. `finish()` consumes staging
 into one owned `buffer`. OOM stays a hard error. There is no nullable/nested/dictionary type,
 reflection, `soa<T>` conversion, file/mmap/stream API, compression, checksum, Arrow IPC/Flight,

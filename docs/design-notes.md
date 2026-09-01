@@ -1348,8 +1348,10 @@ framing, nullable/nested type system, or compatibility policy into the language 
 Validation is a one-time capability transition. Before `codec.open` returns, it proves every width,
 offset, order, padding byte, unique name, bool tail bit, string offset, and UTF-8 range. The returned
 batch is a Copy view tied to the input's region and storage generation, so the borrow checker—not a
-second checksum or reparse—keeps those facts true. Numeric projection then becomes a normal slice;
-bool and string indexing lower to visible bounds/bit/offset operations. A permissive decoder would
+second checksum or reparse—keeps those facts true. Every kind projects to one symmetric typed column
+view whose `at` lowers to visible alignment-1 byte/bit/offset operations. This keeps validity
+independent of `buffer`'s byte-aligned storage instead of overstating typed-pointer alignment. A
+permissive decoder would
 destroy the one-semantic-value/one-byte-value property and move uncertainty into every accessor, so
 v1 rejects unknown flags, tags, gaps, nonzero padding, and trailing bytes.
 
@@ -1361,7 +1363,11 @@ consumes that one owner into `buffer`, preserving the existing ownership and har
 compile-time reflected `soa<T>` codec, variadic columns, and a generic dynamic value were rejected:
 each adds a second schema or generic mechanism before `pkg.frame` establishes a real need.
 
-Nullability is deferred as one whole decision. Arrow validity bitmaps, source `Option` columns,
+Allocation-free duplicate checking is deliberately capped at 1024 columns. The decoder uses two
+fixed `[u16; 1024]` stack arrays and ten stable merge passes, bounding the full-size case at 9,217
+lexicographic comparisons; the encoder keeps a sorted name index and rejects the next column before
+mutation. Nullability is deferred as one whole decision.
+Arrow validity bitmaps, source `Option` columns,
 typed accessors, and encoder inputs must arrive together; accepting a bitmap flag now without that
 Cartesian contract would create unreadable states. The same rule keeps nested types, dictionary
 encoding, IPC, compression, streaming, and RPC out of v1. Exact bytes and the closure matrix are in

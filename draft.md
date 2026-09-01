@@ -2383,7 +2383,7 @@ target.
 ### core.codec
 
 `core.codec` is the one canonical columnar **data-batch** wire format. It is not RPC. The v1
-envelope `ALNCOL01` carries a row count and ordered, uniquely named `i64`, `f64`, `bool`, or `str`
+envelope `ALNCOL01` carries a row count and at most 1024 ordered, uniquely named `i64`, `f64`, `bool`, or `str`
 columns. Its child buffers use the corresponding non-null Arrow physical layouts: contiguous
 little-endian 64-bit values, an LSB-first boolean bitmap, or signed i32 UTF-8 offsets plus bytes.
 The Align envelope and metadata are their own fixed canonical format, not Arrow IPC or the Arrow C
@@ -2399,15 +2399,18 @@ first := names.at(0) else ""
 
 `codec.open(bytes) -> Result<codec.batch, Error>` validates the complete envelope exactly once,
 allocation-free. A malformed or noncanonical input is `Error.Invalid`. The returned Copy batch,
-its names, numeric slices, and `codec.bool_column` / `codec.str_column` projections are zero-copy
+its names and `codec.i64_column` / `codec.f64_column` / `codec.bool_column` /
+`codec.str_column` projections are zero-copy
 views region-bound to the input and its storage generation. Metadata and typed projection are
-total: a negative/out-of-range ordinal, absent name, or kind mismatch returns `None`; bool/string
-element `at` also returns `None` out of range. Numeric element work is an ordinary slice pipeline.
+total: a negative/out-of-range ordinal, absent name, or kind mismatch returns `None`; every typed
+column uses `len` and `at`, and `at` returns `None` out of range. Numeric and
+string-offset reads are alignment-1 little-endian loads, so wire validity never depends on the
+address of the enclosing `bytes`.
 
 Encoding is explicit owned construction. `codec.encoder(rows)` creates one Move accumulator;
 `put_i64` / `put_f64` / `put_bool` / `put_str` borrow and copy one exact-length named column, and
 `finish()` consumes the accumulator into an owned `buffer`. An invalid row count, empty/duplicate
-name, length mismatch, or v1 representability limit is `Error.Invalid` before mutation, so a failed
+name, 1025th column, length mismatch, or v1 representability limit is `Error.Invalid` before mutation, so a failed
 put leaves the encoder usable. Allocation remains visible at the encoder/output owner; OOM retains
 the language-wide hard-abort rule. The exact bytes, validation precedence, ownership, regions,
 deferrals, and independent golden vectors are fixed in `docs/impl/core-design/codec.md`.

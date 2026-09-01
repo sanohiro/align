@@ -8,8 +8,10 @@ and `str` columns. Its child buffers deliberately match Arrow physical layouts, 
 the small canonical metadata, exact zero padding, strict validation order, and version boundary.
 
 `codec.open` validates once without allocation and returns Copy views tied to the input region and
-storage generation. Numeric columns become ordinary slices; bool/string columns use total typed
-views. Encoding chose an explicit Move accumulator with four transactional typed puts and a
+storage generation. All four kinds use total typed column views with alignment-1 little-endian
+access, so `buffer`'s byte alignment cannot invalidate an envelope. The format caps columns at 1024
+and uses fixed-stack merge sorting to bound allocation-free name uniqueness work. Encoding chose
+an explicit Move accumulator with four transactional typed puts and a
 consuming `buffer` finish. This rejected schema reflection, generic dynamic values, a permissive
 future-tag reader, hidden borrowed-column retention, nullability without its complete Option/
 validity contract, and premature Arrow IPC/stream/RPC scope. The decision and implementation

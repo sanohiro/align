@@ -3939,9 +3939,11 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   matrix: `std-design/log.md`.
 - **core.codec — DESIGNED 2026-09-01** — canonical `ALNCOL01` columnar wire format, **data only,
   NOT RPC**; `codec.open` validates once allocation-free, then total metadata and typed column
-  access is zero-copy and region/storage-generation-bound to input. V1 has ordered unique names,
-  non-null i64/f64/bool/str Arrow-compatible physical buffers, one explicit Move encoder with
-  transactional `put_*` calls, and independent golden vectors in both directions. The Align
+  access is zero-copy and region/storage-generation-bound to input. V1 has at most 1024 ordered
+  unique names, four symmetric alignment-independent typed column views over non-null
+  i64/f64/bool/str Arrow-compatible physical buffers, one explicit Move encoder with
+  transactional `put_*` calls, fixed-stack ten-pass name validation, and independent golden
+  vectors in both directions. The Align
   envelope is not Arrow IPC/C Data. Exact public ledger and implementation closure matrix:
   `core-design/codec.md`; implementation remains pending.
 - **pkg.frame** — dataframe over `soa-groupby` + codec batches; hash equi-join v1; reuses the
