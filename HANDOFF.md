@@ -10,31 +10,10 @@ neither is a source of current status.
 _Last updated: 2026-09-01._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
-implementation merged in PR #916.
-
-PR #920 is active on `agent/request22-string-index-impl` with a retention repair discovered by the
-comprehensive review. Direct and function-value calls with `borrow mut` or `out` destinations now
-keep hidden temporary owners under normal scope or iteration cleanup; ordinary calls retain their
-early release. MoveCheck preserves the matching iteration root and rejects retained temporary
-storage that crosses an iteration edge. The driver owner covers direct and function-value
-retention, the loop-edge rejection, and a structural MIR owner pins the final drop after destination
-use.
-
-The repair is integrated with `db53bac385f0f44eb43e9c706183851936bbfe8a`. Focused verification
-passes: Request 22 MIR 1/1, `borrowed_params` 38/38, temporary iteration owners 5/5, and the
-ordinary Unit-call early-release control 1/1.
-
-The comprehensive review of `43d2e8df0852c8726906826147fb0ccb2b7e444e` found one valid P1: the
-single-expression/break loop fast path recognized only a direct retaining call, so a control
-wrapper could suppress the iteration root. The consolidated repair routes that entire loop shape
-through the normal loop checker. Direct, block, `unsafe`, and `if` retention regressions pass 1/1;
-the existing temporary iteration owners remain 5/5, Request 22 MIR remains 1/1, and the ordinary
-Unit-call control remains 1/1.
-
-Next, run exact preflight with the reviewed finding fixed, update and merge PR #920, then stop as
-explicitly requested. Do not start pin adoption or another capability in this session. Afterward,
-`std.log` remains implemented against `docs/impl/std-design/log.md`; design `core.codec` next as the
-next self-hosting capability.
+implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
+owner-test closure against the accepted ledger. `std.log` is
+implemented against `docs/impl/std-design/log.md`; `core.codec` is designed against
+`docs/impl/core-design/codec.md` and is the next implementation capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -420,8 +399,8 @@ facts must live in this repository.
   per-unit compilation through six keyed runtime rows. The owner set closes checked-HIR, canonical
   type identity, interface/generic carriers, runtime ABI/export parity, exact output, malformed
   native inputs, and aggregate-to-native level-tag extraction.
-- **Next language capability:** author the `core.codec` public-contract ledger as the next
-  self-hosting layer before implementation. The completed
+- **Next language capability:** implement the accepted `core.codec` public-contract ledger as the
+  next self-hosting layer. The completed
   align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

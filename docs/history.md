@@ -1,5 +1,22 @@
 # History of Align
 
+## 2026-09-01: columnar interchange settles on one validated canonical batch
+
+The self-hosting library wave fixed `core.codec` as a data-only `ALNCOL01` envelope rather than
+Arrow IPC or an RPC substrate. V1 carries ordered unique names and non-null `i64`, `f64`, `bool`,
+and `str` columns. Its child buffers deliberately match Arrow physical layouts, while Align owns
+the small canonical metadata, exact zero padding, strict validation order, and version boundary.
+
+`codec.open` validates once without allocation and returns Copy views tied to the input region and
+storage generation. All four kinds use total typed column views with alignment-1 little-endian
+access, so `buffer`'s byte alignment cannot invalidate an envelope. The format caps columns at 1024
+and uses fixed-stack merge sorting to bound allocation-free name uniqueness work. Encoding chose
+an explicit Move accumulator with four transactional typed puts and a
+consuming `buffer` finish. This rejected schema reflection, generic dynamic values, a permissive
+future-tag reader, hidden borrowed-column retention, nullability without its complete Option/
+validity contract, and premature Arrow IPC/stream/RPC scope. The decision and implementation
+closure matrix are `docs/impl/core-design/codec.md`.
+
 ## 2026-08-31: owned string arrays index to the canonical text view
 
 The R7 tokenizer consumer made the remaining Move-array gap concrete: an `array<string>` could be

@@ -1336,6 +1336,44 @@ would add an effect, allocation, ambient input, or policy that the caller did no
 ordinary packages or explicit values if real consumers establish their contracts. The complete
 surface and closure matrix are in `impl/std-design/log.md`.
 
+## Why `core.codec` validates one canonical envelope before exposing views
+
+The columnar format has two jobs that must not be confused. Its metadata makes one batch
+self-describing enough to inspect; its child buffers keep ordinary numeric work on an
+optimizer-visible typed-column path without per-element runtime calls. `ALNCOL01` therefore owns a
+small fixed envelope while deliberately reusing Arrow's non-null physical layouts for `i64`, `f64`,
+bit-packed bool, and 32-bit-offset UTF-8. Reusing the buffers allows later explicit adapters without
+importing Arrow IPC's FlatBuffers schema, stream framing, nullable/nested type system, or
+compatibility policy into the language core.
+
+Validation is a one-time capability transition. Before `codec.open` returns, it proves every width,
+offset, order, padding byte, unique name, bool tail bit, string offset, and UTF-8 range. The returned
+batch is a Copy view tied to the input's region and storage generation, so the borrow checker—not a
+second checksum or reparse—keeps those facts true. Every kind projects to one symmetric typed column
+view whose `at` lowers to visible alignment-1 byte/bit/offset operations. This keeps validity
+independent of `buffer`'s byte-aligned storage instead of overstating typed-pointer alignment. A
+permissive decoder would
+destroy the one-semantic-value/one-byte-value property and move uncertainty into every accessor, so
+v1 rejects unknown flags, tags, gaps, nonzero padding, and trailing bytes.
+
+The explicit Move encoder is the allocation home. Its `put_*` calls copy because retaining an
+unbounded sequence of borrowed column regions would require runtime-changing lifetime facts on the
+receiver. Each put first proves its complete prospective change, then commits atomically; a caller
+can handle `Error.Invalid` and keep using the same encoder without hidden partial state. `finish`
+consumes that one owner into `buffer`, preserving the existing ownership and hard-OOM models. A
+compile-time reflected `soa<T>` codec, variadic columns, and a generic dynamic value were rejected:
+each adds a second schema or generic mechanism before `pkg.frame` establishes a real need.
+
+Allocation-free duplicate checking is deliberately capped at 1024 columns. The decoder uses two
+fixed `[u16; 1024]` stack arrays and ten stable merge passes, bounding the full-size case at 9,217
+lexicographic comparisons; the encoder keeps a sorted name index and rejects the next column before
+mutation. Nullability is deferred as one whole decision.
+Arrow validity bitmaps, source `Option` columns,
+typed accessors, and encoder inputs must arrive together; accepting a bitmap flag now without that
+Cartesian contract would create unreadable states. The same rule keeps nested types, dictionary
+encoding, IPC, compression, streaming, and RPC out of v1. Exact bytes and the closure matrix are in
+`impl/core-design/codec.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private
