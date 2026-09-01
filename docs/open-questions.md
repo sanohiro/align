@@ -19,6 +19,34 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### Auth v1 is explicit bounded protocol assembly (SETTLED 2026-09-01)
+
+**Decision:** `pkg.auth` is ordinary package source over existing JSON, encoding, and crypto. Its
+only public surfaces are `Argon2Policy { m_cost, t_cost, parallelism }`, HS256 encode/verify,
+Argon2id PHC password hash/verify, and a fixed 256-bit session token. There is no new native ABI,
+cryptographic primitive, algorithm selector, clock read, key source, provider configuration,
+session store, or identity policy.
+
+JWT keys are at least 32 bytes. Claims and tokens are bounded; an allocation-free package lexical
+pass rejects the shipped JSON parser's raw-C0 and leading-zero leniencies. Verification authenticates the
+original compact input before JSON parsing, requires unique-key JSON objects, pins `alg=HS256`,
+rejects `crit`, and applies optional integer-form i64 `exp`/`nbf` seconds to explicit nonnegative
+caller `now_ns`. Malformed authenticated header JSON is `Invalid`; valid-object alg/typ/crit policy
+failure is `Denied`. Password hashing uses exact caller work parameters, a fresh 16-byte salt, a fixed
+32-byte tag, and one canonical Argon2id v19 PHC spelling. Verification accepts caller cost maxima
+and rejects over-limit records before KDF work; native provider/context/output-reserve failure is
+exact `Error.Code(0)`, while derive rejection is `Error.Invalid`. Session tokens always encode 32
+CSPRNG bytes to 43 unpadded base64url characters.
+
+All five functions are Impure, borrow inputs only for the call, and return ordinary strings/bool.
+They inherit the existing lack of zeroizing string/buffer Drop. Capability collection is
+module-wide, so every auth import retains the complete module set and libcrypto. Issuer/audience policy, asymmetric
+JWT/JWKS/OIDC, cookies/storage/revocation, pepper, rehash advice, other password KDFs, and secret
+owner types remain separate consumer-gated capabilities. The existing `pkg.jwt` prototype is
+replaced outright at implementation rather than retained as an alias.
+
+Record: `docs/impl/pkg-design/auth.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### Frame v1 is one bounded stable ordinal inner join (SETTLED 2026-09-01)
 
 **Decision:** `pkg.frame` adds no Frame wrapper, schema reflection, materialized joined columns, or

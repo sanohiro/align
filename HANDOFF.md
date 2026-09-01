@@ -14,7 +14,8 @@ implementation merged in PR #916. Its retained-temporary repair merged in PR #92
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
 `docs/impl/core-design/codec.md`; and `pkg.frame` is implemented against
-`docs/impl/pkg-design/frame.md`. `pkg.auth` design is the next language capability.
+`docs/impl/pkg-design/frame.md`. `pkg.auth` has an accepted cross-source design and is the next
+implementation capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -399,9 +400,12 @@ facts must live in this repository.
   nounwind A121/A122. The owner set closes canonical package admission, whole/per-unit execution,
   stable duplicate products, byte-exact strings, bounds, malformed checked HIR, ABI identity, and
   runtime oracle/collision/unaligned-input behavior.
-- **Next language capability:** author the exact `pkg.auth` public ledger over shipped crypto,
-  base64url, and time primitives before implementation. The planned boundary remains JWT HS256,
-  Argon2id PHC, and session tokens with explicit `now_ns`; no new crypto substrate is implied.
+- **Next language capability:** implement the accepted `pkg.auth` ledger over shipped JSON, crypto,
+  encoding, and explicit caller time. It fixes HS256 encode/verify, canonical bounded Argon2id PHC
+  hash/verify, one 256-bit session token, a narrow strict-JSON precheck, the shipped native Argon2
+  `Code(0)`/`Invalid` failure split, and module-wide libcrypto retention. No new compiler/runtime
+  ABI, clock read, provider/key source, identity policy, or session store is added. Exact closure matrix:
+  `docs/impl/pkg-design/auth.md`.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

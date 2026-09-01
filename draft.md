@@ -3538,7 +3538,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The first-party packages developed in this repository are exactly three subtrees:
+The first-party packages developed in this repository are exactly four subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3547,6 +3547,7 @@ pkg.db.sqlite      // driver submodule
 pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
+pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 ```
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
@@ -3605,6 +3606,51 @@ v1. Callers use `codec.find` plus an explicit typed projection before the join, 
 ordinary result through the existing array/slice pipeline. The exact ownership, validation
 precedence, inactive native ABI rows, and implementation closure matrix are fixed in
 `docs/impl/pkg-design/frame.md`.
+
+`pkg.auth` v1 is ordinary package composition over the shipped JSON, encoding, crypto, and time
+representations. It defines one Copy policy record and five functions:
+
+```text
+pkg.auth.Argon2Policy { m_cost: i64, t_cost: i64, parallelism: i64 }
+pkg.auth.encode_hs256(claims_json: str, key: slice<u8>) -> Result<string, Error>
+pkg.auth.verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, Error>
+pkg.auth.password_hash(password: slice<u8>, policy: pkg.auth.Argon2Policy) -> Result<string, Error>
+pkg.auth.password_verify(
+  password: slice<u8>,
+  phc: str,
+  maximum: pkg.auth.Argon2Policy,
+) -> Result<bool, Error>
+pkg.auth.session_token() -> string
+```
+
+HS256 keys are at least 32 bytes. Encoding accepts at most 8192 bytes of strict RFC 8259 unique-key JSON-object
+claims, emits the fixed `{"alg":"HS256","typ":"JWT"}` header, and returns at most 11004 bytes.
+Verification accepts at most
+16384 token bytes, authenticates the original compact signing input before parsing JSON, pins
+`alg=HS256`, rejects `crit`, and admits optional `typ` only as `JWT`. It returns the exact owned
+payload JSON only after the authenticated payload is one unique-key object and optional integer-form
+i64 `exp`/`nbf` NumericDate seconds admit the required nonnegative caller-supplied Unix `now_ns`.
+Signature, valid-header policy, or time denial is `Error.Denied`; malformed/non-strict input,
+including authenticated header JSON, is `Error.Invalid`. An allocation-free package precheck rejects
+raw C0 string bytes and leading-zero integers before the shipped lenient `json.doc` parser.
+There is no clock read, issuer/audience policy, algorithm selector, key lookup, or unauthenticated
+JSON parse.
+
+Password hashing takes an explicit `Argon2Policy`, generates a fresh 16-byte salt, derives a
+32-byte Argon2id v19 tag, and emits exactly canonical
+`$argon2id$v=19$m=...,t=...,p=...$<salt>$<tag>` with unpadded standard base64. Verification accepts
+only that exact grammar and validates three caller-supplied inclusive cost maxima before one KDF;
+a mismatch is `Ok(false)`, malformed/over-limit input is `Error.Invalid`, and the shipped native
+Argon2 split remains provider/context/output-reserve `Error.Code(0)` versus derive-rejection
+`Error.Invalid`. `session_token()` is exactly 32 CSPRNG bytes encoded as a 43-character
+unpadded base64url string. All five functions are Impure, borrow their inputs only for the call,
+and use ordinary string/buffer Drop without a zeroization promise. There is no new checked HIR,
+native ABI, session store, password policy default, pepper, or ambient provider/configuration.
+Existing capability collection is module-wide, so every `pkg.auth` import retains the complete
+JSON/base64/HMAC/Argon2/random set and libcrypto, including session-only use.
+The exact contract and implementation closure matrix are
+`docs/impl/pkg-design/auth.md`. The existing `pkg.jwt` prototype is replaced outright when this
+accepted design implements; no compatibility alias is retained.
 
 **First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
 live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer

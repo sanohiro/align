@@ -1318,7 +1318,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The first-party packages developed in this repository are exactly three vendorable subtrees:
+The first-party packages developed in this repository are exactly four vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1327,6 +1327,7 @@ pkg.db.sqlite      // driver submodule
 pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
+pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 ```
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
@@ -1345,3 +1346,20 @@ for the call, strings compare as exact validated bytes, and the result retains o
 ordinals. There is no Frame wrapper, schema/query DSL, materialization, adaptive side choice,
 nullable/composite/bool/f64 key, outer join, parallelism, or spill. Exact contract:
 `impl/pkg-design/frame.md`.
+
+`pkg.auth` v1 is ordinary source composition with no new compiler or native ABI. It defines
+`Argon2Policy { m_cost, t_cost, parallelism }`; `encode_hs256(claims_json, key)`;
+`verify_hs256(token, key, now_ns)`; `password_hash(password, policy)`;
+`password_verify(password, phc, maximum)`; and `session_token()`. Keys are at least 32 bytes.
+JWT claims are bounded strict RFC 8259 unique-key JSON objects. A package lexical precheck rejects
+raw C0 string bytes and leading-zero integers before the shipped parser. Verification authenticates the original compact
+input before JSON parsing, pins HS256, and checks optional integer-form `exp`/`nbf` seconds against
+the required nonnegative caller-supplied Unix nanoseconds. Password hashes use a fresh 16-byte salt,
+a fixed 32-byte Argon2id v19 tag, canonical PHC text, and caller-explicit work parameters/verify
+ceilings; native Argon2 provider/context/output-reserve failure is `Error.Code(0)` and derive
+rejection is `Error.Invalid`. Session tokens are exactly 32 CSPRNG bytes encoded as 43 unpadded
+base64url characters.
+All operations are Impure, retain no input, read no clock or configuration, and inherit ordinary
+non-zeroizing string/buffer Drop. Any import retains the module-wide complete capability set and
+libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:
+`impl/pkg-design/auth.md`.
