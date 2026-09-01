@@ -3964,18 +3964,29 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv — DESIGN CANDIDATE 2026-09-02** — one synchronous plaintext RESP2 client with an
+- **pkg.kv — REVISED DESIGN CANDIDATE 2026-09-02** — one synchronous plaintext RESP2 client with an
   opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
   owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
   positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
   public operations are `connect`, `get`, `set`, and `delete`; uncertain transport/framing/size
-  failure retires the client, while a fully consumed bounded server error or non-UTF-8 text reply
-  remains synchronized. There is no generic command/reply value, default endpoint, credential,
+  failure retires the client, while a fully consumed bounded arbitrary-byte server error or
+  non-UTF-8 text reply remains synchronized; UTF-8 classification follows complete framing and
+  empty owned results use canonical null/zero. There is no generic command/reply value, default endpoint, credential,
   database, retry, redirect, pool, transaction, script, pub/sub, protocol negotiation, client
-  clock, or TLS. Package source owns RESP; one planned unkeyed runtime row supplies checked socket
-  timeout installation, while the existing connection-derived writer is hardened in place for
-  SIGPIPE-safe complete writes with no ABI/count change in one prerequisite PR before the package.
-  Independent review is pending; no public contract is accepted. Exact
+  clock, or TLS. The first exact-SHA review found unchecked nonblocking install/restore and
+  under-specified timeout/address/native/cache behavior. The revised first prerequisite hardens the
+  shared timeout substrate with full-range start-plus-budget arithmetic, checked fd-mode
+  transitions, ceil/rechecked connect waits, resolver-order first-success/last-failure selection,
+  shared `std.net`/`std.http` positive-I/O-ns ceil-to-microsecond conversion, and the same
+  poll conversion for `process.command`. A second prerequisite hardens the existing
+  connection-derived writer in place for
+  SIGPIPE-safe complete writes and explicit fail/retry/overlap/transitive-route owners, with no
+  ABI/count change, including the existing builder overload. Package source owns RESP and exact
+  native-status/count-view decoding; impossible products use an explicit `std.process` dependency
+  and existing keyed `ProcessAbort`. Its implementation
+  atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
+  installation without a language/HIR/MIR operation. A fresh complete review of the revised
+  strategy is pending; no public contract is accepted. Exact
   ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

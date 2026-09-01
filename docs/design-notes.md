@@ -1439,8 +1439,9 @@ would let an incomplete nested reply silently desynchronize every later operatio
 instead admits only `GET`, `SET`, and one-key `DEL`, each with a closed reply shape. An opaque Move
 client and call-bounded `borrow mut` make one request/one reply the only concurrency model. A
 transport failure, oversized response, or reply whose framing cannot be proved complete retires the
-client before returning; only a complete bounded server error or text payload that fails UTF-8
-decoding leaves the stream synchronized and reusable.
+client before returning; only a complete bounded arbitrary-byte server error or text payload that
+fails UTF-8 decoding leaves the stream synchronized and reusable. Error framing and same-read
+trailing validation finish before UTF-8 selects owned `Server` versus reusable `Decode`.
 
 Endpoint, timeout, memory, condition, and expiry policy stay visible at the call site. `connect`
 takes an explicit host, port, per-address connect timeout, socket I/O timeout, and inclusive reply
@@ -1451,20 +1452,40 @@ nanosecond duration converted upward to Redis `PX` milliseconds. This is enough 
 retention, and one-key `DEL` supplies revocation. No client clock, retry, redirect, credential,
 database, pooling, transaction, script, pub/sub, or ambient configuration is implied.
 
+That visibility requires the existing timeout substrate to honor what the caller wrote. A positive
+connect attempt therefore uses monotonic start-plus-budget arithmetic rather than an overflowable
+absolute deadline, checks both nonblocking installation and blocking restoration, closes and
+continues on either failure, rounds a remaining wait upward to milliseconds, and rechecks an early
+zero from `poll`; an immediate/readiness result wins the logical deadline race. Resolver order is
+preserved, with first success and last attempted failure. Failure to install I/O timeouts after
+selection closes the unpublished connection rather than trying another address. Positive socket
+I/O timeouts round upward to normalized microseconds. This repair is a prerequisite shared by
+existing `std.net`/`std.http`; the same poll conversion and start/budget rule closes the complete
+positive-i64 range for `process.command` without changing its timeout-wins checkpoint order. It is
+not package-local policy or a claim that kernel scheduling supplies a strict wall-clock return.
+
 RESP framing and validation remain ordinary package source. The only planned runtime addition is
-one generic package-internal row for checked receive/send timeout installation. SIGPIPE safety is
-instead repaired in the existing connection-derived writer, so every `std.net` consumer benefits
-and `pkg.kv` does not create a second byte-write path. Its private socket sink selects
+one generic package-internal row for checked receive/send timeout installation. The compiler knows
+its physical symbol for typed ABI compatibility, collision, and reachability, but it is not a
+language builtin or HIR/MIR operation. Package source explicitly decodes the shared native-status
+table because ordinary extern calls do not receive builtin MIR decoding automatically. Its internal
+modules import `std.process`; impossible status/count/view/output products reach the existing
+`ProcessAbort` capability before parsing or publication. SIGPIPE
+safety is instead repaired in the existing connection-derived writer, so every `std.net` consumer
+benefits and `pkg.kv` does not create a second byte-write path. Slice and builder writer overloads
+converge on it. Its private socket sink selects
 `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; file and standard-stream writers remain unchanged. This
 keeps Redis parsing out of the runtime, adds no language operation or public network surface, and
 changes no existing writer ABI identity.
 
 GET values and server errors are ordinary owned strings; keys and SET values are borrowed only for
 their synchronous write. No reply or scratch view escapes, and the configured response cap bounds
-the only value-sized receive allocation. V1 deliberately stays on plaintext RESP2 with no protocol
+the only value-sized receive allocation. Empty owned results use canonical `{null, 0}` without a
+final buffer; nonempty results allocate one. V1 deliberately stays on plaintext RESP2 with no protocol
 negotiation or TLS. The exact candidate contract, byte grammar, error precedence, runtime
-reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`; no public contract
-is accepted until its independent review closes.
+reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
+review reopened the timeout/native/cache axes; no public contract is accepted until a fresh complete
+review closes the revised candidate.
 
 ## Why tests are Result blocks run in separate processes
 

@@ -3538,7 +3538,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The first-party packages developed in this repository are exactly five subtrees:
+The implemented first-party packages in this repository are exactly four vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3548,8 +3548,10 @@ pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
-pkg.kv             // candidate synchronous RESP2 GET/SET/DEL client
 ```
+
+`pkg.kv` is a synchronous RESP2 GET/SET/DEL design candidate, listed below separately. It has no
+vendorable source subtree until its reviewed implementation ships.
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
 versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
@@ -3682,14 +3684,29 @@ port `1..=65535`, connect timeout `1..=86400000000000` ns, I/O timeout in the sa
 response cap `0..=536870912`, all before DNS, allocation, or socket work. The cap is inclusive for
 a GET bulk or owned error payload; every non-error control line has a separate 64-byte cap. The
 endpoint, per-address connect timeout, per-blocking-read/write I/O timeout, and response cap are
-all caller-explicit. The connect timeout covers each post-DNS address attempt, not DNS or the whole
-address list; the I/O timeout covers one blocking wait for progress, not a whole command. Each
-key/value admits `0..=536870912` UTF-8 bytes, including embedded NUL/CR/LF. `SetOptions` has no
-default: `Always`,
+all caller-explicit. The connect timeout records a fresh monotonic start and positive budget for
+each usable post-DNS address, not DNS or the whole list, and forms no overflowable absolute
+deadline. Its shared prerequisite checks nonblocking installation and blocking restoration, closes
+and advances on failure, rounds each positive `poll` remainder up to milliseconds, rechecks an early
+zero, and lets immediate/readiness results win. Usable addresses are attempted in resolver order;
+first success wins, no usable entry makes the substrate return
+`AL_INVALID` and package source return `Io(core.Error.Invalid)`, and an all-failed list returns the
+last socket/connect/mode status. I/O-timeout installation failure closes the selected unpublished
+connection and does not try another resolved address. The I/O timeout rounds positive ns up to a
+normalized microsecond `timeval` and covers one blocking wait for progress, not a whole command;
+kernel scheduling may return later than either logical/option deadline. Each key/value admits
+`0..=536870912` UTF-8 bytes, including embedded NUL/CR/LF. `SetOptions` has no default: `Always`,
 `IfAbsent`, and `IfPresent` map to no condition, `NX`, and `XX`; `None` requests persistent SET and
 therefore removes an existing TTL, while `Some(ns)` requires `1..=i64::MAX` and emits checked
 `PX ceil(ns / 1000000)`. The two option records and condition sum are Copy and Pure. `Error` is
-Move only because `Server` owns its string; its other variants allocate nothing.
+Move only because `Server` contains an owned string. Empty GET/`Server` strings use canonical
+`{null, 0}` with no final result buffer; a nonempty result owns one. Its other variants allocate
+nothing.
+
+The same socket conversion reaches `std.http`. `process.command` shares the poll conversion and
+likewise uses monotonic start-plus-budget arithmetic for the complete positive-i64 range while
+retaining its existing post-syscall timeout-wins order. Every consumer preserves its zero-timeout
+behavior.
 
 The three commands emit only canonical uppercase bulk-array RESP2 `GET`, `SET`, and single-key
 `DEL`. GET returns an owned `Some(string)` or `None`; SET returns whether exact `+OK` or an admitted
@@ -3697,27 +3714,46 @@ conditional null reply applied the write; DEL admits only a signed-i64 integer w
 or one. Inputs are borrowed only for the call. The opaque client owns one TCP connection and
 package state plus one retained non-owning reader and writer shell; a successful connect retains
 exactly those four allocations. It is Move, non-Copy, and accepts exactly one call-bounded
-`borrow mut` operation at a time. Complete bounded `Server(string)` and complete framed non-UTF-8 `Decode` replies consume one
-whole response and leave it reusable. `Io`, `ResponseTooLarge`, `Protocol`, and first-reply EOF as
+`borrow mut` operation at a time. A complete bounded arbitrary-byte server-error frame is classified
+only after framing/trailing validation: UTF-8 becomes `Server(string)` and non-UTF-8 becomes
+`Decode`; a complete framed non-UTF-8 GET likewise yields `Decode`. These consume one whole response
+and leave it reusable. `Io`, `ResponseTooLarge`, `Protocol`, and first-reply EOF as
 `Closed` retire it before returning; every later operation returns `Closed` without I/O. `Invalid`
-precedes I/O, the first error wins, and Drop closes/frees the owner at most once.
-All four operations are Impure.
+precedes I/O, cleanup never replaces a selected terminal package error, and Drop closes/frees the
+owner at most once.
+All four operations are Impure. The per-unit resource record pins `client`, empty type parameters,
+arity zero, representation version one, `__align_resource_drop$pkg.kv$client`, and
+`b"align-res-drop-1"`. Existing cache scope remains exact: any own-source byte edit misses its
+frontend; a public interface edit misses transitive reverse dependencies, and
+a private dependency-body edit rebuilds that dependency and relinks while unchanged consumer
+frontend/objects hit; a semantic no-op may re-hit its structural object.
 
 V1 sends no PING, AUTH, SELECT, or HELLO and provides no TLS, RESP3 negotiation, generic command or
 reply value, pipeline, reconnect, redirect, replay, or hidden retry. It relies on the server's
-default RESP2 mode. Ordinary package source owns framing and parsing; no checked HIR or compiler
-operation is added. One package-internal runtime row remains planned and inactive while this
-contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both socket I/O
-timeouts and reuses ABI shape A04. SIGPIPE safety hardens the existing connection-derived
-`writer` in place: its unchanged write row keeps complete partial-write/EINTR/timeout behavior but
-uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`, while file and standard-stream writers keep their
-existing path. No writer ABI identity or count changes. The candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and
-closure matrix are `docs/impl/pkg-design/kv.md`; independent review has not yet accepted them.
+default RESP2 mode. Ordinary package source owns framing and parsing; no language builtin or
+checked-HIR/MIR operation is added. One package-internal runtime row remains planned and inactive
+while this contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both
+socket I/O timeouts and reuses ABI shape A04. It returns `AL_INVALID` for null then out-of-range
+input before fd access; compiler registry recognition of its fixed symbol supplies typed extern
+compatibility, collision, and reachability. Package source imports `std.process`, maps native status
+zero to success, `1..=4` to the four builtin error categories and `>=5` to `Code(status-5)`, and
+exhausts invalid-negative/admitted-negative/zero/positive/oversized reader counts against buffer-view
+length with checked i32 narrowing. Impossible status/count/view/output products call the existing
+`process.abort()` before parsing or publication and retain keyed `ProcessAbort`. SIGPIPE safety
+hardens the existing connection-derived `writer` in place: its unchanged write row keeps complete partial-write/EINTR/timeout behavior but
+uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and builder overloads reach that path,
+while file and standard-stream writers keep their existing path. No writer ABI identity or count
+changes. The timeout substrate and writer hardening are separate prerequisite capabilities; the
+new row lands with its package consumer. The revised
+candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
+`docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
+review has not yet accepted them.
 
-**First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
-live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer
-code, never ambiently resolvable: a consumer copies `pkg/web/` into their project exactly as they
-would a third-party dependency.
+**Implemented first-party packages** (developed in this repo and distributed with the system as
+vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design
+candidate such as `pkg.kv` joins that set only when its source ships. First-party packages are
+ordinary pkg-layer code, never ambiently resolvable: a consumer copies `pkg/web/` into their project
+exactly as they would a third-party dependency.
 
 ---
 

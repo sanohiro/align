@@ -12,20 +12,23 @@
 拡張してはならない。V1 は plaintext TCP 上の同期 RESP2 text-value client 1 個である。generic
 Redis command surface、protocol negotiation、compiler operation、ambient endpoint、hidden retry は
 加えない。package-internal かつ source-reachable な runtime 1 行で checked timeout installation を閉じる。
+この row の activate 前に shared connect/timeout substrate の checked fd-mode transition、
+start-plus-budget deadline arithmetic、`std.net`/`std.http`/`process.command` consumer の正の timeout の
+exact quantization を閉じる。
 既存 TCP-derived writer path は in-place に強化し、この package だけでなく全 `std.net` consumer が
 SIGPIPE-safe write を得る。
 
 | 公開表面 | exact input・default・検証・評価 | exact result・error・順序・effect | ownership・lifetime・allocation・cleanup | compiler/runtime/package owner・artifact・cache identity | prerequisite・acceptance owner |
 |---|---|---|---|---|---|
-| `pub resource client = pkg.kv.internal.resource.drop_client` | `connect` 成功時だけ構築される opaque non-null resource 1 個。nominal、Move、non-Copy、比較不能、print 不能で、public raw conversion/constructor はない。 | live value は同期 mutable operation を 1 個だけ許す。transport failure、oversized response、malformed/unexpected/truncated RESP reply は最初の error を返す前に close し、以後は I/O なしで常に `Error.Closed`。完全に framed された non-UTF-8 GET/error payload は例外として reusable `Decode`。public close operation は `Drop` だけ。 | resource は package state allocation 1 個と、live 中は runtime TCP connection、non-owning reader shell、non-owning unbuffered writer shell を各 1 個所有。live value の Move は 4 allocations 全部を移し、`borrow mut` は call-bounded で request overlap を排除。Drop は writer、reader の順に free し、socket を高々 1 回 close、state を厳密に 1 回 free。 | `pkg.kv` が nominal identity と synthesized Drop thunk、`pkg.kv.internal.resource` が private state と hook を所有。既存 resource interface identity は nominal name、representation version、Drop-thunk fingerprint を含む。 | 出荷済み opaque resource/TCP。formation/visibility、Move/Drop、control flow、malformed state、close-once、later-Closed、whole/per-unit、interface identity owner。 |
-| `pub ClientOptions { connect_timeout_ns: i64, io_timeout_ns: i64, max_response_bytes: i64 }` | field/source order は表示どおり exact。default なし。両 timeout は `1..=86400000000000` ns。`max_response_bytes` は `0..=536870912` で、GET bulk payload または owned RESP error payload の inclusive cap。 | Copy/Pure。不正 field は `connect` 中に field order で、DNS/allocation/socket work より前に `Error.Invalid`。正の 1 microsecond 未満の I/O timeout は出荷済み TCP の 1 microsecond clamp を継承。 | i64 field 3 個。borrow/allocation/Drop/retained ambient state なし。成功時は socket が設定済み I/O timeout を保持し、package state が response cap を保持。connect timeout は構築で消費。 | nominal 定義は `pkg.kv` owner。whole-program/per-unit interface は name と ordered fields を serialize し、完全な定義が interface/dependency/cache identity に入る。 | 出荷済み i64-ns duration/TCP timeout machinery。field/order/exact/next bound、no-default、sub-microsecond、whole/per-unit、cache owner。 |
+| `pub resource client = pkg.kv.internal.resource.drop_client` | `connect` 成功時だけ構築される opaque non-null resource 1 個。nominal、Move、non-Copy、比較不能、print 不能で、public raw conversion/constructor はない。 | live value は同期 mutable operation を 1 個だけ許す。transport failure、oversized response、malformed/unexpected/truncated RESP reply は選択した terminal error を返す前に close し、以後は I/O なしで常に `Error.Closed`。完全に framed された non-UTF-8 GET/error payload は例外として reusable `Decode`。public close operation は `Drop` だけ。 | resource は package state allocation 1 個と、live 中は runtime TCP connection、non-owning reader shell、non-owning unbuffered writer shell を各 1 個所有。live value の Move は 4 allocations 全部を移し、`borrow mut` は call-bounded で request overlap を排除。Drop は writer、reader の順に free し、socket を高々 1 回 close、state を厳密に 1 回 free。 | unit `pkg.kv` が interface resource record `{ name: "client", type_params: [], generic_arity: 0, representation_version: 1, drop_thunk: "__align_resource_drop$pkg.kv$client", drop_abi_fingerprint: b"align-res-drop-1" }` を所有し、`pkg.kv.internal.resource` が private hook/state を所有。全 field を serialize して interface identity に含める。 | 出荷済み opaque resource/TCP。formation/visibility、Move/Drop、control flow、malformed state、close-once、later-Closed、whole/per-unit、独立した 6-field interface mutation owner。 |
+| `pub ClientOptions { connect_timeout_ns: i64, io_timeout_ns: i64, max_response_bytes: i64 }` | field/source order は表示どおり exact。default なし。両 timeout は `1..=86400000000000` ns。`max_response_bytes` は `0..=536870912` で、GET bulk payload または owned RESP error payload の inclusive cap。 | Copy/Pure。不正 field は `connect` 中に field order で、DNS/allocation/socket work より前に `Error.Invalid`。正の connect remainder は `poll` が表現できる次の millisecond へ切り上げ、正の I/O timeout は `timeval` が表現できる次の microsecond へ切り上げる。どちらも早期 expire しない。 | i64 field 3 個。borrow/allocation/Drop/retained ambient state なし。成功時は socket が設定済み I/O timeout を保持し、package state が response cap を保持。connect timeout は構築で消費。 | nominal 定義は `pkg.kv` owner。whole-program/per-unit interface は name と ordered fields を serialize し、完全な定義が interface/dependency/cache identity に入る。 | 出荷済み i64-ns duration/TCP machinery と timeout-substrate prerequisite。field/order/exact/next bound、no-default、ns/ms/us boundary、whole/per-unit、cache owner。 |
 | `pub SetCondition { Always, IfAbsent, IfPresent }` | closed source/discriminator order は exact に `Always = 0`, `IfAbsent = 1`, `IfPresent = 2`。 | Copy/Pure。順に condition token なし、`NX`、`XX` に対応。integer/string selector や unknown fallback はない。 | Copy tag 1 個。borrow/allocation/Drop/retained state なし。 | nominal sum と interface discriminator order は `pkg.kv` owner。 | exact tag/order、construction/match、interface、malformed checked-HIR owner。 |
 | `pub SetOptions { condition: SetCondition, expires_in_ns: Option<i64> }` | field/source order は表示どおり exact。default なし。`None` は persistent value。`Some(ns)` は `1..=i64::MAX` で、checked `ceil(ns / 1000000)` により Redis `PX` millisecond へ変換。 | Copy/Pure。不正 expiry は request construction/I/O より前に `Error.Invalid`。`None` は意図的に plain `SET` を使い、Redis SET semantics に従って既存 key TTL を削除。 | Copy tag と i64 が 1 個ずつ、Copy condition 1 個。borrow/allocation/Drop/clock read/retained state なし。 | nominal 定義は `pkg.kv` owner。完全な reachable definition graph が通常の interface/dependency identity に入る。 | exact condition/expiry product、ns-to-ms boundary/overflow、persistence/TTL interop、interface/cache owner。 |
-| `pub Error { Invalid, Io(core.Error), Server(string), Decode, ResponseTooLarge, Protocol, Closed }` | closed source/discriminator order は表示どおり exact に `0..=6`。`Invalid` は caller input/options。`Io` は builtin transport category/code を変更せず保持。`Server` は完全な UTF-8 RESP error payload 1 個。`Decode` は完全に消費した non-UTF-8 bulk/error string。`ResponseTooLarge` は caller cap 超過の GET/error payload、またはそれ以外の admitted control line の 64 byte 超過。`Protocol` は malformed、unexpected、partial truncation、trailing framing/control data。`Closed` は reply byte より前の EOF、または retired client の後続利用。 | `Server` が string を所有するため Move。message synthesis/logging/retry/reconnect/redirect handling/second cleanup error はない。operation の最初の error が勝つ。完全で bounded な `Server` response と完全な `Decode` では synchronized client を再利用可能。`Invalid` は I/O 前。`Io`、`ResponseTooLarge`、`Protocol`、first-observation `Closed` は retire。 | allocation を所有するのは `Server` だけ。error の Move で移し、Drop が通常どおり free。reply view/scratch buffer は escape しない。他 variant は allocation なし。 | 通常 package sum identity。`Io` は tag を変えず always-available な `core.Error` identity を再利用。 | variant/payload/order/interface owner、全 producer x reuse/close state、owned-error escape/Drop、whole/per-unit、malformed-HIR owner。 |
-| `pkg.kv.connect(host: str, port: i64, options: ClientOptions) -> Result<client, Error>` | 引数は左から右に 1 回評価。nonempty かつ U+0000 なしの host、`1..=65535` の `port`、source order の option fields の順に、全 side effect より前に検証。host はそれ以外 byte-exact UTF-8 のまま system resolver へ渡す。URL/default host/port/database number/credential/environment/config file はない。 | 成功は TCP connection 1 個を確立し、保持する socket I/O timeout を両方 strict に設定し、reader、writer shell の順に構築して live client を返す。PING/AUTH/SELECT/HELLO その他 Redis byte は送信しない。native connect/configuration failure は `Error.Io(core.Error)`。`connect_timeout_ns` は resolved address ごとの socket-connect attempt を制限し、DNS と address list 全体の end-to-end deadline ではない。Impure。 | host は resolution 中だけ借用し、runtime の NUL-terminated resolver input へ一時的に 1 回 copy。成功は connection、reader shell、writer shell、package state の exact 4 allocations を保持。失敗した全 candidate socket と resolver allocation は runtime が cleanup。timeout configuration failure は wrapper/state 構築前に新 socket を close し、client を公開しない。wrapper/state OOM は hard-abort policy。 | 通常 package source は出荷済み `align_rt_tcp_connect`/free と planned unkeyed `align_rt_tcp_conn_set_io_timeout` の exact compatible extern を使う。新 ABI shape/checked-HIR operation/compiler recognition はない。 | 出荷済み TCP/resource と planned checked-timeout row。validation/no-side-effect、resolver/address ordering、per-attempt timeout、IPv4/IPv6 loopback、native status、strict timeout installation、construction order、cleanup、effect、whole/per-unit owner。 |
-| `pkg.kv.get(borrow mut owner: client, key: str) -> Result<Option<string>, Error>` | receiver、key の順に 1 回評価。live state、key length `0..=536870912`、checked canonical RESP request length の順に allocation/I/O より前に検証。request は bulk string のため empty UTF-8 key と embedded NUL/CR/LF を許す。 | exact uppercase 2-element RESP2 `GET` を送信。bulk reply は owned `Some(string)` 1 個、null bulk `$-1` は `None`、zero-length bulk は `Some("")`。完全な non-UTF-8 bulk は消費後 `Decode` を返し client を live のまま保つ。valid bounded `-` reply は `Server`、完全な non-UTF-8 error も reusable `Decode`。他 type/length/framing、partial EOF、current read 内の completed reply 後の byte は `Protocol`。1 byte 前の EOF は `Closed`。cap 超過を宣言した bulk は drain せず `ResponseTooLarge`。Impure。 | key は同期 write 中だけ借用し非保持。成功は ordinary owned result string 1 個を公開し、`None` は result allocation なし。retained reader/writer shell は synchronized success 後も存続し、receive chunk/line state/conversion storage/unpublished output は operation owner で全 exit 時に Drop。返す value は client/key/scratch を借用しない。 | package source が既存 TCP-derived writer、reader、buffer、UTF-8 row と exact compatible extern 上の RESP assembly/parser state を所有。generic writer prerequisite が全 connection-derived writer の SIGPIPE を抑止し、package-specific write row/runtime parser はない。 | official RESP2/GET semantics。independent wire vector、fragmentation/coalescing、null/empty/exact/next bound、UTF-8/NUL/CRLF、ownership/Drop、safe-write、error/reuse、loopback owner。 |
-| `pkg.kv.set(borrow mut owner: client, key: str, value: str, options: SetOptions) -> Result<bool, Error>` | receiver、key、value、options を左から右に 1 回評価。live state、key/value length を各 `0..=536870912`、condition、expiry、全 request-length/decimal calculation の順に allocation/I/O より前に検証。empty と embedded NUL/CR/LF の key/value byte は有効。 | canonical RESP2 `SET` 1 個を `SET key value`、optional `NX`/`XX`、optional `PX <ceil-ms>` の順で送信。exact `+OK` は `true`。null bulk `$-1` は `IfAbsent`/`IfPresent` だけ `false`、`Always` では `Protocol`。valid bounded UTF-8 `-` reply は `Server`、完全な non-UTF-8 error は reusable `Decode`。他 success spelling/type/integer/bulk/framing と current-read trailing byte はすべて `Protocol`。Impure。 | input は call 中だけ借用。request framing は bounded operation-owned decimal/header storage を使い、key/value は保持・clone せず直接 write。bool result は allocation なし。retained writer/reader shell は synchronized success 後も存続し、全 operation scratch は return 前に Drop。 | 通常 package source は hardened existing connection-derived writer と既存 read/buffer row を利用。atomic SET condition/expiry behavior と server clock は Redis owner。package は clock を読まない。 | official SET semantics。3 conditions x 2 expiry states、exact ns/ms edge、persistence/expiry behavior、collision/non-resurrection use、byte golden、partial-write/response failure、ownership/effect owner。 |
-| `pkg.kv.delete(borrow mut owner: client, key: str) -> Result<bool, Error>` | receiver、key の順に 1 回評価。live state、key length `0..=536870912`、canonical request arithmetic の順に I/O 前に検証。key byte admission は `get` と同じ。 | exact uppercase one-key RESP2 `DEL` を送信。値が 0 の valid RESP signed-i64 integer spelling（`0`、optional sign、leading zeros）は `false`、値 1 は `true`。他 value/overflow/reply type は `Protocol`。valid bounded UTF-8 `-` reply は `Server`、完全な non-UTF-8 error は reusable `Decode`。Impure。 | key は call-bounded で非保持。bool result と通常 request framing は value-sized allocation 不要。retained writer/reader shell は synchronized success 後も存続し、全 operation scratch は return 前に Drop。 | 同じ hardened existing writer/read boundary。package-specific write row/multi-key overload はない。 | official DEL semantics。0/1 の optional-sign/leading-zero spelling、negative/two/overflow/type mutation、error、fragmentation、ownership、effect、reuse owner。 |
+| `pub Error { Invalid, Io(core.Error), Server(string), Decode, ResponseTooLarge, Protocol, Closed }` | closed source/discriminator order は表示どおり exact に `0..=6`。`Invalid` は caller input/options。`Io` は builtin transport category/code を変更せず保持。`Server` は完全な UTF-8 RESP error payload 1 個。`Decode` は完全に消費した non-UTF-8 bulk/error string。`ResponseTooLarge` は caller cap 超過の GET/error payload、またはそれ以外の admitted control line の 64 byte 超過。`Protocol` は malformed、unexpected、partial truncation、trailing framing/control data。`Closed` は reply byte より前の EOF、または retired client の後続利用。 | `Server` が string を所有するため Move。message synthesis/logging/retry/reconnect/redirect handling/second cleanup error はない。package operation が terminal error を選択した後は cleanup error が置換しない。resolved-address iteration には後述の別の last-failed-candidate rule がある。完全で bounded な `Server` response と完全な `Decode` では synchronized client を再利用可能。`Invalid` は I/O 前。`Io`、`ResponseTooLarge`、`Protocol`、first-observation `Closed` は retire。 | nonempty `Server` は string allocation 1 個を所有し、empty `Server("")` は canonical `{null, 0}` owned string で result buffer allocation なし。Move は representation を移し、Drop は nonempty buffer を通常どおり free。reply view/scratch buffer は escape しない。他 variant は allocation なし。 | 通常 package sum identity。`Io` は tag を変えず always-available な `core.Error` identity を再利用。 | variant/payload/order/interface owner、全 producer x reuse/close state、empty/nonempty owned-error allocation/escape/Drop、whole/per-unit、malformed-HIR owner。 |
+| `pkg.kv.connect(host: str, port: i64, options: ClientOptions) -> Result<client, Error>` | 引数は左から右に 1 回評価。nonempty かつ U+0000 なしの host、`1..=65535` の `port`、source order の option fields の順に、全 side effect より前に検証。host はそれ以外 byte-exact UTF-8 のまま system resolver へ渡す。URL/default host/port/database number/credential/environment/config file はない。 | resolver の usable address を返却順に試し、unsupported family、null address、zero address length は skip し、最初の成功が勝つ。usable entry がなければ `Io(core.Error.Invalid)`、全 attempted entry が失敗すれば最後の socket/connect/mode-transition failure を返す。成功は checked nonblocking connect を完了し blocking mode を checked-restored した socket だけを公開し、保持する I/O timeout を両方 strict に設定し、reader、writer shell の順に構築して Redis byte は送らない。timeout configuration failure は既に選択した connection を close し、別の resolved address を試さない。DNS と aggregate address list には end-to-end deadline がない。Impure。 | host は resolution 中だけ借用し、runtime の NUL-terminated resolver input へ一時的に 1 回 copy。成功は connection、reader shell、writer shell、package state の exact 4 allocations を保持。失敗した全 candidate socket と resolver allocation は runtime が cleanup。timeout configuration failure は wrapper/state 構築前に新 socket を close し、client を公開しない。wrapper/state OOM は hard-abort policy。 | 通常 package source は出荷済み `align_rt_tcp_connect`/free と planned unkeyed `align_rt_tcp_conn_set_io_timeout` の exact compatible extern を使う。compiler registry は fixed-ABI compatibility/collision/reachability のため physical timeout symbol を認識するが、新 language builtin、checked-HIR/MIR operation、ABI shape、call-spelling selector はない。 | 出荷済み TCP/resource、timeout-substrate hardening、planned checked-timeout row。validation/no-side-effect、resolver ordering/skips/empty/mixed failure、checked mode transition、timeout quantization/precedence、IPv4/IPv6 loopback、native status、strict timeout installation、construction/cleanup/effect、whole/per-unit owner。 |
+| `pkg.kv.get(borrow mut owner: client, key: str) -> Result<Option<string>, Error>` | receiver、key の順に 1 回評価。live state、key length `0..=536870912`、checked canonical RESP request length の順に allocation/I/O より前に検証。request は bulk string のため empty UTF-8 key と embedded NUL/CR/LF を許す。 | exact uppercase 2-element RESP2 `GET` を送信。bulk reply は owned `Some(string)` 1 個、null bulk `$-1` は `None`、zero-length bulk は `Some("")`。完全な non-UTF-8 bulk は消費後 `Decode` を返し client を live のまま保つ。完全で bounded な `-` reply は framing 後、UTF-8 なら `Server`、それ以外は reusable `Decode`。他 type/length/framing、partial EOF、current read 内の completed reply 後の byte は `Protocol`。1 byte 前の EOF は `Closed`。cap 超過を宣言した bulk は drain せず `ResponseTooLarge`。Impure。 | key は同期 write 中だけ借用し非保持。nonempty GET 成功は ordinary owned string allocation 1 個を公開し、empty `Some("")` は canonical `{null, 0}`、`None` は result allocation なし。retained reader/writer shell は synchronized success 後も存続し、receive chunk/line state/conversion storage/unpublished output は operation owner で全 exit 時に Drop。返す value は client/key/scratch を借用しない。 | package source が既存 TCP-derived writer、reader、buffer、UTF-8 row と exact compatible extern 上の RESP assembly/parser state を所有。generic writer prerequisite が全 connection-derived writer の SIGPIPE を抑止し、package-specific write row/runtime parser はない。 | official RESP2/GET semantics。independent wire vector、fragmentation/coalescing、null/empty/nonempty allocation、exact/next bound、UTF-8/NUL/CRLF、ownership/Drop、safe-write、error/reuse、loopback owner。 |
+| `pkg.kv.set(borrow mut owner: client, key: str, value: str, options: SetOptions) -> Result<bool, Error>` | receiver、key、value、options を左から右に 1 回評価。live state、key/value length を各 `0..=536870912`、condition、expiry、全 request-length/decimal calculation の順に allocation/I/O より前に検証。empty と embedded NUL/CR/LF の key/value byte は有効。 | canonical RESP2 `SET` 1 個を `SET key value`、optional `NX`/`XX`、optional `PX <ceil-ms>` の順で送信。exact `+OK` は `true`。null bulk `$-1` は `IfAbsent`/`IfPresent` だけ `false`、`Always` では `Protocol`。完全で bounded な `-` frame は UTF-8 なら `Server`、それ以外は reusable `Decode`。他 success spelling/type/integer/bulk/framing と current-read trailing byte はすべて `Protocol`。Impure。 | input は call 中だけ借用。request framing は bounded operation-owned decimal/header storage を使い、key/value は保持・clone せず直接 write。bool result は allocation なし。retained writer/reader shell は synchronized success 後も存続し、全 operation scratch は return 前に Drop。 | 通常 package source は hardened existing connection-derived writer と既存 read/buffer row を利用。atomic SET condition/expiry behavior と server clock は Redis owner。package は clock を読まない。 | official SET semantics。3 conditions x 2 expiry states、exact ns/ms edge、persistence/expiry behavior、collision/non-resurrection use、byte golden、partial-write/response failure、ownership/effect owner。 |
+| `pkg.kv.delete(borrow mut owner: client, key: str) -> Result<bool, Error>` | receiver、key の順に 1 回評価。live state、key length `0..=536870912`、canonical request arithmetic の順に I/O 前に検証。key byte admission は `get` と同じ。 | exact uppercase one-key RESP2 `DEL` を送信。値が 0 の valid RESP signed-i64 integer spelling（`0`、optional sign、leading zeros）は `false`、値 1 は `true`。他 value/overflow/reply type は `Protocol`。完全で bounded な `-` frame は UTF-8 なら `Server`、それ以外は reusable `Decode`。Impure。 | key は call-bounded で非保持。bool result と通常 request framing は value-sized allocation 不要。retained writer/reader shell は synchronized success 後も存続し、全 operation scratch は return 前に Drop。 | 同じ hardened existing writer/read boundary。package-specific write row/multi-key overload はない。 | official DEL semantics。0/1 の optional-sign/leading-zero spelling、negative/two/overflow/type mutation、error、fragmentation、ownership、effect、reuse owner。 |
 
 ## 決定と範囲
 
@@ -114,12 +117,40 @@ I/O はしない。その後 key、存在する場合 value、condition、expiry
 
 2 timeout field は hidden wall-clock promise ではなく、次の exact substrate semantics を持つ。
 
-- `connect_timeout_ns` は synchronous DNS resolution 後の socket connect attempt ごとを制限する。
-  DNS と複数 resolved address の合計は制限しない。
+- `connect_timeout_ns` は synchronous DNS resolution 後、usable socket address ごとの最初の
+  `F_GETFL` 直前に fresh monotonic start と positive `Duration` budget を記録する。absolute
+  `start + budget` を作らないため、shared substrate の positive-i64 全域が overflow で
+  unbounded wait にならない。`connect` 前に `F_GETFL` と
+  `F_SETFL(O_NONBLOCK)` の両方を checked にする。失敗時は
+  mapped status を記録して candidate を close し、`connect` を呼ばず次の address へ進む。checked
+  installation 後に immediate `connect` を 1 回発行する。zero は success、
+  `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は wait に入り、他の全 errno は直ちに map する。どちらの
+  immediate terminal result も budget が同時に exhaust していても勝つ。in-progress path は正の
+  remaining duration を次の millisecond へ**切り上げ**、`i32::MAX` で saturate して `poll` する。
+  既に deadline へ達していれば `AL_TIMEOUT`、`EINTR` は remainder を再計算し、`poll` の zero return は
+  monotonic budget を再検査して時間が残れば再度 poll する。budget が exhaust した後は additional
+  `poll` call の前に `AL_TIMEOUT` を返す。他の poll error は直ちに map する。実行中の poll から返った
+  positive readiness/error event は budget が同時に exhaust していても勝ち、`SO_ERROR` で解決する。
+  immediate/polled connect の成功後は毎回 `F_GETFL` と
+  `F_SETFL(flags & !O_NONBLOCK)` の両方を checked にし、restoration failure は candidate を close して
+  mapped failure を記録する。blocking mode の checked restoration 前に socket を公開しない。
+  scheduler/kernel delay により requested instant より後に返り得るため、これは logical wait deadline
+  であって不可能な end-to-end wall-clock guarantee ではない。DNS と複数 resolved address の合計は
+  制限しない。
 - `io_timeout_ns` は checked package-internal TCP row により blocking socket の receive/send timeout
-  の両方へ設定。multi-read command 全体でなく、progress を待つ 1 blocking read/write を制限する。
-  timeout は `Error.Io(core.Error.Timeout)` を返し、request の partial send または response の
-  partial consume があり得るため client を close。
+  の両方へ設定。正の nanosecond 値はすべて次の microsecond へ**切り上げ**てから、normalized
+  `timeval { tv_sec, tv_usec: 0..999999 }` に分割する。exact microsecond は exact のままで、`0` は
+  この package の admitted range 外で既存の clear/no-timeout value のまま。kernel は option value
+  より遅く return を schedule し得る。multi-read command 全体でなく、progress を待つ 1 blocking
+  read/write を制限する。timeout は `Error.Io(core.Error.Timeout)` を返し、request の partial send
+  または response の partial consume があり得るため client を close。
+
+resolver order は observable。unsupported family、null address、zero address length は last failure を
+変えず skip する。最初に成功した usable address が勝つ。usable address がなければ substrate は
+`AL_INVALID` を返し、全 attempted candidate が失敗した場合は最後の socket、nonblocking-install、
+connect/poll/`SO_ERROR`、または blocking-restoration status を返す。package-level I/O-timeout installation
+はこの selection 後だけ行い、失敗時は selected unpublished connection を close して、resolution の
+再開や別 address の試行を行わず返す。後続 cleanup failure は選択済み error を置換しない。
 
 ## canonical RESP2 byte
 
@@ -157,7 +188,7 @@ parser は期待 command shape から開始するが、全 operation で RESP er
 - GET: `$-1\r\n`、または `$<one-or-more-digit nonnegative decimal>\r\n<payload>\r\n`。
 - SET: exact `+OK\r\n`、および conditional SET だけ `$-1\r\n`。
 - DEL: parse value が exact に 0 または 1 の signed-i64 integer frame。
-- 全 command: UTF-8 payload の `-<0..=max_response_bytes payload bytes>\r\n`。
+- 全 command: `-<0..=max_response_bytes arbitrary payload bytes>\r\n`。
 
 request length/count text は canonical unsigned ASCII。response bulk length は leading zero を含む
 1 digit 以上の unsigned decimal と、null 用 exact `-1` を受理。magnitude より先に digit grammar を
@@ -174,8 +205,9 @@ response decision order は固定。
 
 1. negative native read status は `Io(core.Error)`。response byte 前の EOF は `Closed`、prefix 後は
    `Protocol`。いずれも client を retire。
-2. 認識した `-` frame は読みながら bound。inclusive cap を越えれば `ResponseTooLarge`、drain せず
-   close。完全な non-UTF-8 error payload は `Decode`、それ以外は clone して `Server`。両方とも
+2. 認識した `-` frame は text classification より先に arbitrary byte として bound/framing する。
+   inclusive cap を越えれば `ResponseTooLarge`、drain せず close。terminal CRLF と same-read trailing
+   byte の検証後、完全な non-UTF-8 payload は `Decode`、それ以外は clone して `Server`。両方とも
    synchronization 完了結果なので connection は live。
 3. current command が許さない reply marker を拒否し、canonical line grammar と semantic value を
    検証。失敗はすべて `Protocol` で close。
@@ -183,8 +215,9 @@ response decision order は固定。
    `ResponseTooLarge`、drain せず close。payload と終端 CRLF を exact に読む。完全な non-UTF-8
    payload は client を live のまま `Decode`、それ以外は owned clone を公開。
 5. success/`Server`/`Decode` 公開前に、同じ native read 内で complete frame 後の trailing byte を
-   `Protocol` として拒否し close。後から来る unsolicited byte は future server reply と区別不能。
-   V1 は Redis の one-reply-per-command contract に依存し、pipeline はしない。
+   `Protocol` として拒否し close。UTF-8 classification と final clone はこの check 後だけ行う。
+   後から来る unsolicited byte は future server reply と区別不能。V1 は Redis の
+   one-reply-per-command contract に依存し、pipeline はしない。
 
 全 fragment は、package-only row で bypass せず、全 `std.net` consumer 向けに harden した既存の
 connection-derived `writer` を使う。private sink kind により Linux `send(MSG_NOSIGNAL)` または checked
@@ -198,6 +231,12 @@ positive-length zero progress は deterministic `core.Error.Code(0)`、option-in
 送らない。writer error は 0 byte 以上の request byte が peer に届いた後かもしれないため
 `Io(core.Error)` として close。GET/DEL でも automatic replay しない。cleanup は先の error を置換せず、
 Drop は後の close failure を報告できない。
+
+writer prerequisite は、macOS/BSD の failed-install/no-send から retry/success、2 個の overlapping shell
+について両順序の success/failure、option clear を伴わない shell Drop、setting を破棄する connection
+close を直接 own する。Linux/macOS subprocess owner は closed peer に対する direct writer、logger、
+`io.copy` route を覆い、signal termination でなく返却された `Error` を要求する。file/standard-stream
+parity と partial/EINTR/timeout/zero-progress owner は、これら state-transition test と独立に保つ。
 
 ## ownership・allocation・state・cleanup
 
@@ -232,9 +271,11 @@ SIGPIPE-ready transition が上記 failure/retry/close rule に従い、別 pack
 reader/writer shell は `connect` が 1 回構築し、per-command shell allocation なしで再利用。request header
 と decimal text は bounded operation storage。key/value byte は call-bounded `str` view
 から write し非保持。receive chunk と framing state は response cap + fixed protocol overhead で bounded。
-GET 成功または Server error は complete frame synchronization 後に ordinary owned string result 1 個を
-allocate。V1 は consuming buffer-to-string freeze を加えないため、peak storage に N-byte receive buffer
-と N-byte final owned copy の両方を含み得る。全 native receive buffer は first read 前に実際の
+nonempty GET 成功または `Server` error は complete frame synchronization 後に ordinary owned string
+result 1 個を allocate。empty `Some("")` または `Server("")` は final buffer allocation なしで canonical
+`{null, 0}` owned string を公開する。V1 は consuming buffer-to-string freeze を加えないため、nonempty
+result の peak storage に N-byte receive buffer と N-byte final owned copy の両方を含み得る。全 native
+receive buffer は first read 前に実際の
 `buffer.capacity()` と requested positive capacity を比較し、不一致は EOF に見せず OOM policy で
 hard-abort。intermediate raw/source buffer は unpublished で、全 error 時に最初に Drop。OOM は言語の
 既存 hard-abort contract。live client が保持する exact 4 allocations を除き、per-command scratch/result
@@ -242,7 +283,9 @@ allocation-count、zero-copy receive、zeroization、throughput、latency は約
 
 ## package・runtime・artifact・cache boundary
 
-vendorable subtree は root `pkg.kv` と `pkg.kv.internal.resource` を所有する。internal source は既に
+vendorable subtree は root `pkg.kv` と `pkg.kv.internal.resource` を所有する。internal module は
+`std.process` を import し、impossible native state はすべて `process.abort()` を呼ぶ。extern の新設や
+recoverable package error への変換ではなく、出荷済み keyed `ProcessAbort` row を選ぶ。source は既に
 keyed な TCP connect/free/reader/writer、I/O read/write/free、buffer new/bytes/capacity/free row と、
 planned で source-reachable な unkeyed row 1 個について exact type-compatible extern declaration を使う。
 
@@ -271,18 +314,44 @@ FFI `str`/`slice<u8>` は data pointer だけを供給するため、隣接す�
 TcpConnSetIoTimeout  align_rt_tcp_conn_set_io_timeout  i32(ptr, i64)  // ABI A04
 ```
 
-`TcpConnSetIoTimeout` は non-null live connection と `1..=86400000000000` の timeout を要求する。
-最初に `SO_RCVTIMEO` を設定し、失敗すれば `SO_SNDTIMEO` を試さず fixed errno-mapped status を返す。
+`TcpConnSetIoTimeout` は最初に null connection を `AL_INVALID` で拒否し、その後
+`1..=86400000000000` 外の timeout を `AL_INVALID` で拒否する。どちらも fd を読まず
+`setsockopt` を呼ばない。non-null dangling pointer は unsafe native ABI provenance contract の外で、
+検出不能。admitted input では上記 normalized positive-timeout `timeval` を構築し、最初に
+`SO_RCVTIMEO` を設定する。失敗すれば `SO_SNDTIMEO` を試さず fixed errno-mapped status を返す。
 成功時だけ `SO_SNDTIMEO` を設定してその status を返し、両方成功した場合だけ zero。第二 option
-失敗時は第一が設定済みだが、package は unpublished connection を直ちに close するため、他 operation
-との overlap も rollback もない。この row は
-allocation/retain/close をしない。mandatory base export、source-reachable compatible extern、
-collision-reserved unkeyed identity である。既存 ABI shape を再利用するため、activation は exact
-base/maximum count を 347/355 から 348/356 に変え、keyed count は 330 のまま、A123 は次の
-unreserved shape のまま。
+失敗時は第一が設定済みだが、package は別の resolved address を retry せず unpublished connection を
+直ちに close する。configuration は他 operation と overlap せず rollback 不要。parameterized direct-runtime
+owner は exact `timeval`、option order、option call count、returned status、
+`{receive failure, send failure, both succeed}` state product を固定し、第二 case 後の package
+close/no-publish behavior も含む。この row は allocation/retain/close をしない。mandatory base export、
+source-reachable compatible extern、collision-reserved unkeyed identity である。既存 ABI
+shape を再利用するため、activation は exact base/maximum count を 347/355 から 348/356 に変え、keyed
+count は 330 のまま。unkeyed count は 18、そのうち source-reachable は 13 になり、A123 は次の
+unreserved shape のまま。LLVM/Rust definition は既存の A04/default-C-calling-convention contract を
+使い、curated function/return/parameter attribute はない。
 
-既存 `TcpConnWriter`/`IoWriterWrite`/`IoWriterFree` の identity、declaration、attribute、count は不変。
-private runtime `Writer` に socket sink kind を加え、`align_rt_tcp_conn_writer` だけが設定する。この kind
+通常 package source は全 native status を明示的に decode する。常に `core.Error.Code(status)` を構築する
+`error(status)` は使用できない。i32-status row では zero が success、`1`、`2`、`3`、`4` は順に
+`NotFound`、`Invalid`、`Denied`、`Timeout`、`5..=i32::MAX` は `Code(status - 5)`。負の i32 status は
+impossible ABI result として hard-abort。reader result は正の byte 数、zero EOF、または負で encode
+された status。source は parser state を変更する前に分類する。`i64::MIN` と
+`-(i32::MAX as i64)` より小さい全 value は buffer view を inspect する前に abort。admitted negative は
+checked-negate して明示的に i32 へ narrow し、empty buffer view を要求してから同じ status table を
+適用する。zero は empty view を要求して EOF を意味する。positive count は最初に requested buffer
+capacity 以下であることを要求し、次に parsing 前に同じ length の view を要求する。oversized positive
+count、または negative/zero/positive のいずれかと view length の mismatch は abort する。runtime が
+view pointer provenance を所有し、matching non-null pointer の forged value は unsafe native ABI contract
+の外で検出不能。`align_rt_tcp_connect` では zero は non-null output connection を要求し、
+nonzero は null を要求する。矛盾した status/pointer product は ownership change 前に hard-abort。
+全 category sentinel、`Code(0)`、representative positive code、signed-width boundary、byte-count/view
+product、malformed product に独立 owner を置く。各 hard-abort branch は explicit `std.process`
+dependency を使う通常 package source であり、後続の parsing/publication/ownership change より前に exercise する。
+
+既存 `TcpConnWriter`/`IoWriterWrite`/`IoWriterWriteBuilder`/`IoWriterFree` の identity、declaration、
+attribute、count は不変。`IoWriterWriteBuilder` は引き続き `IoWriterWrite` へ delegate するため、
+source-visible builder overload も同じ sink policy に到達する。private runtime `Writer` に socket sink
+kind を加え、`align_rt_tcp_conn_writer` だけが設定する。この kind
 からの nonempty write は上記 SIGPIPE-safe send policy を使い、成功した `SO_NOSIGPIPE` だけを cache。
 他 constructor は byte-identical な fd path を維持。option は monotone な per-socket setting で、overlap
 する shell は各々試行でき、各 shell は自身の成功後だけ送信し、失敗した shell は retryable。shell Drop
@@ -290,18 +359,27 @@ private runtime `Writer` に socket sink kind を加え、`align_rt_tcp_conn_wri
 hidden write を行わず socket を close せず、connection close が fd と option を破棄する。
 
 source extern compatibility は各 registry row の exact LLVM type/attribute/symbol/runtime definition を
-再利用し、第二 physical symbol を宣言せず collision check を bypass しない。package は HIR/MIR variant、
-compiler-recognized function spelling、reflection table、static artifact、schema input、environment option
-を加えない。`docs/impl/19-hir-validation-ledger.md` は不変。`docs/impl/20-runtime-abi-ledger.md` は exact
-1-row inactive delta を reserve し、ABI を変えない既存 writer hardening を pin する。
+再利用し、第二 physical symbol を宣言せず collision check を bypass しない。compiler は
+`align_rt_tcp_conn_set_io_timeout` を fixed physical ABI symbol として認識する一方、package は language
+builtin、HIR/MIR variant、call-spelling capability selector、reflection table、static artifact、schema input、
+environment option を加えない。`docs/impl/19-hir-validation-ledger.md` は不変。
+`docs/impl/20-runtime-abi-ledger.md` は exact 1-row inactive delta を reserve し、ABI を変えない既存
+writer hardening を pin する。
 
 whole-program compilation は通常 package body を見る。per-unit compilation は resource、
 `ClientOptions`、`SetCondition`、`SetOptions`、`Error`、public signature 4 個を serialize し、producer
 object は resource Drop thunk と既存 native dependency を保持。現 capability collection は module-wide
-なので、どの operation を使っても root/internal TCP/I/O/buffer set 全体を保持し、call-spelling selector
-で変わらない。package source/interface と dependency implementation hash が通常 object/link/cache
-identity を決める。endpoint/resolver result/response/clock/source file/runtime inspection は artifact
-identity に入らない。
+なので、どの operation を使っても root/internal TCP/I/O/buffer と keyed `ProcessAbort` set 全体を保持し、
+call-spelling selector で変わらない。通常 per-unit cache identity では、unit の source byte に対する全 edit がその unit の
+frontend key を miss する。semantic private-body edit はその unit の structural object も miss し、
+final link は変更済み object を消費する一方、consumer は private implementation hash でなく dependency
+interface hash に依存するため unchanged frontend/object が hit する。exported-surface edit は interface
+hash を変え、transitive interface set にそれを含む全 reverse dependency の frontend/object を miss
+させる。span-erased semantic MIR が不変の source-only edit は structural object に再 hit できる。
+exact revert は以前の key に再 hit でき、unrelated unit は一貫して hit。whole-program mode は通常の
+complete-source identity を維持する。endpoint、resolver result、response、clock、ambient/runtime-inspected
+source file、runtime inspection は artifact identity に入らず、vendored package source 自体は explicit
+input である。
 
 現 function-value subset は scalar-only。この resource/reference/string/owned-Result signature は local、
 aggregate field、control-joined function value を形成できず、V1 は例外を加えない。`pkg.kv` のない
@@ -328,33 +406,36 @@ consumer と exact ledger を要し、ここで string/option tag の背後に r
 
 ## 実装 closure matrix
 
-generic TCP-writer hardening は、既に出荷済みの `std.net` consumer と閉じた signal-safety failure
-domain を持つ distinct prerequisite capability なので、package より先に independently useful な PR
-として land する。public signature/ABI identity は変更しない。残る client/resource/parser/3 command
-は 1 本の strict producer-to-consumer chain。parser-only または
-connection-only PR は stable public consumer を残さず、command 分割は同じ synchronization/poisoning/
-fake-server/capability/Drop proof を重複させる。adversarial owner matrix を含め capability はおよそ
-1,000 changed hand-written lines を超え得るが、全 reply kind が publication 前に同じ state machine で
-閉じるため、1 boundary の方が integration risk が低い。
+shared timeout substrate が最初の distinct prerequisite capability。positive connect deadline を
+enforceable にし、nonblocking connection の公開を防ぎ、ABI identity を変えずに既に出荷済みの
+`std.http`/`std.net` consumer の shared connect/I/O quantization を修正する。generic TCP-writer
+hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite で、
+同様に public signature/ABI identity を変更しない。残る新 timeout row と
+client/resource/parser/3 command は 1 本の strict producer-to-consumer chain。dormant row、parser-only、
+connection-only package PR は stable public consumer を残さず、command 分割は同じ
+synchronization/poisoning/fake-server/capability/Drop proof を重複させる。adversarial owner matrix を含め
+package capability はおよそ 1,000 changed hand-written lines を超え得るが、全 reply kind が publication
+前に同じ state machine で閉じるため、1 boundary の方が integration risk が低い。
 
 | axis | 必須 closure | owner evidence |
 |---|---|---|
 | public formation・identity | exact module/resource/record/sum definition、field/discriminator order、4 signature、qualification、visibility、direct/imported call、generic consumer-wrapper monomorphization、現 function-value rejection、whole/per-unit interface parity。 | public-source extraction、positive consumer compile/run、near-spelling/type/arity negative、monomorphic/generic-wrapper parity、interface round-trip、generic alias control。 |
-| connect・option admission | host/U+0000、port、ordered option bound 3 個、exact/next boundary、complete validation 前 side effect なし、DNS + per-address timeout semantics、timeout application、全 native status、reader-then-writer-then-state construction、IPv4/IPv6、Redis byte なし。 | instrumented connect/runtime counter と loopback listener、resolver/refused/timeout/malformed/retained-allocation/allocation-cleanup failpoint。 |
+| shared timeout substrate | absolute deadline を作らない positive-i64 全域の monotonic start-plus-budget arithmetic。per-address ceil-ns-to-ms `poll` conversion、zero-result recheck、exhaustion 後の poll なし、immediate/readiness precedence、checked nonblocking install/blocking restore、candidate close/continuation。`process.command` は同じ start/budget と ceil conversion を使い、従来の timeout-wins checkpoint order を維持。`std.net`/`std.http` が共有する positive socket timeout は ns を normalized `timeval` microsecond へ ceil。全 zero-timeout behavior は不変。 | direct exact/next/maximum ns/us/ms/chunk/deadline owner。immediate/polled success の `F_GETFL`/`F_SETFL` install/restore failpoint、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` と他の immediate errno、early zero-result と exhausted/no-call poll、EINTR、readiness-at-deadline、mixed-address、no-publication/blocking-mode、command capture/reap、HTTP plain/TLS/pool-rearm probe。 |
+| connect・option admission | host/U+0000、port、ordered option bound 3 個、exact/next boundary、complete validation 前 side effect なし、DNS + ordered/skipped/empty/first-success/last-failure address semantics、address retry なしの timeout application、全 native status/pointer product、reader-then-writer-then-state construction、IPv4/IPv6、Redis byte なし。 | instrumented connect/runtime counter と loopback listener は socket failure、nonblocking GET/SET failure、immediate errno、poll error/timeout、`getsockopt` failure/nonzero `SO_ERROR`、blocking-restore GET/SET failure、各 failure 後の skipped entry、later success を parameterize し、各 vector の last attempted status と close count を固定。malformed status/pointer、retained-allocation、allocation/cleanup failpoint が残る product を閉じる。 |
 | request byte | exact GET/SET-product/DEL array、uppercase token、canonical decimal、value-sized request copy なしの 512-MiB admission、embedded NUL/CR/LF、first write 前の全 arithmetic。 | independent semantic-to-byte golden、boundary/mutation table、fragmented writer、partial-write owner。 |
 | reply framing | 全 marker、leading zero/integer sign を含む official bulk/integer grammar、64-byte control cap、CRLF、fragmented/coalesced read、null/empty/exact/next cap、error cap、trailing byte、全 ordinal の EOF、quadratic scan なし。 | deterministic scripted TCP peer による one-byte/all-split/multi-part product、independent byte-to-semantic golden、comparison counter。 |
-| GET semantics | bulk/null/empty ownership、exact byte、full consumption 後 UTF-8 decode、Decode reuse、wrong kind/oversized declaration close。 | official vector + valid/invalid UTF-8、lifetime escape、subsequent command、allocation/Drop、no-drain probe。 |
+| GET・error semantics | bulk/null/empty ownership、exact byte、arbitrary bounded error byte、framing/trailing validation 後だけ UTF-8 classification、Decode reuse、wrong kind/oversized declaration close。 | official vector + empty/nonempty valid/invalid UTF-8、empty `Server`/GET allocation/Drop、lifetime escape、subsequent command、no-drain probe。 |
 | SET semantics | Always/NX/XX x None/Some、condition-before-PX wire order、ceil-ns conversion、persistent TTL removal、+OK/null result matrix、server error、unexpected status。 | scripted byte + collision/expiry/refresh-without-resurrection/exact-next duration/wrong-reply product の Redis-compatible state model。 |
 | DEL semantics | one-key request、0/1 の全 official signed/leading-zero spelling、server error、他の全 value/type。 | false/true と sign/leading-zero/negative/two/overflow/type mutation matrix、reuse/close check。 |
-| error・poison state | I/O 前 Invalid、bounded UTF-8 Server/full-bulk Decode は reusable、Io/too-large/protocol/truncation/partial-write は close、first error 保持、以後の全 call は zero I/O の Closed。 | error-producer x command x before/during/after-frame x reuse table、native call counter、first-error/cleanup-failure probe。 |
+| error・native status・poison state | I/O 前 Invalid。bounded UTF-8 Server と complete non-UTF-8 Decode は reusable。exact `0/1/2/3/4/>=5` status decode。reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x exact/mismatched view product と checked i32 narrowing。Io/too-large/protocol/truncation/partial-write は close。selected terminal error を cleanup より保持。以後の全 call は zero I/O の Closed。全 impossible product は parser/publication/ownership change 前に `process.abort` へ到達。 | error-producer x command x before/during/after-frame x reuse table。全 category/representative code/width/count/view/malformed product、native call counter、explicit `ProcessAbort` IR/capability retention、no-import negative、selected-error/cleanup-failure probe。 |
 | ownership・cleanup | resource formation、move-in/out/return/replacement、if/match/else/?/map_err/branch/loop/early return、source nulling、state/socket/wrapper/scratch/result の Drop once、malformed state は untrusted call なし。 | resource/drop counter、allocation parity、parameterized control-flow owner、state semantic-to-byte/byte-to-semantic golden、malformed field product。 |
-| ABI・effect・capability・cache | 既存 row の exact compatible reuse と `TcpConnSetIoTimeout` の atomic activation、strict timeout status、既存 connection-writer の sink provenance と partial/EINTR/zero/EPIPE/timeout mapping、writer ABI/count を変えない Linux/macOS SIGPIPE safety、新 ABI shape/HIR row なし、Impure operation、module-wide native retention、package absence、source/interface/dependency edit invalidation。 | exact registry/golden/base-export/type/collision/source-reuse owner、file/std/socket writer-kind parity、Linux/macOS subprocess closed-peer signal owner、package whole/per-unit IR/link run、effect check、no-package negative、add/remove/edit/revert cache twin。 |
+| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation、exact receive-then-send option state product、default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、exact-timeval、receive-fail/no-send、send-fail/receive-retained/package-close/no-address-retry、both-success owner。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
 
 ## source of truth と author consistency pass
 
 `../kv.md` の英語 ledger、`docs/impl/pkg-design/ja/kv.md`、`draft.md`、`docs/language-spec.md`、
 `docs/design-notes.md`、`docs/history.md`、`docs/open-questions.md`、`docs/impl/07-roadmap.md`、
-`docs/impl/std-design/net.md` とその日本語ミラー、`docs/impl/20-runtime-abi-ledger.md`、`HANDOFF.md` は
+`net`/`http`/`process` の英語・日本語 `std-design` 文書、`docs/impl/20-runtime-abi-ledger.md`、`HANDOFF.md` は
 一致しなければならない。HIR ledger は不変。
 exact 1-row reservation を越える ABI change、または public writer-surface change はこの design を reopen する。
 
@@ -362,7 +443,8 @@ candidate review 中は `docs/open-questions.md` がこの項目を Open に置�
 entry はない。acceptance 時は exact reviewed contract を Settled へ移し、history record を追加し、
 各 candidate status を accepted/inactive の該当状態へ変更してから implementation を許可する。
 
-独立 review 前の author-side pass は 2026-09-02 に完了:
+finding ledger の repair 後、revised author-side ledger-to-prose および closure-matrix consistency pass は
+fresh complete review 前の 2026-09-02 に完了:
 
 - 全 public argument/result に exact type、evaluation order、default、ownership、lifetime、allocation、
   cleanup、error、effect rule が 1 個ずつある。
@@ -370,11 +452,18 @@ entry はない。acceptance 時は exact reviewed contract を Settled へ移�
   discriminator、unavailable-result product が exhaustive。
 - host/key/value/error text の UTF-8、embedded-NUL、CR/LF、boundary validation、pre-side-effect semantics が固定。
 - multi-invalid call の state/host/port/option/key/value/condition/expiry/wire と native/reply/error precedence が deterministic。
-- endpoint/credential/database/retry/clock/resolver result/configuration/artifact/source input は ambient でない。
+- shared connect、HTTP socket、command-capture timeout consumer の start/budget arithmetic、ceil conversion、
+  zero-result/exhaustion behavior、それぞれの terminal-event precedence が固定。
+- native status、reader count x view、connect status x output、receive/send option-call product が exhaustive。
+  impossible product は parsing/publication/後続 ownership change 前に explicit existing
+  `std.process`/`ProcessAbort` dependency へ到達。
+- endpoint/credential/database/retry/clock/resolver result/configuration/artifact/runtime-inspected source input は
+  ambient でなく、vendored package file は explicit compiler input のまま。
 - canonical RESP scalar/tag/sequence order/malformed rejection、independent semantic-to-byte と byte-to-semantic golden が固定。
 - resource record/RESP state machine の全 state/tag/reserved/pointer/length product、overlap exclusion、
   failed-second-operation behavior、error preservation、Drop order が固定。
-- exact existing producer-owned runtime row が reflection/artifact I/O なしで native state を供給。
+- exact existing producer-owned runtime row が reflection/artifact I/O なしで native state を供給し、
+  slice/builder writer overload は同じ hardened sink へ合流。
 - example は accepted syntax を使い declaration と positional call を分離。
 - acceptance owner が全 ledger invariant を覆い、約束していない benchmark を gate にしない。
 
@@ -386,4 +475,25 @@ official protocol/command reference: Redis
 
 ## design-review finding-to-fix ledger
 
-独立 review は未実施。finding はまずこの ledger を変更し、その後全 source of truth へ 1 pass で伝播する。
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...45a5cea85579c2dd5170cd6e41958f114bcad3c3`
+を exact base とする独立 review は P1 1 件、P2 10 件、P3 1 件を返した。この ledger が authoritative
+repair を記録する。fresh complete review が design を accept する前に、全 row を日本語 mirror と
+synchronized summary へ伝播しなければならない。
+
+| finding | authoritative correction・closure owner |
+|---|---|
+| P1 unchecked connect fd mode | independently useful な shared-timeout prerequisite を加える。checked `F_GETFL`/`F_SETFL` install/restore、failure 時の close-and-continue、checked blocking restoration 前の publication 禁止。direct immediate/polled failpoint が全 transition を own。 |
+| P2 timeout quantization/precedence | positive-i64 全域に monotonic start-plus-budget arithmetic を使う。positive connect と `process.command` wait は ns を millisecond へ ceil し early zero を recheck。connect は immediate/readiness event を優先し、command は従来の timeout-wins checkpoint を維持。positive `std.net`/`std.http` I/O option は ns を normalized microsecond へ ceil。exact/next/maximum と readiness-at-deadline owner が全 shared consumer を pin。 |
+| P2 multi-address selection | usable resolver entry を順に試し first success を返す。none なら substrate は `AL_INVALID` を返し package source が `Io(core.Error.Invalid)` へ map、attempted failure があれば最後の socket/connect/mode failure を返す。post-selection timeout configuration は resolution を restart しない。mixed-failure owner が ordering と native/package error layer を pin。 |
+| P2 native status decode | package source は fixed `0/1/2/3/4/>=5` table を実装し、checked i32 narrowing を伴う invalid-negative/admitted-negative/zero/positive reader count x view-length product を exhaust し、connect-status/output product を検査し、全 impossible ABI result に explicit `std.process`/`ProcessAbort` dependency を使う。category/code/width/product と whole/per-unit capability owner が閉じる。 |
+| P2 new-row malformed input | `TcpConnSetIoTimeout` は最初に null、その後 inclusive timeout range を検証し、fd access 前に `AL_INVALID` を返す。dangling non-null provenance は unsafe precondition のまま。direct runtime evidence は null x range product に加え、exact `timeval` と receive-fail/no-send、send-fail/receive-retained、both-success の option-call product を覆う。package は second-option failure を publication/address retry なしで close。 |
+| P2 RESP error grammar | arbitrary bounded error byte を最初に frame し、same-read trailing byte を検証してから UTF-8 `Server` または non-UTF-8 reusable `Decode` を選ぶ。empty/invalid UTF-8 と trailing-byte vector が distinction を own。 |
+| P2 empty owned allocation | empty GET/`Server` result は final buffer なしの canonical `{null, 0}`。nonempty result だけが 1 個を所有。empty/nonempty allocation/Drop counter が rule を own。 |
+| P2 SIGPIPE state evidence | failed-install/no-send→retry、overlapping-shell order、Drop/no-clear、connection-close、applicable platform 上の direct slice/builder/logger/`io.copy` closed-peer owner を加える。既存 `IoWriterWriteBuilder` identity は不変で、hardened write row へ delegate する。 |
+| P2 physical-symbol recognition | exact ABI compatibility/collision/reachability のため compiler registry recognition を維持する一方、language builtin、HIR/MIR operation、ABI shape、call-spelling selector を加えない。wrong-type/collision/source-reuse owner が pin。 |
+| P2 resource interface identity | non-generic `pkg.kv.client` の serialized field 6 個すべてを pin。exact generated thunk と `b"align-res-drop-1"` を含み、interface owner で各 field を独立に mutate。 |
+| P2 cache identity | own-source byte edit は frontend を miss。semantic private-body edit は自身の object/final link を miss する一方 consumer frontend/object は hit。public interface edit は transitive reverse dependency を miss。source-only semantic no-op は object-hit 可。exact edit/revert cache twin が各 scope を own。 |
+| P3 package inventory | source 出荷前、normative summary は implemented vendorable subtree 4 個と design candidate `pkg.kv` を分けて記載。 |
+
+P1 が capability boundary と timeout strategy を変更するため、acceptance には complete revised diff の
+fresh full review が 1 回必要。candidate status はその review が clean になるまで Open のまま。

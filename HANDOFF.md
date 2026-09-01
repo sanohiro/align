@@ -16,7 +16,9 @@ implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented a
 `docs/impl/core-design/codec.md`; `pkg.frame` is implemented against
 `docs/impl/pkg-design/frame.md`; and `pkg.auth` is implemented against
 `docs/impl/pkg-design/auth.md`. The exact `pkg.kv` public-contract design candidate is authored in
-`docs/impl/pkg-design/kv.md`; independent review is next, and no public contract is accepted yet.
+`docs/impl/pkg-design/kv.md`. Its first independent review reopened the shared
+timeout/native/cache axes; the ledger-first repair is complete. A fresh complete review of the
+revised candidate is next, and no public contract is accepted yet.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -346,8 +348,8 @@ facts must live in this repository.
 - **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
   in-language test runner, bounded data/protocol library wave (`core.codec`,
   `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact
-  design candidate and remains the next language capability; independent review is pending.
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact revised
+  design candidate and remains the next language capability; fresh complete review is pending.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
@@ -403,12 +405,18 @@ facts must live in this repository.
   independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
   whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
   new compiler/runtime ABI or ambient clock/provider/key/session owner.
-- **Next language capability:** independently review the exact `pkg.kv` public-contract candidate
-  in `docs/impl/pkg-design/kv.md`. It specifies one synchronous plaintext RESP2 Move client,
-  explicit connect/I/O timeouts and response cap, owned-string GET, conditional/expiring SET,
-  one-key DEL, fail-closed synchronization, one planned generic TCP row for checked timeout
-  installation, and in-place SIGPIPE hardening of the existing connection-derived writer. TLS and the wider Redis surface remain
-  deferred. No public surface is accepted yet.
+- **Next language capability:** complete a fresh independent review of the revised exact `pkg.kv`
+  public-contract candidate in `docs/impl/pkg-design/kv.md`. The first exact-SHA review found an
+  unenforceable positive-connect bound from unchecked `F_GETFL`/`F_SETFL`, plus timeout/address,
+  native-status/ABI, RESP/allocation, SIGPIPE-owner, interface/cache, and inventory gaps. The repair
+  adds a first shared timeout-substrate prerequisite (full-range start-plus-budget arithmetic,
+  checked mode transitions, ceil/rechecked connect waits, resolver-order first-success/last-failure,
+  positive socket I/O ns ceil to microseconds, and the shared `process.command` poll conversion), a
+  second in-place SIGPIPE writer prerequisite across slice/builder writes, then one
+  compiler-recognized generic timeout row with the ordinary-source RESP package. Impossible native
+  products use its explicit existing `std.process`/`ProcessAbort` dependency. The public client remains synchronous plaintext RESP2 with
+  explicit timeouts/cap, owned-string GET, conditional/expiring SET, one-key DEL, and fail-closed
+  synchronization. TLS and the wider Redis surface remain deferred. No public surface is accepted.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

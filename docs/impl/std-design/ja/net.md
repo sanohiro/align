@@ -172,7 +172,9 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 > その場でデッドラインを設定し、その満了を reader/writer のバイト経路が `Err(Error.Timeout)` として表面化する。
 > raw な `tcp.connect(host, port)` サーフェスはタイムアウト無しのままでリテラル `0` を渡す。`std.http` の
 > `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は #634 で出荷済みで、同じ
-> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。
+> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。下記の design-candidate
+> prerequisite はこの public surface や ABI identity を変えず、positive-timeout の mode transition と
+> quantization を厳密化する。
 
 `std.http` のリクエスト単位タイムアウト(http.md「I/O timeouts」)は net 基盤（レール）に載るので、基盤はここで
 設計する;net は raw-socket 呼び出し側向けにこれを直接も公開する。動機は `align-llm` の LLM API 呼び出し
@@ -197,9 +199,11 @@ read/write 箇所はデッドライン武装済みの `EAGAIN` を明示的に `
 
 ### Connect timeout — the shared substrate
 
-**connect** デッドラインは `align_rt_tcp_connect`(ランタイム `:679`;現在は「no connect timeout」、`:621`)に
-宿る:これが `timeout_ns` パラメータを得る — non-blocking `connect` → `EINPROGRESS` → ns デッドラインで
-`poll(POLLOUT)` → `SO_ERROR` を確認;poll タイムアウトは `AL_TIMEOUT` を返す。`timeout_ns == 0` は現在の
+**connect** デッドラインは `align_rt_tcp_connect` に宿る: positive `timeout_ns` は
+non-blocking mode を使う。immediate zero は成功、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は
+`poll(POLLOUT)` へ入り、その他の immediate errno は map する。readiness は `SO_ERROR` で解決し、poll
+timeout は `AL_TIMEOUT` を返す。下記 inactive prerequisite が mode installation/restoration を checked にする。
+`timeout_ns == 0` は現在の
 ブロッキング connect を正確に保つ。`std.http` はこの同じパラメータを通して有効リクエストタイムアウトを渡す。
 raw-`net` の `tcp.connect(host, port)` シグネチャは v1 ではタイムアウト無しのまま(デッドラインを設定する
 connect 前のハンドルが無く、Align には任意引数が無い);raw-socket の消費者が有界 connect を必要とするなら、
@@ -215,13 +219,77 @@ connect 前のハンドルが無く、Align には任意引数が無い);raw-soc
 
 ### Test / gate
 
-ブラックホール化された(決して accept しない)アドレスへ上限付きで connect → 上限内で `Err(Timeout)`。相手が
-accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が上限内で `Err(Timeout)` を返す。
+ブラックホール化されたアドレスへ logical wait deadline 付きで connect → early expiry せず
+`Err(Timeout)`。相手が accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が
+configured blocking wait 後に `Err(Timeout)` を返す。
 `ns == 0` はブロッキング挙動を保つ。
 
 ---
 
-## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite — DESIGN CANDIDATE 2026-09-02)
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+
+> **ステータス:** 最初の independently useful prerequisite。`pkg.kv` design が accept されるまで未実装。
+> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+
+各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
+monotonic start と positive `Duration` budget を記録し、次に `F_GETFL` と
+`F_SETFL(flags | O_NONBLOCK)` を検査する。いずれかの failure で fixed errno-mapped status を記録し、
+candidate を close し、`connect` を呼ばず次の address へ進む。checked installation 後に immediate
+`connect` を正確に 1 回呼ぶ。zero は成功、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は wait へ入り、その他の
+errno は直ちに map する。いずれの immediate terminal result も同時に budget が exhaust していても優先する。
+in-progress path は同じ start/budget pair を継続する。absolute `start + budget` は作らないので、
+`Instant::checked_add` overflow が huge positive timeout を unbounded wait に変えることはない。
+
+- 各 iteration で budget から `start.elapsed()` を引く。positive remainder は次の millisecond へ切り上げ、
+  1 回の `poll` 用に `i32::MAX` で saturate するため、positive i64 全域は repeated chunk で bounded のまま。
+  exhausted remainder は次の poll を行わず `AL_TIMEOUT` を返し、最後の zero-timeout `poll` call も行わない。
+- EINTR は remainder を再計算し、その他の poll error は直ちに map する。`poll` の zero は再度
+  monotonic recheck を行い、まだ時間が残る場合だけ再度 poll、budget を使い切っていれば追加の poll 無しで
+  `AL_TIMEOUT` とする。
+- positive readiness/error event は同時に使い切った budget より優先し、`SO_ERROR` で解決する。
+
+各 immediate/polled success 後に `F_GETFL` と `F_SETFL(flags & !O_NONBLOCK)` を検査する。
+restoration failure はその status を記録し、candidate を close して次へ進む。blocking mode の checked
+restoration が済むまで connection は publish しない。nonpositive raw-ABI blocking path は不変で、public HTTP
+caller はこの ABI 前に negative value を拒否し、raw `tcp.connect` は zero を渡す。DNS と複数 address の合計に end-to-end
+deadline は無く、scheduler/kernel delay で address の logical deadline 後に return することはある。
+
+resolver order は observable である。unsupported family、null address、zero address length は last failure を
+変えずに skip する。最初に成功した usable address が勝つ。usable address が無ければ `AL_INVALID` を返し、
+attempt した candidate がすべて失敗すれば socket creation、nonblocking `F_GETFL`、nonblocking `F_SETFL`、
+immediate connect errno、poll error/timeout、`getsockopt(SO_ERROR)` failure、nonzero `SO_ERROR`、
+blocking-restore `F_GETFL`、blocking-restore `F_SETFL` のうち最後の status を返す。mixed-address owner は各
+failure class の後に skipped entry と later success を置き、all-failure variant は last attempted status と
+close count を固定する。
+
+同じ prerequisite が public `read_timeout_ns`/`write_timeout_ns` と planned checked package row で共有する
+socket-timeout conversion を修正する。全 positive nanosecond 値を `ceil(ns / 1000)` microseconds とし、それを
+normalized `timeval { tv_sec, tv_usec: 0..999999 }` に分割する。exact microsecond は exact のまま、zero は既存の
+clear/no-timeout 意味を保つ。option は 1 回の blocking progress wait を bound し、multi-read/multi-write operation 全体を
+bound しない。
+
+planned `TcpConnSetIoTimeout` consumer はこの exact normalized `timeval` を使い、receive を send より先に
+install し、各 state product を direct owner で固定する。receive failure は `setsockopt` を正確に 1 回呼び、その
+mapped status を返し、`SO_SNDTIMEO` を呼ばない。send failure は正確に 2 回呼び、send の mapped status を返し、
+receive を installed のまま残す。その後 package は selected unpublished connection を close し、resolution を
+再開せず別 address も試さない。both-success installation は正確に 2 回呼び zero を返す。owner は option
+order、call count、returned status、retained option state も固定する。
+
+ceil-to-microsecond conversion は出荷済み `std.http` の plain/TLS/pool rearm にも届く。
+poll-millisecond helper は `process.command` にも届き、その consumer は従来の post-syscall
+timeout-wins precedence を保ったまま、positive-i64 全域に同じ monotonic start-plus-budget arithmetic と
+ceil conversion を使う。これらは package-local conversion の分岐ではなく、1 個の shared prerequisite である。
+
+acceptance owner は exact/next/maximum-positive ns、us、ms、chunk、deadline boundary、immediate/polled
+success での `F_GETFL`/`F_SETFL` installation/restoration failure、early zero-result recheck と
+exhausted/no-call poll、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` とその他 immediate errno、EINTR remainder
+recomputation、deadline 時の readiness、全 resolver skip/last-status failure class、mixed-address
+close/continuation、no early expiry、publish する全 connection の blocking-mode probe、exact-timeval と
+receive/send option state product、HTTP plain/TLS/pool rearm、command pipe-drain/post-EOF reap を含む。
+
+---
+
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — DESIGN CANDIDATE 2026-09-02)
 
 > **ステータス:** independently useful な safety prerequisite。`pkg.kv` design が accept されるまで未実装。
 > public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
@@ -248,7 +316,18 @@ process-global signal handler/mask はない。同じ call の earlier attempt �
 close が破棄する。同じ connection-derived writer を使う logger/`io.copy` は第二 path を開かず socket
 sink kind を継承する。
 
-acceptance owner は Linux/macOS の subprocess closed-peer test(regression は SIGPIPE で終了せず必ず
-`Error` を返す)、partial/EINTR/timeout/zero-progress mapping の direct test、file/std writer parity。
-exact package consumption と implementation boundary は `../pkg-design/kv.md`、不変 ABI identity と planned
-checked-timeout row は `../20-runtime-abi-ledger.md` に記録する。
+既存の keyed `IoWriterWriteBuilder` identity、A19
+`i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration、
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI、attribute、shipped 330/347/355
+keyed/base/maximum count への inclusion は変わらない。source-visible builder overload は builder byte を
+borrow して hardened `IoWriterWrite` row に delegate するので、socket sink policy を迂回できない。
+
+acceptance owner は macOS/BSD での failed install/no send 後の retry、overlap する shell の両方の
+success/failure order、option clear 無しの shell Drop、setting を破棄する connection close を含む。
+Linux/macOS の subprocess closed-peer test は direct slice/builder overload、logger、`io.copy` route を覆い、SIGPIPE で終了せず
+必ず `Error` を返す。direct partial/EINTR/timeout/zero-progress test と file/std writer parity は別個の owner のまま。
+
+checked timeout substrate を最初、writer hardening を 2 番目に出荷する。その後、planned
+`TcpConnSetIoTimeout` row とその `pkg.kv` package consumer を同時に activate する。exact package consumption と
+implementation boundary は `../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
+`../20-runtime-abi-ledger.md` に記録する。
