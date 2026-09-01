@@ -3640,8 +3640,9 @@ Password hashing takes an explicit `Argon2Policy`, generates a fresh 16-byte sal
 32-byte Argon2id v19 tag, and emits exactly canonical
 `$argon2id$v=19$m=...,t=...,p=...$<salt>$<tag>` with unpadded standard base64. Verification accepts
 only that exact grammar and validates three caller-supplied inclusive cost maxima before one KDF;
-a mismatch is `Ok(false)`, malformed/over-limit input is `Error.Invalid`, and native Argon2
-provider/context/output-reserve/derive failure is exactly `Error.Code(0)`. `session_token()` is exactly 32 CSPRNG bytes encoded as a 43-character
+a mismatch is `Ok(false)`, malformed/over-limit input is `Error.Invalid`, and the shipped native
+Argon2 split remains provider/context/output-reserve `Error.Code(0)` versus derive-rejection
+`Error.Invalid`. `session_token()` is exactly 32 CSPRNG bytes encoded as a 43-character
 unpadded base64url string. All five functions are Impure, borrow their inputs only for the call,
 and use ordinary string/buffer Drop without a zeroization promise. There is no new checked HIR,
 native ABI, session store, password policy default, pepper, or ambient provider/configuration.

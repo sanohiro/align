@@ -402,9 +402,9 @@ facts must live in this repository.
   runtime oracle/collision/unaligned-input behavior.
 - **Next language capability:** implement the accepted `pkg.auth` ledger over shipped JSON, crypto,
   encoding, and explicit caller time. It fixes HS256 encode/verify, canonical bounded Argon2id PHC
-  hash/verify, one 256-bit session token, a narrow strict-JSON precheck, exact `Error.Code(0)` native
-  KDF failures, and module-wide libcrypto retention. No new compiler/runtime ABI, clock read,
-  provider/key source, identity policy, or session store is added. Exact closure matrix:
+  hash/verify, one 256-bit session token, a narrow strict-JSON precheck, the shipped native Argon2
+  `Code(0)`/`Invalid` failure split, and module-wide libcrypto retention. No new compiler/runtime
+  ABI, clock read, provider/key source, identity policy, or session store is added. Exact closure matrix:
   `docs/impl/pkg-design/auth.md`.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar

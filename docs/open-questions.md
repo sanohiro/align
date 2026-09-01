@@ -34,9 +34,9 @@ rejects `crit`, and applies optional integer-form i64 `exp`/`nbf` seconds to exp
 caller `now_ns`. Malformed authenticated header JSON is `Invalid`; valid-object alg/typ/crit policy
 failure is `Denied`. Password hashing uses exact caller work parameters, a fresh 16-byte salt, a fixed
 32-byte tag, and one canonical Argon2id v19 PHC spelling. Verification accepts caller cost maxima
-and rejects over-limit records before KDF work; native engine/output-reserve failure is exact
-`Error.Code(0)`. Session tokens always encode 32 CSPRNG bytes to 43
-unpadded base64url characters.
+and rejects over-limit records before KDF work; native provider/context/output-reserve failure is
+exact `Error.Code(0)`, while derive rejection is `Error.Invalid`. Session tokens always encode 32
+CSPRNG bytes to 43 unpadded base64url characters.
 
 All five functions are Impure, borrow inputs only for the call, and return ordinary strings/bool.
 They inherit the existing lack of zeroizing string/buffer Drop. Capability collection is

@@ -16,8 +16,8 @@ primitive、native ABI、key owner、clock read、ambient auth state は加え�
 | `pub Argon2Policy { m_cost: i64, t_cost: i64, parallelism: i64 }` | `crypto.argon2_params` と同じ KiB、iteration、lane。既定値なし。hash では exact 値、verify では保存 PHC に許す独立 inclusive maximum。hash は `p=1..=16777215`、`t=1..=4294967295`、`m=8*p..=4194304`。verify maximum は各 engine ceiling 内の正値で、保存 tuple は hash 関係と全 maximum を満たす。 | 3 i64 の Copy/Pure record。借用・割当・Drop・secret なし。`pkg.auth` nominal 定義と通常 interface/cache owner が所有。 |
 | `pkg.auth.encode_hs256(claims_json: str, key: slice<u8>) -> Result<string, Error>` | 左から 1 回評価。key は 32 byte 以上。claims は 8192 byte 以下の strict RFC 8259 JSON object、semantic duplicate key なし。allocation-free precheck が既知の parser leniency である string 内 raw C0 と leading-zero integer を `json.doc` 前に拒否。present `exp`/`nbf` は integer-form i64 NumericDate 秒。header は exact `{"alg":"HS256","typ":"JWT"}`。成功は最大 11004 byte の unpadded base64url compact JWS。無効入力・length arithmetic は `Invalid`。 | 入力は呼出中だけ借用。成功は owned string 1 個、全 temporary は return 前に Drop。HMAC FFI のため Impure。新 checked op/ABI はない。capability は module-wide で、session-only consumer も JSON/base64/HMAC/Argon2/random と libcrypto を保持する。 |
 | `pkg.auth.verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, Error>` | key は同じ。`now_ns` は必須の非負 Unix wall-clock ns。token は 1..=16384 byte、exact 3 個の非空 canonical unpadded base64url segment、signature は 32 byte。元の `header.payload` を先に HMAC/CT 比較し、不一致は JSON parse 前に `Denied`。認証後 header の non-strict/malformed/non-object/duplicate は `Invalid`。valid unique object の `alg!=HS256`、present `typ` が string `JWT` 以外、`crit` present は `Denied`。payload は 8192 byte 以下の strict unique object。present `exp`/`nbf` は i64 秒。`now_s=now_ns/1e9` に対し `now_s < exp`、`now_s >= nbf`。 | 成功は payload JSON の byte-exact owned clone。malformed/base64/bound/key/now/認証済み JSON・claim 型は `Invalid`、MAC/header policy/time failure は `Denied`。HMAC FFI のため Impure。未認証 JSON を parse/return/log/保持しない。 |
-| `pkg.auth.password_hash(password: slice<u8>, policy: Argon2Policy) -> Result<string, Error>` | 空・NUL を含む任意 byte password を許す。policy 検証後、CSPRNG salt 16 byte、Argon2id v19 tag 32 byteを生成。成功は exact `$argon2id$v=19$m=<m>,t=<t>,p=<p>$<salt>$<tag>`。decimal は正、符号・leading zero なし。salt/tag は standard unpadded base64 の 22/43 文字。policy は `Invalid`、Argon2 provider/context/output-reserve/derive failure は exact `Code(0)`、package builder/string allocation と random failure は abort。 | password は借用・非保持。owned PHC string 1 個だけ公開し、salt/tag/encoding/builder は Drop。random/Argon2 FFI のため Impure。既存 Drop は zeroize を約束せず、V1 は第二の secret owner を加えない。 |
-| `pkg.auth.password_verify(password: slice<u8>, phc: str, maximum: Argon2Policy) -> Result<bool, Error>` | maximum を PHC 読取前に検証。parser は上記 exact canonical grammar、5 個の `$`、exact identifier/version/order、canonical decimal、16/32 decoded byte だけを受理。保存 policy は engine relation と caller の 3 maximum 以下。全検証後に Argon2 を 1 回実行。tag は 32 byte 全体を CT 比較。 | match は `Ok(true)`、wrong password は `Ok(false)`。maximum、malformed/noncanonical/unsupported/over-limit は KDF 前に `Invalid`。Argon2 provider/context/output-reserve/derive failure は exact `Code(0)`。入力非保持、全 temporary Drop。Argon2 FFI のため Impure。 |
+| `pkg.auth.password_hash(password: slice<u8>, policy: Argon2Policy) -> Result<string, Error>` | 空・NUL を含む任意 byte password を許す。policy 検証後、CSPRNG salt 16 byte、Argon2id v19 tag 32 byteを生成。成功は exact `$argon2id$v=19$m=<m>,t=<t>,p=<p>$<salt>$<tag>`。decimal は正、符号・leading zero なし。salt/tag は standard unpadded base64 の 22/43 文字。policy は `Invalid`。shipped Argon2 status split をそのまま伝播し、provider/context/output-reserve failure は exact `Code(0)`、`EVP_KDF_derive` rejection は `Invalid`。package builder/string allocation と random failure は abort。 | password は借用・非保持。owned PHC string 1 個だけ公開し、salt/tag/encoding/builder は Drop。random/Argon2 FFI のため Impure。既存 Drop は zeroize を約束せず、V1 は第二の secret owner を加えない。 |
+| `pkg.auth.password_verify(password: slice<u8>, phc: str, maximum: Argon2Policy) -> Result<bool, Error>` | maximum を PHC 読取前に検証。parser は上記 exact canonical grammar、5 個の `$`、exact identifier/version/order、canonical decimal、16/32 decoded byte だけを受理。保存 policy は engine relation と caller の 3 maximum 以下。全検証後に Argon2 を 1 回実行。tag は 32 byte 全体を CT 比較。 | match は `Ok(true)`、wrong password は `Ok(false)`。maximum、malformed/noncanonical/unsupported/over-limit は KDF 前に `Invalid`。shipped Argon2 status split をそのまま伝播し、provider/context/output-reserve failure は exact `Code(0)`、`EVP_KDF_derive` rejection は `Invalid`。入力非保持、全 temporary Drop。Argon2 FFI のため Impure。 |
 | `pkg.auth.session_token() -> string` | 引数・default・clock・seed・prefix・store なし。CSPRNG 32 byte を exact 43 文字 `[A-Za-z0-9_-]` の unpadded base64url にする。random/allocation failure は abort。uniqueness guarantee はなく、衝突確率は OS CSPRNG に従う。 | ordinary owned string。temporary buffer は Drop。返す bearer secret も zeroize しない通常 string。Impure。registry/cookie/expiry/storage/revocation owner なし。 |
 
 ## 決定と範囲
@@ -114,8 +114,9 @@ hash は random 前に exact policy を検証。verify は 3 maximum、grammar�
 tag mismatch は `Ok(false)`。
 
 salt は常に fresh 16 byte、tag は 32 byte。default work factor、pepper、automatic upgrade、password
-normalization、UTF-8 requirement、prehash はない。Argon2 provider/context/output-reserve/derive failure
-は exact `Error.Code(0)`、後段の package builder/string allocation は hard OOM。
+normalization、UTF-8 requirement、prehash はない。Argon2 provider/context/output-reserve failure
+は exact `Error.Code(0)`、`EVP_KDF_derive` rejection は `Error.Invalid`、後段の package
+builder/string allocation は hard OOM。
 
 ## ownership、allocation、effect、secret
 
@@ -166,7 +167,7 @@ zeroizing string、user DB、HTTP middleware、clock read は含まない。
 | JWT encode | fixed header、canonical segment/signing/tag、claims/token bounds、partial result なし。独立 RFC vector と decoder、exact/next bound。 |
 | JWT verify | key/time/shape/auth/JSON/claim 順序、MAC before JSON、C0/leading-zero precheck、unique keys、malformed header `Invalid` と alg/typ/crit `Denied`、exp/nbf edge。raw C0/leading-zero encode/authenticated header/payload、mutation、escaped duplicate、call instrumentation。 |
 | PHC | exact grammar/version/order/decimal/base64/salt/tag/policy。独立 vector/parser、one-byte mutation、injected/real random。 |
-| password resource | KDF 前の maximum、engine relation、3 inclusive ceiling、NUL/empty、32-byte CT true/false、exact `Code(0)`。no-KDF probe、call count、provider/context/output-reserve/derive failure。 |
+| password resource | KDF 前の maximum、engine relation、3 inclusive ceiling、NUL/empty、32-byte CT true/false、provider/context/output-reserve `Code(0)` と derive rejection `Invalid` の exact split。no-KDF probe、call count、injected provider/context/output-reserve/derive failure。 |
 | ownership/effect | 全 result path の Drop/非保持、全関数 Impure、package の secret-dependent compare なし。allocation parity、MIR/control owner。 |
 | capability/cache | 既存 ABI/semantics 不変、import 時は complete module capability/libcrypto retain、session-only positive、package absence negative、edit/revert cache、optimized/unoptimized、whole/per-unit。 |
 | session | 32 random byte、43 canonical character、clock/prefix/store なし、ordinary Drop。decode oracle、alphabet/length、multi-sample sanity。 |
@@ -189,5 +190,11 @@ benchmark は gate にしない。
 | P1: `json.doc` の raw C0 / leading-zero leniency | allocation-free lexical precheck、exact state/boundary、`Invalid` precedence、encode/authenticated header/payload owner を追加。shared JSON は不変。 |
 | P2: used-body capability promise | 実際の module-wide whole/per-unit collection に修正。session-only でも complete capability/libcrypto を保持。 |
 | P2: malformed authenticated header error | lexical/parse/non-object/duplicate は `Invalid`、valid document の alg/typ/crit policy は `Denied` に統一。 |
-| P2: Argon2 output allocation | native provider/context/output-reserve/derive は exact `Code(0)`、package-owned 後段 OOM は abort と区別。 |
+| P2: Argon2 output allocation | native provider/context/output-reserve `Code(0)`、derive-rejection `Invalid`、package-owned 後段 OOM を区別。 |
 | P2: candidate/Settled state | 英語・日本語 ledger、roadmap、handoff、Settled、history を受理済みに統一。 |
+
+上記修正の changed-slice review は追加 P2 を 1 件返した。
+
+| finding | 解消 |
+|---|---|
+| P2: 最初の Argon2 修正が derive rejection も `Code(0)` に分類 | shipped primitive の complete split、すなわち provider/context/output-reserve は `Code(0)`、derive rejection は `Invalid`、後段 package-owned OOM は abort に復元し、public row、precedence、closure owner、digest、roadmap、handoff を同期。 |

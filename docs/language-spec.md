@@ -1356,7 +1356,9 @@ raw C0 string bytes and leading-zero integers before the shipped parser. Verific
 input before JSON parsing, pins HS256, and checks optional integer-form `exp`/`nbf` seconds against
 the required nonnegative caller-supplied Unix nanoseconds. Password hashes use a fresh 16-byte salt,
 a fixed 32-byte Argon2id v19 tag, canonical PHC text, and caller-explicit work parameters/verify
-ceilings; native Argon2 engine/output-reserve failure is `Error.Code(0)`. Session tokens are exactly 32 CSPRNG bytes encoded as 43 unpadded base64url characters.
+ceilings; native Argon2 provider/context/output-reserve failure is `Error.Code(0)` and derive
+rejection is `Error.Invalid`. Session tokens are exactly 32 CSPRNG bytes encoded as 43 unpadded
+base64url characters.
 All operations are Impure, retain no input, read no clock or configuration, and inherit ordinary
 non-zeroizing string/buffer Drop. Any import retains the module-wide complete capability set and
 libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:

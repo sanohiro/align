@@ -3959,8 +3959,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   policy and verify ceilings, and one fixed 256-bit session token. All five operations are Impure
   ordinary package composition over shipped JSON/crypto/encoding; HS256 keys are at least 32 bytes,
   and no compiler/runtime ABI, clock read, key/provider source, identity policy, or session store is
-  added. A package lexical pass closes the shared parser's two known JSON leniencies, native Argon2
-  engine/output-reserve failure remains `Error.Code(0)`, and module-wide capability collection means
+  added. A package lexical pass closes the shared parser's two known JSON leniencies; native Argon2
+  provider/context/output-reserve failure remains `Error.Code(0)` while derive rejection remains
+  `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact accepted ledger and one-PR implementation matrix:
   `pkg-design/auth.md`.
 - **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on
