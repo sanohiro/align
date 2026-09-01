@@ -19,6 +19,30 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### Frame v1 is one bounded stable ordinal inner join (SETTLED 2026-09-01)
+
+**Decision:** `pkg.frame` adds no Frame wrapper, schema reflection, materialized joined columns, or
+query DSL. Its exact public surface is `RowPair { left: i64, right: i64 }`, tag-only
+`JoinError { InvalidLimit, LimitExceeded }`, and `inner_join_i64` / `inner_join_str` over the
+corresponding exact typed `core.codec` column views plus one required `max_pairs`.
+
+The result is every matching source-row ordinal pair in left-major/right-ascending order; duplicate
+keys produce the stable Cartesian product. The right side is always built, so neither data-dependent
+side choice nor hash iteration changes order. I64 uses decoded scalar equality; str uses byte-exact
+equality after collision confirmation. Inputs are borrowed only for the call and the owned result
+retains no batch region.
+
+The bound is inclusive and accepts exactly `0..=i64::MAX`. A negative bound returns
+`InvalidLimit` before input access or allocation. An unrepresentable right-build index or the first
+would-be pair beyond the caller bound, i64 result length, or target output range returns
+`LimitExceeded` without output. Empty success allocates no output; nonempty success publishes one
+exact output allocation; transient right-index scratch may be allocated in either case and is
+released before return. OOM aborts. Bool/f64,
+nullable/composite keys, outer joins, parallelism, and spill remain outside v1 and require their own
+consumer-backed ledgers.
+
+Record: `docs/impl/pkg-design/frame.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### Columnar interchange is one canonical validated batch format (SETTLED 2026-09-01)
 
 **Decision:** `core.codec` is a data-batch format, not RPC. V1 has the fixed `ALNCOL01` envelope,

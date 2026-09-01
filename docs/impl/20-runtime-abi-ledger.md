@@ -169,6 +169,47 @@ hard-aborts because no source-valid call can form it. Free is null-safe and rele
 staging exactly once. Every row is C calling convention and `nounwind`. Open and all encoder rows
 carry no curated memory, parameter, or return attribute.
 
+## Planned `pkg.frame` extension (design accepted 2026-09-01; inactive until implementation)
+
+The accepted design reserves two new shapes after implemented A120. They are documentation-only
+until one atomic implementation boundary; neither symbol, key, shape,
+collision reservation, declaration, definition, export, fingerprint input, or total is active.
+
+| Candidate runtime key | Candidate symbol | Reserved ABI row and exact LLVM declaration | Exact Rust ABI |
+|---|---|---|---|
+| `FrameInnerJoinI64V1` | `align_rt_frame_inner_join_i64_v1` | A121: `i32 @SYM(ptr, i64, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const u8, i64, i64, *mut AlignStr) -> i32` |
+| `FrameInnerJoinStrV1` | `align_rt_frame_inner_join_str_v1` | A122: `i32 @SYM(ptr, ptr, i64, ptr, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, *const u8, i64, *const u8, *const u8, i64, i64, *mut AlignStr) -> i32` |
+
+A121 receives two unaligned little-endian i64 value ranges and their element counts. A122 receives
+two validated string-column offset/data pairs and their row counts; each offset base addresses an
+alignment-1 `(rows + 1) * 4` little-endian i32 range, and each data pointer addresses the bytes
+through the validated final offset. The last pointer in both rows is a nonnull, correctly aligned,
+writable `AlignStr` header used privately as `{ ptr, element_count }` for 16-byte `RowPair`
+elements. It is not an Align source `str`. Empty output is `{ null, 0 }`; nonempty output comes from
+the ordinary runtime allocator with the target ABI alignment of `{ i64, i64 }` and must be freed by
+the existing dynamic-array owner.
+
+Both rows are C calling convention and `nounwind`. No curated memory, return, or parameter
+attribute is reserved before implementation proves it against the final bodies. Runtime first
+requires and zeroes the output header, then validates negative limit before either input, left view
+before right view, right-table load-factor/capacity/byte arithmetic before allocation, and every
+output bound before output allocation. For positive right length `R`, the exact logical index uses
+`Q = R + ceil(R / 3)`, the smallest power-of-two `C >= max(8,Q)`, two `C`-entry i64 head/tail
+tables, and one `R`-entry i64 next-link table. `Q`, `C`, and `16*C + 8*R` must fit i64 and the target
+allocation-size domain; `R == 0` needs no index. A representability failure returns private `-2`
+even when the semantic join result would be empty. Zero returns success; private `-1` means only
+`JoinError.InvalidLimit`; private `-2` means only `JoinError.LimitExceeded`. A positive
+`AL_INVALID` identifies a malformed compiler-
+private ABI and hard-aborts in compiler-produced lowering. Every return frees transient scratch and
+an error publishes no output.
+
+The right input is always indexed in ascending ordinal order. The runtime counts stable matches
+before one exact output allocation, probes again to fill left-major/right-ascending pairs, confirms
+equality after every hash match, and retains no input pointer. Activation would move the current
+keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and make A123 the next
+unreserved shape. Implementation must recompute all totals and collision sets rather than trust the
+reservation arithmetic here. Exact public semantics and owner matrix: `pkg-design/frame.md`.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:

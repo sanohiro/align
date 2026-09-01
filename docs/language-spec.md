@@ -1318,7 +1318,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The first-party packages developed in this repository are exactly two vendorable subtrees:
+The first-party packages developed in this repository are exactly three vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1326,9 +1326,22 @@ pkg.db             // common driver surface: db.value, db.row, db.Driver, db.Err
 pkg.db.sqlite      // driver submodule
 pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
+pkg.frame          // bounded stable inner equi-join over typed codec columns
 ```
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
 packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
 package are ordinary third-party `pkg` subtrees under the same two path rules; the language reserves
 no names for them. Not part of the language core. (`draft.md` §18.3.)
+
+`pkg.frame` v1 defines `RowPair { left: i64, right: i64 }`, tag-only
+`JoinError { InvalidLimit, LimitExceeded }`, and `inner_join_i64` / `inner_join_str`. Each function
+takes exact typed codec columns plus a required nonnegative `max_pairs`, then returns an owned
+`array<RowPair>` in left-row-major and ascending-right-ordinal order. Duplicate keys produce the
+stable Cartesian product; the right input is always the hash-build side. A negative bound returns
+`InvalidLimit` before input access. An unrepresentable right-build index or the first pair beyond
+the inclusive caller, i64-length, or target-byte bound returns `LimitExceeded` without output. OOM aborts. Inputs are borrowed only
+for the call, strings compare as exact validated bytes, and the result retains only source
+ordinals. There is no Frame wrapper, schema/query DSL, materialization, adaptive side choice,
+nullable/composite/bool/f64 key, outer join, parallelism, or spill. Exact contract:
+`impl/pkg-design/frame.md`.

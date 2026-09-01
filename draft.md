@@ -3538,7 +3538,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The first-party packages developed in this repository are exactly two subtrees:
+The first-party packages developed in this repository are exactly three subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3546,6 +3546,7 @@ pkg.db             // the common driver surface: db.value, db.row, db.Driver, db
 pkg.db.sqlite      // driver submodule
 pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
+pkg.frame          // bounded stable inner equi-join over typed codec columns
 ```
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
@@ -3564,6 +3565,46 @@ stay fully qualified (`pkg.web.get(...)`); there are no import aliases. Vendorin
 its subtree into `pkg/`; one version exists per tree by construction. Compiled-library distribution
 (shipping an interface + objects instead of source) is enabled by the per-unit interface summaries
 but stays a future packaging exercise — source-first, fully greppable dependencies are the default.
+
+`pkg.frame` v1 is one data-oriented operation rather than a second schema or query system. It
+defines `RowPair { left: i64, right: i64 }`, the tag-only
+`JoinError { InvalidLimit, LimitExceeded }`, and exactly two functions:
+
+```text
+pkg.frame.inner_join_i64(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<pkg.frame.RowPair>, pkg.frame.JoinError>
+
+pkg.frame.inner_join_str(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<pkg.frame.RowPair>, pkg.frame.JoinError>
+```
+
+Both return every matching source-row ordinal pair in left-row-major order and ascending right
+ordinal within a left row. Duplicate keys produce that stable Cartesian product. The right input
+is always the hash-build side; the implementation counts before one exact output allocation and
+never exposes hash iteration order. I64 equality uses decoded scalar `==`; string equality is
+byte-exact over the already validated UTF-8 ranges and confirms bytes after a hash collision.
+
+`max_pairs` is required and admits exactly `0..=i64::MAX`. A negative value returns
+`InvalidLimit` before either input is read or any allocation occurs. A right-build index whose
+load-factor/capacity/byte arithmetic is not target-representable, or the first would-be pair beyond
+the inclusive caller bound, i64 result length, or target-representable output byte range, returns
+`LimitExceeded` without publishing output. OOM remains a hard abort. Inputs are Copy codec views
+borrowed only for the call; the owned `array<RowPair>` retains only ordinals. Empty success is the
+canonical empty array and allocates no output. The operation is Pure and has no ambient schema, hash seed,
+configuration, I/O, or adaptive build-side choice.
+
+There is no `Frame` wrapper, name-based column selection, materialized joined columns, query DSL,
+filter/sort/aggregate surface, nullable/composite/bool/f64 key, outer join, parallelism, or spill in
+v1. Callers use `codec.find` plus an explicit typed projection before the join, then consume the
+ordinary result through the existing array/slice pipeline. The exact ownership, validation
+precedence, inactive native ABI rows, and implementation closure matrix are fixed in
+`docs/impl/pkg-design/frame.md`.
 
 **First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
 live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer
