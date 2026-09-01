@@ -3591,11 +3591,12 @@ never exposes hash iteration order. I64 equality uses decoded scalar `==`; strin
 byte-exact over the already validated UTF-8 ranges and confirms bytes after a hash collision.
 
 `max_pairs` is required and admits exactly `0..=i64::MAX`. A negative value returns
-`InvalidLimit` before either input is read or any allocation occurs. The first would-be pair beyond
-the inclusive caller bound, i64 result length, or target-representable output byte range returns
+`InvalidLimit` before either input is read or any allocation occurs. A right-build index whose
+load-factor/capacity/byte arithmetic is not target-representable, or the first would-be pair beyond
+the inclusive caller bound, i64 result length, or target-representable output byte range, returns
 `LimitExceeded` without publishing output. OOM remains a hard abort. Inputs are Copy codec views
 borrowed only for the call; the owned `array<RowPair>` retains only ordinals. Empty success is the
-canonical allocation-free empty array. The operation is Pure and has no ambient schema, hash seed,
+canonical empty array and allocates no output. The operation is Pure and has no ambient schema, hash seed,
 configuration, I/O, or adaptive build-side choice.
 
 There is no `Frame` wrapper, name-based column selection, materialized joined columns, query DSL,

@@ -1339,8 +1339,8 @@ no names for them. Not part of the language core. (`draft.md` §18.3.)
 takes exact typed codec columns plus a required nonnegative `max_pairs`, then returns an owned
 `array<RowPair>` in left-row-major and ascending-right-ordinal order. Duplicate keys produce the
 stable Cartesian product; the right input is always the hash-build side. A negative bound returns
-`InvalidLimit` before input access, while the first pair beyond the inclusive caller, i64-length,
-or target-byte bound returns `LimitExceeded` without output. OOM aborts. Inputs are borrowed only
+`InvalidLimit` before input access. An unrepresentable right-build index or the first pair beyond
+the inclusive caller, i64-length, or target-byte bound returns `LimitExceeded` without output. OOM aborts. Inputs are borrowed only
 for the call, strings compare as exact validated bytes, and the result retains only source
 ordinals. There is no Frame wrapper, schema/query DSL, materialization, adaptive side choice,
 nullable/composite/bool/f64 key, outer join, parallelism, or spill. Exact contract:

@@ -13,8 +13,8 @@ is ordinary pipeline data; it is not a query language or a second column/schema 
 | Public surface | Exact inputs, defaults, validation, and evaluation | Exact result, errors, order, and effects | Ownership, lifetime, allocation, and cleanup | Compiler/runtime/package owner, artifact, and cache identity | Prerequisite and acceptance owner |
 |---|---|---|---|---|---|
 | `pub RowPair { left: i64, right: i64 }` | One flat public record. `left` and `right` are zero-based source row ordinals; negative values are never produced. There is no hidden batch, key, hash, null, or provenance field. | Copy, Pure, equality follows ordinary record-field use rather than a new whole-record equality rule. Field order and physical/source order are exactly `left`, then `right`. | Two i64 fields, no borrow, allocation, Drop, or retained input. An `array<RowPair>` is the ordinary owned dynamic AoS array and supports the existing array/slice pipeline. | `pkg.frame` owns the nominal public definition. Whole-program and per-unit interfaces serialize its name and two ordered fields; the complete definition participates in interface/dependency/cache identity. | Existing dynamic flat-record arrays; source construction/field/index/pipeline/whole-per-unit owners and exact layout checks. |
-| `pub JoinError { InvalidLimit, LimitExceeded }` | One closed public tag-only sum. Source ordinals are exactly `InvalidLimit=0`, `LimitExceeded=1`; there is no payload, native code, message, alias, or ambient registry. | Copy and Pure. `InvalidLimit` means `max_pairs < 0`. `LimitExceeded` means the exact result would exceed `max_pairs`, i64 result length, or the target-representable output byte range. OOM remains a hard abort and is never converted to either variant. | The ordinary one-field `{ i32 tag }` enum aggregate; no borrow, allocation, or Drop. | `pkg.frame` owns the nominal definition and ordinals. Interfaces, checked HIR, MIR, and cache identity use the ordinary closed-enum machinery. Native status values are compiler-private and map bijectively to these two variants. | Existing tag-only sums and `Result`; exact ordinal/mapping, exhaustive match, malformed tag, whole/per-unit owners. |
-| `pkg.frame.inner_join_i64(left: codec.i64_column, right: codec.i64_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | Arguments evaluate once, left-to-right. Both columns must be source-valid live `core.codec` i64 views; their row counts may differ, either may be empty, they may share one batch/storage generation, and no equal-length rule applies. `max_pairs` has no default and admits exactly `0..=i64::MAX`. The operation compares decoded signed i64 values with settled scalar `==`; it does not compare encoded byte order. | Success returns every matching `(left row, right row)` pair in left-row-major order, with matching right ordinals ascending. Duplicate keys therefore emit the stable Cartesian product; unmatched rows are absent. Empty input or no match returns an empty array. A negative limit returns `Err(InvalidLimit)` before reading either column or allocating. The first would-be pair beyond the bound, i64 length, or target output range returns `Err(LimitExceeded)` with no output published. Pure; no I/O, global state, randomness, or source mutation. | Inputs are borrowed only for the call and never retained. Success owns one ordinary `array<RowPair>` allocation (null/zero is the canonical empty array); transient right-side hash/index scratch is operation-owned and freed before return. Every error frees all scratch and owns no output. OOM aborts after ordinary allocator cleanup semantics. | `pkg.frame` owns the public wrapper and exact signature. Sema forms one dedicated checked operation only for this exact qualified function and argument types; HIR/MIR/LLVM preserve evaluation, status, and cleanup. Runtime owns one inactive-until-implementation keyed A121 candidate row `i32 @SYM(ptr, i64, ptr, i64, i64, ptr)` over unaligned little-endian codec bytes plus one aligned output `{ptr,len}` slot. Package source, public interface hash, HIR semantic identity, runtime registry/fingerprint, compiler build id, dependency implementation hashes, and object cache keys change at implementation; no ambient schema/artifact input exists. | Implemented `core.codec`, existing array pipeline, and existing i64/str hash substrate. Owners: exact/empty/unequal/duplicate/self-storage/order/limit matrix; failure allocation parity; source-null and malformed-HIR; whole/per-unit/cache; runtime ABI/export and optimized/unoptimized lowering. |
+| `pub JoinError { InvalidLimit, LimitExceeded }` | One closed public tag-only sum. Source ordinals are exactly `InvalidLimit=0`, `LimitExceeded=1`; there is no payload, native code, message, alias, or ambient registry. | Copy and Pure. `InvalidLimit` means `max_pairs < 0`. `LimitExceeded` means the right-build index cannot be represented for the target, or the exact result would exceed `max_pairs`, i64 result length, or the target-representable output byte range. OOM remains a hard abort and is never converted to either variant. | The ordinary one-field `{ i32 tag }` enum aggregate; no borrow, allocation, or Drop. | `pkg.frame` owns the nominal definition and ordinals. Interfaces, checked HIR, MIR, and cache identity use the ordinary closed-enum machinery. Native status values are compiler-private and map bijectively to these two variants. | Existing tag-only sums and `Result`; exact ordinal/mapping, exhaustive match, malformed tag, whole/per-unit owners. |
+| `pkg.frame.inner_join_i64(left: codec.i64_column, right: codec.i64_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | Arguments evaluate once, left-to-right. Both columns must be source-valid live `core.codec` i64 views; their row counts may differ, either may be empty, they may share one batch/storage generation, and no equal-length rule applies. `max_pairs` has no default and admits exactly `0..=i64::MAX`. The operation compares decoded signed i64 values with settled scalar `==`; it does not compare encoded byte order. | Success returns every matching `(left row, right row)` pair in left-row-major order, with matching right ordinals ascending. Duplicate keys therefore emit the stable Cartesian product; unmatched rows are absent. Empty input or no match returns an empty array. A negative limit returns `Err(InvalidLimit)` before reading either column or allocating. An unrepresentable right-build index or the first would-be pair beyond the bound, i64 length, or target output range returns `Err(LimitExceeded)` with no output published. Pure; no I/O, global state, randomness, or source mutation. | Inputs are borrowed only for the call and never retained. Nonempty success owns one ordinary `array<RowPair>` allocation; empty success uses the canonical null/zero array and allocates no output. Transient right-side hash/index scratch is operation-owned and freed before return. Every error frees all scratch and owns no output. OOM aborts after ordinary allocator cleanup semantics. | `pkg.frame` owns the exact public wrapper and signature. Every direct, imported, local/function-field, or joined indirect call executes that ordinary wrapper body; its single call to the exact private root-module bridge forms the dedicated checked operation. HIR/MIR/LLVM preserve evaluation, status, and cleanup. Runtime owns one inactive-until-implementation keyed A121 candidate row `i32 @SYM(ptr, i64, ptr, i64, i64, ptr)` over unaligned little-endian codec bytes plus one aligned output `{ptr,len}` slot. Package source, public interface hash, HIR semantic identity, runtime registry/fingerprint, compiler build id, dependency implementation hashes, and object cache keys change at implementation; no ambient schema/artifact input exists. | Implemented `core.codec`, existing array pipeline, and existing i64/str hash substrate. Owners: exact/empty/unequal/duplicate/self-storage/order/limit matrix; direct/imported/local/function-field/joined-indirect parity; failure allocation parity; source-null and malformed-HIR; whole/per-unit/cache; runtime ABI/export and optimized/unoptimized lowering. |
 | `pkg.frame.inner_join_str(left: codec.str_column, right: codec.str_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | Evaluation, lifetime, row-count, sharing, and limit rules are identical to `inner_join_i64`. Both inputs must be source-valid live `codec.str_column` views. Equality is settled byte-exact `str == str`; UTF-8 was validated by `codec.open`, embedded NUL/LF are ordinary bytes, and there is no normalization, locale, case fold, collation, or allocation for a key copy. | The same exact stable inner-join result and error rules. Hash equality always confirms byte length and bytes, so collisions cannot create a pair. Pure and deterministic. | Inputs and all string bytes remain borrowed for the call only. The result contains ordinals, not strings, so it is self-contained and retains neither batch. Output/scratch/error/OOM rules are identical to `inner_join_i64`. | The same package/compiler identity boundary. Runtime owns one inactive-until-implementation keyed A122 candidate row `i32 @SYM(ptr, ptr, i64, ptr, ptr, i64, i64, ptr)` over validated offset/data pairs plus the output slot. It shares the i64 row's status protocol, output allocator provenance, hash-table engine, and registry activation boundary. | Same prerequisites. Owners add empty/NUL/LF/multibyte/common-prefix/collision keys, distinct-but-equal bytes across batches, and no-retained-input Drop/mutation checks. |
 
 ## Decision and scope
@@ -99,6 +99,14 @@ first rejected pair; it does not scan the remaining Cartesian product merely to 
 number. If the exact output count fits the caller bound but `count * 16` cannot be represented as an
 i64 and target allocation size, the same `LimitExceeded` is returned before output allocation.
 
+The right index has one deterministic logical layout. For positive right length `R`, let
+`Q = R + ceil(R / 3)` and let `C` be the smallest power of two at least `max(8, Q)`. The index has
+i64 head and tail tables of `C` entries each plus an i64 next-link table of `R` entries; right rows
+append to their bucket chain in ascending ordinal order. `Q`, `C`, and the logical scratch byte size
+`16*C + 8*R` must each fit i64 and the target allocation-size domain. Any failure is
+`LimitExceeded`; `R == 0` needs no index. This formula fixes the observable representability
+boundary without promising whether the three logical tables share one allocation.
+
 ## Validation and error precedence
 
 Source evaluation follows ordinary left-to-right call rules. After checked HIR has formed a call,
@@ -111,7 +119,9 @@ the runtime boundary uses one fixed pre-side-effect sequence:
    codec producer guarantees monotonic offsets and UTF-8, but the ABI defensively requires nonnull
    offset storage for the `(rows + 1) * 4` range and a nonnull data pointer when the final offset is
    positive. No slice or typed reference is formed before its protecting arithmetic/pointer check.
-4. Validate right-side hash-table capacity arithmetic before allocating scratch.
+4. Validate the exact `Q`, `C`, and `16*C + 8*R` right-index arithmetic above before allocating
+   scratch. A source-valid right column whose index cannot be represented for the target returns
+   `LimitExceeded` before allocation, even when the eventual semantic result would be empty.
 5. Build the right index in ordinal order, then probe left in ordinal order and count stable matches.
    The caller limit precedes i64/output-byte representability because it is checked at each
    would-be pair; all three map to `LimitExceeded` and publish nothing.
@@ -152,14 +162,55 @@ classification without a new carrier exception.
 ## Package, compiler, runtime, and ABI boundary
 
 The vendorable package subtree owns module `pkg.frame`, its two public definitions, and its two
-public functions. No `pkg.frame.internal` module or native symbol is public. The compiler recognizes
-the exact qualified functions only after ordinary module resolution proves the canonical public
-signature; a same-named local/module function is an ordinary call. This is the same explicit
-package/compiler bridge class used by compiler-produced `pkg.db` operations, not an ambient builtin
-available without the vendored package.
+public functions. No `pkg.frame.internal` module or native symbol is public. Each public function is
+an ordinary Align wrapper whose complete body is one call to its corresponding private root-module
+bridge. Direct, imported, local/function-field, and control-joined function-value calls therefore
+all invoke the same compiled wrapper; no call-site spelling selects semantics. The compiler
+recognizes only each exact private bridge declaration after ordinary module resolution proves the
+canonical package source, wrapper signature, and public definition graph. A same-named declaration
+in any other module, or a widened/modified vendored package definition, is an ordinary function and
+never selects the bridge. This is a package-owned compiler bridge, not an ambient builtin available
+without the vendored package.
 
-Sema owns exact function recognition, argument/result types, evaluation order, purity, input-region
-liveness, and the two checked expression discriminators. Checked-HIR validation independently
+The canonical root module imports `core.codec` and `std.process` and owns exactly these private
+bridge declarations and wrapper bodies; the unreachable abort bodies are the same source-level
+placeholder pattern used by package operations whose resolved call becomes checked HIR:
+
+```align
+fn inner_join_i64_bridge(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+fn inner_join_str_bridge(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+pub fn inner_join_i64(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_i64_bridge(left, right, max_pairs)
+
+pub fn inner_join_str(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_str_bridge(left, right, max_pairs)
+```
+
+The compiler admits the bridge discriminator only at the corresponding wrapper's complete
+single-expression body. Any other call position, helper body, wrapper shape, function value of the
+private bridge, or altered declaration rejects package admission rather than executing the abort.
+The public wrappers themselves remain ordinary callable values.
+
+Sema owns exact private-bridge recognition, wrapper/argument/result types, evaluation order, purity,
+input-region liveness, and the two checked expression discriminators. Checked-HIR validation independently
 recomputes the canonical package definition identity, both input kinds, result record/error identity,
 fallthrough, and region/no-retention facts. MIR owns status mapping, exact output type, ownership,
 failure cleanup, and target-independent little-endian semantics. LLVM owns the typed native calls,
@@ -219,10 +270,10 @@ author-side matrix is mandatory before coding.
 
 | Axis | Required implementation closure | Exact owner evidence |
 |---|---|---|
-| Public formation and identity | Canonical vendored `pkg.frame` only; exact two records/two functions; no ambient/same-name interception; ordinals and field order; whole/per-unit and generic signature reconstruction. | Package import/name/signature positives and wrong-module/type negatives; interface bytes/hash; same-name control; malformed public definition rejection. |
+| Public formation and identity | Canonical vendored `pkg.frame` only; exact two records/two public wrappers/two private root bridges; no ambient/same-name interception; ordinals and field order; whole/per-unit and generic signature reconstruction. Every direct, imported, local/function-field, and control-joined indirect target executes the wrapper and reaches exactly one corresponding bridge action. | Package import/name/signature positives and wrong-module/type negatives; exact public wrapper/private bridge body and interface bytes/hash; parameterized direct/imported/local/function-field/joined-indirect parity; same-name control; malformed public definition/bridge rejection. |
 | Input region and evaluation | Left, right, limit evaluate once in order; every terminating child stops later formation/action; direct/field/Option/Result/control-selected codec views retain complete input generation through the call and no longer. | Parameterized direct/control/termination and source-invalidation owner across i64/str, whole/per-unit, and malformed HIR. |
 | Join products | Zero/one/many rows; unequal lengths; no-match; one-to-one; left/right duplicates; stable Cartesian order; shared/same batch; every i64 edge and str byte class; collision confirmation. | Independent nested-loop oracle over fixed and generated bounded fixtures; mutation of pair membership/order; base-alignment 0..7 and endian-lowering twins. |
-| Limit and validation precedence | Negative, zero, exact, rejected-next, i64/output-byte overflow; output slot then limit then left/right private views then scratch arithmetic then build/count/output; no partial publication. | Direct runtime multi-invalid matrix; exact/rejected-next source owners; failpoint after every scratch/output acquisition; output header remains null/zero on every error. |
+| Limit and validation precedence | Negative, zero, exact, rejected-next, right-index load-factor/capacity/byte overflow, i64/output-byte overflow; output slot then limit then left/right private views then scratch arithmetic then build/count/output; no partial publication. | Direct runtime multi-invalid matrix; exact/rejected-next source owners; target-representability twins including empty semantic output; failpoint after every scratch/output acquisition; output header remains null/zero on every error. |
 | Output ownership and control | Exact `{ptr,len}` `array<RowPair>` reconstruction; empty/nonempty Drop; move-in/out/nulling; replacement; return; destructure; `if`/`match`/`else`/`?`/`map_err`; branch/loop joins; early exit; unused success/error. | Existing recursive-array Drop counters plus focused driver control matrix and MIR cleanup/source-null assertions. |
 | Native ABI and allocation | Exact A121/A122 declarations/exports/statuses, nonnegative lengths, null/alignment, unaligned LE reads, output allocator/free provenance, no unwind, every acquisition cleanup, no retained input/global state. | Runtime ABI registry/export/attribute mutation owner; direct malformed ABI; cumulative allocation/free parity; optimized/unoptimized and rt-LTO link. |
 | Hash engine | One shared engine policy; fixed seed; right ordinal chain stability; collision equality; no key byte copy; two probes produce identical counts/order; scratch bounded by right rows and released. | Shared i64/str engine units, forced-collision fixture, pass counters, no-string-copy allocation probe, count/fill parity assertion. |

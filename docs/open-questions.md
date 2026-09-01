@@ -33,9 +33,11 @@ equality after collision confirmation. Inputs are borrowed only for the call and
 retains no batch region.
 
 The bound is inclusive and accepts exactly `0..=i64::MAX`. A negative bound returns
-`InvalidLimit` before input access or allocation. The first would-be pair beyond the caller bound,
-i64 result length, or target output range returns `LimitExceeded` without output. Empty success
-allocates nothing; nonempty success publishes one exact output allocation; OOM aborts. Bool/f64,
+`InvalidLimit` before input access or allocation. An unrepresentable right-build index or the first
+would-be pair beyond the caller bound, i64 result length, or target output range returns
+`LimitExceeded` without output. Empty success allocates no output; nonempty success publishes one
+exact output allocation; transient right-index scratch may be allocated in either case and is
+released before return. OOM aborts. Bool/f64,
 nullable/composite keys, outer joins, parallelism, and spill remain outside v1 and require their own
 consumer-backed ledgers.
 

@@ -1390,7 +1390,8 @@ duplicate order does not depend on cardinality heuristics, allocator state, or h
 
 The explicit inclusive `max_pairs` makes duplicate fanout and output allocation visible. Counting
 before one exact output allocation preserves all-or-nothing publication; a negative limit is
-distinguished from an otherwise valid join that exceeds its resource bound. I64 and byte-exact str
+distinguished from an otherwise valid join that exceeds its result or right-index representability
+bound. I64 and byte-exact str
 reuse the settled equality/hash families. Bool's two buckets have no demonstrated consumer, while
 f64 requires a separate `-0.0`/NaN hash-canonicalization decision, so neither is admitted by
 analogy. The complete contract and implementation closure matrix are in

@@ -758,7 +758,9 @@ unchanged. The package definition graph, ordinary recursive Move/Drop plan for
 `array<RowPair>`, and enum identity remain part of the existing interface and compiler fingerprints.
 
 The candidate adds exactly two expression discriminators atomically with package recognition,
-runtime rows, validation, lowering, and owners:
+runtime rows, validation, lowering, and owners. They occur only at the two exact private root-module
+bridge calls inside the ordinary public wrappers; a caller's direct or indirect wrapper call remains
+the ordinary `Call` / `FnValue` / `CallFnValue` path and converges on that compiled bridge body:
 
 | Record family | Exact checked contract |
 |---|---|
@@ -766,12 +768,23 @@ runtime rows, validation, lowering, and owners:
 | `FrameInnerJoinStr` | The identical envelope with exact `codec.str_column` children. Both input provenance sets remain live through the call action, including distinct and shared-batch roots, and neither enters the ordinal-only result. The discriminator cannot select the i64 ABI row, and the i64 discriminator cannot select this one. |
 
 Sema may emit either record only after ordinary module resolution proves the exact canonical
-vendored `pkg.frame` function and public definition graph. A same-named local function, another
-module, an absent package, a wrong column kind, a wider shared helper type, a wrong RowPair field or
-JoinError tag, or a result alias remains an ordinary call or rejects; none is rewritten to these
-records. Children evaluate exactly once left-to-right. A terminating earlier child suppresses every
-later child and native action. The signed value of `max_pairs` is runtime data, not a malformed-HIR
-axis; checked HIR validates its exact i64 type while runtime maps negative and exceeded bounds.
+vendored `pkg.frame` private bridge, its one-call public wrapper body, and public definition graph.
+A same-named local function, another module, an absent package, a modified wrapper/bridge body, a
+wrong column kind, a wider shared helper type, a wrong RowPair field or JoinError tag, or a result
+alias remains an ordinary call or rejects; none is rewritten to these records. Direct, imported,
+local/function-field, and control-joined public function values execute the same ordinary wrapper
+and therefore reach exactly one corresponding bridge record. Children evaluate exactly once
+left-to-right. A terminating earlier child suppresses every later child and native action. The
+signed value of `max_pairs` is runtime data, not a malformed-HIR axis; checked HIR validates its
+exact i64 type while runtime maps negative and exceeded bounds.
+
+The exact private names are `inner_join_i64_bridge` and `inner_join_str_bridge`. Each has the same
+three parameters and result as its corresponding public wrapper and a source placeholder body of
+`process.abort()`. The matching record is legal only in that wrapper's complete single-expression
+body with the three wrapper parameters passed once in declaration order. A bridge call in any other
+body or expression position, a private bridge `FnValue`, a repeated/reordered/wrapped child, or a
+wrapper that contains any other expression rejects canonical package admission. The placeholder
+abort is unreachable after accepted formation and emits no MIR/native action of its own.
 
 Validation independently recomputes canonical package/type identity, exact discriminator-to-column
 kind, child/result types, fallthrough, purity, complete input provenance, and absence of result
@@ -782,8 +795,9 @@ direct/control-selected/whole-per-unit/malformed matrix in `pkg-design/frame.md`
 missing child, wrong order/type/result, lost generation, retained region, or missing cleanup.
 
 These records are reservations only. Until the design is accepted and implementation activates the
-complete boundary, they add no `ExprKind`, canonical encoder/decoder arm, interface/compiler
-fingerprint input, accepted source program, cache identity, or runtime key.
+complete boundary, they add no `ExprKind`, canonical encoder/decoder arm, public/private package
+body admission, interface/compiler fingerprint input, accepted source program, cache identity, or
+runtime key.
 
 ## Header-adjacent records
 

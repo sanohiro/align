@@ -192,9 +192,14 @@ the existing dynamic-array owner.
 Both rows are C calling convention and `nounwind`. No curated memory, return, or parameter
 attribute is reserved before implementation proves it against the final bodies. Runtime first
 requires and zeroes the output header, then validates negative limit before either input, left view
-before right view, right-table arithmetic before allocation, and every output bound before output
-allocation. Zero returns success; private `-1` means only `JoinError.InvalidLimit`; private `-2`
-means only `JoinError.LimitExceeded`. A positive `AL_INVALID` identifies a malformed compiler-
+before right view, right-table load-factor/capacity/byte arithmetic before allocation, and every
+output bound before output allocation. For positive right length `R`, the exact logical index uses
+`Q = R + ceil(R / 3)`, the smallest power-of-two `C >= max(8,Q)`, two `C`-entry i64 head/tail
+tables, and one `R`-entry i64 next-link table. `Q`, `C`, and `16*C + 8*R` must fit i64 and the target
+allocation-size domain; `R == 0` needs no index. A representability failure returns private `-2`
+even when the semantic join result would be empty. Zero returns success; private `-1` means only
+`JoinError.InvalidLimit`; private `-2` means only `JoinError.LimitExceeded`. A positive
+`AL_INVALID` identifies a malformed compiler-
 private ABI and hard-aborts in compiler-produced lowering. Every return frees transient scratch and
 an error publishes no output.
 

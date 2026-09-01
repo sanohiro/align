@@ -10,8 +10,8 @@ schema system, materialized joined batch, expression tree, or query DSL.
 I64 and byte-exact string keys reuse the existing hash/equality substrate. The right side is always
 the build side, while output remains left-row-major and right-ordinal-ascending, including the
 stable Cartesian product for duplicate keys. One required inclusive `max_pairs` bounds fanout and
-output allocation: negative is `InvalidLimit`; the first pair beyond the caller, i64-length, or
-target-byte range is `LimitExceeded`; OOM remains a hard abort. Inputs are borrowed only during the
+output allocation: negative is `InvalidLimit`; an unrepresentable right index or the first pair
+beyond the caller, i64-length, or target-byte range is `LimitExceeded`; OOM remains a hard abort. Inputs are borrowed only during the
 call and the ordinal result retains neither codec batch. The exact public ledger, inactive ABI
 rows, and implementation matrix are `docs/impl/pkg-design/frame.md`.
 
