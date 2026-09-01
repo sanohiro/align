@@ -1318,7 +1318,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The first-party packages developed in this repository are exactly four vendorable subtrees:
+The first-party packages developed in this repository are exactly five vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1328,6 +1328,7 @@ pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
+pkg.kv             // candidate synchronous RESP2 GET/SET/DEL client
 ```
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
@@ -1363,3 +1364,55 @@ All operations are Impure, retain no input, read no clock or configuration, and 
 non-zeroizing string/buffer Drop. Any import retains the module-wide complete capability set and
 libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:
 `impl/pkg-design/auth.md`.
+
+The `pkg.kv` v1 design candidate proposes this exact root public surface:
+
+```text
+pkg.kv.client  // opaque Move resource
+pkg.kv.ClientOptions {
+  connect_timeout_ns: i64,
+  io_timeout_ns: i64,
+  max_response_bytes: i64,
+}
+pkg.kv.SetCondition { Always, IfAbsent, IfPresent }
+pkg.kv.SetOptions { condition: SetCondition, expires_in_ns: Option<i64> }
+pkg.kv.Error { Invalid, Io(core.Error), Server(string), Decode, ResponseTooLarge, Protocol, Closed }
+pkg.kv.connect(host: str, port: i64, options: ClientOptions) -> Result<client, Error>
+pkg.kv.get(borrow mut owner: client, key: str) -> Result<Option<string>, Error>
+pkg.kv.set(
+  borrow mut owner: client,
+  key: str,
+  value: str,
+  options: SetOptions,
+) -> Result<bool, Error>
+pkg.kv.delete(borrow mut owner: client, key: str) -> Result<bool, Error>
+```
+
+No argument has a default. `connect` validates before side effects, in order: a nonempty host
+without U+0000, port `1..=65535`, connect and I/O timeouts each in `1..=86400000000000` ns, and a
+response cap in `0..=536870912`. The cap is inclusive for a GET/error payload; non-error control
+lines have a separate 64-byte cap. Each key/value length is `0..=536870912` bytes.
+`Some(expires_in_ns)` is `1..=i64::MAX` and emits checked
+`PX ceil(ns / 1000000)`; `None` is persistent SET and removes an existing TTL. The endpoint,
+per-address connect timeout, per-read/write I/O timeout, cap, SET condition, and expiry are all
+explicit. Connect timeout covers each post-DNS address attempt rather than DNS or the complete
+address list; I/O timeout covers one blocking wait for progress rather than the whole command.
+
+The package emits only typed canonical RESP2 GET, SET, and single-key DEL over plaintext TCP. GET
+returns an owned optional string; SET maps `Always`/`IfAbsent`/`IfPresent` to no token/`NX`/`XX`
+and reports whether the write applied; DEL accepts only integer value zero or one. Inputs are
+call-bounded, one `borrow mut` excludes overlap, and Drop is the only public close. A complete
+bounded server error or fully consumed non-UTF-8 GET/error reply yields reusable `Server` or
+`Decode`; transport, oversized, malformed/truncated/trailing, or initial-EOF failure retires the
+client and later use is `Closed` without I/O. `ClientOptions`, `SetCondition`, and `SetOptions` are
+Copy and Pure; `Error` is Move only because `Server` owns its string. All four operations are
+Impure. A successful connect retains exactly four allocations: package state, TCP connection, and
+non-owning reader and writer shells. `Invalid` precedes I/O and the first error wins. There is no AUTH, TLS, RESP3/HELLO
+negotiation, generic command/reply surface, pipeline, redirect, replay, reconnect, or hidden retry;
+the client relies on the server's default RESP2 mode. One source-reachable runtime row remains
+planned and inactive until implementation: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` for
+checked receive/send timeout installation, reusing A04. SIGPIPE safety hardens the existing
+connection-derived writer in place with `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; file and
+standard-stream writers retain their existing path, and no writer ABI identity/count or compiler
+operation changes. Exact candidate contract: `impl/pkg-design/kv.md`; independent
+review has not yet accepted it.

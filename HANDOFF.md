@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-09-01._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-02._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
@@ -15,7 +15,8 @@ owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
 `docs/impl/core-design/codec.md`; `pkg.frame` is implemented against
 `docs/impl/pkg-design/frame.md`; and `pkg.auth` is implemented against
-`docs/impl/pkg-design/auth.md`. `pkg.kv` design is the next language capability.
+`docs/impl/pkg-design/auth.md`. The exact `pkg.kv` public-contract design candidate is authored in
+`docs/impl/pkg-design/kv.md`; independent review is next, and no public contract is accepted yet.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -345,8 +346,8 @@ facts must live in this repository.
 - **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
   in-language test runner, bounded data/protocol library wave (`core.codec`,
   `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` remains the
-  next language capability.
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact
+  design candidate and remains the next language capability; independent review is pending.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
@@ -402,9 +403,12 @@ facts must live in this repository.
   independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
   whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
   new compiler/runtime ABI or ambient clock/provider/key/session owner.
-- **Next language capability:** author and review the exact public ledger for `pkg.kv`, the queued
-  RESP2 typed Redis client. The roadmap outline requires a Move client, owned-string values, and
-  fail-closed protocol handling; TLS remains deferred. No public surface is settled yet.
+- **Next language capability:** independently review the exact `pkg.kv` public-contract candidate
+  in `docs/impl/pkg-design/kv.md`. It specifies one synchronous plaintext RESP2 Move client,
+  explicit connect/I/O timeouts and response cap, owned-string GET, conditional/expiring SET,
+  one-key DEL, fail-closed synchronization, one planned generic TCP row for checked timeout
+  installation, and in-place SIGPIPE hardening of the existing connection-derived writer. TLS and the wider Redis surface remain
+  deferred. No public surface is accepted yet.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

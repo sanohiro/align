@@ -57,7 +57,10 @@ six keyed rows. The `core.test` child-control extension then added four unkeyed 
 added six keyed rows, `core.codec` then added eight, and `pkg.frame` added two. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
 are 330 keyed records, 347 base records, and 355 records in the maximum optional-probe export table.
-No probe category changed.
+No probe category changed. The `pkg.kv` design candidate below reserves one source-reachable
+unkeyed identity that reuses an existing ABI shape; it is inactive and excluded from these shipped
+counts until implementation. The candidate also hardens existing TCP-derived writers without
+changing a symbol, key, shape, attribute, or count.
 
 ## core.test child-control extension
 
@@ -102,6 +105,51 @@ successful `process.exec` closes it through close-on-exec or process termination
 harness returns. The independent driver codecs and the runtime codecs both pin the three semantic
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
+
+## Planned `pkg.kv` TCP substrate (design candidate; inactive)
+
+The `pkg.kv` candidate reserves exactly one package-internal, source-reachable unkeyed row. It
+closes the checked-configuration failure domain that the existing public timeout setters cannot:
+those setters return Unit and discard `setsockopt` failure. The new row is a general TCP-connection
+operation rather than a RESP parser or package-specific helper:
+
+| Unkeyed key | Exact symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
+|---|---|---|---|
+| `TcpConnSetIoTimeout` | `align_rt_tcp_conn_set_io_timeout` | A04: `i32 @SYM(ptr, i64)` | `unsafe extern "C" fn(*mut TcpConn, i64) -> i32` |
+
+`TcpConnSetIoTimeout` accepts only a non-null live connection and `timeout_ns` in
+`1..=86400000000000`. It constructs the same positive/sub-microsecond-clamped `timeval` as the
+shipped setters, then installs `SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without
+attempting `SO_SNDTIMEO`; otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only
+after both succeed. If the second installation fails, the first may remain installed;
+`pkg.kv.connect` closes the unpublished connection, so configuration cannot overlap another
+operation and no rollback or partially configured public client exists. It allocates, retains, and
+closes nothing.
+
+The same candidate repairs the already-shipped `TcpConnWriter` → `IoWriterWrite` path rather than
+adding a second write ABI. The private runtime `Writer` gains a socket sink kind and macOS/BSD
+readiness bit; only `align_rt_tcp_conn_writer` sets the kind. A nonempty socket-kind write keeps the existing complete
+partial-write loop, EINTR retry, and `EAGAIN`/`EWOULDBLOCK` timeout mapping, but Linux calls
+`send(MSG_NOSIGNAL)` and macOS/BSD performs checked `SO_NOSIGPIPE` before the first send on that
+writer shell, caching only success. The option failure sends nothing through that call and remains
+retryable; positive-length zero progress deterministically returns `AL_CODE`
+(`core.Error.Code(0)`). File and standard-stream writers retain the existing generic `write(2)`
+path. Connection-derived writers remain unbuffered and non-owning, so `IoWriterFree` performs no
+write and does not close the socket. `SO_NOSIGPIPE` is monotone and idempotent per socket:
+overlapping shells may each attempt it, each sends only after its own successful result, a failed
+shell remains retryable, no shell Drop clears it, and connection close discards it. No
+process-global signal state changes. The existing three row
+identities, LLVM declarations, Rust exports, attributes, registry entries, fingerprints, and counts
+remain unchanged.
+
+At package implementation, the one new key, symbol, definition, collision reservation, typed
+registry row, runtime ABI fingerprint input, base/maximum export entry, and source-compatible extern
+reuse activate atomically. It increases the unkeyed/base/maximum counts by one and the keyed count
+by zero: the exact keyed/base/maximum counts become 330/348/356. It reuses an existing shape, so
+A123 remains the next unreserved shape. Until then it is not a runtime export or legal
+compatible-native definition. The writer hardening lands first as an independently useful
+`std.net` safety prerequisite because it changes no ABI identity. Exact public consumption,
+poisoning, and owner matrix: `pkg-design/kv.md`.
 
 ## Implemented std.log extension (2026-08-31)
 

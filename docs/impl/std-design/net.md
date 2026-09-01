@@ -11,10 +11,11 @@ module.
 ## Overview
 
 Low-level sockets: tcp, udp, dns, socket. Syscall-backed. The keystone reuse: a connected
-socket's fd plugs into the **existing M9 reader/writer** unchanged — polymorphism lives in
+socket's fd plugs into the **existing M9 reader/writer** — polymorphism lives in
 construction (a net-side constructor returning an fd-owning handle), the read/write/Drop-closes-fd
 machinery is identical (draft §18.2 io principle; realized by reader/writer being fd-generic). So
-net adds socket lifecycle + DNS, NOT a new I/O path.
+net adds socket lifecycle + DNS, NOT a new I/O path. The `pkg.kv` prerequisite below keeps that one
+writer ABI and adds only private sink provenance so socket writes can suppress SIGPIPE safely.
 
 ## Signatures
 
@@ -67,8 +68,9 @@ All net ops are **impure** (syscalls) — never in a `par_map` closure.
 Syscall failures go through the **shared errno→Error table** (M9): ECONNREFUSED/ETIMEDOUT/
 EHOSTUNREACH → `Error.Code(errno)` (no dedicated variant in v1 — extend the table only if a
 consumer needs to branch on them), ENOENT-class DNS failure → a resolve-specific `Error.Invalid`
-or `Error.Code`. Partial read/write handled by the reused reader/writer (already correct).
-Connection reset mid-stream surfaces as a read/write Error.
+or `Error.Code`. Partial read/write is handled by the reused reader/writer. Connection reset
+mid-stream surfaces as a read/write Error; the `pkg.kv` prerequisite below closes the current Linux
+SIGPIPE hole so a write to a closed peer cannot terminate the process first.
 
 **`l.accept()` is the exception, and deliberately so: a failure of ONE inbound connection is not a
 failure of the listener.** `accept(2)` reports both through the same errno, so the ones that
@@ -99,7 +101,8 @@ HTTP/3, TLS, socket tuning (TFO/REUSEPORT/thread-per-core) are pkg, not std.
 
 3 new Move `Ty` (TcpConn/TcpListener/UdpSocket) + runtime structs + Drop(close); socket-lifecycle
 runtime fns (socket/connect/bind/listen/accept, getaddrinfo for `dns.resolve`, sendto/recvfrom);
-reuse M9 reader/writer verbatim for the byte path (the win); `region_of` arms binding borrowed
+reuse the M9 reader/writer ABI for the byte path (the win), with the private socket-sink hardening
+recorded below; `region_of` arms binding borrowed
 reader/writer to their conn; the `task_group` + blocking-pool substrate that `std.http`'s
 `get_many` builds on (batching itself is http's, not net's). No new effect, no new I/O path, no
 async runtime.
@@ -148,6 +151,7 @@ just supplies the `task_group` + blocking-pool substrate, already available.)
 
 - `dns.resolve` localhost → contains 127.0.0.1
 - connect to a local listener + round-trip bytes through reader/writer
+- connection-derived writer to a closed peer returns Error without SIGPIPE process termination
 - reader used past conn Drop → compile error (P2)
 - accept loop serves N clients
 - udp `send_to`/`recv_from` round-trip
@@ -218,3 +222,42 @@ path — this is socket options on the existing blocking rail.
 Connect to a black-holed (never-accepting) address with a bound → `Err(Timeout)` within the bound. A
 conn whose peer accepts then never sends, with `read_timeout_ns` set → a read returns `Err(Timeout)`
 within the bound. `ns == 0` preserves blocking behavior.
+
+---
+
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite — DESIGN CANDIDATE 2026-09-02)
+
+> **Status:** independently useful safety prerequisite; not implemented until the `pkg.kv` design
+> is accepted. No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
+> row count changes.
+
+The existing `c.writer() -> writer` remains the one TCP byte-write surface. Its private runtime
+`Writer` state gains a sink kind and macOS/BSD readiness bit set to socket/not-ready only by
+`align_rt_tcp_conn_writer`; standard-stream and file constructors set the generic-fd kind. A
+nonempty socket-kind `w.write(...)` keeps the one
+complete-write loop and exact existing Result taxonomy, with these platform rules:
+
+- Linux calls `send(MSG_NOSIGNAL)` for every attempt.
+- macOS/BSD lazily installs `SO_NOSIGPIPE` before the first send on that writer shell and caches only
+  success. A failed option installation returns its fixed errno-mapped `Error` before that call
+  sends bytes, leaves the shell not-ready for a later retry, and a successful installation then uses
+  `send` for this and later writes.
+- A partial send advances the remaining view, EINTR retries, an armed blocking-socket
+  `EAGAIN`/`EWOULDBLOCK` remains `Error.Timeout`, and positive-length zero progress is deterministic
+  `Error.Code(0)` rather than a spin or stale errno.
+
+There is no process-global signal handler or mask. A failure may follow bytes already written by an
+earlier attempt in the same call, so the caller receives the error and owns replay policy. File and
+standard-stream writers retain the existing `write(2)` path byte-for-byte. Connection-derived
+writers remain unbuffered and `owns_fd: false`; their `flush`/Drop has no pending write and only the
+`tcp_conn` closes the socket. `SO_NOSIGPIPE` is monotone and idempotent per socket: overlapping
+shells may each attempt it, each sends only after its own successful result, a failed shell remains
+retryable, no shell Drop clears it, and connection close discards it. A logger or `io.copy` that
+uses the same connection-derived writer inherits the socket sink kind instead of opening a second
+path.
+
+Acceptance owners are a subprocess closed-peer test on Linux and macOS (a regression must return
+`Error`, never die from SIGPIPE), direct partial/EINTR/timeout/zero-progress mapping tests, and
+file/std writer parity. Exact package consumption and the implementation boundary are in
+`../pkg-design/kv.md`; the unchanged ABI identities and planned checked-timeout row are recorded in
+`../20-runtime-abi-ledger.md`.

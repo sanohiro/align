@@ -3538,7 +3538,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The first-party packages developed in this repository are exactly four subtrees:
+The first-party packages developed in this repository are exactly five subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3548,6 +3548,7 @@ pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
+pkg.kv             // candidate synchronous RESP2 GET/SET/DEL client
 ```
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
@@ -3651,6 +3652,67 @@ JSON/base64/HMAC/Argon2/random set and libcrypto, including session-only use.
 The exact contract and implementation closure matrix are
 `docs/impl/pkg-design/auth.md`. `pkg.auth` replaced the former `pkg.jwt` prototype outright; no
 compatibility alias is retained.
+
+The `pkg.kv` v1 design candidate proposes one synchronous plaintext RESP2 text-value client. Its
+exact public types and signatures are:
+
+```text
+pkg.kv.client  // opaque Move resource; Drop is the only public close operation
+pkg.kv.ClientOptions {
+  connect_timeout_ns: i64,
+  io_timeout_ns: i64,
+  max_response_bytes: i64,
+}
+pkg.kv.SetCondition { Always, IfAbsent, IfPresent }
+pkg.kv.SetOptions { condition: SetCondition, expires_in_ns: Option<i64> }
+pkg.kv.Error { Invalid, Io(core.Error), Server(string), Decode, ResponseTooLarge, Protocol, Closed }
+pkg.kv.connect(host: str, port: i64, options: ClientOptions) -> Result<client, Error>
+pkg.kv.get(borrow mut owner: client, key: str) -> Result<Option<string>, Error>
+pkg.kv.set(
+  borrow mut owner: client,
+  key: str,
+  value: str,
+  options: SetOptions,
+) -> Result<bool, Error>
+pkg.kv.delete(borrow mut owner: client, key: str) -> Result<bool, Error>
+```
+
+There are no defaults. `connect` requires, and validates in order, a nonempty host without U+0000,
+port `1..=65535`, connect timeout `1..=86400000000000` ns, I/O timeout in the same range, and
+response cap `0..=536870912`, all before DNS, allocation, or socket work. The cap is inclusive for
+a GET bulk or owned error payload; every non-error control line has a separate 64-byte cap. The
+endpoint, per-address connect timeout, per-blocking-read/write I/O timeout, and response cap are
+all caller-explicit. The connect timeout covers each post-DNS address attempt, not DNS or the whole
+address list; the I/O timeout covers one blocking wait for progress, not a whole command. Each
+key/value admits `0..=536870912` UTF-8 bytes, including embedded NUL/CR/LF. `SetOptions` has no
+default: `Always`,
+`IfAbsent`, and `IfPresent` map to no condition, `NX`, and `XX`; `None` requests persistent SET and
+therefore removes an existing TTL, while `Some(ns)` requires `1..=i64::MAX` and emits checked
+`PX ceil(ns / 1000000)`. The two option records and condition sum are Copy and Pure. `Error` is
+Move only because `Server` owns its string; its other variants allocate nothing.
+
+The three commands emit only canonical uppercase bulk-array RESP2 `GET`, `SET`, and single-key
+`DEL`. GET returns an owned `Some(string)` or `None`; SET returns whether exact `+OK` or an admitted
+conditional null reply applied the write; DEL admits only a signed-i64 integer whose value is zero
+or one. Inputs are borrowed only for the call. The opaque client owns one TCP connection and
+package state plus one retained non-owning reader and writer shell; a successful connect retains
+exactly those four allocations. It is Move, non-Copy, and accepts exactly one call-bounded
+`borrow mut` operation at a time. Complete bounded `Server(string)` and complete framed non-UTF-8 `Decode` replies consume one
+whole response and leave it reusable. `Io`, `ResponseTooLarge`, `Protocol`, and first-reply EOF as
+`Closed` retire it before returning; every later operation returns `Closed` without I/O. `Invalid`
+precedes I/O, the first error wins, and Drop closes/frees the owner at most once.
+All four operations are Impure.
+
+V1 sends no PING, AUTH, SELECT, or HELLO and provides no TLS, RESP3 negotiation, generic command or
+reply value, pipeline, reconnect, redirect, replay, or hidden retry. It relies on the server's
+default RESP2 mode. Ordinary package source owns framing and parsing; no checked HIR or compiler
+operation is added. One package-internal runtime row remains planned and inactive while this
+contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both socket I/O
+timeouts and reuses ABI shape A04. SIGPIPE safety hardens the existing connection-derived
+`writer` in place: its unchanged write row keeps complete partial-write/EINTR/timeout behavior but
+uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`, while file and standard-stream writers keep their
+existing path. No writer ABI identity or count changes. The candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and
+closure matrix are `docs/impl/pkg-design/kv.md`; independent review has not yet accepted them.
 
 **First-party packages** (developed in this repo, distributed with the system as vendorable subtrees)
 live at the same depth as any other `pkg` — `pkg.web` is the flagship. They are ordinary pkg-layer

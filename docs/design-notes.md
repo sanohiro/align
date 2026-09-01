@@ -1432,6 +1432,40 @@ session-token-only `pkg.auth` consumer still retains the module's HMAC/Argon2 ca
 libcrypto. The design records that existing cost explicitly instead of promising per-function
 linking that the current whole/per-unit machinery does not provide.
 
+## Why `pkg.kv` is a typed RESP2 client, not a generic Redis protocol API
+
+One Redis connection carries a sequential byte stream, so a generic command/reply escape hatch
+would let an incomplete nested reply silently desynchronize every later operation. The candidate
+instead admits only `GET`, `SET`, and one-key `DEL`, each with a closed reply shape. An opaque Move
+client and call-bounded `borrow mut` make one request/one reply the only concurrency model. A
+transport failure, oversized response, or reply whose framing cannot be proved complete retires the
+client before returning; only a complete bounded server error or text payload that fails UTF-8
+decoding leaves the stream synchronized and reusable.
+
+Endpoint, timeout, memory, condition, and expiry policy stay visible at the call site. `connect`
+takes an explicit host, port, per-address connect timeout, socket I/O timeout, and inclusive reply
+cap. `SET` takes a closed `Always` / `IfAbsent` / `IfPresent` condition and an optional positive
+nanosecond duration converted upward to Redis `PX` milliseconds. This is enough for the first
+`pkg.auth` session-store consumer: `IfAbsent` supplies an atomic token-collision check,
+`IfPresent` avoids resurrecting a revoked or expired session, explicit expiry gives server-owned
+retention, and one-key `DEL` supplies revocation. No client clock, retry, redirect, credential,
+database, pooling, transaction, script, pub/sub, or ambient configuration is implied.
+
+RESP framing and validation remain ordinary package source. The only planned runtime addition is
+one generic package-internal row for checked receive/send timeout installation. SIGPIPE safety is
+instead repaired in the existing connection-derived writer, so every `std.net` consumer benefits
+and `pkg.kv` does not create a second byte-write path. Its private socket sink selects
+`MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; file and standard-stream writers remain unchanged. This
+keeps Redis parsing out of the runtime, adds no language operation or public network surface, and
+changes no existing writer ABI identity.
+
+GET values and server errors are ordinary owned strings; keys and SET values are borrowed only for
+their synchronous write. No reply or scratch view escapes, and the configured response cap bounds
+the only value-sized receive allocation. V1 deliberately stays on plaintext RESP2 with no protocol
+negotiation or TLS. The exact candidate contract, byte grammar, error precedence, runtime
+reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`; no public contract
+is accepted until its independent review closes.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private

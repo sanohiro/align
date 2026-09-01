@@ -3964,8 +3964,19 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on
-  protocol violation. (rediss:// TLS deferred; plaintext TCP v1.)
+- **pkg.kv — DESIGN CANDIDATE 2026-09-02** — one synchronous plaintext RESP2 client with an
+  opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
+  owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
+  positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
+  public operations are `connect`, `get`, `set`, and `delete`; uncertain transport/framing/size
+  failure retires the client, while a fully consumed bounded server error or non-UTF-8 text reply
+  remains synchronized. There is no generic command/reply value, default endpoint, credential,
+  database, retry, redirect, pool, transaction, script, pub/sub, protocol negotiation, client
+  clock, or TLS. Package source owns RESP; one planned unkeyed runtime row supplies checked socket
+  timeout installation, while the existing connection-derived writer is hardened in place for
+  SIGPIPE-safe complete writes with no ABI/count change in one prerequisite PR before the package.
+  Independent review is pending; no public contract is accepted. Exact
+  ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.
 - **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to

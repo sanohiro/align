@@ -3227,6 +3227,32 @@ shipped behavior normative without fixing the internal sorting algorithm. Full c
 
 ## Open (to be decided)
 
+### `pkg.kv` v1 typed RESP2 client — DESIGN CANDIDATE 2026-09-02
+
+The candidate public surface is one opaque Move `client`, explicit `ClientOptions`, a closed
+`SetCondition` and `SetOptions`, the exact error sum `Invalid | Io(core.Error) | Server(string) |
+Decode | ResponseTooLarge | Protocol | Closed`, and four Impure operations: `connect`, `get`,
+`set`, and single-key `delete`. GET returns an owned `Option<string>`; SET reports whether its
+explicit `Always` / `IfAbsent` / `IfPresent` condition applied and optionally maps a positive
+nanosecond duration upward to Redis `PX` milliseconds; DEL reports whether one key was removed.
+
+V1 is synchronous RESP2 over explicit plaintext TCP only. Endpoint, per-address connect timeout,
+socket I/O timeout, and inclusive response cap are caller inputs; request keys/values and reply
+payloads have an exact 512 MiB ceiling. There is no generic command/reply value, URL, default,
+credential, database selection, retry, redirect, pool, transaction, script, pub/sub, protocol
+negotiation, TLS, client clock, or ambient configuration. One `borrow mut` operation owns each
+request/reply exchange. Transport, size, or uncertain framing failure closes the client; only a
+fully consumed bounded server error or non-UTF-8 text payload is reusable.
+
+RESP assembly and parsing stay in package source. Implementation would activate one planned
+unkeyed runtime row for checked socket timeout configuration. SIGPIPE safety instead hardens the
+existing connection-derived writer in place without an ABI/count change, leaving file and standard
+writers unchanged; neither change adds a language operation or public networking surface. Exact inputs, validation
+precedence, ownership, allocation, wire grammar, reuse/retirement rules, ABI reservation, and
+acceptance owners are recorded in `impl/pkg-design/kv.md` and
+`impl/20-runtime-abi-ledger.md`. This item remains open: independent adversarial review must close
+before it may move to Settled or authorize implementation.
+
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 
 SQLite can persist comparator results in indexes and schema objects, but its collation registration

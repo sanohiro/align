@@ -13,8 +13,10 @@
 低レベルのソケット群である: tcp、udp、dns、socket。いずれも syscall に裏打ちされる。設計の要は再利用に
 ある。接続済みソケットの fd は、**既存の M9 reader/writer** にそのまま差し込める。多態性は construction
 の側 — fd を所有するハンドルを返す net 側のコンストラクタ — にあり、read/write と Drop での fd close の
-仕組みは全く同一である(draft §18.2 の io 原則。reader/writer が fd に対して汎用であることで実現してい
-る)。つまり net が足すのはソケットのライフサイクルと DNS だけで、新しい I/O パスは足さない。
+仕組みは同一である(draft §18.2 の io 原則。reader/writer が fd に対して汎用であることで実現している)。
+つまり net が足すのはソケットのライフサイクルと DNS だけで、新しい I/O パスは足さない。下記の
+`pkg.kv` prerequisite は writer ABI を 1 個のまま保ち、socket write が SIGPIPE を安全に抑止できる
+private sink provenance だけを加える。
 
 ## Signatures
 
@@ -68,8 +70,9 @@ net の操作はすべて **impure**(syscall)である — `par_map` のクロ�
 syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECONNREFUSED/ETIMEDOUT/EHOSTUNREACH は
 `Error.Code(errno)` になる(v1 では専用バリアントを設けず、これらで分岐したい消費者が現れたときに初めて
 テーブルを拡張する)。ENOENT 系の DNS 失敗は、resolve 専用の `Error.Invalid` か `Error.Code` にする。
-部分的な read/write は、再利用する reader/writer 側がすでに正しく処理している。ストリーム途中のコネクション
-リセットは read/write の Error として表面化する。
+部分的な read/write は再利用する reader/writer が処理する。ストリーム途中の connection reset は read/write
+Error として表面化する。下記の `pkg.kv` prerequisite は現在の Linux SIGPIPE hole を閉じ、closed peer への
+write が Error を返す前に process を terminate しないようにする。
 
 **`l.accept()` だけは例外であり、それは意図的である: inbound コネクション 1 本の失敗は、listener の失敗
 ではない。** `accept(2)` は両者を同じ errno で報告するので、コネクションを記述しているほうは返さずに内部で
@@ -100,8 +103,9 @@ std ではなく pkg の領分である。
 
 必要になるものは次のとおり。Move 型の `Ty` 3 種(TcpConn/TcpListener/UdpSocket)+ ランタイム構造体 +
 Drop(close)。ソケットのライフサイクル用ランタイム関数(socket/connect/bind/listen/accept、`dns.resolve`
-用の getaddrinfo、sendto/recvfrom)。バイトパスは M9 の reader/writer をそのまま再利用する(ここが最大の
-利点)。借用した reader/writer をその conn に束縛する `region_of` 分岐。そして `std.http` の `get_many` が
+用の getaddrinfo、sendto/recvfrom)。バイトパスは M9 の reader/writer ABI を再利用し(ここが最大の利点)、
+下記の private socket-sink hardening を加える。借用した reader/writer をその conn に束縛する `region_of`
+分岐。そして `std.http` の `get_many` が
 土台にする `task_group` + ブロッキングプールの基盤(バッチング自体は net ではなく http の担当)。新しい
 effect も、新しい I/O パスも、async ランタイムも要らない。
 
@@ -147,6 +151,7 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 
 - `dns.resolve` の localhost に 127.0.0.1 が含まれる
 - ローカルの listener へ connect し、reader/writer 経由でバイトを往復させる
+- connection-derived writer で closed peer へ write すると、SIGPIPE で process termination せず Error を返す
 - conn の Drop 後に reader を使う → コンパイルエラー(P2)
 - accept ループが N 個のクライアントをさばく
 - udp の `send_to`/`recv_from` の往復
@@ -213,3 +218,37 @@ connect 前のハンドルが無く、Align には任意引数が無い);raw-soc
 ブラックホール化された(決して accept しない)アドレスへ上限付きで connect → 上限内で `Err(Timeout)`。相手が
 accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が上限内で `Err(Timeout)` を返す。
 `ns == 0` はブロッキング挙動を保つ。
+
+---
+
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite — DESIGN CANDIDATE 2026-09-02)
+
+> **ステータス:** independently useful な safety prerequisite。`pkg.kv` design が accept されるまで未実装。
+> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+
+既存の `c.writer() -> writer` が唯一の TCP byte-write surface のまま。private runtime `Writer` state に
+sink kind と macOS/BSD readiness bit を加え、`align_rt_tcp_conn_writer` だけが socket/not-ready に設定。
+standard-stream/file constructor は generic-fd kind を設定。socket-kind の nonempty `w.write(...)` は
+1 本の complete-write loop と exact existing Result taxonomy を維持し、platform rule は次のとおり。
+
+- Linux は全 attempt で `send(MSG_NOSIGNAL)` を呼ぶ。
+- macOS/BSD はその writer shell の最初の send 前に `SO_NOSIGPIPE` を lazy install し、成功だけを cache。
+  option installation failure はその call が byte を送る前に fixed errno-mapped `Error` を返し、shell は
+  not-ready のまま後続 call で retry する。成功後は今回以降の write で `send` を使う。
+- partial send は残り view を進め、EINTR は retry。armed blocking-socket の
+  `EAGAIN`/`EWOULDBLOCK` は `Error.Timeout` のまま。positive-length zero progress は spin/stale errno
+  でなく deterministic `Error.Code(0)`。
+
+process-global signal handler/mask はない。同じ call の earlier attempt が byte を送った後に failure が
+起こり得るため、caller が error を受け replay policy を所有する。file/standard-stream writer は既存の
+`write(2)` path を byte-for-byte で維持。connection-derived writer は unbuffered かつ
+`owns_fd: false` のままで、`flush`/Drop に pending write はなく socket を close するのは `tcp_conn` だけ。
+`SO_NOSIGPIPE` は monotone/idempotent な per-socket setting。overlap する shell は各々設定を試せるが、
+各 shell は自身の成功後だけ send し、失敗した shell は retryable。shell Drop は clear せず、connection
+close が破棄する。同じ connection-derived writer を使う logger/`io.copy` は第二 path を開かず socket
+sink kind を継承する。
+
+acceptance owner は Linux/macOS の subprocess closed-peer test(regression は SIGPIPE で終了せず必ず
+`Error` を返す)、partial/EINTR/timeout/zero-progress mapping の direct test、file/std writer parity。
+exact package consumption と implementation boundary は `../pkg-design/kv.md`、不変 ABI identity と planned
+checked-timeout row は `../20-runtime-abi-ledger.md` に記録する。
