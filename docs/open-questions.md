@@ -3242,29 +3242,37 @@ payloads have an exact 512 MiB ceiling. There is no generic command/reply value,
 credential, database selection, retry, redirect, pool, transaction, script, pub/sub, protocol
 negotiation, TLS, client clock, or ambient configuration. One `borrow mut` operation owns each
 request/reply exchange. Transport, size, or uncertain framing failure closes the client; only a
-fully consumed bounded arbitrary-byte server error or non-UTF-8 text payload is reusable. Error
-framing/trailing validation precedes UTF-8 classification; empty owned results use canonical
-null/zero without a final allocation.
+fully consumed bounded grammar-valid Simple Error payload (NUL/invalid UTF-8 admitted, CR/LF
+excluded, exact CRLF terminator) or non-UTF-8 GET payload is reusable. A CR/LF violation is retiring
+`Protocol`; error grammar/cap/framing/trailing validation precedes UTF-8 classification. Empty owned
+results use canonical null/zero without a final allocation.
 
 The first exact-SHA review found that the shipped positive-connect path ignored nonblocking install
 and blocking-restore failure and did not fix timeout quantization/precedence. The revised closure
 matrix therefore adds a first shared timeout-substrate prerequisite: monotonic start-plus-budget
 arithmetic across the complete positive-i64 range, checked fd-mode transitions,
-close-and-next-address failure, ceil/rechecked millisecond connect waits, resolver-order first
-success/last failure, positive socket-I/O ns rounded up to normalized microseconds for
+close-and-next-address failure, ceil/rechecked millisecond connect waits, named EAI mapping before
+resolver-order first-success/last failure, positive socket-I/O ns rounded up to normalized
+microseconds for
 `std.net`/`std.http`, and the same ceil/start-budget correction for `process.command`. RESP assembly,
 native-status decoding, and parsing stay in package source. Internal modules explicitly import
-`std.process`; every impossible status/count/view/output product reaches the existing keyed
-`ProcessAbort` before parsing or publication. Implementation would then harden the
+`std.process`; every impossible status/count/view-length/view-pointer/output product reaches the
+existing keyed `ProcessAbort` before parsing or publication. Implementation would then harden the
 existing connection-derived writer for SIGPIPE across its slice and builder overloads without an
 ABI/count change, and finally activate
 one planned fixed-symbol runtime row for checked socket timeout configuration with the package.
+Every non-null compatible caller must hold one live/unfreed connection exclusively; pre-armed
+receive/send state distinguishes unchanged receive-option failure, send-option failure with receive
+changed, and both-success.
+Either option failure mandates caller retirement and later free/Drop, and the package closes its
+fresh unpublished connection without retry.
 Compiler registry recognition supplies exact extern compatibility/collision/reachability but none
 of these changes adds a language/HIR/MIR operation or public networking surface. Exact inputs, validation
 precedence, ownership, allocation, wire grammar, reuse/retirement rules, ABI reservation, and
 acceptance owners are recorded in `impl/pkg-design/kv.md` and
-`impl/20-runtime-abi-ledger.md`. This item remains open: the strategy-changing repair requires one
-fresh complete adversarial review before it may move to Settled or authorize implementation.
+`impl/20-runtime-abi-ledger.md`. The first fresh review found four remaining native/wire boundary
+gaps; this item remains open until another fresh complete adversarial review accepts the second
+repair, after which it may move to Settled and authorize implementation.
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 

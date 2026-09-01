@@ -134,14 +134,22 @@ continues, so no connection is published before checked blocking-mode restoratio
 nonpositive raw-ABI blocking path stays unchanged: public HTTP callers reject negative values before
 this ABI, and raw `tcp.connect` supplies zero.
 
-Resolver order is observable. Unsupported families, null addresses, and zero address lengths are
-skipped without changing the last failure. The first successful usable address wins. No usable
-address returns `AL_INVALID`; if every attempted candidate fails, the runtime returns the last
-status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`, an immediate connect
-errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`, blocking-restore
-`F_GETFL`, or blocking-restore `F_SETFL`. Direct mixed-address owners place a skipped entry and a
-later success after every failure class; all-failure variants pin the last attempted status and
-candidate close count. DNS and the sum across addresses have no end-to-end deadline.
+A nonzero `getaddrinfo` result returns before address iteration. `EAI_NONAME`/`EAI_NODATA` maps to
+`AL_INVALID`; every other symbolic EAI value maps to
+`AL_CODE.saturating_add(eai.saturating_abs())`. The already-cleared connection output remains null,
+no socket is attempted, no address-list owner escapes, and transient host/service storage drops
+before return. Direct symbolic EAI owners pin both mapping categories, null output, zero socket
+calls, and cleanup.
+
+After successful resolution, resolver order is observable. Unsupported families, null addresses,
+and zero address lengths are skipped without changing the last failure. The first successful usable
+address wins. No usable address returns `AL_INVALID`; if every attempted candidate fails, the
+runtime returns the last status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`,
+an immediate connect errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`,
+blocking-restore `F_GETFL`, or blocking-restore `F_SETFL`. Direct mixed-address owners place a
+skipped entry and a later success after every failure class; all-failure variants pin the last
+attempted status and candidate close count. DNS and the sum across addresses have no end-to-end
+deadline.
 
 The same prerequisite makes the shared positive-nanosecond socket-timeout conversion exact for
 `std.net`, `std.http`, and the planned checked package row:
@@ -196,20 +204,28 @@ row is a general TCP-connection operation rather than a RESP parser or package-s
 
 `TcpConnSetIoTimeout` first rejects a null connection with `AL_INVALID`, then rejects
 `timeout_ns` outside `1..=86400000000000` with `AL_INVALID`; either rejection occurs before reading
-the fd or calling `setsockopt`. A non-null dangling pointer violates the unsafe native ABI
-provenance precondition and is not detectable. For an admitted input the row uses the normalized
-ceil-to-microsecond `timeval` above, then installs `SO_RCVTIMEO`. A failure returns its fixed
-errno-mapped status without attempting `SO_SNDTIMEO`; otherwise it installs `SO_SNDTIMEO` and
-returns that status, or zero only after both succeed. If the second installation fails, the first
-may remain installed; `pkg.kv.connect` closes the unpublished connection, so configuration cannot
-overlap another operation and no rollback or partially configured public client exists. It
-allocates, retains, and closes nothing. The null x range product directly owns validation order and
-the no-fd/no-option side-effect rule. Parameterized direct-runtime owners pin the exact normalized
-`timeval`, option order, call counts, returned status, and retained option state: receive failure is
-one `setsockopt` call, returns that mapped status, and makes no send call; send failure is two calls,
-returns the send mapped status, and leaves receive installed; successful installation of both is
-exactly two calls and returns zero. The package owner closes the selected unpublished connection
-after send failure and proves that resolution is not reopened and no other address is attempted.
+the fd or calling `setsockopt`, and a live connection remains usable after the range rejection.
+Every non-null call has the unsafe precondition that the pointer names one live, unfreed `TcpConn`
+held with exclusive logical access for the complete call. A dangling or concurrently aliased
+pointer violates that precondition and is not detectable; no read, write, other configuration,
+reader/writer construction, free, or Drop may overlap.
+
+For an admitted input the row uses the normalized ceil-to-microsecond `timeval` above, then installs
+`SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without attempting `SO_SNDTIMEO`;
+otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after both succeed. Let
+`R0` and `S0` be the receive/send option states at entry and `T` the requested state. Receive failure
+leaves `{R0,S0}`, send failure leaves `{T,S0}`, and success leaves `{T,T}`. After either option
+failure, a compatible caller must retire the still-owned connection, perform no read/write/configure
+or retry on it, and invoke its ordinary free/Drop path exactly once; close discards the entry or
+partial state. Success preserves usability, and a later exclusive successful call may overwrite
+both options. The row itself allocates, retains, rolls back, closes, or consumes nothing. The null x
+range product directly owns validation order and the no-fd/no-option side-effect rule.
+Parameterized direct-runtime owners pre-arm both option states and pin live/exclusive preconditions,
+the exact normalized `timeval`, option order, call counts, returned status, the
+`{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
+prohibition, retirement, and later free/Drop. The package calls only on a fresh exclusively owned
+unpublished connection with both entry options clear; its owner closes after either option failure and proves that resolution is not
+reopened, no other address is attempted, and no partially configured client is published.
 
 The LLVM and Rust definitions use A04's default C calling convention and have no curated function,
 return, or parameter attributes. The compiler recognizes the fixed physical symbol for exact ABI

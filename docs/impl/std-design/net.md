@@ -67,8 +67,11 @@ All net ops are **impure** (syscalls) — never in a `par_map` closure.
 
 Syscall failures go through the **shared errno→Error table** (M9): ECONNREFUSED/ETIMEDOUT/
 EHOSTUNREACH → `Error.Code(errno)` (no dedicated variant in v1 — extend the table only if a
-consumer needs to branch on them), ENOENT-class DNS failure → a resolve-specific `Error.Invalid`
-or `Error.Code`. Partial read/write is handled by the reused reader/writer. Connection reset
+consumer needs to branch on them). Resolver failures are EAI values, not errno:
+`EAI_NONAME`/`EAI_NODATA` → `Error.Invalid`; every other nonzero EAI value →
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())`, then
+`Error.Code(encoded - AL_CODE)`. Partial
+read/write is handled by the reused reader/writer. Connection reset
 mid-stream surfaces as a read/write Error; the `pkg.kv` prerequisite below closes the current Linux
 SIGPIPE hole so a write to a closed peer cannot terminate the process first.
 
@@ -263,14 +266,20 @@ raw-ABI blocking path stays unchanged: public HTTP callers reject negative value
 and raw `tcp.connect` supplies zero. DNS and the sum across multiple addresses have no end-to-end
 deadline; scheduler/kernel delay may return after an address's logical deadline.
 
-Resolver order is observable. Unsupported families, null addresses, and zero address lengths are
-skipped without changing the last failure. The first successful usable address wins. No usable
-address returns `AL_INVALID`; if every attempted candidate fails, the runtime returns the last
-status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`, an immediate connect
-errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`, blocking-restore
-`F_GETFL`, or blocking-restore `F_SETFL`. Mixed-address owners put a skipped entry and a later
-success after each failure class; all-failure variants pin the last attempted status and close
-count.
+A nonzero `getaddrinfo` result returns before address iteration:
+`EAI_NONAME`/`EAI_NODATA` maps to `AL_INVALID`, while every other symbolic EAI value maps to
+`AL_CODE.saturating_add(eai.saturating_abs())`. The connection output remains null,
+transient host/service storage drops, no address-list owner escapes, and no socket is attempted.
+Symbolic EAI owners pin both categories, null output, cleanup, and zero socket calls.
+
+After successful resolution, resolver order is observable. Unsupported families, null addresses,
+and zero address lengths are skipped without changing the last failure. The first successful usable
+address wins. No usable address returns `AL_INVALID`; if every attempted candidate fails, the
+runtime returns the last status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`,
+an immediate connect errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`,
+blocking-restore `F_GETFL`, or blocking-restore `F_SETFL`. Mixed-address owners put a skipped entry
+and a later success after each failure class; all-failure variants pin the last attempted status and
+close count.
 
 The same prerequisite fixes the shared socket-timeout conversion used by public
 `read_timeout_ns`/`write_timeout_ns` and the planned checked package row. Every positive nanosecond
@@ -279,13 +288,18 @@ value becomes `ceil(ns / 1000)` microseconds and then a normalized
 existing clear/no-timeout meaning. The option bounds one blocking wait for progress, not the total
 duration of a multi-read or multi-write operation.
 
-The planned `TcpConnSetIoTimeout` consumer uses that exact normalized `timeval`, installs receive
-before send, and has one direct owner for each state product. Receive failure performs exactly one
-`setsockopt`, returns its mapped status, and never calls `SO_SNDTIMEO`. Send failure performs exactly
-two calls, returns the send mapped status, and leaves receive installed; the package then closes the
-selected unpublished connection without reopening resolution or trying another address. Successful
-installation of both performs exactly two calls and returns zero. The owners also pin option order,
-call counts, returned status, and retained option state.
+The planned source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
+to hold one live, unfreed connection exclusively across the call, with no overlapping
+read/write/configure/reader-writer-construction/free/Drop. It uses the exact normalized `timeval` and
+installs receive before send. With entry option states `{R0,S0}` and requested state `T`, receive
+failure performs exactly one `setsockopt`, returns its mapped status, makes no send call, and leaves
+`{R0,S0}`; send failure performs exactly two calls, returns the send mapped status, and leaves
+`{T,S0}`; success performs exactly two calls, returns zero, and leaves `{T,T}`. Either option failure
+requires the compatible caller to retire the connection without retry and free/Drop it exactly once;
+success preserves usability and permits a later exclusive overwrite. The package calls only on a
+fresh unpublished clear/clear connection and closes either failure without reopening resolution or
+trying another address. Owners pin live/exclusive preconditions, pre-armed states, option order,
+call counts, returned status, retry prohibition, retirement, and close/Drop.
 
 The ceil-to-microsecond conversion also serves shipped `std.http` plain/TLS/pool rearming. The
 poll-millisecond helper also serves `process.command`; that consumer adopts the same monotonic
@@ -297,8 +311,8 @@ Acceptance owners cover exact/next and maximum-positive ns, us, ms, chunk, and d
 failed `F_GETFL`/`F_SETFL` installation and restoration on immediate and polled success; early
 zero-result recheck versus exhausted/no-call poll, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` versus other
 immediate errno, EINTR remainder recomputation, readiness at the deadline, every resolver skip and
-last-status failure class, mixed-address close/continuation, no early expiry, a blocking-mode probe
-on every published connection, exact-timeval and receive/send option state products, HTTP
+last-status failure class, symbolic EAI branch, mixed-address close/continuation, no early expiry, a blocking-mode probe
+on every published connection, exact-timeval and pre-armed receive/send state plus caller-retirement products, HTTP
 plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
 
 ---

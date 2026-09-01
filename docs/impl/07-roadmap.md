@@ -3969,24 +3969,33 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
   positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
   public operations are `connect`, `get`, `set`, and `delete`; uncertain transport/framing/size
-  failure retires the client, while a fully consumed bounded arbitrary-byte server error or
-  non-UTF-8 text reply remains synchronized; UTF-8 classification follows complete framing and
-  empty owned results use canonical null/zero. There is no generic command/reply value, default endpoint, credential,
+  failure retires the client, while a fully consumed bounded grammar-valid Simple Error payload
+  (NUL/invalid UTF-8 admitted, CR/LF excluded, exact CRLF terminator) or non-UTF-8 GET reply remains
+  synchronized; grammar/cap/trailing validation precedes UTF-8 classification and CR/LF violation
+  is retiring `Protocol`; empty owned results use canonical null/zero. There is no generic
+  command/reply value, default endpoint, credential,
   database, retry, redirect, pool, transaction, script, pub/sub, protocol negotiation, client
   clock, or TLS. The first exact-SHA review found unchecked nonblocking install/restore and
   under-specified timeout/address/native/cache behavior. The revised first prerequisite hardens the
   shared timeout substrate with full-range start-plus-budget arithmetic, checked fd-mode
-  transitions, ceil/rechecked connect waits, resolver-order first-success/last-failure selection,
+  transitions, ceil/rechecked connect waits, named EAI mapping before resolver-order
+  first-success/last-failure selection,
   shared `std.net`/`std.http` positive-I/O-ns ceil-to-microsecond conversion, and the same
   poll conversion for `process.command`. A second prerequisite hardens the existing
   connection-derived writer in place for
   SIGPIPE-safe complete writes and explicit fail/retry/overlap/transitive-route owners, with no
   ABI/count change, including the existing builder overload. Package source owns RESP and exact
-  native-status/count-view decoding; impossible products use an explicit `std.process` dependency
+  native-status/count/view-length/view-pointer decoding before typed-slice construction; impossible
+  products use an explicit `std.process` dependency
   and existing keyed `ProcessAbort`. Its implementation
   atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
-  installation without a language/HIR/MIR operation. A fresh complete review of the revised
-  strategy is pending; no public contract is accepted. Exact
+  installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
+  live connection exclusively; pre-armed receive/send state distinguishes unchanged receive-option
+  failure, send-option failure with receive changed, and success. Either failure mandates caller
+  retirement/free while the package closes its fresh unpublished connection. That fresh complete
+  review found four remaining
+  native/wire boundary gaps; another fresh complete review of the second repair is pending, and no
+  public contract is accepted. Exact
   ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

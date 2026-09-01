@@ -69,7 +69,10 @@ net の操作はすべて **impure**(syscall)である — `par_map` のクロ�
 
 syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECONNREFUSED/ETIMEDOUT/EHOSTUNREACH は
 `Error.Code(errno)` になる(v1 では専用バリアントを設けず、これらで分岐したい消費者が現れたときに初めて
-テーブルを拡張する)。ENOENT 系の DNS 失敗は、resolve 専用の `Error.Invalid` か `Error.Code` にする。
+テーブルを拡張する)。resolver failure は errno でなく EAI value であり、
+`EAI_NONAME`/`EAI_NODATA` は `Error.Invalid`、他の nonzero EAI value は
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())`、次に
+`Error.Code(encoded - AL_CODE)` にする。
 部分的な read/write は再利用する reader/writer が処理する。ストリーム途中の connection reset は read/write
 Error として表面化する。下記の `pkg.kv` prerequisite は現在の Linux SIGPIPE hole を閉じ、closed peer への
 write が Error を返す前に process を terminate しないようにする。
@@ -254,13 +257,18 @@ restoration が済むまで connection は publish しない。nonpositive raw-A
 caller はこの ABI 前に negative value を拒否し、raw `tcp.connect` は zero を渡す。DNS と複数 address の合計に end-to-end
 deadline は無く、scheduler/kernel delay で address の logical deadline 後に return することはある。
 
-resolver order は observable である。unsupported family、null address、zero address length は last failure を
-変えずに skip する。最初に成功した usable address が勝つ。usable address が無ければ `AL_INVALID` を返し、
-attempt した candidate がすべて失敗すれば socket creation、nonblocking `F_GETFL`、nonblocking `F_SETFL`、
-immediate connect errno、poll error/timeout、`getsockopt(SO_ERROR)` failure、nonzero `SO_ERROR`、
-blocking-restore `F_GETFL`、blocking-restore `F_SETFL` のうち最後の status を返す。mixed-address owner は各
-failure class の後に skipped entry と later success を置き、all-failure variant は last attempted status と
-close count を固定する。
+nonzero `getaddrinfo` result は address iteration 前に返る。`EAI_NONAME`/`EAI_NODATA` は `AL_INVALID`、
+他の symbolic EAI value は `AL_CODE.saturating_add(eai.saturating_abs())` へ map。
+connection output は null のまま、transient host/service storage は drop、address-list owner は escape せず、
+socket を試さない。symbolic EAI owner が両 category、null output、cleanup、zero socket call を pin。
+
+resolution 成功後の resolver order は observable。unsupported family、null address、zero address length は
+last failure を変えずに skip する。最初に成功した usable address が勝つ。usable address が無ければ
+`AL_INVALID` を返し、attempt した candidate がすべて失敗すれば socket creation、nonblocking `F_GETFL`、
+nonblocking `F_SETFL`、immediate connect errno、poll error/timeout、`getsockopt(SO_ERROR)` failure、
+nonzero `SO_ERROR`、blocking-restore `F_GETFL`、blocking-restore `F_SETFL` のうち最後の status を返す。
+mixed-address owner は各 failure class の後に skipped entry と later success を置き、all-failure variant は
+last attempted status と close count を固定する。
 
 同じ prerequisite が public `read_timeout_ns`/`write_timeout_ns` と planned checked package row で共有する
 socket-timeout conversion を修正する。全 positive nanosecond 値を `ceil(ns / 1000)` microseconds とし、それを
@@ -268,12 +276,16 @@ normalized `timeval { tv_sec, tv_usec: 0..999999 }` に分割する。exact micr
 clear/no-timeout 意味を保つ。option は 1 回の blocking progress wait を bound し、multi-read/multi-write operation 全体を
 bound しない。
 
-planned `TcpConnSetIoTimeout` consumer はこの exact normalized `timeval` を使い、receive を send より先に
-install し、各 state product を direct owner で固定する。receive failure は `setsockopt` を正確に 1 回呼び、その
-mapped status を返し、`SO_SNDTIMEO` を呼ばない。send failure は正確に 2 回呼び、send の mapped status を返し、
-receive を installed のまま残す。その後 package は selected unpublished connection を close し、resolution を
-再開せず別 address も試さない。both-success installation は正確に 2 回呼び zero を返す。owner は option
-order、call count、returned status、retained option state も固定する。
+planned source-reachable `TcpConnSetIoTimeout` consumer は全 non-null compatible caller に、call 全体で
+exclusive な 1 個の live/unfreed connection を要求し、read/write/configure/reader-writer-construction/free/Drop
+の overlap を禁止する。exact normalized `timeval` を使い receive を send より先に install。entry option state を
+`{R0,S0}`、requested state を `T` とすると、receive failure は `setsockopt` を exact 1 回呼び mapped status を
+返して send call なし、state は `{R0,S0}`。send failure は exact 2 回、send mapped status、state は `{T,S0}`。
+success は exact 2 回、zero、state は `{T,T}`。どちらかの option failure は compatible caller に retry なしの
+retirement と exact 1 回の free/Drop を要求し、success は usability と後の exclusive overwrite を許す。
+package は fresh unpublished clear/clear connection だけで call し、どちらの failure も resolution 再開/別 address
+試行なしで close。owner は live/exclusive precondition、pre-armed state、option order/call count/returned status、
+retry prohibition、retirement、close/Drop を pin。
 
 ceil-to-microsecond conversion は出荷済み `std.http` の plain/TLS/pool rearm にも届く。
 poll-millisecond helper は `process.command` にも届き、その consumer は従来の post-syscall
@@ -283,9 +295,10 @@ ceil conversion を使う。これらは package-local conversion の分岐で�
 acceptance owner は exact/next/maximum-positive ns、us、ms、chunk、deadline boundary、immediate/polled
 success での `F_GETFL`/`F_SETFL` installation/restoration failure、early zero-result recheck と
 exhausted/no-call poll、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` とその他 immediate errno、EINTR remainder
-recomputation、deadline 時の readiness、全 resolver skip/last-status failure class、mixed-address
-close/continuation、no early expiry、publish する全 connection の blocking-mode probe、exact-timeval と
-receive/send option state product、HTTP plain/TLS/pool rearm、command pipe-drain/post-EOF reap を含む。
+recomputation、deadline 時の readiness、全 resolver skip/last-status failure class、symbolic EAI branch、
+mixed-address close/continuation、no early expiry、publish する全 connection の blocking-mode probe、
+exact-timeval と pre-armed receive/send state および caller-retirement product、HTTP plain/TLS/pool rearm、
+command pipe-drain/post-EOF reap を含む。
 
 ---
 

@@ -3688,11 +3688,17 @@ all caller-explicit. The connect timeout records a fresh monotonic start and pos
 each usable post-DNS address, not DNS or the whole list, and forms no overflowable absolute
 deadline. Its shared prerequisite checks nonblocking installation and blocking restoration, closes
 and advances on failure, rounds each positive `poll` remainder up to milliseconds, rechecks an early
-zero, and lets immediate/readiness results win. Usable addresses are attempted in resolver order;
-first success wins, no usable entry makes the substrate return
-`AL_INVALID` and package source return `Io(core.Error.Invalid)`, and an all-failed list returns the
-last socket/connect/mode status. I/O-timeout installation failure closes the selected unpublished
-connection and does not try another resolved address. The I/O timeout rounds positive ns up to a
+zero, and lets immediate/readiness results win. Usable addresses are attempted in resolver order
+only after successful resolution. A nonzero `getaddrinfo` result returns first:
+`EAI_NONAME`/`EAI_NODATA` becomes `Io(core.Error.Invalid)`; every other EAI uses
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())` and becomes
+`Io(core.Error.Code(encoded - AL_CODE))`. The connection output stays null, and no socket is
+attempted. For a successful empty/all-skipped list,
+the substrate returns `AL_INVALID` and package source returns `Io(core.Error.Invalid)`; otherwise
+first success wins and an all-failed list returns the last socket/connect/mode status. Either
+receive- or send-timeout installation failure retires and closes the selected unpublished
+connection and does not try another resolved address; a send failure may have changed receive before
+close. The I/O timeout rounds positive ns up to a
 normalized microsecond `timeval` and covers one blocking wait for progress, not a whole command;
 kernel scheduling may return later than either logical/option deadline. Each key/value admits
 `0..=536870912` UTF-8 bytes, including embedded NUL/CR/LF. `SetOptions` has no default: `Always`,
@@ -3714,9 +3720,11 @@ conditional null reply applied the write; DEL admits only a signed-i64 integer w
 or one. Inputs are borrowed only for the call. The opaque client owns one TCP connection and
 package state plus one retained non-owning reader and writer shell; a successful connect retains
 exactly those four allocations. It is Move, non-Copy, and accepts exactly one call-bounded
-`borrow mut` operation at a time. A complete bounded arbitrary-byte server-error frame is classified
-only after framing/trailing validation: UTF-8 becomes `Server(string)` and non-UTF-8 becomes
-`Decode`; a complete framed non-UTF-8 GET likewise yields `Decode`. These consume one whole response
+`borrow mut` operation at a time. A complete bounded grammar-valid Simple Error payload admits
+NUL/invalid UTF-8 but excludes CR/LF; CRLF is its sole terminator. It is classified only after
+grammar/cap/framing/trailing validation: UTF-8 becomes `Server(string)` and non-UTF-8 becomes
+`Decode`; a CR/LF violation is `Protocol` and retires the client. A complete framed non-UTF-8 GET
+likewise yields `Decode`. These consume one whole response
 and leave it reusable. `Io`, `ResponseTooLarge`, `Protocol`, and first-reply EOF as
 `Closed` retire it before returning; every later operation returns `Closed` without I/O. `Invalid`
 precedes I/O, cleanup never replaces a selected terminal package error, and Drop closes/frees the
@@ -3734,11 +3742,21 @@ default RESP2 mode. Ordinary package source owns framing and parsing; no languag
 checked-HIR/MIR operation is added. One package-internal runtime row remains planned and inactive
 while this contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both
 socket I/O timeouts and reuses ABI shape A04. It returns `AL_INVALID` for null then out-of-range
-input before fd access; compiler registry recognition of its fixed symbol supplies typed extern
-compatibility, collision, and reachability. Package source imports `std.process`, maps native status
+input before fd access. Every non-null compatible caller supplies one live, unfreed, exclusively
+held connection and excludes read/write/configure/free/Drop overlap. From pre-armed option state
+`{R0,S0}` and requested `T`, receive failure leaves `{R0,S0}`, send failure leaves `{T,S0}`, and
+success leaves `{T,T}`. The row never rolls back, closes, or consumes; either option failure requires
+caller retirement and one later free/Drop, while success preserves usability and permits a later
+exclusive overwrite. The package closes either failure on its fresh unpublished connection.
+Compiler registry recognition of the fixed symbol supplies typed extern compatibility, collision,
+and reachability. Package source imports `std.process`, maps native status
 zero to success, `1..=4` to the four builtin error categories and `>=5` to `Code(status-5)`, and
-exhausts invalid-negative/admitted-negative/zero/positive/oversized reader counts against buffer-view
-length with checked i32 narrowing. Impossible status/count/view/output products call the existing
+exhausts invalid-negative/admitted-negative/zero/positive/oversized reader counts against raw
+buffer-view length and pointer representation with checked i32 narrowing. Invalid-negative and
+oversized-positive abort before reading that header. Negative/zero requires
+zero length and never dereferences either empty pointer form; positive requires exact length and a
+non-null pointer before typed-slice construction. Impossible
+status/count/view-length/view-pointer/output products call the existing
 `process.abort()` before parsing or publication and retain keyed `ProcessAbort`. SIGPIPE safety
 hardens the existing connection-derived `writer` in place: its unchanged write row keeps complete partial-write/EINTR/timeout behavior but
 uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and builder overloads reach that path,
@@ -3747,7 +3765,8 @@ changes. The timeout substrate and writer hardening are separate prerequisite ca
 new row lands with its package consumer. The revised
 candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
-review has not yet accepted them.
+review found four remaining native/wire boundary gaps. Another fresh complete review has not yet
+accepted the second repair.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design

@@ -1402,10 +1402,16 @@ usable address rather than covering DNS or the complete list; it forms no overfl
 deadline. Its shared prerequisite checks nonblocking installation and blocking restoration, closes
 and advances on failure, rounds a positive `poll` remainder up to milliseconds, rechecks early zero
 returns, and lets immediate/readiness results win. Usable addresses are attempted in resolver
-order; first success wins, no usable address makes the
-substrate return `AL_INVALID` and package source return `Io(core.Error.Invalid)`, and all attempted
-failures return the last socket/connect/mode status. I/O-timeout installation failure closes the
-selected unpublished connection and does not try another resolved address. A positive I/O timeout
+order only after successful resolution. A nonzero `getaddrinfo` result returns first:
+`EAI_NONAME`/`EAI_NODATA` becomes `Io(core.Error.Invalid)`; every other EAI uses
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())` and becomes
+`Io(core.Error.Code(encoded - AL_CODE))`. The connection output stays null, and no socket is
+attempted. For a successful empty/all-skipped list,
+the substrate returns `AL_INVALID` and package source returns `Io(core.Error.Invalid)`; otherwise
+first success wins and all attempted failures return the last socket/connect/mode status. Either
+receive- or send-timeout installation failure retires and closes the selected unpublished
+connection and does not try another resolved address; a send failure may have changed receive before
+close. A positive I/O timeout
 rounds up to a normalized microsecond `timeval` and covers one blocking wait for progress rather
 than the whole command; kernel scheduling may return later than either logical/option deadline.
 The same conversion reaches `std.http` socket timeouts. `process.command` shares the poll conversion
@@ -1417,8 +1423,10 @@ The package emits only typed canonical RESP2 GET, SET, and single-key DEL over p
 returns an owned optional string; SET maps `Always`/`IfAbsent`/`IfPresent` to no token/`NX`/`XX`
 and reports whether the write applied; DEL accepts only integer value zero or one. Inputs are
 call-bounded, one `borrow mut` excludes overlap, and Drop is the only public close. A complete
-bounded arbitrary-byte server-error frame or fully consumed non-UTF-8 GET reply yields reusable
-UTF-8 `Server` or non-UTF-8 `Decode` only after framing/trailing validation; transport, oversized,
+bounded grammar-valid Simple Error payload admits NUL/invalid UTF-8 but excludes CR/LF; CRLF is its
+sole terminator. It or a fully consumed non-UTF-8 GET reply yields reusable UTF-8 `Server` or
+non-UTF-8 `Decode` only after grammar/cap/framing/trailing validation; a Simple Error CR/LF violation
+is `Protocol` and retires the client. Transport, oversized,
 malformed/truncated/trailing, or initial-EOF failure retires the
 client and later use is `Closed` without I/O. `ClientOptions`, `SetCondition`, and `SetOptions` are
 Copy and Pure; `Error` is Move only because `Server` owns its string. All four operations are
@@ -1435,12 +1443,21 @@ RESP3/HELLO negotiation, generic command/reply surface, pipeline, redirect, repl
 the client relies on the server's default RESP2 mode. One source-reachable runtime row remains
 planned and inactive until implementation: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` for
 checked receive/send timeout installation, reusing A04. It returns `AL_INVALID` for null then
-out-of-range input before fd access; the compiler recognizes its fixed ABI symbol for typed extern
-compatibility, collision, and reachability without adding a language/HIR/MIR operation. Ordinary
+out-of-range input before fd access. Every non-null compatible caller supplies one live, unfreed,
+exclusively held connection and excludes read/write/configure/free/Drop overlap. From pre-armed
+option state `{R0,S0}` and requested `T`, receive failure leaves `{R0,S0}`, send failure leaves
+`{T,S0}`, and success leaves `{T,T}`. The row never rolls back, closes, or consumes; either option
+failure requires caller retirement and one later free/Drop, while success preserves usability and
+permits a later exclusive overwrite. The package uses a fresh unpublished connection and closes
+either failure. The compiler recognizes its fixed ABI symbol for typed extern compatibility,
+collision, and reachability without adding a language/HIR/MIR operation. Ordinary
 package source imports `std.process`, explicitly decodes native status zero as success, `1..=4` to
 the four `core.Error` categories and `>=5` to `Code(status-5)`, and exhausts invalid-negative,
-admitted-negative, zero, positive, and oversized reader counts against the returned buffer-view
-length with checked i32 narrowing. Every impossible status/count/view/output product calls the
+admitted-negative, zero, positive, and oversized reader counts against the raw buffer-view length
+and pointer representation with checked i32 narrowing. Invalid-negative/oversized-positive abort
+before reading that header. Negative/zero requires zero length and never
+dereferences either empty pointer form; positive requires exact length and non-null pointer before
+typed-slice construction. Every impossible status/count/view-length/view-pointer/output product calls the
 existing `process.abort()` before parsing or publication, retaining keyed `ProcessAbort` in whole
 and per-unit output. SIGPIPE safety then hardens the existing
 connection-derived writer in place with `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and
@@ -1448,4 +1465,5 @@ builder write overloads reach that path, file and standard-stream writers retain
 path, and no writer ABI identity/count changes. The
 timeout substrate and writer hardening are separate prerequisite capabilities; the new row lands
 with its package consumer. Exact revised candidate contract: `impl/pkg-design/kv.md`; its first
-independent review found contract gaps and a fresh complete review has not yet accepted it.
+independent review found contract gaps, the fresh complete review found four remaining native/wire
+boundary gaps, and another fresh complete review has not yet accepted the second repair.

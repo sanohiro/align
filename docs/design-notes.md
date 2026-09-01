@@ -1439,9 +1439,11 @@ would let an incomplete nested reply silently desynchronize every later operatio
 instead admits only `GET`, `SET`, and one-key `DEL`, each with a closed reply shape. An opaque Move
 client and call-bounded `borrow mut` make one request/one reply the only concurrency model. A
 transport failure, oversized response, or reply whose framing cannot be proved complete retires the
-client before returning; only a complete bounded arbitrary-byte server error or text payload that
-fails UTF-8 decoding leaves the stream synchronized and reusable. Error framing and same-read
-trailing validation finish before UTF-8 selects owned `Server` versus reusable `Decode`.
+client before returning; only a complete bounded grammar-valid Simple Error payload (NUL/invalid
+UTF-8 admitted, CR/LF excluded, exact CRLF terminator) or complete GET text payload that fails UTF-8
+decoding leaves the stream synchronized and reusable. A Simple Error CR/LF violation is `Protocol`
+and retires the client. Grammar, cap, framing, and same-read trailing validation finish before UTF-8
+selects owned `Server` versus reusable `Decode`.
 
 Endpoint, timeout, memory, condition, and expiry policy stay visible at the call site. `connect`
 takes an explicit host, port, per-address connect timeout, socket I/O timeout, and inclusive reply
@@ -1456,20 +1458,28 @@ That visibility requires the existing timeout substrate to honor what the caller
 connect attempt therefore uses monotonic start-plus-budget arithmetic rather than an overflowable
 absolute deadline, checks both nonblocking installation and blocking restoration, closes and
 continues on either failure, rounds a remaining wait upward to milliseconds, and rechecks an early
-zero from `poll`; an immediate/readiness result wins the logical deadline race. Resolver order is
-preserved, with first success and last attempted failure. Failure to install I/O timeouts after
-selection closes the unpublished connection rather than trying another address. Positive socket
+zero from `poll`; an immediate/readiness result wins the logical deadline race. A nonzero resolver
+result maps `EAI_NONAME`/`EAI_NODATA` to `Io(Invalid)` and every other EAI through the shipped
+magnitude encoding to `Io(Code)`, leaving null output and attempting no socket. Only after successful
+resolution is order preserved, with first success and last attempted failure. Failure to install
+either I/O timeout after selection retires/closes the unpublished connection rather than trying
+another address; send failure may have changed receive before close. Positive socket
 I/O timeouts round upward to normalized microseconds. This repair is a prerequisite shared by
 existing `std.net`/`std.http`; the same poll conversion and start/budget rule closes the complete
 positive-i64 range for `process.command` without changing its timeout-wins checkpoint order. It is
 not package-local policy or a claim that kernel scheduling supplies a strict wall-clock return.
 
 RESP framing and validation remain ordinary package source. The only planned runtime addition is
-one generic package-internal row for checked receive/send timeout installation. The compiler knows
-its physical symbol for typed ABI compatibility, collision, and reachability, but it is not a
-language builtin or HIR/MIR operation. Package source explicitly decodes the shared native-status
-table because ordinary extern calls do not receive builtin MIR decoding automatically. Its internal
-modules import `std.process`; impossible status/count/view/output products reach the existing
+one generic package-internal row for checked receive/send timeout installation. A non-null
+compatible caller must hold one live/unfreed connection exclusively with no read/write/configure/
+free/Drop overlap. From entry `{R0,S0}`, receive failure retains both states, send failure leaves
+`{T,S0}`, and success leaves `{T,T}`; the row does not roll back or close. Either option failure
+requires caller retirement and later free/Drop, and the package closes its fresh unpublished
+connection. The compiler knows its physical symbol for typed ABI compatibility, collision, and
+reachability, but it is not a language builtin or HIR/MIR operation. Package source explicitly
+decodes the shared native-status table because ordinary extern calls do not receive builtin MIR
+decoding automatically. Its internal modules import `std.process`; impossible
+status/count/view-length/view-pointer/output products reach the existing
 `ProcessAbort` capability before parsing or publication. SIGPIPE
 safety is instead repaired in the existing connection-derived writer, so every `std.net` consumer
 benefits and `pkg.kv` does not create a second byte-write path. Slice and builder writer overloads
@@ -1484,8 +1494,9 @@ the only value-sized receive allocation. Empty owned results use canonical `{nul
 final buffer; nonempty results allocate one. V1 deliberately stays on plaintext RESP2 with no protocol
 negotiation or TLS. The exact candidate contract, byte grammar, error precedence, runtime
 reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
-review reopened the timeout/native/cache axes; no public contract is accepted until a fresh complete
-review closes the revised candidate.
+review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
+raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. No public contract is accepted
+until another fresh complete review closes the second repair.
 
 ## Why tests are Result blocks run in separate processes
 
