@@ -1,5 +1,20 @@
 # History of Align
 
+## 2026-09-01: frame joins are bounded ordinal products, not a query language
+
+The first `pkg.frame` capability settled one stable inner equi-join over exact typed codec columns.
+It returns an ordinary owned `array<RowPair>` of left/right source ordinals, leaving column lookup,
+typed projection, gathering, and later array work explicit. There is no Frame wrapper, second
+schema system, materialized joined batch, expression tree, or query DSL.
+
+I64 and byte-exact string keys reuse the existing hash/equality substrate. The right side is always
+the build side, while output remains left-row-major and right-ordinal-ascending, including the
+stable Cartesian product for duplicate keys. One required inclusive `max_pairs` bounds fanout and
+output allocation: negative is `InvalidLimit`; the first pair beyond the caller, i64-length, or
+target-byte range is `LimitExceeded`; OOM remains a hard abort. Inputs are borrowed only during the
+call and the ordinal result retains neither codec batch. The exact public ledger, inactive ABI
+rows, and implementation matrix are `docs/impl/pkg-design/frame.md`.
+
 ## 2026-09-01: columnar interchange settles on one validated canonical batch
 
 The self-hosting library wave fixed `core.codec` as a data-only `ALNCOL01` envelope rather than

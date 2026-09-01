@@ -13,7 +13,8 @@ PR #915. align-llm Request 22's borrowed string-array indexing design is merged 
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
-`docs/impl/core-design/codec.md`. `pkg.frame` is the next language design capability.
+`docs/impl/core-design/codec.md`. `pkg.frame` is the next language capability and has one
+cross-source design candidate awaiting independent review.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -398,8 +399,11 @@ facts must live in this repository.
   the same bytes transactionally through eight keyed runtime rows. The owner set closes exact
   independent goldens, every input base alignment, the 1024-column boundary, checked-HIR and
   canonical identity, whole/per-unit interfaces, and source-null/Drop behavior.
-- **Next language capability:** design `pkg.frame` over the settled codec batch and existing SoA
-  group-by substrate; no public contract is accepted yet. The completed
+- **Next language capability:** `pkg.frame` has a cross-source design candidate over the settled
+  codec batch and existing SoA group-by/hash substrate. It proposes two bounded stable ordinal
+  inner joins and deliberately adds no Frame wrapper or query DSL; independent design review must
+  close `docs/impl/pkg-design/frame.md` before its public contract is accepted or implementation
+  starts. The completed
   align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

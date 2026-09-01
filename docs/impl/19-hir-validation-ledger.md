@@ -748,6 +748,43 @@ canonical classifiers. All type/scalar/expression variants, canonical encoders/d
 interface/compiler fingerprints, and parameterized valid/malformed owners are active atomically.
 `core-design/codec.md` owns the public surface, wire bytes, and full matrix.
 
+### Planned `pkg.frame` records (design candidate 2026-09-01; inactive until acceptance and implementation)
+
+`pkg.frame.RowPair` and `pkg.frame.JoinError` use the existing declared-record and tag-only-enum
+families rather than new `Ty` or `Scalar` variants. The canonical public definition graph fixes
+`RowPair` fields as ordered `left: i64`, `right: i64`, and `JoinError` tags as
+`InvalidLimit=0`, `LimitExceeded=1`. Interface format 8 and canonical type-record version 3 remain
+unchanged. The package definition graph, ordinary recursive Move/Drop plan for
+`array<RowPair>`, and enum identity remain part of the existing interface and compiler fingerprints.
+
+The candidate adds exactly two expression discriminators atomically with package recognition,
+runtime rows, validation, lowering, and owners:
+
+| Record family | Exact checked contract |
+|---|---|
+| `FrameInnerJoinI64` | Three children in source order: exact `codec.i64_column`, exact `codec.i64_column`, then exact i64. Result is the canonical `Result<array<pkg.frame.RowPair>, pkg.frame.JoinError>`. Each column child carries one live codec input region and storage generation into the call action; neither fact enters success or error. The record stores no package name, hash seed, build-side choice, retained region, or allocation fact. |
+| `FrameInnerJoinStr` | The identical envelope with exact `codec.str_column` children. Both input provenance sets remain live through the call action, including distinct and shared-batch roots, and neither enters the ordinal-only result. The discriminator cannot select the i64 ABI row, and the i64 discriminator cannot select this one. |
+
+Sema may emit either record only after ordinary module resolution proves the exact canonical
+vendored `pkg.frame` function and public definition graph. A same-named local function, another
+module, an absent package, a wrong column kind, a wider shared helper type, a wrong RowPair field or
+JoinError tag, or a result alias remains an ordinary call or rejects; none is rewritten to these
+records. Children evaluate exactly once left-to-right. A terminating earlier child suppresses every
+later child and native action. The signed value of `max_pairs` is runtime data, not a malformed-HIR
+axis; checked HIR validates its exact i64 type while runtime maps negative and exceeded bounds.
+
+Validation independently recomputes canonical package/type identity, exact discriminator-to-column
+kind, child/result types, fallthrough, purity, complete input provenance, and absence of result
+provenance. It rejects forged/extra/missing regions, a retained input fact, cross-kind native
+selection, an output allocation before all child fallthrough, or any sibling discriminator omitted
+from the exhaustive canonical classifiers. Existing array/Result control owners plus the exact
+direct/control-selected/whole-per-unit/malformed matrix in `pkg-design/frame.md` must fail for any
+missing child, wrong order/type/result, lost generation, retained region, or missing cleanup.
+
+These records are reservations only. Until the design is accepted and implementation activates the
+complete boundary, they add no `ExprKind`, canonical encoder/decoder arm, interface/compiler
+fingerprint input, accepted source program, cache identity, or runtime key.
+
 ## Header-adjacent records
 
 | Record | Exact contract |

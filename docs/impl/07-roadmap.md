@@ -3946,8 +3946,14 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   vectors in both directions. The Align
   envelope is not Arrow IPC/C Data. Exact public ledger and implementation closure matrix:
   `core-design/codec.md`.
-- **pkg.frame** — dataframe over `soa-groupby` + codec batches; hash equi-join v1; reuses the
-  array pipeline (no query DSL); built after codec settles.
+- **pkg.frame — DESIGN CANDIDATE 2026-09-01** — exactly two bounded stable inner hash joins over
+  `codec.i64_column` and `codec.str_column`; returns an ordinary owned `array<RowPair>` of source
+  ordinals in left-major/right-ascending order. The right side is fixed as the build side and one
+  required inclusive `max_pairs` makes duplicate fanout/output allocation visible. There is no
+  Frame wrapper, schema/query DSL, materialized joined batch, adaptive side choice, nullable or
+  composite key, outer join, parallelism, or spill. Exact candidate public ledger, inactive A121/
+  A122 rows, and implementation closure matrix: `pkg-design/frame.md`; implementation waits for
+  independent design review.
 - **pkg.auth** — JWT HS256, argon2id PHC, session token; pure assembly over shipped
   crypto/base64url (no new base infra); `now_ns` passed in; all Impure (FFI); HS256 key ≥ 32B.
 - **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on

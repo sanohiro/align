@@ -1374,6 +1374,28 @@ Cartesian contract would create unreadable states. The same rule keeps nested ty
 encoding, IPC, compression, streaming, and RPC out of v1. Exact bytes and the closure matrix are in
 `impl/core-design/codec.md`.
 
+## Why `pkg.frame` returns row ordinals instead of owning another frame
+
+The codec batch already owns canonical dynamic metadata and typed zero-copy projections. Wrapping
+it in a second `Frame` would duplicate schema identity, kind validation, ownership, and lifetime
+rules before a consumer demonstrates any additional capability. Selecting columns also stays an
+explicit caller operation: `find` followed by one typed projection makes missing-column and
+wrong-kind policy visible instead of moving it behind a dynamic join API.
+
+The first relational primitive therefore consumes two exact typed columns and returns an ordinary
+`array<RowPair>`. Ordinals are sufficient for explicit gather operations, retain no input region,
+and flow through the existing array pipeline without a query-plan value or materialized-column
+copy. The right side is fixed as the build side and output is left-major/right-ascending, so
+duplicate order does not depend on cardinality heuristics, allocator state, or hash iteration.
+
+The explicit inclusive `max_pairs` makes duplicate fanout and output allocation visible. Counting
+before one exact output allocation preserves all-or-nothing publication; a negative limit is
+distinguished from an otherwise valid join that exceeds its resource bound. I64 and byte-exact str
+reuse the settled equality/hash families. Bool's two buckets have no demonstrated consumer, while
+f64 requires a separate `-0.0`/NaN hash-canonicalization decision, so neither is admitted by
+analogy. The complete contract and implementation closure matrix are in
+`impl/pkg-design/frame.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private
