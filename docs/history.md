@@ -8,10 +8,12 @@ and constant-time comparison. It adds no crypto primitive, native ABI, algorithm
 read, key fetch, session store, or identity policy.
 
 JWT verification takes explicit Unix `now_ns`, authenticates compact bytes before JSON parsing,
-pins HS256, and checks optional integer-form `exp`/`nbf`. Password hashing takes exact work policy;
+pins HS256, and checks optional integer-form `exp`/`nbf`. A package lexical pass closes the shipped
+JSON parser's raw-C0 and leading-zero leniencies. Password hashing takes exact work policy;
 verification parses one canonical v19 PHC form and enforces caller-supplied cost ceilings before
 the KDF. Session tokens have one fixed 32-byte/43-character shape. The package borrows inputs and
-returns ordinary owned strings without claiming zeroization. Exact surface, formats, precedence,
+returns ordinary owned strings without claiming zeroization. Capability retention remains
+module-wide, so every auth import retains libcrypto. Exact surface, formats, precedence,
 and implementation matrix: `docs/impl/pkg-design/auth.md`.
 
 ## 2026-09-01: frame joins are bounded ordinal products, not a query language

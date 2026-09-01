@@ -1413,6 +1413,12 @@ there is deliberately no recommended default hidden in library code. The session
 fixed at 256 random bits because allowing a caller to select a weaker token length adds no useful
 authentication policy.
 
+The shared `json.doc` parser currently has two documented RFC 8259 leniencies: unescaped C0 bytes
+inside strings and leading-zero numbers. Auth cannot sign or return those spellings as valid JSON.
+One allocation-free package lexical pass rejects exactly those forms before the shared parser owns
+the remaining grammar; changing only auth does not fork JSON semantics or silently tighten every
+existing JSON consumer.
+
 Claims remain bounded JSON text and a verified token returns those exact bytes. The package does
 not infer issuer, audience, roles, cookies, storage, rotation, or revocation. Likewise, canonical
 Argon2id PHC owns no password rules, pepper, automatic rehash, or user database. These are
@@ -1420,6 +1426,11 @@ application decisions, not alternate modes inside one auth helper. Ordinary borr
 and owned string results also preserve the existing ownership model; V1 states the current lack of
 zeroizing string/buffer Drop instead of inventing a package-local secret type. Exact format,
 precedence, allocation, and closure rules are in `impl/pkg-design/auth.md`.
+
+Compilation-unit capability collection is module-wide, not call-reachability-based. Consequently a
+session-token-only `pkg.auth` consumer still retains the module's HMAC/Argon2 capability and
+libcrypto. The design records that existing cost explicitly instead of promising per-function
+linking that the current whole/per-unit machinery does not provide.
 
 ## Why tests are Result blocks run in separate processes
 

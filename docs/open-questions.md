@@ -27,16 +27,20 @@ Argon2id PHC password hash/verify, and a fixed 256-bit session token. There is n
 cryptographic primitive, algorithm selector, clock read, key source, provider configuration,
 session store, or identity policy.
 
-JWT keys are at least 32 bytes. Claims and tokens are bounded; verification authenticates the
+JWT keys are at least 32 bytes. Claims and tokens are bounded; an allocation-free package lexical
+pass rejects the shipped JSON parser's raw-C0 and leading-zero leniencies. Verification authenticates the
 original compact input before JSON parsing, requires unique-key JSON objects, pins `alg=HS256`,
 rejects `crit`, and applies optional integer-form i64 `exp`/`nbf` seconds to explicit nonnegative
-caller `now_ns`. Password hashing uses exact caller work parameters, a fresh 16-byte salt, a fixed
+caller `now_ns`. Malformed authenticated header JSON is `Invalid`; valid-object alg/typ/crit policy
+failure is `Denied`. Password hashing uses exact caller work parameters, a fresh 16-byte salt, a fixed
 32-byte tag, and one canonical Argon2id v19 PHC spelling. Verification accepts caller cost maxima
-and rejects over-limit records before KDF work. Session tokens always encode 32 CSPRNG bytes to 43
+and rejects over-limit records before KDF work; native engine/output-reserve failure is exact
+`Error.Code(0)`. Session tokens always encode 32 CSPRNG bytes to 43
 unpadded base64url characters.
 
 All five functions are Impure, borrow inputs only for the call, and return ordinary strings/bool.
-They inherit the existing lack of zeroizing string/buffer Drop. Issuer/audience policy, asymmetric
+They inherit the existing lack of zeroizing string/buffer Drop. Capability collection is
+module-wide, so every auth import retains the complete module set and libcrypto. Issuer/audience policy, asymmetric
 JWT/JWKS/OIDC, cookies/storage/revocation, pepper, rehash advice, other password KDFs, and secret
 owner types remain separate consumer-gated capabilities. The existing `pkg.jwt` prototype is
 replaced outright at implementation rather than retained as an alias.

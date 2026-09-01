@@ -1351,11 +1351,13 @@ nullable/composite/bool/f64 key, outer join, parallelism, or spill. Exact contra
 `Argon2Policy { m_cost, t_cost, parallelism }`; `encode_hs256(claims_json, key)`;
 `verify_hs256(token, key, now_ns)`; `password_hash(password, policy)`;
 `password_verify(password, phc, maximum)`; and `session_token()`. Keys are at least 32 bytes.
-JWT claims are bounded unique-key JSON objects. Verification authenticates the original compact
+JWT claims are bounded strict RFC 8259 unique-key JSON objects. A package lexical precheck rejects
+raw C0 string bytes and leading-zero integers before the shipped parser. Verification authenticates the original compact
 input before JSON parsing, pins HS256, and checks optional integer-form `exp`/`nbf` seconds against
 the required nonnegative caller-supplied Unix nanoseconds. Password hashes use a fresh 16-byte salt,
 a fixed 32-byte Argon2id v19 tag, canonical PHC text, and caller-explicit work parameters/verify
-ceilings. Session tokens are exactly 32 CSPRNG bytes encoded as 43 unpadded base64url characters.
+ceilings; native Argon2 engine/output-reserve failure is `Error.Code(0)`. Session tokens are exactly 32 CSPRNG bytes encoded as 43 unpadded base64url characters.
 All operations are Impure, retain no input, read no clock or configuration, and inherit ordinary
-non-zeroizing string/buffer Drop. Exact errors, bounds, formats, precedence, and non-goals:
+non-zeroizing string/buffer Drop. Any import retains the module-wide complete capability set and
+libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:
 `impl/pkg-design/auth.md`.

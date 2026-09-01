@@ -3954,13 +3954,15 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   composite key, outer join, parallelism, or spill. A121/A122 and the two checked operations are
   active atomically. Exact public ledger and implementation closure matrix:
   `pkg-design/frame.md`.
-- **pkg.auth — DESIGN CANDIDATE 2026-09-01** — exactly HS256 encode/verify over bounded unique-key
+- **pkg.auth — DESIGNED 2026-09-01** — exactly HS256 encode/verify over bounded strict unique-key
   JSON claims with caller `now_ns`, canonical Argon2id v19 PHC hash/verify with explicit exact work
   policy and verify ceilings, and one fixed 256-bit session token. All five operations are Impure
   ordinary package composition over shipped JSON/crypto/encoding; HS256 keys are at least 32 bytes,
   and no compiler/runtime ABI, clock read, key/provider source, identity policy, or session store is
-  added. Exact candidate ledger and one-PR implementation matrix: `pkg-design/auth.md`;
-  implementation waits for independent design review.
+  added. A package lexical pass closes the shared parser's two known JSON leniencies, native Argon2
+  engine/output-reserve failure remains `Error.Code(0)`, and module-wide capability collection means
+  even session-only use retains libcrypto. Exact accepted ledger and one-PR implementation matrix:
+  `pkg-design/auth.md`.
 - **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on
   protocol violation. (rediss:// TLS deferred; plaintext TCP v1.)
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped

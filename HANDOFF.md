@@ -14,8 +14,8 @@ implementation merged in PR #916. Its retained-temporary repair merged in PR #92
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
 `docs/impl/core-design/codec.md`; and `pkg.frame` is implemented against
-`docs/impl/pkg-design/frame.md`. `pkg.auth` now has one cross-source design candidate awaiting
-independent review.
+`docs/impl/pkg-design/frame.md`. `pkg.auth` has an accepted cross-source design and is the next
+implementation capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -400,11 +400,12 @@ facts must live in this repository.
   nounwind A121/A122. The owner set closes canonical package admission, whole/per-unit execution,
   stable duplicate products, byte-exact strings, bounds, malformed checked HIR, ABI identity, and
   runtime oracle/collision/unaligned-input behavior.
-- **Next language capability:** `pkg.auth` has a cross-source design candidate over shipped JSON,
-  crypto, encoding, and explicit caller time. It proposes HS256 encode/verify, canonical bounded
-  Argon2id PHC hash/verify, and one fixed 256-bit session token, with no new compiler/runtime ABI,
-  clock read, provider/key source, identity policy, or session store. Independent review must close
-  `docs/impl/pkg-design/auth.md` before implementation starts.
+- **Next language capability:** implement the accepted `pkg.auth` ledger over shipped JSON, crypto,
+  encoding, and explicit caller time. It fixes HS256 encode/verify, canonical bounded Argon2id PHC
+  hash/verify, one 256-bit session token, a narrow strict-JSON precheck, exact `Error.Code(0)` native
+  KDF failures, and module-wide libcrypto retention. No new compiler/runtime ABI, clock read,
+  provider/key source, identity policy, or session store is added. Exact closure matrix:
+  `docs/impl/pkg-design/auth.md`.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.
