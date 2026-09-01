@@ -2437,6 +2437,63 @@ grep -Fq 'CACHE_CAS_MAX_BYTES: u64 = 256 * 1024 * 1024' "$cache_source" &&
 python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
   "$cache_inventory"
 
+# The release workflow passes a repository-relative cache destination. The
+# builder changes to its private work directory for compiler invocations, so
+# that destination must be fixed to the caller's directory before the first
+# build. This fake compiler produces the smallest complete cache graph and
+# reports a hit only when the second invocation receives that absolute root.
+relative_cache_case="$tmp_dir/relative-cache"
+mkdir -p "$relative_cache_case"
+cat > "$relative_cache_case/alignc" <<'FAKE_ALIGNC'
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_root="$(dirname "$2")"
+if [[ ! -d "$ALIGNC_CACHE/actions" ]]; then
+  mkdir -p \
+    "$ALIGNC_CACHE/actions/unit" "$ALIGNC_CACHE/actions/codegen" \
+    "$ALIGNC_CACHE/index/unit" "$ALIGNC_CACHE/index/codegen" \
+    "$ALIGNC_CACHE/cas/00"
+  printf '\0%.0s' {1..16} > "$ALIGNC_CACHE/cas/00/00000000000000000000000000000000"
+  index=0
+  while IFS= read -r unit; do
+    index=$((index + 1))
+    name="$(printf '%032x' "$index")"
+    printf 'unit' > "$ALIGNC_CACHE/actions/unit/$name"
+    cp "$ALIGNC_CACHE/actions/unit/$name" "$ALIGNC_CACHE/index/unit/$name"
+    printf '\0%.0s' {1..16} > "$ALIGNC_CACHE/actions/codegen/$name"
+    cp "$ALIGNC_CACHE/actions/codegen/$name" "$ALIGNC_CACHE/index/codegen/$name"
+    echo "alignc: cache: $unit frontend miss" >&2
+    echo "alignc: cache: $unit miss" >&2
+  done < <(
+    find "$source_root" -name '*.align' -type f -exec \
+      awk '$1 == "module" { print $2; found = 1 } END { if (!found) exit 1 }' '{}' \; \
+      | LC_ALL=C sort -u
+  )
+else
+  outcome=miss
+  if [[ "$ALIGNC_CACHE" == "$EXPECTED_CACHE_ROOT" ]]; then
+    outcome=hit
+  fi
+  while IFS= read -r unit; do
+    echo "alignc: cache: $unit frontend $outcome" >&2
+    echo "alignc: cache: $unit $outcome" >&2
+  done < <(
+    find "$source_root" -name '*.align' -type f -exec \
+      awk '$1 == "module" { print $2; found = 1 } END { if (!found) exit 1 }' '{}' \; \
+      | LC_ALL=C sort -u
+  )
+fi
+FAKE_ALIGNC
+chmod +x "$relative_cache_case/alignc"
+mkdir -p "$relative_cache_case/package/share/align/cache/1"
+(
+  cd "$relative_cache_case"
+  EXPECTED_CACHE_ROOT="$relative_cache_case/package/share/align/cache/1" \
+    "$repo_root/scripts/build-prebuilt-cache.sh" \
+      "$relative_cache_case/alignc" package/share/align/cache/1
+)
+
 for script in \
   bench/prebuilt_cache/run.sh \
   scripts/build-prebuilt-cache.sh \

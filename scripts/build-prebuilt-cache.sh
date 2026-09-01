@@ -14,6 +14,12 @@ if [[ ! -x "$ALIGNC_ARG" ]]; then
   exit 1
 fi
 ALIGNC_BIN="$(cd "$(dirname "$ALIGNC_ARG")" && pwd)/$(basename "$ALIGNC_ARG")"
+# Both compiler invocations run from WORK_ROOT below. Preserve the caller's
+# meaning for a relative release destination before changing directories.
+case "$OUTPUT_ROOT" in
+  /*) ;;
+  *) OUTPUT_ROOT="$PWD/$OUTPUT_ROOT" ;;
+esac
 
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/align-prebuilt-cache.XXXXXX")"
 cleanup() {
