@@ -4,7 +4,7 @@
 >
 > **注意:** 英語版 (`../frame.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** 設計候補。独立レビューが完了するまで公開契約は受理されない。
+> **ステータス:** 設計受理済み（2026-09-01）。実装待ち。
 
 ## 公開契約台帳
 
@@ -121,7 +121,9 @@ ordinal だけなので、呼出後に source owner を move/replacement でき�
 vendor 可能な `pkg.frame` が 2 定義・2 public wrapper・2 private root bridge を所有する。direct、
 imported、local/function-field、control-joined function value はすべて同じ通常 wrapper を実行し、
 その本体の唯一の private bridge call だけを compiler が正準 package source/signature/definition
-graph の検証後に認識する。他 module の同名関数や変更された package は通常の call。Sema は
+graph の検証後に認識する。他 module の同名関数は通常の call。一方、正準 public definition、
+private bridge declaration、wrapper body と異なる vendored `pkg.frame` は、body、placeholder abort、
+native selection、artifact action より前の package admission で拒否する。Sema は
 bridge signature/evaluation/purity/region と 2 checked discriminator、checked
 HIR は canonical package identity・input kind・result identity・fallthrough・非保持、MIR は status・
 ownership/cleanup、LLVM は typed call/output reconstruction、runtime は hash engine・count/fill・
@@ -134,7 +136,7 @@ body だけが対応 bridge を同じ 3 引数で 1 回呼ぶ。compiler はそ�
 別位置、helper、変更 wrapper、private bridge の function value は package admission で拒否する。
 public wrapper 自体は通常の callable value のままである。
 
-設計中は次の行を inactive とする。
+受理済みの次の計画行は実装まで inactive とする。
 
 | 候補行 | symbol | ABI shape | Rust ABI |
 |---|---|---|---|
@@ -180,7 +182,7 @@ parallel/spill/distributed、automatic build-side choiceはない。将来能力
 `docs/open-questions.md`、`docs/impl/07-roadmap.md`、`docs/impl/19-hir-validation-ledger.md`、
 `docs/impl/20-runtime-abi-ledger.md`、`HANDOFF.md` は実装前に一致させる。
 
-全引数・結果の型/評価/既定/ownership/lifetime/allocation/cleanup/error/effect、全 join/limit product、
+設計は 2026-09-01 の独立レビューで受理済み。全引数・結果の型/評価/既定/ownership/lifetime/allocation/cleanup/error/effect、全 join/limit product、
 UTF-8/NUL/byte equality、multi-invalid precedence、非 ambient 性、ABI scalar/pointer/status/allocator/
 activation、producer-owned inspection、構文確認済み例、全 ledger invariant の acceptance owner を照合する。
 benchmark は実装級の証拠であり correctness gate ではない。

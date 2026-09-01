@@ -2,7 +2,7 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/frame.md`.
 >
-> **Status:** design candidate; no public contract is accepted until independent review closes.
+> **Status:** accepted design (2026-09-01); implementation is pending.
 
 ## Authoritative public-contract ledger
 
@@ -168,9 +168,11 @@ bridge. Direct, imported, local/function-field, and control-joined function-valu
 all invoke the same compiled wrapper; no call-site spelling selects semantics. The compiler
 recognizes only each exact private bridge declaration after ordinary module resolution proves the
 canonical package source, wrapper signature, and public definition graph. A same-named declaration
-in any other module, or a widened/modified vendored package definition, is an ordinary function and
-never selects the bridge. This is a package-owned compiler bridge, not an ambient builtin available
-without the vendored package.
+in any other module is an ordinary function and never selects the bridge. A vendored `pkg.frame`
+whose public definitions, private bridge declarations, or wrapper bodies differ from the canonical
+shape is instead rejected at package admission before any function body, placeholder abort, native
+selection, or artifact action. This is a package-owned compiler bridge, not an ambient builtin
+available without the vendored package.
 
 The canonical root module imports `core.codec` and `std.process` and owns exactly these private
 bridge declarations and wrapper bodies; the unreachable abort bodies are the same source-level
@@ -218,7 +220,7 @@ output slot, guarded success/error reconstruction, source nonnull/range attribut
 proved, and output allocation provenance. Runtime owns the shared hash/index engine, count/fill
 passes, scratch/output allocation, collision equality, limit enforcement, and cleanup.
 
-The planned rows remain inactive during design:
+The accepted planned rows remain inactive until implementation:
 
 | Candidate row | Exact symbol | Candidate ABI shape | Exact Rust ABI |
 |---|---|---|---|
@@ -264,7 +266,7 @@ result order or deliberately replace this pre-release contract in one pass.
 
 ## Implementation closure matrix
 
-Implementation may begin only after independent review accepts this ledger. The capability crosses
+Independent review accepted this ledger on 2026-09-01. The implementation crosses
 package formation, sema, checked HIR, MIR, LLVM, runtime ABI, and owned-array construction, so the
 author-side matrix is mandatory before coding.
 
@@ -286,7 +288,7 @@ This English ledger, `docs/impl/pkg-design/ja/frame.md`, `draft.md`,
 `docs/open-questions.md`, `docs/impl/07-roadmap.md`, `docs/impl/19-hir-validation-ledger.md`,
 `docs/impl/20-runtime-abi-ledger.md`, and `HANDOFF.md` must agree before implementation.
 
-Author-side pass for the design candidate:
+Author-side pass for the accepted design:
 
 - every public argument/result has one exact type, evaluation order, default, ownership, lifetime,
   allocation, cleanup, error, and effect rule;
@@ -295,8 +297,9 @@ Author-side pass for the design candidate:
 - all text is already validated UTF-8, embedded NUL is data, equality is byte-exact, and no native
   boundary retains a borrowed range;
 - every multi-invalid input has one validation order and package error precedence;
-- there is no ambient configuration, schema reflection, artifact/source I/O, hash seed, adaptive
-  build-side choice, or target-dependent result;
+- there is no ambient configuration, schema reflection, artifact/source I/O, hash seed, or adaptive
+  build-side choice; successful membership/order is target-independent, while only the documented
+  right-index/output representability checks may produce target-dependent `LimitExceeded`;
 - both native signatures fix scalar widths, pointer roles, output initialization, status mapping,
   malformed-input behavior, allocator provenance, and activation identity;
 - runtime inspection consumes only compiler-formed codec views and never reads source, interfaces,

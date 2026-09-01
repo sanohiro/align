@@ -169,10 +169,10 @@ hard-aborts because no source-valid call can form it. Free is null-safe and rele
 staging exactly once. Every row is C calling convention and `nounwind`. Open and all encoder rows
 carry no curated memory, parameter, or return attribute.
 
-## Planned `pkg.frame` extension (design candidate 2026-09-01; inactive)
+## Planned `pkg.frame` extension (design accepted 2026-09-01; inactive until implementation)
 
-The candidate reserves two new shapes after implemented A120. They are documentation-only until
-independent design acceptance and one atomic implementation boundary; neither symbol, key, shape,
+The accepted design reserves two new shapes after implemented A120. They are documentation-only
+until one atomic implementation boundary; neither symbol, key, shape,
 collision reservation, declaration, definition, export, fingerprint input, or total is active.
 
 | Candidate runtime key | Candidate symbol | Reserved ABI row and exact LLVM declaration | Exact Rust ABI |

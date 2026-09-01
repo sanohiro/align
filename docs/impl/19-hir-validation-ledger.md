@@ -748,7 +748,7 @@ canonical classifiers. All type/scalar/expression variants, canonical encoders/d
 interface/compiler fingerprints, and parameterized valid/malformed owners are active atomically.
 `core-design/codec.md` owns the public surface, wire bytes, and full matrix.
 
-### Planned `pkg.frame` records (design candidate 2026-09-01; inactive until acceptance and implementation)
+### Planned `pkg.frame` records (design accepted 2026-09-01; inactive until implementation)
 
 `pkg.frame.RowPair` and `pkg.frame.JoinError` use the existing declared-record and tag-only-enum
 families rather than new `Ty` or `Scalar` variants. The canonical public definition graph fixes
@@ -757,7 +757,7 @@ families rather than new `Ty` or `Scalar` variants. The canonical public definit
 unchanged. The package definition graph, ordinary recursive Move/Drop plan for
 `array<RowPair>`, and enum identity remain part of the existing interface and compiler fingerprints.
 
-The candidate adds exactly two expression discriminators atomically with package recognition,
+The accepted design adds exactly two expression discriminators atomically with package recognition,
 runtime rows, validation, lowering, and owners. They occur only at the two exact private root-module
 bridge calls inside the ordinary public wrappers; a caller's direct or indirect wrapper call remains
 the ordinary `Call` / `FnValue` / `CallFnValue` path and converges on that compiled bridge body:
@@ -769,9 +769,10 @@ the ordinary `Call` / `FnValue` / `CallFnValue` path and converges on that compi
 
 Sema may emit either record only after ordinary module resolution proves the exact canonical
 vendored `pkg.frame` private bridge, its one-call public wrapper body, and public definition graph.
-A same-named local function, another module, an absent package, a modified wrapper/bridge body, a
-wrong column kind, a wider shared helper type, a wrong RowPair field or JoinError tag, or a result
-alias remains an ordinary call or rejects; none is rewritten to these records. Direct, imported,
+A same-named local function or another module remains an ordinary call. An absent package, a
+modified canonical wrapper/bridge body, a wrong column kind, a wider shared helper type, a wrong
+RowPair field or JoinError tag, or a result alias rejects package admission before body evaluation;
+none is rewritten to these records. Direct, imported,
 local/function-field, and control-joined public function values execute the same ordinary wrapper
 and therefore reach exactly one corresponding bridge record. Children evaluate exactly once
 left-to-right. A terminating earlier child suppresses every later child and native action. The
