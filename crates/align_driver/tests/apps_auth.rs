@@ -136,9 +136,47 @@ fn main() -> Result<(), Error> {{
   zeros := encoding.hex_decode("0000000000000000000000000000000000000000000000000000000000000000")?
   mut unauthenticated := builder()
   unauthenticated.write(encoding.base64url_encode(header))
-  unauthenticated.write(".!." )
+  unauthenticated.write(".")
+  unauthenticated.write(encoding.base64url_encode("{{"))
+  unauthenticated.write(".")
   unauthenticated.write(encoding.base64url_encode(zeros.bytes()))
   print(error_class(pkg.auth.verify_hs256(unauthenticated.to_string(), key.bytes(), 0)))
+
+  zero_tag := encoding.base64url_encode(zeros.bytes())
+  mut invalid_alphabet := builder()
+  invalid_alphabet.write(encoding.base64url_encode(header))
+  invalid_alphabet.write(".!.")
+  invalid_alphabet.write(zero_tag)
+  print(error_class(pkg.auth.verify_hs256(invalid_alphabet.to_string(), key.bytes(), 0)))
+
+  mut noncanonical_header := builder()
+  noncanonical_header.write("Zh.")
+  noncanonical_header.write(encoding.base64url_encode("{{}}"))
+  noncanonical_header.write(".")
+  noncanonical_header.write(zero_tag)
+  print(error_class(pkg.auth.verify_hs256(noncanonical_header.to_string(), key.bytes(), 0)))
+
+  mut noncanonical_payload := builder()
+  noncanonical_payload.write(encoding.base64url_encode(header))
+  noncanonical_payload.write(".Zh.")
+  noncanonical_payload.write(zero_tag)
+  print(error_class(pkg.auth.verify_hs256(noncanonical_payload.to_string(), key.bytes(), 0)))
+
+  mut noncanonical_signature := builder()
+  noncanonical_signature.write(encoding.base64url_encode(header))
+  noncanonical_signature.write(".")
+  noncanonical_signature.write(encoding.base64url_encode("{{}}"))
+  noncanonical_signature.write(".")
+  noncanonical_signature.write(zero_tag[0..zero_tag.len() - 1])
+  noncanonical_signature.write("B")
+  print(error_class(pkg.auth.verify_hs256(noncanonical_signature.to_string(), key.bytes(), 0)))
+
+  signed := sign_raw(header, "{{}}", key.bytes())
+  mut padded_signature := builder()
+  padded_signature.write(signed)
+  padded_signature.write("=")
+  print(error_class(pkg.auth.verify_hs256(padded_signature.to_string(), key.bytes(), 0)))
+
   print(error_class(pkg.auth.verify_hs256("a.b.A", key.bytes(), 0)))
   print(error_class(pkg.auth.verify_hs256("a.b", key.bytes(), 0)))
   print(error_class(pkg.auth.verify_hs256(sign_raw(header, "{{}}", key.bytes()), key.bytes(), -1)))
@@ -155,7 +193,7 @@ fn main() -> Result<(), Error> {{
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "1\n1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n1\n1\n1\n1\n2\n2\n0\n2\n1\n1\n1\n",
+        "1\n1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n1\n1\n1\n1\n2\n2\n0\n2\n1\n1\n1\n1\n1\n1\n1\n1\n",
     );
 }
 

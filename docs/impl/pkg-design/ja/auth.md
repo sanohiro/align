@@ -181,10 +181,18 @@ author-side matrix-to-diff pass は compiler/runtime 変更なしで次の owner
 | matrix row | implementation / regression owner |
 |---|---|
 | public/identity/whole-per-unit/capability | `apps/auth/pkg/auth.align`、`apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`、`apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed`。exact public source、現行 function-value rejection、session-only libcrypto retain を含む。既存 package-foundation/unit-cache owner が absence と通常 invalidation を保持。 |
-| JWT bytes/auth/policy/bounds/precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`、`apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`、`apps_auth::jwt_claim_and_result_bounds_are_exact`。OpenSSL HMAC-SHA256 独立 vector と既存 JSON/encoding owner を使用。 |
+| JWT bytes/auth/policy/bounds/precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`、`apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`、`apps_auth::jwt_claim_and_result_bounds_are_exact`。3 segment の alphabet/unpadded length/trailing-bit canonicality と MAC-before-JSON precedence、OpenSSL HMAC-SHA256 独立 vector、既存 JSON/encoding owner を使用。 |
 | PHC/resource/comparison | `apps_auth::password_phc_vector_policy_and_canonical_mutation_matrix_are_exact`。OpenSSL 3.5 Argon2id 独立 vector、canonical mutation、policy、NUL/empty、true/false を閉じる。既存 `m11_crypto` owner が native status split、bounds、random、CT、cleanup を保持。 |
 | ownership/effect | `apps_auth::owned_results_escape_inputs_and_auth_operations_remain_impure` と whole/per-unit JWT owner。既存 JSON/encoding/crypto control/Drop owner を再利用。 |
 | session | `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed` が 32-byte decode、43-character output、2 sample inequality、Impure/module-wide behavior を閉じる。 |
+
+## 実装レビュー finding-to-fix 台帳
+
+fresh full-diff implementation review は P1 を 1 件返した。fix は segment class 全体を閉じる。
+
+| finding | class-wide resolution |
+|---|---|
+| P1: optional padding と malformed header/payload segment text が authentication へ到達可能 | HMAC 前に 3 個すべての nonempty segment を検査する allocation-free canonical base64url validator を追加。`=`、non-URL byte、length mod 4 == 1、nonzero unused trailing bit を拒否する。owner は bad tag と malformed header/payload/signature、canonical bytes だが unauthenticated invalid JSON の `Denied`、otherwise-valid signature の padded alias `Invalid` を分離。 |
 
 ## 正典と author consistency pass
 

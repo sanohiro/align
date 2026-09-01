@@ -237,10 +237,18 @@ The author-side matrix-to-diff pass closes the capability without a compiler/run
 | Matrix rows | Implementation and regression owner |
 |---|---|
 | Public formation, identity, whole/per-unit, and capability | `apps/auth/pkg/auth.align`; `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`; `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed`, including exact public-source extraction, scalar-only function-value rejection, and session-only libcrypto retention. Existing package-foundation and unit-cache owners continue to cover absence and ordinary source/interface/dependency invalidation. |
-| JWT bytes, authentication, policy, bounds, and precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`; `apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`; `apps_auth::jwt_claim_and_result_bounds_are_exact`. The first vector is independently reproduced with OpenSSL HMAC-SHA256. Existing JSON and encoding owners retain the parser/base64 primitive contracts. |
+| JWT bytes, authentication, policy, bounds, and precedence | `apps_auth::jwt_vector_and_whole_per_unit_execution_are_exact`; `apps_auth::jwt_validation_order_and_error_classes_cover_strict_authenticated_products`; `apps_auth::jwt_claim_and_result_bounds_are_exact`. The mutation owner covers all three segments' alphabet, unpadded length, trailing-bit canonicality, and MAC-before-JSON precedence. The first vector is independently reproduced with OpenSSL HMAC-SHA256. Existing JSON and encoding owners retain the parser/base64 primitive contracts. |
 | PHC construction/parser, resource admission, and comparison | `apps_auth::password_phc_vector_policy_and_canonical_mutation_matrix_are_exact`, including an independently generated OpenSSL 3.5 Argon2id vector, canonical mutations, exact/invalid policy, NUL/empty passwords, and true/false comparison. Existing `m11_crypto` owners retain provider/context/output-reserve/derive classification, parameter bounds, random, constant-time equality, and primitive cleanup. |
 | Ownership and effects | `apps_auth::owned_results_escape_inputs_and_auth_operations_remain_impure` plus the whole/per-unit JWT owner; existing JSON/encoding/crypto control-flow and Drop owners cover their unchanged temporaries. |
 | Session token | `apps_auth::session_only_use_keeps_module_crypto_and_public_surface_is_closed` decodes every result to 32 bytes, pins 43 output characters, checks two samples differ, and proves Impure/module-wide behavior. |
+
+## Implementation-review finding-to-fix ledger
+
+The fresh full-diff implementation review found one P1. The fix audits the complete segment class:
+
+| Finding | Class-wide resolution |
+|---|---|
+| P1: optional padding and malformed header/payload segment text could reach authentication | Added one allocation-free canonical base64url validator for all three nonempty segments before signature decode or HMAC. It rejects `=`, every non-URL byte, length modulo four equal to one, and nonzero unused trailing bits. The owner covers malformed header, payload, and signature spellings with a bad tag, preserves `Denied` for canonical bytes whose decoded JSON is invalid but unauthenticated, and rejects a padded otherwise-valid signature alias as `Invalid`. |
 
 ## Sources of truth and author consistency pass
 

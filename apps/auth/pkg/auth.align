@@ -14,6 +14,38 @@ HEADER_JSON := "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
 
 fn decimal_digit(byte: u8) -> bool = byte >= 48 as u8 && byte <= 57 as u8
 
+fn base64url_value(byte: u8) -> Option<i64> {
+  if byte >= 65 as u8 && byte <= 90 as u8 { return Some((byte - 65 as u8) as i64) }
+  if byte >= 97 as u8 && byte <= 122 as u8 {
+    return Some((byte - 97 as u8) as i64 + 26)
+  }
+  if byte >= 48 as u8 && byte <= 57 as u8 {
+    return Some((byte - 48 as u8) as i64 + 52)
+  }
+  if byte == 45 as u8 { return Some(62) }
+  if byte == 95 as u8 { return Some(63) }
+  return None
+}
+
+// Validate the canonical unpadded spelling without decoding header or payload bytes before HMAC.
+fn canonical_base64url(text: str) -> bool {
+  if text.len() == 0 { return false }
+  remainder := text.len() % 4
+  if remainder == 1 { return false }
+  bytes := text.bytes()
+  mut index := 0
+  mut last_value := 0
+  loop {
+    if index >= bytes.len() { break }
+    value := base64url_value(bytes[index]) else { return false }
+    last_value = value
+    index = index + 1
+  }
+  if remainder == 2 { return last_value % 16 == 0 }
+  if remainder == 3 { return last_value % 4 == 0 }
+  return true
+}
+
 fn json_value_boundary(bytes: slice<u8>, index: i64) -> bool {
   if index == 0 { return true }
   previous := bytes[index - 1]
@@ -192,7 +224,13 @@ pub fn verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, E
     return Err(Error.Invalid)
   }
 
+  header_segment := token[0..first]
+  payload_segment := token[first + 1..second]
   signature_text := token[second + 1..token.len()]
+  if !canonical_base64url(header_segment) || !canonical_base64url(payload_segment) ||
+    !canonical_base64url(signature_text) {
+    return Err(Error.Invalid)
+  }
   signature := encoding.base64url_decode(signature_text) else { return Err(Error.Invalid) }
   if signature.len() != 32 { return Err(Error.Invalid) }
   expected := crypto.hmac_sha256(key, token[0..second])
@@ -200,7 +238,7 @@ pub fn verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, E
     return Err(Error.Denied)
   }
 
-  header_buffer := encoding.base64url_decode(token[0..first]) else { return Err(Error.Invalid) }
+  header_buffer := encoding.base64url_decode(header_segment) else { return Err(Error.Invalid) }
   header_text := header_buffer.bytes().as_str() else { return Err(Error.Invalid) }
   if !strict_json_lexical(header_text) { return Err(Error.Invalid) }
   header_policy := arena {
@@ -217,7 +255,7 @@ pub fn verify_hs256(token: str, key: slice<u8>, now_ns: i64) -> Result<string, E
   }
   if !header_policy { return Err(Error.Denied) }
 
-  payload_buffer := encoding.base64url_decode(token[first + 1..second]) else {
+  payload_buffer := encoding.base64url_decode(payload_segment) else {
     return Err(Error.Invalid)
   }
   if payload_buffer.len() > 8192 { return Err(Error.Invalid) }
