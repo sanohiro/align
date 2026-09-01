@@ -466,6 +466,38 @@ fn walk_body_records<'a>(
                     logger: lhs,
                     level: rhs,
                 }
+                | ExprKind::CodecBatchName {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecBatchKind {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecBatchFind {
+                    batch: lhs,
+                    name: rhs,
+                }
+                | ExprKind::CodecBatchI64s {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecBatchF64s {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecBatchBools {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecBatchStrs {
+                    batch: lhs,
+                    index: rhs,
+                }
+                | ExprKind::CodecColumnAt {
+                    column: lhs,
+                    index: rhs,
+                }
                 | ExprKind::IoCopy {
                     reader: lhs,
                     writer: rhs,
@@ -684,6 +716,16 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(level), child_depth));
                     work.push((BodyRecord::Expr(logger), child_depth));
                 }
+                ExprKind::CodecEncoderPut {
+                    encoder,
+                    name,
+                    values,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(values), child_depth));
+                    work.push((BodyRecord::Expr(name), child_depth));
+                    work.push((BodyRecord::Expr(encoder), child_depth));
+                }
                 ExprKind::RawPointerLoad { ptr, offset } => {
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(ptr), child_depth));
@@ -789,6 +831,12 @@ fn walk_body_records<'a>(
                 | ExprKind::BytesAsStr { bytes: recv }
                 | ExprKind::WriterFlush { writer: recv }
                 | ExprKind::LogFlush { logger: recv }
+                | ExprKind::CodecOpen { input: recv }
+                | ExprKind::CodecBatchRows { batch: recv }
+                | ExprKind::CodecBatchColumns { batch: recv }
+                | ExprKind::CodecColumnLen { column: recv }
+                | ExprKind::CodecEncoderNew { rows: recv }
+                | ExprKind::CodecEncoderFinish { encoder: recv }
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
                 | ExprKind::FileLen { file: recv }

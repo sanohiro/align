@@ -2,7 +2,7 @@
 
 > 🌐 [English](../codec.md) · **日本語**
 >
-> **状態:** 設計済み、実装待ち。
+> **状態:** 2026-09-01 実装済み。
 
 ## 権威ある公開契約レジャー
 
@@ -12,8 +12,8 @@
 
 | 公開面 | 正確な入力、検証、評価 | 正確な結果、エラー、effect | ownership、lifetime、allocation、cleanup | compiler/runtime owner と identity | acceptance owner |
 |---|---|---|---|---|---|
-| `codec.kind { I64, F64, Bool, Str }` | 閉じた builtin tag-only sum は1つだけ。source ordinal と wire tag は `I64=0`、`F64=1`、`Bool=2`、`Str=3`。数値変換、custom kind、nullable modifier、extension metadata、alias、ambient registry はない。 | Copy かつ Pure。equality は既存の closed-enum rule。source から作れる値では error も abort もない。 | 確定済みの一フィールド enum aggregate `{ i32 tag }`。borrow、allocation、Drop はない。 | `import core.codec` の背後にある唯一の builtin enum を `align_sema` が所有し、HIR/MIR は通常の enum aggregate を保持する。interface は nominal named definition を serialize する。ordinal は descriptor の `kind` byte と同一。 | import/type/variant positive、正確な ordinal、wrong module/type negative、checked-HIR enum identity/closed-tag validation、whole/per-unit identity。 |
-| `codec.open(input: bytes) -> Result<codec.batch, Error>` | positional argument は1つだけ。`input` を borrow し、一度だけ評価する。成功する input は最大1024列のcanonical v1 envelope。先頭 address は任意alignment。owned/heap allocationなしで、fixed 4096-byte stack scratchと10-pass bottom-up merge sortによりname uniquenessを検証する。unknown tag/flag/version、overflow、over-limit、非canonical topology/padding、duplicate/invalid name、malformed buffer/UTF-8、trailing、positive-length nullを拒否する。 | Pure。成功時は validated batch view。malformed は `Err(Error.Invalid)` でowned allocation/mutation/partial batchなし。dangling pointerはsafe ABI precondition外。 | `codec.batch` は input のCopy opaque viewでgenerationを運び、`region_of(result)=region_of(input)`。derived view live中のinput owner move/replace/drop/mut borrowを拒否。 | Sema/HIR/MIR/runtimeの正確なResult/region/validator owner。capability/version/native/type leavesはfingerprintへ入る。 | 独立golden、precedence、truncation、overflow、1024/1025と4096-byte scratch、common-prefix work、base alignment 0..7、no-owned-allocation、region/control、whole/per-unit、malformed HIR/ABI。 |
+| `codec.kind { I64, F64, Bool, Str }` | 閉じた builtin tag-only sum は1つだけ。source ordinal と wire tag は `I64=0`、`F64=1`、`Bool=2`、`Str=3`。数値変換、custom kind、nullable modifier、extension metadata、alias、ambient registry はない。 | Copy かつ Pure。inspection は既存の exhaustive closed-enum `match` を使い、enum に `==` は定義しない。source から作れる値では error も abort もない。 | 確定済みの一フィールド enum aggregate `{ i32 tag }`。borrow、allocation、Drop はない。 | `import core.codec` の背後にある唯一の builtin enum を `align_sema` が所有し、HIR/MIR は通常の enum aggregate を保持する。interface は nominal named definition を serialize する。ordinal は descriptor の `kind` byte と同一。 | import/type/variant positive、正確な ordinal、wrong module/type negative、checked-HIR enum identity/closed-tag validation、whole/per-unit identity。 |
+| `codec.open(input: slice<u8>) -> Result<codec.batch, Error>` | positional argument は1つだけ。`input` を borrow し、一度だけ評価する。成功する input は最大1024列のcanonical v1 envelope。先頭 address は任意alignment。owned/heap allocationなしで、fixed 4096-byte stack scratchと10-pass bottom-up merge sortによりname uniquenessを検証する。unknown tag/flag/version、overflow、over-limit、非canonical topology/padding、duplicate/invalid name、malformed buffer/UTF-8、trailing、positive-length nullを拒否する。 | Pure。成功時は validated batch view。malformed は `Err(Error.Invalid)` でowned allocation/mutation/partial batchなし。dangling pointerはsafe ABI precondition外。 | `codec.batch` は input のCopy opaque viewでgenerationを運び、`region_of(result)=region_of(input)`。derived view live中のinput owner move/replace/drop/mut borrowを拒否。 | Sema/HIR/MIR/runtimeの正確な`slice<u8>`/Result/region/validator owner。capability/version/native/type leavesはfingerprintへ入る。 | 独立golden、precedence、truncation、overflow、1024/1025と4096-byte scratch、common-prefix work、base alignment 0..7、no-owned-allocation、region/control、whole/per-unit、malformed HIR/ABI。 |
 | `b.rows() -> i64`; `b.columns() -> i64` | `b` は validated `codec.batch` で read-only borrow。 | Pure かつ total な Copy count。再検証しない。 | allocation、retained borrow、mutation はない。 | `rows` はenvelope byte 16のalignment-1 little-endian i64 bit loadとtarget-required byte swapへlowerする。`columns` はbyte 24のalignment-1 little-endian u32 load、swap、i64 zero-extensionへlowerする。`{ input_ptr, input_len }` batch scalarにprivate count fieldはない。 | empty/nonempty/max-admitted count、反復、全base alignment、imported/carrier-held batch、little-/big-endian owner。 |
 | `b.name(i: i64) -> Option<str>`; `b.kind(i: i64) -> Option<codec.kind>`; `b.find(name: str|string) -> Option<i64>` | receiver、argument の順に一度だけ評価する。negative/out-of-range `i` は `None`。`find` は ordinal 順に byte-exact、case-sensitive 比較し、唯一の最初の一致を返す。なければ `None`。owned `string` は auto-borrow。 | Pure かつ total。`name` は zero-copy UTF-8 view、`kind` と ordinal は Copy。error/abort はない。 | `name` とその `Option` は batch/input region を運ぶ。`find` は何も保持しない。allocation はない。 | name projectionと`find`はvalidated descriptor offset/lengthをalignment-1 little-endian loadとtarget swapで再読し、kindは1 byteを読む。typed descriptor pointerなしのoptimizer-visible operation/ordinal loopへlowerする。追加native ABI row、source/artifact I/O、reflectionはない。 | negative/in-range/upper-bound の積、empty/non-ASCII/NUL name、exact-case miss、ordered lookup、反復、全base alignment、region escape/invalidation、no revalidation/allocation。 |
 | `b.i64s(i: i64) -> Option<codec.i64_column>`; `b.f64s(i: i64) -> Option<codec.f64_column>`; `b.bools(i: i64) -> Option<codec.bool_column>`; `b.strs(i: i64) -> Option<codec.str_column>` | receiver、ordinal を一度ずつ評価する。negative/out-of-range または異なる kind は `None`、一致時は全 row の view。再検証しない。4 view は全 input base alignment を許す。 | Pure かつ total。すべて zero-copy。`f64` は NaN/infinity を含む IEEE bit pattern をそのまま保つ。kind 間 coercion、alignment-dependent unavailable state はない。 | 返す view と `Option` はすべて Copy で batch input と generation に region-bound。allocation、ownership transfer、Drop はない。 | 4つの distinct checked HIR/MIR projectionはkindとvalidated data/aux descriptor fieldをbyteまたはalignment-1 little-endian loadで再読し、4つのopaque `{ ptr, len }` class scalarを作る。ordinal/kind成功前にtyped descriptor/element pointerを形成しない。 | 4×4 kind/accessor、negative/out-of-range、全 base alignment、numeric/NaN bytes、region carrier/control/return/mutation rejection、element loop に runtime call がないこと。 |
@@ -44,7 +44,7 @@ fn encode(
   return Ok(out.finish())
 }
 
-fn first(input: bytes) -> Result<str, Error> {
+fn first(input: slice<u8>) -> Result<str, Error> {
   batch := codec.open(input)?
   index := batch.find("name") else { return Err(Error.Invalid) }
   names := batch.strs(index) else { return Err(Error.Invalid) }
@@ -59,7 +59,7 @@ insertion/wire order。name は normalization されない identity である。
 ## canonical v1 envelope
 
 envelope と buffer の整数はすべて little-endian。各 buffer **offset** は8の倍数だが、
-enclosing `bytes` address は任意alignmentでよく、accessor はalignment-1 loadを使う。
+enclosing `slice<u8>` address は任意alignmentでよく、accessor はalignment-1 loadを使う。
 `total_len` は完全一致し、prefix/suffix framing と trailing byte は認めない。
 
 ### header — 32 bytes
@@ -264,6 +264,11 @@ v2 は別の8-byte magic と新しい complete ledger を使う。v1 decoder は
 
 independent review がこの ledger を accept するまで implementation を始めない。1つの
 implementation capability で各 applicable row を閉じる。
+hand-written implementation diffは約1,000行を超える見込みだが、1 capabilityを維持する。
+source formation、6 checked-HIR type family、region/Move classifier、MIR operation、LLVM
+layout/access、8 runtime row、独立encoder/decoder ownerは1つのdormant producer-to-consumer
+chainである。splitするとuseful stable consumerがなく、type/ABI/provenance proofを重複させ、
+inactive intermediateのdriftを許すため、atomic activationの方がintegration riskが低い。
 
 | axis | required closure | owner evidence |
 |---|---|---|

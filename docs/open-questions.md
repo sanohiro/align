@@ -27,7 +27,7 @@ one row count, at most 1024 ordered byte-unique UTF-8 column names, and exactly 
 64-bit values, an LSB-first boolean bitmap, and signed i32 UTF-8 offsets plus bytes—but the
 canonical envelope is Align-owned and is neither Arrow IPC nor the Arrow C Data Interface.
 
-`codec.open(bytes)` validates the complete envelope once, allocation-free, under one deterministic
+`codec.open(input: slice<u8>)` validates the complete envelope once, allocation-free, under one deterministic
 arithmetic/topology/name/content precedence. Every malformed, noncanonical, over-limit, truncated,
 or trailing input returns `Error.Invalid` before publishing a batch. Input base alignment does not
 affect validity: all four typed column views use inline alignment-1 little-endian access. Name

@@ -1162,6 +1162,31 @@ pub enum ExprKind {
     LogLine { logger: Box<Expr>, level: Box<Expr>, message: Box<Expr>, builder: bool },
     /// `l.flush()` — expose the first latched or current writer flush error as `Result<(), Error>`.
     LogFlush { logger: Box<Expr> },
+    /// `codec.open(input)` — validate one complete canonical v1 envelope and borrow its bytes.
+    CodecOpen { input: Box<Expr> },
+    CodecBatchRows { batch: Box<Expr> },
+    CodecBatchColumns { batch: Box<Expr> },
+    CodecBatchName { batch: Box<Expr>, index: Box<Expr> },
+    CodecBatchKind { batch: Box<Expr>, index: Box<Expr> },
+    CodecBatchFind { batch: Box<Expr>, name: Box<Expr> },
+    CodecBatchI64s { batch: Box<Expr>, index: Box<Expr> },
+    CodecBatchF64s { batch: Box<Expr>, index: Box<Expr> },
+    CodecBatchBools { batch: Box<Expr>, index: Box<Expr> },
+    CodecBatchStrs { batch: Box<Expr>, index: Box<Expr> },
+    /// Shared record families whose exact receiver and result type select one of four column kinds.
+    CodecColumnLen { column: Box<Expr> },
+    CodecColumnAt { column: Box<Expr>, index: Box<Expr> },
+    /// `codec.encoder(rows)` creates one fresh transactional Move owner.
+    CodecEncoderNew { rows: Box<Expr> },
+    /// One of the four typed staging operations. The encoder is borrowed mutably, never consumed.
+    CodecEncoderPut {
+        encoder: Box<Expr>,
+        name: Box<Expr>,
+        values: Box<Expr>,
+        kind: CodecPutKind,
+    },
+    /// Consume the encoder into the existing owned `buffer` representation.
+    CodecEncoderFinish { encoder: Box<Expr> },
     /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer
     /// (memory is O(buffer), never O(file size)), borrowing **both** (neither consumed — the fd
     /// ownership does not move, so `r`/`w` remain usable after the call, like `print`'s argument).
@@ -1889,6 +1914,14 @@ pub enum ExprKind {
         message: Box<Expr>,
         signature: Box<Expr>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum CodecPutKind {
+    I64,
+    F64,
+    Bool,
+    Str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

@@ -24,7 +24,7 @@ core の領域を実装・変更する際は、同じ PR 内でここの該当�
 - [arena-heap.md](arena-heap.md) — `arena {}` と `heap.new` / `box`: region、escape、drop
 - [hash.md](hash.md) — `core.hash`(`hash64`/`hash128`): 状態と設計
 - [test.md](test.md) — 実装済み `core.test` declaration/assertion、isolated runner protocol、terse-output policy
-- [codec.md](codec.md) — 設計済み `core.codec` canonical columnar batch envelope、zero-copy view、encoder（implementation pending）
+- [codec.md](codec.md) — 実装済み `core.codec` canonical columnar batch envelope、zero-copy view、encoder
 - [json-escape-benchmark-evidence.md](json-escape-benchmark-evidence.md) — JSON escape benchmark の
   trusted native-host controller、isolation、report schema、acceptance boundary
 

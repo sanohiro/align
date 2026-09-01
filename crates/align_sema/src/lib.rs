@@ -226,6 +226,15 @@ pub enum Scalar {
     /// A `log.logger` payload. The Move handle owns one writer and preserves that writer's region;
     /// aggregate storage therefore carries the same borrowed-descriptor provenance.
     Logger,
+    /// A validated `core.codec` batch view into one borrowed canonical envelope.
+    CodecBatch,
+    /// Alignment-independent typed column views borrowed from a validated codec batch.
+    CodecI64Column,
+    CodecF64Column,
+    CodecBoolColumn,
+    CodecStrColumn,
+    /// A runtime-owned `core.codec` staging encoder. Move and region-free.
+    CodecEncoder,
     /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
@@ -335,7 +344,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -614,6 +623,15 @@ pub enum Ty {
     /// logger preserves the writer's descriptor provenance and region, latches its first sink
     /// failure, and is Drop-freed through the writer's ordinary flush/close path.
     Logger,
+    /// Validated, Copy views over one canonical `core.codec` envelope. Every value retains the
+    /// exact input storage region and generation; no variant owns or aligns the underlying bytes.
+    CodecBatch,
+    CodecI64Column,
+    CodecF64Column,
+    CodecBoolColumn,
+    CodecStrColumn,
+    /// Runtime-owned transactional column staging. A bare Move pointer with no retained region.
+    CodecEncoder,
     /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
     /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
     /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
@@ -903,6 +921,12 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Builder
         | Ty::Writer
         | Ty::Logger
+        | Ty::CodecBatch
+        | Ty::CodecI64Column
+        | Ty::CodecF64Column
+        | Ty::CodecBoolColumn
+        | Ty::CodecStrColumn
+        | Ty::CodecEncoder
         | Ty::Reader
         | Ty::Buffer
         | Ty::SignatureKey(_)
@@ -968,6 +992,12 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn
+        | Scalar::CodecStrColumn
+        | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -1026,6 +1056,12 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
         Ty::Logger => Some(Scalar::Logger),
+        Ty::CodecBatch => Some(Scalar::CodecBatch),
+        Ty::CodecI64Column => Some(Scalar::CodecI64Column),
+        Ty::CodecF64Column => Some(Scalar::CodecF64Column),
+        Ty::CodecBoolColumn => Some(Scalar::CodecBoolColumn),
+        Ty::CodecStrColumn => Some(Scalar::CodecStrColumn),
+        Ty::CodecEncoder => Some(Scalar::CodecEncoder),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
         Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
@@ -1160,6 +1196,12 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Logger => Ty::Logger,
+        Scalar::CodecBatch => Ty::CodecBatch,
+        Scalar::CodecI64Column => Ty::CodecI64Column,
+        Scalar::CodecF64Column => Ty::CodecF64Column,
+        Scalar::CodecBoolColumn => Ty::CodecBoolColumn,
+        Scalar::CodecStrColumn => Ty::CodecStrColumn,
+        Scalar::CodecEncoder => Ty::CodecEncoder,
         Scalar::Buffer => Ty::Buffer,
         Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
@@ -2420,6 +2462,7 @@ pub fn drop_plan(
                         | Ty::StrFinder
                         | Ty::Writer
                         | Ty::Logger
+                        | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
                         | Ty::SignatureKey(_)
@@ -2880,6 +2923,12 @@ pub fn ty_contains_signature_key(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
             | Ty::StrFinder
@@ -2944,6 +2993,11 @@ pub fn ty_may_borrow(
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
             | Ty::Soa(_)
             | Ty::SoaParam(_)
             // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
@@ -3071,6 +3125,12 @@ fn ty_contains_http_receive_stream(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3198,6 +3258,12 @@ fn ty_contains_http_receive_stream(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3273,6 +3339,12 @@ pub fn http_stream_carrier_class(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::CodecBatch
+            | Scalar::CodecI64Column
+            | Scalar::CodecF64Column
+            | Scalar::CodecBoolColumn
+            | Scalar::CodecStrColumn
+            | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
             | Scalar::Regex
@@ -3399,6 +3471,12 @@ pub fn http_stream_carrier_class(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -4032,6 +4110,12 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("reader", Ty::Reader),
     ("writer", Ty::Writer),
     ("log.logger", Ty::Logger),
+    ("codec.batch", Ty::CodecBatch),
+    ("codec.i64_column", Ty::CodecI64Column),
+    ("codec.f64_column", Ty::CodecF64Column),
+    ("codec.bool_column", Ty::CodecBoolColumn),
+    ("codec.str_column", Ty::CodecStrColumn),
+    ("codec.encoder", Ty::CodecEncoder),
     ("buffer", Ty::Buffer),
     ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
     ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
@@ -7746,6 +7830,25 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         });
     }
 
+    // The builtin `codec.kind` enum (`core.codec`). Its source ordinals are also the exact v1 wire
+    // descriptor tags, so it remains the ordinary checked enum aggregate all the way to lowering.
+    {
+        let codec_kind_id = enums.len() as u32;
+        enum_ids.insert("codec.kind".to_string(), codec_kind_id);
+        enums.push(hir::EnumDef {
+            name: "codec.kind".to_string(),
+            source_name: "codec.kind".to_string(),
+            variants: ["I64", "F64", "Bool", "Str"]
+                .into_iter()
+                .map(|variant| hir::EnumVariant {
+                    name: variant.to_string(),
+                    payload: Vec::new(),
+                    field_base: 1,
+                })
+                .collect(),
+        });
+    }
+
     // The builtin `regex_match` struct (`std.regex`) — a plain Copy pair of UTF-8 byte offsets.
     // Visible everywhere and reserved, like `argon2_params`, so `find` can return an ordinary
     // `Option<regex_match>` without adding another special aggregate representation.
@@ -8123,6 +8226,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // `log.logger` may cross a sum-type boundary as an owned tagged carrier.
                     // The enum's tag-switched drop forwards the active handle to `log_free`.
                     Ty::Logger => payload.push(Scalar::Logger),
+                    Ty::CodecBatch => payload.push(Scalar::CodecBatch),
+                    Ty::CodecI64Column => payload.push(Scalar::CodecI64Column),
+                    Ty::CodecF64Column => payload.push(Scalar::CodecF64Column),
+                    Ty::CodecBoolColumn => payload.push(Scalar::CodecBoolColumn),
+                    Ty::CodecStrColumn => payload.push(Scalar::CodecStrColumn),
+                    Ty::CodecEncoder => payload.push(Scalar::CodecEncoder),
                     Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
                         &mut tagged_types,
                         hir::TaggedType::Option(value),
@@ -14732,6 +14841,32 @@ impl EffectScan<'_> {
                 walk!(logger);
                 self.impure_direct = true;
             }
+            // `core.codec` is entirely in-memory and Pure; walk every operand in source order.
+            ExprKind::CodecOpen { input }
+            | ExprKind::CodecBatchRows { batch: input }
+            | ExprKind::CodecBatchColumns { batch: input }
+            | ExprKind::CodecColumnLen { column: input }
+            | ExprKind::CodecEncoderNew { rows: input }
+            | ExprKind::CodecEncoderFinish { encoder: input } => walk!(input),
+            ExprKind::CodecBatchName { batch, index }
+            | ExprKind::CodecBatchKind { batch, index }
+            | ExprKind::CodecBatchI64s { batch, index }
+            | ExprKind::CodecBatchF64s { batch, index }
+            | ExprKind::CodecBatchBools { batch, index }
+            | ExprKind::CodecBatchStrs { batch, index }
+            | ExprKind::CodecColumnAt { column: batch, index } => {
+                walk!(batch);
+                walk!(index);
+            }
+            ExprKind::CodecBatchFind { batch, name } => {
+                walk!(batch);
+                walk!(name);
+            }
+            ExprKind::CodecEncoderPut { encoder, name, values, .. } => {
+                walk!(encoder);
+                walk!(name);
+                walk!(values);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 walk!(reader);
                 walk!(buffer);
@@ -18545,6 +18680,12 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Child
             | Ty::HttpRequest
             | Ty::HttpResponse
@@ -20529,7 +20670,13 @@ impl<'a> EscapeCheck<'a> {
             Ty::DictEncoded(..) => return true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
-            Ty::Soa(_) | Ty::SoaParam(_) => return true,
+            Ty::Soa(_)
+            | Ty::SoaParam(_)
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
             // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
             Ty::HttpHeaders => return true,
@@ -20627,6 +20774,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Raw
             | Ty::Builder
             | Ty::Buffer
+            | Ty::CodecEncoder
             | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
             // bytes) — it borrows nothing, so it carries no inferred region.
@@ -22093,6 +22241,13 @@ impl<'a> EscapeCheck<'a> {
             // `log.new` transfers the writer and therefore inherits its exact region. An owned
             // writer is Static; a writer borrowed from a connection remains connection-bound.
             ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
+            ExprKind::CodecOpen { input } => work.push(Work::Eval(input, depth)),
+            ExprKind::CodecBatchName { batch, .. }
+            | ExprKind::CodecBatchI64s { batch, .. }
+            | ExprKind::CodecBatchF64s { batch, .. }
+            | ExprKind::CodecBatchBools { batch, .. }
+            | ExprKind::CodecBatchStrs { batch, .. } => work.push(Work::Eval(batch, depth)),
+            ExprKind::CodecColumnAt { column, .. } => work.push(Work::Eval(column, depth)),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
             // frame. Without this explicit arm a `Static` classification would let the view
@@ -22516,6 +22671,14 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::LogEnabled { .. }
             | ExprKind::LogLine { .. }
             | ExprKind::LogFlush { .. }
+            | ExprKind::CodecBatchRows { .. }
+            | ExprKind::CodecBatchColumns { .. }
+            | ExprKind::CodecBatchKind { .. }
+            | ExprKind::CodecBatchFind { .. }
+            | ExprKind::CodecColumnLen { .. }
+            | ExprKind::CodecEncoderNew { .. }
+            | ExprKind::CodecEncoderPut { .. }
+            | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
@@ -22769,6 +22932,13 @@ impl<'a> EscapeCheck<'a> {
             // the receiver is (a sub-slice of a local array is still a view of that stack array).
             // Without this, `return xs[0..2]` over a local array returns a dangling slice.
             ExprKind::SliceRange { recv, .. } => work.push(recv),
+            ExprKind::CodecOpen { input } => work.push(input),
+            ExprKind::CodecBatchName { batch, .. }
+            | ExprKind::CodecBatchI64s { batch, .. }
+            | ExprKind::CodecBatchF64s { batch, .. }
+            | ExprKind::CodecBatchBools { batch, .. }
+            | ExprKind::CodecBatchStrs { batch, .. } => work.push(batch),
+            ExprKind::CodecColumnAt { column, .. } => work.push(column),
             // A `match`/`else` yields one of its arms, so it is frame-local if any arm is (like the
             // `if`/`else` arm above — a local-backed slice must not escape through either).
             ExprKind::Match { arms, .. } => {
@@ -22932,6 +23102,14 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::LogEnabled { .. }
             | ExprKind::LogLine { .. }
             | ExprKind::LogFlush { .. }
+            | ExprKind::CodecBatchRows { .. }
+            | ExprKind::CodecBatchColumns { .. }
+            | ExprKind::CodecBatchKind { .. }
+            | ExprKind::CodecBatchFind { .. }
+            | ExprKind::CodecColumnLen { .. }
+            | ExprKind::CodecEncoderNew { .. }
+            | ExprKind::CodecEncoderPut { .. }
+            | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
@@ -26559,6 +26737,34 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(message, depth);
             }
             ExprKind::LogFlush { logger } => self.walk(logger, depth),
+            ExprKind::CodecOpen { input } => self.walk(input, depth),
+            ExprKind::CodecBatchRows { batch }
+            | ExprKind::CodecBatchColumns { batch } => self.walk(batch, depth),
+            ExprKind::CodecBatchName { batch, index }
+            | ExprKind::CodecBatchKind { batch, index }
+            | ExprKind::CodecBatchI64s { batch, index }
+            | ExprKind::CodecBatchF64s { batch, index }
+            | ExprKind::CodecBatchBools { batch, index }
+            | ExprKind::CodecBatchStrs { batch, index } => {
+                self.walk(batch, depth);
+                self.walk(index, depth);
+            }
+            ExprKind::CodecBatchFind { batch, name } => {
+                self.walk(batch, depth);
+                self.walk(name, depth);
+            }
+            ExprKind::CodecColumnLen { column } => self.walk(column, depth),
+            ExprKind::CodecColumnAt { column, index } => {
+                self.walk(column, depth);
+                self.walk(index, depth);
+            }
+            ExprKind::CodecEncoderNew { rows } => self.walk(rows, depth),
+            ExprKind::CodecEncoderPut { encoder, name, values, .. } => {
+                self.walk(encoder, depth);
+                self.walk(name, depth);
+                self.walk(values, depth);
+            }
+            ExprKind::CodecEncoderFinish { encoder } => self.walk(encoder, depth),
             ExprKind::ReaderRead { reader, buffer } => {
                 self.walk(reader, depth);
                 self.walk(buffer, depth);
@@ -28349,6 +28555,13 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
 
         ExprKind::ResourceViewFromRaw { .. }
         | ExprKind::BufferBytes { .. }
+        | ExprKind::CodecOpen { .. }
+        | ExprKind::CodecBatchName { .. }
+        | ExprKind::CodecBatchI64s { .. }
+        | ExprKind::CodecBatchF64s { .. }
+        | ExprKind::CodecBatchBools { .. }
+        | ExprKind::CodecBatchStrs { .. }
+        | ExprKind::CodecColumnAt { .. }
         | ExprKind::StrBytes { .. }
         | ExprKind::RunBytesStdout { .. }
         | ExprKind::RunBytesStderr { .. }
@@ -28489,6 +28702,14 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::LogEnabled { .. }
         | ExprKind::LogLine { .. }
         | ExprKind::LogFlush { .. }
+        | ExprKind::CodecBatchRows { .. }
+        | ExprKind::CodecBatchColumns { .. }
+        | ExprKind::CodecBatchKind { .. }
+        | ExprKind::CodecBatchFind { .. }
+        | ExprKind::CodecColumnLen { .. }
+        | ExprKind::CodecEncoderNew { .. }
+        | ExprKind::CodecEncoderPut { .. }
+        | ExprKind::CodecEncoderFinish { .. }
         | ExprKind::IoCopy { .. }
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
@@ -35365,6 +35586,15 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
             // Logger construction transfers the writer without widening or severing its region.
             ExprKind::LogNew { output, .. } => self.borrow_sources(output),
+            ExprKind::CodecOpen { input } => self.storage_roots(input),
+            ExprKind::CodecBatchName { batch, .. }
+            | ExprKind::CodecBatchI64s { batch, .. }
+            | ExprKind::CodecBatchF64s { batch, .. }
+            | ExprKind::CodecBatchBools { batch, .. }
+            | ExprKind::CodecBatchStrs { batch, .. } => self.storage_roots(batch),
+            ExprKind::CodecColumnAt { column, .. } if e.ty == Ty::Option(Scalar::Str) => {
+                self.storage_roots(column)
+            }
             ExprKind::BytesAsStr { bytes }
             | ExprKind::StrTrim { recv: bytes, .. }
             | ExprKind::PathComponent { path: bytes, .. } => self.storage_roots(bytes),
@@ -35647,7 +35877,13 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
             | ExprKind::WriterFlush { .. } | ExprKind::LogEnabled { .. } | ExprKind::LogLine { .. }
-            | ExprKind::LogFlush { .. } | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
+            | ExprKind::LogFlush { .. }
+            | ExprKind::CodecBatchRows { .. } | ExprKind::CodecBatchColumns { .. }
+            | ExprKind::CodecBatchKind { .. } | ExprKind::CodecBatchFind { .. }
+            | ExprKind::CodecColumnLen { .. } | ExprKind::CodecColumnAt { .. }
+            | ExprKind::CodecEncoderNew { .. }
+            | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
+            | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
@@ -41187,6 +41423,35 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, message, moved, false, false);
             }
             ExprKind::LogFlush { logger } => move_expr!(self, logger, moved, false, false),
+            ExprKind::CodecOpen { input } => move_expr!(self, input, moved, false, false),
+            ExprKind::CodecBatchRows { batch }
+            | ExprKind::CodecBatchColumns { batch }
+            | ExprKind::CodecColumnLen { column: batch } => {
+                move_expr!(self, batch, moved, false, false)
+            }
+            ExprKind::CodecBatchName { batch, index }
+            | ExprKind::CodecBatchKind { batch, index }
+            | ExprKind::CodecBatchI64s { batch, index }
+            | ExprKind::CodecBatchF64s { batch, index }
+            | ExprKind::CodecBatchBools { batch, index }
+            | ExprKind::CodecBatchStrs { batch, index }
+            | ExprKind::CodecColumnAt { column: batch, index } => {
+                move_expr!(self, batch, moved, false, false);
+                move_expr!(self, index, moved, false, false)
+            }
+            ExprKind::CodecBatchFind { batch, name } => {
+                move_expr!(self, batch, moved, false, false);
+                move_expr!(self, name, moved, false, false)
+            }
+            ExprKind::CodecEncoderNew { rows } => move_expr!(self, rows, moved, false, false),
+            ExprKind::CodecEncoderPut { encoder, name, values, .. } => {
+                move_expr!(self, encoder, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, values, moved, false, false)
+            }
+            ExprKind::CodecEncoderFinish { encoder } => {
+                move_expr!(self, encoder, moved, true, true)
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 move_expr!(self, reader, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
@@ -42232,6 +42497,8 @@ struct Checker<'a, 't> {
     json_kind_enum_id: u32,
     /// The id of the builtin `log.level` enum. Runtime calls receive only its validated field 0.
     log_level_enum_id: u32,
+    /// The id of the builtin `codec.kind` enum. Its ordinal is the canonical wire tag.
+    codec_kind_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
     /// resolution (mutable, like the other interners). Field access reads it.
     structs: &'t mut Vec<StructDef>,
@@ -42457,6 +42724,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `Error`), so its id is always present in `enum_ids`.
             json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
             log_level_enum_id: *enum_ids.get("log.level").expect("builtin log.level enum registered"),
+            codec_kind_enum_id: *enum_ids.get("codec.kind").expect("builtin codec.kind enum registered"),
             structs,
             struct_templates,
             struct_mono,
@@ -45245,6 +45513,16 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return Ok(Some("log.level".to_string()));
         }
+        if flat == "codec.kind" {
+            if !self.imports.contains("core.codec") {
+                self.diags.error(
+                    "`codec.kind` requires `import core.codec` — the capability is not imported".to_string(),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some("codec.kind".to_string()));
+        }
         if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
             if let Some(required) = alias.required_import
                 && !self.imports.contains(required)
@@ -47681,6 +47959,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.log", "log.new", span);
                 return self.check_log_new(args, span);
             }
+            if module == "codec" && matches!(method, "open" | "encoder") {
+                self.require_import("core.codec", &format!("codec.{method}"), span);
+                return self.check_codec_constructor(method, args, span);
+            }
             if module == "json" && method == "encode_bounded" {
                 self.require_import("core.json", "json.encode_bounded", span);
                 return self.check_json_encode_bounded(args, span);
@@ -48094,6 +48376,45 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
+        }
+        if matches!(
+            method,
+            "rows"
+                | "columns"
+                | "name"
+                | "kind"
+                | "find"
+                | "i64s"
+                | "f64s"
+                | "bools"
+                | "strs"
+                | "at"
+                | "put_i64"
+                | "put_f64"
+                | "put_bool"
+                | "put_str"
+                | "finish"
+        ) {
+            let recv_expr = self.check_expr(recv, None);
+            match recv_expr.ty {
+                Ty::CodecBatch => return self.check_codec_batch_method(recv_expr, method, args, span),
+                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn
+                    if method == "at" =>
+                {
+                    return self.check_codec_column_method(recv_expr, method, args, span);
+                }
+                Ty::CodecEncoder => return self.check_codec_encoder_method(recv_expr, method, args, span),
+                _ => {}
+            }
+        }
+        if method == "len" {
+            let recv_expr = self.check_expr(recv, None);
+            if matches!(
+                recv_expr.ty,
+                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn
+            ) {
+                return self.check_codec_column_method(recv_expr, method, args, span);
+            }
         }
         // `log.logger` methods borrow one bound logger handle. Keep this dispatch ahead of the
         // shared writer `.flush()` lane so the receiver is checked exactly once.
@@ -58988,6 +59309,218 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn check_codec_constructor(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'codec.{method}' expects 1 argument, got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let error = Scalar::Enum(self.error_enum_id);
+        match method {
+            "open" => {
+                let input = self.check_bytes_init(&args[0], "'codec.open'");
+                if input.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CodecOpen { input: Box::new(input) },
+                    ty: Ty::Result(Scalar::CodecBatch, error),
+                    span,
+                }
+            }
+            "encoder" => {
+                let rows = self.check_expr(
+                    &args[0],
+                    Some(Ty::Int(IntTy { bits: 64, signed: true })),
+                );
+                if rows.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CodecEncoderNew { rows: Box::new(rows) },
+                    ty: Ty::Result(Scalar::CodecEncoder, error),
+                    span,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn check_codec_batch_method(
+        &mut self,
+        batch: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match method {
+            "rows" | "columns" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                let kind = if method == "rows" {
+                    ExprKind::CodecBatchRows { batch: Box::new(batch) }
+                } else {
+                    ExprKind::CodecBatchColumns { batch: Box::new(batch) }
+                };
+                Expr { kind, ty: i64_ty, span }
+            }
+            "name" | "kind" | "i64s" | "f64s" | "bools" | "strs" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.{method}()' takes 1 ordinal, got {} arguments", args.len()), span);
+                    return err;
+                }
+                let index = self.check_expr(&args[0], Some(i64_ty));
+                if index.ty == Ty::Error {
+                    return err;
+                }
+                let (kind, ty) = match method {
+                    "name" => (
+                        ExprKind::CodecBatchName { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::Str),
+                    ),
+                    "kind" => (
+                        ExprKind::CodecBatchKind { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::Enum(self.codec_kind_enum_id)),
+                    ),
+                    "i64s" => (
+                        ExprKind::CodecBatchI64s { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::CodecI64Column),
+                    ),
+                    "f64s" => (
+                        ExprKind::CodecBatchF64s { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::CodecF64Column),
+                    ),
+                    "bools" => (
+                        ExprKind::CodecBatchBools { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::CodecBoolColumn),
+                    ),
+                    "strs" => (
+                        ExprKind::CodecBatchStrs { batch: Box::new(batch), index: Box::new(index) },
+                        Ty::Option(Scalar::CodecStrColumn),
+                    ),
+                    _ => unreachable!(),
+                };
+                Expr { kind, ty, span }
+            }
+            "find" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.find()' takes 1 name, got {} arguments", args.len()), span);
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                if name.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CodecBatchFind { batch: Box::new(batch), name: Box::new(name) },
+                    ty: Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true })),
+                    span,
+                }
+            }
+            _ => err,
+        }
+    }
+
+    fn check_codec_column_method(
+        &mut self,
+        column: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if method == "len" {
+            if !args.is_empty() {
+                self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
+                return err;
+            }
+            return Expr { kind: ExprKind::CodecColumnLen { column: Box::new(column) }, ty: i64_ty, span };
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'.at()' takes 1 index, got {} arguments", args.len()), span);
+            return err;
+        }
+        let index = self.check_expr(&args[0], Some(i64_ty));
+        if index.ty == Ty::Error {
+            return err;
+        }
+        let payload = match column.ty {
+            Ty::CodecI64Column => Scalar::Int(IntTy { bits: 64, signed: true }),
+            Ty::CodecF64Column => Scalar::Float(FloatTy { bits: 64 }),
+            Ty::CodecBoolColumn => Scalar::Bool,
+            Ty::CodecStrColumn => Scalar::Str,
+            _ => return err,
+        };
+        Expr {
+            kind: ExprKind::CodecColumnAt { column: Box::new(column), index: Box::new(index) },
+            ty: Ty::Option(payload),
+            span,
+        }
+    }
+
+    fn check_codec_encoder_method(
+        &mut self,
+        encoder: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "finish" {
+            if !args.is_empty() {
+                self.diags.error(format!("'.finish()' takes no arguments, got {}", args.len()), span);
+                return err;
+            }
+            if !matches!(encoder.kind, ExprKind::Local(_)) {
+                self.diags.error("bind the codec encoder to a local before using it".to_string(), span);
+                return err;
+            }
+            return Expr { kind: ExprKind::CodecEncoderFinish { encoder: Box::new(encoder) }, ty: Ty::Buffer, span };
+        }
+        if args.len() != 2 {
+            self.diags.error(format!("'.{method}()' takes a name and values, got {} arguments", args.len()), span);
+            return err;
+        }
+        let argument_mark = self.diags.len();
+        let name = self.check_str_init(&args[0]);
+        let (put_kind, element) = match method {
+            "put_i64" => (hir::CodecPutKind::I64, Scalar::Int(IntTy { bits: 64, signed: true })),
+            "put_f64" => (hir::CodecPutKind::F64, Scalar::Float(FloatTy { bits: 64 })),
+            "put_bool" => (hir::CodecPutKind::Bool, Scalar::Bool),
+            "put_str" => (hir::CodecPutKind::Str, Scalar::Str),
+            _ => return err,
+        };
+        let values = self.check_slice_init(&args[1], element);
+        if name.ty == Ty::Error || values.ty == Ty::Error || self.diags.len() != argument_mark {
+            return err;
+        }
+        if !matches!(encoder.kind, ExprKind::Local(_)) {
+            self.diags.error("bind the codec encoder to a local before using it".to_string(), span);
+            return err;
+        }
+        if !self.require_exclusive_handle_receiver(&encoder, "codec.encoder", method, "mutate") {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::CodecEncoderPut {
+                encoder: Box::new(encoder),
+                name: Box::new(name),
+                values: Box::new(values),
+                kind: put_kind,
+            },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// Borrowing methods on a bound `log.logger`. `line` accepts text or a builder by borrow and
     /// deliberately returns Unit; `flush` is the sole public observation of the first error latch.
     fn check_logger_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
@@ -61676,6 +62209,31 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(message);
             }
             ExprKind::LogFlush { logger } => self.finalize_expr(logger),
+            ExprKind::CodecOpen { input } => self.finalize_expr(input),
+            ExprKind::CodecBatchRows { batch }
+            | ExprKind::CodecBatchColumns { batch }
+            | ExprKind::CodecColumnLen { column: batch }
+            | ExprKind::CodecEncoderNew { rows: batch }
+            | ExprKind::CodecEncoderFinish { encoder: batch } => self.finalize_expr(batch),
+            ExprKind::CodecBatchName { batch, index }
+            | ExprKind::CodecBatchKind { batch, index }
+            | ExprKind::CodecBatchI64s { batch, index }
+            | ExprKind::CodecBatchF64s { batch, index }
+            | ExprKind::CodecBatchBools { batch, index }
+            | ExprKind::CodecBatchStrs { batch, index }
+            | ExprKind::CodecColumnAt { column: batch, index } => {
+                self.finalize_expr(batch);
+                self.finalize_expr(index);
+            }
+            ExprKind::CodecBatchFind { batch, name } => {
+                self.finalize_expr(batch);
+                self.finalize_expr(name);
+            }
+            ExprKind::CodecEncoderPut { encoder, name, values, .. } => {
+                self.finalize_expr(encoder);
+                self.finalize_expr(name);
+                self.finalize_expr(values);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 self.finalize_expr(reader);
                 self.finalize_expr(buffer);
@@ -62354,7 +62912,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "core.option", "core.result", "core.array", "core.slice", "core.chunks", "core.vec",
     "core.mask", "core.bitset", "core.map", "core.reduce", "core.scan", "core.partition",
     "core.sort", "core.str", "core.string", "core.bytes", "core.buffer", "core.builder",
-    "core.arena", "core.json", "core.template", "core.hash", "core.math",
+    "core.arena", "core.json", "core.codec", "core.template", "core.hash", "core.math",
     "core.test",
     // std — the OS boundary
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
@@ -62689,6 +63247,12 @@ fn ty_name(ty: Ty) -> String {
         // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::Writer => "writer".to_string(),
         Ty::Logger => "log.logger".to_string(),
+        Ty::CodecBatch => "codec.batch".to_string(),
+        Ty::CodecI64Column => "codec.i64_column".to_string(),
+        Ty::CodecF64Column => "codec.f64_column".to_string(),
+        Ty::CodecBoolColumn => "codec.bool_column".to_string(),
+        Ty::CodecStrColumn => "codec.str_column".to_string(),
+        Ty::CodecEncoder => "codec.encoder".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
@@ -63089,6 +63653,12 @@ fn resolved_type_source_spelling(
             Ty::Builder => "builder".to_string(),
             Ty::Writer => "writer".to_string(),
             Ty::Logger => "log.logger".to_string(),
+            Ty::CodecBatch => "codec.batch".to_string(),
+            Ty::CodecI64Column => "codec.i64_column".to_string(),
+            Ty::CodecF64Column => "codec.f64_column".to_string(),
+            Ty::CodecBoolColumn => "codec.bool_column".to_string(),
+            Ty::CodecStrColumn => "codec.str_column".to_string(),
+            Ty::CodecEncoder => "codec.encoder".to_string(),
             Ty::Reader => "reader".to_string(),
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
@@ -64185,8 +64755,9 @@ fn scalar_arg(
     // return `Result<reader/writer, Error>`) — the `allow_param` positions — but **never** as an
     // array / slice / vec / box **element**: an element read copies the handle by value (no
     // move-out), so two copies would close/free the same fd (double close + double `Box::from_raw`
-    // = UB). A `buffer` is never a payload at all. Reject at the type, matching `is_field_ok` /
-    // tuple elements (which also refuse these handles).
+    // = UB). A `buffer` follows the same direct Option/Result carrier rule; collections still
+    // reject it. This is required by the existing decoding/compression APIs that return
+    // `Result<buffer, Error>`.
     // A `cli command` is never a payload (like `buffer`); a `cli parsed` may ride a `Result` Ok
     // payload (`c.parse(args)`) — the `allow_param` positions — but never as an array/slice/box
     // element (an element read would copy + double-free the handle), same as `reader`/`writer`.
@@ -64208,7 +64779,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -64298,6 +64869,12 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
             | Ty::Regex
             | Ty::Captures
             | Ty::CliParsed
@@ -64789,6 +65366,34 @@ fn resolve_type(
                 .get("log.level")
                 .map(|&id| Ty::Enum(id))
                 .unwrap_or(Ty::Error)
+        };
+    }
+    // `core.codec` exposes only qualified nominal types. None is constructible from a literal;
+    // operations below are their sole producers.
+    if path.segments.len() == 2
+        && path.segments[0].name == "codec"
+        && matches!(name, "kind" | "batch" | "i64_column" | "f64_column" | "bool_column" | "str_column" | "encoder")
+    {
+        if !cx.builtin_imports.contains("core.codec") {
+            diags.error(
+                format!("`codec.{name}` requires `import core.codec` — the capability is not imported"),
+                span,
+            );
+            return Ty::Error;
+        }
+        if !args.is_empty() {
+            diags.error(format!("`codec.{name}` takes no type arguments"), span);
+            return Ty::Error;
+        }
+        return match name {
+            "kind" => cx.enum_ids.get("codec.kind").map(|&id| Ty::Enum(id)).unwrap_or(Ty::Error),
+            "batch" => Ty::CodecBatch,
+            "i64_column" => Ty::CodecI64Column,
+            "f64_column" => Ty::CodecF64Column,
+            "bool_column" => Ty::CodecBoolColumn,
+            "str_column" => Ty::CodecStrColumn,
+            "encoder" => Ty::CodecEncoder,
+            _ => unreachable!(),
         };
     }
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
@@ -65584,6 +66189,7 @@ pub fn is_move_handle(ty: Ty) -> bool {
 pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Writer,
     Ty::Logger,
+    Ty::CodecEncoder,
     Ty::Reader,
     Ty::Buffer,
     Ty::SignatureKey(SignatureKeyKind::Rs256Private),
@@ -65653,7 +66259,22 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // framework handles intentionally admitted as fields, embedding it would broaden the
         // reviewed ownership surface without a field move-out/replacement owner.
         Ty::RunBytes => return false,
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Resource(_) | Ty::ResourceRef(_) | Ty::Param(_) | Ty::Error => {}
+        Ty::Int(_)
+        | Ty::Float(_)
+        | Ty::Bool
+        | Ty::Char
+        | Ty::Str
+        | Ty::String
+        | Ty::Struct(_)
+        | Ty::Resource(_)
+        | Ty::ResourceRef(_)
+        | Ty::Param(_)
+        | Ty::Error
+        | Ty::CodecBatch
+        | Ty::CodecI64Column
+        | Ty::CodecF64Column
+        | Ty::CodecBoolColumn
+        | Ty::CodecStrColumn => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the
@@ -65973,7 +66594,14 @@ fn enum_payload_ok(
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
         // Opaque handles admitted by concrete Pass 0c must remain legal after generic
         // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
-        Scalar::ResponseBuilder | Scalar::Logger => true,
+        Scalar::ResponseBuilder
+        | Scalar::Logger
+        | Scalar::CodecBatch
+        | Scalar::CodecI64Column
+        | Scalar::CodecF64Column
+        | Scalar::CodecBoolColumn
+        | Scalar::CodecStrColumn
+        | Scalar::CodecEncoder => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its
         // per-element string Drop is not part of this enum payload contract. Struct arrays are
@@ -67240,8 +67868,11 @@ mod tests {
                 variants += 1;
             }
         }
+        // `core.codec` adds fifteen closed expressions: open, five batch metadata/projection
+        // operations, four typed projections, two shared column operations, and three encoder
+        // operations. The wildcard-free policy above classifies every one explicitly.
         assert_eq!(
-            variants, 285,
+            variants, 300,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

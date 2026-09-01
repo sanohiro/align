@@ -940,6 +940,52 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::LogFlush { logger } => ExprKind::LogFlush {
             logger: boxed!(logger),
         },
+        ExprKind::CodecOpen { input } => ExprKind::CodecOpen { input: boxed!(input) },
+        ExprKind::CodecBatchRows { batch } => ExprKind::CodecBatchRows { batch: boxed!(batch) },
+        ExprKind::CodecBatchColumns { batch } => ExprKind::CodecBatchColumns { batch: boxed!(batch) },
+        ExprKind::CodecBatchName { batch, index } => ExprKind::CodecBatchName {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecBatchKind { batch, index } => ExprKind::CodecBatchKind {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecBatchFind { batch, name } => ExprKind::CodecBatchFind {
+            batch: boxed!(batch),
+            name: boxed!(name),
+        },
+        ExprKind::CodecBatchI64s { batch, index } => ExprKind::CodecBatchI64s {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecBatchF64s { batch, index } => ExprKind::CodecBatchF64s {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecBatchBools { batch, index } => ExprKind::CodecBatchBools {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecBatchStrs { batch, index } => ExprKind::CodecBatchStrs {
+            batch: boxed!(batch),
+            index: boxed!(index),
+        },
+        ExprKind::CodecColumnLen { column } => ExprKind::CodecColumnLen { column: boxed!(column) },
+        ExprKind::CodecColumnAt { column, index } => ExprKind::CodecColumnAt {
+            column: boxed!(column),
+            index: boxed!(index),
+        },
+        ExprKind::CodecEncoderNew { rows } => ExprKind::CodecEncoderNew { rows: boxed!(rows) },
+        ExprKind::CodecEncoderPut { encoder, name, values, kind } => ExprKind::CodecEncoderPut {
+            encoder: boxed!(encoder),
+            name: boxed!(name),
+            values: boxed!(values),
+            kind: *kind,
+        },
+        ExprKind::CodecEncoderFinish { encoder } => ExprKind::CodecEncoderFinish {
+            encoder: boxed!(encoder),
+        },
         ExprKind::IoCopy { reader, writer } => ExprKind::IoCopy {
             reader: boxed!(reader),
             writer: boxed!(writer),
@@ -2065,6 +2111,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             logger: lhs,
             level: rhs,
         }
+        | ExprKind::CodecBatchName { batch: lhs, index: rhs }
+        | ExprKind::CodecBatchKind { batch: lhs, index: rhs }
+        | ExprKind::CodecBatchFind { batch: lhs, name: rhs }
+        | ExprKind::CodecBatchI64s { batch: lhs, index: rhs }
+        | ExprKind::CodecBatchF64s { batch: lhs, index: rhs }
+        | ExprKind::CodecBatchBools { batch: lhs, index: rhs }
+        | ExprKind::CodecBatchStrs { batch: lhs, index: rhs }
+        | ExprKind::CodecColumnAt { column: lhs, index: rhs }
         | ExprKind::IoCopy {
             reader: lhs,
             writer: rhs,
@@ -2283,6 +2337,11 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(level);
             one!(message);
         }
+        ExprKind::CodecEncoderPut { encoder, name, values, .. } => {
+            one!(encoder);
+            one!(name);
+            one!(values);
+        }
         ExprKind::RawStore { ptr, offset, value }
         | ExprKind::Select {
             mask: ptr,
@@ -2411,6 +2470,12 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BytesAsStr { bytes: recv }
         | ExprKind::WriterFlush { writer: recv }
         | ExprKind::LogFlush { logger: recv }
+        | ExprKind::CodecOpen { input: recv }
+        | ExprKind::CodecBatchRows { batch: recv }
+        | ExprKind::CodecBatchColumns { batch: recv }
+        | ExprKind::CodecColumnLen { column: recv }
+        | ExprKind::CodecEncoderNew { rows: recv }
+        | ExprKind::CodecEncoderFinish { encoder: recv }
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
         | ExprKind::FileLen { file: recv }

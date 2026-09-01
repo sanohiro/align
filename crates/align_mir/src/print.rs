@@ -722,6 +722,56 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::LogLine(logger, level, message) => format!("log_line({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogLineBuilder(logger, level, message) => format!("log_line_builder({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogFlush(logger) => format!("log_flush({})", operand_str(logger)),
+        Rvalue::CodecOpen(input) => format!("codec_open({})", operand_str(input)),
+        Rvalue::CodecBatchRows(batch) => format!("codec_batch_rows({})", operand_str(batch)),
+        Rvalue::CodecBatchColumns(batch) => {
+            format!("codec_batch_columns({})", operand_str(batch))
+        }
+        Rvalue::CodecBatchName(batch, index) => format!(
+            "codec_batch_name({}, {})",
+            operand_str(batch),
+            operand_str(index)
+        ),
+        Rvalue::CodecBatchKind(batch, index) => format!(
+            "codec_batch_kind({}, {})",
+            operand_str(batch),
+            operand_str(index)
+        ),
+        Rvalue::CodecBatchFind(batch, name) => format!(
+            "codec_batch_find({}, {})",
+            operand_str(batch),
+            operand_str(name)
+        ),
+        Rvalue::CodecBatchColumn { batch, index, kind } => format!(
+            "codec_batch_column_{kind:?}({}, {})",
+            operand_str(batch),
+            operand_str(index)
+        ),
+        Rvalue::CodecColumnLen(column) => {
+            format!("codec_column_len({})", operand_str(column))
+        }
+        Rvalue::CodecColumnAt { column, index, kind } => format!(
+            "codec_column_at_{kind:?}({}, {})",
+            operand_str(column),
+            operand_str(index)
+        ),
+        Rvalue::CodecEncoderNew { rows, out } => {
+            format!("codec_encoder_new({}, -> _{out})", operand_str(rows))
+        }
+        Rvalue::CodecEncoderPut {
+            encoder,
+            name,
+            values,
+            kind,
+        } => format!(
+            "codec_encoder_put_{kind:?}({}, {}, {})",
+            operand_str(encoder),
+            operand_str(name),
+            operand_str(values)
+        ),
+        Rvalue::CodecEncoderFinish(encoder) => {
+            format!("codec_encoder_finish({})", operand_str(encoder))
+        }
         Rvalue::FileCreateRw { path, out } => format!("fs_create_rw({}, -> _{out})", operand_str(path)),
         Rvalue::FileOpenRw { path, out } => format!("fs_open_rw({}, -> _{out})", operand_str(path)),
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),

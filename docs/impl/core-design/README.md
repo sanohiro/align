@@ -33,7 +33,7 @@ PR (same rule as std-design).
 - [arena-heap.md](arena-heap.md) — `arena {}` and `heap.new` / `box`: regions, escape, drop
 - [hash.md](hash.md) — `core.hash` (`hash64`/`hash128`): status and design
 - [test.md](test.md) — implemented `core.test` declarations, assertions, isolated runner protocol, and terse-output policy
-- [codec.md](codec.md) — designed `core.codec` canonical columnar batch envelope, zero-copy views, and encoder (implementation pending)
+- [codec.md](codec.md) — implemented `core.codec` canonical columnar batch envelope, zero-copy views, and encoder
 - [json-escape-benchmark-evidence.md](json-escape-benchmark-evidence.md) — trusted native-host
   controller, isolation, report schema, and acceptance boundary for the JSON escape benchmark
 
