@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "align_ast"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_span",
  "serde",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "align_codegen_llvm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -39,14 +39,14 @@ dependencies = [
 
 [[package]]
 name = "align_diag"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_span",
 ]
 
 [[package]]
 name = "align_driver"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_codegen_llvm",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "align_fmt"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -79,11 +79,11 @@ dependencies = [
 
 [[package]]
 name = "align_hash"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "align_interface"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "align_lexer"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_diag",
  "align_span",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "align_mir"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "align_parser"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "align_repl"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "align_runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_hash",
  "libc",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "align_sema"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_ast",
  "align_diag",
@@ -164,11 +164,11 @@ dependencies = [
 
 [[package]]
 name = "align_span"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "align_watch"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "align_interface",
  "libc",

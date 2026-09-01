@@ -342,10 +342,11 @@ facts must live in this repository.
 
 ## Current baseline
 
-- **Release:** v0.5.0 is the release checkpoint for the complete committed
-  `pkg.db` roadmap through D14. `RELEASE_NOTES_0.5.0.md` is the release record.
-  It includes the post-v0.4.0 macOS `clearenv(3)` portability fix from #636;
-  macOS CI is green and Linux behavior is unchanged.
+- **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
+  in-language test runner, bounded data/protocol library wave (`core.codec`,
+  `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` remains the
+  next language capability.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
