@@ -140,9 +140,13 @@ the implementation activates all eight with their checked-HIR records and owner 
 owned/heap-allocation-free six-stage `ALNCOL01` validation in `core-design/codec.md`, rejects column
 count 1025 before descriptor access, and returns zero or `AL_INVALID`; name uniqueness uses exactly
 two `[u16; 1024]` stack arrays, ten stable merge passes, and at most 9,217 lexicographic comparisons.
-It retains nothing and has no output slot. MIR forms the batch scalar from the still-live input only
-after zero. Metadata, four typed projections, alignment-1 element access, and `find` lower from that
-validated scalar without another runtime row; no per-element opaque call is introduced.
+It retains nothing and has no output slot. MIR forms the `{ input_ptr, input_len }` batch scalar from
+the still-live input only after zero. Row and column counts lower to alignment-1 little-endian loads
+from header bytes 16 and 24, with target-required swaps and u32-to-i64 zero extension for columns;
+they are not hidden scalar fields. Remaining metadata and four typed projections reread descriptor
+bytes with byte or alignment-1 little-endian operations and target-required swaps; element access
+uses the same alignment-1 rule. `find` and all of these paths lower from the validated input without
+another runtime row; no typed descriptor pointer or per-element opaque call is introduced.
 
 `CodecEncoderNewV1` stores null to its nonnull aligned output before validating rows or allocating,
 and publishes one allocator-provenanced shell only on zero. Each put requires a nonnull shell,
