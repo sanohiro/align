@@ -48397,13 +48397,40 @@ impl<'a, 't> Checker<'a, 't> {
         ) {
             let recv_expr = self.check_expr(recv, None);
             match recv_expr.ty {
-                Ty::CodecBatch => return self.check_codec_batch_method(recv_expr, method, args, span),
-                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn
-                    if method == "at" =>
-                {
-                    return self.check_codec_column_method(recv_expr, method, args, span);
+                Ty::CodecBatch => {
+                    if matches!(
+                        method,
+                        "rows" | "columns" | "name" | "kind" | "find" | "i64s" | "f64s"
+                            | "bools" | "strs"
+                    ) {
+                        return self.check_codec_batch_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on codec.batch"),
+                        span,
+                    );
+                    return err;
                 }
-                Ty::CodecEncoder => return self.check_codec_encoder_method(recv_expr, method, args, span),
+                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn => {
+                    if method == "at" {
+                        return self.check_codec_column_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                        span,
+                    );
+                    return err;
+                }
+                Ty::CodecEncoder => {
+                    if matches!(method, "put_i64" | "put_f64" | "put_bool" | "put_str" | "finish") {
+                        return self.check_codec_encoder_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on codec.encoder"),
+                        span,
+                    );
+                    return err;
+                }
                 _ => {}
             }
         }
@@ -59321,8 +59348,9 @@ impl<'a, 't> Checker<'a, 't> {
         let error = Scalar::Enum(self.error_enum_id);
         match method {
             "open" => {
-                let input = self.check_bytes_init(&args[0], "'codec.open'");
-                if input.ty == Ty::Error {
+                let bytes = Scalar::Int(IntTy { bits: 8, signed: false });
+                let input = self.check_slice_init(&args[0], bytes);
+                if input.ty != Ty::Slice(bytes) {
                     return err;
                 }
                 Expr {

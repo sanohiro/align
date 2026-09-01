@@ -66,6 +66,19 @@ fn codec_surface_rejects_missing_import_wrong_types_unbound_receivers_and_shared
         "import core.codec\nfn main() { _ := codec.open(7) }\n",
     ));
     assert!(check_errs(
+        "core-codec-open-str",
+        "import core.codec\nfn main() { _ := codec.open(\"ALNCOL01\") }\n",
+    ));
+    for (name, method) in [("at", "at(0)"), ("finish", "finish()")] {
+        let diagnostics = check_diagnostics(
+            &format!("core-codec-batch-cross-method-{name}"),
+            &format!(
+                "import core.codec\nfn bad(batch: codec.batch) {{ _ := batch.{method} }}\nfn main() -> i32 = 0\n"
+            ),
+        );
+        assert!(diagnostics.contains("is not a method on codec.batch"), "{diagnostics}");
+    }
+    assert!(check_errs(
         "core-codec-put-type",
         "import core.codec\nfn main() -> Result<(), Error> { encoder := codec.encoder(1)?; encoder.put_i64(\"x\", [true])?; return Ok(()) }\n",
     ));

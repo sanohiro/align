@@ -20673,10 +20673,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?;
 
         self.builder.position_at_end(done);
-        Ok(self
-            .builder
+        self.builder
             .build_load(option_type, result_slot, "codec.find.result")
-            .map_err(|error| self.err(error))?)
+            .map_err(|error| self.err(error))
     }
 
     /// All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len). `#[inline(never)]` so the

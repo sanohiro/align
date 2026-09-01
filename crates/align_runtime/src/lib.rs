@@ -10763,23 +10763,37 @@ pub unsafe extern "C" fn align_rt_codec_open_v1(ptr: *const u8, len: i64) -> i32
         }
     }
 
-    // Stage 4: packed names, then fixed-stack stable uniqueness sorting, then name padding.
+    // Stage 4: validate the complete packed topology before inspecting any name content, then
+    // validate every name before fixed-stack stable uniqueness sorting and name padding.
     let mut name_cursor = names_start;
     let mut sorted = [0_u16; CODEC_MAX_COLUMNS];
     let mut scratch = [0_u16; CODEC_MAX_COLUMNS];
     for ordinal in 0..column_count {
         let Some(descriptor) = codec_descriptor(input, ordinal) else { return AL_INVALID };
-        if descriptor.name_offset != name_cursor || descriptor.name_len == 0 {
+        if descriptor.name_offset != name_cursor {
             return AL_INVALID;
         }
-        let Some(end) = name_cursor.checked_add(descriptor.name_len).filter(|end| *end <= input.len()) else {
+        let Some(end) = name_cursor.checked_add(descriptor.name_len) else {
             return AL_INVALID;
         };
-        if std::str::from_utf8(&input[name_cursor..end]).is_err() {
+        name_cursor = end;
+    }
+    for (ordinal, sorted_ordinal) in sorted.iter_mut().enumerate().take(column_count) {
+        let Some(descriptor) = codec_descriptor(input, ordinal) else { return AL_INVALID };
+        if descriptor.name_len == 0 {
             return AL_INVALID;
         }
-        name_cursor = end;
-        sorted[ordinal] = ordinal as u16;
+        let Some(end) = descriptor
+            .name_offset
+            .checked_add(descriptor.name_len)
+            .filter(|end| *end <= input.len())
+        else {
+            return AL_INVALID;
+        };
+        if std::str::from_utf8(&input[descriptor.name_offset..end]).is_err() {
+            return AL_INVALID;
+        }
+        *sorted_ordinal = ordinal as u16;
     }
     let mut width = 1;
     for _ in 0..10 {
@@ -11030,11 +11044,12 @@ fn codec_fixed_width_input(
     if encoder.is_null() {
         return AL_INVALID;
     }
-    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
     let encoder = unsafe { &mut *encoder };
+    let Ok(name) = (unsafe { codec_name(name_ptr, name_len) }) else { return AL_INVALID };
     if encoder.columns.len() >= CODEC_MAX_COLUMNS {
         return AL_INVALID;
     }
+    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
     let Ok(rows) = usize::try_from(encoder.rows) else { return AL_INVALID };
     if values_len != rows {
         return AL_INVALID;
@@ -11048,7 +11063,6 @@ fn codec_fixed_width_input(
     if values_len > 0 && values_ptr.is_null() {
         return AL_INVALID;
     }
-    let Ok(name) = (unsafe { codec_name(name_ptr, name_len) }) else { return AL_INVALID };
     if encoder
         .names
         .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(name))
@@ -11125,7 +11139,11 @@ pub unsafe extern "C" fn align_rt_codec_encoder_put_i64_v1(
     codec_fixed_width_input(encoder, name, name_len, values.cast(), values_len, CodecKind::I64)
 }
 
-/// Stage one f64 column. See [`align_rt_codec_encoder_put_i64_v1`] for pointer preconditions.
+/// Stage one f64 column.
+///
+/// # Safety
+/// The encoder must be live and the name/value pointers must satisfy their compiler-private view
+/// preconditions. A zero value length permits a null value pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_codec_encoder_put_f64_v1(
     encoder: *mut CodecEncoder,
@@ -11138,6 +11156,10 @@ pub unsafe extern "C" fn align_rt_codec_encoder_put_f64_v1(
 }
 
 /// Stage one bool column. Source bools use the compiler-private one-byte representation.
+///
+/// # Safety
+/// The encoder must be live and the name/value pointers must satisfy their compiler-private view
+/// preconditions. A zero value length permits a null value pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_codec_encoder_put_bool_v1(
     encoder: *mut CodecEncoder,
@@ -11165,24 +11187,17 @@ pub unsafe extern "C" fn align_rt_codec_encoder_put_str_v1(
     if encoder.is_null() {
         return AL_INVALID;
     }
-    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
     let encoder = unsafe { &mut *encoder };
+    let Ok(name) = (unsafe { codec_name(name, name_len) }) else { return AL_INVALID };
     if encoder.columns.len() >= CODEC_MAX_COLUMNS {
         return AL_INVALID;
     }
+    let Ok(values_len) = safe_len(values_len) else { return AL_INVALID };
     let Ok(rows) = usize::try_from(encoder.rows) else { return AL_INVALID };
     if values_len != rows {
         return AL_INVALID;
     }
     if values_len > 0 && values.is_null() {
-        return AL_INVALID;
-    }
-    let Ok(name) = (unsafe { codec_name(name, name_len) }) else { return AL_INVALID };
-    if encoder
-        .names
-        .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(name))
-        .is_ok()
-    {
         return AL_INVALID;
     }
     let headers = if values_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(values, values_len) } };
@@ -11204,6 +11219,13 @@ pub unsafe extern "C" fn align_rt_codec_encoder_put_str_v1(
     let Some(offset_capacity) = values_len.checked_add(1).and_then(|n| n.checked_mul(4)) else {
         return AL_INVALID;
     };
+    if encoder
+        .names
+        .binary_search_by(|ordinal| encoder.columns[usize::from(*ordinal)].name.as_slice().cmp(name))
+        .is_ok()
+    {
+        return AL_INVALID;
+    }
     if codec_output_len_parts(&encoder.columns, Some((name.len(), offset_capacity, Some(total)))).is_none() {
         return AL_INVALID;
     }
@@ -43407,6 +43429,26 @@ mod regex_tests {
             unsafe { align_rt_codec_open_v1(bad_cell.as_ptr(), bad_cell.len() as i64) },
             AL_INVALID,
         );
+
+        // The complete name topology precedes all name-content validation: the first name is
+        // invalid UTF-8 while the later descriptor breaks the packed-offset chain.
+        let topology = codec_encoder(0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(topology, b"x".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        assert_eq!(unsafe {
+            align_rt_codec_encoder_put_i64_v1(topology, b"y".as_ptr(), 1, core::ptr::null(), 0)
+        }, 0);
+        let mut topology = codec_finish(topology);
+        let first = codec_descriptor(&topology, 0).expect("first descriptor");
+        topology[first.name_offset] = 0xff;
+        let second_descriptor = CODEC_HEADER_LEN + CODEC_DESCRIPTOR_LEN;
+        topology[second_descriptor..second_descriptor + 8]
+            .copy_from_slice(&(first.name_offset as u64).to_le_bytes());
+        assert_eq!(
+            unsafe { align_rt_codec_open_v1(topology.as_ptr(), topology.len() as i64) },
+            AL_INVALID,
+        );
     }
 
     #[test]
@@ -43555,9 +43597,16 @@ mod regex_tests {
                 0,
             )
         }, AL_INVALID);
-        // The cap is decided before inspecting or copying a candidate name/value range.
+        // Name validation precedes the cap, but neither invalidity allocates or mutates the full
+        // encoder. This multi-invalid call also has a mismatched negative value length.
         assert_eq!(unsafe {
-            align_rt_codec_encoder_put_i64_v1(encoder, core::ptr::null(), 1, core::ptr::null(), 0)
+            align_rt_codec_encoder_put_i64_v1(
+                encoder,
+                core::ptr::null(),
+                1,
+                core::ptr::null(),
+                -1,
+            )
         }, AL_INVALID);
         let bytes = codec_finish(encoder);
         assert_eq!(codec_read_u32(&bytes, 24), Some(1024_u32));
