@@ -985,6 +985,7 @@ core.arena
 core.json
 core.template
 core.test
+core.codec
 
 core.hash
 core.math
@@ -1019,6 +1020,20 @@ owner cannot outlive its explicit region and therefore retains its existing boun
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-
 resistant (crypto → `std.crypto`). `core.bitset` is the M6 SIMD layer (`vec`/`mask`), not built yet.
+
+`core.codec` is the designed canonical columnar data-batch format, not RPC. V1 uses the fixed
+`ALNCOL01` envelope and ordered unique names over exactly `i64`, `f64`, `bool`, and `str` columns.
+Its non-null child buffers match Arrow physical layouts: contiguous little-endian 64-bit values,
+LSB-first bool bits, and signed i32 UTF-8 offsets plus data. The envelope is Align-specific, not
+Arrow IPC/C Data. `codec.open(bytes) -> Result<codec.batch, Error>` validates the complete canonical
+input once without allocation; malformed input is `Error.Invalid`. The Copy batch and every name,
+numeric slice, `codec.bool_column`, or `codec.str_column` projection are zero-copy and region-bound
+to the input storage generation. Ordinal/name/kind lookup and bool/string `at` are total through
+`Option`. `codec.encoder(rows)` is an explicit Move accumulator; its four transactional `put_*`
+methods copy exact-length named columns, and consuming `finish()` returns an owned `buffer`.
+Negative rows, empty/duplicate names, length mismatches, and v1 limits return `Error.Invalid` before
+mutation; OOM aborts. Nulls, nested/dictionary columns, compression, reflection, Arrow IPC/RPC, and
+dataframe operations are outside v1. Exact bytes and rules: `impl/core-design/codec.md`.
 
 ## Standard library
 

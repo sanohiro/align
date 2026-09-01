@@ -19,6 +19,32 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### Columnar interchange is one canonical validated batch format (SETTLED 2026-09-01)
+
+**Decision:** `core.codec` is a data-batch format, not RPC. V1 has the fixed `ALNCOL01` envelope,
+one row count, ordered byte-unique UTF-8 column names, and exactly four non-null kinds: `i64`,
+`f64`, `bool`, and `str`. Child buffers match Arrow's physical layouts—contiguous little-endian
+64-bit values, an LSB-first boolean bitmap, and signed i32 UTF-8 offsets plus bytes—but the
+canonical envelope is Align-owned and is neither Arrow IPC nor the Arrow C Data Interface.
+
+`codec.open(bytes)` validates the complete envelope once, allocation-free, under one deterministic
+arithmetic/topology/name/content precedence. Every malformed, noncanonical, unaligned, truncated,
+or trailing input returns `Error.Invalid` before publishing a batch. Its Copy batch, names, numeric
+slices, and bool/string column views borrow the input's exact region and storage generation;
+mutation or owner replacement cannot invalidate the validation certificate while a derived view is
+live. Metadata/kind lookup and bool/string element access are total through `Option`, and no
+per-element runtime call hides in the hot path.
+
+Encoding uses one explicit Move `codec.encoder(rows)`. Four transactional `put_*` operations borrow
+and copy an exact-length named column; a negative row count, empty/duplicate name, length mismatch,
+or v1 representability limit returns `Error.Invalid` before mutation. `finish()` consumes staging
+into one owned `buffer`. OOM stays a hard error. There is no nullable/nested/dictionary type,
+reflection, `soa<T>` conversion, file/mmap/stream API, compression, checksum, Arrow IPC/Flight,
+query, dataframe, or compatibility-permissive decoder in v1. A later format uses a new magic and a
+new complete ledger.
+
+Record: `docs/impl/core-design/codec.md`, `draft.md` §18.1, `docs/language-spec.md`
+
 ### Logging is an explicit level-gated Move sink (SETTLED 2026-08-31)
 
 **Decision:** `std.log` has one Copy closed level order

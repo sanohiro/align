@@ -119,6 +119,46 @@ implemented shape range through A117. A118 remains the next unreserved shape. No
 optional feature, or target-dependent row was added. The public/runtime ownership and validation
 contract remains in `std-design/log.md`.
 
+## Planned `core.codec` extension (designed 2026-09-01; inactive until implementation)
+
+The accepted codec design reserves eight keyed rows. They do not enter `RuntimeKey::ALL`, the
+compiler-visible registry, collision reservation, ABI fingerprint, or runtime export counts until
+the implementation activates all eight with their checked-HIR records and owner tests atomically.
+
+| Planned runtime key | Exact symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
+|---|---|---|---|
+| `CodecOpenV1` | `align_rt_codec_open_v1` | A118: `i32 @SYM(ptr, i64)` | `unsafe extern "C" fn(*const u8, i64) -> i32` |
+| `CodecEncoderNewV1` | `align_rt_codec_encoder_new_v1` | A119: `i32 @SYM(i64, ptr)` | `unsafe extern "C" fn(i64, *mut *mut CodecEncoder) -> i32` |
+| `CodecEncoderPutI64V1` | `align_rt_codec_encoder_put_i64_v1` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut CodecEncoder, *const u8, i64, *const i64, i64) -> i32` |
+| `CodecEncoderPutF64V1` | `align_rt_codec_encoder_put_f64_v1` | A120 | `unsafe extern "C" fn(*mut CodecEncoder, *const u8, i64, *const f64, i64) -> i32` |
+| `CodecEncoderPutBoolV1` | `align_rt_codec_encoder_put_bool_v1` | A120 | `unsafe extern "C" fn(*mut CodecEncoder, *const u8, i64, *const u8, i64) -> i32` |
+| `CodecEncoderPutStrV1` | `align_rt_codec_encoder_put_str_v1` | A120 | `unsafe extern "C" fn(*mut CodecEncoder, *const u8, i64, *const AlignStr, i64) -> i32` |
+| `CodecEncoderFinishV1` | `align_rt_codec_encoder_finish_v1` | existing A50: `ptr @SYM(ptr)` | `unsafe extern "C" fn(*mut CodecEncoder) -> *mut Buffer` |
+| `CodecEncoderFreeV1` | `align_rt_codec_encoder_free_v1` | existing A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut CodecEncoder)` |
+
+`CodecOpenV1` receives one compiler-formed valid byte view, performs the exact allocation-free six-
+stage `ALNCOL01` validation in `core-design/codec.md`, and returns zero or `AL_INVALID`; it retains
+nothing and has no output slot. MIR forms the batch scalar from the still-live input only after
+zero. Metadata, typed projection, bool/string element access, and `find` lower from that validated
+scalar without another runtime row; no per-element opaque call is introduced.
+
+`CodecEncoderNewV1` stores null to its nonnull aligned output before validating rows or allocating,
+and publishes one allocator-provenanced shell only on zero. Each put requires a nonnull shell,
+nonnegative signed lengths, null only for a zero-length name/value range, and the compiler-private
+valid element/header range. It completes name/row/kind/duplicate/final-size validation and all
+fallible staging allocation before committing one column; `AL_INVALID` leaves the shell byte-for-
+byte equivalent for future output. The str entry reads exact `{ ptr, i64 }` headers and copies no
+cell before the complete prospective call is admitted. OOM uses the hard-abort allocator path and
+never returns a status.
+
+Finish receives one live complete shell, allocates and fills the exact canonical final buffer,
+consumes all staging, and returns the existing nonnull Buffer pointer; a null/private-invalid shell
+hard-aborts because no source-valid call can form it. Free is null-safe and releases unfinished
+staging exactly once. Every row is C calling convention and `nounwind`. Open additionally receives
+the audited read-only/nofree/nosync attributes only if its implementation owner proves them against
+the final body; all encoder rows default to no curated memory/return attribute. A118 through A120
+remain reservations, not current inventory, until implementation.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:

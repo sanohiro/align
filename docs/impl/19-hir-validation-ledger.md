@@ -709,6 +709,44 @@ The parameterized type-class and expression-envelope owners in `std-design/log.m
 missing variant, wrong enum id, wrong result type, lost writer region, unknown/truncated/trailing
 canonical byte, or native extraction before checked validation.
 
+### Planned `core.codec` records (designed 2026-09-01; inactive until implementation)
+
+The accepted codec capability adds four nominal builtin type families. `Ty::CodecBatch`,
+`Ty::CodecBoolColumn`, and `Ty::CodecStrColumn` are Copy region-bearing views; their corresponding
+scalars preserve the exact input region and storage generation through every admitted carrier.
+`Ty::CodecEncoder`/`Scalar::CodecEncoder` is one bare Move owner. `codec.kind` remains the ordinary
+unique `Ty::Enum`/`Scalar::Enum` aggregate `{ i32 tag }`, with exact tags 0 through 3; it gets no
+scalar shortcut.
+
+Canonical type record version 3 reserves the append-only Ty tags
+`CodecBatch=65`, `CodecBoolColumn=66`, `CodecStrColumn=67`, and `CodecEncoder=68`, and Scalar tags
+`CodecBatch=41`, `CodecBoolColumn=42`, `CodecStrColumn=43`, and `CodecEncoder=44`. Thus the four Ty
+roots encode as `[3,0,0,0,0,65]` through `[3,0,0,0,0,68]`, and an Option over each scalar encodes as
+`[3,0,0,0,0,4,41]` through `[3,0,0,0,0,4,44]`. Tags 69 and 45 remain the next unknown Ty and
+Scalar tags and reject, as do truncation and trailing bytes. Interface format 8 remains unchanged:
+the public names and `codec.kind` use the existing named-type/enum grammar.
+
+The expression envelope is closed as follows:
+
+| Planned record family | Exact checked contract |
+|---|---|
+| `CodecOpen` | One `bytes` child; exact `Result<codec.batch, builtin Error>` result; batch success provenance equals the child region/storage generation; no output fact on a terminating child. |
+| `CodecBatchRows` / `Columns` | One validated batch receiver; exact i64 result; Copy read with no mutation or new fact. |
+| `CodecBatchName` / `Kind` / `Find` | Exact batch receiver followed by exact i64 or text child; result respectively `Option<str>`, `Option<codec.kind>`, or `Option<i64>`; only the name result inherits batch provenance. |
+| `CodecBatchI64s` / `F64s` / `Bools` / `Strs` | Batch then i64 ordinal; result is the exact Option over `slice<i64>`, `slice<f64>`, bool column, or str column; every view result inherits the complete batch provenance and storage generation. |
+| `CodecColumnLen` / `At` | Exact bool/str column receiver; i64 length or exact `Option<bool>`/`Option<str>` result. Only the str result inherits provenance. The kind of receiver and result must agree. |
+| `CodecEncoderNew` | One i64 child; exact `Result<codec.encoder, builtin Error>` result; success creates one fresh complete Move owner and no region. |
+| four `CodecEncoderPut*` forms | Bound initialized mutable encoder receiver, text name, and exact `slice<i64>`/`slice<f64>`/`slice<bool>`/`slice<str>` child in source order; exact `Result<Unit,builtin Error>` result; receiver is borrowed and remains the same complete owner on success and recoverable failure; arguments are borrowed only for the call and no region enters the encoder. |
+| `CodecEncoderFinish` | Bound initialized encoder receiver; exact `buffer` result; consumes/nulls the complete source exactly once and transfers no encoder identity or region into the buffer. |
+
+Validation independently rejects user construction, casts, raw/extern creation, forbidden
+placement/capture/parallel edges, a view result with missing or extra provenance, an encoder child
+or result with a region, wrong enum id, cross-kind accessor result, unbound mutable receiver,
+incomplete/consumed source, forged Drop/nulling, and any new sibling type/record omitted from the
+canonical classifiers. The implementation activates all type/scalar/expression variants,
+canonical encoders/decoders, interface/compiler fingerprints, and parameterized valid/malformed
+owners atomically. `core-design/codec.md` owns the public surface, wire bytes, and full matrix.
+
 ## Header-adjacent records
 
 | Record | Exact contract |
