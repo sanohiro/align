@@ -13,6 +13,7 @@ digest="$(printf '%s\n' "$prepare_output" | sed -n 's/^artifact-manifest-sha256:
 ALIGN_BENCH_WORK_DIR="$work_dir" ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256="$digest" \
   bench/json_soa/run.sh native  # optional native decomposition output
 bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
+bench/frame_join/run.sh       # pkg.frame i64/str hash-join implementation-class probe
 bench/task_group/run.sh  # task-group split vs packed-record/cache-line probe
 bench/function_incremental/run.sh  # item-6 edit/cold/RSS/size controls
 ```

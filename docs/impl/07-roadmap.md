@@ -3842,8 +3842,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`HANDOFF.md` names implementation of the accepted `pkg.frame` design as the next language
-capability after the implemented `core.codec` foundation. Promotion of an optimization slice is a separate explicit
+`HANDOFF.md` names `pkg.auth` design as the next language capability after the implemented
+`pkg.frame` foundation. Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -3946,13 +3946,13 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   vectors in both directions. The Align
   envelope is not Arrow IPC/C Data. Exact public ledger and implementation closure matrix:
   `core-design/codec.md`.
-- **pkg.frame — DESIGNED 2026-09-01; IMPLEMENTATION PENDING** — exactly two bounded stable inner hash joins over
+- **pkg.frame — IMPLEMENTED 2026-09-01** — exactly two bounded stable inner hash joins over
   `codec.i64_column` and `codec.str_column`; returns an ordinary owned `array<RowPair>` of source
   ordinals in left-major/right-ascending order. The right side is fixed as the build side and one
   required inclusive `max_pairs` makes duplicate fanout/output allocation visible. There is no
   Frame wrapper, schema/query DSL, materialized joined batch, adaptive side choice, nullable or
-  composite key, outer join, parallelism, or spill. The independent design review is closed. Exact
-  accepted public ledger, inactive A121/A122 rows, and implementation closure matrix:
+  composite key, outer join, parallelism, or spill. A121/A122 and the two checked operations are
+  active atomically. Exact public ledger and implementation closure matrix:
   `pkg-design/frame.md`.
 - **pkg.auth** — JWT HS256, argon2id PHC, session token; pure assembly over shipped
   crypto/base64url (no new base infra); `now_ns` passed in; all Impure (FFI); HS256 key ≥ 32B.

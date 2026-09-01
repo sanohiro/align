@@ -772,6 +772,18 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::CodecEncoderFinish(encoder) => {
             format!("codec_encoder_finish({})", operand_str(encoder))
         }
+        Rvalue::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            kind,
+            out,
+        } => format!(
+            "frame_inner_join_{kind:?}({}, {}, {}, -> _{out})",
+            operand_str(left),
+            operand_str(right),
+            operand_str(max_pairs),
+        ),
         Rvalue::FileCreateRw { path, out } => format!("fs_create_rw({}, -> _{out})", operand_str(path)),
         Rvalue::FileOpenRw { path, out } => format!("fs_open_rw({}, -> _{out})", operand_str(path)),
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),

@@ -726,6 +726,16 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(name), child_depth));
                     work.push((BodyRecord::Expr(encoder), child_depth));
                 }
+                ExprKind::FrameInnerJoin {
+                    left,
+                    right,
+                    max_pairs,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(max_pairs), child_depth));
+                    work.push((BodyRecord::Expr(right), child_depth));
+                    work.push((BodyRecord::Expr(left), child_depth));
+                }
                 ExprKind::RawPointerLoad { ptr, offset } => {
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(ptr), child_depth));

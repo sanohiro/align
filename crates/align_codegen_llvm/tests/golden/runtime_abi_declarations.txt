@@ -110,6 +110,8 @@ key|EnvGet|env_get|declare i32 @align_rt_env_get(ptr, i64, ptr)
 key|EnvSet|env_set|declare i32 @align_rt_env_set(ptr, i64, ptr, i64)
 key|FormDecode|form_decode|declare i32 @align_rt_form_decode(ptr, i64, ptr)
 key|FormEncode|form_encode|declare { ptr, i64 } @align_rt_form_encode(ptr, i64)
+key|FrameInnerJoinI64V1|frame_inner_join_i64_v1|declare i32 @align_rt_frame_inner_join_i64_v1(ptr, i64, ptr, i64, i64, ptr) #2
+key|FrameInnerJoinStrV1|frame_inner_join_str_v1|declare i32 @align_rt_frame_inner_join_str_v1(ptr, ptr, i64, ptr, ptr, i64, i64, ptr) #2
 key|Free|free|declare void @align_rt_free(ptr)
 key|FreeResponseArray|free_response_array|declare void @align_rt_free_response_array(ptr, i64)
 key|FreeStringArray|free_string_array|declare void @align_rt_free_string_array(ptr, i64)

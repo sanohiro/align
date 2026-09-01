@@ -748,7 +748,7 @@ canonical classifiers. All type/scalar/expression variants, canonical encoders/d
 interface/compiler fingerprints, and parameterized valid/malformed owners are active atomically.
 `core-design/codec.md` owns the public surface, wire bytes, and full matrix.
 
-### Planned `pkg.frame` records (design accepted 2026-09-01; inactive until implementation)
+### Implemented `pkg.frame` records (2026-09-01)
 
 `pkg.frame.RowPair` and `pkg.frame.JoinError` use the existing declared-record and tag-only-enum
 families rather than new `Ty` or `Scalar` variants. The canonical public definition graph fixes
@@ -757,7 +757,7 @@ families rather than new `Ty` or `Scalar` variants. The canonical public definit
 unchanged. The package definition graph, ordinary recursive Move/Drop plan for
 `array<RowPair>`, and enum identity remain part of the existing interface and compiler fingerprints.
 
-The accepted design adds exactly two expression discriminators atomically with package recognition,
+The implementation adds exactly two expression discriminators atomically with package recognition,
 runtime rows, validation, lowering, and owners. They occur only at the two exact private root-module
 bridge calls inside the ordinary public wrappers; a caller's direct or indirect wrapper call remains
 the ordinary `Call` / `FnValue` / `CallFnValue` path and converges on that compiled bridge body:
@@ -795,10 +795,8 @@ from the exhaustive canonical classifiers. Existing array/Result control owners 
 direct/control-selected/whole-per-unit/malformed matrix in `pkg-design/frame.md` must fail for any
 missing child, wrong order/type/result, lost generation, retained region, or missing cleanup.
 
-These records are reservations only. Until the design is accepted and implementation activates the
-complete boundary, they add no `ExprKind`, canonical encoder/decoder arm, public/private package
-body admission, interface/compiler fingerprint input, accepted source program, cache identity, or
-runtime key.
+Both records, their canonical encoder/decoder arms, public/private package-body admission,
+interface/compiler fingerprint inputs, cache identity, and runtime keys are active as one boundary.
 
 ## Header-adjacent records
 

@@ -4,7 +4,7 @@
 >
 > **注意:** 英語版 (`../frame.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** 設計受理済み（2026-09-01）。実装待ち。
+> **ステータス:** 実装済み（2026-09-01）。
 
 ## 公開契約台帳
 
@@ -15,8 +15,8 @@ V1 は、結果を既存パイプラインへ渡す、上限付きの安定 inne
 |---|---|---|---|---|
 | `pub RowPair { left: i64, right: i64 }` | `left`、`right` は 0 始まりの入力行 ordinal。負値や隠しフィールドは生成しない。物理・ソース順はこの順。 | Copy、Pure。レコード全体の新しい等値規則は加えない。 | 借用・割当・Drop を持たない。`array<RowPair>` は通常の owned 動的 AoS 配列。 | `pkg.frame` が nominal 定義を所有し、完全な定義グラフが interface/dependency/cache 同一性へ入る。既存配列と whole/per-unit owner が受理する。 |
 | `pub JoinError { InvalidLimit, LimitExceeded }` | 閉じた payload なし sum。ordinal は `InvalidLimit=0`、`LimitExceeded=1`。 | 前者は `max_pairs < 0`。後者は right-build index が対象で表現不能、または結果が上限、i64 長、出力 byte 範囲を超えること。OOM は hard abort。 | 通常の `{ i32 tag }`。借用・割当・Drop なし。 | `pkg.frame` が定義と ordinal を所有する。通常の enum/Result と exact mapping owner が受理する。 |
-| `pkg.frame.inner_join_i64(left: codec.i64_column, right: codec.i64_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | 引数は左から 1 回ずつ評価。入力は生きた正規 `core.codec` i64 view。長さは異なってよく、空でも、同じ batch/storage generation でもよい。`max_pairs` に既定値はなく、範囲は正確に `0..=i64::MAX`。値は decode 後の符号付き i64 `==` で比較。 | 全一致対を left-row-major、同一 left 内は right ordinal 昇順で返す。重複は安定 Cartesian 積。負の上限は入力読取・割当前に `InvalidLimit`。right index 表現不能または次の 1 対が上限、i64 長、出力 byte 範囲を超える時は出力を公開せず `LimitExceeded`。Pure。 | 入力は呼出中だけ借用し保持しない。非空成功は通常の `array<RowPair>` 出力 1 個を所有し、空成功は `{null,0}` で出力割当なし。right hash/index scratch は処理所有で全 return 前に解放。error は出力なし。 | direct/imported/local/function-field/joined indirect の全 call が通常の public wrapper を実行し、その唯一の private root bridge call が専用 checked operation と inactive A121 候補を選ぶ。target-shape parity、join matrix、割当 parity、malformed-HIR、whole/per-unit/cache、ABI/export が owner。 |
-| `pkg.frame.inner_join_str(left: codec.str_column, right: codec.str_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | 評価・寿命・長さ・共有・上限規則は i64 と同じ。等値は byte-exact `str == str`。UTF-8 は `codec.open` が検証済み。NUL/LF は通常の byte で、正規化・locale・case fold・collation・key copy はない。 | 同じ安定 inner join と error。hash 一致後に必ず長さと byte を確認する。 | 文字列 byte も呼出中だけ借用。結果は ordinal だけを持ち両 batch を保持しない。 | inactive A122 候補を i64 行と同じ境界で有効化。owner は NUL/LF/multibyte/common-prefix/collision、別 batch の同一 byte、入力非保持も覆う。 |
+| `pkg.frame.inner_join_i64(left: codec.i64_column, right: codec.i64_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | 引数は左から 1 回ずつ評価。入力は生きた正規 `core.codec` i64 view。長さは異なってよく、空でも、同じ batch/storage generation でもよい。`max_pairs` に既定値はなく、範囲は正確に `0..=i64::MAX`。値は decode 後の符号付き i64 `==` で比較。 | 全一致対を left-row-major、同一 left 内は right ordinal 昇順で返す。重複は安定 Cartesian 積。負の上限は入力読取・割当前に `InvalidLimit`。right index 表現不能または次の 1 対が上限、i64 長、出力 byte 範囲を超える時は出力を公開せず `LimitExceeded`。Pure。 | 入力は呼出中だけ借用し保持しない。非空成功は通常の `array<RowPair>` 出力 1 個を所有し、空成功は `{null,0}` で出力割当なし。right hash/index scratch は処理所有で全 return 前に解放。error は出力なし。 | direct/imported/local/function-field/joined indirect の全 call が通常の public wrapper を実行し、その唯一の private root bridge call が専用 checked operation と active A121 row を選ぶ。target-shape parity、join matrix、割当 parity、malformed-HIR、whole/per-unit/cache、ABI/export が owner。 |
+| `pkg.frame.inner_join_str(left: codec.str_column, right: codec.str_column, max_pairs: i64) -> Result<array<RowPair>, JoinError>` | 評価・寿命・長さ・共有・上限規則は i64 と同じ。等値は byte-exact `str == str`。UTF-8 は `codec.open` が検証済み。NUL/LF は通常の byte で、正規化・locale・case fold・collation・key copy はない。 | 同じ安定 inner join と error。hash 一致後に必ず長さと byte を確認する。 | 文字列 byte も呼出中だけ借用。結果は ordinal だけを持ち両 batch を保持しない。 | active A122 row を i64 行と同じ境界で有効化済み。owner は NUL/LF/multibyte/common-prefix/collision、別 batch の同一 byte、入力非保持も覆う。 |
 
 ## 決定と範囲
 
@@ -136,18 +136,17 @@ body だけが対応 bridge を同じ 3 引数で 1 回呼ぶ。compiler はそ�
 別位置、helper、変更 wrapper、private bridge の function value は package admission で拒否する。
 public wrapper 自体は通常の callable value のままである。
 
-受理済みの次の計画行は実装まで inactive とする。
+実装は次の 2 行を原子的に有効化した。
 
-| 候補行 | symbol | ABI shape | Rust ABI |
+| runtime 行 | symbol | ABI shape | Rust ABI |
 |---|---|---|---|
 | A121 | `align_rt_frame_inner_join_i64_v1` | `i32 @SYM(ptr, i64, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const u8, i64, i64, *mut AlignStr) -> i32` |
 | A122 | `align_rt_frame_inner_join_str_v1` | `i32 @SYM(ptr, ptr, i64, ptr, ptr, i64, i64, ptr)` | `unsafe extern "C" fn(*const u8, *const u8, i64, *const u8, *const u8, i64, i64, *mut AlignStr) -> i32` |
 
-両方 C calling convention、`nounwind`。実装 body に対する証明前は curated attribute を持たない。
+両方 C calling convention、`nounwind` で、それ以外の curated attribute は持たない。
 最終 pointer は aligned writable `AlignStr` header で、source `str` ではない。2 symbol、keyed row、
-checked-HIR discriminator、package interface、owner は原子的に有効化する。それまでは registry、
-collision reservation、total、fingerprint、capability identity に入らない。現在値からは
-328/345/353 が 330/347/355 になり A123 が次だが、実装時に再計算する。
+checked-HIR discriminator、package interface、owner は原子的に有効である。inventory は
+328/345/353 から 330/347/355 になり、A123 が次である。
 
 ## 計算量と性能境界
 
@@ -164,6 +163,12 @@ output、mutable/nullable/composite/bool/f64 key、outer/semi/anti/cross/as-of j
 parallel/spill/distributed、automatic build-side choiceはない。将来能力は実消費者と新しい完全な台帳を必要とする。
 
 ## 実装 closure matrix
+
+実装は hand-written 差分約 1,000 行を超える見込みだが、1 境界が低リスクである。public wrapper は
+2 checked discriminator、validator/lowering、A121/A122、結果 ownership、runtime count/fill engine が
+一致するまで有用な挙動を持たず、producer/consumer の片側だけでは dormant または abort path と次 PR
+での ABI/cleanup proof 重複を作る。2 key kind は同じ status/allocation/order/hash-chain failure domain を
+共有するため、分割しても独立した消費者境界にならない。
 
 | 軸 | 必須 closure | owner 証拠 |
 |---|---|---|

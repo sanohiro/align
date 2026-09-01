@@ -13,8 +13,8 @@ PR #915. align-llm Request 22's borrowed string-array indexing design is merged 
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
-`docs/impl/core-design/codec.md`. The cross-source `pkg.frame` design is accepted; its implementation
-is the next language capability.
+`docs/impl/core-design/codec.md`; and `pkg.frame` is implemented against
+`docs/impl/pkg-design/frame.md`. `pkg.auth` design is the next language capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -393,17 +393,16 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `core.codec` is implemented against
-  `docs/impl/core-design/codec.md`. Its allocation-free validator admits one canonical `ALNCOL01`
-  batch, typed zero-copy views retain the input generation, and the explicit Move encoder emits
-  the same bytes transactionally through eight keyed runtime rows. The owner set closes exact
-  independent goldens, every input base alignment, the 1024-column boundary, checked-HIR and
-  canonical identity, whole/per-unit interfaces, and source-null/Drop behavior.
-- **Next language capability:** implement the accepted `pkg.frame` design over the settled codec
-  batch and existing SoA group-by/hash substrate. Its two bounded stable ordinal inner joins add no
-  Frame wrapper or query DSL; the public ledger, inactive A121/A122 rows, and implementation closure
-  matrix are closed in `docs/impl/pkg-design/frame.md`. The completed
-  align-llm Request 22 implementation follows
+- **Latest language capability:** `pkg.frame` is implemented against
+  `docs/impl/pkg-design/frame.md`. Its two bounded stable ordinal inner joins consume settled codec
+  columns, return ordinary owned `array<RowPair>` data, and activate checked operations plus
+  nounwind A121/A122. The owner set closes canonical package admission, whole/per-unit execution,
+  stable duplicate products, byte-exact strings, bounds, malformed checked HIR, ABI identity, and
+  runtime oracle/collision/unaligned-input behavior.
+- **Next language capability:** author the exact `pkg.auth` public ledger over shipped crypto,
+  base64url, and time primitives before implementation. The planned boundary remains JWT HS256,
+  Argon2id PHC, and session tokens with explicit `now_ns`; no new crypto substrate is implied.
+- **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.
 - **align-llm requests:** Requests 1–18 are closed in the consumer register: each shipped Align

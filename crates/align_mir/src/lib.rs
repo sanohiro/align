@@ -1501,6 +1501,15 @@ pub enum Rvalue {
         kind: hir::CodecPutKind,
     },
     CodecEncoderFinish(Operand),
+    /// Canonical `pkg.frame` join. Runtime writes the ordinary owned dynamic AoS header into `out`
+    /// and returns 0, -1 (invalid limit), -2 (limit exceeded), or a defensive positive status.
+    FrameInnerJoin {
+        left: Operand,
+        right: Operand,
+        max_pairs: Operand,
+        kind: hir::FrameJoinKind,
+        out: Slot,
+    },
     /// `io.copy(r, w)` — stream all of the `reader` operand into the `writer` operand through a
     /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
     /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
@@ -7050,6 +7059,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::CodecEncoderNew { .. }
             | hir::ExprKind::CodecEncoderPut { .. }
             | hir::ExprKind::CodecEncoderFinish { .. } => lower_codec_expr(b, e),
+            hir::ExprKind::FrameInnerJoin { .. } => lower_frame_inner_join(b, e),
             // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
             // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
             hir::ExprKind::IoCopy { reader, writer } => {
@@ -17060,6 +17070,150 @@ fn lower_codec_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     }
 }
 
+#[inline(never)]
+fn lower_frame_inner_join(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::FrameInnerJoin {
+        left,
+        right,
+        max_pairs,
+        kind,
+    } = &e.kind
+    else {
+        return Operand::Const(Const::Unit);
+    };
+    let Ty::Result(Scalar::DynStructArray(row_id), Scalar::Enum(error_id)) = e.ty else {
+        return Operand::Const(Const::Unit);
+    };
+    let left = lower_required!(b, lower_expr(b, left), Operand::Const(Const::Unit));
+    let right = lower_required!(b, lower_expr(b, right), Operand::Const(Const::Unit));
+    let max_pairs = lower_required!(b, lower_expr(b, max_pairs), Operand::Const(Const::Unit));
+    let array_ty = Ty::DynStructArray(row_id, Layout::Aos);
+    let out = b.new_slot(array_ty);
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        status,
+        Rvalue::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            kind: *kind,
+            out,
+        },
+    ));
+
+    let success = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        success,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_block = b.new_block();
+    let error_dispatch = b.new_block();
+    let invalid_block = b.new_block();
+    let exceeded_dispatch = b.new_block();
+    let exceeded_block = b.new_block();
+    let abort_block = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(e.ty);
+    b.terminate(Term::Branch(
+        Operand::Value(success),
+        ok_block,
+        error_dispatch,
+    ));
+
+    b.cur = ok_block;
+    let array = b.fresh_value(array_ty);
+    b.push(Stmt::Let(array, Rvalue::Load(out)));
+    let ok = b.fresh_value(e.ty);
+    b.push(Stmt::Let(ok, Rvalue::ResultOk(Operand::Value(array))));
+    b.push(Stmt::Store(result, Operand::Value(ok)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = error_dispatch;
+    let invalid = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        invalid,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(-1, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(
+        Operand::Value(invalid),
+        invalid_block,
+        exceeded_dispatch,
+    ));
+
+    b.cur = invalid_block;
+    let error = b.fresh_value(Ty::Enum(error_id));
+    b.push(Stmt::Let(
+        error,
+        Rvalue::MakeEnum {
+            enum_id: error_id,
+            variant: 0,
+            payload: Vec::new(),
+        },
+    ));
+    let invalid_result = b.fresh_value(e.ty);
+    b.push(Stmt::Let(
+        invalid_result,
+        Rvalue::ResultErr(Operand::Value(error)),
+    ));
+    b.push(Stmt::Store(result, Operand::Value(invalid_result)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = exceeded_dispatch;
+    let exceeded = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        exceeded,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(-2, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(
+        Operand::Value(exceeded),
+        exceeded_block,
+        abort_block,
+    ));
+
+    b.cur = exceeded_block;
+    let error = b.fresh_value(Ty::Enum(error_id));
+    b.push(Stmt::Let(
+        error,
+        Rvalue::MakeEnum {
+            enum_id: error_id,
+            variant: 1,
+            payload: Vec::new(),
+        },
+    ));
+    let exceeded_result = b.fresh_value(e.ty);
+    b.push(Stmt::Let(
+        exceeded_result,
+        Rvalue::ResultErr(Operand::Value(error)),
+    ));
+    b.push(Stmt::Store(result, Operand::Value(exceeded_result)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = abort_block;
+    let aborted = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        aborted,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = join;
+    let value = b.fresh_value(e.ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
 fn lower_status_value_result(
     b: &mut Builder,
     status: ValueId,
@@ -20575,6 +20729,103 @@ mod tests {
             .collect::<Vec<_>>();
         let program = align_sema::check_program(&modules, &mut diagnostics);
         (program, diagnostics)
+    }
+
+    #[test]
+    fn frame_join_checked_hir_recomputes_the_complete_wrapper_envelope() {
+        let frame_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/frame/pkg/frame.align");
+        let frame = std::fs::read_to_string(&frame_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", frame_path.display()));
+        let main = "module main\nimport pkg.frame\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) =
+            check_modules(&[("pkg.frame", false, frame.as_str()), ("main", true, main)]);
+        assert!(
+            !diagnostics.has_errors(),
+            "canonical frame fixture failed: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            lower_program_checked(&program, false, None).is_ok(),
+            "canonical pkg.frame HIR must cross the MIR boundary",
+        );
+
+        fn frame_expr_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Expr {
+            program
+                .fns
+                .iter_mut()
+                .find(|function| function.name == name)
+                .and_then(|function| function.body.value.as_deref_mut())
+                .unwrap_or_else(|| panic!("{name} wrapper expression"))
+        }
+
+        let mut wrong_kind = program.clone();
+        let hir::ExprKind::FrameInnerJoin { kind, .. } =
+            &mut frame_expr_mut(&mut wrong_kind, "pkg.frame$inner_join_i64").kind
+        else {
+            panic!("i64 wrapper must contain a frame join")
+        };
+        *kind = hir::FrameJoinKind::Str;
+        assert!(
+            lower_program_checked(&wrong_kind, false, None).is_err(),
+            "a forged join discriminator must fail before MIR lowering",
+        );
+
+        let mut wrong_child = program.clone();
+        let hir::ExprKind::FrameInnerJoin { max_pairs, .. } =
+            &mut frame_expr_mut(&mut wrong_child, "pkg.frame$inner_join_i64").kind
+        else {
+            panic!("i64 wrapper must contain a frame join")
+        };
+        max_pairs.ty = Ty::Bool;
+        assert!(
+            lower_program_checked(&wrong_child, false, None).is_err(),
+            "a forged child type must fail before MIR lowering",
+        );
+
+        let mut wrong_origin = program.clone();
+        wrong_origin
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "pkg.frame$inner_join_i64")
+            .unwrap_or_else(|| panic!("i64 wrapper"))
+            .origin = hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: false,
+        };
+        assert!(
+            lower_program_checked(&wrong_origin, false, None).is_err(),
+            "a private or reconstructed wrapper cannot claim the trusted operation",
+        );
+
+        let mut wrong_row = program.clone();
+        wrong_row
+            .structs
+            .iter_mut()
+            .find(|definition| definition.name == "pkg.frame$RowPair")
+            .unwrap_or_else(|| panic!("RowPair"))
+            .fields[1]
+            .ty = Ty::Bool;
+        assert!(
+            lower_program_checked(&wrong_row, false, None).is_err(),
+            "a forged output record layout must fail before MIR lowering",
+        );
+
+        let mut wrong_error = program;
+        wrong_error
+            .enums
+            .iter_mut()
+            .find(|definition| definition.name == "pkg.frame$JoinError")
+            .unwrap_or_else(|| panic!("JoinError"))
+            .variants
+            .swap(0, 1);
+        assert!(
+            lower_program_checked(&wrong_error, false, None).is_err(),
+            "forged error ordinals must fail before MIR lowering",
+        );
     }
 
     #[test]

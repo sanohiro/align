@@ -7421,6 +7421,218 @@ fn normalize_test_assertion_expr(expression: &mut ast::Expr, is_statement: bool)
     }
 }
 
+fn ast_path_is(path: &ast::Path, expected: &[&str]) -> bool {
+    path.segments.len() == expected.len()
+        && path
+            .segments
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.name == *expected)
+}
+
+fn ast_named_type_is(ty: &ast::Type, path: &[&str], args: &[fn(&ast::Type) -> bool]) -> bool {
+    let ast::Type::Named {
+        path: actual_path,
+        args: actual_args,
+        ..
+    } = ty
+    else {
+        return false;
+    };
+    ast_path_is(actual_path, path)
+        && actual_args.len() == args.len()
+        && actual_args
+            .iter()
+            .zip(args)
+            .all(|(actual, expected)| expected(actual))
+}
+
+fn ast_type_i64(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["i64"], &[])
+}
+
+fn ast_type_row_pair(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["RowPair"], &[])
+}
+
+fn ast_type_join_error(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["JoinError"], &[])
+}
+
+fn ast_type_row_pair_array(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["array"], &[ast_type_row_pair])
+}
+
+fn ast_type_frame_result(ty: &ast::Type) -> bool {
+    ast_named_type_is(
+        ty,
+        &["Result"],
+        &[ast_type_row_pair_array, ast_type_join_error],
+    )
+}
+
+fn ast_frame_column_type(ty: &ast::Type, kind: &str) -> bool {
+    ast_named_type_is(ty, &["codec", kind], &[])
+}
+
+fn ast_frame_params_are(params: &[ast::Param], kind: &str) -> bool {
+    matches!(
+        params,
+        [left, right, max_pairs]
+            if left.mode == ast::ParamMode::ByValue
+                && left.name.name == "left"
+                && ast_frame_column_type(&left.ty, kind)
+                && right.mode == ast::ParamMode::ByValue
+                && right.name.name == "right"
+                && ast_frame_column_type(&right.ty, kind)
+                && max_pairs.mode == ast::ParamMode::ByValue
+                && max_pairs.name.name == "max_pairs"
+                && ast_type_i64(&max_pairs.ty)
+    )
+}
+
+fn ast_frame_abort_body(body: &ast::FnBody) -> bool {
+    let ast::FnBody::Expr(expression) = body else {
+        return false;
+    };
+    let ast::ExprKind::Call { callee, args } = &expression.kind else {
+        return false;
+    };
+    let ast::ExprKind::FieldAccess { recv, field } = &callee.kind else {
+        return false;
+    };
+    matches!(&recv.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["process"]))
+        && field.name == "abort"
+        && args.is_empty()
+}
+
+fn ast_frame_wrapper_body(body: &ast::FnBody, bridge: &str) -> bool {
+    let ast::FnBody::Expr(expression) = body else {
+        return false;
+    };
+    let ast::ExprKind::Call { callee, args } = &expression.kind else {
+        return false;
+    };
+    matches!(&callee.kind, ast::ExprKind::Path(path) if ast_path_is(path, &[bridge]))
+        && matches!(
+            args.as_slice(),
+            [left, right, max_pairs]
+                if matches!(&left.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["left"]))
+                    && matches!(&right.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["right"]))
+                    && matches!(&max_pairs.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["max_pairs"]))
+        )
+}
+
+fn ast_frame_function_is(
+    item: &ast::Item,
+    visibility: ast::Vis,
+    name: &str,
+    kind: &str,
+    body_is_valid: impl FnOnce(&ast::FnBody) -> bool,
+) -> bool {
+    let ast::Item::Fn(function) = item else {
+        return false;
+    };
+    function.vis == visibility
+        && function.name.name == name
+        && function.type_params.is_empty()
+        && ast_frame_params_are(&function.params, kind)
+        && function.ret.as_ref().is_some_and(ast_type_frame_result)
+        && body_is_valid(&function.body)
+}
+
+fn canonical_pkg_frame_module(file: &ast::File) -> bool {
+    if file.imports.len() != 2
+        || !ast_path_is(&file.imports[0], &["core", "codec"])
+        || !ast_path_is(&file.imports[1], &["std", "process"])
+    {
+        return false;
+    }
+    let [
+        row_pair,
+        join_error,
+        i64_bridge,
+        str_bridge,
+        i64_wrapper,
+        str_wrapper,
+    ] = file.items.as_slice()
+    else {
+        return false;
+    };
+    let row_pair_is_valid = matches!(
+        row_pair,
+        ast::Item::Struct(definition)
+            if definition.vis == ast::Vis::Pub
+                && definition.name.name == "RowPair"
+                && definition.type_params.is_empty()
+                && definition.align.is_none()
+                && !definition.c_repr
+                && matches!(definition.fields.as_slice(), [left, right]
+                    if left.name.name == "left" && ast_type_i64(&left.ty)
+                        && right.name.name == "right" && ast_type_i64(&right.ty))
+    );
+    let join_error_is_valid = matches!(
+        join_error,
+        ast::Item::Enum(definition)
+            if definition.vis == ast::Vis::Pub
+                && definition.name.name == "JoinError"
+                && definition.type_params.is_empty()
+                && matches!(definition.variants.as_slice(), [invalid, exceeded]
+                    if invalid.name.name == "InvalidLimit" && invalid.payload.is_empty()
+                        && exceeded.name.name == "LimitExceeded" && exceeded.payload.is_empty())
+    );
+    row_pair_is_valid
+        && join_error_is_valid
+        && ast_frame_function_is(
+            i64_bridge,
+            ast::Vis::Private,
+            "inner_join_i64_bridge",
+            "i64_column",
+            ast_frame_abort_body,
+        )
+        && ast_frame_function_is(
+            str_bridge,
+            ast::Vis::Private,
+            "inner_join_str_bridge",
+            "str_column",
+            ast_frame_abort_body,
+        )
+        && ast_frame_function_is(
+            i64_wrapper,
+            ast::Vis::Pub,
+            "inner_join_i64",
+            "i64_column",
+            |body| ast_frame_wrapper_body(body, "inner_join_i64_bridge"),
+        )
+        && ast_frame_function_is(
+            str_wrapper,
+            ast::Vis::Pub,
+            "inner_join_str",
+            "str_column",
+            |body| ast_frame_wrapper_body(body, "inner_join_str_bridge"),
+        )
+}
+
+fn validate_pkg_frame_modules(modules: &[Module], diags: &mut Diagnostics) {
+    for module in modules {
+        if module.path != "pkg.frame" || module.interface_only {
+            continue;
+        }
+        if canonical_pkg_frame_module(module.file) {
+            continue;
+        }
+        let span = module
+            .file
+            .module
+            .as_ref()
+            .map_or_else(|| Span::new(0, 0, 0), |path| path.span);
+        diags.error(
+            "module `pkg.frame` must match the canonical package definition".to_string(),
+            span,
+        );
+    }
+}
+
 /// Per-unit-capable checking with all producer facts and the L5c descriptor inventory.
 pub fn check_program_with_all_interface_facts_and_static_descriptors(
     modules: &[Module],
@@ -7430,6 +7642,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     external_resource_hooks: &ExternalResourceHookFacts,
     diags: &mut Diagnostics,
 ) -> CheckedProgram {
+    validate_pkg_frame_modules(modules, diags);
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -14867,6 +15080,16 @@ impl EffectScan<'_> {
                 walk!(name);
                 walk!(values);
             }
+            ExprKind::FrameInnerJoin {
+                left,
+                right,
+                max_pairs,
+                ..
+            } => {
+                walk!(left);
+                walk!(right);
+                walk!(max_pairs);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 walk!(reader);
                 walk!(buffer);
@@ -22242,6 +22465,10 @@ impl<'a> EscapeCheck<'a> {
             // writer is Static; a writer borrowed from a connection remains connection-bound.
             ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
             ExprKind::CodecOpen { input } => work.push(Work::Eval(input, depth)),
+            // The runtime returns one free-standing allocator-owned `array<RowPair>`. It does not
+            // use the surrounding arena and retains neither input view, so the result is Static
+            // even when the call expression is nested inside an arena block.
+            ExprKind::FrameInnerJoin { .. } => values.push(Region::Static),
             ExprKind::CodecBatchName { batch, .. }
             | ExprKind::CodecBatchI64s { batch, .. }
             | ExprKind::CodecBatchF64s { batch, .. }
@@ -23110,6 +23337,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CodecEncoderNew { .. }
             | ExprKind::CodecEncoderPut { .. }
             | ExprKind::CodecEncoderFinish { .. }
+            | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
@@ -26765,6 +26993,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(values, depth);
             }
             ExprKind::CodecEncoderFinish { encoder } => self.walk(encoder, depth),
+            ExprKind::FrameInnerJoin {
+                left,
+                right,
+                max_pairs,
+                ..
+            } => {
+                self.walk(left, depth);
+                self.walk(right, depth);
+                self.walk(max_pairs, depth);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 self.walk(reader, depth);
                 self.walk(buffer, depth);
@@ -28613,6 +28851,12 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         }
         ExprKind::ArrayBuilderBuild(_) => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::BuilderElement)
+        }
+        // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
+        // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
+        // Result::Err carries no storage header.
+        ExprKind::FrameInnerJoin { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
         ExprKind::Unit
@@ -35883,6 +36127,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CodecColumnLen { .. } | ExprKind::CodecColumnAt { .. }
             | ExprKind::CodecEncoderNew { .. }
             | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
+            | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
@@ -41452,6 +41697,16 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CodecEncoderFinish { encoder } => {
                 move_expr!(self, encoder, moved, true, true)
             }
+            ExprKind::FrameInnerJoin {
+                left,
+                right,
+                max_pairs,
+                ..
+            } => {
+                move_expr!(self, left, moved, false, false);
+                move_expr!(self, right, moved, false, false);
+                move_expr!(self, max_pairs, moved, false, false);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 move_expr!(self, reader, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
@@ -46918,6 +47173,29 @@ impl<'a, 't> Checker<'a, 't> {
             if let Some(argument) = checked.get(index) {
                 self.validate_borrow_argument(argument, mode, &name);
             }
+        }
+        let frame_kind = match (self.cur_fn.as_str(), name.as_str()) {
+            ("pkg.frame$inner_join_i64", "pkg.frame$inner_join_i64_bridge") => {
+                Some(hir::FrameJoinKind::I64)
+            }
+            ("pkg.frame$inner_join_str", "pkg.frame$inner_join_str_bridge") => {
+                Some(hir::FrameJoinKind::Str)
+            }
+            _ => None,
+        };
+        if let Some(kind) = frame_kind
+            && let [left, right, max_pairs] = checked.as_slice()
+        {
+            return Expr {
+                kind: ExprKind::FrameInnerJoin {
+                    left: Box::new(left.clone()),
+                    right: Box::new(right.clone()),
+                    max_pairs: Box::new(max_pairs.clone()),
+                    kind,
+                },
+                ty: ret,
+                span,
+            };
         }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
     }
@@ -62262,6 +62540,16 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(values);
             }
+            ExprKind::FrameInnerJoin {
+                left,
+                right,
+                max_pairs,
+                ..
+            } => {
+                self.finalize_expr(left);
+                self.finalize_expr(right);
+                self.finalize_expr(max_pairs);
+            }
             ExprKind::ReaderRead { reader, buffer } => {
                 self.finalize_expr(reader);
                 self.finalize_expr(buffer);
@@ -67896,11 +68184,11 @@ mod tests {
                 variants += 1;
             }
         }
-        // `core.codec` adds fifteen closed expressions: open, five batch metadata/projection
-        // operations, four typed projections, two shared column operations, and three encoder
-        // operations. The wildcard-free policy above classifies every one explicitly.
+        // `pkg.frame` adds one checked operation family with two closed kind values. The
+        // wildcard-free policy above classifies it explicitly beside the fifteen core.codec
+        // expressions.
         assert_eq!(
-            variants, 300,
+            variants, 301,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

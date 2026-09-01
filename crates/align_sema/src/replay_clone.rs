@@ -986,6 +986,17 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::CodecEncoderFinish { encoder } => ExprKind::CodecEncoderFinish {
             encoder: boxed!(encoder),
         },
+        ExprKind::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            kind,
+        } => ExprKind::FrameInnerJoin {
+            left: boxed!(left),
+            right: boxed!(right),
+            max_pairs: boxed!(max_pairs),
+            kind: *kind,
+        },
         ExprKind::IoCopy { reader, writer } => ExprKind::IoCopy {
             reader: boxed!(reader),
             writer: boxed!(writer),
@@ -2341,6 +2352,16 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(encoder);
             one!(name);
             one!(values);
+        }
+        ExprKind::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            ..
+        } => {
+            one!(left);
+            one!(right);
+            one!(max_pairs);
         }
         ExprKind::RawStore { ptr, offset, value }
         | ExprKind::Select {

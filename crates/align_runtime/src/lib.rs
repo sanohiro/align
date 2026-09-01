@@ -11336,6 +11336,323 @@ pub unsafe extern "C" fn align_rt_codec_encoder_free_v1(encoder: *mut CodecEncod
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameRowPair {
+    left: i64,
+    right: i64,
+}
+
+const FRAME_INVALID_LIMIT: i32 = -1;
+const FRAME_LIMIT_EXCEEDED: i32 = -2;
+
+fn frame_index_capacity(right_rows: usize) -> Option<usize> {
+    let third = right_rows
+        .checked_div(3)?
+        .checked_add(usize::from(!right_rows.is_multiple_of(3)))?;
+    let requested = right_rows.checked_add(third)?.max(8);
+    let capacity = requested.checked_next_power_of_two()?;
+    let scratch_bytes = capacity
+        .checked_mul(16)?
+        .checked_add(right_rows.checked_mul(8)?)?;
+    (i64::try_from(requested).is_ok()
+        && i64::try_from(capacity).is_ok()
+        && i64::try_from(scratch_bytes).is_ok()
+        && scratch_bytes <= isize::MAX.unsigned_abs())
+    .then_some(capacity)
+}
+
+fn frame_bucket(hash: u64, capacity: usize) -> usize {
+    let mask = capacity
+        .checked_sub(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| panic_abort("invalid frame hash capacity"));
+    usize::try_from(hash & mask).unwrap_or_else(|_| panic_abort("frame hash bucket overflow"))
+}
+
+unsafe fn frame_i64_at(data: *const u8, ordinal: usize) -> i64 {
+    let offset = ordinal
+        .checked_mul(core::mem::size_of::<i64>())
+        .unwrap_or_else(|| panic_abort("frame i64 ordinal overflow"));
+    let mut bytes = [0_u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(data.add(offset), bytes.as_mut_ptr(), bytes.len()) };
+    i64::from_le_bytes(bytes)
+}
+
+unsafe fn frame_str_offset(offsets: *const u8, ordinal: usize) -> i32 {
+    let offset = ordinal
+        .checked_mul(core::mem::size_of::<i32>())
+        .unwrap_or_else(|| panic_abort("frame string ordinal overflow"));
+    let mut bytes = [0_u8; 4];
+    unsafe { core::ptr::copy_nonoverlapping(offsets.add(offset), bytes.as_mut_ptr(), bytes.len()) };
+    i32::from_le_bytes(bytes)
+}
+
+unsafe fn frame_str_at<'a>(offsets: *const u8, data: *const u8, ordinal: usize) -> &'a [u8] {
+    let start = usize::try_from(unsafe { frame_str_offset(offsets, ordinal) })
+        .unwrap_or_else(|_| panic_abort("negative frame string start"));
+    let end = usize::try_from(unsafe { frame_str_offset(offsets, ordinal + 1) })
+        .unwrap_or_else(|_| panic_abort("negative frame string end"));
+    if start == end {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data.add(start), end - start) }
+    }
+}
+
+fn frame_validate_i64_view(data: *const u8, rows: i64) -> Option<usize> {
+    let rows = safe_len(rows).ok()?;
+    let bytes = rows.checked_mul(core::mem::size_of::<i64>())?;
+    if bytes > isize::MAX.unsigned_abs() || (bytes != 0 && data.is_null()) {
+        return None;
+    }
+    Some(rows)
+}
+
+unsafe fn frame_validate_str_view(offsets: *const u8, data: *const u8, rows: i64) -> Option<usize> {
+    let rows = safe_len(rows).ok()?;
+    let offset_count = rows.checked_add(1)?;
+    let offset_bytes = offset_count.checked_mul(core::mem::size_of::<i32>())?;
+    if offsets.is_null() || offset_bytes > isize::MAX.unsigned_abs() {
+        return None;
+    }
+    let mut previous = unsafe { frame_str_offset(offsets, 0) };
+    if previous != 0 {
+        return None;
+    }
+    for ordinal in 0..rows {
+        let current = unsafe { frame_str_offset(offsets, ordinal + 1) };
+        if current < previous {
+            return None;
+        }
+        previous = current;
+    }
+    let bytes = usize::try_from(previous).ok()?;
+    if bytes > isize::MAX.unsigned_abs() || (bytes != 0 && data.is_null()) {
+        return None;
+    }
+    for ordinal in 0..rows {
+        let value = unsafe { frame_str_at(offsets, data, ordinal) };
+        if std::str::from_utf8(value).is_err() {
+            return None;
+        }
+    }
+    Some(rows)
+}
+
+fn frame_inner_join_impl(
+    left_rows: usize,
+    right_rows: usize,
+    max_pairs: i64,
+    out: *mut AlignStr,
+    mut left_hash: impl FnMut(usize) -> u64,
+    mut right_hash: impl FnMut(usize) -> u64,
+    mut equal: impl FnMut(usize, usize) -> bool,
+) -> i32 {
+    if right_rows == 0 {
+        return 0;
+    }
+    let Some(capacity) = frame_index_capacity(right_rows) else {
+        return FRAME_LIMIT_EXCEEDED;
+    };
+    let mut heads = vec![-1_i64; capacity];
+    let mut tails = vec![-1_i64; capacity];
+    let mut next = vec![-1_i64; right_rows];
+    for right in 0..right_rows {
+        let bucket = frame_bucket(right_hash(right), capacity);
+        let ordinal =
+            i64::try_from(right).unwrap_or_else(|_| panic_abort("frame right ordinal overflow"));
+        if heads[bucket] < 0 {
+            heads[bucket] = ordinal;
+        } else {
+            let tail = usize::try_from(tails[bucket])
+                .unwrap_or_else(|_| panic_abort("negative frame bucket tail"));
+            next[tail] = ordinal;
+        }
+        tails[bucket] = ordinal;
+    }
+
+    let mut count = 0_i64;
+    for left in 0..left_rows {
+        let bucket = frame_bucket(left_hash(left), capacity);
+        let mut right = heads[bucket];
+        while right >= 0 {
+            let ordinal = usize::try_from(right)
+                .unwrap_or_else(|_| panic_abort("negative frame chain ordinal"));
+            if equal(left, ordinal) {
+                if count >= max_pairs {
+                    return FRAME_LIMIT_EXCEEDED;
+                }
+                let Some(next_count) = count.checked_add(1) else {
+                    return FRAME_LIMIT_EXCEEDED;
+                };
+                count = next_count;
+            }
+            right = next[ordinal];
+        }
+    }
+    let Some(output_bytes) = count.checked_mul(16).and_then(|bytes| safe_len(bytes).ok()) else {
+        return FRAME_LIMIT_EXCEEDED;
+    };
+    if output_bytes > isize::MAX.unsigned_abs() {
+        return FRAME_LIMIT_EXCEEDED;
+    }
+    if count == 0 {
+        return 0;
+    }
+
+    let output_len = i64::try_from(output_bytes)
+        .unwrap_or_else(|_| panic_abort("frame output byte length overflow"));
+    let output = align_rt_alloc(output_len).cast::<FrameRowPair>();
+    let expected_count =
+        usize::try_from(count).unwrap_or_else(|_| panic_abort("negative frame result count"));
+    let mut written = 0_usize;
+    for left in 0..left_rows {
+        let bucket = frame_bucket(left_hash(left), capacity);
+        let mut right = heads[bucket];
+        while right >= 0 {
+            let ordinal = usize::try_from(right)
+                .unwrap_or_else(|_| panic_abort("negative frame chain ordinal"));
+            if equal(left, ordinal) {
+                if written >= expected_count {
+                    unsafe { align_rt_free(output.cast::<u8>()) };
+                    panic_abort("frame join count/fill mismatch");
+                }
+                unsafe {
+                    output.add(written).write(FrameRowPair {
+                        left: i64::try_from(left)
+                            .unwrap_or_else(|_| panic_abort("frame left ordinal overflow")),
+                        right,
+                    })
+                };
+                written += 1;
+            }
+            right = next[ordinal];
+        }
+    }
+    if written != expected_count {
+        unsafe { align_rt_free(output.cast::<u8>()) };
+        panic_abort("frame join count/fill mismatch");
+    }
+    unsafe {
+        out.write(AlignStr {
+            ptr: output.cast::<u8>(),
+            len: count,
+        })
+    };
+    0
+}
+
+/// Stable bounded inner join over two canonical codec i64 columns.
+///
+/// # Safety
+/// Positive input lengths must name readable codec byte ranges. `out` must be a nonnull aligned
+/// writable [`AlignStr`] header and must not alias either input range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_frame_inner_join_i64_v1(
+    left_data: *const u8,
+    left_rows: i64,
+    right_data: *const u8,
+    right_rows: i64,
+    max_pairs: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return AL_INVALID;
+    }
+    unsafe {
+        out.write(AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        })
+    };
+    if max_pairs < 0 {
+        return FRAME_INVALID_LIMIT;
+    }
+    let Some(left_rows) = frame_validate_i64_view(left_data, left_rows) else {
+        return AL_INVALID;
+    };
+    let Some(right_rows) = frame_validate_i64_view(right_data, right_rows) else {
+        return AL_INVALID;
+    };
+    frame_inner_join_impl(
+        left_rows,
+        right_rows,
+        max_pairs,
+        out,
+        |ordinal| {
+            let value = unsafe { frame_i64_at(left_data, ordinal) };
+            wyhash(&value.to_le_bytes(), WY_SEED)
+        },
+        |ordinal| {
+            let value = unsafe { frame_i64_at(right_data, ordinal) };
+            wyhash(&value.to_le_bytes(), WY_SEED)
+        },
+        |left, right| unsafe { frame_i64_at(left_data, left) == frame_i64_at(right_data, right) },
+    )
+}
+
+/// Stable bounded inner join over two canonical codec string columns.
+///
+/// # Safety
+/// Offset/data arguments must name the readable ranges implied by their row counts and final
+/// offsets. `out` has the same requirements as [`align_rt_frame_inner_join_i64_v1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_frame_inner_join_str_v1(
+    left_offsets: *const u8,
+    left_data: *const u8,
+    left_rows: i64,
+    right_offsets: *const u8,
+    right_data: *const u8,
+    right_rows: i64,
+    max_pairs: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return AL_INVALID;
+    }
+    unsafe {
+        out.write(AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        })
+    };
+    if max_pairs < 0 {
+        return FRAME_INVALID_LIMIT;
+    }
+    let Some(left_rows) = (unsafe { frame_validate_str_view(left_offsets, left_data, left_rows) })
+    else {
+        return AL_INVALID;
+    };
+    let Some(right_rows) =
+        (unsafe { frame_validate_str_view(right_offsets, right_data, right_rows) })
+    else {
+        return AL_INVALID;
+    };
+    frame_inner_join_impl(
+        left_rows,
+        right_rows,
+        max_pairs,
+        out,
+        |ordinal| {
+            wyhash(
+                unsafe { frame_str_at(left_offsets, left_data, ordinal) },
+                WY_SEED,
+            )
+        },
+        |ordinal| {
+            wyhash(
+                unsafe { frame_str_at(right_offsets, right_data, ordinal) },
+                WY_SEED,
+            )
+        },
+        |left, right| unsafe {
+            frame_str_at(left_offsets, left_data, left)
+                == frame_str_at(right_offsets, right_data, right)
+        },
+    )
+}
+
 /// Exact Base64 output length. Every size operation is checked before allocation so a hostile ABI
 /// length cannot wrap into a smaller destination.
 fn base64_encoded_len(input_len: usize, pad: bool) -> Option<usize> {
@@ -24775,8 +25092,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 345);
-        assert_eq!(registry.len(), 345);
+        assert_eq!(runtime.len(), 347);
+        assert_eq!(registry.len(), 347);
         assert_eq!(runtime, registry);
     }
 
@@ -43618,5 +43935,366 @@ mod regex_tests {
             unsafe { align_rt_codec_open_v1(over_limit.as_ptr(), over_limit.len() as i64) },
             AL_INVALID,
         );
+    }
+
+    fn frame_i64_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn frame_string_bytes(values: &[&str]) -> (Vec<u8>, Vec<u8>) {
+        let mut offsets = Vec::with_capacity((values.len() + 1) * 4);
+        let mut data = Vec::new();
+        offsets.extend_from_slice(&0_i32.to_le_bytes());
+        for value in values {
+            data.extend_from_slice(value.as_bytes());
+            offsets.extend_from_slice(
+                &i32::try_from(data.len())
+                    .unwrap_or_else(|_| panic!("small frame string fixture"))
+                    .to_le_bytes(),
+            );
+        }
+        (offsets, data)
+    }
+
+    fn frame_take_pairs(out: &mut AlignStr) -> Vec<FrameRowPair> {
+        let pairs = if out.len == 0 {
+            assert!(
+                out.ptr.is_null(),
+                "an empty join must publish canonical null/zero"
+            );
+            Vec::new()
+        } else {
+            unsafe {
+                core::slice::from_raw_parts(
+                    out.ptr.cast::<FrameRowPair>(),
+                    usize::try_from(out.len)
+                        .unwrap_or_else(|_| panic!("nonnegative frame result length")),
+                )
+                .to_vec()
+            }
+        };
+        unsafe { align_rt_free(out.ptr.cast_mut()) };
+        *out = AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        };
+        pairs
+    }
+
+    #[test]
+    fn frame_i64_join_is_stable_bounded_and_drop_compatible() {
+        let left = frame_i64_bytes(&[2, 1, 2, 3]);
+        let right = frame_i64_bytes(&[2, 2, 3]);
+        let junk = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        let mut out = AlignStr { ptr: junk, len: 99 };
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(left.as_ptr(), 4, right.as_ptr(), 3, 5, &mut out)
+            },
+            0,
+        );
+        assert_eq!(
+            frame_take_pairs(&mut out),
+            [
+                FrameRowPair { left: 0, right: 0 },
+                FrameRowPair { left: 0, right: 1 },
+                FrameRowPair { left: 2, right: 0 },
+                FrameRowPair { left: 2, right: 1 },
+                FrameRowPair { left: 3, right: 2 },
+            ],
+        );
+
+        out = AlignStr { ptr: junk, len: 99 };
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(left.as_ptr(), 4, right.as_ptr(), 3, 4, &mut out)
+            },
+            FRAME_LIMIT_EXCEEDED,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
+
+        let none = frame_i64_bytes(&[8]);
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(none.as_ptr(), 1, right.as_ptr(), 3, 0, &mut out)
+            },
+            0,
+        );
+        assert!(frame_take_pairs(&mut out).is_empty());
+    }
+
+    #[test]
+    fn frame_string_join_is_byte_exact_for_nul_newline_utf8_and_prefixes() {
+        let (left_offsets, left_data) =
+            frame_string_bytes(&["a\0b", "é", "\n", "prefix-x", "a\0b"]);
+        let (right_offsets, right_data) = frame_string_bytes(&["a\0b", "\n", "prefix", "é"]);
+        let mut out = AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        };
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_str_v1(
+                    left_offsets.as_ptr(),
+                    left_data.as_ptr(),
+                    5,
+                    right_offsets.as_ptr(),
+                    right_data.as_ptr(),
+                    4,
+                    4,
+                    &mut out,
+                )
+            },
+            0,
+        );
+        assert_eq!(
+            frame_take_pairs(&mut out),
+            [
+                FrameRowPair { left: 0, right: 0 },
+                FrameRowPair { left: 1, right: 3 },
+                FrameRowPair { left: 2, right: 1 },
+                FrameRowPair { left: 4, right: 0 },
+            ],
+        );
+    }
+
+    #[test]
+    fn frame_abi_validation_precedence_and_output_publication_are_exact() {
+        let junk = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        let mut out = AlignStr { ptr: junk, len: 99 };
+
+        // The limit precedes both malformed views, but the output slot itself precedes the limit.
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(
+                    core::ptr::null(),
+                    -1,
+                    core::ptr::null(),
+                    -1,
+                    -1,
+                    &mut out,
+                )
+            },
+            FRAME_INVALID_LIMIT,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(
+                    core::ptr::null(),
+                    -1,
+                    core::ptr::null(),
+                    -1,
+                    -1,
+                    core::ptr::null_mut(),
+                )
+            },
+            AL_INVALID,
+        );
+
+        out = AlignStr { ptr: junk, len: 99 };
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(
+                    core::ptr::null(),
+                    1,
+                    core::ptr::null(),
+                    -1,
+                    0,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
+
+        #[repr(align(16))]
+        struct AlignedOutputBytes([u8; core::mem::size_of::<AlignStr>() + 1]);
+        let mut misaligned = AlignedOutputBytes([0; core::mem::size_of::<AlignStr>() + 1]);
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    misaligned.0.as_mut_ptr().add(1).cast::<AlignStr>(),
+                )
+            },
+            AL_INVALID,
+        );
+
+        let bad_offsets = [1_i32.to_le_bytes(), 1_i32.to_le_bytes()].concat();
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_str_v1(
+                    bad_offsets.as_ptr(),
+                    core::ptr::null(),
+                    1,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    -1,
+                    0,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
+    }
+
+    #[test]
+    fn frame_i64_join_matches_nested_loop_oracle_for_unaligned_inputs() {
+        fn values(seed: u64, len: usize) -> Vec<i64> {
+            let mut state = seed;
+            (0..len)
+                .map(|ordinal| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let selector = usize::try_from(state % 7)
+                        .unwrap_or_else(|_| panic!("small oracle selector"));
+                    match (selector + ordinal) % 7 {
+                        0 => i64::MIN,
+                        1 => i64::MAX,
+                        other => {
+                            i64::try_from(other).unwrap_or_else(|_| panic!("small oracle value"))
+                                - 3
+                        }
+                    }
+                })
+                .collect()
+        }
+
+        for case in 0..192_usize {
+            let left = values(case as u64 ^ 0x51f0_15e5, case % 9);
+            let right = values(case as u64 ^ 0xa11c_e55, (case * 5) % 11);
+            let left_offset = case % 8;
+            let right_offset = (case * 3 + 1) % 8;
+            let left_bytes = frame_i64_bytes(&left);
+            let right_bytes = frame_i64_bytes(&right);
+            let mut left_storage = vec![0xa5; left_offset];
+            left_storage.extend_from_slice(&left_bytes);
+            let mut right_storage = vec![0x5a; right_offset];
+            right_storage.extend_from_slice(&right_bytes);
+
+            let expected: Vec<_> = left
+                .iter()
+                .enumerate()
+                .flat_map(|(left_ordinal, left_value)| {
+                    right
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, right_value)| left_value == *right_value)
+                        .map(move |(right_ordinal, _)| FrameRowPair {
+                            left: i64::try_from(left_ordinal)
+                                .unwrap_or_else(|_| panic!("small left ordinal")),
+                            right: i64::try_from(right_ordinal)
+                                .unwrap_or_else(|_| panic!("small right ordinal")),
+                        })
+                })
+                .collect();
+            let mut out = AlignStr {
+                ptr: core::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    align_rt_frame_inner_join_i64_v1(
+                        left_storage.as_ptr().add(left_offset),
+                        i64::try_from(left.len()).unwrap_or_else(|_| panic!("small left length")),
+                        right_storage.as_ptr().add(right_offset),
+                        i64::try_from(right.len()).unwrap_or_else(|_| panic!("small right length")),
+                        i64::try_from(expected.len())
+                            .unwrap_or_else(|_| panic!("small expected length")),
+                        &mut out,
+                    )
+                },
+                0,
+                "oracle case {case}",
+            );
+            assert_eq!(frame_take_pairs(&mut out), expected, "oracle case {case}");
+
+            if !expected.is_empty() {
+                assert_eq!(
+                    unsafe {
+                        align_rt_frame_inner_join_i64_v1(
+                            left_storage.as_ptr().add(left_offset),
+                            i64::try_from(left.len())
+                                .unwrap_or_else(|_| panic!("small left length")),
+                            right_storage.as_ptr().add(right_offset),
+                            i64::try_from(right.len())
+                                .unwrap_or_else(|_| panic!("small right length")),
+                            i64::try_from(expected.len() - 1)
+                                .unwrap_or_else(|_| panic!("small rejected limit")),
+                            &mut out,
+                        )
+                    },
+                    FRAME_LIMIT_EXCEEDED,
+                    "rejected-next case {case}",
+                );
+                assert!(
+                    out.ptr.is_null() && out.len == 0,
+                    "rejected-next case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frame_hash_chain_collision_and_capacity_boundaries_are_exact() {
+        assert_eq!(frame_index_capacity(0), Some(8));
+        assert_eq!(frame_index_capacity(1), Some(8));
+        assert_eq!(frame_index_capacity(6), Some(8));
+        assert_eq!(frame_index_capacity(7), Some(16));
+
+        let left = [4_i64, 1, 4];
+        let right = [4_i64, 2, 4, 1];
+        let mut out = AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        };
+        assert_eq!(
+            frame_inner_join_impl(
+                left.len(),
+                right.len(),
+                5,
+                &mut out,
+                |_| 0,
+                |_| 0,
+                |left_ordinal, right_ordinal| left[left_ordinal] == right[right_ordinal],
+            ),
+            0,
+        );
+        assert_eq!(
+            frame_take_pairs(&mut out),
+            [
+                FrameRowPair { left: 0, right: 0 },
+                FrameRowPair { left: 0, right: 2 },
+                FrameRowPair { left: 1, right: 3 },
+                FrameRowPair { left: 2, right: 0 },
+                FrameRowPair { left: 2, right: 2 },
+            ],
+        );
+
+        let oversized_rows = (isize::MAX as i64) / 8;
+        assert_eq!(
+            unsafe {
+                align_rt_frame_inner_join_i64_v1(
+                    core::ptr::null(),
+                    0,
+                    core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    oversized_rows,
+                    0,
+                    &mut out,
+                )
+            },
+            FRAME_LIMIT_EXCEEDED,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
     }
 }

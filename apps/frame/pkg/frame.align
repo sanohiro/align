@@ -1,0 +1,40 @@
+module pkg.frame
+
+import core.codec
+import std.process
+
+pub RowPair {
+  left: i64,
+  right: i64,
+}
+
+pub JoinError {
+  InvalidLimit,
+  LimitExceeded,
+}
+
+fn inner_join_i64_bridge(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+fn inner_join_str_bridge(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+pub fn inner_join_i64(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_i64_bridge(left, right, max_pairs)
+
+pub fn inner_join_str(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_str_bridge(left, right, max_pairs)
