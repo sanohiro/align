@@ -2389,10 +2389,23 @@ grep -Fq 'libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev' \
   echo "the Debian compiler package cannot link the complete cached pkg.db corpus" >&2
   exit 1
 }
-grep -Fq 'brew install --formula --build-from-source' "$release_workflow" || {
-  echo "release.yml no longer tests Homebrew's real install/cleanup path" >&2
+grep -Fq 'brew tap-new --no-git "$RELEASE_TAP"' "$release_workflow" &&
+  grep -Fq 'RELEASE_TAP_ROOT="$(brew --repository "$RELEASE_TAP")"' "$release_workflow" &&
+  grep -Fq 'cp "$RUNNER_TEMP/align.rb" "$RELEASE_TAP_ROOT/Formula/align.rb"' "$release_workflow" &&
+  grep -Fq 'brew trust --formula "$RELEASE_TAP/align"' "$release_workflow" &&
+  grep -Fq 'brew install --formula --build-from-source "$RELEASE_TAP/align"' "$release_workflow" &&
+  grep -Fq 'brew uninstall "$RELEASE_TAP/align"' "$release_workflow" &&
+  grep -Fq 'brew untrust --formula "$RELEASE_TAP/align"' "$release_workflow" &&
+  grep -Fq 'brew untap "$RELEASE_TAP"' "$release_workflow" || {
+  echo "release.yml no longer tests Homebrew's trusted tap install/cleanup path" >&2
   exit 1
 }
+if grep -Fq 'brew install --formula --build-from-source "$RUNNER_TEMP/align.rb"' \
+  "$release_workflow"
+then
+  echo "release.yml uses Homebrew's rejected direct formula-path install" >&2
+  exit 1
+fi
 grep -Fq 'bench/prebuilt_cache/run.sh package' "$release_workflow" || {
   echo "release.yml no longer records prebuilt-cache release evidence" >&2
   exit 1
