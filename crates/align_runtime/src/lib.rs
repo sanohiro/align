@@ -11349,7 +11349,7 @@ const FRAME_LIMIT_EXCEEDED: i32 = -2;
 fn frame_index_capacity(right_rows: usize) -> Option<usize> {
     let third = right_rows
         .checked_div(3)?
-        .checked_add(usize::from(right_rows % 3 != 0))?;
+        .checked_add(usize::from(!right_rows.is_multiple_of(3)))?;
     let requested = right_rows.checked_add(third)?.max(8);
     let capacity = requested.checked_next_power_of_two()?;
     let scratch_bytes = capacity

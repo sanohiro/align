@@ -68184,11 +68184,11 @@ mod tests {
                 variants += 1;
             }
         }
-        // `core.codec` adds fifteen closed expressions: open, five batch metadata/projection
-        // operations, four typed projections, two shared column operations, and three encoder
-        // operations. The wildcard-free policy above classifies every one explicitly.
+        // `pkg.frame` adds one checked operation family with two closed kind values. The
+        // wildcard-free policy above classifies it explicitly beside the fifteen core.codec
+        // expressions.
         assert_eq!(
-            variants, 300,
+            variants, 301,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
