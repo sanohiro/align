@@ -1,0 +1,17 @@
+Package: alignc
+Version: 0.6.0
+Architecture: amd64
+Maintainer: sanohiro
+Depends: llvm-22, clang-22, libclang-rt-22-dev, libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev
+Filename: pool/main/a/alignc/alignc_0.6.0_amd64.deb
+Size: 16010500
+MD5sum: 7c68bfedb8d134345172aa8328535d3d
+SHA1: 7c2bde97df2af6d6195676d8c8d44b7c23c2a9b7
+SHA256: 74ccc6a30725df60bea77c248f4828645ae27dbea331e50d42b54a9cf37224e6
+Section: devel
+Priority: optional
+Description: AOT compiler for the Align programming language
+ Align is a data-oriented language with predictable native performance.
+ Ships alignc and align-repl, an AOT REPL that compiles and runs each
+ entry natively.
+
