@@ -1339,11 +1339,12 @@ surface and closure matrix are in `impl/std-design/log.md`.
 ## Why `core.codec` validates one canonical envelope before exposing views
 
 The columnar format has two jobs that must not be confused. Its metadata makes one batch
-self-describing enough to inspect; its child buffers let ordinary numeric work remain a direct
-slice pipeline. `ALNCOL01` therefore owns a small fixed envelope while deliberately reusing Arrow's
-non-null physical layouts for `i64`, `f64`, bit-packed bool, and 32-bit-offset UTF-8. Reusing the
-buffers allows later explicit adapters without importing Arrow IPC's FlatBuffers schema, stream
-framing, nullable/nested type system, or compatibility policy into the language core.
+self-describing enough to inspect; its child buffers keep ordinary numeric work on an
+optimizer-visible typed-column path without per-element runtime calls. `ALNCOL01` therefore owns a
+small fixed envelope while deliberately reusing Arrow's non-null physical layouts for `i64`, `f64`,
+bit-packed bool, and 32-bit-offset UTF-8. Reusing the buffers allows later explicit adapters without
+importing Arrow IPC's FlatBuffers schema, stream framing, nullable/nested type system, or
+compatibility policy into the language core.
 
 Validation is a one-time capability transition. Before `codec.open` returns, it proves every width,
 offset, order, padding byte, unique name, bool tail bit, string offset, and UTF-8 range. The returned

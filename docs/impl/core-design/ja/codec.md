@@ -280,6 +280,7 @@ implementation capability で各 applicable row を閉じる。
 |---|---|
 | P1 existing `buffer` の `Vec<u8>` がdecoder必須の8-byte base alignmentを保証せず、encoder outputを自分でopenできない | base alignmentをwire validityから除去し、standard numeric sliceをsymmetric opaque i64/f64 column viewへ置換。numeric/string offsetはalignment 1とexplicit little-endianでlowerし、全base alignmentと`finish().bytes()` roundtripをownする。Buffer cross-cutting changeは不要。 |
 | P2 allocation-free duplicate-name checkがu32列までquadratic amplificationを許した | v1を1024列に固定し1025を事前拒否。decoderは2つのfixed `[u16;1024]` と10-pass merge sort（最大9,217 lexicographic comparisons）、encoderはsorted index/binary search。limit/next/common-prefix/scratch/precedence ownerを固定。 |
+| re-review P2 でopaque typed view移行後もdesign rationaleにdirect-slice promiseが残った | optimizer-visible typed-column pathへ置換し、current codec source-of-truth全体のdirect/ordinary/numeric/standard-sliceとslice-pipeline promiseをsweepした。残るmatchはこのfindingまたは無関係なsettled numeric-slice behaviorだけ。 |
 
 ## source of truth と author consistency pass
 

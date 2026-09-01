@@ -289,6 +289,7 @@ capability must close every applicable row; a parameterized invariant owner may 
 |---|---|
 | P1 encoder output could not guarantee the 8-byte base alignment required by its own decoder because existing `buffer` stores `Vec<u8>` | Remove base alignment from wire validity and replace standard numeric slices with symmetric opaque i64/f64 column views. All numeric/string offset reads lower with alignment 1 and explicit little-endian semantics; every base alignment succeeds, encoder `finish().bytes()` round-trips, and no cross-cutting Buffer representation change is required. |
 | P2 allocation-free duplicate-name validation admitted quadratic amplification up to u32 columns | Fix the v1 admitted column count at 1024 in both decoder and encoder; reject 1025 before descriptor access or mutation. Decoder uniqueness uses two fixed `[u16; 1024]` arrays and ten-pass bottom-up merge sort, at most 9,217 lexicographic comparisons; encoder keeps a sorted name index and binary-searches it. Exact-limit, rejected-next, common-prefix work, scratch-size, and duplicate-precedence owners close the class. |
+| Re-review P2 left a direct-slice promise in the design rationale after the public surface moved to opaque typed views | Replace it with the optimizer-visible typed-column path and sweep every current codec source-of-truth for direct/ordinary/numeric/standard-slice and slice-pipeline promises. The only remaining matches describe this finding or unrelated settled numeric-slice behavior. |
 
 ## Sources of truth and author consistency pass
 
