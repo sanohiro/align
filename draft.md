@@ -3773,8 +3773,9 @@ candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and c
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
 review found four remaining native/wire boundary gaps. The next complete review found two P3
 consistency gaps in the timeout action lists and malformed-state error partition. The following
-review found one remaining P2 in the pre-existing-derived-shell entry state. A fresh complete review
-has not yet accepted the fourth repair.
+review found one remaining P2 in the pre-existing-derived-shell entry state, and its repair review
+found one P3 in the recursively reachable reader/writer/logger carrier owner graph. A fresh complete
+review has not yet accepted the fifth repair.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design

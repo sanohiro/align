@@ -4001,8 +4001,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   connection before shell construction and closes either failure. A fresh complete
   review found four native/wire boundary gaps; the next complete review found two P3 consistency
   gaps in the timeout action lists and malformed-state error partition; the following review found
-  one P2 in the pre-existing-derived-shell entry state. A fresh complete review of the fourth repair
-  is pending, and no public contract is accepted. Exact
+  one P2 in the pre-existing-derived-shell entry state; its repair review found one P3 in the
+  recursively reachable reader/writer/logger carrier owner graph. A fresh complete review of the
+  fifth repair is pending, and no public contract is accepted. Exact
   ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

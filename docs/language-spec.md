@@ -1474,5 +1474,6 @@ with its package consumer. Exact revised candidate contract: `impl/pkg-design/kv
 independent review found contract gaps, the fresh complete review found four remaining native/wire
 boundary gaps, and the next complete review found two P3 consistency gaps in the timeout action
 lists and malformed-state error partition. The following review found one remaining P2 in the
-pre-existing-derived-shell entry state. A fresh complete review has not yet accepted the fourth
-repair.
+pre-existing-derived-shell entry state, and its repair review found one P3 in the recursively
+reachable reader/writer/logger carrier owner graph. A fresh complete review has not yet accepted the
+fifth repair.

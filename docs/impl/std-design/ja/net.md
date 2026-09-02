@@ -289,7 +289,17 @@ zero-derived-shell entry state により、その close と順序付ける shell
 package は fresh unpublished clear/clear connection だけで shell construction 前に call し、どちらの failure も
 resolution 再開/別 address 試行なしで close。owner は live/exclusive/zero-derived-shell entry precondition、
 pre-armed state、option order/call count/returned status、retry prohibition、overlap 中/failure 後の
-constructor call zero、success-construct-Drop-reconfigure cycle、retirement、close/Drop を pin。
+constructor call zero、retirement、close/Drop を pin。structural owner 1 個が complete active recursive
+Drop graph を通じた target-connection provenance で retainer を分類する。local/call、struct field、nested
+`Option`/`Result`、admitted user-sum path にある direct/buffered reader、writer、logger-owned writer leaf を
+walk し、retaining struct の source-constructed fixed array element も含む。この last path は既存 struct-field と
+fixed Move-struct-array rule を compose し、direct handle array element を admit しない。canonical formation/Drop graph から
+derive し new-edge tripwire を持ち、inactive/moved-out state、other/mixed-connection shell、zero/one/multiple
+target leaf を cross。zero だけ compatible。各 positive carrier class は configure-construct-move-into-
+move-out-where-supported-or-recursive-Drop-reconfigure を完了。direct handle collection/box/tuple と direct
+reader/writer user-sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、
+admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/
+slice element、tuple、builtin `Option`/`Result` edge は explicit no-live-producer owner を維持。
 
 ceil-to-microsecond conversion は出荷済み `std.http` の plain/TLS/pool rearm にも届く。
 poll-millisecond helper は `process.command` にも届き、その consumer は従来の post-syscall

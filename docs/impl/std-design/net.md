@@ -304,7 +304,20 @@ values to Drop first. The package calls only on a fresh unpublished clear/clear 
 shell construction and closes either failure without reopening resolution or trying another
 address. Owners pin live/exclusive/zero-derived-shell entry preconditions, pre-armed states, option
 order, call counts, returned status, retry prohibition, zero overlapping/post-failure constructor
-calls, the success-construct-Drop-reconfigure cycle, retirement, and close/Drop.
+calls, retirement, and close/Drop. One structural owner classifies retainers by target-connection
+provenance through the complete active recursive Drop graph: direct/buffered reader, writer, or
+logger-owned writer leaves in locals/calls, struct fields, nested `Option`/`Result`, and admitted
+user-sum paths, plus elements of source-constructed fixed arrays of retaining structs. That last
+path composes the existing struct-field and fixed Move-struct-array rules and does not admit a
+direct handle array element. Derived from
+the canonical formation/Drop graph with a new-edge tripwire, it crosses inactive/moved-out states,
+other/mixed-connection shells, and zero/one/multiple target leaves; only zero is compatible. Every
+positive carrier class completes configure-construct-move-into-move-out-where-supported-or-
+recursive-Drop-reconfigure. Direct handle collections/boxes/tuples and direct reader/writer user-sum
+payloads remain formation negatives; nameable dynamic-array/slice shapes for retaining structs/sums,
+the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element,
+tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` retain explicit no-live-
+producer owners.
 
 The ceil-to-microsecond conversion also serves shipped `std.http` plain/TLS/pool rearming. The
 poll-millisecond helper also serves `process.command`; that consumer adopts the same monotonic

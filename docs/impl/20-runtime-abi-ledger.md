@@ -211,6 +211,26 @@ from that connection and no other value retaining one at entry. A dangling or co
 aliased pointer or a live derived shell violates that precondition and is not detectable; no read,
 write, other configuration, reader-or-writer construction, free, or Drop may overlap.
 
+A target-connection retainer is classified by runtime provenance rather than numeric-fd equality:
+its active recursive Drop graph reaches an initialized direct/buffered reader derived from that
+connection, a derived writer, or a logger owning such a writer. The positive value graph uses
+direct leaves, acyclic user-struct fields, nested active `Option`/`Result`, active user-sum paths
+rooted in a logger/retaining struct/nested sum/tagged carrier, and elements of source-constructed
+fixed arrays of retaining structs, including ordinary local, parameter, return, move, and by-value-
+call placement. The fixed-array element is the retaining struct, so this composes existing struct-
+field and fixed Move-struct-array rules rather than widening direct handle placement. Direct handle
+collection/fixed-array/tuple/box elements and direct reader/writer
+user-sum payloads reject formation. The admitted dynamic-array/slice shapes for retaining
+structs/sums can name a type. A direct `DynStructArray` may additionally occupy a dynamic-array/
+slice element, tuple element, or builtin `Option`/`Result` payload. Every admitted shape in this
+paragraph except the tuple wrapper may occupy a user-struct field and then recurse through the
+ordinary acyclic struct/tagged/sum carrier grammar. Every current
+materializer, builder, decode, and
+Move-slice producer rejects a live handle-retaining value. Inactive arms,
+moved/null leaves, and carriers containing only other-
+connection shells have target count zero; a compatible call requires zero even when a carrier can
+otherwise reach multiple or mixed-provenance leaves.
+
 For an admitted input the row uses the normalized ceil-to-microsecond `timeval` above, then installs
 `SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without attempting `SO_SNDTIMEO`;
 otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after both succeed. Let
@@ -227,12 +247,17 @@ Parameterized direct-runtime owners pre-arm both option states and pin live/excl
 zero-derived-shell entry preconditions, the exact normalized `timeval`, option order, call counts,
 returned status, the
 `{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
-prohibition, zero overlapping/post-failure reader/writer-constructor calls, the
-success-construct-Drop-reconfigure cycle, retirement, and later free/Drop. Entry-state owners
-distinguish never-constructed zero, constructed-then-dropped zero, live direct reader, live buffered
-reader, live direct writer, live logger-retained writer, and moved/call-transferred reader or writer,
-with only the two zero-live states compatible. The success-construct-Drop-reconfigure owner covers
-each compatible retainer kind. The package calls only on a fresh exclusively owned unpublished
+prohibition, zero overlapping/post-failure reader/writer-constructor calls, retirement, and later
+free/Drop. One parameterized structural owner derives its traversal from the canonical type-
+formation and recursive Drop graph; a storage-edge tripwire makes every future edge require
+classification. It crosses direct/buffered reader, direct writer, logger-owned writer, struct/
+tagged/sum/fixed-struct-array placement, active/inactive/moved-out state, target/other/mixed
+provenance, and zero/one/multiple target leaves, and separately pins the formation/no-live-producer
+edges above. It excludes every nonzero target count without invoking the unsafe row. For each
+positive carrier class, the success cycle configures at zero, constructs and moves the leaf into
+that carrier, moves it out where supported and drops it or recursively drops the smallest owning
+carrier, observes zero, and reconfigures. The package
+calls only on a fresh exclusively owned unpublished
 connection with both entry options clear and before shell construction; its owner
 closes after either option failure and proves that resolution is not reopened, no other address is
 attempted, and no partially configured client is published.

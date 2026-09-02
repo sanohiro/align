@@ -3280,8 +3280,9 @@ acceptance owners are recorded in `impl/pkg-design/kv.md` and
 `impl/20-runtime-abi-ledger.md`. The first fresh review found four remaining native/wire boundary
 gaps; the next complete review found two P3 consistency gaps in the timeout action lists and
 malformed-state error partition; the following review found one remaining P2 in the pre-existing-
-derived-shell entry state. This item remains open until a fresh complete adversarial review accepts
-the fourth repair, after which it may move to Settled and authorize implementation.
+derived-shell entry state; its repair review found one P3 in the recursively reachable
+reader/writer/logger carrier owner graph. This item remains open until a fresh complete adversarial
+review accepts the fifth repair, after which it may move to Settled and authorize implementation.
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 

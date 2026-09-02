@@ -340,6 +340,28 @@ pointer が 1 個の live/unfreed `TcpConn` を指し、caller が call 全体�
 unsafe precondition がある。dangling/concurrently aliased pointer または live derived shell は precondition 違反で
 検出不能。read/write/別 configuration/reader-writer construction/free/Drop は call と overlap 不可。
 
+この precondition の retainer は numeric fd equality でなく runtime provenance で分類する。target leaf は、
+その `TcpConn` 由来の initialized reader（unbuffered/buffered）、derived writer、またはその writer を own する
+`log.logger`。live value は active recursive Drop graph が target leaf を 1 個以上 reach する場合だけ target
+retainer。現在の positive value grammar は direct leaf、acyclic user-struct field graph、任意に nest した
+`Option`/`Result` の active `Some`/`Ok`/`Err` path、direct logger/retaining struct/別 sum/tagged carrier を
+root とする active user-sum payload path、retaining Move struct を in-place construct した fixed struct array
+の各 element を通る。その後 local/parameter/return/by-value call を move しても leaf provenance は不変。
+ここで fixed-array element は retaining struct であって direct handle element ではなく、既存 struct-field と
+fixed Move-struct-array rule を compose するだけで direct handle placement を widen しない。direct
+reader/writer user-sum payload と direct reader/writer/logger の collection/fixed-array/tuple/box element
+は formation を reject。`align(N)` のない retaining struct の `array<RetainingStruct>`、任意の retaining
+struct の `slice<RetainingStruct>`、retaining sum に対応する admitted dynamic-array/slice shape は structural
+type を form できる。direct `DynStructArray` はさらに dynamic-array/slice element、tuple element、または
+builtin `Option`/`Result` payload にも置ける。この段落で admitted な shape は tuple wrapper を除きすべて
+user-struct field に置け、その後 ordinary acyclic struct/tagged/sum carrier grammar を再帰できる。現行
+`.to_array`、heap/region builder、
+JSON decode、Move-element slice producer は live handle-
+retaining value を作れないため producer-negative で
+あり positive lifecycle case ではない。`None`、inactive `Result`/user-sum arm、moved/null leaf、別 connection
+由来 shell だけの同じ carrier shape は target leaf zero。fd number 再利用は provenance を変えない。carrier
+は multiple/mixed-provenance leaf を reach でき、active target count が exact zero の場合だけ compatible。
+
 admitted input では上記 normalized positive-timeout `timeval` を構築し、最初に `SO_RCVTIMEO` を設定。
 失敗すれば `SO_SNDTIMEO` を試さず fixed errno-mapped status を返す。成功時だけ `SO_SNDTIMEO` を設定して
 その status を返し、両方成功した場合だけ zero。entry 時の receive/send option state を `R0`/`S0`、requested
@@ -351,11 +373,19 @@ success は usability を保ち、その後 reader/writer を構築できるが�
 retain する value を Drop して同じ zero-shell entry state を復元した後だけ compatible。row 自体は
 allocate/retain/rollback/close/consume しない。`pkg.kv` は両 entry state が clear の fresh、exclusive、
 unpublished connection だけで、どちらの shell も構築する前に call し、nonzero option result なら resolution を
-再開せず別 address を試さず直ちに close。parameterized direct-runtime owner は両 option state を pre-arm し、
-exact `timeval`、option order/call count/returned status、`{R0,S0}`/`{T,S0}`/`{T,T}` post-state、
-exclusive-call precondition、entry 時の live derived shell/retaining value zero、overlap 中/option failure 後の
-reader/writer constructor call zero、success-construct-Drop-reconfigure cycle、caller retirement、後続
-close/Drop を固定する。mandatory base export、
+再開せず別 address を試さず直ちに close。parameterized structural owner は second hand-maintained type list
+でなく canonical type-formation/recursive Drop graph から walk を derive し、future graph edge に分類を必須に
+する exhaustive storage-edge tripwire を持つ。direct/buffered leaf、local/moved/call-transferred placement、
+active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple target leaf を cross。
+nonzero target count は unsafe row を invoke せず compatible call set から exclude。各 positive carrier class
+について、zero で configure、leaf を construct して carrier へ move、supported なら move-out 後 Drop、
+または smallest owning carrier を recursive Drop、zero を再観測、reconfigure する。fixed-struct-array case は
+recursive-Drop branch。formation/producer negative は excluded collection/box/tuple/sum-payload/materializer/
+builder/decode/Move-slice edge をすべて pin。direct-runtime half は両 option state を pre-arm し、exact
+`timeval`、option order/call count/returned status、`{R0,S0}`/`{T,S0}`/`{T,T}` post-state、exclusive-call
+precondition、overlap 中/option failure 後の reader/writer constructor call zero、caller retirement、後続
+close/Drop を固定する。
+mandatory base export、
 source-reachable compatible extern、collision-reserved unkeyed identity である。既存 ABI
 shape を再利用するため、activation は exact base/maximum count を 347/355 から 348/356 に変え、keyed
 count は 330 のまま。unkeyed count は 18、そのうち source-reachable は 13 になり、A123 は次の
@@ -464,7 +494,7 @@ package capability はおよそ 1,000 changed hand-written lines を超え得る
 | DEL semantics | one-key request、0/1 の全 official signed/leading-zero spelling、server error、他の全 value/type。 | false/true と sign/leading-zero/negative/two/overflow/type mutation matrix、reuse/close check。 |
 | error・native status・poison state | I/O 前 Invalid。bounded UTF-8 Server と complete non-UTF-8 Decode は reusable。exact `0/1/2/3/4/>=5` status decode。reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation と checked i32 narrowing、typed-slice construction 前の raw-header validation。invalid-negative/oversized-positive は header inspection 前に abort。Io/too-large/protocol/truncation/partial-write は close。selected terminal error を cleanup より保持。以後の全 call は zero I/O の Closed。malformed private resource state は Closed ではなく native I/O/untrusted access 前に `process.abort`。全 impossible native product は parser/publication/ownership change 前に `process.abort` へ到達。 | error-producer x command x before/during/after-frame x reuse table。early-abort/no-header inspection、両 empty pointer form、positive-null abort を含む全 category/representative code/width/count/length/pointer/malformed product、operation/Drop x one-field-at-a-time malformed resource state が zero native call の `ProcessAbort` を pin。native call counter、explicit `ProcessAbort` IR/capability retention、no-import negative、selected-error/cleanup-failure probe。 |
 | ownership・cleanup | resource formation、move-in/out/return/replacement、if/match/else/?/map_err/branch/loop/early return、source nulling、state/socket/wrapper/scratch/result の Drop once、malformed state は untrusted access 前に abort。 | resource/drop counter、allocation parity、parameterized control-flow owner、state semantic-to-byte/byte-to-semantic golden、operation/Drop x malformed-field abort product。 |
-| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し、entry 時にその connection 由来の live reader/writer shell またはそれを retain する value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。後の timeout call 前に success 後の derived shell/retainer をすべて Drop。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap と zero-derived-shell entry precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。entry-state product は never-constructed zero、constructed-then-dropped zero、live direct reader、live buffered reader、live direct writer、live logger-retained writer、moved/call-transferred reader/writer を区別し、2 個の zero-live state だけ compatible。range-rejection retry と option-failure retry 禁止、overlap 中/failure 後の constructor call zero、各 compatible retainer kind の success-construct-Drop-reconfigure、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
+| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し、entry 時にその connection 由来の live reader/writer shell またはそれを retain する value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。target-connection count は active recursive Drop graph が reach する initialized reader/writer/logger-owned-writer leaf 数で、fd-number equality と独立。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。後の timeout call 前に success 後の derived shell/retainer をすべて Drop。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap と zero-derived-shell entry precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。canonical graph から derive した structural owner 1 個と storage-edge tripwire が direct/buffered reader、direct writer、logger-owned writer、recursive struct field、nested active `Option`/`Result`、logger/struct/sum/tagged carrier を root とする active user-sum path、source-produced fixed struct-array element を walk し、local/moved/call-transferred placement、active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple target leaf を cross。exact zero だけ compatible。direct handle collection/box/tuple と direct reader/writer user-sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/slice element、tuple、builtin `Option`/`Result` edge は explicit no-live-producer owner を維持。range-rejection retry と option-failure retry 禁止、overlap 中/failure 後の constructor call zero、各 positive carrier の configure-construct-move-into-move-out-where-supported-or-recursive-Drop-reconfigure cycle、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
 
 ## source of truth と author consistency pass
 
@@ -478,7 +508,7 @@ candidate review 中は `docs/open-questions.md` がこの項目を Open に置�
 entry はない。acceptance 時は exact reviewed contract を Settled へ移し、history record を追加し、
 各 candidate status を accepted/inactive の該当状態へ変更してから implementation を許可する。
 
-4 回目の finding-ledger repair 後、4 回目の author-side ledger-to-prose および closure-matrix consistency
+5 回目の finding-ledger repair 後、5 回目の author-side ledger-to-prose および closure-matrix consistency
 pass は、another fresh complete review 前の 2026-09-02 に完了:
 
 - 全 public argument/result に exact type、evaluation order、default、ownership、lifetime、allocation、
@@ -500,8 +530,10 @@ pass は、another fresh complete review 前の 2026-09-02 に完了:
 - canonical RESP scalar/tag/sequence order/malformed rejection、independent semantic-to-byte と byte-to-semantic golden が固定。
 - resource record、RESP state machine、source-reachable timeout row の全 state/tag/reserved/pointer/length
   product、zero-derived-shell entry state、constructor call を含む live/exclusive overlap exclusion、
-  success-construct-Drop-reconfigure cycle、failed-second-option 後の no-operation/construction/retry
-  retirement、error preservation、Drop order が固定。
+  fixed retaining-struct array、target/other/mixed provenance、zero/one/multiple leaf を含む complete active
+  recursive reader/writer/logger carrier graph、各 construct-move-into-move-out-where-supported-or-recursive-
+  Drop-reconfigure cycle、graph-edge tripwire と全 formation/producer negative、failed-second-option 後の
+  no-operation/construction/retry retirement、error preservation、Drop order が固定。
 - exact existing producer-owned runtime row が reflection/artifact I/O なしで native state を供給し、
   slice/builder writer overload は同じ hardened sink へ合流。
 - example は accepted syntax を使い declaration と positional call を分離。
@@ -567,4 +599,13 @@ dangling-shell path を閉じたため、complete repair はもう 1 回の fres
 | P2 pre-existing derived shell | non-null compatible caller は entry 時、その connection 由来の live reader/writer shell と、その shell を retain する value が zero。idle でも live direct/moved/buffered shell、logger、その他 retainer は unsafe-precondition 違反。call 中 constructor なし。success 後は shell を構築できるが、後の timeout call 前に全 shell/retainer を Drop。option failure は zero shell から始まり、construction を禁止し、shell cleanup order なしで connection を 1 回 close。entry-state owner は never-constructed zero、constructed-then-dropped zero、live direct/buffered reader、live direct/logger-retained writer、moved/call-transferred reader/writer を区別し、package sequence は timeout-before-reader-before-writer を pin。 |
 
 この finding は、同じ source-reachable dangling-shell class の残っていた pre-entry half を閉じる。
-fourth complete repair の fresh full review が clean になるまで candidate status は Open のまま。
+fresh full review
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...70ddb527dadaf095792b4bd9fe57d764a7380329`
+は P3 finding 1 件を返した。この fifth repair は recursive-derived-shell-carrier matrix axis を reopen:
+
+| finding | authoritative correction・closure owner |
+|---|---|
+| P3 recursive shell-carrier owner graph | target retainer を complete active recursive Drop graph の runtime provenance で定義。direct/buffered reader、direct writer、logger-owned writer leaf は local/call、recursive struct field、nested active `Option`/`Result`、admitted user-sum path、retaining struct の source-constructible fixed array を移動できる。canonical formation/Drop graph から parameterized owner 1 個を derive し exhaustive storage-edge tripwire を追加。active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple leaf を cross し、nonzero target count は unsafe row を invoke せず incompatible。各 positive class は configure → construct → carrier へ move → supported なら move-out 後 Drop または recursive Drop → zero-count reconfigure。direct handle collection/box/tuple と direct reader/writer sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/slice element、tuple、builtin `Option`/`Result` edge は explicit materializer/builder/decode/slice no-live-producer owner を維持。 |
+
+この finding は、同じ source-reachable dangling-shell class の recursively reachable な未閉包 half を閉じる。
+fifth complete repair の fresh full review が clean になるまで candidate status は Open のまま。

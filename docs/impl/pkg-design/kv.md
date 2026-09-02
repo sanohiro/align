@@ -367,6 +367,32 @@ aliased pointer or a live derived shell violates that precondition and is not de
 write, another configuration call, reader or writer construction, free, and Drop must not overlap
 the call.
 
+For this precondition a retainer is classified by runtime provenance, never by numeric-fd equality.
+A target leaf is an initialized reader (unbuffered or buffered) derived from that `TcpConn`, a
+derived writer, or a `log.logger` that owns such a writer. A live value is a target retainer exactly
+when its active recursive Drop graph reaches at least one target leaf. The current positive value
+grammar reaches leaves directly; through an acyclic user-struct field graph; through an active
+`Some`, `Ok`, or `Err` path in arbitrarily nested `Option`/`Result`; through an active user-sum
+payload rooted in a direct logger, retaining struct, another sum, or tagged carrier; and through
+each element of a fixed struct array constructed in place from retaining Move structs. Those
+values may then move through locals, parameters, returns, and by-value calls without changing leaf
+provenance. The fixed-array element here is the retaining struct, not a direct handle element; this
+composes the already admitted struct-field and fixed Move-struct-array rules without widening direct
+handle placement. Direct reader/writer user-sum payloads and direct reader/writer/logger collection,
+fixed-array, tuple, or box elements reject formation. The following can form a structural type:
+`array<RetainingStruct>` for a retaining struct without `align(N)`;
+`slice<RetainingStruct>` for any retaining struct; and the corresponding admitted dynamic-array/
+slice shapes for retaining sums. A direct `DynStructArray` may additionally occupy a dynamic-array/
+slice element, tuple element, or builtin `Option`/`Result` payload. Every admitted shape in this
+paragraph except the tuple wrapper may occupy a user-struct field and then recurse through the
+ordinary acyclic struct/tagged/sum carrier grammar. Current `.to_array`,
+heap/region builder, JSON decode, and Move-element slice producers
+cannot create any such live handle-retaining value, so these are producer-negative rather than
+positive lifecycle cases. `None`, an inactive `Result` or user-sum arm, a moved/null leaf, and
+the same carrier shape containing only shells from another connection contribute zero target
+leaves; fd-number reuse does not change provenance. A carrier may reach multiple or mixed-provenance
+leaves, and the call is compatible exactly when its active target count is zero.
+
 For admitted inputs the row constructs the normalized positive-timeout `timeval` above, installs
 `SO_RCVTIMEO`, and returns its fixed errno-mapped status without attempting `SO_SNDTIMEO` if that
 call fails. Otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after both
@@ -382,11 +408,20 @@ the same zero-shell entry state. The row itself allocates, retains, rolls back, 
 nothing. `pkg.kv` calls it only with a fresh exclusively owned unpublished connection whose entry
 states are both clear and before constructing either shell; on either nonzero option result it
 immediately closes the connection without reopening resolution or trying another address. A
-parameterized direct-runtime owner pre-arms both option states and fixes the exact `timeval`, option
-order, option-call counts, returned status, `{R0,S0}`/`{T,S0}`/`{T,T}` post-state, exclusive-call
-precondition, zero live derived shells or retaining values at entry, zero overlapping or
-post-failure reader/writer constructor calls, the success-construct-Drop-reconfigure cycle, caller
-retirement, and later close/Drop behavior.
+parameterized structural owner derives its walk from the canonical type-formation and recursive
+Drop graph rather than a second hand-maintained type list; an exhaustive storage-edge tripwire makes
+a future graph edge require classification. It crosses direct/buffered leaf, local/moved/call-
+transferred placement, active/inactive/moved-out state, target/other/mixed provenance, and
+zero/one/multiple target leaves. Every nonzero target count is excluded from the compatible call set
+without invoking the unsafe row. For each positive carrier class, a success cycle configures at
+zero, constructs the leaf, moves it into that carrier, moves it out where supported and drops it or
+recursively drops the smallest owning carrier, observes zero again, and reconfigures; the fixed-
+struct-array case takes the recursive-Drop branch. Formation and producer negatives pin every
+excluded collection, box, tuple, sum-payload, materializer, builder, decode, and Move-slice edge.
+The direct-runtime half pre-arms both option states and fixes the exact `timeval`, option order,
+option-call counts, returned status, `{R0,S0}`/`{T,S0}`/`{T,T}` post-state, exclusive-call
+precondition, zero overlapping or post-failure reader/writer constructor calls, caller retirement,
+and later close/Drop behavior.
 It is a mandatory base
 export, source-reachable compatible extern, and collision-reserved unkeyed identity. It reuses an
 existing ABI shape, so activation changes the exact base/maximum counts from 347/355 to 348/356
@@ -505,7 +540,7 @@ integration risk because every reply kind closes against the same state machine 
 | DEL semantics | One-key request, every official signed/leading-zero spelling of values 0/1, server error, every other value/type. | False/true and sign/leading-zero/negative/two/overflow/type mutation matrix with reuse/close checks. |
 | Error, native status, and poison state | Invalid before I/O; bounded UTF-8 Server and complete non-UTF-8 Decode reusable; exact `0/1/2/3/4/>=5` status decode; reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation with checked i32 narrowing and raw-header validation before typed-slice construction; invalid-negative/oversized-positive abort before header inspection; Io/too-large/protocol/truncation/partial-write close; selected terminal error retained over cleanup; every later call Closed with zero I/O; malformed private resource state is not Closed and reaches `process.abort` before native I/O/untrusted access; every impossible native product reaches `process.abort` before parser/publication/ownership change. | Error-producer x command x before/during/after-frame x reuse table; every category/representative code/width/count/length/pointer/malformed product, including early-abort no-header inspection, both empty pointer forms, and positive-null abort; operation/Drop x one-field-at-a-time malformed resource state pins `ProcessAbort` with zero native calls; native call counters, explicit `ProcessAbort` IR/capability retention, no-import negative, and selected-error/cleanup-failure probes. |
 | Ownership and cleanup | Resource formation, move-in/out/return/replacement, if/match/else/?/map_err/branch/loop/early return, source nulling, state/socket/wrapper/scratch/result Drop once, malformed state abort before untrusted access. | Resource/drop counters, allocation parity, parameterized control-flow owner, state semantic-to-byte and byte-to-semantic goldens, and operation/Drop x malformed-field abort products. |
-| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection with zero live reader/writer shells or values retaining one derived from it at entry and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; any later timeout call requires every success-derived shell/retainer to be dropped first; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap plus zero-derived-shell entry preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; entry-state products distinguish never-constructed zero, constructed-then-dropped zero, live direct reader, live buffered reader, live direct writer, live logger-retained writer, and moved/call-transferred reader or writer, with only the two zero-live states compatible; range-rejection retry versus option-failure retry prohibition, zero overlapping/post-failure reader/writer-constructor calls, each compatible success-construct-Drop-reconfigure retainer kind, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std/direct/slice/builder/logger/`io.copy` writer owners; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
+| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection with zero live reader/writer shells or values retaining one derived from it at entry and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; the target-connection count is the number of initialized reader, writer, or logger-owned-writer leaves reached by the active recursive Drop graph, independent of fd-number equality; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; any later timeout call requires every success-derived shell/retainer to be dropped first; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap plus zero-derived-shell entry preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; one canonical-graph-derived structural owner with a storage-edge tripwire walks direct/buffered reader, direct writer, logger-owned writer, recursive struct fields, nested active `Option`/`Result`, active user-sum paths rooted in a logger/struct/sum/tagged carrier, and source-produced fixed struct-array elements, across local/moved/call-transferred placement, active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple target leaves; exactly zero is compatible; direct handle collections/boxes/tuples and direct reader/writer user-sum payloads are formation negatives, while nameable dynamic-array/slice shapes for retaining structs/sums, the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element, tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` keep explicit no-live-producer owners; range-rejection retry versus option-failure retry prohibition, zero overlapping/post-failure reader/writer-constructor calls, configure-construct-move-into-each-positive-carrier-move-out-where-supported-or-recursive-Drop-reconfigure cycles, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std/direct/slice/builder/logger/`io.copy` writer owners; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
 
 ## Sources of truth and author consistency pass
 
@@ -521,7 +556,7 @@ During candidate review, `docs/open-questions.md` keeps this item under Open and
 Settled, add its history record, change every candidate status to accepted/inactive as applicable,
 and only then authorize implementation.
 
-After the fourth finding-ledger repair, the fourth author-side ledger-to-prose and closure-matrix
+After the fifth finding-ledger repair, the fifth author-side ledger-to-prose and closure-matrix
 consistency pass completed on 2026-09-02 before another fresh complete review:
 
 - every public argument/result has one exact type, evaluation order, default, ownership, lifetime,
@@ -545,7 +580,10 @@ consistency pass completed on 2026-09-02 before another fresh complete review:
   semantic-to-byte plus byte-to-semantic goldens are fixed;
 - the resource record, RESP state machine, and source-reachable timeout row fix every
   state/tag/reserved/pointer/length product, zero-derived-shell entry state, live/exclusive overlap
-  exclusion including constructor calls, success-construct-Drop-reconfigure cycle,
+  exclusion including constructor calls, the complete active recursive reader/writer/logger
+  carrier graph with fixed retaining-struct arrays, target/other/mixed provenance, and
+  zero/one/multiple leaves, each construct-move-into-move-out-where-supported-or-recursive-Drop-
+  reconfigure cycle, plus graph-edge tripwire and every formation/producer negative,
   failed-second-option no-operation/construction/retry retirement, error preservation, and Drop
   order;
 - exact existing producer-owned runtime rows supply native state without reflection or artifact I/O;
@@ -617,4 +655,14 @@ returned one P2 finding. This fourth repair reopens the derived-shell-entry-stat
 | P2 pre-existing derived shell | A non-null compatible caller has zero live reader/writer shells and zero values retaining such a shell derived from the connection at entry; a live direct shell, moved shell, buffered shell, logger, or other retainer is an unsafe-precondition violation even while idle. No constructor overlaps the call. Success may construct shells afterward, but every such shell/retainer must Drop before a later timeout call; either option failure starts from zero shells, forbids construction, and closes the connection once with no shell cleanup ordering. Entry-state owners distinguish never-constructed zero, constructed-then-dropped zero, live direct/buffered reader, live direct/logger-retained writer, and moved/call-transferred reader or writer; package sequencing pins timeout-before-reader-before-writer. |
 
 This finding closes the remaining pre-entry half of the same source-reachable dangling-shell class.
-Candidate status remains Open until a fresh full review of the fourth complete repair is clean.
+The fresh full review of
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...70ddb527dadaf095792b4bd9fe57d764a7380329`
+returned one P3 finding. This fifth repair reopens the recursive-derived-shell-carrier matrix axis:
+
+| Finding | Authoritative correction and closure owner |
+|---|---|
+| P3 recursive shell-carrier owner graph | Define a target retainer by runtime provenance through its complete active recursive Drop graph: direct/buffered reader, direct writer, or logger-owned writer leaves may travel through locals/calls, recursive struct fields, nested active `Option`/`Result`, admitted user-sum paths, and source-constructible fixed arrays of retaining structs. Derive one parameterized owner from the canonical formation/Drop graph and add an exhaustive storage-edge tripwire; cross active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple leaves. Any nonzero target count is incompatible without invoking the unsafe row. Each positive class executes configure → construct → move into carrier → move out where supported and Drop or recursively Drop → zero-count reconfigure. Direct handle collections/boxes/tuples and direct reader/writer sum payloads are formation negatives; nameable dynamic-array/slice shapes for retaining structs/sums, the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element, tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` keep explicit materializer/builder/decode/slice no-live-producer owners. |
+
+This finding closes the missing recursively reachable half of the same source-reachable
+dangling-shell class. Candidate status remains Open until a fresh full review of the fifth complete
+repair is clean.

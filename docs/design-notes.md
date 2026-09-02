@@ -1503,8 +1503,9 @@ reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. I
 review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
 raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found
 two P3 consistency gaps in the timeout action lists and malformed-state error partition; the
-following review found one remaining P2 in the pre-existing-derived-shell entry state. No public
-contract is accepted until a fresh complete review closes this fourth repair.
+following review found one remaining P2 in the pre-existing-derived-shell entry state, and its
+repair review found one P3 in the recursively reachable reader/writer/logger carrier owner graph.
+No public contract is accepted until a fresh complete review closes this fifth repair.
 
 ## Why tests are Result blocks run in separate processes
 
