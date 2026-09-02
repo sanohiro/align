@@ -16,10 +16,13 @@ runtime-provenance reader/writer/logger retention graph, including recursive str
 fixed Move-struct-array carriers. Native impossibilities abort before parsing, publication, or
 ownership change; malformed private state aborts before native I/O or untrusted pointer access.
 
-A fresh full review accepted the fifth repaired ledger with no P0–P3 finding. The package remains
-unimplemented, the planned ABI row remains inactive, and the implemented first-party inventory
-remains four vendorable subtrees until source ships. Exact surface, ownership, wire grammar, error
-precedence, prerequisites, and implementation matrix: `docs/impl/pkg-design/kv.md`.
+A fresh full review accepted the fifth repaired ledger with no P0–P3 finding. Implementation then
+shipped root `pkg.kv`, `pkg.kv.internal.resource`, and the checked ABI row together, bringing the
+implemented first-party inventory to five vendorable subtrees. The current runtime inventory is 330
+keyed plus 18 unkeyed records, 13 of the unkeyed records source-reachable: 348 base exports, 352
+with either four-row probe feature alone, and 356 at the maximum combined probe surface. A123
+remains the next unreserved ABI shape. Exact surface, ownership, wire grammar, error precedence,
+prerequisites, and implementation matrix: `docs/impl/pkg-design/kv.md`.
 
 ## 2026-09-01: auth composes fixed protocols over the one crypto substrate
 

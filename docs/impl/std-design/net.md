@@ -234,9 +234,9 @@ expiry. A conn whose peer accepts then never sends, with `read_timeout_ns` set �
 
 ## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **Status:** implemented as the first independently useful prerequisite. It changes no public
-> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count. The planned
-> checked package row remains inactive until package implementation.
+> **Status:** implemented as the first independently useful prerequisite. It changed no public
+> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count. At that
+> boundary the checked package row remained inactive; it is now active with `pkg.kv`.
 
 For every usable resolver address and positive `timeout_ns`, `align_rt_tcp_connect` records a
 monotonic start and positive `Duration` budget immediately before the first `F_GETFL`, then checks
@@ -282,13 +282,13 @@ and a later success after each failure class; all-failure variants pin the last 
 close count.
 
 The same prerequisite fixes the shared socket-timeout conversion used by public
-`read_timeout_ns`/`write_timeout_ns` and the planned checked package row. Every positive nanosecond
+`read_timeout_ns`/`write_timeout_ns` and the now-active checked package row. Every positive nanosecond
 value becomes `ceil(ns / 1000)` microseconds and then a normalized
 `timeval { tv_sec, tv_usec: 0..999999 }`; exact microseconds remain exact, and zero retains the
 existing clear/no-timeout meaning. The option bounds one blocking wait for progress, not the total
 duration of a multi-read or multi-write operation.
 
-The planned source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
+The active source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
 to hold one live, unfreed connection exclusively across the call, with no live reader/writer shell
 derived from it and no other value retaining one at entry, and no overlapping read/write/
 configuration/reader-or-writer construction/free/Drop. It uses the exact normalized `timeval` and
@@ -344,9 +344,8 @@ pre-existing end-to-end timeout and command cleanup/precedence owners.
 ## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — IMPLEMENTED 2026-09-02)
 
 > **Status:** implemented as the second independently useful safety prerequisite. No public
-> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count changed. The
-> package source and planned checked-timeout row remain inactive until their joint capability
-> boundary.
+> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count changed. At
+> that boundary the package source and checked-timeout row remained inactive; both are now active.
 
 The existing `c.writer() -> writer` remains the one TCP byte-write surface. Its private runtime
 `Writer` state gains a sink kind and macOS/BSD readiness bit set to socket/not-ready only by
@@ -376,7 +375,8 @@ path.
 The existing keyed `IoWriterWriteBuilder` identity, A19
 `i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration,
 `unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI, attributes, and inclusion in the
-shipped 330/347/355 keyed/base/maximum counts do not change. Its source-visible builder overload
+then-shipped 330/347/355 keyed/base/maximum counts did not change at the writer-prerequisite
+boundary. The later `pkg.kv` row makes the current totals 330/348/356. Its source-visible builder overload
 borrows the builder bytes and delegates to the hardened `IoWriterWrite` row, so it cannot bypass the
 socket sink policy.
 
@@ -390,7 +390,7 @@ The shipped direct owners are `tcp_writer_complete_send_transition_matrix`,
 `tcp_writer_macos_nosigpipe_state_matrix`, `tcp_writer_generic_fd_parity_and_socket_lifecycle`, and
 `tcp_writer_closed_peer_routes_do_not_sigpipe`.
 
-Both prerequisites have landed. The planned `TcpConnSetIoTimeout` row and its `pkg.kv` package
-consumer are the next capability and activate together. Exact package consumption and the
-implementation boundary are in `../pkg-design/kv.md`; the one-row reservation and unchanged
-prerequisite ABI identities are recorded in `../20-runtime-abi-ledger.md`.
+Both prerequisites have landed. The `TcpConnSetIoTimeout` row and its `pkg.kv` package consumer
+have also landed and are active together. Exact package consumption and the implementation
+boundary are in `../pkg-design/kv.md`; the active one-row delta and unchanged prerequisite ABI
+identities are recorded in `../20-runtime-abi-ledger.md`.

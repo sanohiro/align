@@ -345,6 +345,7 @@ unkeyed|TestLaunchRecvV1|declare i32 @align_rt_test_launch_recv_v1(i32, ptr) #2
 unkeyed|TestFdCloexecV1|declare i32 @align_rt_test_fd_cloexec_v1(i32) #2
 unkeyed|TestAckV1|declare i32 @align_rt_test_ack_v1(i32, i32) #2
 unkeyed|TestReportV1|declare i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32) #2
+unkeyed|TcpConnSetIoTimeout|declare i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64)
 rt-lto-guarded|align_rt_str_ends_with,align_rt_str_eq,align_rt_str_eq_ignore_case,align_rt_str_starts_with
 attributes #0 = { nofree nounwind }
 attributes #1 = { noreturn }

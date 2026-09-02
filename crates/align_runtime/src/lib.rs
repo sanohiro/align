@@ -806,6 +806,7 @@ const EINPROGRESS: i32 = 36; // macOS/BSD
 /// `struct timeval` — the `SO_RCVTIMEO`/`SO_SNDTIMEO` option value. `tv_sec` is `time_t` (a `long` on
 /// both 64-bit Linux and macOS/BSD); `tv_usec` is `suseconds_t` — a `long` on Linux but an `int` on
 /// macOS/BSD, so cfg that field to keep the C layout exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 struct Timeval {
     tv_sec: core::ffi::c_long,
@@ -1282,6 +1283,84 @@ fn timeval_from_ns(ns: i64) -> Timeval {
     };
     Timeval { tv_sec, tv_usec }
 }
+
+/// Static-dispatch seam for the checked connection-wide timeout pair. Production calls libc
+/// directly; tests script each option transition without process-global hooks.
+trait TcpIoTimeoutOps {
+    fn set_timeout(&mut self, fd: i32, optname: i32, timeout: &Timeval) -> SocketCallOutcome;
+}
+
+struct NativeTcpIoTimeoutOps;
+
+impl TcpIoTimeoutOps for NativeTcpIoTimeoutOps {
+    fn set_timeout(&mut self, fd: i32, optname: i32, timeout: &Timeval) -> SocketCallOutcome {
+        let Ok(timeout_len) = u32::try_from(core::mem::size_of::<Timeval>()) else {
+            panic_abort("socket timeout: timeval size does not fit native socklen_t")
+        };
+        let result = unsafe {
+            setsockopt(
+                fd,
+                SOL_SOCKET,
+                optname,
+                (timeout as *const Timeval).cast(),
+                timeout_len,
+            )
+        };
+        let errno = if result < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        let Ok(result) = isize::try_from(result) else {
+            panic_abort("socket timeout: setsockopt result does not fit isize")
+        };
+        SocketCallOutcome { result, errno }
+    }
+}
+
+/// Checked body for [`align_rt_tcp_conn_set_io_timeout`]. Validation observes neither the fd nor
+/// native option state. An admitted call installs receive before send and deliberately does not
+/// roll receive back if the send option fails; the caller must retire the connection after either
+/// native failure.
+unsafe fn tcp_conn_set_io_timeout_with<O: TcpIoTimeoutOps>(
+    c: *mut TcpConn,
+    timeout_ns: i64,
+    ops: &mut O,
+) -> i32 {
+    if c.is_null() {
+        return AL_INVALID;
+    }
+    if !(1..=86_400_000_000_000).contains(&timeout_ns) {
+        return AL_INVALID;
+    }
+
+    let timeout = timeval_from_ns(timeout_ns);
+    let fd = unsafe { (*c).fd };
+    if let Err(status) = socket_option_status(ops.set_timeout(fd, SO_RCVTIMEO, &timeout)) {
+        return status;
+    }
+    if let Err(status) = socket_option_status(ops.set_timeout(fd, SO_SNDTIMEO, &timeout)) {
+        return status;
+    }
+    0
+}
+
+/// Install one positive retained I/O timeout on both directions of a fresh, exclusively owned
+/// `tcp_conn`. Null or a value outside `1..=86_400_000_000_000` ns returns `AL_INVALID` before fd
+/// access. Receive is installed before send. A native option failure is returned through the
+/// shared status table, with no rollback, retry, allocation, close, or ownership transfer.
+///
+/// # Safety
+/// A non-null `c` must name one live, unfreed connection held with exclusive logical access for the
+/// complete call. No reader/writer shell derived from it may be live, and no read, write, other
+/// configuration, shell construction/free, connection free, or Drop may overlap this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_conn_set_io_timeout(c: *mut TcpConn, timeout_ns: i64) -> i32 {
+    let mut ops = NativeTcpIoTimeoutOps;
+    unsafe { tcp_conn_set_io_timeout_with(c, timeout_ns, &mut ops) }
+}
+
+const _: unsafe extern "C" fn(*mut TcpConn, i64) -> i32 = align_rt_tcp_conn_set_io_timeout;
 
 /// Shared body of the two `tcp_conn` timeout setters: arm (`ns > 0`) or clear (`ns == 0`) the given
 /// `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline on the conn's fd. A null handle or a **negative** `ns`
@@ -25634,8 +25713,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 347);
-        assert_eq!(registry.len(), 347);
+        assert_eq!(runtime.len(), 348);
+        assert_eq!(registry.len(), 348);
         assert_eq!(runtime, registry);
     }
 
@@ -34637,6 +34716,345 @@ mod tests {
         result
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TcpIoTimeoutCall {
+        fd: i32,
+        optname: i32,
+        timeout: Timeval,
+    }
+
+    struct ScriptedTcpIoTimeoutOps {
+        outcomes: std::collections::VecDeque<SocketCallOutcome>,
+        calls: Vec<TcpIoTimeoutCall>,
+        receive: Timeval,
+        send: Timeval,
+    }
+
+    impl ScriptedTcpIoTimeoutOps {
+        fn new(
+            outcomes: impl IntoIterator<Item = SocketCallOutcome>,
+            receive: Timeval,
+            send: Timeval,
+        ) -> Self {
+            Self {
+                outcomes: outcomes.into_iter().collect(),
+                calls: Vec::new(),
+                receive,
+                send,
+            }
+        }
+
+        fn assert_finished(&self) {
+            assert!(
+                self.outcomes.is_empty(),
+                "unconsumed timeout outcomes: {:?}",
+                self.outcomes
+            );
+        }
+    }
+
+    impl TcpIoTimeoutOps for ScriptedTcpIoTimeoutOps {
+        fn set_timeout(&mut self, fd: i32, optname: i32, timeout: &Timeval) -> SocketCallOutcome {
+            self.calls.push(TcpIoTimeoutCall {
+                fd,
+                optname,
+                timeout: *timeout,
+            });
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected timeout option call {optname}"));
+            if outcome.result == 0 {
+                if optname == SO_RCVTIMEO {
+                    self.receive = *timeout;
+                } else if optname == SO_SNDTIMEO {
+                    self.send = *timeout;
+                } else {
+                    panic!("unexpected timeout option {optname}");
+                }
+            }
+            outcome
+        }
+    }
+
+    #[test]
+    fn tcp_conn_set_io_timeout_validation_precedes_fd_and_options() {
+        let initial_receive = Timeval {
+            tv_sec: 7,
+            tv_usec: 11,
+        };
+        let initial_send = Timeval {
+            tv_sec: 13,
+            tv_usec: 17,
+        };
+        for timeout_ns in [i64::MIN, 0, 1, 86_400_000_000_000, 86_400_000_000_001] {
+            let mut ops = ScriptedTcpIoTimeoutOps::new([], initial_receive, initial_send);
+            assert_eq!(
+                unsafe {
+                    tcp_conn_set_io_timeout_with(core::ptr::null_mut(), timeout_ns, &mut ops)
+                },
+                AL_INVALID,
+                "null connection at {timeout_ns} ns"
+            );
+            assert!(ops.calls.is_empty());
+            assert_eq!(ops.receive, initial_receive);
+            assert_eq!(ops.send, initial_send);
+        }
+
+        for timeout_ns in [-1, 0, 86_400_000_000_001, i64::MAX] {
+            let mut conn = TcpConn { fd: 23 };
+            let mut ops = ScriptedTcpIoTimeoutOps::new(
+                [
+                    SocketCallOutcome::returned(0),
+                    SocketCallOutcome::returned(0),
+                ],
+                initial_receive,
+                initial_send,
+            );
+            assert_eq!(
+                unsafe { tcp_conn_set_io_timeout_with(&mut conn, timeout_ns, &mut ops) },
+                AL_INVALID,
+                "range rejection at {timeout_ns} ns"
+            );
+            assert!(ops.calls.is_empty());
+            assert_eq!(ops.receive, initial_receive);
+            assert_eq!(ops.send, initial_send);
+
+            assert_eq!(
+                unsafe { tcp_conn_set_io_timeout_with(&mut conn, 1, &mut ops) },
+                0,
+                "a rejected range preserves the live connection for a valid retry"
+            );
+            assert_eq!(
+                ops.calls,
+                [
+                    TcpIoTimeoutCall {
+                        fd: 23,
+                        optname: SO_RCVTIMEO,
+                        timeout: Timeval {
+                            tv_sec: 0,
+                            tv_usec: 1,
+                        },
+                    },
+                    TcpIoTimeoutCall {
+                        fd: 23,
+                        optname: SO_SNDTIMEO,
+                        timeout: Timeval {
+                            tv_sec: 0,
+                            tv_usec: 1,
+                        },
+                    },
+                ]
+            );
+            ops.assert_finished();
+        }
+    }
+
+    #[test]
+    fn tcp_conn_set_io_timeout_quantization_and_option_order() {
+        for (timeout_ns, expected) in [
+            (
+                1,
+                Timeval {
+                    tv_sec: 0,
+                    tv_usec: 1,
+                },
+            ),
+            (
+                999,
+                Timeval {
+                    tv_sec: 0,
+                    tv_usec: 1,
+                },
+            ),
+            (
+                1_000,
+                Timeval {
+                    tv_sec: 0,
+                    tv_usec: 1,
+                },
+            ),
+            (
+                1_001,
+                Timeval {
+                    tv_sec: 0,
+                    tv_usec: 2,
+                },
+            ),
+            (
+                999_999_999,
+                Timeval {
+                    tv_sec: 1,
+                    tv_usec: 0,
+                },
+            ),
+            (
+                1_000_000_000,
+                Timeval {
+                    tv_sec: 1,
+                    tv_usec: 0,
+                },
+            ),
+            (
+                1_000_000_001,
+                Timeval {
+                    tv_sec: 1,
+                    tv_usec: 1,
+                },
+            ),
+            (
+                86_400_000_000_000,
+                Timeval {
+                    tv_sec: 86_400,
+                    tv_usec: 0,
+                },
+            ),
+        ] {
+            let mut conn = TcpConn { fd: 29 };
+            let zero = Timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            let mut ops = ScriptedTcpIoTimeoutOps::new(
+                [
+                    SocketCallOutcome::returned(0),
+                    SocketCallOutcome::returned(0),
+                ],
+                zero,
+                zero,
+            );
+            assert_eq!(
+                unsafe { tcp_conn_set_io_timeout_with(&mut conn, timeout_ns, &mut ops) },
+                0
+            );
+            assert_eq!(
+                ops.calls,
+                [
+                    TcpIoTimeoutCall {
+                        fd: 29,
+                        optname: SO_RCVTIMEO,
+                        timeout: expected,
+                    },
+                    TcpIoTimeoutCall {
+                        fd: 29,
+                        optname: SO_SNDTIMEO,
+                        timeout: expected,
+                    },
+                ],
+                "receive then send at {timeout_ns} ns"
+            );
+            assert_eq!(ops.receive, expected);
+            assert_eq!(ops.send, expected);
+            ops.assert_finished();
+        }
+    }
+
+    #[test]
+    fn tcp_conn_set_io_timeout_failure_transition_matrix() {
+        let initial_receive = Timeval {
+            tv_sec: 2,
+            tv_usec: 3,
+        };
+        let initial_send = Timeval {
+            tv_sec: 5,
+            tv_usec: 7,
+        };
+        let target = Timeval {
+            tv_sec: 1,
+            tv_usec: 1,
+        };
+        for errno in [
+            libc::ENOENT,
+            libc::EINVAL,
+            libc::EACCES,
+            libc::ETIMEDOUT,
+            libc::EAGAIN,
+        ] {
+            let expected_status = io_error_to_status(&std::io::Error::from_raw_os_error(errno));
+            let mut conn = TcpConn { fd: 31 };
+            let mut receive_failure = ScriptedTcpIoTimeoutOps::new(
+                [SocketCallOutcome::failed(errno)],
+                initial_receive,
+                initial_send,
+            );
+            assert_eq!(
+                unsafe {
+                    tcp_conn_set_io_timeout_with(&mut conn, 1_000_000_001, &mut receive_failure)
+                },
+                expected_status
+            );
+            assert_eq!(
+                receive_failure.calls,
+                [TcpIoTimeoutCall {
+                    fd: 31,
+                    optname: SO_RCVTIMEO,
+                    timeout: target,
+                }]
+            );
+            assert_eq!(receive_failure.receive, initial_receive);
+            assert_eq!(receive_failure.send, initial_send);
+            receive_failure.assert_finished();
+
+            let mut send_failure = ScriptedTcpIoTimeoutOps::new(
+                [
+                    SocketCallOutcome::returned(0),
+                    SocketCallOutcome::failed(errno),
+                ],
+                initial_receive,
+                initial_send,
+            );
+            assert_eq!(
+                unsafe {
+                    tcp_conn_set_io_timeout_with(&mut conn, 1_000_000_001, &mut send_failure)
+                },
+                expected_status
+            );
+            assert_eq!(
+                send_failure
+                    .calls
+                    .iter()
+                    .map(|call| call.optname)
+                    .collect::<Vec<_>>(),
+                [SO_RCVTIMEO, SO_SNDTIMEO]
+            );
+            assert!(send_failure.calls.iter().all(|call| call.timeout == target));
+            assert_eq!(send_failure.receive, target);
+            assert_eq!(send_failure.send, initial_send);
+            send_failure.assert_finished();
+        }
+
+        let mut conn = TcpConn { fd: 31 };
+        let mut success = ScriptedTcpIoTimeoutOps::new(
+            [
+                SocketCallOutcome::returned(0),
+                SocketCallOutcome::returned(0),
+            ],
+            initial_receive,
+            initial_send,
+        );
+        assert_eq!(
+            unsafe { tcp_conn_set_io_timeout_with(&mut conn, 1_000_000_001, &mut success) },
+            0
+        );
+        assert_eq!(
+            success
+                .calls
+                .iter()
+                .map(|call| call.optname)
+                .collect::<Vec<_>>(),
+            [SO_RCVTIMEO, SO_SNDTIMEO]
+        );
+        assert_eq!(success.receive, target);
+        assert_eq!(success.send, target);
+        success.assert_finished();
+
+        assert_eq!(
+            io_error_to_status(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            AL_CODE.saturating_add(libc::EAGAIN),
+            "timeout-option EAGAIN is an errno code, not the read/write Timeout sentinel"
+        );
+    }
+
     #[test]
     fn socket_timeout_timeval_quantization() {
         for (ns, seconds, microseconds) in [
@@ -35281,6 +35699,108 @@ mod tests {
         unsafe { align_rt_tcp_conn_free(conn) };
         unsafe { align_rt_buffer_free(b) };
         server.join().expect("silent server");
+    }
+
+    #[test]
+    fn tcp_conn_set_io_timeout_native_socket_lifecycle() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = i64::from(listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept timeout connection");
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("bound server read");
+            let mut request = [0u8; 4];
+            socket
+                .read_exact(&mut request)
+                .expect("read timeout request");
+            assert_eq!(&request, b"ping");
+            socket.write_all(b"pong").expect("write timeout response");
+            let mut trailing = [0u8; 1];
+            assert_eq!(socket.read(&mut trailing).expect("observe client close"), 0);
+        });
+
+        let (host, host_len) = view_of("127.0.0.1");
+        let mut conn = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_tcp_connect(host, host_len, port, 0, &mut conn) },
+            0
+        );
+        assert!(!conn.is_null());
+
+        let read_option = |optname| {
+            let mut value = Timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            let mut len = u32::try_from(core::mem::size_of::<Timeval>()).unwrap();
+            assert_eq!(
+                unsafe {
+                    getsockopt(
+                        (*conn).fd,
+                        SOL_SOCKET,
+                        optname,
+                        (&mut value as *mut Timeval).cast(),
+                        &mut len,
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                usize::try_from(len).unwrap(),
+                core::mem::size_of::<Timeval>()
+            );
+            value
+        };
+
+        assert_eq!(
+            unsafe { align_rt_tcp_conn_set_io_timeout(conn, 2_000_000_000) },
+            0
+        );
+        let two_seconds = Timeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        };
+        assert_eq!(read_option(SO_RCVTIMEO), two_seconds);
+        assert_eq!(read_option(SO_SNDTIMEO), two_seconds);
+
+        assert_eq!(
+            unsafe { align_rt_tcp_conn_set_io_timeout(conn, 0) },
+            AL_INVALID
+        );
+        assert_eq!(read_option(SO_RCVTIMEO), two_seconds);
+        assert_eq!(read_option(SO_SNDTIMEO), two_seconds);
+
+        let writer = unsafe { align_rt_tcp_conn_writer(conn) };
+        let reader = unsafe { align_rt_tcp_conn_reader(conn) };
+        assert!(!writer.is_null() && !reader.is_null());
+        assert_eq!(
+            unsafe { align_rt_io_writer_write(writer, b"ping".as_ptr(), 4) },
+            0
+        );
+        let buffer = align_rt_buffer_new(4);
+        assert_eq!(unsafe { align_rt_io_reader_read(reader, buffer) }, 4);
+        let buffer_ref = unsafe { &*buffer };
+        assert_eq!(&buffer_ref.data[..buffer_ref.len], b"pong");
+
+        unsafe { align_rt_io_writer_free(writer) };
+        unsafe { align_rt_io_reader_free(reader) };
+        assert_eq!(
+            unsafe { align_rt_tcp_conn_set_io_timeout(conn, 1_000_000_000) },
+            0
+        );
+        let one_second = Timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        assert_eq!(read_option(SO_RCVTIMEO), one_second);
+        assert_eq!(read_option(SO_SNDTIMEO), one_second);
+
+        unsafe { align_rt_buffer_free(buffer) };
+        unsafe { align_rt_tcp_conn_free(conn) };
+        server.join().expect("timeout server");
     }
 
     #[test]

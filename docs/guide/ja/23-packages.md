@@ -1,8 +1,8 @@
-# パッケージ: vendoring、pkg.web、pkg.frame、pkg.auth、pkg.db
+# パッケージ: vendoring、pkg.web、pkg.frame、pkg.auth、pkg.kv、pkg.db
 
 > 🌐 [English](../23-packages.md) · **日本語**
 
-`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.frame`、`pkg.auth`、`pkg.db` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
+`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.frame`、`pkg.auth`、`pkg.kv`、`pkg.db` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
 
 ## パッケージはソースツリー
 
@@ -14,11 +14,15 @@ pkg/
   db.align
   auth.align
   frame.align
+  kv.align
   web.align
   db/
     sqlite.align
     postgres.align
     pool.align
+  kv/
+    internal/
+      resource.align
   web/
     types.align
     cookie.align
@@ -28,7 +32,7 @@ pkg/
 
 `import pkg.web` は `pkg/web.align`、`import pkg.web.cookie` は `pkg/web/cookie.align` に解決されます。呼び出しや型名は `pkg.web.get(...)`、`pkg.web.types.Ctx` のように常に完全修飾します。
 
-Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/frame/pkg](../../../apps/frame/pkg)、[apps/auth/pkg](../../../apps/auth/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
+Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/frame/pkg](../../../apps/frame/pkg)、[apps/auth/pkg](../../../apps/auth/pkg)、[apps/kv/pkg](../../../apps/kv/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
 
 パッケージ用のマニフェスト、lockfile、レジストリ、バージョンソルバ、ダウンロードコマンドはありません。依存グラフは `import` とファイルシステムから決まり、1つのソースツリーに存在できる `pkg/<name>` は1つです。依存関係の更新や監査は、vendoring したソース自体の更新や監査として行います。
 
@@ -102,9 +106,40 @@ fn main() -> Result<(), Error> {
 
 検証は JSON parse より先に compact bytes を認証し、algorithm を HS256 に固定して signature を定数時間で比較します。必須の `now_ns` は hidden clock read なしに optional integer-form `exp` / `nbf` を検査します。password verify は Argon2 実行前に caller の 3 work ceiling を強制します。default password policy、key lookup、issuer/audience policy、cookie、session store は含みません。exact bound/error は [`pkg.auth` design](../../impl/pkg-design/ja/auth.md) が正本です。
 
+## `pkg.kv`
+
+`pkg.kv` は typed GET、SET、single-key DEL を扱う同期 plaintext RESP2 client です。connection / I/O timeout と maximum response size は明示的です。Move な `client` は同時に1つの `borrow mut` operation から使い、Drop を public close operation とします。
+
+```align
+import pkg.kv
+
+fn open_store() -> Result<pkg.kv.client, pkg.kv.Error> {
+    options := pkg.kv.ClientOptions {
+        connect_timeout_ns: 1000000000,
+        io_timeout_ns: 1000000000,
+        max_response_bytes: 1048576,
+    }
+    return pkg.kv.connect("127.0.0.1", 6379, options)
+}
+
+fn create_session(
+    borrow mut store: pkg.kv.client,
+    key: str,
+    payload: str,
+) -> Result<bool, pkg.kv.Error> {
+    options := pkg.kv.SetOptions {
+        condition: pkg.kv.SetCondition.IfAbsent,
+        expires_in_ns: Some(900000000000),
+    }
+    return pkg.kv.set(store, key, payload, options)
+}
+```
+
+`get` は owned optional string、`set` は `Always` / `IfAbsent` / `IfPresent` condition が適用されたか、`delete` は key が存在したかを返します。transport、oversized response、malformed response は client を retire し、その後の operation は `Closed` を返します。default endpoint、authentication、TLS、RESP3 negotiation、generic command API、pipeline、retry、redirect、pool、transaction、script、pub/sub surface はありません。root `pkg.kv` と private 実装 `pkg.kv.internal.resource` は同時に出荷されます。exact bound/error rule は [`pkg.kv` design](../../impl/pkg-design/ja/kv.md) が正本です。
+
 ## `pkg.db` ― コミット済みロードマップ完了
 
-`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 3 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。
+`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 4 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。
 
 完了しているのは、公開初回リリースの範囲です。型付きの静的クエリとコマンドは、実際のスキーマメタデータに対してコンパイル時に検査され、SQLite と PostgreSQL の両方で実行でき、そのメタデータをオフラインで再生成できます。プリペアドステートメント、トランザクション、デッドラインとキャンセルを備えた型付き行ストリーム、一対多／多対一の複合出力、マイグレーションのライフサイクル管理、`EXPLAIN` を含む読み取り専用のカタログ検査も、すべて入っています。
 

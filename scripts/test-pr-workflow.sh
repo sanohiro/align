@@ -2371,7 +2371,7 @@ if [[ "$historical_guards" -ne 3 ]]; then
 fi
 corpus_links="$(
   find "$repo_root/apps/web/pkg" "$repo_root/apps/frame/pkg" "$repo_root/apps/auth/pkg" \
-    "$repo_root/apps/db/pkg" \
+    "$repo_root/apps/db/pkg" "$repo_root/apps/kv/pkg" \
     -name '*.align' -type f -exec \
     sed -n 's/.*extern "C" link("\([^"]*\)").*/\1/p' '{}' + \
     | LC_ALL=C sort -u | paste -sd, -
@@ -2380,15 +2380,29 @@ if [[ "$corpus_links" != "crypto,pq,sqlite3,ssl,z,zstd" ]]; then
   echo "the prebuilt-cache native-link declaration inventory changed: $corpus_links" >&2
   exit 1
 fi
-grep -Fq 'libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev' "$release_workflow" || {
-  echo "the release runner cannot link the complete cached pkg.db corpus" >&2
+release_apt_packages="$(
+  awk '
+    $0 == "      ALIGN_APT_PACKAGES: >-" { in_packages = 1; next }
+    in_packages && /^        [^#]/ {
+      sub(/^        /, "")
+      printf "%s%s", separator, $0
+      separator = " "
+      next
+    }
+    in_packages { exit }
+  ' "$release_workflow"
+)"
+expected_release_apt_packages='llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev'
+if [[ "$release_apt_packages" != "$expected_release_apt_packages" ]]; then
+  echo "the release runner dependency mapping changed: $release_apt_packages" >&2
   exit 1
-}
-grep -Fq 'libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev' \
-  "$release_workflow" || {
-  echo "the Debian compiler package cannot link the complete cached pkg.db corpus" >&2
+fi
+debian_dependencies="$(sed -n 's/^          Depends: //p' "$release_workflow")"
+expected_debian_dependencies='llvm-22, clang-22, libclang-rt-22-dev, libpq-dev, libsqlite3-dev, libssl-dev, zlib1g-dev, libzstd-dev'
+if [[ "$debian_dependencies" != "$expected_debian_dependencies" ]]; then
+  echo "the Debian compiler package dependency mapping changed: $debian_dependencies" >&2
   exit 1
-}
+fi
 grep -Fq 'brew tap-new --no-git "$RELEASE_TAP"' "$release_workflow" &&
   grep -Fq 'RELEASE_TAP_ROOT="$(brew --repository "$RELEASE_TAP")"' "$release_workflow" &&
   grep -Fq 'cp "$RUNNER_TEMP/align.rb" "$RELEASE_TAP_ROOT/Formula/align.rb"' "$release_workflow" &&

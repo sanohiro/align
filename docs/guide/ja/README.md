@@ -41,6 +41,6 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 
 ## 第 V 部 —— パッケージ
 
-- [23 — パッケージ: vendoring、pkg.web、pkg.frame、pkg.auth、pkg.db](23-packages.md)
+- [23 — パッケージ: vendoring、pkg.web、pkg.frame、pkg.auth、pkg.kv、pkg.db](23-packages.md)
 - [24 — データベース: pkg.db の実践](24-database.md)
 - [25 — pkg.db を通じたベクトル検索](25-vector-search.md)

@@ -1027,7 +1027,7 @@ errno)、`Error.Denied`(TLS 検証失敗)、4xx/5xx ステータスを運ぶ通�
 
 > **ステータス:** implemented。上の shipped timeout surface と ABI は変更せず、この prerequisite は
 > public signature、compiler operation、runtime symbol、ABI shape、registry key、row count のいずれも
-> 変更しない。planned checked package row は inactive のまま。
+> 変更しなかった。この boundary では checked package row は inactive のままで、現在は `pkg.kv` と共に active。
 
 HTTP connect は `net.md` に記録した checked net-rail transition を継承する。各 usable resolver
 address と正の effective timeout について、runtime は最初の `F_GETFL` 直前に monotonic start と

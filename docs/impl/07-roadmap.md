@@ -202,9 +202,11 @@ every item below has since completed as recorded in the per-milestone sections, 
    of them risks the wrong op set (premature). See `open-questions.md` "bytes / buffer". So the
    next *build* is #3.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. **DONE** (slices ①–③
-   + ④a–④c, PRs #104–117; only fully-escaping fn values — return / struct-field / array-element —
-   stay deferred, see the M7 section above). Design SETTLED (`open-questions.md`); closures are the
-   foundation, `task_group` the consumer. Built in slices:
+   + ④a–④c, PRs #104–117; returned fn values and environment-bearing or capturing fn values
+   carried out of every enclosing region through a struct field or array element stay deferred.
+   Locally used `Static`/noncapturing named fn values in those aggregates are supported; see the M7
+   section above). Design SETTLED (`open-questions.md`); closures are the foundation, `task_group`
+   the consumer. Built in slices:
    **① non-capturing function values DONE** — a top-level fn used as a value is a function pointer
    (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
    f(5)`; scalar signatures). **②a lambda-as-value DONE** — a non-capturing lambda with typed
@@ -1190,11 +1192,14 @@ already lives in `docs/open-questions.md`.
   `ParPool` and propagates a failing task's `Err`; `t.get()` reads a result after the join (a
   `get`-before-`wait` use is a compile-time flow error). Tasks may be impure (I/O); safety from
   by-value capture. Runtime: `align_rt_tg_begin/alloc/register/wait/end`.
-- [deferred] **fully-escaping function values** — returning a fn value from a function, or storing
-  one in a struct field / array element, is **not** supported: it needs a **heap-owned** closure
-  environment with its own drop (the "escapes every region" model), whose design is not yet settled
-  and which has no consumer today (`task_group` uses the region env). Deliberately deferred — see
-  `open-questions.md` "First-class closures + task_group" (the escape-every-region note).
+- [deferred] **returned and environment-escaping function values** — returning a fn value from a
+  function remains unsupported. Carrying an environment-bearing or capturing fn value out of every
+  enclosing region through a struct field or array element is also unsupported: that shape needs a
+  **heap-owned** closure environment with its own drop (the "escapes every region" model), whose
+  design is not yet settled and which has no consumer today (`task_group` uses the region env).
+  Locally used `Static`/noncapturing named fn values in struct fields and arrays are supported;
+  aggregate placement alone is not a full escape. Deliberately deferred — see `open-questions.md`
+  "First-class closures + task_group" (the escape-every-region note).
 - async/await is not included (`non-goals.md`).
 
 **Parallel correctness/output-IR companion record (2026-07-12):**
@@ -3842,8 +3847,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`HANDOFF.md` names `pkg.kv` design as the next language capability after the implemented
-`pkg.auth` package. Promotion of an optimization slice is a separate explicit
+`pkg.kv` is implemented after `pkg.auth`; the planned domain order places `pkg.csv` next, with no
+accepted surface yet. Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -3964,7 +3969,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv — ACCEPTED DESIGN 2026-09-02; PREREQUISITES 1–2 IMPLEMENTED; PACKAGE PENDING** — one synchronous plaintext RESP2 client with an
+- **pkg.kv — IMPLEMENTED 2026-09-02** — one synchronous plaintext RESP2 client with an
   opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
   owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
   positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
@@ -3989,7 +3994,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   products use an explicit `std.process` dependency and existing keyed `ProcessAbort` before
   parsing, publication, or ownership change; every malformed private resource operation/Drop uses
   the same dependency before native I/O or untrusted pointer access. Its
-  implementation atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
+  implementation atomically activates one compiler-recognized fixed-symbol row for checked socket timeout
   installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
   live connection exclusively with no live reader/writer shell derived from it and no other value
   retaining one at entry, and no read/write/configuration/reader-or-writer construction/free/Drop
@@ -4009,8 +4014,8 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   quantization, deterministic resolver/transition owners, HTTP plain/TLS/pool/stream rearm evidence,
   and command pipe/post-EOF evidence. The second shared writer prerequisite is also implemented with
   checked SIGPIPE suppression, complete-write parity, non-owning socket-writer lifecycle, and direct
-  slice/builder/logger/`io.copy` closed-peer evidence. The package source and planned ABI row remain
-  inactive and are the next joint capability. Exact ledger and implementation closure matrix:
+  slice/builder/logger/`io.copy` closed-peer evidence. The package source and checked ABI row are
+  active together. Exact ledger and implementation closure matrix:
   `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

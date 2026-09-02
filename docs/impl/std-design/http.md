@@ -1056,8 +1056,8 @@ effective-timeout resolution (request override else client default) happens in `
 ### Checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
 > **Status:** implemented. The shipped timeout surface and ABI remain unchanged; this prerequisite
-> changes no public signature, compiler operation, runtime symbol, ABI shape, registry key, or row
-> count. The planned checked package row remains inactive.
+> changed no public signature, compiler operation, runtime symbol, ABI shape, registry key, or row
+> count. At that boundary the checked package row remained inactive; it is now active with `pkg.kv`.
 
 HTTP connect inherits the checked net-rail transition recorded in `net.md`. For each usable
 resolver address and positive effective timeout, the runtime records a monotonic start and positive

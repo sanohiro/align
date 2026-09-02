@@ -675,9 +675,11 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 > threads, scoped capture environments, `spawn`/`wait()`/`get()`, and fallible `wait()?`. The plan
 > below is retained as the implementation record. The exact stored-Result/control-flow
 > successful-Wait proof described below is pending the am-w correction after its 2026-07-31 audit.
-> Only function values that escape every enclosing
-> region (return / struct field / array element) remain deferred pending a heap-owned environment
-> and Drop model with a real consumer.
+> Returning function values, and environment-bearing or capturing function values carried out of
+> every enclosing region through a struct field or array element, remain deferred pending a
+> heap-owned environment and Drop model with a real consumer. A `Static`/noncapturing named function
+> value may already occupy a locally used struct field or array element; aggregate placement alone
+> is not a full escape.
 **Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety comes from by-value capture (no shared mutable state). Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
 Record: `draft.md` §11 (Task Group), `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
@@ -698,7 +700,7 @@ Decomposition: **④a** scope + the task region + `spawn` (fresh region env per 
 - **Future owned `R` (`string`/`array<T>`)** is not part of the current primitive-result producer. If admitted, the slot would hold the owned `{ptr,len}` and `get()` would consume a Move `R`: afterward the caller would own the buffer, while the slot itself stayed in the region until scope end. An **un-`get()`'d** owned-`R` task would still need to free its buffer before the region drops, likely via a conditional per-task drop gated by a flag cleared by `get()`; making `get()` mandatory is the alternative. This ownership decision belongs to that future producer slice. Current Copy `R` needs none of it.
 
 **④c-2 plan — the `wait()?` error boundary (the last task_group slice).** A task may **fail**: its closure returns `Result<R, Error>`. `wait()?` joins all, and if any task failed, propagates the `Err` from the lowest spawn index out of the enclosing function (deterministic across parallel completion order; documented). After `wait()?`, `get()` yields the `Ok` `R`. Implementation, in order:
-- **Prerequisite — `Result`-returning spawn closures.** A `Result`-returning lambda cannot be a `Ty::Fn` value today (`FnTy.ret` is scalar-only). Since a spawned lambda is *consumed by `spawn`* (never a free first-class value), `check_spawn` **lifts the literal lambda directly** (via `lift_lambda`, whose result type may legitimately be `Ty::Result(ok, builtin Error)`) instead of routing through a `Ty::Fn` value — and the `Spawn` node carries the lifted name + captures + the `Ok` scalar + a `fallible` flag, like `Closure` does. The task's Err type is the exact builtin `Error` used by the enclosing fallible function, so `spawn(fn { fallible()? ; Ok(x) })` type-checks without a written return type.
+- **Prerequisite — `Result`-returning spawn closures.** At this plan's 2026-06-23 boundary, a `Result`-returning lambda could not be a `Ty::Fn` value (`FnTy.ret` was scalar-only). Since a spawned lambda is *consumed by `spawn`* (never a free first-class value), `check_spawn` **lifts the literal lambda directly** (via `lift_lambda`, whose result type may legitimately be `Ty::Result(ok, builtin Error)`) instead of routing through a `Ty::Fn` value — and the `Spawn` node carries the lifted name + captures + the `Ok` scalar + a `fallible` flag, like `Closure` does. The task's Err type is the exact builtin `Error` used by the enclosing fallible function, so `spawn(fn { fallible()? ; Ok(x) })` type-checks without a written return type.
 - **`get()` requires a *successful* `wait()`.** For a fallible group, a bare `wait()` whose `Result` is ignored does **not** make `get()` safe — an `Err` task never stored its slot, so the slot is uninitialized. Each Wait Result carries its exact compiler-only group/proof-epoch/Wait-id/covered-generation fact through bare locals, copy/reassignment, block tail, `map_err`, and value-producing control. `?`, exhaustive Result `match`, or Result `else` resolves that exact id on its Ok continuation, including inside a nested group. Every earlier Wait for the same drained generation must also be proved Ok: a second empty `wait()?` cannot hide an unresolved or failed first Wait. Err advances the proof epoch and invalidates every Task/Wait proof it covered. Every Spawn advances the current task generation and stales earlier Wait proofs; with an unresolved Wait it also invalidates covered Tasks, while after successful completion the next successful Wait reauthorizes old and new handles. A later no-task Wait cannot revoke completion already established for that generation, even when its Result is left unhandled. Loop headers join entry and reachable body fallthrough to a fixed point using stable syntax-site tokens before accepted breaks form the exit, so an earlier iteration's unresolved or failed Wait cannot disappear. Calls, returns, closure captures, imported values, and aggregate reconstruction do not transport the proof; passing a Copy Result leaves the caller's original local intact but gives the callee/return no proof. A Task is a Move handle with a separate compiler-only originating-group/born-generation proof, transferred through local moves/reassignment and value-producing control but not opaque boundaries. `get()` checks that exact still-active generation range: an inner Wait cannot authorize an outer Task, while an already-successful outer generation remains readable inside a nested group. Group exit clears every proof naming the exited group, including one attached to its Result block value, and preserves proofs for still-active outer groups; handling the cleared inner Result outside cannot authorize an outer Task. For an infallible group `wait()` returns `()` and enables `get()` immediately. Current Task results are primitive Copy values, so `get()` preserves the handle and may repeat; owned Task results remain a future slice.
 - **Per-`task_group` `fallible` flag** (a stack like `wait_state`): set when a `Result`-returning task is spawned. `wait()`'s type is `Result<(), Error>` when the group is fallible, else `()` (so infallible groups stay `()` — no spurious `Result`).
 - **Full-Error reporting via private task slots.** Each fallible task gets a private `err_slot`. The per-`R` trampoline stores `R` and returns 0 on Ok, or stores the complete builtin `Error` and returns 1 on Err. `align_rt_tg_wait` joins all workers and returns null on success or the lowest-spawn-index errored slot pointer. The slots are disjoint region allocations, so no shared mutable error cell is introduced.
@@ -709,9 +711,11 @@ review recorded here (a lambda capturing an arena-backed view escaped the arena 
 use-after-free; `f := arena { v := fs.read_bytes_view(p)?; fn { v[0] } }` passed `check` and
 SIGSEGVed at `f()`) is closed: `Ty::Fn` is now `tracks_region`, and `region_of` folds a closure's
 region over its captures, so that program is rejected at `check`. Zero-capture closures stay
-`Static`; closures used entirely within the arena stay legal. When fully-escaping fn values
-(return / struct-field / array-element) land, this capture-region fold is the machinery they
-must preserve.
+`Static`; closures used entirely within the arena stay legal. Locally used `Static`/noncapturing
+named function values in struct fields and arrays are already supported; aggregate placement alone
+is not a full escape. When returned function values and environment-bearing or capturing values
+that escape every enclosing region land, this capture-region fold is the machinery they must
+preserve.
 
 ### `bytes` / `buffer` — design SETTLED; minimal `buffer` BUILT 2026-07-03; `str.bytes()` BUILT 2026-07-15
 **Decision (2026-06-23): `bytes` is `slice<u8>`; `buffer` is a distinct growable owned byte container.** Resolving the two forks left by `draft.md` §12 (which names the types but specs no operations):
@@ -3257,10 +3261,9 @@ native-status decoding, and parsing stay in package source. Internal modules exp
 `std.process`; every impossible status/count/view-length/view-pointer/output product reaches the
 existing keyed `ProcessAbort` before parsing or publication. A malformed private resource record is
 not a `Closed` producer; every operation and Drop reaches the same abort dependency before native
-I/O or untrusted pointer access. Implementation would then harden the
-existing connection-derived writer for SIGPIPE across its slice and builder overloads without an
-ABI/count change, and finally activate
-one planned fixed-symbol runtime row for checked socket timeout configuration with the package.
+I/O or untrusted pointer access. Implementation then hardened the existing connection-derived
+writer for SIGPIPE across its slice and builder overloads without an ABI/count change, and activated
+one fixed-symbol runtime row for checked socket timeout configuration with the package.
 Every non-null compatible caller must hold one live/unfreed connection exclusively with no live
 reader/writer shell derived from it and no other value retaining one at entry, and no read/write/
 configuration/reader-or-writer construction/free/Drop overlap; pre-armed
@@ -3282,7 +3285,8 @@ derived-shell entry state; its repair review found one P3 in the recursively rea
 reader/writer/logger carrier owner graph. A fresh complete adversarial review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 accepted the fifth repair with no P0–P3 finding. This item is Settled and authorizes implementation
-in the recorded prerequisite order; no package source or planned ABI row is active yet.
+in the recorded prerequisite order. Both shared prerequisites, the package source, and the ABI row
+are active.
 
 ## Open (to be decided)
 

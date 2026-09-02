@@ -1,0 +1,778 @@
+module pkg.kv
+
+import std.process
+import pkg.kv.internal.resource
+
+extern "C" {
+  fn align_rt_tcp_connect(host: str, host_len: i64, port: i64, timeout_ns: i64, out: raw) -> i32
+  fn align_rt_tcp_conn_free(connection: raw)
+  fn align_rt_tcp_conn_reader(connection: raw) -> raw
+  fn align_rt_tcp_conn_writer(connection: raw) -> raw
+  fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64) -> i32
+  fn align_rt_io_reader_read(reader: raw, output: raw) -> i64
+  fn align_rt_io_reader_free(reader: raw)
+  fn align_rt_io_writer_write(writer: raw, bytes: slice<u8>, length: i64) -> i32
+  fn align_rt_io_writer_free(writer: raw)
+  fn align_rt_buffer_new(capacity: i64) -> raw
+  fn align_rt_buffer_bytes(buffer: raw, out: raw)
+  fn align_rt_buffer_capacity(buffer: raw) -> i64
+  fn align_rt_buffer_free(buffer: raw)
+}
+
+MAX_TIMEOUT_NS: i64 := 86400000000000
+MAX_VALUE_BYTES: i64 := 536870912
+READ_CHUNK_BYTES: i64 := 32768
+MAX_CONTROL_BYTES: i64 := 64
+I32_MAX: i64 := 2147483647
+
+pub resource client = pkg.kv.internal.resource.drop_client
+
+pub ClientOptions {
+  connect_timeout_ns: i64,
+  io_timeout_ns: i64,
+  max_response_bytes: i64,
+}
+
+pub SetCondition {
+  Always
+  IfAbsent
+  IfPresent
+}
+
+pub SetOptions {
+  condition: SetCondition,
+  expires_in_ns: Option<i64>,
+}
+
+pub Error {
+  Invalid
+  Io(core.Error)
+  Server(string)
+  Decode
+  ResponseTooLarge
+  Protocol
+  Closed
+}
+
+fn native_status_error(status: i32) -> core.Error {
+  if status <= 0 { process.abort() }
+  if status == 1 { return core.Error.NotFound }
+  if status == 2 { return core.Error.Invalid }
+  if status == 3 { return core.Error.Denied }
+  if status == 4 { return core.Error.Timeout }
+  return core.Error.Code(status - 5)
+}
+
+fn host_valid(host: str) -> bool {
+  if host.len() == 0 { return false }
+  bytes := host.bytes()
+  mut index := 0
+  loop {
+    if index >= bytes.len() { break }
+    if bytes[index] == 0 { return false }
+    index = index + 1
+  }
+  return true
+}
+
+fn timeout_valid(timeout_ns: i64) -> bool =
+timeout_ns >= 1 && timeout_ns <= MAX_TIMEOUT_NS
+
+fn response_cap_valid(max_response_bytes: i64) -> bool =
+max_response_bytes >= 0 && max_response_bytes <= MAX_VALUE_BYTES
+
+fn decimal_length(value: i64) -> i64 {
+  if value < 0 { process.abort() }
+  mut remaining := value
+  mut length := 1
+  loop {
+    if remaining < 10 { break }
+    remaining = remaining / 10
+    length = length + 1
+  }
+  return length
+}
+
+fn checked_total(parts: slice<i64>) -> Option<i64> {
+  mut total := 0
+  mut index := 0
+  loop {
+    if index >= parts.len() { break }
+    part := parts[index]
+    if part < 0 || total > 9223372036854775807 - part { return None }
+    total = total + part
+    index = index + 1
+  }
+  return Some(total)
+}
+
+fn request_length_valid(key_length: i64) -> bool = match checked_total([
+    18,
+    decimal_length(key_length),
+    key_length,
+  ]) {
+  Some(_) => true
+  None => false
+}
+
+fn set_request_length_valid(
+  key_length: i64,
+  value_length: i64,
+  condition: i64,
+  expiry_ms: i64,
+) -> bool {
+  condition_length := if condition == 0 { 0 } else { 8 }
+  expiry_digits := if expiry_ms == 0 { 0 } else { decimal_length(expiry_ms) }
+  expiry_length := if expiry_ms == 0 {
+    0
+  } else {
+    13 + decimal_length(expiry_digits) + expiry_digits
+  }
+  return match checked_total([
+      23,
+      decimal_length(key_length),
+      key_length,
+      decimal_length(value_length),
+      value_length,
+      condition_length,
+      expiry_length,
+    ]) {
+    Some(_) => true
+    None => false
+  }
+}
+
+fn write_part(writer: raw, bytes: slice<u8>) -> Result<(), Error> {
+  unsafe {
+    status := align_rt_io_writer_write(writer, bytes, bytes.len())
+    if status < 0 { process.abort() }
+    if status == 0 { return Ok(()) }
+    return Err(Error.Io(native_status_error(status)))
+  }
+}
+
+fn send_get(state: raw, key: str) -> Result<(), Error> {
+  writer := pkg.kv.internal.resource.client_writer(state)
+  mut prefix := builder()
+  prefix.write("*2\r\n$3\r\nGET\r\n$")
+  prefix.write_int(key.len())
+  prefix.write("\r\n")
+  prefix_text := prefix.to_string()
+  write_part(writer, prefix_text.bytes())?
+  write_part(writer, key.bytes())?
+  return write_part(writer, "\r\n".bytes())
+}
+
+fn send_delete(state: raw, key: str) -> Result<(), Error> {
+  writer := pkg.kv.internal.resource.client_writer(state)
+  mut prefix := builder()
+  prefix.write("*2\r\n$3\r\nDEL\r\n$")
+  prefix.write_int(key.len())
+  prefix.write("\r\n")
+  prefix_text := prefix.to_string()
+  write_part(writer, prefix_text.bytes())?
+  write_part(writer, key.bytes())?
+  return write_part(writer, "\r\n".bytes())
+}
+
+fn send_set(
+  state: raw,
+  key: str,
+  value: str,
+  condition: i64,
+  expiry_ms: i64,
+) -> Result<(), Error> {
+  writer := pkg.kv.internal.resource.client_writer(state)
+  argument_count := 3 + (if condition == 0 { 0 } else { 1 })
+    + (if expiry_ms == 0 { 0 } else { 2 })
+
+  mut prefix := builder()
+  prefix.write("*")
+  prefix.write_int(argument_count)
+  prefix.write("\r\n$3\r\nSET\r\n$")
+  prefix.write_int(key.len())
+  prefix.write("\r\n")
+  prefix_text := prefix.to_string()
+
+  mut middle := builder()
+  middle.write("\r\n$")
+  middle.write_int(value.len())
+  middle.write("\r\n")
+  middle_text := middle.to_string()
+
+  mut suffix := builder()
+  suffix.write("\r\n")
+  if condition == 1 { suffix.write("$2\r\nNX\r\n") }
+  if condition == 2 { suffix.write("$2\r\nXX\r\n") }
+  if expiry_ms != 0 {
+    expiry_digits := decimal_length(expiry_ms)
+    suffix.write("$2\r\nPX\r\n$")
+    suffix.write_int(expiry_digits)
+    suffix.write("\r\n")
+    suffix.write_int(expiry_ms)
+    suffix.write("\r\n")
+  }
+  suffix_text := suffix.to_string()
+
+  write_part(writer, prefix_text.bytes())?
+  write_part(writer, key.bytes())?
+  write_part(writer, middle_text.bytes())?
+  write_part(writer, value.bytes())?
+  return write_part(writer, suffix_text.bytes())
+}
+
+fn new_read_input() -> raw {
+  unsafe {
+    buffer := align_rt_buffer_new(READ_CHUNK_BYTES)
+    if buffer.is_null() || align_rt_buffer_capacity(buffer) != READ_CHUNK_BYTES {
+      process.abort()
+    }
+    header := raw.alloc(16)
+    input := raw.alloc(40)
+    raw.store(input, 0, buffer)
+    raw.store(input, 8, header)
+    raw.store(input, 16, raw.null())
+    raw.store(input, 24, 0 as i64)
+    raw.store(input, 32, 0 as i64)
+    return input
+  }
+}
+
+fn free_read_input(input: raw) {
+  unsafe {
+    buffer: raw := raw.load(input, 0)
+    header: raw := raw.load(input, 8)
+    align_rt_buffer_free(buffer)
+    raw.free(header)
+    raw.free(input)
+  }
+}
+
+fn refill(
+  reader: raw,
+  input: raw,
+) -> Result<bool, Error> {
+  unsafe {
+    buffer: raw := raw.load(input, 0)
+    header: raw := raw.load(input, 8)
+    count := align_rt_io_reader_read(reader, buffer)
+    if count == -9223372036854775808 || count < 0 - I32_MAX
+      || count > READ_CHUNK_BYTES {
+      process.abort()
+    }
+
+    align_rt_buffer_bytes(buffer, header)
+    pointer: raw := raw.load(header, 0)
+    length: i64 := raw.load(header, 8)
+    if count < 0 {
+      if length != 0 { process.abort() }
+      status_value := 0 - count
+      if status_value <= 0 || status_value > I32_MAX { process.abort() }
+      status: i32 := status_value as i32
+      return Err(Error.Io(native_status_error(status)))
+    }
+    if count == 0 {
+      if length != 0 { process.abort() }
+      raw.store(input, 16, pointer)
+      raw.store(input, 24, 0 as i64)
+      raw.store(input, 32, 0 as i64)
+      return Ok(false)
+    }
+    if pointer.is_null() || length != count { process.abort() }
+    raw.store(input, 16, pointer)
+    raw.store(input, 24, length)
+    raw.store(input, 32, 0 as i64)
+    return Ok(true)
+  }
+}
+
+fn next_byte(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+) -> Result<Option<u8>, Error> {
+  unsafe {
+    mut input_length: i64 := raw.load(input, 24)
+    mut input_index: i64 := raw.load(input, 32)
+    if input_index >= input_length {
+      available := refill(reader, input)?
+      if !available { return Ok(None) }
+      input_length = raw.load(input, 24)
+      input_index = raw.load(input, 32)
+    }
+    input_pointer: raw := raw.load(input, 16)
+    bytes: slice<u8> := resource.view_from_raw(
+      reference,
+      input_pointer,
+      input_length,
+    ) else {
+      process.abort()
+    }
+    byte := bytes[input_index]
+    raw.store(input, 32, input_index + 1)
+    return Ok(Some(byte))
+  }
+}
+
+fn required_byte(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+) -> Result<u8, Error> {
+  return match next_byte(reference, reader, input)? {
+    Some(byte) => Ok(byte)
+    None => Err(Error.Protocol)
+  }
+}
+
+fn trailing_in_current_read(input: raw) -> bool {
+  unsafe {
+    input_length: i64 := raw.load(input, 24)
+    input_index: i64 := raw.load(input, 32)
+    return input_index < input_length
+  }
+}
+
+// Parse one unsigned bulk length. The complete digit grammar is established before an over-cap
+// magnitude is selected, while the 64-byte control guard wins as soon as a 65th digit is observed.
+fn bulk_length(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+  max_response_bytes: i64,
+) -> Result<i64, Error> {
+  first := required_byte(reference, reader, input)?
+  if first == 45 {
+    if required_byte(reference, reader, input)? != 49 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 13 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+    return Ok(-1)
+  }
+  if first < 48 || first > 57 { return Err(Error.Protocol) }
+
+  mut digits := 1
+  mut magnitude := (first - 48) as i64
+  mut too_large := magnitude > max_response_bytes
+  loop {
+    byte := required_byte(reference, reader, input)?
+    if byte == 13 {
+      if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+      if too_large { return Err(Error.ResponseTooLarge) }
+      return Ok(magnitude)
+    }
+    if byte < 48 || byte > 57 { return Err(Error.Protocol) }
+    if digits >= MAX_CONTROL_BYTES { return Err(Error.ResponseTooLarge) }
+    digits = digits + 1
+    digit := (byte - 48) as i64
+    if !too_large {
+      if magnitude > max_response_bytes / 10
+        || (magnitude == max_response_bytes / 10
+          && digit > max_response_bytes % 10) {
+        too_large = true
+      } else {
+        magnitude = magnitude * 10 + digit
+      }
+    }
+  }
+}
+
+fn parse_error_reply(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+  max_response_bytes: i64,
+) -> Error {
+  mut payload: array_builder<u8> := array_builder()
+  mut length := 0
+  loop {
+    byte := match required_byte(reference, reader, input) {
+      Ok(value) => value
+      Err(error) => { return error }
+    }
+    if byte == 13 {
+      terminal := match required_byte(reference, reader, input) {
+        Ok(value) => value
+        Err(error) => { return error }
+      }
+      if terminal != 10 { return Error.Protocol }
+      if trailing_in_current_read(input) { return Error.Protocol }
+      payload_bytes := payload.build()
+      payload_view := payload_bytes[0..payload_bytes.len()]
+      payload_text := payload_view.as_str() else { return Error.Decode }
+      return Error.Server(payload_text.clone())
+    }
+    if byte == 10 { return Error.Protocol }
+    if length >= max_response_bytes { return Error.ResponseTooLarge }
+    payload.push(byte)
+    length = length + 1
+  }
+}
+
+fn parse_get(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+  max_response_bytes: i64,
+) -> Result<Option<string>, Error> {
+  marker := match next_byte(reference, reader, input)? {
+    Some(byte) => byte
+    None => { return Err(Error.Closed) }
+  }
+  if marker == 45 {
+    return Err(parse_error_reply(reference, reader, input, max_response_bytes))
+  }
+  if marker != 36 { return Err(Error.Protocol) }
+
+  length := bulk_length(reference, reader, input, max_response_bytes)?
+  if length == -1 {
+    if trailing_in_current_read(input) { return Err(Error.Protocol) }
+    return Ok(None)
+  }
+
+  mut payload: array_builder<u8> := array_builder()
+  mut index := 0
+  loop {
+    if index >= length { break }
+    payload.push(required_byte(reference, reader, input)?)
+    index = index + 1
+  }
+  if required_byte(reference, reader, input)? != 13 { return Err(Error.Protocol) }
+  if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+  if trailing_in_current_read(input) { return Err(Error.Protocol) }
+  get_bytes := payload.build()
+  get_view := get_bytes[0..get_bytes.len()]
+  get_text := get_view.as_str() else { return Err(Error.Decode) }
+  return Ok(Some(get_text.clone()))
+}
+
+fn parse_set(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+  max_response_bytes: i64,
+  conditional: bool,
+) -> Result<bool, Error> {
+  marker := match next_byte(reference, reader, input)? {
+    Some(byte) => byte
+    None => { return Err(Error.Closed) }
+  }
+  if marker == 45 {
+    return Err(parse_error_reply(reference, reader, input, max_response_bytes))
+  }
+  if marker == 43 {
+    if required_byte(reference, reader, input)? != 79 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 75 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 13 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+    if trailing_in_current_read(input) { return Err(Error.Protocol) }
+    return Ok(true)
+  }
+  if marker == 36 {
+    if required_byte(reference, reader, input)? != 45 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 49 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 13 { return Err(Error.Protocol) }
+    if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+    if trailing_in_current_read(input) { return Err(Error.Protocol) }
+    if conditional { return Ok(false) }
+  }
+  return Err(Error.Protocol)
+}
+
+fn parse_delete_integer(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+) -> Result<bool, Error> {
+  mut byte := required_byte(reference, reader, input)?
+  mut negative := false
+  mut control_bytes := 0
+  if byte == 43 || byte == 45 {
+    negative = byte == 45
+    control_bytes = 1
+    byte = required_byte(reference, reader, input)?
+  }
+  if byte < 48 || byte > 57 { return Err(Error.Protocol) }
+
+  control_bytes = control_bytes + 1
+  mut magnitude: u64 := (byte - 48) as u64
+  limit: u64 := if negative { 9223372036854775808 } else { 9223372036854775807 }
+  loop {
+    byte = required_byte(reference, reader, input)?
+    if byte == 13 {
+      if required_byte(reference, reader, input)? != 10 { return Err(Error.Protocol) }
+      if trailing_in_current_read(input) { return Err(Error.Protocol) }
+      if magnitude == 0 { return Ok(false) }
+      if !negative && magnitude == 1 { return Ok(true) }
+      return Err(Error.Protocol)
+    }
+    if byte < 48 || byte > 57 { return Err(Error.Protocol) }
+    if control_bytes >= MAX_CONTROL_BYTES { return Err(Error.ResponseTooLarge) }
+    control_bytes = control_bytes + 1
+    digit := (byte - 48) as u64
+    if magnitude > limit / 10 || (magnitude == limit / 10 && digit > limit % 10) {
+      return Err(Error.Protocol)
+    }
+    magnitude = magnitude * 10 + digit
+  }
+}
+
+fn parse_delete(
+  reference: resource_ref<client>,
+  reader: raw,
+  input: raw,
+  max_response_bytes: i64,
+) -> Result<bool, Error> {
+  marker := match next_byte(reference, reader, input)? {
+    Some(byte) => byte
+    None => { return Err(Error.Closed) }
+  }
+  if marker == 45 {
+    return Err(parse_error_reply(reference, reader, input, max_response_bytes))
+  }
+  if marker != 58 { return Err(Error.Protocol) }
+  return parse_delete_integer(reference, reader, input)
+}
+
+fn read_get_response(
+  reference: resource_ref<client>,
+  state: raw,
+) -> Result<Option<string>, Error> {
+  reader := pkg.kv.internal.resource.client_reader(state)
+  max_response_bytes := pkg.kv.internal.resource.client_max_response_bytes(state)
+  input := new_read_input()
+  result := parse_get(reference, reader, input, max_response_bytes)
+  free_read_input(input)
+  return result
+}
+
+fn read_set_response(
+  reference: resource_ref<client>,
+  state: raw,
+  conditional: bool,
+) -> Result<bool, Error> {
+  reader := pkg.kv.internal.resource.client_reader(state)
+  max_response_bytes := pkg.kv.internal.resource.client_max_response_bytes(state)
+  input := new_read_input()
+  result := parse_set(reference, reader, input, max_response_bytes, conditional)
+  free_read_input(input)
+  return result
+}
+
+fn read_delete_response(
+  reference: resource_ref<client>,
+  state: raw,
+) -> Result<bool, Error> {
+  reader := pkg.kv.internal.resource.client_reader(state)
+  max_response_bytes := pkg.kv.internal.resource.client_max_response_bytes(state)
+  input := new_read_input()
+  result := parse_delete(reference, reader, input, max_response_bytes)
+  free_read_input(input)
+  return result
+}
+
+fn expiry_milliseconds(expires_in_ns: Option<i64>) -> Result<i64, Error> {
+  return match expires_in_ns {
+    None => Ok(0)
+    Some(value) => {
+      if value <= 0 { return Err(Error.Invalid) }
+      milliseconds := value / 1000000
+        + (if value % 1000000 == 0 { 0 } else { 1 })
+      Ok(milliseconds)
+    }
+  }
+}
+
+fn finish_get(
+  state: raw,
+  result: Result<Option<string>, Error>,
+) -> Result<Option<string>, Error> {
+  return match result {
+    Ok(value) => Ok(value)
+    Err(error) => {
+      match error {
+        Server(message) => Err(Error.Server(message))
+        Decode => Err(Error.Decode)
+        Invalid => Err(Error.Invalid)
+        Io(native) => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Io(native))
+        }
+        ResponseTooLarge => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.ResponseTooLarge)
+        }
+        Protocol => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Protocol)
+        }
+        Closed => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Closed)
+        }
+      }
+    }
+  }
+}
+
+fn finish_bool(state: raw, result: Result<bool, Error>) -> Result<bool, Error> {
+  return match result {
+    Ok(value) => Ok(value)
+    Err(error) => {
+      match error {
+        Server(message) => Err(Error.Server(message))
+        Decode => Err(Error.Decode)
+        Invalid => Err(Error.Invalid)
+        Io(native) => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Io(native))
+        }
+        ResponseTooLarge => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.ResponseTooLarge)
+        }
+        Protocol => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Protocol)
+        }
+        Closed => {
+          pkg.kv.internal.resource.retire_client(state)
+          Err(Error.Closed)
+        }
+      }
+    }
+  }
+}
+
+pub fn connect(
+  host: str,
+  port: i64,
+  options: ClientOptions,
+) -> Result<client, Error> {
+  if !host_valid(host) { return Err(Error.Invalid) }
+  if port < 1 || port > 65535 { return Err(Error.Invalid) }
+  if !timeout_valid(options.connect_timeout_ns) { return Err(Error.Invalid) }
+  if !timeout_valid(options.io_timeout_ns) { return Err(Error.Invalid) }
+  if !response_cap_valid(options.max_response_bytes) { return Err(Error.Invalid) }
+
+  unsafe {
+    output := raw.alloc(8)
+    raw.store(output, 0, raw.null())
+    status := align_rt_tcp_connect(
+      host,
+      host.len(),
+      port,
+      options.connect_timeout_ns,
+      output,
+    )
+    connection: raw := raw.load(output, 0)
+    raw.free(output)
+    if status < 0 { process.abort() }
+    if status != 0 {
+      if !connection.is_null() { process.abort() }
+      return Err(Error.Io(native_status_error(status)))
+    }
+    if connection.is_null() { process.abort() }
+
+    timeout_status := align_rt_tcp_conn_set_io_timeout(connection, options.io_timeout_ns)
+    if timeout_status < 0 { process.abort() }
+    if timeout_status != 0 {
+      align_rt_tcp_conn_free(connection)
+      return Err(Error.Io(native_status_error(timeout_status)))
+    }
+
+    reader := align_rt_tcp_conn_reader(connection)
+    if reader.is_null() { process.abort() }
+    writer := align_rt_tcp_conn_writer(connection)
+    if writer.is_null() { process.abort() }
+    state := pkg.kv.internal.resource.new_client_state(
+      connection,
+      reader,
+      writer,
+      options.max_response_bytes,
+    )
+    owner: client := resource.from_raw(state)
+    return Ok(owner)
+  }
+}
+
+pub fn get(
+  borrow mut owner: client,
+  key: str,
+) -> Result<Option<string>, Error> {
+  unsafe {
+    reference := resource.borrow(owner)
+    state := resource.raw(reference)
+    if !pkg.kv.internal.resource.client_live(state) { return Err(Error.Closed) }
+    if key.len() > MAX_VALUE_BYTES || !request_length_valid(key.len()) {
+      return Err(Error.Invalid)
+    }
+    sent := send_get(state, key)
+    match sent {
+      Ok(_) => {}
+      Err(error) => {
+        pkg.kv.internal.resource.retire_client(state)
+        return Err(error)
+      }
+    }
+    return finish_get(state, read_get_response(reference, state))
+  }
+}
+
+pub fn set(
+  borrow mut owner: client,
+  key: str,
+  value: str,
+  options: SetOptions,
+) -> Result<bool, Error> {
+  unsafe {
+    reference := resource.borrow(owner)
+    state := resource.raw(reference)
+    if !pkg.kv.internal.resource.client_live(state) { return Err(Error.Closed) }
+    if key.len() > MAX_VALUE_BYTES { return Err(Error.Invalid) }
+    if value.len() > MAX_VALUE_BYTES { return Err(Error.Invalid) }
+    condition := match options.condition {
+      Always => 0
+      IfAbsent => 1
+      IfPresent => 2
+    }
+    expiry_ms := expiry_milliseconds(options.expires_in_ns)?
+    if !set_request_length_valid(key.len(), value.len(), condition, expiry_ms) {
+      return Err(Error.Invalid)
+    }
+    sent := send_set(state, key, value, condition, expiry_ms)
+    match sent {
+      Ok(_) => {}
+      Err(error) => {
+        pkg.kv.internal.resource.retire_client(state)
+        return Err(error)
+      }
+    }
+    return finish_bool(
+      state,
+      read_set_response(reference, state, condition != 0),
+    )
+  }
+}
+
+pub fn delete(
+  borrow mut owner: client,
+  key: str,
+) -> Result<bool, Error> {
+  unsafe {
+    reference := resource.borrow(owner)
+    state := resource.raw(reference)
+    if !pkg.kv.internal.resource.client_live(state) { return Err(Error.Closed) }
+    if key.len() > MAX_VALUE_BYTES || !request_length_valid(key.len()) {
+      return Err(Error.Invalid)
+    }
+    sent := send_delete(state, key)
+    match sent {
+      Ok(_) => {}
+      Err(error) => {
+        pkg.kv.internal.resource.retire_client(state)
+        return Err(error)
+      }
+    }
+    return finish_bool(state, read_delete_response(reference, state))
+  }
+}

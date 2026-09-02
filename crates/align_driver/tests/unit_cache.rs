@@ -1233,6 +1233,113 @@ fn pkg_db_modules() -> Vec<(String, String)> {
     .collect()
 }
 
+fn pkg_kv_sources() -> (String, String) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("apps")
+        .join("kv")
+        .join("pkg")
+        .join("kv");
+    let package =
+        std::fs::read_to_string(root.with_extension("align")).expect("read pkg.kv source");
+    let resource = std::fs::read_to_string(root.join("internal").join("resource.align"))
+        .expect("read pkg.kv resource source");
+    (package, resource)
+}
+
+#[test]
+fn pkg_kv_nested_source_frontend_cache_scope_is_exact() {
+    let _serial = serial();
+    let (package, resource) = pkg_kv_sources();
+    let main = "import pkg.kv\n\nfn main() -> i32 = 0\n";
+    let proj = Proj::new(
+        "pkg-kv-nested-source",
+        &[
+            ("pkg/kv.align", &package),
+            ("pkg/kv/internal/resource.align", &resource),
+            ("main.align", main),
+        ],
+    );
+
+    let cold = proj.build(UnitReuse::Allowed);
+    for unit in ["pkg.kv.internal.resource", "pkg.kv", "main"] {
+        assert!(!hit(&cold, unit), "cold {unit} must miss");
+    }
+    let warm = proj.build(UnitReuse::Allowed);
+    for unit in ["pkg.kv.internal.resource", "pkg.kv", "main"] {
+        assert!(hit(&warm, unit), "warm {unit} must hit");
+    }
+
+    proj.write(
+        "pkg/kv/internal/resource.align",
+        &format!("// cache comment probe\n{resource}"),
+    );
+    let comment = proj.build(UnitReuse::Allowed);
+    assert!(!hit(&comment, "pkg.kv.internal.resource"));
+    assert!(hit(&comment, "pkg.kv") && hit(&comment, "main"));
+    proj.write("pkg/kv/internal/resource.align", &resource);
+    let comment_reverted = proj.build(UnitReuse::Allowed);
+    assert!(
+        ["pkg.kv.internal.resource", "pkg.kv", "main"]
+            .into_iter()
+            .all(|unit| hit(&comment_reverted, unit))
+    );
+
+    let private_resource = resource.replace(
+        "MAX_RESPONSE_BYTES: i64 := 536870912",
+        "MAX_RESPONSE_BYTES: i64 := 536870911",
+    );
+    assert_ne!(private_resource, resource);
+    proj.write("pkg/kv/internal/resource.align", &private_resource);
+    let internal_edit = proj.build(UnitReuse::Allowed);
+    assert!(!hit(&internal_edit, "pkg.kv.internal.resource"));
+    assert!(hit(&internal_edit, "pkg.kv") && hit(&internal_edit, "main"));
+    proj.write("pkg/kv/internal/resource.align", &resource);
+    let internal_reverted = proj.build(UnitReuse::Allowed);
+    assert!(
+        ["pkg.kv.internal.resource", "pkg.kv", "main"]
+            .into_iter()
+            .all(|unit| hit(&internal_reverted, unit))
+    );
+
+    let private_package = package.replace(
+        "READ_CHUNK_BYTES: i64 := 32768",
+        "READ_CHUNK_BYTES: i64 := 16384",
+    );
+    assert_ne!(private_package, package);
+    proj.write("pkg/kv.align", &private_package);
+    let root_edit = proj.build(UnitReuse::Allowed);
+    assert!(hit(&root_edit, "pkg.kv.internal.resource"));
+    assert!(!hit(&root_edit, "pkg.kv"));
+    assert!(hit(&root_edit, "main"));
+    proj.write("pkg/kv.align", &package);
+    let root_reverted = proj.build(UnitReuse::Allowed);
+    assert!(
+        ["pkg.kv.internal.resource", "pkg.kv", "main"]
+            .into_iter()
+            .all(|unit| hit(&root_reverted, unit))
+    );
+
+    let public_package = package.replace(
+        "  max_response_bytes: i64,\n}",
+        "  max_response_bytes: i64,\n  cache_identity_probe: i64,\n}",
+    );
+    assert_ne!(public_package, package);
+    proj.write("pkg/kv.align", &public_package);
+    let public_edit = proj.build(UnitReuse::Allowed);
+    assert!(hit(&public_edit, "pkg.kv.internal.resource"));
+    assert!(!hit(&public_edit, "pkg.kv"));
+    assert!(!hit(&public_edit, "main"));
+    proj.write("pkg/kv.align", &package);
+    let public_reverted = proj.build(UnitReuse::Allowed);
+    assert!(
+        ["pkg.kv.internal.resource", "pkg.kv", "main"]
+            .into_iter()
+            .all(|unit| hit(&public_reverted, unit))
+    );
+}
+
 #[test]
 fn a_descriptor_owning_unit_is_never_cached() {
     let _serial = serial();

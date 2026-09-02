@@ -1,0 +1,133 @@
+module pkg.kv.internal.resource
+
+import std.process
+
+extern "C" {
+  fn align_rt_tcp_conn_free(connection: raw)
+  fn align_rt_io_reader_free(reader: raw)
+  fn align_rt_io_writer_free(writer: raw)
+}
+
+CLIENT_VERSION: u32 := 1
+CLIENT_LIVE: u8 := 0
+CLIENT_CLOSED: u8 := 1
+MAX_RESPONSE_BYTES: i64 := 536870912
+
+// The private client state is one 40-byte, 8-aligned raw allocation:
+//   0: u32 version (= 1)
+//   4: u8  state (0 = live, 1 = closed)
+//   5: u8  reserved (= 0)
+//   6: u16 reserved (= 0)
+//   8: raw owning runtime TCP connection, non-null iff live
+//  16: raw non-owning runtime reader shell, non-null iff live
+//  24: raw non-owning unbuffered runtime writer shell, non-null iff live
+//  32: i64 maximum response bytes (0..=512 MiB)
+pub fn new_client_state(
+  connection: raw,
+  reader: raw,
+  writer: raw,
+  max_response_bytes: i64,
+) -> raw {
+  if connection.is_null() || reader.is_null() || writer.is_null()
+    || max_response_bytes < 0 || max_response_bytes > MAX_RESPONSE_BYTES {
+    process.abort()
+  }
+  unsafe {
+    state := raw.alloc(40)
+    raw.store(state, 0, CLIENT_VERSION)
+    raw.store(state, 4, CLIENT_LIVE)
+    raw.store(state, 5, 0 as u8)
+    raw.store(state, 6, 0 as u16)
+    raw.store(state, 8, connection)
+    raw.store(state, 16, reader)
+    raw.store(state, 24, writer)
+    raw.store(state, 32, max_response_bytes)
+    return state
+  }
+}
+
+// Authenticate the complete scalar image before any retained pointer is returned or called.
+// Pointer values remain opaque here; validation only checks the producer-owned state product.
+fn client_state_valid(state: raw) -> bool {
+  unsafe {
+    if state.is_null() { return false }
+    version: u32 := raw.load(state, 0)
+    lifecycle: u8 := raw.load(state, 4)
+    reserved_byte: u8 := raw.load(state, 5)
+    reserved_word: u16 := raw.load(state, 6)
+    connection: raw := raw.load(state, 8)
+    reader: raw := raw.load(state, 16)
+    writer: raw := raw.load(state, 24)
+    max_response_bytes: i64 := raw.load(state, 32)
+    if version != CLIENT_VERSION || reserved_byte != 0 || reserved_word != 0
+      || max_response_bytes < 0 || max_response_bytes > MAX_RESPONSE_BYTES {
+      return false
+    }
+    if lifecycle == CLIENT_LIVE {
+      return !connection.is_null() && !reader.is_null() && !writer.is_null()
+    }
+    return lifecycle == CLIENT_CLOSED
+      && connection.is_null() && reader.is_null() && writer.is_null()
+  }
+}
+
+fn require_client_state(state: raw) {
+  if !client_state_valid(state) { process.abort() }
+}
+
+pub fn client_live(state: raw) -> bool {
+  require_client_state(state)
+  unsafe {
+    lifecycle: u8 := raw.load(state, 4)
+    return lifecycle == CLIENT_LIVE
+  }
+}
+
+pub fn client_reader(state: raw) -> raw {
+  require_client_state(state)
+  unsafe { return raw.load(state, 16) }
+}
+
+pub fn client_writer(state: raw) -> raw {
+  require_client_state(state)
+  unsafe { return raw.load(state, 24) }
+}
+
+pub fn client_max_response_bytes(state: raw) -> i64 {
+  require_client_state(state)
+  unsafe { return raw.load(state, 32) }
+}
+
+// Publish the closed representation before invoking any native destructor. The shells do not
+// own the socket, so cleanup is writer, reader, then the sole TCP owner.
+fn close_live_client(state: raw) {
+  unsafe {
+    connection: raw := raw.load(state, 8)
+    reader: raw := raw.load(state, 16)
+    writer: raw := raw.load(state, 24)
+    raw.store(state, 4, CLIENT_CLOSED)
+    raw.store(state, 8, raw.null())
+    raw.store(state, 16, raw.null())
+    raw.store(state, 24, raw.null())
+    align_rt_io_writer_free(writer)
+    align_rt_io_reader_free(reader)
+    align_rt_tcp_conn_free(connection)
+  }
+}
+
+pub fn retire_client(state: raw) {
+  require_client_state(state)
+  unsafe {
+    lifecycle: u8 := raw.load(state, 4)
+    if lifecycle == CLIENT_LIVE { close_live_client(state) }
+  }
+}
+
+pub fn drop_client(state: raw) {
+  require_client_state(state)
+  unsafe {
+    lifecycle: u8 := raw.load(state, 4)
+    if lifecycle == CLIENT_LIVE { close_live_client(state) }
+    raw.free(state)
+  }
+}

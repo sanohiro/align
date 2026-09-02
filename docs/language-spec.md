@@ -1318,7 +1318,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The implemented first-party packages in this repository are exactly four vendorable subtrees:
+The implemented first-party packages in this repository are exactly five vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1328,10 +1328,11 @@ pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
+pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 ```
 
-`pkg.kv` has an accepted synchronous RESP2 GET/SET/DEL design, listed below separately. It has no
-vendorable source subtree until implementation ships.
+`pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
+`pkg.kv.internal.resource`.
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
 packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
@@ -1367,7 +1368,7 @@ non-zeroizing string/buffer Drop. Any import retains the module-wide complete ca
 libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:
 `impl/pkg-design/auth.md`.
 
-The accepted `pkg.kv` v1 design fixes this exact root public surface:
+The implemented `pkg.kv` v1 follows its accepted design with this exact root public surface:
 
 ```text
 pkg.kv.client  // opaque Move resource
@@ -1442,8 +1443,8 @@ frontend; a public interface edit misses transitive reverse dependencies, and
 a private dependency-body edit rebuilds that dependency and relinks while unchanged consumer
 frontend/objects hit; a semantic no-op may re-hit its structural object. There is no AUTH, TLS,
 RESP3/HELLO negotiation, generic command/reply surface, pipeline, redirect, replay, reconnect, or hidden retry;
-the client relies on the server's default RESP2 mode. One source-reachable runtime row remains
-planned and inactive until implementation: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` for
+the client relies on the server's default RESP2 mode. One source-reachable runtime row is active:
+`align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` for
 checked receive/send timeout installation, reusing A04. It returns `AL_INVALID` for null then
 out-of-range input before fd access. Every non-null compatible caller supplies one live, unfreed,
 exclusively held connection with no live reader/writer shell derived from it and no other value
@@ -1469,11 +1470,12 @@ and per-unit output. SIGPIPE safety then hardens the existing
 connection-derived writer in place with `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and
 builder write overloads reach that path, file and standard-stream writers retain their existing
 path, and no writer ABI identity/count changes. The
-timeout substrate and writer hardening are separate prerequisite capabilities; the new row lands
+timeout substrate and writer hardening are separate prerequisite capabilities; the new row landed
 with its package consumer. Exact accepted contract: `impl/pkg-design/kv.md`; its first
 independent review found contract gaps, the fresh complete review found four remaining native/wire
 boundary gaps, and the next complete review found two P3 consistency gaps in the timeout action
 lists and malformed-state error partition. The following review found one remaining P2 in the
 pre-existing-derived-shell entry state, and its repair review found one P3 in the recursively
 reachable reader/writer/logger carrier owner graph. A fresh complete review accepted the fifth
-repair with no P0–P3 finding; implementation remains pending.
+repair with no P0–P3 finding; implementation then shipped the accepted package source and runtime
+row together.

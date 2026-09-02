@@ -23,8 +23,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 audit_target="$work_dir/audit-target"
 archive="$audit_target/debug/libalign_runtime.a"
 sed -nE 's/.*@(align_rt_[A-Za-z0-9_]+)\(.*/\1/p' "$golden" | sort -u > "$work_dir/base"
-if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 347 ]]; then
-  echo "test-runtime-abi-exports: declaration golden does not contain 347 base symbols" >&2
+if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 348 ]]; then
+  echo "test-runtime-abi-exports: declaration golden does not contain 348 base symbols" >&2
   exit 1
 fi
 
@@ -73,13 +73,13 @@ perl -ne '
   print join("|", $symbol, native_type($ret), @params), "\n";
 ' "$runtime_ir" | sort > "$work_dir/runtime-abi"
 
-if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 347 ]] \
-  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 347 ]]; then
-  echo "test-runtime-abi-exports: normalized base ABI does not contain 347 rows" >&2
+if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 348 ]] \
+  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 348 ]]; then
+  echo "test-runtime-abi-exports: normalized base ABI does not contain 348 rows" >&2
   exit 1
 fi
 diff -u "$work_dir/golden-abi" "$work_dir/runtime-abi"
-printf 'runtime-abi-signatures base 347\n'
+printf 'runtime-abi-signatures base 348\n'
 
 audit_case() {
   local label=$1
@@ -138,8 +138,8 @@ audit_case() {
   printf 'runtime-abi-exports %s %s\n' "$label" "$expected_count"
 }
 
-audit_case base "" 347
-audit_case alloc alloc-count 351
-audit_case par par-map-probe 351
-audit_case task task-group-probe 347
-audit_case all alloc-count,par-map-probe,task-group-probe 355
+audit_case base "" 348
+audit_case alloc alloc-count 352
+audit_case par par-map-probe 352
+audit_case task task-group-probe 348
+audit_case all alloc-count,par-map-probe,task-group-probe 356
