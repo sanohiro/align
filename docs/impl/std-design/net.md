@@ -208,7 +208,7 @@ timeout-unarmed fds).
 The **connect** deadline lives in `align_rt_tcp_connect`: a positive `timeout_ns` uses
 non-blocking mode; immediate zero succeeds, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` enter
 `poll(POLLOUT)`, and every other immediate errno is mapped. Readiness is resolved through
-`SO_ERROR`; poll timeout returns `AL_TIMEOUT`. The inactive prerequisite below makes mode
+`SO_ERROR`; poll timeout returns `AL_TIMEOUT`. The implemented prerequisite below makes mode
 installation and restoration checked.
 `timeout_ns == 0` preserves the current blocking connect exactly. `std.http` passes its effective
 request timeout through this same parameter. The raw-`net` `tcp.connect(host, port)` signature stays
@@ -232,11 +232,11 @@ expiry. A conn whose peer accepts then never sends, with `read_timeout_ns` set �
 
 ---
 
-## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **Status:** first independently useful prerequisite; accepted design, implementation pending.
-> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
-> row count changes.
+> **Status:** implemented as the first independently useful prerequisite. It changes no public
+> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count. The planned
+> checked package row and prerequisite 2 remain inactive.
 
 For every usable resolver address and positive `timeout_ns`, `align_rt_tcp_connect` records a
 monotonic start and positive `Duration` budget immediately before the first `F_GETFL`, then checks
@@ -333,6 +333,12 @@ last-status failure class, symbolic EAI branch, mixed-address close/continuation
 on every published connection, exact-timeval and pre-armed receive/send state plus caller-retirement products, HTTP
 plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
 
+The shipped direct owners are `socket_timeout_timeval_quantization`,
+`tcp_connect_timeout_budget_quantization`, `tcp_connect_transition_and_address_matrix`,
+`tcp_connect_resolver_status_and_order_matrix`, `tcp_connect_positive_timeout_publishes_blocking_fd`,
+`http_timeout_quantization_plain_tls_pool_rearm`, and `command_timeout_budget_quantization`, plus the
+pre-existing end-to-end timeout and command cleanup/precedence owners.
+
 ---
 
 ## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
@@ -379,7 +385,7 @@ discarding the setting. Linux/macOS subprocess closed-peer tests cover direct sl
 overloads, logger, and `io.copy` routes and must return `Error`, never die from SIGPIPE. Direct
 partial/EINTR/timeout/zero-progress tests and file/std writer parity remain separate owners.
 
-The checked timeout substrate lands first and the writer hardening second. After both, the planned
-`TcpConnSetIoTimeout` row and its `pkg.kv` package consumer activate together. Exact package
-consumption and the implementation boundary are in `../pkg-design/kv.md`; the one-row reservation
+The checked timeout substrate has landed; writer hardening is the second prerequisite. After it,
+the planned `TcpConnSetIoTimeout` row and its `pkg.kv` package consumer activate together. Exact
+package consumption and the implementation boundary are in `../pkg-design/kv.md`; the one-row reservation
 and unchanged prerequisite ABI identities are recorded in `../20-runtime-abi-ledger.md`.

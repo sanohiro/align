@@ -107,10 +107,11 @@ harness returns. The independent driver codecs and the runtime codecs both pin t
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
 
-## Planned `pkg.kv` TCP prerequisites and substrate (accepted design; inactive until implementation)
+## `pkg.kv` TCP prerequisites and substrate (prerequisite 1 implemented 2026-09-02)
 
-The first independently useful prerequisite hardens the shipped shared timeout substrate without
-changing an ABI identity. For every usable address and positive `timeout_ns`,
+The first independently useful prerequisite is implemented in the shipped shared timeout substrate
+without changing an ABI identity. Prerequisite 2 and the planned checked package row remain
+inactive. For every usable address and positive `timeout_ns`,
 `align_rt_tcp_connect` records a monotonic start and positive `Duration` budget immediately before
 the first `F_GETFL`, then checks `F_GETFL` and `F_SETFL(flags | O_NONBLOCK)` before `connect`.
 Either failure records its fixed errno-mapped status, closes that candidate, and continues to the
@@ -167,6 +168,12 @@ zero-result recheck versus exhausted/no-call poll, `EINPROGRESS`/`EAGAIN`/`EWOUL
 immediate errno, EINTR remainder recomputation, readiness at the deadline, every resolver skip and
 last-status failure class, candidate close/continuation, a blocking-mode probe on every published
 connection, HTTP plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
+
+The direct runtime owners are `socket_timeout_timeval_quantization`,
+`tcp_connect_timeout_budget_quantization`, `tcp_connect_transition_and_address_matrix`,
+`tcp_connect_resolver_status_and_order_matrix`, `tcp_connect_positive_timeout_publishes_blocking_fd`,
+`http_timeout_quantization_plain_tls_pool_rearm`, and `command_timeout_budget_quantization`. No
+registry declaration, source-reachable symbol, ABI count, or runtime export changed at this boundary.
 
 The second independently useful prerequisite repairs the already-shipped
 `TcpConnWriter` -> `IoWriterWrite` path rather than adding a second write ABI. The private runtime
@@ -273,8 +280,8 @@ reuse activate atomically. It increases the unkeyed/base/maximum counts by one a
 by zero: the exact keyed/base/maximum counts become 330/348/356. It reuses an existing shape, so
 A123 remains the next unreserved shape. Until then it is not a runtime export or legal
 compatible-native definition. The unkeyed count becomes eighteen, thirteen of which are
-source-reachable. The timeout hardening lands first, the writer hardening second, and the new row
-activates atomically with its `pkg.kv` consumer.
+source-reachable. The timeout hardening has landed; writer hardening is the second prerequisite, and
+the new row then activates atomically with its `pkg.kv` consumer.
 Exact public consumption, poisoning, and owner matrix: `pkg-design/kv.md`.
 
 ## Implemented std.log extension (2026-08-31)

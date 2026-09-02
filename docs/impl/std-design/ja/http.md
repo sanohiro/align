@@ -1023,11 +1023,11 @@ errno)、`Error.Denied`(TLS 検証失敗)、4xx/5xx ステータスを運ぶ通�
   写す(それ以外は `WANT_*` はリトライ、`SYSCALL` は errno を写す — 従来通りで、`ns == 0` はバイト一致・
   スピンなし)。ハンドシェイク(`SSL_connect`)も同じ arm された fd 上で走り、同一条件を `AL_TIMEOUT` に写す。
 
-### checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+### checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **ステータス:** accepted design。implementation まで inactive。上の shipped timeout surface と ABI は
-> 変更せず、この prerequisite は public signature、compiler operation、runtime symbol、ABI shape、
-> registry key、row count のいずれも変更しない。
+> **ステータス:** implemented。上の shipped timeout surface と ABI は変更せず、この prerequisite は
+> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count のいずれも
+> 変更しない。planned checked package row は inactive のまま。
 
 HTTP connect は `net.md` に記録した checked net-rail transition を継承する。各 usable resolver
 address と正の effective timeout について、runtime は最初の `F_GETFL` 直前に monotonic start と
@@ -1054,7 +1054,9 @@ acceptance owner は exact/next/maximum ns-to-ms と ns-to-us boundary、failed 
 installation/restoration、immediate errno class、`EINTR`、early-zero と exhausted/no-call の poll behavior、
 expiry 時に in-flight の readiness、pooled connection の
 re-arm/zero-clear、normalized `timeval` field、no early expiry を覆う。これらは上の shipped Request 2 test ではなく
-prerequisite とともに activate する。
+prerequisite とともに active になった。`http_timeout_quantization_plain_tls_pool_rearm` は fresh plaintext、
+dependent response-stream、TLS handshake、request I/O、pooled rearm、pooled zero-clear で normalized
+receive/send pair を直接観測する。
 
 ### Test / gate
 
@@ -1067,10 +1069,11 @@ accept 後無応答 → `AL_TIMEOUT`(read 経路、`SO_RCVTIMEO` + 平文写像�
 ループバックブラックホール → `AL_TIMEOUT`(connect 経路、Linux)、高速応答は無影響 — さらに
 `crates/align_driver/tests/http_timeout.rs` の Align 表面経由 E2E(`cl.timeout` / `r.timeout` →
 サイレントサーバで `Err(Error.Timeout)`、リクエスト単位上書き、高速時は無効、および unbound レシーバ / 非 i64
-のコンパイルゲート)。TLS のタイムアウト経路は共有 `SO_*TIMEO` 機構と平文 E2E でカバーされる(正の TLS
-ラウンドトリップはドライバハーネスから駆動できない — `#[cfg(test)]` の信頼フックがそこには無い、スライス 5 の
-記録どおり);TLS トランスポートが唯一異なる `tls_read`/`tls_write_all` の `has_deadline` 写像は上に記述した。
-既存の http/TLS/pool/get_many/stream テストはすべて不変で通る(有効 0 のバイト一致不変条件)。
+のコンパイルゲート)。上の runtime owner は positive TLS handshake/request arm と pooled TLS zero-clear を
+カバーする。positive TLS round-trip はドライバハーネスから駆動できない。`#[cfg(test)]` の信頼フックがそこには
+無いためで、スライス 5 の記録どおりである。TLS transport が唯一異なる `tls_read`/`tls_write_all` の
+`has_deadline` mapping は上に記述した。既存の http/TLS/pool/get_many/stream テストはすべて不変で通る
+(effective-0 の byte-identical invariant)。
 
 ## Client response framing (align-llm Request 4 — DESIGNED + IMPLEMENTED 2026-08-14)
 

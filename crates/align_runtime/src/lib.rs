@@ -790,7 +790,7 @@ const SO_SNDTIMEO: i32 = 21; // Linux
 const SO_SNDTIMEO: i32 = 0x1005; // macOS/BSD
 
 // `EINPROGRESS` — a non-blocking `connect` returns this errno to mean "handshake started, poll for
-// completion". Differs between Linux and macOS/BSD. Used only by [`connect_with_deadline`].
+// completion". Differs between Linux and macOS/BSD. Used by the checked TCP candidate state machine.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const EINPROGRESS: i32 = 115; // Linux
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -815,88 +815,342 @@ pub struct TcpConn {
     fd: i32,
 }
 
-/// Establish a non-blocking `connect` to `addr` bounded by an ns deadline (the connect-timeout
-/// substrate, net.md "I/O timeouts"). Sets the socket `O_NONBLOCK`, issues `connect` (expecting
-/// `EINPROGRESS`), `poll`s `POLLOUT` until the deadline, then reads `SO_ERROR` to learn the outcome.
-/// On success restores blocking mode (so the resulting fd behaves exactly like a normal blocking
-/// connection) and returns `Ok(())`. Returns `Err(AL_TIMEOUT)` when the deadline expires before the
-/// handshake completes, or `Err(<mapped errno>)` for a `connect`/`poll`/`SO_ERROR` failure. Does NOT
-/// close `fd` — the caller closes it on `Err` (and tries the next candidate address). `timeout_ns`
-/// must be `> 0` (the caller's `== 0` case takes the plain blocking path instead). A `timeout_ns` so
-/// large the deadline `Instant` would overflow falls back to an unbounded `poll(-1)` rather than
-/// panicking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpConnectOutcome {
+    Connected,
+    Failed { status: i32, in_progress: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpPollOutcome {
+    Ready,
+    Zero,
+    Interrupted,
+    Failed(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpSocketErrorOutcome {
+    Connected,
+    GetFailed(i32),
+    ConnectFailed(i32),
+}
+
+/// Native operations and monotonic-clock observations used by the TCP connect state machine.
+/// Generic static dispatch lets unit tests script every transition without adding production global
+/// state, heap allocation, or an indirect call.
+trait TcpConnectOps {
+    type Mark: Copy;
+
+    fn mark(&mut self) -> Self::Mark;
+    fn elapsed_since(&mut self, mark: Self::Mark) -> std::time::Duration;
+
+    unsafe fn resolve(
+        &mut self,
+        node: *const u8,
+        service: *const u8,
+        hints: &AddrInfo,
+    ) -> Result<*mut AddrInfo, i32>;
+    unsafe fn free_addresses(&mut self, addresses: *mut AddrInfo);
+    unsafe fn socket(&mut self, family: i32, ty: i32, protocol: i32) -> Result<i32, i32>;
+    unsafe fn get_fl(&mut self, fd: i32) -> Result<i32, i32>;
+    unsafe fn set_fl(&mut self, fd: i32, flags: i32) -> Result<(), i32>;
+    unsafe fn connect(&mut self, fd: i32, addr: *const u8, addrlen: u32) -> TcpConnectOutcome;
+    unsafe fn poll_writable(&mut self, fd: i32, timeout_ms: i32) -> TcpPollOutcome;
+    unsafe fn socket_error(&mut self, fd: i32) -> TcpSocketErrorOutcome;
+    unsafe fn close(&mut self, fd: i32);
+}
+
+struct NativeTcpConnectOps;
+
+fn tcp_connect_error_outcome(error: &std::io::Error) -> TcpConnectOutcome {
+    TcpConnectOutcome::Failed {
+        status: io_error_to_status(error),
+        in_progress: error.raw_os_error() == Some(EINPROGRESS)
+            || error.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
+impl TcpConnectOps for NativeTcpConnectOps {
+    type Mark = std::time::Instant;
+
+    #[inline]
+    fn mark(&mut self) -> Self::Mark {
+        std::time::Instant::now()
+    }
+
+    #[inline]
+    fn elapsed_since(&mut self, mark: Self::Mark) -> std::time::Duration {
+        mark.elapsed()
+    }
+
+    #[inline]
+    unsafe fn resolve(
+        &mut self,
+        node: *const u8,
+        service: *const u8,
+        hints: &AddrInfo,
+    ) -> Result<*mut AddrInfo, i32> {
+        let mut addresses = core::ptr::null_mut();
+        let rc = unsafe { getaddrinfo(node, service, hints, &mut addresses) };
+        if rc == 0 { Ok(addresses) } else { Err(rc) }
+    }
+
+    #[inline]
+    unsafe fn free_addresses(&mut self, addresses: *mut AddrInfo) {
+        unsafe { freeaddrinfo(addresses) };
+    }
+
+    #[inline]
+    unsafe fn socket(&mut self, family: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
+        let fd = unsafe { cloexec_socket(family, ty, protocol) };
+        if fd >= 0 {
+            Ok(fd)
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        }
+    }
+
+    #[inline]
+    unsafe fn get_fl(&mut self, fd: i32) -> Result<i32, i32> {
+        let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+        if flags >= 0 {
+            Ok(flags)
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        }
+    }
+
+    #[inline]
+    unsafe fn set_fl(&mut self, fd: i32, flags: i32) -> Result<(), i32> {
+        if unsafe { fcntl(fd, F_SETFL, flags) } >= 0 {
+            Ok(())
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        }
+    }
+
+    #[inline]
+    unsafe fn connect(&mut self, fd: i32, addr: *const u8, addrlen: u32) -> TcpConnectOutcome {
+        if unsafe { connect(fd, addr, addrlen) } == 0 {
+            return TcpConnectOutcome::Connected;
+        }
+        let error = std::io::Error::last_os_error();
+        tcp_connect_error_outcome(&error)
+    }
+
+    #[inline]
+    unsafe fn poll_writable(&mut self, fd: i32, timeout_ms: i32) -> TcpPollOutcome {
+        let mut pfd = PollFd { fd, events: POLLOUT, revents: 0 };
+        let rc = unsafe { poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            TcpPollOutcome::Ready
+        } else if rc == 0 {
+            TcpPollOutcome::Zero
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                TcpPollOutcome::Interrupted
+            } else {
+                TcpPollOutcome::Failed(io_error_to_status(&error))
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn socket_error(&mut self, fd: i32) -> TcpSocketErrorOutcome {
+        let mut error = 0i32;
+        let mut len = core::mem::size_of::<i32>() as u32;
+        if unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut error as *mut i32 as *mut core::ffi::c_void,
+                &mut len,
+            )
+        } != 0
+        {
+            return TcpSocketErrorOutcome::GetFailed(io_error_to_status(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        if error == 0 {
+            TcpSocketErrorOutcome::Connected
+        } else {
+            TcpSocketErrorOutcome::ConnectFailed(io_error_to_status(
+                &std::io::Error::from_raw_os_error(error),
+            ))
+        }
+    }
+
+    #[inline]
+    unsafe fn close(&mut self, fd: i32) {
+        unsafe { close(fd) };
+    }
+}
+
+/// Return the strictly-positive remainder of a start-plus-budget timeout without ever forming an
+/// absolute `start + budget`. `None` means the budget is exhausted; an equal elapsed duration is
+/// already exhausted and therefore cannot authorize a final zero-timeout native wait.
+fn remaining_timeout_budget(
+    budget: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    budget.checked_sub(elapsed).filter(|remaining| !remaining.is_zero())
+}
+
+/// Restore a successfully connected socket to blocking mode. Both transitions are checked: a
+/// failure means this candidate cannot be published and the address loop closes it.
+unsafe fn restore_tcp_blocking<O: TcpConnectOps>(ops: &mut O, fd: i32) -> Result<(), i32> {
+    let flags = unsafe { ops.get_fl(fd) }?;
+    unsafe { ops.set_fl(fd, flags & !O_NONBLOCK) }
+}
+
+/// Establish one positive-timeout candidate. The monotonic mark is captured immediately before the
+/// first checked `F_GETFL`; every wait subtracts elapsed time from the positive `Duration` budget.
+/// Immediate connect results and positive readiness win simultaneous exhaustion. The caller owns and
+/// closes `fd` on every `Err`.
+unsafe fn tcp_connect_candidate_with<O: TcpConnectOps>(
+    ops: &mut O,
+    fd: i32,
+    addr: *const u8,
+    addrlen: u32,
+    timeout_ns: i64,
+) -> Result<(), i32> {
+    let Ok(timeout_ns) = u64::try_from(timeout_ns) else { return Err(AL_INVALID) };
+    let budget = std::time::Duration::from_nanos(timeout_ns);
+    let start = ops.mark();
+    let flags = unsafe { ops.get_fl(fd) }?;
+    unsafe { ops.set_fl(fd, flags | O_NONBLOCK) }?;
+
+    match unsafe { ops.connect(fd, addr, addrlen) } {
+        TcpConnectOutcome::Connected => return unsafe { restore_tcp_blocking(ops, fd) },
+        TcpConnectOutcome::Failed { status, in_progress: false } => return Err(status),
+        TcpConnectOutcome::Failed { in_progress: true, .. } => {}
+    }
+
+    loop {
+        let Some(remaining) = remaining_timeout_budget(budget, ops.elapsed_since(start)) else {
+            return Err(AL_TIMEOUT);
+        };
+        let Some(timeout_ms) = poll_timeout_ms(remaining) else {
+            return Err(AL_TIMEOUT);
+        };
+        match unsafe { ops.poll_writable(fd, timeout_ms) } {
+            TcpPollOutcome::Ready => break,
+            TcpPollOutcome::Zero | TcpPollOutcome::Interrupted => continue,
+            TcpPollOutcome::Failed(status) => return Err(status),
+        }
+    }
+
+    match unsafe { ops.socket_error(fd) } {
+        TcpSocketErrorOutcome::Connected => {}
+        TcpSocketErrorOutcome::GetFailed(status)
+        | TcpSocketErrorOutcome::ConnectFailed(status) => return Err(status),
+    }
+    unsafe { restore_tcp_blocking(ops, fd) }
+}
+
+/// Walk one successful resolver list in native order. Unsupported/null/zero-length entries are
+/// skipped without changing `last_status`; every opened failed candidate is closed exactly once.
+unsafe fn tcp_connect_addresses_with<O: TcpConnectOps>(
+    ops: &mut O,
+    addresses: *mut AddrInfo,
+    timeout_ns: i64,
+) -> Result<i32, i32> {
+    let mut last_status = AL_INVALID;
+    let mut current = addresses;
+    while !current.is_null() {
+        // Copy the native node fields before calling back into `ops`. Test adapters may own the
+        // resolver list themselves, so retaining `&*current` across a mutable adapter call would
+        // create an overlapping shared/mutable borrow even though the native list is immutable.
+        let family = unsafe { (*current).ai_family };
+        let socktype = unsafe { (*current).ai_socktype };
+        let protocol = unsafe { (*current).ai_protocol };
+        let addr = unsafe { (*current).ai_addr };
+        let addrlen = unsafe { (*current).ai_addrlen };
+        let next = unsafe { (*current).ai_next };
+        if (family != AF_INET && family != AF_INET6) || addr.is_null() || addrlen == 0
+        {
+            current = next;
+            continue;
+        }
+        let fd = match unsafe { ops.socket(family, socktype, protocol) } {
+            Ok(fd) => fd,
+            Err(status) => {
+                last_status = status;
+                current = next;
+                continue;
+            }
+        };
+        let connected = if timeout_ns > 0 {
+            unsafe { tcp_connect_candidate_with(ops, fd, addr, addrlen, timeout_ns) }
+        } else {
+            match unsafe { ops.connect(fd, addr, addrlen) } {
+                TcpConnectOutcome::Connected => Ok(()),
+                TcpConnectOutcome::Failed { status, .. } => Err(status),
+            }
+        };
+        match connected {
+            Ok(()) => return Ok(fd),
+            Err(status) => {
+                last_status = status;
+                unsafe { ops.close(fd) };
+            }
+        }
+        current = next;
+    }
+    Err(last_status)
+}
+
+/// Resolve and connect, freeing every non-null successful resolver list exactly once before return.
+unsafe fn tcp_connect_fd_with<O: TcpConnectOps>(
+    ops: &mut O,
+    host: *const u8,
+    service: *const u8,
+    timeout_ns: i64,
+) -> Result<i32, i32> {
+    let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    let addresses = unsafe { ops.resolve(host, service, &hints) }.map_err(eai_to_status)?;
+    let result = unsafe { tcp_connect_addresses_with(ops, addresses, timeout_ns) };
+    if !addresses.is_null() {
+        unsafe { ops.free_addresses(addresses) };
+    }
+    result
+}
+
+/// Validate the raw TCP ABI inputs, clear the publication slot, build transient resolver strings,
+/// and return one connected blocking fd. The caller alone performs keepalive setup and publication.
 ///
 /// # Safety
-/// `fd` must be a valid open socket; `addr`/`addrlen` a valid `sockaddr` (as `getaddrinfo` filled).
-unsafe fn connect_with_deadline(fd: i32, addr: *const u8, addrlen: u32, timeout_ns: i64) -> Result<(), i32> {
-    // Deadline = now + timeout_ns. `checked_add` yields `None` on overflow (a multi-century `ns`);
-    // that degrades to an unbounded `poll` below rather than panicking (net.md: "a huge ns falling
-    // back to no-bound is fine, never panic"). `timeout_ns > 0` is the caller's contract, so the
-    // `as u64` cast is exact.
-    let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_nanos(timeout_ns as u64));
-    // Arm non-blocking so `connect` returns immediately (`EINPROGRESS`) and the `poll` owns the wait.
-    let _ = unsafe { set_nonblocking(fd) };
-    let rc = unsafe { connect(fd, addr, addrlen) };
-    if rc == 0 {
-        // Rare: an immediate connect (e.g. a loopback peer already listening). Restore blocking.
-        unsafe { clear_nonblocking(fd) };
-        return Ok(());
+/// `host` must describe a valid byte range for `host_len`; a non-null `out` must point to a writable
+/// `*mut TcpConn` slot.
+unsafe fn tcp_connect_validated_fd_with<O: TcpConnectOps>(
+    ops: &mut O,
+    host: *const u8,
+    host_len: i64,
+    port: i64,
+    timeout_ns: i64,
+    out: *mut *mut TcpConn,
+) -> Result<i32, i32> {
+    if out.is_null() {
+        return Err(AL_INVALID);
     }
-    let e = std::io::Error::last_os_error();
-    // `EINPROGRESS` (or, defensively, an `EAGAIN`/`EWOULDBLOCK` some stacks report) = handshake
-    // underway; poll for completion. Any other errno is an immediate hard failure for this address.
-    let in_progress = e.raw_os_error() == Some(EINPROGRESS) || e.kind() == std::io::ErrorKind::WouldBlock;
-    if !in_progress {
-        return Err(io_error_to_status(&e));
+    unsafe { *out = core::ptr::null_mut() };
+    if !(1..=65535).contains(&port) {
+        return Err(AL_INVALID);
     }
-    // Wait for the socket to become writable (connect complete) or the deadline to pass.
-    loop {
-        let timeout_ms = match deadline {
-            Some(d) => match poll_timeout_ms(d.saturating_duration_since(std::time::Instant::now())) {
-                Some(ms) => ms,
-                None => return Err(AL_TIMEOUT), // deadline already reached
-            },
-            None => -1, // overflowed deadline: unbounded wait (never panics)
-        };
-        let mut pfd = PollFd { fd, events: POLLOUT, revents: 0 };
-        let prc = unsafe { poll(&mut pfd as *mut PollFd, 1, timeout_ms) };
-        if prc < 0 {
-            let pe = std::io::Error::last_os_error();
-            if pe.kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: re-poll (deadline recomputed at the top)
-            }
-            return Err(io_error_to_status(&pe));
-        }
-        if prc == 0 {
-            // `poll` timed out — with a deadline set, the clamp-to-1ms wait is always >= the true
-            // remaining, so a `0` return means the instant has passed (mirrors `drain_two_pipes`).
-            return Err(AL_TIMEOUT);
-        }
-        break; // POLLOUT (or POLLERR/POLLHUP) — read SO_ERROR to learn the actual outcome.
-    }
-    // Read the pending connect error. A writable socket with `SO_ERROR == 0` connected cleanly; a
-    // nonzero value is the connect errno (`ECONNREFUSED`, `EHOSTUNREACH`, ...). This is the same
-    // status the blocking `connect` would have returned, so callers see identical `Error.Code`s.
-    let mut soerr: i32 = 0;
-    let mut optlen: u32 = core::mem::size_of::<i32>() as u32;
-    let g = unsafe {
-        getsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_ERROR,
-            &mut soerr as *mut i32 as *mut core::ffi::c_void,
-            &mut optlen,
-        )
+    let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
+        return Err(AL_INVALID);
     };
-    if g != 0 {
-        return Err(io_error_to_status(&std::io::Error::last_os_error()));
-    }
-    if soerr != 0 {
-        return Err(io_error_to_status(&std::io::Error::from_raw_os_error(soerr)));
-    }
-    // Connected. Restore blocking mode so the M9 reader/writer byte path sees a normal blocking fd.
-    unsafe { clear_nonblocking(fd) };
-    Ok(())
+    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
+        return Err(AL_INVALID);
+    };
+    unsafe { tcp_connect_fd_with(ops, c_host.as_ptr().cast(), c_service.as_ptr().cast(), timeout_ns) }
 }
 
 /// `tcp.connect(host, port)` — resolve `host` via `getaddrinfo` (AF_UNSPEC — both IPv4 and IPv6,
@@ -906,15 +1160,16 @@ unsafe fn connect_with_deadline(fd: i32, addr: *const u8, addrlen: u32, timeout_
 /// on success, else a status the shared table maps: `AL_INVALID` for a bad `port` (outside
 /// `1..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`; `AL_CODE + |eai|`
 /// for another resolver failure; or the last `connect`/`socket` errno (via [`io_error_to_status`])
-/// when every candidate address failed. Leaves `*out = null` on failure. `freeaddrinfo` runs on
-/// every path (no leak).
+/// when every candidate address failed. Leaves `*out = null` on failure. Every non-null successful
+/// resolver list is released before return.
 ///
 /// `timeout_ns` bounds each candidate's `connect`: `0` (the default the raw `tcp.connect` surface
 /// passes — Align has no optional args) preserves the exact blocking `connect` (a hung/black-holed
 /// peer blocks indefinitely, the pre-timeout behavior); a **positive** value bounds the handshake
-/// with a `poll` deadline via [`connect_with_deadline`], returning `AL_TIMEOUT` (`Error.Timeout`) if
-/// no address connects in time. A **negative** `timeout_ns` is treated as `0` (no bound). `std.http`
-/// threads its effective request timeout through this same parameter.
+/// with a monotonic start-plus-budget `poll` loop, returning `AL_TIMEOUT` (`Error.Timeout`) if no
+/// address connects in time. A **negative** `timeout_ns` is treated as `0` (no bound). `std.http`
+/// threads its effective request timeout through this same parameter. The positive budget is per
+/// usable resolver address; DNS and the total multi-address traversal remain unbounded.
 ///
 /// v1 makes no `EINTR` retry on the blocking `connect` (an interrupted attempt fails that address and
 /// moves on to the next candidate); the deadline path does retry `EINTR` on `poll`.
@@ -924,93 +1179,27 @@ unsafe fn connect_with_deadline(fd: i32, addr: *const u8, addrlen: u32, timeout_
 /// `*mut TcpConn` slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, port: i64, timeout_ns: i64, out: *mut *mut TcpConn) -> i32 {
-    if out.is_null() {
-        return AL_INVALID;
-    }
-    unsafe { *out = core::ptr::null_mut() };
-    // A TCP port is 1..=65535 — reject out-of-range (0, negative, > 65535) as a bad argument rather
-    // than aborting or letting it wrap into a valid port.
-    if !(1..=65535).contains(&port) {
-        return AL_INVALID;
-    }
-    // Validate the ABI view and construct getaddrinfo's NUL-terminated input directly. An invalid
-    // UTF-8, oversized, or interior-NUL host is a bad name.
-    let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
-        return AL_INVALID;
-    };
-    // The port passed to `getaddrinfo` as a numeric service string — it fills the correct
-    // `sin_port`/`sin6_port` per family, so no manual `sockaddr` surgery is needed. `port` is in
-    // `1..=65535`, so the decimal string never contains an interior NUL.
-    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
-        return AL_INVALID;
+    let mut ops = NativeTcpConnectOps;
+    let fd = match unsafe { tcp_connect_validated_fd_with(&mut ops, host, host_len, port, timeout_ns, out) } {
+        Ok(fd) => fd,
+        Err(status) => return status,
     };
 
-    // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (TCP).
-    let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), c_service.as_ptr().cast(), &hints, &mut res) };
-    if rc != 0 {
-        return eai_to_status(rc);
+    // Connected (either path). Enable TCP keepalive (best-effort — ignore the result: an unset
+    // keepalive does not make the connection unusable). A positive-timeout candidate reached here
+    // only after checked restoration to blocking mode.
+    let on = 1i32;
+    unsafe {
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &on as *const i32 as *const core::ffi::c_void,
+            core::mem::size_of::<i32>() as u32,
+        );
+        *out = Box::into_raw(Box::new(TcpConn { fd }));
     }
-
-    // Try each resolved address in order. `freeaddrinfo(res)` runs before every return below.
-    let mut last_status = AL_INVALID; // if the list is empty / every family unsupported
-    let mut cur = res;
-    while !cur.is_null() {
-        let ai = unsafe { &*cur };
-        // Only AF_INET / AF_INET6 with a non-null `sockaddr` are connectable; skip anything else.
-        if (ai.ai_family != AF_INET && ai.ai_family != AF_INET6) || ai.ai_addr.is_null() || ai.ai_addrlen == 0 {
-            cur = ai.ai_next;
-            continue;
-        }
-        let fd = unsafe { cloexec_socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
-        if fd < 0 {
-            last_status = io_error_to_status(&std::io::Error::last_os_error());
-            cur = ai.ai_next;
-            continue;
-        }
-        // Establish the connection. A positive `timeout_ns` bounds the handshake with a `poll`
-        // deadline; `timeout_ns <= 0` takes the EXACT original blocking `connect` path (byte-identical
-        // to before the timeout parameter existed). Either way, a failure records the mapped status,
-        // closes this fd, and moves on to the next candidate address.
-        if timeout_ns > 0 {
-            if let Err(status) = unsafe { connect_with_deadline(fd, ai.ai_addr, ai.ai_addrlen, timeout_ns) } {
-                last_status = status;
-                unsafe { close(fd) };
-                cur = ai.ai_next;
-                continue;
-            }
-        } else {
-            let rc = unsafe { connect(fd, ai.ai_addr, ai.ai_addrlen) };
-            if rc != 0 {
-                // Failed — record the errno and close this fd before trying the next address.
-                last_status = io_error_to_status(&std::io::Error::last_os_error());
-                unsafe { close(fd) };
-                cur = ai.ai_next;
-                continue;
-            }
-        }
-        // Connected (either path). Enable TCP keepalive (best-effort — ignore the result: an unset
-        // keepalive does not make the connection unusable).
-        let on: i32 = 1;
-        unsafe {
-            setsockopt(
-                fd,
-                SOL_SOCKET,
-                SO_KEEPALIVE,
-                &on as *const i32 as *const core::ffi::c_void,
-                core::mem::size_of::<i32>() as u32,
-            );
-        }
-        unsafe { freeaddrinfo(res) };
-        unsafe { *out = Box::into_raw(Box::new(TcpConn { fd })) };
-        return 0;
-    }
-    unsafe { freeaddrinfo(res) };
-    last_status
+    0
 }
 
 /// Free a `tcp_conn`, closing its socket fd. Null-safe (a moved-out / never-initialised owned slot
@@ -1059,20 +1248,32 @@ pub unsafe extern "C" fn align_rt_tcp_conn_writer(c: *mut TcpConn) -> *mut Write
 
 /// Build the `struct timeval` for an `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline from a nanosecond count.
 /// `ns == 0` yields a zero `timeval` — the kernel reads that as "no timeout" (block forever), which
-/// is the intended "clear the deadline" semantics. For `ns > 0`, split into whole seconds and the
-/// microsecond remainder; a **sub-microsecond** positive `ns` (which would round to a zero `timeval`
-/// and thus silently mean "block forever") is clamped up to `1 µs` so a positive deadline is never
-/// accidentally infinite. `ns >= 0` is the caller's contract (a negative `ns` aborts before here).
+/// is the intended "clear the deadline" semantics. Every positive value rounds **up** to the next
+/// whole microsecond before normalizing into seconds plus a `0..=999_999` microsecond remainder, so
+/// the kernel timeout cannot expire before the requested ns value. `ns >= 0` is the caller's
+/// contract (a negative `ns` aborts before here).
 fn timeval_from_ns(ns: i64) -> Timeval {
     if ns == 0 {
         return Timeval { tv_sec: 0, tv_usec: 0 };
     }
-    let secs = ns / 1_000_000_000;
-    let usecs = (ns % 1_000_000_000) / 1_000;
-    // A positive `ns` under 1 µs rounds both fields to 0 — bump the microseconds to 1 so the option
-    // is a real (tiny) deadline, not the "block forever" zero `timeval`.
-    let usecs = if secs == 0 && usecs == 0 { 1 } else { usecs };
-    Timeval { tv_sec: secs as core::ffi::c_long, tv_usec: usecs as _ }
+    let Ok(ns) = u64::try_from(ns) else {
+        panic_abort("socket timeout: negative nanosecond value reached timeval conversion")
+    };
+    let total_us = ns.div_ceil(1_000);
+    let seconds = total_us / 1_000_000;
+    let microseconds = total_us % 1_000_000;
+    let Ok(tv_sec) = core::ffi::c_long::try_from(seconds) else {
+        panic_abort("socket timeout: nanosecond value does not fit native time_t")
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let Ok(tv_usec) = core::ffi::c_long::try_from(microseconds) else {
+        panic_abort("socket timeout: normalized microseconds do not fit native suseconds_t")
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let Ok(tv_usec) = core::ffi::c_int::try_from(microseconds) else {
+        panic_abort("socket timeout: normalized microseconds do not fit native suseconds_t")
+    };
+    Timeval { tv_sec, tv_usec }
 }
 
 /// Shared body of the two `tcp_conn` timeout setters: arm (`ns > 0`) or clear (`ns == 0`) the given
@@ -8289,7 +8490,7 @@ fn io_error_to_status(e: &std::io::Error) -> i32 {
 /// as [`io_error_to_status`] does), so no other error path changes.
 ///
 /// **One honest exception: inherited `O_NONBLOCK` on stdio.** The runtime creates every socket/file fd
-/// blocking (and `connect_with_deadline` restores blocking before a `tcp_conn` is handed out), but
+/// blocking (and the timed-connect state machine restores blocking before a `tcp_conn` is handed out), but
 /// `io.stdin`/`io.stdout`/`io.stderr` wrap the *inherited* fds 0/1/2, whose blocking mode this process
 /// does not control. `O_NONBLOCK` lives on the shared open-file-description and can leak in from a
 /// pipeline peer (the classic shell/Node "write to stdout: Resource temporarily unavailable"). In that
@@ -13970,26 +14171,6 @@ unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
     Ok(fds)
 }
 
-/// Set `O_NONBLOCK` on `fd`. The capture engine reads each ready fd in a loop until it
-/// would block (`EAGAIN`), which **requires** `O_NONBLOCK`: without it, that inner `read` blocks after
-/// the last available byte instead of returning to `poll`, and while blocked on one fd a full pipe on
-/// the *other* fd stalls the child — the exact two-pipe deadlock (P7) the concurrent drain exists to
-/// prevent. A failed `F_GETFL` or `F_SETFL` is therefore a hard pre-fork capture setup error. Socket
-/// callers that retain their historical best-effort mode explicitly ignore the returned error.
-///
-/// # Safety
-/// `fd` must be a valid open descriptor.
-unsafe fn set_nonblocking(fd: i32) -> Result<(), i32> {
-    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
-    if flags < 0 {
-        return Err(io_error_to_status(&std::io::Error::last_os_error()));
-    }
-    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
-        return Err(io_error_to_status(&std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureFailpoint {
@@ -14003,12 +14184,20 @@ enum CaptureFailpoint {
     FcntlSetStderr,
     Poll,
     PollAfterDeadline,
+    PollInterrupted,
+    PollZero,
+    PollZeroAfterDeadline,
+    PollZeroFdAfterDeadline,
+    PollErrorZeroFdAfterDeadline,
     PollNval,
     ReadStdout,
+    ReadStdoutAfterDeadline,
     ReadStderr,
     ReadBoth,
     Wait,
     WaitEchild,
+    WaitReapedAfterDeadline,
+    WaitEchildAfterDeadline,
 }
 
 #[cfg(test)]
@@ -14018,6 +14207,13 @@ std::thread_local! {
     static CAPTURE_LAST_PID: core::cell::Cell<i32> = const { core::cell::Cell::new(-1) };
     static CAPTURE_LAST_FDS: core::cell::Cell<(i32, i32)> = const { core::cell::Cell::new((-1, -1)) };
     static CAPTURE_CLOSE_MASK: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+    static CAPTURE_POLL_CALLS: core::cell::RefCell<Vec<(usize, i32)>> = const { core::cell::RefCell::new(Vec::new()) };
+    static CAPTURE_CLEANUP_KILL_CALLS: core::cell::RefCell<Vec<i32>> = const {
+        core::cell::RefCell::new(Vec::new())
+    };
+    static CAPTURE_TIMEOUT_ELAPSED_OVERRIDE: core::cell::Cell<Option<std::time::Duration>> = const {
+        core::cell::Cell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -14039,6 +14235,19 @@ fn set_capture_failpoint(failpoint: CaptureFailpoint) {
     CAPTURE_LAST_PID.with(|pid| pid.set(-1));
     CAPTURE_LAST_FDS.with(|fds| fds.set((-1, -1)));
     CAPTURE_CLOSE_MASK.with(|mask| mask.set(0));
+    CAPTURE_POLL_CALLS.with(|calls| calls.borrow_mut().clear());
+    CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().clear());
+    CAPTURE_TIMEOUT_ELAPSED_OVERRIDE.with(|elapsed| elapsed.set(None));
+}
+
+#[cfg(test)]
+fn expire_capture_timeout() {
+    CAPTURE_TIMEOUT_ELAPSED_OVERRIDE.with(|elapsed| elapsed.set(Some(std::time::Duration::MAX)));
+}
+
+#[cfg(test)]
+fn set_capture_timeout_elapsed(elapsed: std::time::Duration) {
+    CAPTURE_TIMEOUT_ELAPSED_OVERRIDE.with(|slot| slot.set(Some(elapsed)));
 }
 
 #[cfg(test)]
@@ -14090,8 +14299,29 @@ unsafe fn capture_poll(
 ) -> Result<i32, std::io::Error> {
     #[cfg(test)]
     {
+        CAPTURE_POLL_CALLS.with(|calls| calls.borrow_mut().push((count, timeout)));
         if capture_failpoint_take(CaptureFailpoint::PollAfterDeadline) {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            expire_capture_timeout();
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if capture_failpoint_take(CaptureFailpoint::PollInterrupted) {
+            set_capture_timeout_elapsed(std::time::Duration::from_nanos(1_000_001));
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+        if capture_failpoint_take(CaptureFailpoint::PollZero) {
+            set_capture_timeout_elapsed(std::time::Duration::from_nanos(1_000_001));
+            return Ok(0);
+        }
+        if capture_failpoint_take(CaptureFailpoint::PollZeroAfterDeadline) {
+            expire_capture_timeout();
+            return Ok(0);
+        }
+        if count == 0 && capture_failpoint_take(CaptureFailpoint::PollZeroFdAfterDeadline) {
+            expire_capture_timeout();
+            return Ok(0);
+        }
+        if count == 0 && capture_failpoint_take(CaptureFailpoint::PollErrorZeroFdAfterDeadline) {
+            expire_capture_timeout();
             return Err(std::io::Error::from_raw_os_error(5));
         }
         if capture_failpoint_take(CaptureFailpoint::Poll) {
@@ -14117,6 +14347,10 @@ unsafe fn capture_read(fd: i32, index: usize, bytes: &mut [u8]) -> Result<isize,
     let _ = index;
     #[cfg(test)]
     {
+        if index == 0 && capture_failpoint_take(CaptureFailpoint::ReadStdoutAfterDeadline) {
+            expire_capture_timeout();
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
         let selected = match index {
             0 => CaptureFailpoint::ReadStdout,
             _ => CaptureFailpoint::ReadStderr,
@@ -14138,6 +14372,20 @@ unsafe fn capture_read(fd: i32, index: usize, bytes: &mut [u8]) -> Result<isize,
 
 unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, std::io::Error> {
     #[cfg(test)]
+    if capture_failpoint_take(CaptureFailpoint::WaitReapedAfterDeadline) {
+        loop {
+            let rc = unsafe { waitpid(pid, raw, 0) };
+            if rc == pid {
+                expire_capture_timeout();
+                return Ok(rc);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(test)]
     if capture_failpoint_take(CaptureFailpoint::Wait) {
         return Err(std::io::Error::from_raw_os_error(5));
     }
@@ -14158,36 +14406,73 @@ unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, 
         }
         return Err(std::io::Error::from_raw_os_error(10));
     }
+    #[cfg(test)]
+    if capture_failpoint_take(CaptureFailpoint::WaitEchildAfterDeadline) {
+        // Model a competing reaper, then make the timeout observable before the ECHILD result is
+        // classified. Cleanup must remember that the direct child was already consumed.
+        unsafe { kill(pid, 9) };
+        loop {
+            let rc = unsafe { waitpid(pid, raw, 0) };
+            if rc == pid {
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        expire_capture_timeout();
+        return Err(std::io::Error::from_raw_os_error(10));
+    }
     let rc = unsafe { waitpid(pid, raw, options) };
     if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
 }
 
-/// Clear `O_NONBLOCK` on `fd` (restore blocking mode). The connect-timeout substrate sets the socket
-/// non-blocking to bound the `connect` with a `poll` deadline, then restores blocking here so the
-/// resulting `tcp_conn` behaves exactly like a normally-connected one (the M9 reader/writer byte path
-/// expects a blocking fd). Best-effort — a fresh, just-connected socket does not fail `F_SETFL`.
-///
-/// # Safety
-/// `fd` must be a valid open descriptor.
-unsafe fn clear_nonblocking(fd: i32) {
-    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
-    if flags >= 0 {
-        unsafe { fcntl(fd, F_SETFL, flags & !O_NONBLOCK) };
+/// A monotonic start plus a positive duration budget. Keeping these as separate values avoids the
+/// representability failure of an absolute `Instant + Duration`; the complete positive-i64 ns range
+/// therefore remains bounded.
+#[derive(Clone, Copy)]
+struct MonotonicTimeoutBudget {
+    start: std::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl MonotonicTimeoutBudget {
+    fn from_positive_ns(ns: i64) -> Option<Self> {
+        let ns = u64::try_from(ns).ok()?;
+        if ns == 0 {
+            return None;
+        }
+        Some(Self {
+            start: std::time::Instant::now(),
+            budget: std::time::Duration::from_nanos(ns),
+        })
+    }
+
+    fn remaining(&self) -> Option<std::time::Duration> {
+        let elapsed = self.start.elapsed();
+        #[cfg(test)]
+        let elapsed = CAPTURE_TIMEOUT_ELAPSED_OVERRIDE
+            .with(core::cell::Cell::get)
+            .unwrap_or(elapsed);
+        remaining_timeout_budget(self.budget, elapsed)
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.remaining().is_none()
     }
 }
 
-/// Convert a remaining `Duration` until a deadline into the `poll` timeout argument (milliseconds).
-/// Returns `None` when the deadline has already passed (the caller must treat that as a timeout);
-/// otherwise `Some(ms)` clamped to `>= 1` (never a busy-spin `0`, which would be `poll`-returns-
-/// immediately) and to `i32::MAX` (a multi-week wait saturates rather than overflowing the `c_int`).
+/// Convert a strictly positive remaining duration into one `poll` timeout chunk. Nanoseconds round
+/// up to milliseconds so the wait cannot expire early; values above `i32::MAX` ms saturate for this
+/// call and are recomputed after a zero result. `None` means exhausted, so callers never issue a
+/// final zero-timeout probe.
 fn poll_timeout_ms(remaining: std::time::Duration) -> Option<i32> {
     if remaining.is_zero() {
         return None;
     }
-    let ms = remaining.as_millis();
-    // ns→ms rounds DOWN, so a sub-millisecond remainder (`0 < remaining < 1ms`) yields `ms == 0`;
-    // clamp up to `1` so `poll` still waits (a `0` timeout would return immediately and busy-spin).
-    Some(ms.clamp(1, i32::MAX as u128) as i32)
+    let milliseconds = remaining.as_nanos().div_ceil(1_000_000);
+    let milliseconds = milliseconds.min(i32::MAX as u128);
+    i32::try_from(milliseconds).ok()
 }
 
 /// Capture storage selected before pipe creation. The bounded form owns one exact uninitialized
@@ -14309,8 +14594,12 @@ unsafe fn fail_command_capture(
     // EOF in that state, so there is no descendant writer left for this capture to terminate.
     if !child_reaped {
         if use_pgroup {
+            #[cfg(test)]
+            CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(-pid));
             unsafe { kill(-pid, 9) };
         }
+        #[cfg(test)]
+        CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(pid));
         unsafe { kill(pid, 9) };
     }
     unsafe {
@@ -14386,17 +14675,15 @@ unsafe fn run_command_capture(
     unsafe { close(out_pipe[1]); close(err_pipe[1]); }
     let mut out_fd = out_pipe[0];
     let mut err_fd = err_pipe[0];
-    let deadline = if cmd.timeout_ns > 0 {
-        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(cmd.timeout_ns as u64))
-    } else {
-        None
-    };
+    // Keep the accepted post-fork anchor, but store start + positive Duration rather than an
+    // absolute `Instant`. Even `i64::MAX` ns therefore remains bounded.
+    let timeout_budget = MonotonicTimeoutBudget::from_positive_ns(cmd.timeout_ns);
     let mut child_reaped = false;
     let mut raw_status = 0i32;
     let mut scratch = [0u8; 65536];
 
     loop {
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
             unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
             return Err(AL_TIMEOUT);
         }
@@ -14406,7 +14693,7 @@ unsafe fn run_command_capture(
         // hard I/O error must signal the direct pid. Once both streams reach EOF, untimed capture
         // blocks and timed capture checkpoints with WNOHANG until the shared deadline.
         if !child_reaped && out_fd < 0 && err_fd < 0 {
-            let wait_options = if deadline.is_none() { 0 } else { 1 }; // WNOHANG for timed EOF/live
+            let wait_options = if timeout_budget.is_none() { 0 } else { 1 }; // WNOHANG for timed EOF/live
             let wait_result = unsafe { capture_waitpid(pid, &mut raw_status, wait_options) };
             // Record consumption before a post-syscall deadline check. Otherwise a wait that reaps
             // at the deadline boundary could send SIGKILL to a newly recycled pid during cleanup.
@@ -14415,7 +14702,7 @@ unsafe fn run_command_capture(
             if wait_reaped {
                 child_reaped = true;
             }
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
                 unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             }
@@ -14441,15 +14728,26 @@ unsafe fn run_command_capture(
             }
             // Timed EOF/live-child: allocation-free short sleep, then another deadline/WNOHANG
             // checkpoint. Untimed EOF/live-child was handled by blocking waitpid above.
-            let Some(deadline) = deadline else {
+            let Some(timeout_budget) = timeout_budget.as_ref() else {
                 // The untimed EOF/live state uses blocking waitpid above, so reaching this branch is
                 // an internal state mismatch. Fail closed through the ordinary terminal cleanup.
                 unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                 return Err(AL_INVALID);
             };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let timeout = poll_timeout_ms(remaining).unwrap_or(1).min(1);
-            if let Err(error) = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) }
+            let Some(remaining) = timeout_budget.remaining() else {
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_TIMEOUT);
+            };
+            let Some(timeout) = poll_timeout_ms(remaining).map(|timeout| timeout.min(1)) else {
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_TIMEOUT);
+            };
+            let poll_result = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) };
+            if timeout_budget.is_exhausted() {
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_TIMEOUT);
+            }
+            if let Err(error) = poll_result
                 && error.kind() != std::io::ErrorKind::Interrupted
             {
                 let winning = io_error_to_status(&error);
@@ -14463,8 +14761,8 @@ unsafe fn run_command_capture(
             PollFd { fd: out_fd, events: POLLIN, revents: 0 },
             PollFd { fd: err_fd, events: POLLIN, revents: 0 },
         ];
-        let timeout = match deadline {
-            Some(d) => match poll_timeout_ms(d.saturating_duration_since(std::time::Instant::now())) {
+        let timeout = match timeout_budget.as_ref() {
+            Some(timeout_budget) => match timeout_budget.remaining().and_then(poll_timeout_ms) {
                 Some(ms) => ms,
                 None => {
                     unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
@@ -14474,7 +14772,7 @@ unsafe fn run_command_capture(
             None => -1,
         };
         let poll_result = unsafe { capture_poll(fds.as_mut_ptr(), 2, timeout) };
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
             unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
             return Err(AL_TIMEOUT);
         }
@@ -14493,7 +14791,7 @@ unsafe fn run_command_capture(
 
         // Fixed stdout-then-stderr traversal owns deterministic simultaneous-error precedence.
         for (index, pf) in fds.iter().copied().enumerate() {
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
                 unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             }
@@ -14506,12 +14804,12 @@ unsafe fn run_command_capture(
                 return Err(winning);
             }
             loop {
-                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
                     unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                     return Err(AL_TIMEOUT);
                 }
                 let read_result = unsafe { capture_read(pf.fd, index, &mut scratch) };
-                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
                     unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                     return Err(AL_TIMEOUT);
                 }
@@ -21198,12 +21496,60 @@ unsafe fn http_send_all(fd: i32, mut bytes: &[u8]) -> i32 {
 ///
 /// # Safety
 /// `fd` must be a valid connected socket.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HttpTimeoutCall {
+    fd: i32,
+    optname: i32,
+    ns: i64,
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HTTP_TIMEOUT_CALLS: core::cell::RefCell<Option<Vec<HttpTimeoutCall>>> = const {
+        core::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn begin_http_timeout_trace() {
+    HTTP_TIMEOUT_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+fn finish_http_timeout_trace() -> Vec<HttpTimeoutCall> {
+    HTTP_TIMEOUT_CALLS.with(|calls| calls.borrow_mut().take().expect("HTTP timeout trace was started"))
+}
+
+#[cfg(test)]
+fn record_http_timeout_call(fd: i32, optname: i32, ns: i64, tv: &Timeval) {
+    #[cfg(target_pointer_width = "64")]
+    let tv_sec = tv.tv_sec;
+    #[cfg(target_pointer_width = "32")]
+    let tv_sec = i64::from(tv.tv_sec);
+    #[cfg(all(not(any(target_os = "macos", target_os = "ios")), target_pointer_width = "64"))]
+    let tv_usec = tv.tv_usec;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_pointer_width = "32"))]
+    let tv_usec = i64::from(tv.tv_usec);
+    HTTP_TIMEOUT_CALLS.with(|calls| {
+        if let Some(calls) = calls.borrow_mut().as_mut() {
+            calls.push(HttpTimeoutCall { fd, optname, ns, tv_sec, tv_usec });
+        }
+    });
+}
+
 unsafe fn http_arm_conn_timeout(fd: i32, ns: i64) {
     let tv = timeval_from_ns(ns);
     let tvp = &tv as *const Timeval as *const core::ffi::c_void;
     let len = core::mem::size_of::<Timeval>() as u32;
     unsafe {
+        #[cfg(test)]
+        record_http_timeout_call(fd, SO_RCVTIMEO, ns, &tv);
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tvp, len);
+        #[cfg(test)]
+        record_http_timeout_call(fd, SO_SNDTIMEO, ns, &tv);
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tvp, len);
     }
 }
@@ -33099,6 +33445,795 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum ScriptedTcpStep {
+        Resolve(Result<(), i32>),
+        FreeAddresses,
+        Socket { family: i32, result: Result<i32, i32> },
+        Mark,
+        GetFl { fd: i32, result: Result<i32, i32> },
+        SetFl { fd: i32, flags: i32, result: Result<(), i32> },
+        Connect {
+            fd: i32,
+            outcome: TcpConnectOutcome,
+            advance: std::time::Duration,
+        },
+        Elapsed { advance: std::time::Duration },
+        Poll {
+            fd: i32,
+            timeout_ms: i32,
+            outcome: TcpPollOutcome,
+            advance: std::time::Duration,
+        },
+        SocketError { fd: i32, outcome: TcpSocketErrorOutcome },
+        Close(i32),
+    }
+
+    struct ScriptedTcpConnectOps {
+        now: std::time::Duration,
+        steps: std::collections::VecDeque<ScriptedTcpStep>,
+        addresses: Box<[AddrInfo]>,
+        _sockaddr: Box<[u8; 32]>,
+    }
+
+    impl ScriptedTcpConnectOps {
+        fn new(addresses: &[(i32, bool, u32)], steps: Vec<ScriptedTcpStep>) -> Self {
+            let mut sockaddr = Box::new([0u8; 32]);
+            let sockaddr_ptr = sockaddr.as_mut_ptr();
+            let mut nodes: Box<[AddrInfo]> = addresses
+                .iter()
+                .map(|&(family, has_address, address_len)| {
+                    let mut node: AddrInfo = unsafe { core::mem::zeroed() };
+                    node.ai_family = family;
+                    node.ai_socktype = SOCK_STREAM;
+                    node.ai_addr = if has_address { sockaddr_ptr } else { core::ptr::null_mut() };
+                    node.ai_addrlen = address_len;
+                    node
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let pointers: Vec<*mut AddrInfo> = nodes.iter_mut().map(|node| node as *mut AddrInfo).collect();
+            for (index, node) in nodes.iter_mut().enumerate() {
+                node.ai_next = pointers.get(index + 1).copied().unwrap_or(core::ptr::null_mut());
+            }
+            Self {
+                now: std::time::Duration::ZERO,
+                steps: steps.into(),
+                addresses: nodes,
+                _sockaddr: sockaddr,
+            }
+        }
+
+        fn head(&self) -> *mut AddrInfo {
+            self.addresses
+                .first()
+                .map_or(core::ptr::null_mut(), |node| node as *const AddrInfo as *mut AddrInfo)
+        }
+
+        fn next(&mut self, operation: &str) -> ScriptedTcpStep {
+            self.steps
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected TCP operation {operation}"))
+        }
+
+        fn advance(&mut self, duration: std::time::Duration) {
+            self.now = self.now.checked_add(duration).expect("scripted monotonic time fits Duration");
+        }
+
+        fn assert_finished(&self) {
+            assert!(self.steps.is_empty(), "unconsumed TCP script steps: {:?}", self.steps);
+        }
+    }
+
+    impl TcpConnectOps for ScriptedTcpConnectOps {
+        type Mark = std::time::Duration;
+
+        fn mark(&mut self) -> Self::Mark {
+            assert!(matches!(self.next("mark"), ScriptedTcpStep::Mark));
+            self.now
+        }
+
+        fn elapsed_since(&mut self, mark: Self::Mark) -> std::time::Duration {
+            let ScriptedTcpStep::Elapsed { advance } = self.next("elapsed") else {
+                panic!("expected elapsed step")
+            };
+            self.advance(advance);
+            self.now.checked_sub(mark).expect("scripted clock is monotonic")
+        }
+
+        unsafe fn resolve(
+            &mut self,
+            node: *const u8,
+            service: *const u8,
+            hints: &AddrInfo,
+        ) -> Result<*mut AddrInfo, i32> {
+            assert!(!node.is_null() && !service.is_null());
+            assert_eq!(hints.ai_family, AF_UNSPEC);
+            assert_eq!(hints.ai_socktype, SOCK_STREAM);
+            let ScriptedTcpStep::Resolve(result) = self.next("resolve") else {
+                panic!("expected resolve step")
+            };
+            result.map(|()| self.head())
+        }
+
+        unsafe fn free_addresses(&mut self, addresses: *mut AddrInfo) {
+            assert_eq!(addresses, self.head());
+            assert!(matches!(self.next("free_addresses"), ScriptedTcpStep::FreeAddresses));
+        }
+
+        unsafe fn socket(&mut self, family: i32, _ty: i32, _protocol: i32) -> Result<i32, i32> {
+            let ScriptedTcpStep::Socket { family: expected, result } = self.next("socket") else {
+                panic!("expected socket step")
+            };
+            assert_eq!(family, expected);
+            result
+        }
+
+        unsafe fn get_fl(&mut self, fd: i32) -> Result<i32, i32> {
+            let ScriptedTcpStep::GetFl { fd: expected, result } = self.next("F_GETFL") else {
+                panic!("expected F_GETFL step")
+            };
+            assert_eq!(fd, expected);
+            result
+        }
+
+        unsafe fn set_fl(&mut self, fd: i32, flags: i32) -> Result<(), i32> {
+            let ScriptedTcpStep::SetFl {
+                fd: expected_fd,
+                flags: expected_flags,
+                result,
+            } = self.next("F_SETFL")
+            else {
+                panic!("expected F_SETFL step")
+            };
+            assert_eq!(fd, expected_fd);
+            assert_eq!(flags, expected_flags);
+            result
+        }
+
+        unsafe fn connect(&mut self, fd: i32, addr: *const u8, addrlen: u32) -> TcpConnectOutcome {
+            assert!(!addr.is_null() && addrlen > 0);
+            let ScriptedTcpStep::Connect { fd: expected, outcome, advance } = self.next("connect") else {
+                panic!("expected connect step")
+            };
+            assert_eq!(fd, expected);
+            self.advance(advance);
+            outcome
+        }
+
+        unsafe fn poll_writable(&mut self, fd: i32, timeout_ms: i32) -> TcpPollOutcome {
+            let ScriptedTcpStep::Poll {
+                fd: expected_fd,
+                timeout_ms: expected_timeout,
+                outcome,
+                advance,
+            } = self.next("poll")
+            else {
+                panic!("expected poll step")
+            };
+            assert_eq!(fd, expected_fd);
+            assert_eq!(timeout_ms, expected_timeout);
+            self.advance(advance);
+            outcome
+        }
+
+        unsafe fn socket_error(&mut self, fd: i32) -> TcpSocketErrorOutcome {
+            let ScriptedTcpStep::SocketError { fd: expected, outcome } = self.next("SO_ERROR") else {
+                panic!("expected SO_ERROR step")
+            };
+            assert_eq!(fd, expected);
+            outcome
+        }
+
+        unsafe fn close(&mut self, fd: i32) {
+            let ScriptedTcpStep::Close(expected) = self.next("close") else {
+                panic!("expected close step")
+            };
+            assert_eq!(fd, expected);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ScriptedTcpFailure {
+        Socket,
+        InstallGet,
+        InstallSet,
+        ImmediateConnect,
+        PollTimeout,
+        PollError,
+        SocketErrorGet,
+        SocketErrorValue,
+        RestoreGet,
+        RestoreSet,
+    }
+
+    fn scripted_tcp_failure_steps(
+        failure: ScriptedTcpFailure,
+        family: i32,
+        fd: i32,
+        status: i32,
+    ) -> Vec<ScriptedTcpStep> {
+        use std::time::Duration;
+
+        if matches!(failure, ScriptedTcpFailure::Socket) {
+            return vec![ScriptedTcpStep::Socket { family, result: Err(status) }];
+        }
+
+        let mut steps = vec![ScriptedTcpStep::Socket { family, result: Ok(fd) }, ScriptedTcpStep::Mark];
+        if matches!(failure, ScriptedTcpFailure::InstallGet) {
+            steps.push(ScriptedTcpStep::GetFl { fd, result: Err(status) });
+            steps.push(ScriptedTcpStep::Close(fd));
+            return steps;
+        }
+        steps.push(ScriptedTcpStep::GetFl { fd, result: Ok(0x20) });
+        if matches!(failure, ScriptedTcpFailure::InstallSet) {
+            steps.push(ScriptedTcpStep::SetFl { fd, flags: 0x20 | O_NONBLOCK, result: Err(status) });
+            steps.push(ScriptedTcpStep::Close(fd));
+            return steps;
+        }
+        steps.push(ScriptedTcpStep::SetFl { fd, flags: 0x20 | O_NONBLOCK, result: Ok(()) });
+        if matches!(failure, ScriptedTcpFailure::ImmediateConnect) {
+            steps.push(ScriptedTcpStep::Connect {
+                fd,
+                outcome: TcpConnectOutcome::Failed { status, in_progress: false },
+                advance: Duration::ZERO,
+            });
+            steps.push(ScriptedTcpStep::Close(fd));
+            return steps;
+        }
+        steps.push(ScriptedTcpStep::Connect {
+            fd,
+            outcome: TcpConnectOutcome::Failed { status: AL_CODE, in_progress: true },
+            advance: Duration::ZERO,
+        });
+        steps.push(ScriptedTcpStep::Elapsed { advance: Duration::ZERO });
+        match failure {
+            ScriptedTcpFailure::PollTimeout => {
+                steps.push(ScriptedTcpStep::Poll {
+                    fd,
+                    timeout_ms: 1,
+                    outcome: TcpPollOutcome::Zero,
+                    advance: Duration::from_nanos(10),
+                });
+                steps.push(ScriptedTcpStep::Elapsed { advance: Duration::ZERO });
+            }
+            ScriptedTcpFailure::PollError => steps.push(ScriptedTcpStep::Poll {
+                fd,
+                timeout_ms: 1,
+                outcome: TcpPollOutcome::Failed(status),
+                advance: Duration::ZERO,
+            }),
+            ScriptedTcpFailure::SocketErrorGet
+            | ScriptedTcpFailure::SocketErrorValue
+            | ScriptedTcpFailure::RestoreGet
+            | ScriptedTcpFailure::RestoreSet => {
+                steps.push(ScriptedTcpStep::Poll {
+                    fd,
+                    timeout_ms: 1,
+                    outcome: TcpPollOutcome::Ready,
+                    advance: Duration::ZERO,
+                });
+                let outcome = match failure {
+                    ScriptedTcpFailure::SocketErrorGet => TcpSocketErrorOutcome::GetFailed(status),
+                    ScriptedTcpFailure::SocketErrorValue => TcpSocketErrorOutcome::ConnectFailed(status),
+                    _ => TcpSocketErrorOutcome::Connected,
+                };
+                steps.push(ScriptedTcpStep::SocketError { fd, outcome });
+                if matches!(failure, ScriptedTcpFailure::RestoreGet) {
+                    steps.push(ScriptedTcpStep::GetFl { fd, result: Err(status) });
+                } else if matches!(failure, ScriptedTcpFailure::RestoreSet) {
+                    steps.push(ScriptedTcpStep::GetFl { fd, result: Ok(0x20 | O_NONBLOCK) });
+                    steps.push(ScriptedTcpStep::SetFl { fd, flags: 0x20, result: Err(status) });
+                }
+            }
+            ScriptedTcpFailure::Socket
+            | ScriptedTcpFailure::InstallGet
+            | ScriptedTcpFailure::InstallSet
+            | ScriptedTcpFailure::ImmediateConnect => unreachable!("handled before the timed wait"),
+        }
+        steps.push(ScriptedTcpStep::Close(fd));
+        steps
+    }
+
+    fn scripted_tcp_success_steps(family: i32, fd: i32) -> Vec<ScriptedTcpStep> {
+        vec![
+            ScriptedTcpStep::Socket { family, result: Ok(fd) },
+            ScriptedTcpStep::Mark,
+            ScriptedTcpStep::GetFl { fd, result: Ok(0x20) },
+            ScriptedTcpStep::SetFl { fd, flags: 0x20 | O_NONBLOCK, result: Ok(()) },
+            ScriptedTcpStep::Connect {
+                fd,
+                outcome: TcpConnectOutcome::Connected,
+                advance: std::time::Duration::ZERO,
+            },
+            ScriptedTcpStep::GetFl { fd, result: Ok(0x20 | O_NONBLOCK) },
+            ScriptedTcpStep::SetFl { fd, flags: 0x20, result: Ok(()) },
+        ]
+    }
+
+    fn run_scripted_tcp_candidate(
+        timeout_ns: i64,
+        steps: Vec<ScriptedTcpStep>,
+    ) -> Result<(), i32> {
+        let mut ops = ScriptedTcpConnectOps::new(&[], steps);
+        let address = 0u8;
+        let result = unsafe { tcp_connect_candidate_with(&mut ops, 7, &address, 1, timeout_ns) };
+        ops.assert_finished();
+        result
+    }
+
+    #[test]
+    fn socket_timeout_timeval_quantization() {
+        for (ns, seconds, microseconds) in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (999, 0, 1),
+            (1_000, 0, 1),
+            (1_001, 0, 2),
+            (999_999_999, 1, 0),
+            (1_000_000_000, 1, 0),
+            (1_000_000_001, 1, 1),
+            (i64::MAX, 9_223_372_036, 854_776),
+        ] {
+            let timeval = timeval_from_ns(ns);
+            assert_eq!(timeval.tv_sec, seconds, "seconds for {ns} ns");
+            assert_eq!(timeval.tv_usec, microseconds, "microseconds for {ns} ns");
+            assert!((0..1_000_000).contains(&timeval.tv_usec));
+        }
+    }
+
+    #[test]
+    fn tcp_connect_timeout_budget_quantization() {
+        use std::time::Duration;
+
+        assert_eq!(remaining_timeout_budget(Duration::from_nanos(1), Duration::ZERO), Some(Duration::from_nanos(1)));
+        assert_eq!(remaining_timeout_budget(Duration::from_nanos(1), Duration::from_nanos(1)), None);
+        assert_eq!(remaining_timeout_budget(Duration::from_nanos(1), Duration::from_nanos(2)), None);
+        for (remaining, expected) in [
+            (Duration::ZERO, None),
+            (Duration::from_nanos(1), Some(1)),
+            (Duration::from_nanos(999_999), Some(1)),
+            (Duration::from_millis(1), Some(1)),
+            (Duration::from_nanos(1_000_001), Some(2)),
+            (Duration::from_millis(i32::MAX as u64), Some(i32::MAX)),
+            (
+                Duration::from_millis(i32::MAX as u64) + Duration::from_nanos(1),
+                Some(i32::MAX),
+            ),
+            (Duration::from_nanos(i64::MAX as u64), Some(i32::MAX)),
+        ] {
+            assert_eq!(poll_timeout_ms(remaining), expected, "poll conversion for {remaining:?}");
+        }
+
+        let initial_flags = 0x20;
+        let max_chunk = i32::MAX;
+        let result = run_scripted_tcp_candidate(
+            i64::MAX,
+            vec![
+                ScriptedTcpStep::Mark,
+                ScriptedTcpStep::GetFl { fd: 7, result: Ok(initial_flags) },
+                ScriptedTcpStep::SetFl { fd: 7, flags: initial_flags | O_NONBLOCK, result: Ok(()) },
+                ScriptedTcpStep::Connect {
+                    fd: 7,
+                    outcome: TcpConnectOutcome::Failed { status: AL_CODE + 1, in_progress: true },
+                    advance: Duration::ZERO,
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: max_chunk,
+                    outcome: TcpPollOutcome::Zero,
+                    advance: Duration::from_millis(max_chunk as u64),
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: max_chunk,
+                    outcome: TcpPollOutcome::Interrupted,
+                    advance: Duration::from_nanos(1),
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: max_chunk,
+                    outcome: TcpPollOutcome::Ready,
+                    advance: Duration::from_nanos(i64::MAX as u64),
+                },
+                ScriptedTcpStep::SocketError { fd: 7, outcome: TcpSocketErrorOutcome::Connected },
+                ScriptedTcpStep::GetFl { fd: 7, result: Ok(initial_flags | O_NONBLOCK) },
+                ScriptedTcpStep::SetFl { fd: 7, flags: initial_flags, result: Ok(()) },
+            ],
+        );
+        assert_eq!(result, Ok(()), "positive readiness wins simultaneous exhaustion");
+
+        // EINTR must recompute the remainder, not reuse the first rounded wait chunk. Advancing
+        // across a millisecond boundary changes the next timeout from four milliseconds to two.
+        let result = run_scripted_tcp_candidate(
+            3_000_001,
+            vec![
+                ScriptedTcpStep::Mark,
+                ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                ScriptedTcpStep::Connect {
+                    fd: 7,
+                    outcome: TcpConnectOutcome::Failed { status: AL_CODE, in_progress: true },
+                    advance: Duration::ZERO,
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: 4,
+                    outcome: TcpPollOutcome::Interrupted,
+                    advance: Duration::from_nanos(1_000_001),
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: 2,
+                    outcome: TcpPollOutcome::Ready,
+                    advance: Duration::ZERO,
+                },
+                ScriptedTcpStep::SocketError { fd: 7, outcome: TcpSocketErrorOutcome::Connected },
+                ScriptedTcpStep::GetFl { fd: 7, result: Ok(O_NONBLOCK) },
+                ScriptedTcpStep::SetFl { fd: 7, flags: 0, result: Ok(()) },
+            ],
+        );
+        assert_eq!(result, Ok(()));
+
+        let result = run_scripted_tcp_candidate(
+            2,
+            vec![
+                ScriptedTcpStep::Mark,
+                ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                ScriptedTcpStep::Connect {
+                    fd: 7,
+                    outcome: TcpConnectOutcome::Failed { status: AL_CODE + 1, in_progress: true },
+                    advance: Duration::ZERO,
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                ScriptedTcpStep::Poll {
+                    fd: 7,
+                    timeout_ms: 1,
+                    outcome: TcpPollOutcome::Zero,
+                    advance: Duration::from_nanos(2),
+                },
+                ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+            ],
+        );
+        assert_eq!(result, Err(AL_TIMEOUT), "exhaustion after an early zero issues no final poll");
+    }
+
+    #[test]
+    fn tcp_connect_transition_and_address_matrix() {
+        use std::time::Duration;
+
+        for (label, steps, expected) in [
+            (
+                "install get",
+                vec![ScriptedTcpStep::Mark, ScriptedTcpStep::GetFl { fd: 7, result: Err(41) }],
+                Err(41),
+            ),
+            (
+                "install set",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0x20) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: 0x20 | O_NONBLOCK, result: Err(42) },
+                ],
+                Err(42),
+            ),
+            (
+                "immediate terminal wins expiry",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Failed { status: 43, in_progress: false },
+                        advance: Duration::from_nanos(10),
+                    },
+                ],
+                Err(43),
+            ),
+            (
+                "immediate success restores after expiry",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0x20) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: 0x20 | O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Connected,
+                        advance: Duration::from_nanos(10),
+                    },
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0x20 | O_NONBLOCK) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: 0x20, result: Ok(()) },
+                ],
+                Ok(()),
+            ),
+            (
+                "immediate restore get",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Connected,
+                        advance: Duration::from_nanos(10),
+                    },
+                    ScriptedTcpStep::GetFl { fd: 7, result: Err(44) },
+                ],
+                Err(44),
+            ),
+            (
+                "immediate restore set",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Connected,
+                        advance: Duration::from_nanos(10),
+                    },
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(O_NONBLOCK) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: 0, result: Err(45) },
+                ],
+                Err(45),
+            ),
+            (
+                "readiness resolves SO_ERROR after expiry",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Failed { status: 46, in_progress: true },
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                    ScriptedTcpStep::Poll {
+                        fd: 7,
+                        timeout_ms: 1,
+                        outcome: TcpPollOutcome::Ready,
+                        advance: Duration::from_nanos(10),
+                    },
+                    ScriptedTcpStep::SocketError {
+                        fd: 7,
+                        outcome: TcpSocketErrorOutcome::GetFailed(47),
+                    },
+                ],
+                Err(47),
+            ),
+            (
+                "poll hard error",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Failed { status: 48, in_progress: true },
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                    ScriptedTcpStep::Poll {
+                        fd: 7,
+                        timeout_ms: 1,
+                        outcome: TcpPollOutcome::Failed(49),
+                        advance: Duration::ZERO,
+                    },
+                ],
+                Err(49),
+            ),
+            (
+                "polled restore get",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Failed { status: 50, in_progress: true },
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                    ScriptedTcpStep::Poll {
+                        fd: 7,
+                        timeout_ms: 1,
+                        outcome: TcpPollOutcome::Ready,
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::SocketError { fd: 7, outcome: TcpSocketErrorOutcome::Connected },
+                    ScriptedTcpStep::GetFl { fd: 7, result: Err(51) },
+                ],
+                Err(51),
+            ),
+            (
+                "polled restore set",
+                vec![
+                    ScriptedTcpStep::Mark,
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(0) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: O_NONBLOCK, result: Ok(()) },
+                    ScriptedTcpStep::Connect {
+                        fd: 7,
+                        outcome: TcpConnectOutcome::Failed { status: 52, in_progress: true },
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::Elapsed { advance: Duration::ZERO },
+                    ScriptedTcpStep::Poll {
+                        fd: 7,
+                        timeout_ms: 1,
+                        outcome: TcpPollOutcome::Ready,
+                        advance: Duration::ZERO,
+                    },
+                    ScriptedTcpStep::SocketError { fd: 7, outcome: TcpSocketErrorOutcome::Connected },
+                    ScriptedTcpStep::GetFl { fd: 7, result: Ok(O_NONBLOCK) },
+                    ScriptedTcpStep::SetFl { fd: 7, flags: 0, result: Err(53) },
+                ],
+                Err(53),
+            ),
+        ] {
+            assert_eq!(run_scripted_tcp_candidate(10, steps), expected, "{label}");
+        }
+
+        for errno in [EINPROGRESS, libc::EAGAIN, libc::EWOULDBLOCK] {
+            assert!(
+                matches!(tcp_connect_error_outcome(&std::io::Error::from_raw_os_error(errno)), TcpConnectOutcome::Failed { in_progress: true, .. }),
+                "errno {errno} enters the timed wait"
+            );
+        }
+        assert!(matches!(
+            tcp_connect_error_outcome(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+            TcpConnectOutcome::Failed { in_progress: false, .. }
+        ));
+    }
+
+    #[test]
+    fn tcp_connect_resolver_status_and_order_matrix() {
+        let host = b"host";
+        let host_c = b"host\0";
+        let service = b"80\0";
+        for eai in [EAI_NONAME, EAI_NODATA, -3, 3, i32::MIN] {
+            let mut ops = ScriptedTcpConnectOps::new(&[], vec![ScriptedTcpStep::Resolve(Err(eai))]);
+            let mut out = core::ptr::dangling_mut::<TcpConn>();
+            let result = unsafe {
+                tcp_connect_validated_fd_with(
+                    &mut ops,
+                    host.as_ptr(),
+                    i64::try_from(host.len()).unwrap(),
+                    80,
+                    1,
+                    &mut out,
+                )
+            };
+            assert_eq!(result, Err(eai_to_status(eai)), "resolver status {eai}");
+            assert!(out.is_null(), "resolver failure clears the public connection slot");
+            ops.assert_finished(); // proves no socket/free/native iteration after resolver failure
+        }
+
+        // A resolver success with a null list is the no-usable-address case and owns no list to free.
+        let mut ops = ScriptedTcpConnectOps::new(&[], vec![ScriptedTcpStep::Resolve(Ok(()))]);
+        let mut out = core::ptr::dangling_mut::<TcpConn>();
+        assert_eq!(
+            unsafe {
+                tcp_connect_validated_fd_with(
+                    &mut ops,
+                    host.as_ptr(),
+                    i64::try_from(host.len()).unwrap(),
+                    80,
+                    1,
+                    &mut out,
+                )
+            },
+            Err(AL_INVALID)
+        );
+        assert!(out.is_null());
+        ops.assert_finished();
+
+        let mut ops = ScriptedTcpConnectOps::new(
+            &[(999, true, 8), (AF_INET, false, 8), (AF_INET6, true, 0)],
+            vec![ScriptedTcpStep::Resolve(Ok(())), ScriptedTcpStep::FreeAddresses],
+        );
+        assert_eq!(
+            unsafe { tcp_connect_fd_with(&mut ops, host_c.as_ptr(), service.as_ptr(), 1) },
+            Err(AL_INVALID),
+            "all skipped entries preserve the initial Invalid status"
+        );
+        ops.assert_finished();
+
+        for timeout_ns in [0, -1] {
+            let mut ops = ScriptedTcpConnectOps::new(
+                &[(AF_INET, true, 8), (AF_INET6, true, 24), (AF_INET, true, 8)],
+                vec![
+                    ScriptedTcpStep::Resolve(Ok(())),
+                    ScriptedTcpStep::Socket { family: AF_INET, result: Err(51) },
+                    ScriptedTcpStep::Socket { family: AF_INET6, result: Ok(11) },
+                    ScriptedTcpStep::Connect {
+                        fd: 11,
+                        outcome: TcpConnectOutcome::Failed { status: 52, in_progress: false },
+                        advance: std::time::Duration::ZERO,
+                    },
+                    ScriptedTcpStep::Close(11),
+                    ScriptedTcpStep::Socket { family: AF_INET, result: Ok(12) },
+                    ScriptedTcpStep::Connect {
+                        fd: 12,
+                        outcome: TcpConnectOutcome::Connected,
+                        advance: std::time::Duration::ZERO,
+                    },
+                    ScriptedTcpStep::FreeAddresses,
+                ],
+            );
+            assert_eq!(
+                unsafe { tcp_connect_fd_with(&mut ops, host_c.as_ptr(), service.as_ptr(), timeout_ns) },
+                Ok(12),
+                "nonpositive timeout keeps ordered blocking traversal"
+            );
+            ops.assert_finished();
+        }
+
+        let failures = [
+            ScriptedTcpFailure::Socket,
+            ScriptedTcpFailure::InstallGet,
+            ScriptedTcpFailure::InstallSet,
+            ScriptedTcpFailure::ImmediateConnect,
+            ScriptedTcpFailure::PollTimeout,
+            ScriptedTcpFailure::PollError,
+            ScriptedTcpFailure::SocketErrorGet,
+            ScriptedTcpFailure::SocketErrorValue,
+            ScriptedTcpFailure::RestoreGet,
+            ScriptedTcpFailure::RestoreSet,
+        ];
+        for (index, failure) in failures.into_iter().enumerate() {
+            let status = if matches!(failure, ScriptedTcpFailure::PollTimeout) {
+                AL_TIMEOUT
+            } else {
+                100 + i32::try_from(index).unwrap()
+            };
+
+            // Every failure class either closes its opened candidate exactly once or fails socket
+            // creation before ownership. A skipped resolver entry then preserves that status, and
+            // the next usable address gets a fresh budget and succeeds.
+            let mut steps = vec![ScriptedTcpStep::Resolve(Ok(()))];
+            steps.extend(scripted_tcp_failure_steps(failure, AF_INET, 41, status));
+            steps.extend(scripted_tcp_success_steps(AF_INET6, 42));
+            steps.push(ScriptedTcpStep::FreeAddresses);
+            let mut ops = ScriptedTcpConnectOps::new(
+                &[(AF_INET, true, 8), (999, true, 8), (AF_INET6, true, 24)],
+                steps,
+            );
+            assert_eq!(
+                unsafe { tcp_connect_fd_with(&mut ops, host_c.as_ptr(), service.as_ptr(), 10) },
+                Ok(42),
+                "{failure:?} must close/continue to the later success"
+            );
+            ops.assert_finished();
+
+            // With no later success, a prior socket failure cannot replace the selected class's
+            // final status. The scripted Close step pins the exact opened-candidate close count.
+            let mut steps = vec![
+                ScriptedTcpStep::Resolve(Ok(())),
+                ScriptedTcpStep::Socket { family: AF_INET, result: Err(90) },
+            ];
+            steps.extend(scripted_tcp_failure_steps(failure, AF_INET6, 52, status));
+            steps.push(ScriptedTcpStep::FreeAddresses);
+            let mut ops = ScriptedTcpConnectOps::new(
+                &[(AF_INET, true, 8), (AF_INET6, true, 24)],
+                steps,
+            );
+            assert_eq!(
+                unsafe { tcp_connect_fd_with(&mut ops, host_c.as_ptr(), service.as_ptr(), 10) },
+                Err(status),
+                "{failure:?} must be the last attempted status"
+            );
+            ops.assert_finished();
+        }
+    }
+
     #[test]
     fn tcp_connect_roundtrip_reader_writer() {
         use std::io::{Read, Write};
@@ -33150,6 +34285,29 @@ mod tests {
     }
 
     #[test]
+    fn tcp_connect_positive_timeout_publishes_blocking_fd() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = i64::from(listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().expect("accept positive-timeout connection");
+        });
+
+        let (host, host_len) = view_of("127.0.0.1");
+        let mut conn = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_tcp_connect(host, host_len, port, 1_000_000_000, &mut conn) },
+            0
+        );
+        assert!(!conn.is_null());
+        let fd = unsafe { (*conn).fd };
+        let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+        assert!(flags >= 0, "published fd supports F_GETFL");
+        assert_eq!(flags & O_NONBLOCK, 0, "published positive-timeout fd is blocking");
+        unsafe { align_rt_tcp_conn_free(conn) };
+        server.join().unwrap();
+    }
+
+    #[test]
     fn tcp_connect_bad_port_and_null_out() {
         let (hp, hl) = view_of("127.0.0.1");
         // A null `out` slot is rejected as Error.Invalid, never a crash.
@@ -33183,8 +34341,8 @@ mod tests {
         // hangs until the OS default (~2 min) on a normal host, so a 300ms deadline must return
         // `AL_TIMEOUT` well before that. If the sandbox has no network and rejects the address
         // immediately, the deadline can't be exercised — we then only assert the call returned
-        // promptly (never hung) with a non-success status. Either outcome runs `connect_with_deadline`
-        // and proves the call is bounded.
+        // promptly (never hung) with a non-success status. Either outcome runs the timed candidate
+        // state machine and proves the call is bounded.
         let (hp, hl) = view_of("192.0.2.1");
         let mut conn: *mut TcpConn = std::ptr::null_mut();
         let start = std::time::Instant::now();
@@ -34113,6 +35271,145 @@ mod tests {
         assert_eq!(CAPTURE_CLOSE_MASK.with(|mask| mask.get()), 3, "both capture read fds must be closed");
     }
 
+    fn capture_poll_calls() -> Vec<(usize, i32)> {
+        CAPTURE_POLL_CALLS.with(|calls| calls.borrow().clone())
+    }
+
+    fn capture_cleanup_kill_calls() -> Vec<i32> {
+        CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow().clone())
+    }
+
+    fn assert_capture_failpoint_consumed() {
+        assert_eq!(
+            CAPTURE_FAILPOINT.with(core::cell::Cell::get),
+            CaptureFailpoint::None,
+            "the intended post-syscall boundary must consume its failpoint"
+        );
+    }
+
+    #[test]
+    fn command_timeout_budget_quantization() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use std::time::Duration;
+
+        assert!(MonotonicTimeoutBudget::from_positive_ns(0).is_none());
+        assert!(MonotonicTimeoutBudget::from_positive_ns(-1).is_none());
+        let maximum = MonotonicTimeoutBudget::from_positive_ns(i64::MAX).unwrap();
+        assert_eq!(maximum.budget, Duration::from_nanos(i64::MAX as u64));
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1)), Some(1));
+        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), Some(1));
+        assert_eq!(poll_timeout_ms(Duration::from_nanos(1_000_001)), Some(2));
+
+        // The full positive-i64 range remains bounded. Parent setup cannot consume the roughly
+        // 292-year budget, so the first native wait is the required saturated chunk.
+        set_capture_failpoint(CaptureFailpoint::None);
+        let command = capture_test_command(":", true, i64::MAX);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, 0);
+        assert!(!out.is_null());
+        let calls = capture_poll_calls();
+        assert!(!calls.is_empty());
+        assert_eq!(calls[0].1, i32::MAX);
+        assert!(calls.iter().all(|(_, timeout)| *timeout > 0));
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(command) };
+
+        // A spurious zero and EINTR both recompute a positive remainder and retry. They cannot turn
+        // into success/failure on their own or authorize a timeout-zero poll.
+        for failpoint in [CaptureFailpoint::PollZero, CaptureFailpoint::PollInterrupted] {
+            set_capture_failpoint(failpoint);
+            set_capture_timeout_elapsed(Duration::ZERO);
+            let command = capture_test_command("printf x", true, 3_000_001);
+            let mut out: *mut RunOutput = core::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, 0, "{failpoint:?}");
+            assert!(!out.is_null());
+            let calls = capture_poll_calls();
+            assert!(calls.len() >= 2, "{failpoint:?} must be followed by another wait");
+            assert_eq!(calls[0].1, 4, "{failpoint:?} first uses the exact rounded budget");
+            assert_eq!(calls[1].1, 2, "{failpoint:?} retry uses the recomputed remainder");
+            assert!(calls.iter().all(|(_, timeout)| *timeout > 0));
+            unsafe { align_rt_run_output_free(out) };
+            unsafe { align_rt_command_free(command) };
+        }
+
+        // Command arbitration remains timeout-wins after a syscall. The next loop observes
+        // exhaustion before issuing another native wait.
+        set_capture_failpoint(CaptureFailpoint::PollZeroAfterDeadline);
+        let command = capture_test_command("sleep 10", true, 60_000_000_000);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
+        assert!(out.is_null());
+        assert_eq!(capture_poll_calls().len(), 1, "no poll follows observed exhaustion");
+        assert_capture_failpoint_consumed();
+        assert_capture_child_reaped_and_fds_closed();
+        unsafe { align_rt_command_free(command) };
+
+        // The post-EOF/live-child loop applies its 1 ms cap only after obtaining a positive
+        // remainder. Once that call carries time past the budget, no final 1 ms zero-fd probe runs.
+        set_capture_failpoint(CaptureFailpoint::PollZeroFdAfterDeadline);
+        let command = capture_test_command("exec 1>&- 2>&-; sleep 10", true, 60_000_000_000);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
+        assert!(out.is_null());
+        let zero_fd_calls: Vec<_> = capture_poll_calls()
+            .into_iter()
+            .filter(|(count, _)| *count == 0)
+            .collect();
+        assert_eq!(zero_fd_calls, vec![(0, 1)], "exactly one positive zero-fd wait precedes expiry");
+        assert_capture_failpoint_consumed();
+        assert_capture_child_reaped_and_fds_closed();
+        unsafe { align_rt_command_free(command) };
+
+        // The same post-syscall checkpoint applies to the zero-fd path: an observed timeout wins
+        // over a simultaneous native error after the child's stdout and stderr have reached EOF.
+        set_capture_failpoint(CaptureFailpoint::PollErrorZeroFdAfterDeadline);
+        let command = capture_test_command("exec 1>&- 2>&-; sleep 10", true, 60_000_000_000);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
+        assert!(out.is_null());
+        let zero_fd_calls: Vec<_> = capture_poll_calls()
+            .into_iter()
+            .filter(|(count, _)| *count == 0)
+            .collect();
+        assert_eq!(zero_fd_calls, vec![(0, 1)], "timeout beats the first zero-fd poll error");
+        assert_capture_failpoint_consumed();
+        assert_capture_child_reaped_and_fds_closed();
+        unsafe { align_rt_command_free(command) };
+
+        // The post-read checkpoint wins before a competing read error is interpreted.
+        set_capture_failpoint(CaptureFailpoint::ReadStdoutAfterDeadline);
+        let command = capture_test_command("printf x; sleep 10", true, 60_000_000_000);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
+        assert!(out.is_null());
+        assert_capture_failpoint_consumed();
+        assert_capture_child_reaped_and_fds_closed();
+        unsafe { align_rt_command_free(command) };
+
+        // Both successful reaping and ECHILD record child consumption before the post-wait timeout
+        // checkpoint. Timeout cleanup cannot signal a recycled pid in either product.
+        for (failpoint, script) in [
+            (CaptureFailpoint::WaitReapedAfterDeadline, "exec 1>&- 2>&-; exit 7"),
+            (CaptureFailpoint::WaitEchildAfterDeadline, "exec 1>&- 2>&-; sleep 10"),
+        ] {
+            set_capture_failpoint(failpoint);
+            let command = capture_test_command(script, true, 60_000_000_000);
+            let mut out: *mut RunOutput = core::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT, "{failpoint:?}");
+            assert!(out.is_null());
+            assert_capture_failpoint_consumed();
+            assert!(
+                capture_cleanup_kill_calls().is_empty(),
+                "timeout cleanup must not signal a direct child already consumed by {failpoint:?}"
+            );
+            assert_capture_child_reaped_and_fds_closed();
+            unsafe { align_rt_command_free(command) };
+        }
+        set_capture_failpoint(CaptureFailpoint::None);
+    }
+
     #[test]
     fn command_capture_descriptor_setup_failures_precede_fork() {
         if !std::path::Path::new("/bin/sh").exists() {
@@ -34169,10 +35466,12 @@ mod tests {
             return;
         }
         set_capture_failpoint(CaptureFailpoint::PollAfterDeadline);
-        let command = capture_test_command("sleep 10", true, 1_000_000);
+        let command = capture_test_command("sleep 10", true, 60_000_000_000);
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
         assert!(out.is_null());
+        assert_eq!(capture_poll_calls().len(), 1, "the competing poll error must be observed");
+        assert_capture_failpoint_consumed();
         assert_capture_child_reaped_and_fds_closed();
         unsafe { align_rt_command_free(command) };
     }
@@ -39093,6 +40392,175 @@ event: first\nevent:\ndata: x\n\n";
         // The view (what `http_client_perform` reads for the override) carries the request's timeout.
         assert_eq!(unsafe { &*req }.as_view().timeout_ns, 9_999);
         unsafe { align_rt_http_request_free(req) };
+    }
+
+    #[test]
+    fn http_timeout_quantization_plain_tls_pool_rearm() {
+        use std::os::fd::AsRawFd;
+
+        let _net_guard = GET_MANY_SERVER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+
+        let perform = |label: &str, client: *mut HttpClient, url: &str| {
+            let mut out = core::ptr::null_mut();
+            assert_eq!(
+                unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) },
+                0,
+                "{label}"
+            );
+            assert!(!out.is_null());
+            unsafe { align_rt_http_resp_free(out) };
+        };
+        let assert_pair = |calls: &[HttpTimeoutCall], ns, seconds, microseconds, fd: Option<i32>| {
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].optname, SO_RCVTIMEO);
+            assert_eq!(calls[1].optname, SO_SNDTIMEO);
+            for call in calls {
+                assert_eq!(call.ns, ns);
+                assert_eq!(call.tv_sec, seconds);
+                assert_eq!(call.tv_usec, microseconds);
+                if let Some(fd) = fd {
+                    assert_eq!(call.fd, fd);
+                }
+            }
+            assert_eq!(calls[0].fd, calls[1].fd);
+            calls[0].fd
+        };
+
+        // The trace below owns call-site topology; a live connected socket separately proves that
+        // the production helper actually installs and clears both native options.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind timeout state probe");
+        let probe = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            .expect("connect timeout state probe");
+        let (_peer, _) = listener.accept().expect("accept timeout state probe");
+        let read_timeout = |optname| {
+            let mut value = Timeval { tv_sec: 0, tv_usec: 0 };
+            let mut len = u32::try_from(core::mem::size_of::<Timeval>()).unwrap();
+            assert_eq!(
+                unsafe {
+                    getsockopt(
+                        probe.as_raw_fd(),
+                        SOL_SOCKET,
+                        optname,
+                        &mut value as *mut Timeval as *mut core::ffi::c_void,
+                        &mut len,
+                    )
+                },
+                0
+            );
+            assert_eq!(usize::try_from(len).unwrap(), core::mem::size_of::<Timeval>());
+            (value.tv_sec, value.tv_usec)
+        };
+        unsafe { http_arm_conn_timeout(probe.as_raw_fd(), 2_000_000_000) };
+        assert_eq!(read_timeout(SO_RCVTIMEO), (2, 0));
+        assert_eq!(read_timeout(SO_SNDTIMEO), (2, 0));
+        unsafe { http_arm_conn_timeout(probe.as_raw_fd(), 0) };
+        assert_eq!(read_timeout(SO_RCVTIMEO), (0, 0));
+        assert_eq!(read_timeout(SO_SNDTIMEO), (0, 0));
+
+        // A fresh positive plaintext request owns the normalized receive/send pair before any pool
+        // reuse is possible.
+        let (port, server) = http_serve_once(response.clone());
+        let url = format!("http://127.0.0.1:{port}/fresh-positive");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 5_000_000_001) };
+        begin_http_timeout_trace();
+        perform("fresh plaintext positive", client, &url);
+        let fresh_positive = finish_http_timeout_trace();
+        assert_pair(&fresh_positive, 5_000_000_001, 5, 1, None);
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+
+        // A fresh plaintext connection with the default zero timeout preserves the shipped no-arm
+        // path. A positive request then arms both options, and the next zero-timeout request clears
+        // both options on the exact same pooled fd.
+        let (port, server) = http_serve_pool(response.clone(), 1, false);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        begin_http_timeout_trace();
+        perform("fresh plaintext zero", client, &url);
+        assert!(finish_http_timeout_trace().is_empty(), "fresh zero-timeout plaintext skips the arm");
+        unsafe { align_rt_http_client_timeout(client, 5_000_000_001) };
+        begin_http_timeout_trace();
+        perform("pooled plaintext positive", client, &url);
+        let positive = finish_http_timeout_trace();
+        let pooled_fd = assert_pair(&positive, 5_000_000_001, 5, 1, None);
+        unsafe { align_rt_http_client_timeout(client, 0) };
+        begin_http_timeout_trace();
+        perform("pooled plaintext zero", client, &url);
+        let cleared = finish_http_timeout_trace();
+        assert_pair(&cleared, 0, 0, 0, Some(pooled_fd));
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "plaintext positive/zero requests reuse one fd");
+
+        // The dependent response-stream acquisition path has its own arm site and must consume the
+        // same conversion before returning the head to the caller.
+        let (port, server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_vec(),
+        );
+        let url = format!("http://127.0.0.1:{port}/stream");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 5_000_000_001) };
+        begin_http_timeout_trace();
+        let stream = open_http_read_stream(client, &url);
+        let streamed = finish_http_timeout_trace();
+        assert_pair(&streamed, 5_000_000_001, 5, 1, None);
+        assert_eq!(read_http_stream_all(stream, 16), b"hi");
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+
+        // A fresh zero-timeout dependent stream must preserve the no-arm path as well.
+        let (port, server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_vec(),
+        );
+        let url = format!("http://127.0.0.1:{port}/stream-zero");
+        let client = align_rt_http_client_new();
+        begin_http_timeout_trace();
+        let stream = open_http_read_stream(client, &url);
+        assert!(
+            finish_http_timeout_trace().is_empty(),
+            "fresh zero-timeout response stream skips the arm"
+        );
+        assert_eq!(read_http_stream_all(stream, 16), b"hi");
+        unsafe { align_rt_http_read_stream_free(stream) };
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join().unwrap();
+
+        // Fresh TLS arms before SSL_connect and again before request I/O. Pool reuse performs no
+        // second handshake, but the following zero-timeout request still clears both options.
+        tls_test_setup();
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response.clone(), 1, false);
+        let url = format!("https://127.0.0.1:{port}/fresh-zero");
+        let client = align_rt_http_client_new();
+        begin_http_timeout_trace();
+        perform("fresh TLS zero", client, &url);
+        assert!(
+            finish_http_timeout_trace().is_empty(),
+            "fresh zero-timeout TLS handshake and request skip both arm sites"
+        );
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1);
+
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, response, 1, false);
+        let url = format!("https://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_timeout(client, 5_000_000_001) };
+        begin_http_timeout_trace();
+        perform("fresh TLS positive", client, &url);
+        let armed = finish_http_timeout_trace();
+        assert_eq!(armed.len(), 4, "TLS handshake and request each arm receive/send");
+        let tls_fd = assert_pair(&armed[..2], 5_000_000_001, 5, 1, None);
+        assert_pair(&armed[2..], 5_000_000_001, 5, 1, Some(tls_fd));
+        unsafe { align_rt_http_client_timeout(client, 0) };
+        begin_http_timeout_trace();
+        perform("pooled TLS zero", client, &url);
+        let cleared = finish_http_timeout_trace();
+        assert_pair(&cleared, 0, 0, 0, Some(tls_fd));
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "TLS positive/zero requests reuse one live TLS fd");
     }
 
     #[test]

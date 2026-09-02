@@ -205,7 +205,7 @@ read/write 箇所はデッドライン武装済みの `EAGAIN` を明示的に `
 **connect** デッドラインは `align_rt_tcp_connect` に宿る: positive `timeout_ns` は
 non-blocking mode を使う。immediate zero は成功、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は
 `poll(POLLOUT)` へ入り、その他の immediate errno は map する。readiness は `SO_ERROR` で解決し、poll
-timeout は `AL_TIMEOUT` を返す。下記 inactive prerequisite が mode installation/restoration を checked にする。
+timeout は `AL_TIMEOUT` を返す。下記 implemented prerequisite が mode installation/restoration を checked にする。
 `timeout_ns == 0` は現在の
 ブロッキング connect を正確に保つ。`std.http` はこの同じパラメータを通して有効リクエストタイムアウトを渡す。
 raw-`net` の `tcp.connect(host, port)` シグネチャは v1 ではタイムアウト無しのまま(デッドラインを設定する
@@ -229,10 +229,11 @@ configured blocking wait 後に `Err(Timeout)` を返す。
 
 ---
 
-## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **ステータス:** 最初の independently useful prerequisite。accepted design、implementation pending。
-> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+> **ステータス:** 最初の independently useful prerequisite として implemented。public signature、
+> compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。planned checked
+> package row と prerequisite 2 は inactive のまま。
 
 各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
 monotonic start と positive `Duration` budget を記録し、次に `F_GETFL` と
@@ -314,6 +315,12 @@ mixed-address close/continuation、no early expiry、publish する全 connectio
 exact-timeval と pre-armed receive/send state および caller-retirement product、HTTP plain/TLS/pool rearm、
 command pipe-drain/post-EOF reap を含む。
 
+出荷した direct owner は `socket_timeout_timeval_quantization`、
+`tcp_connect_timeout_budget_quantization`、`tcp_connect_transition_and_address_matrix`、
+`tcp_connect_resolver_status_and_order_matrix`、`tcp_connect_positive_timeout_publishes_blocking_fd`、
+`http_timeout_quantization_plain_tls_pool_rearm`、`command_timeout_budget_quantization`。これらに既存の
+end-to-end timeout と command cleanup/precedence owner を組み合わせる。
+
 ---
 
 ## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
@@ -354,7 +361,7 @@ success/failure order、option clear 無しの shell Drop、setting を破棄す
 Linux/macOS の subprocess closed-peer test は direct slice/builder overload、logger、`io.copy` route を覆い、SIGPIPE で終了せず
 必ず `Error` を返す。direct partial/EINTR/timeout/zero-progress test と file/std writer parity は別個の owner のまま。
 
-checked timeout substrate を最初、writer hardening を 2 番目に出荷する。その後、planned
+checked timeout substrate は着地済みで、writer hardening が 2 番目の prerequisite。その後、planned
 `TcpConnSetIoTimeout` row とその `pkg.kv` package consumer を同時に activate する。exact package consumption と
 implementation boundary は `../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
 `../20-runtime-abi-ledger.md` に記録する。
