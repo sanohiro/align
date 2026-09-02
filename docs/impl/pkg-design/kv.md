@@ -2,8 +2,8 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/kv.md`.
 >
-> **Status:** accepted design; prerequisite 1 implemented 2026-09-02. Prerequisite 2, the package
-> source, and the planned runtime row remain inactive until their recorded capability boundaries.
+> **Status:** accepted design; prerequisites 1 and 2 implemented 2026-09-02. The package source and
+> planned runtime row remain inactive until their recorded joint capability boundary.
 
 ## Authoritative public-contract ledger
 
@@ -270,9 +270,9 @@ and Drop cannot report a later close failure.
 The writer prerequisite directly owns macOS/BSD failed-install/no-send followed by retry and
 success, two overlapping shells with success/failure in both orders, shell Drop without option
 clear, and connection close discarding the setting. Linux/macOS subprocess owners cover direct
-writer, logger, and `io.copy` routes to a closed peer and require a returned `Error` rather than
-signal termination. File/standard-stream parity and partial/EINTR/timeout/zero-progress owners
-remain independent of those state-transition tests.
+slice and builder writer overloads, logger, and `io.copy` routes to a closed peer and require a
+returned `Error` rather than signal termination. File/standard-stream parity and
+partial/EINTR/timeout/zero-progress owners remain independent of those state-transition tests.
 
 ## Ownership, allocation, state, and cleanup
 
@@ -523,9 +523,14 @@ shared connect/I/O quantization for the already-shipped `std.http` and `std.net`
 changing an ABI identity. This prerequisite may exceed roughly 1,000 changed hand-written lines
 once its deterministic resolver, transition, process, and HTTP consumer owners are included; one
 boundary avoids duplicating the shared quantization proof and prevents separately landed consumers
-from drifting across incompatible timeout rules. The generic TCP-writer hardening is a second
-independently useful prerequisite with a closed signal-safety failure domain and likewise no public signature or ABI
-identity change. The remaining new timeout row plus client/resource/parser/three commands form one
+from drifting across incompatible timeout rules. The generic TCP-writer hardening has landed as the
+second independently useful prerequisite with a closed signal-safety failure domain and likewise no
+public signature or ABI identity change. It may exceed roughly 1,000 changed hand-written lines once
+raw-syscall classification, both platform state machines, transitive-route subprocess owners, the
+macOS execution owner, and synchronized status mirrors are counted. Keeping them in one boundary
+avoids a dormant sink policy and duplicate signal-safety proof across strict producer/consumer
+halves. The remaining new timeout row plus
+client/resource/parser/three commands form one
 strict producer-to-consumer chain. A dormant row, parser-only, or connection-only package PR would
 leave no stable public consumer, while splitting commands would repeat the same synchronization,
 poisoning, fake-server, capability, and Drop proof. The package capability may exceed roughly 1,000
@@ -544,7 +549,14 @@ integration risk because every reply kind closes against the same state machine 
 | DEL semantics | One-key request, every official signed/leading-zero spelling of values 0/1, server error, every other value/type. | False/true and sign/leading-zero/negative/two/overflow/type mutation matrix with reuse/close checks. |
 | Error, native status, and poison state | Invalid before I/O; bounded UTF-8 Server and complete non-UTF-8 Decode reusable; exact `0/1/2/3/4/>=5` status decode; reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation with checked i32 narrowing and raw-header validation before typed-slice construction; invalid-negative/oversized-positive abort before header inspection; Io/too-large/protocol/truncation/partial-write close; selected terminal error retained over cleanup; every later call Closed with zero I/O; malformed private resource state is not Closed and reaches `process.abort` before native I/O/untrusted access; every impossible native product reaches `process.abort` before parser/publication/ownership change. | Error-producer x command x before/during/after-frame x reuse table; every category/representative code/width/count/length/pointer/malformed product, including early-abort no-header inspection, both empty pointer forms, and positive-null abort; operation/Drop x one-field-at-a-time malformed resource state pins `ProcessAbort` with zero native calls; native call counters, explicit `ProcessAbort` IR/capability retention, no-import negative, and selected-error/cleanup-failure probes. |
 | Ownership and cleanup | Resource formation, move-in/out/return/replacement, if/match/else/?/map_err/branch/loop/early return, source nulling, state/socket/wrapper/scratch/result Drop once, malformed state abort before untrusted access. | Resource/drop counters, allocation parity, parameterized control-flow owner, state semantic-to-byte and byte-to-semantic goldens, and operation/Drop x malformed-field abort products. |
-| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection with zero live reader/writer shells or values retaining one derived from it at entry and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; the target-connection count is the number of initialized reader, writer, or logger-owned-writer leaves reached by the active recursive Drop graph, independent of fd-number equality; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; any later timeout call requires every success-derived shell/retainer to be dropped first; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap plus zero-derived-shell entry preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; one canonical-graph-derived structural owner with a storage-edge tripwire walks direct/buffered reader, direct writer, logger-owned writer, recursive struct fields, nested active `Option`/`Result`, active user-sum paths rooted in a logger/struct/sum/tagged carrier, and source-produced fixed struct-array elements, across local/moved/call-transferred placement, active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple target leaves; exactly zero is compatible; direct handle collections/boxes/tuples and direct reader/writer user-sum payloads are formation negatives, while nameable dynamic-array/slice shapes for retaining structs/sums, the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element, tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` keep explicit no-live-producer owners; range-rejection retry versus option-failure retry prohibition, zero overlapping/post-failure reader/writer-constructor calls, configure-construct-move-into-each-positive-carrier-move-out-where-supported-or-recursive-Drop-reconfigure cycles, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std/direct/slice/builder/logger/`io.copy` writer owners; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
+| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection with zero live reader/writer shells or values retaining one derived from it at entry and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; the target-connection count is the number of initialized reader, writer, or logger-owned-writer leaves reached by the active recursive Drop graph, independent of fd-number equality; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; any later timeout call requires every success-derived shell/retainer to be dropped first; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap plus zero-derived-shell entry preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; one canonical-graph-derived structural owner with a storage-edge tripwire walks direct/buffered reader, direct writer, logger-owned writer, recursive struct fields, nested active `Option`/`Result`, active user-sum paths rooted in a logger/struct/sum/tagged carrier, and source-produced fixed struct-array elements, across local/moved/call-transferred placement, active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple target leaves; exactly zero is compatible; direct handle collections/boxes/tuples and direct reader/writer user-sum payloads are formation negatives, while nameable dynamic-array/slice shapes for retaining structs/sums, the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element, tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` keep explicit no-live-producer owners; range-rejection retry versus option-failure retry prohibition, zero overlapping/post-failure reader/writer-constructor calls, configure-construct-move-into-each-positive-carrier-move-out-where-supported-or-recursive-Drop-reconfigure cycles, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std owners; each native subprocess owner first completes a nonempty live-socket send, installing and caching macOS `SO_NOSIGPIPE`, then enters local `SHUT_WR` and requires exact `EPIPE` without signal termination through direct slice/builder/logger/`io.copy`; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
+
+The post-open macOS execution reopens the native-SIGPIPE-owner axis. A peer-close-only AF_UNIX
+send may return `EINVAL`, while installing `SO_NOSIGPIPE` only after local `SHUT_WR` may fail before
+the send; neither path can prove signal suppression. Every native route owner therefore establishes
+the successful live-socket send and shell-local readiness first, then enters `SHUT_WR` and requires
+the next nonempty route write to return exact `EPIPE`. This tightens owner evidence without changing
+the public contract, runtime ABI, or production state machine.
 
 ## Sources of truth and author consistency pass
 
@@ -558,8 +570,8 @@ writer-surface change reopens this design.
 The fresh full review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 accepted this contract with no P0–P3 finding. `docs/open-questions.md` records it as Settled and
-`docs/history.md` records the decision. Implementation is authorized only in the prerequisite order
-below; every unimplemented prerequisite and runtime row remains inactive.
+`docs/history.md` records the decision. Implementation follows the prerequisite order below; the
+remaining runtime row stays inactive until its joint package boundary.
 
 After the fifth finding-ledger repair, the fifth author-side ledger-to-prose and closure-matrix
 consistency pass completed on 2026-09-02 before another fresh complete review:
@@ -671,8 +683,8 @@ returned one P3 finding. This fifth repair reopens the recursive-derived-shell-c
 This finding closes the missing recursively reachable half of the same source-reachable
 dangling-shell class. A fresh full review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
-returned CLEAN with no P0–P3 finding. This exact contract is accepted; the shared timeout
-prerequisite is implemented, while writer hardening and package implementation remain pending in
+returned CLEAN with no P0–P3 finding. This exact contract is accepted; the shared timeout and generic
+writer-hardening prerequisites are implemented, while package implementation remains pending in
 the recorded order.
 
 The acceptance-status audit then found one P3 summary-only conflation: it joined impossible native

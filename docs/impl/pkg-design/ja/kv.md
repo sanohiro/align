@@ -4,8 +4,8 @@
 >
 > **注意:** 英語版 (`../kv.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** accepted design。prerequisite 1 は 2026-09-02 に implemented。prerequisite 2、
-> package source、planned runtime row は記録済み capability boundary まで inactive。
+> **ステータス:** accepted design。prerequisite 1 と 2 は 2026-09-02 に implemented。package source と
+> planned runtime row は記録済みの joint capability boundary まで inactive。
 
 ## 公開契約台帳
 
@@ -252,9 +252,9 @@ Drop は後の close failure を報告できない。
 
 writer prerequisite は、macOS/BSD の failed-install/no-send から retry/success、2 個の overlapping shell
 について両順序の success/failure、option clear を伴わない shell Drop、setting を破棄する connection
-close を直接 own する。Linux/macOS subprocess owner は closed peer に対する direct writer、logger、
-`io.copy` route を覆い、signal termination でなく返却された `Error` を要求する。file/standard-stream
-parity と partial/EINTR/timeout/zero-progress owner は、これら state-transition test と独立に保つ。
+close を直接 own する。Linux/macOS subprocess owner は closed peer に対する direct slice/builder
+writer overload、logger、`io.copy` route を覆い、signal termination でなく返却された `Error` を要求する。
+file/standard-stream parity と partial/EINTR/timeout/zero-progress owner は、これら state-transition test と独立に保つ。
 
 ## ownership・allocation・state・cleanup
 
@@ -478,8 +478,11 @@ deadline を enforceable にし、nonblocking connection の公開を防ぎ、AB
 transition、process、HTTP consumer owner を含めると、この prerequisite もおよそ 1,000 changed
 hand-written lines を超え得る。shared quantization proof の重複を避け、別々に land した consumer が
 互換性のない timeout rule へ drift するのを防ぐため、1 boundary とする。generic TCP-writer
-hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite で、
-同様に public signature/ABI identity を変更しない。残る新 timeout row と
+hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite として着地済みで、
+同様に public signature/ABI identity を変更しない。raw-syscall classification、両 platform state
+machine、transitive-route subprocess owner、macOS execution owner、同期 status mirror を数えると、
+およそ 1,000 changed hand-written lines を超え得る。strict producer/consumer half に分けて dormant
+sink policy と signal-safety proof の重複を作らないため、1 boundary とする。残る新 timeout row と
 client/resource/parser/3 command は 1 本の strict producer-to-consumer chain。dormant row、parser-only、
 connection-only package PR は stable public consumer を残さず、command 分割は同じ
 synchronization/poisoning/fake-server/capability/Drop proof を重複させる。adversarial owner matrix を含め
@@ -498,7 +501,14 @@ package capability はおよそ 1,000 changed hand-written lines を超え得る
 | DEL semantics | one-key request、0/1 の全 official signed/leading-zero spelling、server error、他の全 value/type。 | false/true と sign/leading-zero/negative/two/overflow/type mutation matrix、reuse/close check。 |
 | error・native status・poison state | I/O 前 Invalid。bounded UTF-8 Server と complete non-UTF-8 Decode は reusable。exact `0/1/2/3/4/>=5` status decode。reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation と checked i32 narrowing、typed-slice construction 前の raw-header validation。invalid-negative/oversized-positive は header inspection 前に abort。Io/too-large/protocol/truncation/partial-write は close。selected terminal error を cleanup より保持。以後の全 call は zero I/O の Closed。malformed private resource state は Closed ではなく native I/O/untrusted access 前に `process.abort`。全 impossible native product は parser/publication/ownership change 前に `process.abort` へ到達。 | error-producer x command x before/during/after-frame x reuse table。early-abort/no-header inspection、両 empty pointer form、positive-null abort を含む全 category/representative code/width/count/length/pointer/malformed product、operation/Drop x one-field-at-a-time malformed resource state が zero native call の `ProcessAbort` を pin。native call counter、explicit `ProcessAbort` IR/capability retention、no-import negative、selected-error/cleanup-failure probe。 |
 | ownership・cleanup | resource formation、move-in/out/return/replacement、if/match/else/?/map_err/branch/loop/early return、source nulling、state/socket/wrapper/scratch/result の Drop once、malformed state は untrusted access 前に abort。 | resource/drop counter、allocation parity、parameterized control-flow owner、state semantic-to-byte/byte-to-semantic golden、operation/Drop x malformed-field abort product。 |
-| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し、entry 時にその connection 由来の live reader/writer shell またはそれを retain する value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。target-connection count は active recursive Drop graph が reach する initialized reader/writer/logger-owned-writer leaf 数で、fd-number equality と独立。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。後の timeout call 前に success 後の derived shell/retainer をすべて Drop。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap と zero-derived-shell entry precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。canonical graph から derive した structural owner 1 個と storage-edge tripwire が direct/buffered reader、direct writer、logger-owned writer、recursive struct field、nested active `Option`/`Result`、logger/struct/sum/tagged carrier を root とする active user-sum path、source-produced fixed struct-array element を walk し、local/moved/call-transferred placement、active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple target leaf を cross。exact zero だけ compatible。direct handle collection/box/tuple と direct reader/writer user-sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/slice element、tuple、builtin `Option`/`Result` edge は explicit no-live-producer owner を維持。range-rejection retry と option-failure retry 禁止、overlap 中/failure 後の constructor call zero、各 positive carrier の configure-construct-move-into-move-out-where-supported-or-recursive-Drop-reconfigure cycle、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
+| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し、entry 時にその connection 由来の live reader/writer shell またはそれを retain する value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。target-connection count は active recursive Drop graph が reach する initialized reader/writer/logger-owned-writer leaf 数で、fd-number equality と独立。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。後の timeout call 前に success 後の derived shell/retainer をすべて Drop。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap と zero-derived-shell entry precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。canonical graph から derive した structural owner 1 個と storage-edge tripwire が direct/buffered reader、direct writer、logger-owned writer、recursive struct field、nested active `Option`/`Result`、logger/struct/sum/tagged carrier を root とする active user-sum path、source-produced fixed struct-array element を walk し、local/moved/call-transferred placement、active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple target leaf を cross。exact zero だけ compatible。direct handle collection/box/tuple と direct reader/writer user-sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/slice element、tuple、builtin `Option`/`Result` edge は explicit no-live-producer owner を維持。range-rejection retry と option-failure retry 禁止、overlap 中/failure 後の constructor call zero、各 positive carrier の configure-construct-move-into-move-out-where-supported-or-recursive-Drop-reconfigure cycle、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std owner。各 native subprocess owner は最初に nonempty live-socket send を完了して macOS `SO_NOSIGPIPE` を install/cache し、その後 local `SHUT_WR` に入り、direct slice/builder/logger/`io.copy` で signal termination なしの exact `EPIPE` を要求。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
+
+post-open macOS execution により native-SIGPIPE-owner axis を reopen する。peer-close だけの AF_UNIX
+send は `EINVAL` を返し得て、local `SHUT_WR` 後だけに `SO_NOSIGPIPE` を install すると send 前に
+failure し得る。どちらも signal suppression を証明できない。このため各 native route owner は最初に
+live-socket send 成功と shell-local readiness を確立し、その後 `SHUT_WR` に入り、次の nonempty route
+write に exact `EPIPE` を要求する。public contract、runtime ABI、production state machine は変えず、
+owner evidence だけを強化する。
 
 ## source of truth と author consistency pass
 
@@ -511,8 +521,8 @@ exact 1-row reservation を越える ABI change、または public writer-surfac
 exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 の fresh full review は P0–P3 finding なしでこの contract を accept した。`docs/open-questions.md` は
-Settled として記録し、`docs/history.md` は decision を記録する。implementation は下記 prerequisite order
-でのみ許可し、未実装 prerequisite と runtime row はすべて inactive のまま。
+Settled として記録し、`docs/history.md` は decision を記録する。implementation は下記 prerequisite order に
+従い、残る runtime row は joint package boundary まで inactive のまま。
 
 5 回目の finding-ledger repair 後、5 回目の author-side ledger-to-prose および closure-matrix consistency
 pass は、another fresh complete review 前の 2026-09-02 に完了:
@@ -617,7 +627,7 @@ fresh full review
 exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 の fresh full review は P0–P3 finding なしで CLEAN を返した。この exact contract は accepted で、shared
-timeout prerequisite は implemented、writer hardening と package implementation は記録済み order のまま pending。
+timeout と generic writer-hardening prerequisite は implemented、package implementation は記録済み order のまま pending。
 
 その後の acceptance-status audit は summary-only conflation の P3 1 件を返した。impossible native product と
 malformed private record を pre-I/O guarantee 1 個にまとめていた。修正は public-contract ledger row と safety

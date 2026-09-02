@@ -72,8 +72,8 @@ consumer needs to branch on them). Resolver failures are EAI values, not errno:
 `encoded := AL_CODE.saturating_add(eai.saturating_abs())`, then
 `Error.Code(encoded - AL_CODE)`. Partial
 read/write is handled by the reused reader/writer. Connection reset
-mid-stream surfaces as a read/write Error; the `pkg.kv` prerequisite below closes the current Linux
-SIGPIPE hole so a write to a closed peer cannot terminate the process first.
+mid-stream surfaces as a read/write Error; the implemented `pkg.kv` prerequisite below has closed
+the former SIGPIPE hole, so a write to a closed peer cannot terminate the process first.
 
 **`l.accept()` is the exception, and deliberately so: a failure of ONE inbound connection is not a
 failure of the listener.** `accept(2)` reports both through the same errno, so the ones that
@@ -236,7 +236,7 @@ expiry. A conn whose peer accepts then never sends, with `read_timeout_ns` set �
 
 > **Status:** implemented as the first independently useful prerequisite. It changes no public
 > signature, compiler operation, runtime symbol, ABI shape, registry key, or row count. The planned
-> checked package row and prerequisite 2 remain inactive.
+> checked package row remains inactive until package implementation.
 
 For every usable resolver address and positive `timeout_ns`, `align_rt_tcp_connect` records a
 monotonic start and positive `Duration` budget immediately before the first `F_GETFL`, then checks
@@ -341,11 +341,12 @@ pre-existing end-to-end timeout and command cleanup/precedence owners.
 
 ---
 
-## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — IMPLEMENTED 2026-09-02)
 
-> **Status:** independently useful safety prerequisite; accepted design, implementation pending.
-> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
-> row count changes.
+> **Status:** implemented as the second independently useful safety prerequisite. No public
+> signature, compiler operation, runtime symbol, ABI shape, registry key, or row count changed. The
+> package source and planned checked-timeout row remain inactive until their joint capability
+> boundary.
 
 The existing `c.writer() -> writer` remains the one TCP byte-write surface. Its private runtime
 `Writer` state gains a sink kind and macOS/BSD readiness bit set to socket/not-ready only by
@@ -385,7 +386,11 @@ discarding the setting. Linux/macOS subprocess closed-peer tests cover direct sl
 overloads, logger, and `io.copy` routes and must return `Error`, never die from SIGPIPE. Direct
 partial/EINTR/timeout/zero-progress tests and file/std writer parity remain separate owners.
 
-The checked timeout substrate has landed; writer hardening is the second prerequisite. After it,
-the planned `TcpConnSetIoTimeout` row and its `pkg.kv` package consumer activate together. Exact
-package consumption and the implementation boundary are in `../pkg-design/kv.md`; the one-row reservation
-and unchanged prerequisite ABI identities are recorded in `../20-runtime-abi-ledger.md`.
+The shipped direct owners are `tcp_writer_complete_send_transition_matrix`,
+`tcp_writer_macos_nosigpipe_state_matrix`, `tcp_writer_generic_fd_parity_and_socket_lifecycle`, and
+`tcp_writer_closed_peer_routes_do_not_sigpipe`.
+
+Both prerequisites have landed. The planned `TcpConnSetIoTimeout` row and its `pkg.kv` package
+consumer are the next capability and activate together. Exact package consumption and the
+implementation boundary are in `../pkg-design/kv.md`; the one-row reservation and unchanged
+prerequisite ABI identities are recorded in `../20-runtime-abi-ledger.md`.

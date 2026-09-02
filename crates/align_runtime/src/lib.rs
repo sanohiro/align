@@ -767,6 +767,13 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
 const SOL_SOCKET: i32 = 1; // Linux
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const SOL_SOCKET: i32 = 0xffff; // macOS/BSD
+// Per-call/per-socket SIGPIPE suppression for connected socket writers. Linux supplies a send flag;
+// macOS/BSD supplies a SOL_SOCKET option. The private Writer sink policy below is the shared
+// std.net path; std.http also reuses these constants for its independent raw-fd path.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const MSG_NOSIGNAL: i32 = 0x4000; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_NOSIGPIPE: i32 = 0x1022; // macOS/BSD
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const SO_KEEPALIVE: i32 = 9; // Linux
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1243,7 +1250,7 @@ pub unsafe extern "C" fn align_rt_tcp_conn_writer(c: *mut TcpConn) -> *mut Write
         return core::ptr::null_mut();
     }
     let fd = unsafe { (*c).fd };
-    Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered: false, buf: Vec::new() }))
+    Box::into_raw(Box::new(Writer::tcp_socket(fd)))
 }
 
 /// Build the `struct timeval` for an `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline from a nanosecond count.
@@ -8533,6 +8540,169 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> i32 {
     0
 }
 
+/// The platform SIGPIPE discipline for a connection-derived writer. Keeping the policy explicit
+/// lets the deterministic owner exercise both state machines on either supported build host while
+/// the native call site still selects exactly one at compile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum SocketSigpipePolicy {
+    SendFlags(i32),
+    InstallSocketOption,
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const NATIVE_SOCKET_SIGPIPE_POLICY: SocketSigpipePolicy =
+    SocketSigpipePolicy::SendFlags(MSG_NOSIGNAL);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const NATIVE_SOCKET_SIGPIPE_POLICY: SocketSigpipePolicy =
+    SocketSigpipePolicy::InstallSocketOption;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketCallOutcome {
+    result: isize,
+    errno: i32,
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "ios"))))]
+impl SocketCallOutcome {
+    #[cfg(test)]
+    const fn returned(result: isize) -> Self {
+        SocketCallOutcome { result, errno: 0 }
+    }
+
+    const fn failed(errno: i32) -> Self {
+        SocketCallOutcome { result: -1, errno }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketWriteAttempt {
+    Sent(usize),
+    Zero,
+    Interrupted,
+    Failed(i32),
+}
+
+fn socket_option_status(outcome: SocketCallOutcome) -> Result<(), i32> {
+    if outcome.result == 0 {
+        Ok(())
+    } else {
+        Err(io_error_to_status(&std::io::Error::from_raw_os_error(
+            outcome.errno,
+        )))
+    }
+}
+
+fn socket_write_attempt(outcome: SocketCallOutcome) -> SocketWriteAttempt {
+    if outcome.result > 0 {
+        return usize::try_from(outcome.result)
+            .map(SocketWriteAttempt::Sent)
+            .unwrap_or(SocketWriteAttempt::Failed(AL_CODE));
+    }
+    if outcome.result == 0 {
+        return SocketWriteAttempt::Zero;
+    }
+    let error = std::io::Error::from_raw_os_error(outcome.errno);
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        SocketWriteAttempt::Interrupted
+    } else {
+        SocketWriteAttempt::Failed(io_read_write_status(&error))
+    }
+}
+
+/// Static-dispatch seam for the socket-only complete-write loop. Production calls libc directly;
+/// tests script exact install/send transitions without process-global hooks or indirect calls.
+trait SocketWriteOps {
+    fn install_nosigpipe(&mut self, fd: i32) -> SocketCallOutcome;
+    fn send(&mut self, fd: i32, bytes: &[u8], flags: i32) -> SocketCallOutcome;
+}
+
+struct NativeSocketWriteOps;
+
+impl SocketWriteOps for NativeSocketWriteOps {
+    fn install_nosigpipe(&mut self, fd: i32) -> SocketCallOutcome {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let on: i32 = 1;
+            let option_len = u32::try_from(core::mem::size_of::<i32>()).unwrap_or(u32::MAX);
+            let rc = unsafe {
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_NOSIGPIPE,
+                    (&on as *const i32).cast(),
+                    option_len,
+                )
+            };
+            let errno = if rc < 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            } else {
+                0
+            };
+            SocketCallOutcome {
+                result: isize::try_from(rc).unwrap_or(-1),
+                errno,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = fd;
+            SocketCallOutcome::failed(0)
+        }
+    }
+
+    fn send(&mut self, fd: i32, bytes: &[u8], flags: i32) -> SocketCallOutcome {
+        let result = unsafe { send(fd, bytes.as_ptr().cast(), bytes.len(), flags) };
+        let errno = if result < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        SocketCallOutcome { result, errno }
+    }
+}
+
+/// Write one complete nonempty view to a connected socket without raising SIGPIPE. A successful
+/// macOS/BSD option install is cached by the caller's writer shell; failure sends no bytes and
+/// leaves that shell retryable. A zero result is `Code(0)` without consulting stale errno.
+fn write_all_socket_with_ops<O: SocketWriteOps>(
+    fd: i32,
+    nosigpipe_ready: &mut bool,
+    policy: SocketSigpipePolicy,
+    mut bytes: &[u8],
+    ops: &mut O,
+) -> i32 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let flags = match policy {
+        SocketSigpipePolicy::SendFlags(flags) => flags,
+        SocketSigpipePolicy::InstallSocketOption => {
+            if !*nosigpipe_ready {
+                if let Err(status) = socket_option_status(ops.install_nosigpipe(fd)) {
+                    return status;
+                }
+                *nosigpipe_ready = true;
+            }
+            0
+        }
+    };
+    while !bytes.is_empty() {
+        match socket_write_attempt(ops.send(fd, bytes, flags)) {
+            SocketWriteAttempt::Sent(0) | SocketWriteAttempt::Zero => return AL_CODE,
+            SocketWriteAttempt::Sent(written) => {
+                let Some(remaining) = bytes.get(written..) else {
+                    return AL_CODE;
+                };
+                bytes = remaining;
+            }
+            SocketWriteAttempt::Interrupted => {}
+            SocketWriteAttempt::Failed(status) => return status,
+        }
+    }
+    0
+}
+
 /// Borrow a `str` view's bytes (`ptr`/`len`) as UTF-8 without allocating or copying. `None` for a
 /// length that doesn't fit `usize` (a 32-bit target) or non-UTF-8 bytes.
 ///
@@ -9784,18 +9954,58 @@ pub unsafe extern "C" fn align_rt_io_reader_free(r: *mut Reader) {
 
 // --- writer -----------------------------------------------------------------------------------
 
-/// A `writer` (`std.io`) — one Move type for every write sink (`io.stdout`, `io.stderr`,
-/// `io.stdout.buffered()`, `fs.create`): it owns an fd and, when `buffered`, an O(buffer)
-/// accumulator that reaches the fd only on a full buffer / explicit `flush` / `Drop`. `Drop`
-/// (`align_rt_io_writer_free`) flushes best-effort, then closes the fd iff `owns_fd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterSink {
+    GenericFd,
+    TcpSocket { nosigpipe_ready: bool },
+}
+
+/// A `writer` (`std.io`) — one Move type for generic fd and connected-socket sinks. Standard/file
+/// writers optionally buffer and retain the existing `write(2)` path. A TCP-derived writer is
+/// unbuffered/non-owning and carries the shell-local SIGPIPE readiness required by its `send` path.
+/// `Drop` (`align_rt_io_writer_free`) flushes best-effort, then closes the fd iff `owns_fd`.
 pub struct Writer {
     fd: i32,
     owns_fd: bool,
     buffered: bool,
     buf: Vec<u8>,
+    sink: WriterSink,
 }
 
 impl Writer {
+    fn generic_fd(fd: i32, owns_fd: bool, buffered: bool) -> Self {
+        let buf = if buffered { Vec::with_capacity(BUF_WRITER_CAP) } else { Vec::new() };
+        Writer { fd, owns_fd, buffered, buf, sink: WriterSink::GenericFd }
+    }
+
+    fn tcp_socket(fd: i32) -> Self {
+        Writer {
+            fd,
+            owns_fd: false,
+            buffered: false,
+            buf: Vec::new(),
+            sink: WriterSink::TcpSocket {
+                nosigpipe_ready: false,
+            },
+        }
+    }
+
+    fn write_unbuffered(&mut self, bytes: &[u8]) -> i32 {
+        match &mut self.sink {
+            WriterSink::GenericFd => write_all_fd(self.fd, bytes),
+            WriterSink::TcpSocket { nosigpipe_ready } => {
+                let mut ops = NativeSocketWriteOps;
+                write_all_socket_with_ops(
+                    self.fd,
+                    nosigpipe_ready,
+                    NATIVE_SOCKET_SIGPIPE_POLICY,
+                    bytes,
+                    &mut ops,
+                )
+            }
+        }
+    }
+
     /// Flush the accumulator to the fd, clearing it on success. Returns the write status.
     fn flush_buf(&mut self) -> i32 {
         if self.buf.is_empty() {
@@ -9813,8 +10023,7 @@ impl Writer {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_io_writer_std(fd: i32, buffered: i32) -> *mut Writer {
     let buffered = buffered != 0;
-    let buf = if buffered { Vec::with_capacity(BUF_WRITER_CAP) } else { Vec::new() };
-    Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered, buf }))
+    Box::into_raw(Box::new(Writer::generic_fd(fd, false, buffered)))
 }
 
 /// `fs.create(path)` — create/truncate `path` (a `str` view) for writing, writing the owned
@@ -9837,12 +10046,11 @@ pub unsafe extern "C" fn align_rt_io_writer_create(path: *const u8, path_len: i6
     match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path_str) {
         Ok(f) => {
             unsafe {
-                *out = Box::into_raw(Box::new(Writer {
-                    fd: f.into_raw_fd(),
-                    owns_fd: true,
-                    buffered: true,
-                    buf: Vec::with_capacity(BUF_WRITER_CAP),
-                }))
+                *out = Box::into_raw(Box::new(Writer::generic_fd(
+                    f.into_raw_fd(),
+                    true,
+                    true,
+                )))
             };
             0
         }
@@ -9880,12 +10088,7 @@ pub unsafe extern "C" fn align_rt_io_writer_create_exclusive(
         return io_error_to_status(&std::io::Error::last_os_error());
     }
     unsafe {
-        *out = Box::into_raw(Box::new(Writer {
-            fd,
-            owns_fd: true,
-            buffered: true,
-            buf: Vec::with_capacity(BUF_WRITER_CAP),
-        }));
+        *out = Box::into_raw(Box::new(Writer::generic_fd(fd, true, true)));
     }
     0
 }
@@ -9922,12 +10125,11 @@ pub unsafe extern "C" fn align_rt_io_writer_create_exclusive_beneath(
         } {
             Ok(fd) => {
                 unsafe {
-                    *out = Box::into_raw(Box::new(Writer {
-                        fd: fd.into_raw(),
-                        owns_fd: true,
-                        buffered: true,
-                        buf: Vec::with_capacity(BUF_WRITER_CAP),
-                    }))
+                    *out = Box::into_raw(Box::new(Writer::generic_fd(
+                        fd.into_raw(),
+                        true,
+                        true,
+                    )))
                 };
                 0
             }
@@ -9960,7 +10162,7 @@ pub unsafe extern "C" fn align_rt_io_writer_write(w: *mut Writer, ptr: *const u8
     let Ok(n) = safe_len(len) else { return AL_INVALID };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
     if !w.buffered {
-        return write_all_fd(w.fd, bytes);
+        return w.write_unbuffered(bytes);
     }
     if w.buf.len() + n > BUF_WRITER_CAP {
         let s = w.flush_buf();
@@ -15848,11 +16050,10 @@ unsafe extern "C" {
     // (the pending connect error) after a non-blocking `connect` becomes writable. `optlen` is
     // in/out (`socklen_t*` = `*mut u32`). Identical prototype on Linux and macOS/BSD.
     fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut core::ffi::c_void, optlen: *mut u32) -> i32;
-    // `send` — a socket write that can suppress `SIGPIPE` via `MSG_NOSIGNAL` (Linux). Writing to a
-    // peer that has closed its read half would otherwise raise `SIGPIPE` and kill the whole process —
-    // the common case when the http pool reuses a keepalive conn the server has since dropped. On
-    // macOS/BSD there is no `MSG_NOSIGNAL`; `SO_NOSIGPIPE` is set on the socket instead (see the http
-    // client), so `flags` is `0` there. Identical prototype on Linux and macOS/BSD.
+    // `send` — the connected-socket write used by the shared `std.net` writer and the independent
+    // HTTP raw-fd paths. Linux passes `MSG_NOSIGNAL`; macOS/BSD first sets `SO_NOSIGPIPE` and passes
+    // zero flags. Both prevent a closed peer from terminating the process. Identical prototype on
+    // Linux and macOS/BSD.
     fn send(sockfd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32) -> isize;
     // `recv` — the connected-socket sibling used with `MSG_PEEK` at the exact close-delimited SSE
     // work boundary. The one-byte application payload stays queued; zero reports peer EOF.
@@ -20435,16 +20636,9 @@ pub unsafe extern "C" fn align_rt_http_resp_free(resp: *mut HttpResponse) {
 const IPPROTO_TCP: i32 = 6;
 const TCP_NODELAY: i32 = 1;
 
-// SIGPIPE suppression on the client write path. On Linux, `send(..., MSG_NOSIGNAL)` never raises
-// `SIGPIPE` (a write to a peer that closed its read half returns `EPIPE` instead). On macOS/BSD there
-// is no such flag; `SO_NOSIGPIPE` is set once on the socket (at `IPPROTO_TCP`'s sibling `SOL_SOCKET`).
-// This matters most for the pool: reusing a keepalive conn the server has since dropped writes to a
-// dead peer, which must fail cleanly (→ retry on a fresh conn) rather than kill the process.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
-const MSG_NOSIGNAL: i32 = 0x4000; // Linux
+// The HTTP client uses the shared socket SIGPIPE constants declared with the std.net socket options.
+// `MSG_PEEK` stays local to HTTP's close-delimited streaming boundary.
 const MSG_PEEK: i32 = 0x2; // Linux and macOS/BSD
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const SO_NOSIGPIPE: i32 = 0x1022; // macOS/BSD socket option (SOL_SOCKET)
 
 /// The cap on a response's status line + header block: a response whose header block is not terminated
 /// within this many bytes is rejected (`AL_INVALID`) — a bound against an adversarial server that
@@ -25744,6 +25938,690 @@ mod tests {
         assert_eq!(unsafe { align_rt_hash64(std::ptr::null(), -5) }, wyhash(b"", WY_SEED));
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum ScriptedSocketWriteCall {
+        Install { fd: i32 },
+        Send { fd: i32, bytes: Vec<u8>, flags: i32 },
+    }
+
+    struct ScriptedSocketWriteOps {
+        installs: std::collections::VecDeque<SocketCallOutcome>,
+        sends: std::collections::VecDeque<SocketCallOutcome>,
+        calls: Vec<ScriptedSocketWriteCall>,
+    }
+
+    impl ScriptedSocketWriteOps {
+        fn new(
+            installs: impl IntoIterator<Item = SocketCallOutcome>,
+            sends: impl IntoIterator<Item = SocketCallOutcome>,
+        ) -> Self {
+            ScriptedSocketWriteOps {
+                installs: installs.into_iter().collect(),
+                sends: sends.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl SocketWriteOps for ScriptedSocketWriteOps {
+        fn install_nosigpipe(&mut self, fd: i32) -> SocketCallOutcome {
+            self.calls.push(ScriptedSocketWriteCall::Install { fd });
+            self.installs.pop_front().expect("scripted SO_NOSIGPIPE result")
+        }
+
+        fn send(&mut self, fd: i32, bytes: &[u8], flags: i32) -> SocketCallOutcome {
+            self.calls.push(ScriptedSocketWriteCall::Send {
+                fd,
+                bytes: bytes.to_vec(),
+                flags,
+            });
+            self.sends.pop_front().expect("scripted send result")
+        }
+    }
+
+    #[test]
+    fn tcp_writer_complete_send_transition_matrix() {
+        const TEST_MSG_NOSIGNAL: i32 = 0x4000;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        assert_eq!(
+            NATIVE_SOCKET_SIGPIPE_POLICY,
+            SocketSigpipePolicy::SendFlags(TEST_MSG_NOSIGNAL),
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert_eq!(
+            NATIVE_SOCKET_SIGPIPE_POLICY,
+            SocketSigpipePolicy::InstallSocketOption,
+        );
+
+        let mut ready = false;
+        let mut ops = ScriptedSocketWriteOps::new(
+            [],
+            [
+                SocketCallOutcome::failed(libc::EINTR),
+                SocketCallOutcome::returned(2),
+                SocketCallOutcome::failed(libc::EINTR),
+                SocketCallOutcome::returned(3),
+            ],
+        );
+        assert_eq!(
+            write_all_socket_with_ops(
+                41,
+                &mut ready,
+                SocketSigpipePolicy::SendFlags(TEST_MSG_NOSIGNAL),
+                b"hello",
+                &mut ops,
+            ),
+            0,
+        );
+        assert!(!ready, "Linux flag policy has no per-shell install transition");
+        assert_eq!(
+            ops.calls,
+            [
+                ScriptedSocketWriteCall::Send {
+                    fd: 41,
+                    bytes: b"hello".to_vec(),
+                    flags: TEST_MSG_NOSIGNAL,
+                },
+                ScriptedSocketWriteCall::Send {
+                    fd: 41,
+                    bytes: b"hello".to_vec(),
+                    flags: TEST_MSG_NOSIGNAL,
+                },
+                ScriptedSocketWriteCall::Send {
+                    fd: 41,
+                    bytes: b"llo".to_vec(),
+                    flags: TEST_MSG_NOSIGNAL,
+                },
+                ScriptedSocketWriteCall::Send {
+                    fd: 41,
+                    bytes: b"llo".to_vec(),
+                    flags: TEST_MSG_NOSIGNAL,
+                },
+            ],
+            "EINTR retries the exact current view, partial progress advances once, and every attempt carries MSG_NOSIGNAL",
+        );
+
+        let epipe = AL_CODE.saturating_add(libc::EPIPE);
+        let mut ready = false;
+        let mut ops = ScriptedSocketWriteOps::new(
+            [],
+            [
+                SocketCallOutcome::returned(1),
+                SocketCallOutcome::failed(libc::EPIPE),
+            ],
+        );
+        assert_eq!(
+            write_all_socket_with_ops(
+                42,
+                &mut ready,
+                SocketSigpipePolicy::SendFlags(TEST_MSG_NOSIGNAL),
+                b"abc",
+                &mut ops,
+            ),
+            epipe,
+            "a later error wins after partial progress; the caller owns replay",
+        );
+        assert_eq!(
+            ops.calls[1],
+            ScriptedSocketWriteCall::Send {
+                fd: 42,
+                bytes: b"bc".to_vec(),
+                flags: TEST_MSG_NOSIGNAL,
+            },
+        );
+
+        assert_eq!(
+            io_read_write_status(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            AL_TIMEOUT,
+        );
+        assert_eq!(
+            io_error_to_status(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            AL_CODE.saturating_add(libc::EAGAIN),
+            "an option-install EAGAIN is an ordinary code, not a send-timeout sentinel",
+        );
+        for errno in [libc::EAGAIN, libc::EWOULDBLOCK] {
+            let mut ready = false;
+            let mut ops =
+                ScriptedSocketWriteOps::new([], [SocketCallOutcome::failed(errno)]);
+            assert_eq!(
+                write_all_socket_with_ops(
+                    43,
+                    &mut ready,
+                    SocketSigpipePolicy::SendFlags(TEST_MSG_NOSIGNAL),
+                    b"x",
+                    &mut ops,
+                ),
+                AL_TIMEOUT,
+            );
+        }
+
+        for errno in [0, libc::EAGAIN] {
+            let mut ready = false;
+            let mut ops = ScriptedSocketWriteOps::new(
+                [],
+                [SocketCallOutcome { result: 0, errno }],
+            );
+            assert_eq!(
+                write_all_socket_with_ops(
+                    44,
+                    &mut ready,
+                    SocketSigpipePolicy::SendFlags(TEST_MSG_NOSIGNAL),
+                    b"x",
+                    &mut ops,
+                ),
+                AL_CODE,
+                "positive-length zero progress is Code(0), independent of stale errno",
+            );
+        }
+
+        let mut ready = false;
+        let mut ops = ScriptedSocketWriteOps::new([], []);
+        assert_eq!(
+            write_all_socket_with_ops(
+                45,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"",
+                &mut ops,
+            ),
+            0,
+        );
+        assert!(ops.calls.is_empty(), "an empty write neither installs nor sends");
+        assert!(!ready);
+    }
+
+    #[test]
+    fn tcp_writer_macos_nosigpipe_state_matrix() {
+        let install_error = AL_CODE.saturating_add(libc::EAGAIN);
+        let send_error = AL_CODE.saturating_add(libc::EPIPE);
+
+        let mut ready = false;
+        let mut ops = ScriptedSocketWriteOps::new(
+            [
+                SocketCallOutcome::failed(libc::EAGAIN),
+                SocketCallOutcome::returned(0),
+            ],
+            [
+                SocketCallOutcome::returned(1),
+                SocketCallOutcome::returned(1),
+            ],
+        );
+        assert_eq!(
+            write_all_socket_with_ops(
+                51,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"a",
+                &mut ops,
+            ),
+            install_error,
+        );
+        assert!(!ready, "a failed install leaves the shell retryable");
+        assert_eq!(ops.calls, [ScriptedSocketWriteCall::Install { fd: 51 }]);
+        assert_eq!(
+            write_all_socket_with_ops(
+                51,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"b",
+                &mut ops,
+            ),
+            0,
+        );
+        assert!(ready);
+        assert_eq!(
+            write_all_socket_with_ops(
+                51,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"c",
+                &mut ops,
+            ),
+            0,
+        );
+        assert_eq!(
+            ops.calls,
+            [
+                ScriptedSocketWriteCall::Install { fd: 51 },
+                ScriptedSocketWriteCall::Install { fd: 51 },
+                ScriptedSocketWriteCall::Send {
+                    fd: 51,
+                    bytes: b"b".to_vec(),
+                    flags: 0,
+                },
+                ScriptedSocketWriteCall::Send {
+                    fd: 51,
+                    bytes: b"c".to_vec(),
+                    flags: 0,
+                },
+            ],
+            "failure sends nothing; success is cached for later calls",
+        );
+
+        let mut ready = false;
+        let mut ops = ScriptedSocketWriteOps::new(
+            [SocketCallOutcome::returned(0)],
+            [
+                SocketCallOutcome::failed(libc::EPIPE),
+                SocketCallOutcome::returned(1),
+            ],
+        );
+        assert_eq!(
+            write_all_socket_with_ops(
+                52,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"x",
+                &mut ops,
+            ),
+            send_error,
+        );
+        assert!(ready, "a successful install remains cached after a later send failure");
+        assert_eq!(
+            write_all_socket_with_ops(
+                52,
+                &mut ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"y",
+                &mut ops,
+            ),
+            0,
+        );
+        assert_eq!(
+            ops.calls.iter().filter(|call| matches!(call, ScriptedSocketWriteCall::Install { .. })).count(),
+            1,
+        );
+
+        for success_first in [true, false] {
+            let mut first_ready = false;
+            let mut second_ready = false;
+            let installs = if success_first {
+                [
+                    SocketCallOutcome::returned(0),
+                    SocketCallOutcome::failed(libc::EAGAIN),
+                    SocketCallOutcome::returned(0),
+                ]
+            } else {
+                [
+                    SocketCallOutcome::failed(libc::EAGAIN),
+                    SocketCallOutcome::returned(0),
+                    SocketCallOutcome::returned(0),
+                ]
+            };
+            let mut ops = ScriptedSocketWriteOps::new(
+                installs,
+                [
+                    SocketCallOutcome::returned(1),
+                    SocketCallOutcome::returned(1),
+                ],
+            );
+            let first_status = write_all_socket_with_ops(
+                53,
+                &mut first_ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"a",
+                &mut ops,
+            );
+            let second_status = write_all_socket_with_ops(
+                53,
+                &mut second_ready,
+                SocketSigpipePolicy::InstallSocketOption,
+                b"b",
+                &mut ops,
+            );
+            if success_first {
+                assert_eq!((first_status, second_status), (0, install_error));
+                assert!(first_ready && !second_ready);
+                assert_eq!(
+                    write_all_socket_with_ops(
+                        53,
+                        &mut second_ready,
+                        SocketSigpipePolicy::InstallSocketOption,
+                        b"c",
+                        &mut ops,
+                    ),
+                    0,
+                );
+            } else {
+                assert_eq!((first_status, second_status), (install_error, 0));
+                assert!(!first_ready && second_ready);
+                assert_eq!(
+                    write_all_socket_with_ops(
+                        53,
+                        &mut first_ready,
+                        SocketSigpipePolicy::InstallSocketOption,
+                        b"c",
+                        &mut ops,
+                    ),
+                    0,
+                );
+            }
+            assert!(first_ready && second_ready);
+            assert_eq!(
+                ops.calls.iter().filter(|call| matches!(call, ScriptedSocketWriteCall::Install { .. })).count(),
+                3,
+                "each overlapping shell needs its own successful install result",
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_writer_generic_fd_parity_and_socket_lifecycle() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+
+        let empty_socket = Box::into_raw(Box::new(Writer::tcp_socket(-1)));
+        assert_eq!(
+            unsafe { align_rt_io_writer_write(empty_socket, b"".as_ptr(), 0) },
+            0,
+        );
+        let empty_builder = align_rt_builder_new(core::ptr::null_mut(), 0);
+        assert_eq!(
+            unsafe { align_rt_io_writer_write_builder(empty_socket, empty_builder) },
+            0,
+        );
+        assert_eq!(unsafe { align_rt_io_writer_flush(empty_socket) }, 0);
+        assert_eq!(
+            unsafe { (*empty_socket).sink },
+            WriterSink::TcpSocket {
+                nosigpipe_ready: false,
+            },
+            "empty slice/builder writes and flush do not install or send",
+        );
+        unsafe {
+            align_rt_builder_free(empty_builder);
+            align_rt_io_writer_free(empty_socket);
+        }
+
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_flags = unsafe { libc::fcntl(pipe_fds[0], libc::F_GETFL) };
+        assert_ne!(read_flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe_fds[0], libc::F_SETFL, read_flags | libc::O_NONBLOCK) },
+            0,
+        );
+        let generic = align_rt_io_writer_std(pipe_fds[1], 0);
+        assert_eq!(unsafe { (*generic).sink }, WriterSink::GenericFd);
+        assert_eq!(unsafe { align_rt_io_writer_write(generic, b"g".as_ptr(), 1) }, 0);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), byte.len()) },
+            1,
+        );
+        assert_eq!(byte, *b"g", "a generic writer keeps the write(2) path");
+        unsafe { align_rt_io_writer_free(generic) };
+        assert_ne!(unsafe { libc::fcntl(pipe_fds[1], libc::F_GETFD) }, -1);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bounded socket peer reads");
+        let fd = socket.into_raw_fd();
+        let conn = Box::into_raw(Box::new(TcpConn { fd }));
+        let writer = unsafe { align_rt_tcp_conn_writer(conn) };
+        assert_eq!(
+            unsafe { (*writer).sink },
+            WriterSink::TcpSocket {
+                nosigpipe_ready: false,
+            },
+        );
+        assert!(!unsafe { (*writer).owns_fd });
+        assert!(!unsafe { (*writer).buffered });
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"x".as_ptr(), 1) }, 0);
+        peer.read_exact(&mut byte).expect("read first socket byte");
+        assert_eq!(byte, *b"x");
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert_eq!(
+                unsafe { (*writer).sink },
+                WriterSink::TcpSocket {
+                    nosigpipe_ready: true,
+                },
+            );
+            let mut enabled = 0i32;
+            let mut option_len = u32::try_from(core::mem::size_of::<i32>()).unwrap_or(u32::MAX);
+            assert_eq!(
+                unsafe {
+                    getsockopt(
+                        fd,
+                        SOL_SOCKET,
+                        SO_NOSIGPIPE,
+                        (&mut enabled as *mut i32).cast(),
+                        &mut option_len,
+                    )
+                },
+                0,
+            );
+            assert_eq!(enabled, 1);
+        }
+        unsafe { align_rt_io_writer_free(writer) };
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "freeing the non-owning shell leaves the connection fd open",
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let mut enabled = 0i32;
+            let mut option_len = u32::try_from(core::mem::size_of::<i32>()).unwrap_or(u32::MAX);
+            assert_eq!(
+                unsafe {
+                    getsockopt(
+                        fd,
+                        SOL_SOCKET,
+                        SO_NOSIGPIPE,
+                        (&mut enabled as *mut i32).cast(),
+                        &mut option_len,
+                    )
+                },
+                0,
+            );
+            assert_eq!(enabled, 1, "shell Drop does not clear the monotone socket option");
+        }
+
+        let second = unsafe { align_rt_tcp_conn_writer(conn) };
+        assert_eq!(
+            unsafe { (*second).sink },
+            WriterSink::TcpSocket {
+                nosigpipe_ready: false,
+            },
+            "a new shell starts with its own not-ready evidence",
+        );
+        assert_eq!(unsafe { align_rt_io_writer_write(second, b"y".as_ptr(), 1) }, 0);
+        peer.read_exact(&mut byte).expect("read second socket byte");
+        assert_eq!(byte, *b"y");
+        unsafe { align_rt_io_writer_free(second) };
+        peer.set_nonblocking(true).expect("nonblocking peer probe");
+        assert_eq!(
+            peer.read(&mut byte).expect_err("shell Drop sends no hidden bytes").kind(),
+            std::io::ErrorKind::WouldBlock,
+        );
+        peer.set_nonblocking(false).expect("restore bounded blocking peer read");
+        unsafe { align_rt_tcp_conn_free(conn) };
+        assert_eq!(
+            peer.read(&mut byte).expect("read EOF after connection close"),
+            0,
+            "connection close reaches the peer as EOF and discards the socket state",
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned with SIGPIPE defaulted/unblocked by tcp_writer_closed_peer_routes_do_not_sigpipe"]
+    fn tcp_writer_closed_peer_route_probe() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+
+        let route = std::env::var("ALIGN_TCP_WRITER_SIGPIPE_ROUTE").expect("route");
+        unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGPIPE, &action, core::ptr::null_mut()), 0);
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut()),
+                0,
+            );
+        }
+
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let fd = socket.into_raw_fd();
+        let conn = Box::into_raw(Box::new(TcpConn { fd }));
+        let writer = unsafe { align_rt_tcp_conn_writer(conn) };
+        // Prime the native socket route while it is live. On macOS this installs and caches
+        // SO_NOSIGPIPE before the deterministic EPIPE state; installing the option only after
+        // SHUT_WR would fail before send and leave the signal owner vacuous.
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"p".as_ptr(), 1) }, 0);
+        let mut priming_byte = [0u8; 1];
+        peer.read_exact(&mut priming_byte).expect("read SIGPIPE probe priming byte");
+        assert_eq!(&priming_byte, b"p");
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
+        drop(peer);
+        let expected = AL_CODE.saturating_add(libc::EPIPE);
+        match route.as_str() {
+            "slice" => {
+                assert_eq!(
+                    unsafe { align_rt_io_writer_write(writer, b"x".as_ptr(), 1) },
+                    expected,
+                );
+                unsafe { align_rt_io_writer_free(writer) };
+            }
+            "builder" => {
+                let builder = align_rt_builder_new(core::ptr::null_mut(), 0);
+                unsafe { align_rt_builder_write(builder, b"x".as_ptr(), 1) };
+                assert_eq!(
+                    unsafe { align_rt_io_writer_write_builder(writer, builder) },
+                    expected,
+                );
+                unsafe {
+                    align_rt_builder_free(builder);
+                    align_rt_io_writer_free(writer);
+                }
+            }
+            "logger" => {
+                let logger = unsafe { align_rt_log_new(writer, 0) };
+                assert!(!logger.is_null());
+                assert_eq!(
+                    unsafe { align_rt_log_line(logger, 1, b"x".as_ptr(), 1) },
+                    expected,
+                );
+                assert_eq!(unsafe { align_rt_log_flush(logger) }, expected);
+                unsafe { align_rt_log_free(logger) };
+            }
+            "io-copy" => {
+                let mut pipe_fds = [-1; 2];
+                assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+                assert_eq!(unsafe { libc::write(pipe_fds[1], b"x".as_ptr().cast(), 1) }, 1);
+                unsafe { libc::close(pipe_fds[1]) };
+                let reader = Box::into_raw(Box::new(Reader::unbuffered(pipe_fds[0], true)));
+                assert_eq!(
+                    unsafe { align_rt_io_copy(reader, writer) },
+                    -i64::from(expected),
+                );
+                unsafe {
+                    align_rt_io_reader_free(reader);
+                    align_rt_io_writer_free(writer);
+                }
+            }
+            _ => panic!("unknown route {route}"),
+        }
+        unsafe { align_rt_tcp_conn_free(conn) };
+    }
+
+    fn run_tcp_writer_closed_peer_probe(route: &str) -> std::process::Output {
+        fn drain<R: std::io::Read + Send + 'static>(
+            mut pipe: R,
+        ) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        }
+
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("current runtime test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::tcp_writer_closed_peer_route_probe",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("ALIGN_TCP_WRITER_SIGPIPE_ROUTE", route)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn closed-peer route probe");
+        let stdout = drain(child.stdout.take().expect("probe stdout pipe"));
+        let stderr = drain(child.stderr.take().expect("probe stderr pipe"));
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(10))
+            .expect("closed-peer probe deadline");
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let kill = child.kill();
+                    let reap = child.wait();
+                    let stdout = stdout.join().expect("join probe stdout");
+                    let stderr = stderr.join().expect("join probe stderr");
+                    panic!(
+                        "poll {route} closed-peer probe: {error}; kill={kill:?}; reap={reap:?}\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr),
+                    );
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill = child.kill();
+                let reap = child.wait();
+                let stdout = stdout.join().expect("join probe stdout");
+                let stderr = stderr.join().expect("join probe stderr");
+                panic!(
+                    "{route} closed-peer probe exceeded its watchdog; kill={kill:?}; reap={reap:?}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.join().expect("join probe stdout"),
+            stderr: stderr.join().expect("join probe stderr"),
+        }
+    }
+
+    #[test]
+    fn tcp_writer_closed_peer_routes_do_not_sigpipe() {
+        for route in ["slice", "builder", "logger", "io-copy"] {
+            let output = run_tcp_writer_closed_peer_probe(route);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{route} route must return Error instead of dying from SIGPIPE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                stdout,
+                stderr,
+            );
+            assert!(
+                stdout.contains("test tests::tcp_writer_closed_peer_route_probe ... ok")
+                    && stdout.contains("1 passed"),
+                "{route} route must execute the exact ignored probe\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+        }
+    }
+
     #[test]
     fn buffered_writer_accumulates_small_writes_without_flushing() {
         // Small writes stay buffered (no syscall, nothing reaches the fd): the buffer holds exactly
@@ -25812,12 +26690,7 @@ mod tests {
 
     #[test]
     fn logger_latches_the_first_validation_or_sink_failure() {
-        let invalid_writer = Box::into_raw(Box::new(Writer {
-            fd: -1,
-            owns_fd: false,
-            buffered: false,
-            buf: Vec::new(),
-        }));
+        let invalid_writer = Box::into_raw(Box::new(Writer::generic_fd(-1, false, false)));
         let logger = unsafe { align_rt_log_new(invalid_writer, 0) };
         let sink_status = unsafe { align_rt_log_line(logger, 3, b"x".as_ptr(), 1) };
         assert_ne!(sink_status, 0);
