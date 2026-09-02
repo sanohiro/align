@@ -208,24 +208,25 @@ the fd or calling `setsockopt`, and a live connection remains usable after the r
 Every non-null call has the unsafe precondition that the pointer names one live, unfreed `TcpConn`
 held with exclusive logical access for the complete call. A dangling or concurrently aliased
 pointer violates that precondition and is not detectable; no read, write, other configuration,
-reader/writer construction, free, or Drop may overlap.
+reader-or-writer construction, free, or Drop may overlap.
 
 For an admitted input the row uses the normalized ceil-to-microsecond `timeval` above, then installs
 `SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without attempting `SO_SNDTIMEO`;
 otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after both succeed. Let
 `R0` and `S0` be the receive/send option states at entry and `T` the requested state. Receive failure
 leaves `{R0,S0}`, send failure leaves `{T,S0}`, and success leaves `{T,T}`. After either option
-failure, a compatible caller must retire the still-owned connection, perform no read/write/configure
-or retry on it, and invoke its ordinary free/Drop path exactly once; close discards the entry or
-partial state. Success preserves usability, and a later exclusive successful call may overwrite
+failure, a compatible caller must retire the still-owned connection, perform no read, write,
+configuration, reader-or-writer construction, or retry on it, and invoke its ordinary free/Drop
+path exactly once; close discards the entry or partial state. Success preserves usability, and a later exclusive successful call may overwrite
 both options. The row itself allocates, retains, rolls back, closes, or consumes nothing. The null x
 range product directly owns validation order and the no-fd/no-option side-effect rule.
 Parameterized direct-runtime owners pre-arm both option states and pin live/exclusive preconditions,
 the exact normalized `timeval`, option order, call counts, returned status, the
 `{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
-prohibition, retirement, and later free/Drop. The package calls only on a fresh exclusively owned
-unpublished connection with both entry options clear; its owner closes after either option failure and proves that resolution is not
-reopened, no other address is attempted, and no partially configured client is published.
+prohibition, zero reader/writer-constructor calls, retirement, and later free/Drop. The package calls
+only on a fresh exclusively owned unpublished connection with both entry options clear; its owner
+closes after either option failure and proves that resolution is not reopened, no other address is
+attempted, and no partially configured client is published.
 
 The LLVM and Rust definitions use A04's default C calling convention and have no curated function,
 return, or parameter attributes. The compiler recognizes the fixed physical symbol for exact ABI

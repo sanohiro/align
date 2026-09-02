@@ -290,16 +290,18 @@ duration of a multi-read or multi-write operation.
 
 The planned source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
 to hold one live, unfreed connection exclusively across the call, with no overlapping
-read/write/configure/reader-writer-construction/free/Drop. It uses the exact normalized `timeval` and
+read/write/configuration/reader-or-writer construction/free/Drop. It uses the exact normalized `timeval` and
 installs receive before send. With entry option states `{R0,S0}` and requested state `T`, receive
 failure performs exactly one `setsockopt`, returns its mapped status, makes no send call, and leaves
 `{R0,S0}`; send failure performs exactly two calls, returns the send mapped status, and leaves
 `{T,S0}`; success performs exactly two calls, returns zero, and leaves `{T,T}`. Either option failure
-requires the compatible caller to retire the connection without retry and free/Drop it exactly once;
+requires the compatible caller to retire the connection, perform no read/write/configuration/
+reader-or-writer construction/retry, and free/Drop it exactly once;
 success preserves usability and permits a later exclusive overwrite. The package calls only on a
 fresh unpublished clear/clear connection and closes either failure without reopening resolution or
 trying another address. Owners pin live/exclusive preconditions, pre-armed states, option order,
-call counts, returned status, retry prohibition, retirement, and close/Drop.
+call counts, returned status, retry prohibition, zero reader/writer-constructor calls, retirement,
+and close/Drop.
 
 The ceil-to-microsecond conversion also serves shipped `std.http` plain/TLS/pool rearming. The
 poll-millisecond helper also serves `process.command`; that consumer adopts the same monotonic

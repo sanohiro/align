@@ -18,8 +18,10 @@ implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented a
 `docs/impl/pkg-design/auth.md`. The exact `pkg.kv` public-contract design candidate is authored in
 `docs/impl/pkg-design/kv.md`. Its first independent review reopened the shared
 timeout/native/cache axes; the first fresh review then found four remaining raw-view,
-source-reachable-lifecycle, resolver, and RESP-grammar gaps. The second ledger-first repair is
-complete; another fresh complete review is next, and no public contract is accepted yet.
+source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found two P3
+consistency gaps in the timeout action lists and malformed-state error partition. The third
+ledger-first repair is complete; a fresh complete review is next, and no public contract is
+accepted yet.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -349,7 +351,7 @@ facts must live in this repository.
 - **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
   in-language test runner, bounded data/protocol library wave (`core.codec`,
   `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact second-revised design
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact third-revised design
   candidate and remains the next language capability; another fresh complete review is pending.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
@@ -406,7 +408,7 @@ facts must live in this repository.
   independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
   whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
   new compiler/runtime ABI or ambient clock/provider/key/session owner.
-- **Next language capability:** complete another fresh independent review of the second revised
+- **Next language capability:** complete another fresh independent review of the third revised
   exact `pkg.kv` public-contract candidate in `docs/impl/pkg-design/kv.md`. The first exact-SHA review found an
   unenforceable positive-connect bound from unchecked `F_GETFL`/`F_SETFL`, plus timeout/address,
   native-status/ABI, RESP/allocation, SIGPIPE-owner, interface/cache, and inventory gaps. The repair
@@ -416,15 +418,20 @@ facts must live in this repository.
   positive socket I/O ns ceil to microseconds, and the shared `process.command` poll conversion), a
   second in-place SIGPIPE writer prerequisite across slice/builder writes, then one
   compiler-recognized generic timeout row with the ordinary-source RESP package. That row requires
-  a live/exclusive compatible caller; fixes unchanged receive-failure, send-failure-with-receive-
-  changed, and both-success option states; and mandates caller retirement/free after either option
-  failure. The package closes its fresh unpublished
-  connection. Impossible native count/view-length/view-pointer products use its explicit existing
-  `std.process`/`ProcessAbort` dependency. The public client remains synchronous plaintext RESP2 with
+  a live/exclusive compatible caller with no read/write/configuration/reader-or-writer construction/
+  free/Drop overlap; fixes unchanged receive-failure, send-failure-with-receive-changed, and
+  both-success option states; and after either option failure prohibits later read/write/
+  configuration/reader-or-writer construction/retry before exactly one free/Drop. The package
+  closes its fresh unpublished connection. Impossible native count/view-length/view-pointer
+  products use its explicit existing
+  `std.process`/`ProcessAbort` dependency. Malformed private resource state is not `Closed`: every
+  operation and Drop reaches the same abort dependency before native I/O or untrusted pointer
+  access. The public client remains synchronous plaintext RESP2 with
   explicit timeouts/cap, owned-string GET, conditional/expiring SET, one-key DEL, and fail-closed
   synchronization. The first fresh review found four remaining raw-view,
   source-reachable-lifecycle, resolver, and RESP-grammar gaps; the second repair closes their full
-  products. TLS and the wider Redis surface remain
+  products. The next complete review found the two consistency gaps above, which the third repair
+  closes. TLS and the wider Redis surface remain
   deferred. No public surface is accepted.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar

@@ -1433,7 +1433,9 @@ Copy and Pure; `Error` is Move only because `Server` owns its string. All four o
 Impure. A successful connect retains exactly four allocations: package state, TCP connection, and
 non-owning reader and writer shells. Empty GET/`Server` strings use canonical `{null, 0}` without a
 result buffer; nonempty results own one. `Invalid` precedes I/O, and cleanup never replaces a
-selected terminal package error. The per-unit resource record pins `client`, empty type parameters,
+selected terminal package error. A malformed private resource record is not a `Closed` producer:
+any public operation or Drop reaches the explicit existing `ProcessAbort` dependency before native
+I/O or untrusted pointer access. The per-unit resource record pins `client`, empty type parameters,
 arity zero, representation version one, `__align_resource_drop$pkg.kv$client`, and
 `b"align-res-drop-1"`. Existing cache scope remains exact: any own-source byte edit misses its
 frontend; a public interface edit misses transitive reverse dependencies, and
@@ -1444,10 +1446,12 @@ the client relies on the server's default RESP2 mode. One source-reachable runti
 planned and inactive until implementation: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` for
 checked receive/send timeout installation, reusing A04. It returns `AL_INVALID` for null then
 out-of-range input before fd access. Every non-null compatible caller supplies one live, unfreed,
-exclusively held connection and excludes read/write/configure/free/Drop overlap. From pre-armed
+exclusively held connection and excludes read/write/configuration/reader-or-writer construction/
+free/Drop overlap. From pre-armed
 option state `{R0,S0}` and requested `T`, receive failure leaves `{R0,S0}`, send failure leaves
 `{T,S0}`, and success leaves `{T,T}`. The row never rolls back, closes, or consumes; either option
-failure requires caller retirement and one later free/Drop, while success preserves usability and
+failure requires caller retirement, forbids later read/write/configuration/reader-or-writer
+construction/retry, and requires one later free/Drop, while success preserves usability and
 permits a later exclusive overwrite. The package uses a fresh unpublished connection and closes
 either failure. The compiler recognizes its fixed ABI symbol for typed extern compatibility,
 collision, and reachability without adding a language/HIR/MIR operation. Ordinary
@@ -1466,4 +1470,6 @@ path, and no writer ABI identity/count changes. The
 timeout substrate and writer hardening are separate prerequisite capabilities; the new row lands
 with its package consumer. Exact revised candidate contract: `impl/pkg-design/kv.md`; its first
 independent review found contract gaps, the fresh complete review found four remaining native/wire
-boundary gaps, and another fresh complete review has not yet accepted the second repair.
+boundary gaps, and the next complete review found two P3 consistency gaps in the timeout action
+lists and malformed-state error partition. A fresh complete review has not yet accepted the third
+repair.

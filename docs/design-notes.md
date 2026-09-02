@@ -1472,15 +1472,18 @@ not package-local policy or a claim that kernel scheduling supplies a strict wal
 RESP framing and validation remain ordinary package source. The only planned runtime addition is
 one generic package-internal row for checked receive/send timeout installation. A non-null
 compatible caller must hold one live/unfreed connection exclusively with no read/write/configure/
-free/Drop overlap. From entry `{R0,S0}`, receive failure retains both states, send failure leaves
-`{T,S0}`, and success leaves `{T,T}`; the row does not roll back or close. Either option failure
-requires caller retirement and later free/Drop, and the package closes its fresh unpublished
+reader-or-writer construction/free/Drop overlap. From entry `{R0,S0}`, receive failure retains both
+states, send failure leaves `{T,S0}`, and success leaves `{T,T}`; the row does not roll back or close. Either option failure
+requires caller retirement, forbids later read/write/configuration/reader-or-writer construction/
+retry, and requires one later free/Drop; the package closes its fresh unpublished
 connection. The compiler knows its physical symbol for typed ABI compatibility, collision, and
 reachability, but it is not a language builtin or HIR/MIR operation. Package source explicitly
 decodes the shared native-status table because ordinary extern calls do not receive builtin MIR
 decoding automatically. Its internal modules import `std.process`; impossible
 status/count/view-length/view-pointer/output products reach the existing
-`ProcessAbort` capability before parsing or publication. SIGPIPE
+`ProcessAbort` capability before parsing or publication. A malformed private resource record is
+also an internal invariant violation rather than a `Closed` producer: every operation and Drop
+reaches `ProcessAbort` before native I/O or untrusted pointer access. SIGPIPE
 safety is instead repaired in the existing connection-derived writer, so every `std.net` consumer
 benefits and `pkg.kv` does not create a second byte-write path. Slice and builder writer overloads
 converge on it. Its private socket sink selects
@@ -1495,8 +1498,9 @@ final buffer; nonempty results allocate one. V1 deliberately stays on plaintext 
 negotiation or TLS. The exact candidate contract, byte grammar, error precedence, runtime
 reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
 review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
-raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. No public contract is accepted
-until another fresh complete review closes the second repair.
+raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found
+two P3 consistency gaps in the timeout action lists and malformed-state error partition. No public
+contract is accepted until a fresh complete review closes this third repair.
 
 ## Why tests are Result blocks run in separate processes
 

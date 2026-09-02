@@ -3986,16 +3986,18 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   SIGPIPE-safe complete writes and explicit fail/retry/overlap/transitive-route owners, with no
   ABI/count change, including the existing builder overload. Package source owns RESP and exact
   native-status/count/view-length/view-pointer decoding before typed-slice construction; impossible
-  products use an explicit `std.process` dependency
-  and existing keyed `ProcessAbort`. Its implementation
-  atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
+  products and every malformed private resource operation/Drop use an explicit `std.process`
+  dependency and existing keyed `ProcessAbort` before native I/O or untrusted pointer access. Its
+  implementation atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
   installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
-  live connection exclusively; pre-armed receive/send state distinguishes unchanged receive-option
+  live connection exclusively with no read/write/configuration/reader-or-writer construction/free/
+  Drop overlap; pre-armed receive/send state distinguishes unchanged receive-option
   failure, send-option failure with receive changed, and success. Either failure mandates caller
-  retirement/free while the package closes its fresh unpublished connection. That fresh complete
-  review found four remaining
-  native/wire boundary gaps; another fresh complete review of the second repair is pending, and no
-  public contract is accepted. Exact
+  retirement, prohibits later read/write/configuration/reader-or-writer construction/retry, and
+  requires one free/Drop while the package closes its fresh unpublished connection. A fresh complete
+  review found four native/wire boundary gaps; the next complete review found two P3 consistency
+  gaps in the timeout action lists and malformed-state error partition. A fresh complete review of
+  the third repair is pending, and no public contract is accepted. Exact
   ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

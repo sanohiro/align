@@ -3257,22 +3257,27 @@ microseconds for
 `std.net`/`std.http`, and the same ceil/start-budget correction for `process.command`. RESP assembly,
 native-status decoding, and parsing stay in package source. Internal modules explicitly import
 `std.process`; every impossible status/count/view-length/view-pointer/output product reaches the
-existing keyed `ProcessAbort` before parsing or publication. Implementation would then harden the
+existing keyed `ProcessAbort` before parsing or publication. A malformed private resource record is
+not a `Closed` producer; every operation and Drop reaches the same abort dependency before native
+I/O or untrusted pointer access. Implementation would then harden the
 existing connection-derived writer for SIGPIPE across its slice and builder overloads without an
 ABI/count change, and finally activate
 one planned fixed-symbol runtime row for checked socket timeout configuration with the package.
-Every non-null compatible caller must hold one live/unfreed connection exclusively; pre-armed
+Every non-null compatible caller must hold one live/unfreed connection exclusively with no read/
+write/configuration/reader-or-writer construction/free/Drop overlap; pre-armed
 receive/send state distinguishes unchanged receive-option failure, send-option failure with receive
 changed, and both-success.
-Either option failure mandates caller retirement and later free/Drop, and the package closes its
-fresh unpublished connection without retry.
+Either option failure mandates caller retirement, prohibits later read/write/configuration/
+reader-or-writer construction/retry, and requires exactly one later free/Drop; the package closes
+its fresh unpublished connection without retry.
 Compiler registry recognition supplies exact extern compatibility/collision/reachability but none
 of these changes adds a language/HIR/MIR operation or public networking surface. Exact inputs, validation
 precedence, ownership, allocation, wire grammar, reuse/retirement rules, ABI reservation, and
 acceptance owners are recorded in `impl/pkg-design/kv.md` and
 `impl/20-runtime-abi-ledger.md`. The first fresh review found four remaining native/wire boundary
-gaps; this item remains open until another fresh complete adversarial review accepts the second
-repair, after which it may move to Settled and authorize implementation.
+gaps; the next complete review found two P3 consistency gaps in the timeout action lists and
+malformed-state error partition. This item remains open until a fresh complete adversarial review
+accepts the third repair, after which it may move to Settled and authorize implementation.
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 

@@ -3728,7 +3728,9 @@ likewise yields `Decode`. These consume one whole response
 and leave it reusable. `Io`, `ResponseTooLarge`, `Protocol`, and first-reply EOF as
 `Closed` retire it before returning; every later operation returns `Closed` without I/O. `Invalid`
 precedes I/O, cleanup never replaces a selected terminal package error, and Drop closes/frees the
-owner at most once.
+owner at most once. A malformed private resource record is not a `Closed` producer: any public
+operation or Drop reaches the explicit existing `ProcessAbort` dependency before native I/O or
+untrusted pointer access.
 All four operations are Impure. The per-unit resource record pins `client`, empty type parameters,
 arity zero, representation version one, `__align_resource_drop$pkg.kv$client`, and
 `b"align-res-drop-1"`. Existing cache scope remains exact: any own-source byte edit misses its
@@ -3743,10 +3745,12 @@ checked-HIR/MIR operation is added. One package-internal runtime row remains pla
 while this contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both
 socket I/O timeouts and reuses ABI shape A04. It returns `AL_INVALID` for null then out-of-range
 input before fd access. Every non-null compatible caller supplies one live, unfreed, exclusively
-held connection and excludes read/write/configure/free/Drop overlap. From pre-armed option state
+held connection and excludes read/write/configuration/reader-or-writer construction/free/Drop
+overlap. From pre-armed option state
 `{R0,S0}` and requested `T`, receive failure leaves `{R0,S0}`, send failure leaves `{T,S0}`, and
 success leaves `{T,T}`. The row never rolls back, closes, or consumes; either option failure requires
-caller retirement and one later free/Drop, while success preserves usability and permits a later
+caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and
+requires one later free/Drop, while success preserves usability and permits a later
 exclusive overwrite. The package closes either failure on its fresh unpublished connection.
 Compiler registry recognition of the fixed symbol supplies typed extern compatibility, collision,
 and reachability. Package source imports `std.process`, maps native status
@@ -3765,8 +3769,9 @@ changes. The timeout substrate and writer hardening are separate prerequisite ca
 new row lands with its package consumer. The revised
 candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
-review found four remaining native/wire boundary gaps. Another fresh complete review has not yet
-accepted the second repair.
+review found four remaining native/wire boundary gaps. The next complete review found two P3
+consistency gaps in the timeout action lists and malformed-state error partition. A fresh complete
+review has not yet accepted the third repair.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design
