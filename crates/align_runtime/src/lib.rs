@@ -26452,6 +26452,7 @@ mod tests {
     #[test]
     #[ignore = "spawned with SIGPIPE defaulted/unblocked by tcp_writer_closed_peer_routes_do_not_sigpipe"]
     fn tcp_writer_closed_peer_route_probe() {
+        use std::io::Read;
         use std::os::fd::IntoRawFd;
 
         let route = std::env::var("ALIGN_TCP_WRITER_SIGPIPE_ROUTE").expect("route");
@@ -26469,17 +26470,19 @@ mod tests {
             );
         }
 
-        let (socket, peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        // Darwin may report EINVAL for a send after only the AF_UNIX peer closes, which cannot
-        // exercise SIGPIPE. Locally close the write half so every platform's next nonempty send
-        // deterministically reaches EPIPE and therefore needs the socket writer's suppression.
-        socket
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shut down probe write half");
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let fd = socket.into_raw_fd();
-        drop(peer);
         let conn = Box::into_raw(Box::new(TcpConn { fd }));
         let writer = unsafe { align_rt_tcp_conn_writer(conn) };
+        // Prime the native socket route while it is live. On macOS this installs and caches
+        // SO_NOSIGPIPE before the deterministic EPIPE state; installing the option only after
+        // SHUT_WR would fail before send and leave the signal owner vacuous.
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"p".as_ptr(), 1) }, 0);
+        let mut priming_byte = [0u8; 1];
+        peer.read_exact(&mut priming_byte).expect("read SIGPIPE probe priming byte");
+        assert_eq!(&priming_byte, b"p");
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
+        drop(peer);
         let expected = AL_CODE.saturating_add(libc::EPIPE);
         match route.as_str() {
             "slice" => {
