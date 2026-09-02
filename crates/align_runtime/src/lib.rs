@@ -26470,6 +26470,12 @@ mod tests {
         }
 
         let (socket, peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        // Darwin may report EINVAL for a send after only the AF_UNIX peer closes, which cannot
+        // exercise SIGPIPE. Locally close the write half so every platform's next nonempty send
+        // deterministically reaches EPIPE and therefore needs the socket writer's suppression.
+        socket
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shut down probe write half");
         let fd = socket.into_raw_fd();
         drop(peer);
         let conn = Box::into_raw(Box::new(TcpConn { fd }));
