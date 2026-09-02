@@ -3263,21 +3263,25 @@ I/O or untrusted pointer access. Implementation would then harden the
 existing connection-derived writer for SIGPIPE across its slice and builder overloads without an
 ABI/count change, and finally activate
 one planned fixed-symbol runtime row for checked socket timeout configuration with the package.
-Every non-null compatible caller must hold one live/unfreed connection exclusively with no read/
-write/configuration/reader-or-writer construction/free/Drop overlap; pre-armed
+Every non-null compatible caller must hold one live/unfreed connection exclusively with no live
+reader/writer shell derived from it and no other value retaining one at entry, and no read/write/
+configuration/reader-or-writer construction/free/Drop overlap; pre-armed
 receive/send state distinguishes unchanged receive-option failure, send-option failure with receive
 changed, and both-success.
 Either option failure mandates caller retirement, prohibits later read/write/configuration/
-reader-or-writer construction/retry, and requires exactly one later free/Drop; the package closes
-its fresh unpublished connection without retry.
+reader-or-writer construction/retry, and requires exactly one later free/Drop. Success may construct
+derived shells, but another timeout call requires all such shells and retaining values to Drop
+first; the package calls before shell construction and closes its fresh unpublished connection
+without retry.
 Compiler registry recognition supplies exact extern compatibility/collision/reachability but none
 of these changes adds a language/HIR/MIR operation or public networking surface. Exact inputs, validation
 precedence, ownership, allocation, wire grammar, reuse/retirement rules, ABI reservation, and
 acceptance owners are recorded in `impl/pkg-design/kv.md` and
 `impl/20-runtime-abi-ledger.md`. The first fresh review found four remaining native/wire boundary
 gaps; the next complete review found two P3 consistency gaps in the timeout action lists and
-malformed-state error partition. This item remains open until a fresh complete adversarial review
-accepts the third repair, after which it may move to Settled and authorize implementation.
+malformed-state error partition; the following review found one remaining P2 in the pre-existing-
+derived-shell entry state. This item remains open until a fresh complete adversarial review accepts
+the fourth repair, after which it may move to Settled and authorize implementation.
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 

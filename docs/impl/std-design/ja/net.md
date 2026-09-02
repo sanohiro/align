@@ -277,16 +277,19 @@ clear/no-timeout 意味を保つ。option は 1 回の blocking progress wait �
 bound しない。
 
 planned source-reachable `TcpConnSetIoTimeout` consumer は全 non-null compatible caller に、call 全体で
-exclusive な 1 個の live/unfreed connection を要求し、read/write/configuration/reader-or-writer construction/
-free/Drop の overlap を禁止する。exact normalized `timeval` を使い receive を send より先に install。entry option state を
+exclusive な 1 個の live/unfreed connection を要求する。entry 時にその connection 由来の live
+reader/writer shell またはその shell を retain する value はなく、read/write/configuration/
+reader-or-writer construction/free/Drop の overlap も禁止。exact normalized `timeval` を使い receive を send より先に install。entry option state を
 `{R0,S0}`、requested state を `T` とすると、receive failure は `setsockopt` を exact 1 回呼び mapped status を
 返して send call なし、state は `{R0,S0}`。send failure は exact 2 回、send mapped status、state は `{T,S0}`。
 success は exact 2 回、zero、state は `{T,T}`。どちらかの option failure は compatible caller に retirement、
-後続 read/write/configuration/reader-or-writer construction/retry 禁止、exact 1 回の free/Drop を要求し、
-success は usability と後の exclusive overwrite を許す。
-package は fresh unpublished clear/clear connection だけで call し、どちらの failure も resolution 再開/別 address
-試行なしで close。owner は live/exclusive precondition、pre-armed state、option order/call count/returned status、
-retry prohibition、zero reader/writer-constructor call、retirement、close/Drop を pin。
+後続 read/write/configuration/reader-or-writer construction/retry 禁止、exact 1 回の free/Drop を要求する。
+zero-derived-shell entry state により、その close と順序付ける shell cleanup はない。success は usability を
+保ち、その後 shell を構築できるが、後の overwrite 前に全 derived shell/retaining value を Drop する。
+package は fresh unpublished clear/clear connection だけで shell construction 前に call し、どちらの failure も
+resolution 再開/別 address 試行なしで close。owner は live/exclusive/zero-derived-shell entry precondition、
+pre-armed state、option order/call count/returned status、retry prohibition、overlap 中/failure 後の
+constructor call zero、success-construct-Drop-reconfigure cycle、retirement、close/Drop を pin。
 
 ceil-to-microsecond conversion は出荷済み `std.http` の plain/TLS/pool rearm にも届く。
 poll-millisecond helper は `process.command` にも届き、その consumer は従来の post-syscall

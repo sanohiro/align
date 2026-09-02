@@ -206,9 +206,10 @@ row is a general TCP-connection operation rather than a RESP parser or package-s
 `timeout_ns` outside `1..=86400000000000` with `AL_INVALID`; either rejection occurs before reading
 the fd or calling `setsockopt`, and a live connection remains usable after the range rejection.
 Every non-null call has the unsafe precondition that the pointer names one live, unfreed `TcpConn`
-held with exclusive logical access for the complete call. A dangling or concurrently aliased
-pointer violates that precondition and is not detectable; no read, write, other configuration,
-reader-or-writer construction, free, or Drop may overlap.
+held with exclusive logical access for the complete call, with no live reader/writer shell derived
+from that connection and no other value retaining one at entry. A dangling or concurrently
+aliased pointer or a live derived shell violates that precondition and is not detectable; no read,
+write, other configuration, reader-or-writer construction, free, or Drop may overlap.
 
 For an admitted input the row uses the normalized ceil-to-microsecond `timeval` above, then installs
 `SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without attempting `SO_SNDTIMEO`;
@@ -217,14 +218,22 @@ otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after 
 leaves `{R0,S0}`, send failure leaves `{T,S0}`, and success leaves `{T,T}`. After either option
 failure, a compatible caller must retire the still-owned connection, perform no read, write,
 configuration, reader-or-writer construction, or retry on it, and invoke its ordinary free/Drop
-path exactly once; close discards the entry or partial state. Success preserves usability, and a later exclusive successful call may overwrite
-both options. The row itself allocates, retains, rolls back, closes, or consumes nothing. The null x
+path exactly once; the zero-derived-shell entry state leaves no shell cleanup to order against that
+close. Success preserves usability and may construct derived shells afterward, but a later timeout
+call may overwrite both options only after every such shell and retaining value has dropped. The row
+itself allocates, retains, rolls back, closes, or consumes nothing. The null x
 range product directly owns validation order and the no-fd/no-option side-effect rule.
-Parameterized direct-runtime owners pre-arm both option states and pin live/exclusive preconditions,
-the exact normalized `timeval`, option order, call counts, returned status, the
+Parameterized direct-runtime owners pre-arm both option states and pin live/exclusive plus
+zero-derived-shell entry preconditions, the exact normalized `timeval`, option order, call counts,
+returned status, the
 `{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
-prohibition, zero reader/writer-constructor calls, retirement, and later free/Drop. The package calls
-only on a fresh exclusively owned unpublished connection with both entry options clear; its owner
+prohibition, zero overlapping/post-failure reader/writer-constructor calls, the
+success-construct-Drop-reconfigure cycle, retirement, and later free/Drop. Entry-state owners
+distinguish never-constructed zero, constructed-then-dropped zero, live direct reader, live buffered
+reader, live direct writer, live logger-retained writer, and moved/call-transferred reader or writer,
+with only the two zero-live states compatible. The success-construct-Drop-reconfigure owner covers
+each compatible retainer kind. The package calls only on a fresh exclusively owned unpublished
+connection with both entry options clear and before shell construction; its owner
 closes after either option failure and proves that resolution is not reopened, no other address is
 attempted, and no partially configured client is published.
 

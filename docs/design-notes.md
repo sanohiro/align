@@ -1471,13 +1471,16 @@ not package-local policy or a claim that kernel scheduling supplies a strict wal
 
 RESP framing and validation remain ordinary package source. The only planned runtime addition is
 one generic package-internal row for checked receive/send timeout installation. A non-null
-compatible caller must hold one live/unfreed connection exclusively with no read/write/configure/
+compatible caller must hold one live/unfreed connection exclusively with no live reader/writer shell
+derived from it and no other value retaining one at entry, and no read/write/configure/
 reader-or-writer construction/free/Drop overlap. From entry `{R0,S0}`, receive failure retains both
 states, send failure leaves `{T,S0}`, and success leaves `{T,T}`; the row does not roll back or close. Either option failure
 requires caller retirement, forbids later read/write/configuration/reader-or-writer construction/
-retry, and requires one later free/Drop; the package closes its fresh unpublished
-connection. The compiler knows its physical symbol for typed ABI compatibility, collision, and
-reachability, but it is not a language builtin or HIR/MIR operation. Package source explicitly
+retry, and requires one later free/Drop. Success may construct derived shells, but another timeout
+call requires all such shells and retaining values to Drop first; the package calls before shell
+construction and closes its fresh unpublished connection on failure. The compiler knows its
+physical symbol for typed ABI compatibility, collision, and reachability, but it is not a language
+builtin or HIR/MIR operation. Package source explicitly
 decodes the shared native-status table because ordinary extern calls do not receive builtin MIR
 decoding automatically. Its internal modules import `std.process`; impossible
 status/count/view-length/view-pointer/output products reach the existing
@@ -1499,8 +1502,9 @@ negotiation or TLS. The exact candidate contract, byte grammar, error precedence
 reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
 review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
 raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found
-two P3 consistency gaps in the timeout action lists and malformed-state error partition. No public
-contract is accepted until a fresh complete review closes this third repair.
+two P3 consistency gaps in the timeout action lists and malformed-state error partition; the
+following review found one remaining P2 in the pre-existing-derived-shell entry state. No public
+contract is accepted until a fresh complete review closes this fourth repair.
 
 ## Why tests are Result blocks run in separate processes
 

@@ -289,19 +289,22 @@ existing clear/no-timeout meaning. The option bounds one blocking wait for progr
 duration of a multi-read or multi-write operation.
 
 The planned source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
-to hold one live, unfreed connection exclusively across the call, with no overlapping
-read/write/configuration/reader-or-writer construction/free/Drop. It uses the exact normalized `timeval` and
+to hold one live, unfreed connection exclusively across the call, with no live reader/writer shell
+derived from it and no other value retaining one at entry, and no overlapping read/write/
+configuration/reader-or-writer construction/free/Drop. It uses the exact normalized `timeval` and
 installs receive before send. With entry option states `{R0,S0}` and requested state `T`, receive
 failure performs exactly one `setsockopt`, returns its mapped status, makes no send call, and leaves
 `{R0,S0}`; send failure performs exactly two calls, returns the send mapped status, and leaves
 `{T,S0}`; success performs exactly two calls, returns zero, and leaves `{T,T}`. Either option failure
 requires the compatible caller to retire the connection, perform no read/write/configuration/
-reader-or-writer construction/retry, and free/Drop it exactly once;
-success preserves usability and permits a later exclusive overwrite. The package calls only on a
-fresh unpublished clear/clear connection and closes either failure without reopening resolution or
-trying another address. Owners pin live/exclusive preconditions, pre-armed states, option order,
-call counts, returned status, retry prohibition, zero reader/writer-constructor calls, retirement,
-and close/Drop.
+reader-or-writer construction/retry, and free/Drop it exactly once; its zero-derived-shell entry
+state leaves no shell cleanup to order against that close. Success preserves usability and may
+construct derived shells afterward, but a later overwrite requires all such shells and retaining
+values to Drop first. The package calls only on a fresh unpublished clear/clear connection before
+shell construction and closes either failure without reopening resolution or trying another
+address. Owners pin live/exclusive/zero-derived-shell entry preconditions, pre-armed states, option
+order, call counts, returned status, retry prohibition, zero overlapping/post-failure constructor
+calls, the success-construct-Drop-reconfigure cycle, retirement, and close/Drop.
 
 The ceil-to-microsecond conversion also serves shipped `std.http` plain/TLS/pool rearming. The
 poll-millisecond helper also serves `process.command`; that consumer adopts the same monotonic

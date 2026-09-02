@@ -335,23 +335,27 @@ TcpConnSetIoTimeout  align_rt_tcp_conn_set_io_timeout  i32(ptr, i64)  // ABI A04
 `TcpConnSetIoTimeout` は最初に null connection を `AL_INVALID` で拒否し、その後
 `1..=86400000000000` 外の timeout を `AL_INVALID` で拒否する。どちらも fd を読まず
 `setsockopt` を呼ばず、range rejection 後もそれ以外は live な connection は usable。全 non-null call には、
-pointer が 1 個の live/unfreed `TcpConn` を指し、caller が call 全体で exclusive logical access を持つという
-unsafe precondition がある。dangling/concurrently aliased pointer は precondition 違反で検出不能。
-read/write/別 configuration/reader-writer construction/free/Drop は overlap 不可。
+pointer が 1 個の live/unfreed `TcpConn` を指し、caller が call 全体で exclusive logical access を持ち、entry 時に
+その connection 由来の live reader/writer shell またはその shell を retain する別 value が 1 個もないという
+unsafe precondition がある。dangling/concurrently aliased pointer または live derived shell は precondition 違反で
+検出不能。read/write/別 configuration/reader-writer construction/free/Drop は call と overlap 不可。
 
 admitted input では上記 normalized positive-timeout `timeval` を構築し、最初に `SO_RCVTIMEO` を設定。
 失敗すれば `SO_SNDTIMEO` を試さず fixed errno-mapped status を返す。成功時だけ `SO_SNDTIMEO` を設定して
 その status を返し、両方成功した場合だけ zero。entry 時の receive/send option state を `R0`/`S0`、requested
 state を `T` とすると、receive failure は `{R0,S0}`、send failure は `{T,S0}`、success は `{T,T}` を残す。
 どちらかの option failure 後も connection owner は caller にあるが、compatible caller はそれを retire し、
-read/write/configuration/reader-or-writer construction/retry をせず ordinary free/Drop path へ exact 1 回渡す。close は entry/partial state を
-破棄する。success は usability を保ち、後の exclusive successful call は両 option を overwrite できる。
-row 自体は allocate/retain/rollback/close/consume しない。`pkg.kv` は両 entry state が clear の fresh、
-exclusive、unpublished connection だけで call し、どちらの nonzero option result でも resolution を再開せず
-別 address を試さず直ちに close。parameterized direct-runtime owner は両 option state を pre-arm し、exact
-`timeval`、option order/call count/returned status、`{R0,S0}`/`{T,S0}`/`{T,T}` post-state、exclusive-call
-precondition、overlap 中/option failure 後の reader/writer constructor call zero、caller retirement、
-後続 close/Drop を固定する。mandatory base export、
+read/write/configuration/reader-or-writer construction/retry をせず ordinary free/Drop path へ exact 1 回渡す。
+zero-derived-shell entry precondition により、その close と順序付ける shell/retaining wrapper は存在しない。
+success は usability を保ち、その後 reader/writer を構築できるが、後の timeout call は全 derived shell とそれを
+retain する value を Drop して同じ zero-shell entry state を復元した後だけ compatible。row 自体は
+allocate/retain/rollback/close/consume しない。`pkg.kv` は両 entry state が clear の fresh、exclusive、
+unpublished connection だけで、どちらの shell も構築する前に call し、nonzero option result なら resolution を
+再開せず別 address を試さず直ちに close。parameterized direct-runtime owner は両 option state を pre-arm し、
+exact `timeval`、option order/call count/returned status、`{R0,S0}`/`{T,S0}`/`{T,T}` post-state、
+exclusive-call precondition、entry 時の live derived shell/retaining value zero、overlap 中/option failure 後の
+reader/writer constructor call zero、success-construct-Drop-reconfigure cycle、caller retirement、後続
+close/Drop を固定する。mandatory base export、
 source-reachable compatible extern、collision-reserved unkeyed identity である。既存 ABI
 shape を再利用するため、activation は exact base/maximum count を 347/355 から 348/356 に変え、keyed
 count は 330 のまま。unkeyed count は 18、そのうち source-reachable は 13 になり、A123 は次の
@@ -460,7 +464,7 @@ package capability はおよそ 1,000 changed hand-written lines を超え得る
 | DEL semantics | one-key request、0/1 の全 official signed/leading-zero spelling、server error、他の全 value/type。 | false/true と sign/leading-zero/negative/two/overflow/type mutation matrix、reuse/close check。 |
 | error・native status・poison state | I/O 前 Invalid。bounded UTF-8 Server と complete non-UTF-8 Decode は reusable。exact `0/1/2/3/4/>=5` status decode。reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation と checked i32 narrowing、typed-slice construction 前の raw-header validation。invalid-negative/oversized-positive は header inspection 前に abort。Io/too-large/protocol/truncation/partial-write は close。selected terminal error を cleanup より保持。以後の全 call は zero I/O の Closed。malformed private resource state は Closed ではなく native I/O/untrusted access 前に `process.abort`。全 impossible native product は parser/publication/ownership change 前に `process.abort` へ到達。 | error-producer x command x before/during/after-frame x reuse table。early-abort/no-header inspection、両 empty pointer form、positive-null abort を含む全 category/representative code/width/count/length/pointer/malformed product、operation/Drop x one-field-at-a-time malformed resource state が zero native call の `ProcessAbort` を pin。native call counter、explicit `ProcessAbort` IR/capability retention、no-import negative、selected-error/cleanup-failure probe。 |
 | ownership・cleanup | resource formation、move-in/out/return/replacement、if/match/else/?/map_err/branch/loop/early return、source nulling、state/socket/wrapper/scratch/result の Drop once、malformed state は untrusted access 前に abort。 | resource/drop counter、allocation parity、parameterized control-flow owner、state semantic-to-byte/byte-to-semantic golden、operation/Drop x malformed-field abort product。 |
-| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。range-rejection retry と option-failure retry 禁止、zero reader/writer-constructor call、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
+| ABI・effect・capability・cache | fixed-symbol `TcpConnSetIoTimeout` の null-then-range/no-side-effect validation と atomic activation。全 non-null caller は live/unfreed/exclusive connection を渡し、entry 時にその connection 由来の live reader/writer shell またはそれを retain する value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap を排除。pre-armed receive/send entry/post-state product、option failure 後は caller retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、1 回の free/Drop が必須。validation rejection はそれ以外 live な connection を維持し、success も usability を保持。後の timeout call 前に success 後の derived shell/retainer をすべて Drop。default-C A04/no-curated-attribute identity。既存 connection-writer の sink provenance と slice/builder overload を通る partial/EINTR/zero/EPIPE/timeout mapping。writer ABI/count を変えない Linux/macOS SIGPIPE state/transitive route。新 ABI shape/language builtin/HIR/MIR row/selector なし。Impure operation、module-wide TCP/I/O/buffer/`ProcessAbort` retention、package absence、exact own-source/public-interface/private-dependency cache outcome。 | exact registry/golden/base-export/type/attribute/collision/source-reuse、null x range、live/dangling/aliased/overlap と zero-derived-shell entry precondition、exact-timeval、pre-armed `{R0,S0}` x receive-fail/no-send、send-fail/`{T,S0}`、both-success/`{T,T}` owner。entry-state product は never-constructed zero、constructed-then-dropped zero、live direct reader、live buffered reader、live direct writer、live logger-retained writer、moved/call-transferred reader/writer を区別し、2 個の zero-live state だけ compatible。range-rejection retry と option-failure retry 禁止、overlap 中/failure 後の constructor call zero、各 compatible retainer kind の success-construct-Drop-reconfigure、retirement、package close/no-address-retry、compatible-caller free/Drop。failed-install/retry/overlap/Drop と file/std/direct/slice/builder/logger/`io.copy` writer owner。package whole/per-unit IR/link run、effect check、exact `ProcessAbort` dependency、6-field resource mutation、no-package negative、private/public/add/remove/edit/revert cache twin。 |
 
 ## source of truth と author consistency pass
 
@@ -474,7 +478,7 @@ candidate review 中は `docs/open-questions.md` がこの項目を Open に置�
 entry はない。acceptance 時は exact reviewed contract を Settled へ移し、history record を追加し、
 各 candidate status を accepted/inactive の該当状態へ変更してから implementation を許可する。
 
-3 回目の finding-ledger repair 後、3 回目の author-side ledger-to-prose および closure-matrix consistency
+4 回目の finding-ledger repair 後、4 回目の author-side ledger-to-prose および closure-matrix consistency
 pass は、another fresh complete review 前の 2026-09-02 に完了:
 
 - 全 public argument/result に exact type、evaluation order、default、ownership、lifetime、allocation、
@@ -495,8 +499,9 @@ pass は、another fresh complete review 前の 2026-09-02 に完了:
   ambient でなく、vendored package file は explicit compiler input のまま。
 - canonical RESP scalar/tag/sequence order/malformed rejection、independent semantic-to-byte と byte-to-semantic golden が固定。
 - resource record、RESP state machine、source-reachable timeout row の全 state/tag/reserved/pointer/length
-  product、constructor call を含む live/exclusive overlap exclusion、failed-second-option 後の
-  no-operation/construction/retry retirement、error preservation、Drop order が固定。
+  product、zero-derived-shell entry state、constructor call を含む live/exclusive overlap exclusion、
+  success-construct-Drop-reconfigure cycle、failed-second-option 後の no-operation/construction/retry
+  retirement、error preservation、Drop order が固定。
 - exact existing producer-owned runtime row が reflection/artifact I/O なしで native state を供給し、
   slice/builder writer overload は同じ hardened sink へ合流。
 - example は accepted syntax を使い declaration と positional call を分離。
@@ -521,7 +526,7 @@ synchronized summary へ伝播しなければならない。
 | P2 timeout quantization/precedence | positive-i64 全域に monotonic start-plus-budget arithmetic を使う。positive connect と `process.command` wait は ns を millisecond へ ceil し early zero を recheck。connect は immediate/readiness event を優先し、command は従来の timeout-wins checkpoint を維持。positive `std.net`/`std.http` I/O option は ns を normalized microsecond へ ceil。exact/next/maximum と readiness-at-deadline owner が全 shared consumer を pin。 |
 | P2 multi-address selection | nonzero resolver failure を iteration 前に map し、その後 usable entry を順に試し first success を返す。successful resolution で usable entry がなければ substrate は `AL_INVALID` を返し package source が `Io(core.Error.Invalid)` へ map、attempted failure があれば最後の socket/connect/mode failure。post-selection timeout configuration は resolution を restart しない。symbolic EAI/mixed-failure owner が distinct branch、ordering、cleanup、native/package error layer を pin。 |
 | P2 native status decode | package source は fixed `0/1/2/3/4/>=5` table を実装し、checked i32 narrowing と typed-slice construction 前の raw-header validation を伴う invalid-negative/admitted-negative/zero/positive reader count x view-length x pointer-representation product を exhaust し、connect-status/output product を検査し、全 impossible ABI result に explicit `std.process`/`ProcessAbort` dependency を使う。category/code/width/product と whole/per-unit capability owner が閉じる。 |
-| P2 new-row malformed input | `TcpConnSetIoTimeout` は最初に null、その後 inclusive timeout range を検証し、fd access 前に `AL_INVALID`。全 non-null caller は read/write/configuration/reader-or-writer construction/free/Drop overlap のない live/unfreed/exclusive connection を渡す。direct runtime evidence は null x range、overlap/provenance precondition、exact `timeval`、pre-armed `{R0,S0}` から receive-fail/no-send/`{R0,S0}`、send-fail/`{T,S0}`、both-success/`{T,T}` の transition を覆う。range rejection は live connection を維持し、admitted-input option failure は後続 read/write/configuration/reader-or-writer construction/retry 禁止、caller retirement、後続 1 回の free/Drop を必須にする。package は publication/address retry なしで close。 |
+| P2 new-row malformed input | `TcpConnSetIoTimeout` は最初に null、その後 inclusive timeout range を検証し、fd access 前に `AL_INVALID`。全 non-null caller は live derived reader/writer shell/retaining value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap のない live/unfreed/exclusive connection を渡す。direct runtime evidence は null x range、entry-shell/overlap/provenance precondition、exact `timeval`、pre-armed `{R0,S0}` から receive-fail/no-send/`{R0,S0}`、send-fail/`{T,S0}`、both-success/`{T,T}` の transition を覆う。range rejection は live connection を維持し、admitted-input option failure は後続 read/write/configuration/reader-or-writer construction/retry 禁止、caller retirement、後続 1 回の free/Drop を必須にする。package は publication/address retry なしで close。 |
 | P2 RESP error grammar | NUL/invalid UTF-8 を許す一方 CR/LF を除く bounded error payload を frame し、exact terminal CRLF と same-read trailing byte を検証してから UTF-8 `Server` または non-UTF-8 reusable `Decode` を選ぶ。empty/invalid UTF-8、exact/next-cap、lone/split CR/LF vector が distinction/precedence を own。 |
 | P2 empty owned allocation | empty GET/`Server` result は final buffer なしの canonical `{null, 0}`。nonempty result だけが 1 個を所有。empty/nonempty allocation/Drop counter が rule を own。 |
 | P2 SIGPIPE state evidence | failed-install/no-send→retry、overlapping-shell order、Drop/no-clear、connection-close、applicable platform 上の direct slice/builder/logger/`io.copy` closed-peer owner を加える。既存 `IoWriterWriteBuilder` identity は不変で、hardened write row へ delegate する。 |
@@ -537,7 +542,7 @@ fresh full review
 | finding | authoritative correction・closure owner |
 |---|---|
 | P1 reader count/view pointer | 最初に count を classify し、invalid-negative/oversized-positive は raw-header inspection 前に abort。その後 typed-slice construction 前に raw `{ptr,len}` を inspect。admitted negative/zero は zero length を要求し null/non-null empty pointer を許して dereference しない。admitted positive は exact length/non-null pointer を要求。count x length x pointer owner は early-abort/no-header、両 empty form、positive-null abort を含む。 |
-| P2 timeout compatible-caller lifecycle | 全 non-null compatible caller は read/write/configuration/reader-or-writer construction/free/Drop overlap のない live/unfreed/exclusive connection を渡す。pre-armed `{R0,S0}` は `{R0,S0}`/`{T,S0}`/`{T,T}` へ transition。どちらかの option failure は retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、後続 1 回の free/Drop が必須で、validation rejection と success は usability を保持。direct/package owner は許可される range-rejection retry と禁止される option-failure retry を区別し、後続 constructor call zero、publication 禁止、close once を固定。 |
+| P2 timeout compatible-caller lifecycle | 全 non-null compatible caller は live derived reader/writer shell/retaining value が zero で、read/write/configuration/reader-or-writer construction/free/Drop overlap のない live/unfreed/exclusive connection を渡す。pre-armed `{R0,S0}` は `{R0,S0}`/`{T,S0}`/`{T,T}` へ transition。どちらかの option failure は retirement、後続 read/write/configuration/reader-or-writer construction/retry 禁止、後続 1 回の free/Drop が必須で、validation rejection と success は usability を保持。direct/package owner は許可される range-rejection retry と禁止される option-failure retry を区別し、overlap 中/後続 constructor call zero、publication 禁止、close once を固定。success-construct-Drop-reconfigure owner は次の call 前に zero-shell entry state を復元。 |
 | P2 resolver failure partition | nonzero `getaddrinfo` result は iteration 前に name/no-data を `Io(Invalid)`、他 symbolic EAI を `Io(Code)` へ map。output は null、transient storage は drop、socket attempt なし。symbolic EAI owner が successful empty/skipped list と区別。 |
 | P2 Simple Error CR/LF | payload は CR/LF 以外の任意 byte を許し、CRLF だけが terminator。exact/next-cap x lone/split CR/LF x fragmentation/trailing owner が UTF-8 classification 前の `ResponseTooLarge`/`Protocol` を pin。 |
 
@@ -553,5 +558,13 @@ post-failure-construction-exclusion と malformed-state-error-partition axis を
 | P3 malformed-state `Closed` contradiction | exact public `Closed` producer set は変更しない。malformed private resource record は recoverable package error でなく internal invariant violation。全 operation と Drop は native I/O/untrusted pointer access 前に explicit existing `ProcessAbort` dependency へ到達。operation/Drop x one-field-at-a-time record corruption owner は abort と native call zero を assert。 |
 
 malformed-state correction は internal safety strategy を変更し、lifecycle correction は source-reachable
-dangling-shell path を閉じるため、この complete repair の fresh full review が clean になるまで candidate status は
-Open のまま。
+dangling-shell path を閉じたため、complete repair はもう 1 回の fresh full review を受けた。exact review
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...7148d4414355365a6c2cbb77d169b1ac8181c5bf`
+は P2 finding 1 件を返した。この fourth repair は derived-shell-entry-state matrix axis を reopen:
+
+| finding | authoritative correction・closure owner |
+|---|---|
+| P2 pre-existing derived shell | non-null compatible caller は entry 時、その connection 由来の live reader/writer shell と、その shell を retain する value が zero。idle でも live direct/moved/buffered shell、logger、その他 retainer は unsafe-precondition 違反。call 中 constructor なし。success 後は shell を構築できるが、後の timeout call 前に全 shell/retainer を Drop。option failure は zero shell から始まり、construction を禁止し、shell cleanup order なしで connection を 1 回 close。entry-state owner は never-constructed zero、constructed-then-dropped zero、live direct/buffered reader、live direct/logger-retained writer、moved/call-transferred reader/writer を区別し、package sequence は timeout-before-reader-before-writer を pin。 |
+
+この finding は、同じ source-reachable dangling-shell class の残っていた pre-entry half を閉じる。
+fourth complete repair の fresh full review が clean になるまで candidate status は Open のまま。

@@ -3745,13 +3745,15 @@ checked-HIR/MIR operation is added. One package-internal runtime row remains pla
 while this contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both
 socket I/O timeouts and reuses ABI shape A04. It returns `AL_INVALID` for null then out-of-range
 input before fd access. Every non-null compatible caller supplies one live, unfreed, exclusively
-held connection and excludes read/write/configuration/reader-or-writer construction/free/Drop
-overlap. From pre-armed option state
+held connection with no live reader/writer shell derived from it and no other value retaining one at
+entry, and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap. From
+pre-armed option state
 `{R0,S0}` and requested `T`, receive failure leaves `{R0,S0}`, send failure leaves `{T,S0}`, and
 success leaves `{T,T}`. The row never rolls back, closes, or consumes; either option failure requires
 caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and
-requires one later free/Drop, while success preserves usability and permits a later
-exclusive overwrite. The package closes either failure on its fresh unpublished connection.
+requires one later free/Drop, while success preserves usability. A later exclusive overwrite is
+compatible only after all success-derived shells and retaining values Drop. The package closes
+either failure on its fresh unpublished connection before shell construction.
 Compiler registry recognition of the fixed symbol supplies typed extern compatibility, collision,
 and reachability. Package source imports `std.process`, maps native status
 zero to success, `1..=4` to the four builtin error categories and `>=5` to `Code(status-5)`, and
@@ -3770,8 +3772,9 @@ new row lands with its package consumer. The revised
 candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
 review found four remaining native/wire boundary gaps. The next complete review found two P3
-consistency gaps in the timeout action lists and malformed-state error partition. A fresh complete
-review has not yet accepted the third repair.
+consistency gaps in the timeout action lists and malformed-state error partition. The following
+review found one remaining P2 in the pre-existing-derived-shell entry state. A fresh complete review
+has not yet accepted the fourth repair.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design

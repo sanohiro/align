@@ -361,9 +361,11 @@ TcpConnSetIoTimeout  align_rt_tcp_conn_set_io_timeout  i32(ptr, i64)  // ABI A04
 outside `1..=86400000000000` with `AL_INVALID`; neither rejection reads the fd or calls
 `setsockopt`, and an otherwise live connection remains usable after the range rejection. Every
 non-null call has the unsafe precondition that the pointer names one live, unfreed `TcpConn` to which
-the caller holds exclusive logical access for the complete call. A dangling or concurrently aliased
-pointer violates that precondition and is not detectable; read, write, another configuration call,
-reader or writer construction, free, and Drop must not overlap it.
+the caller holds exclusive logical access for the complete call, with no live reader/writer shell
+derived from that connection and no other value retaining one at entry. A dangling or concurrently
+aliased pointer or a live derived shell violates that precondition and is not detectable; read,
+write, another configuration call, reader or writer construction, free, and Drop must not overlap
+the call.
 
 For admitted inputs the row constructs the normalized positive-timeout `timeval` above, installs
 `SO_RCVTIMEO`, and returns its fixed errno-mapped status without attempting `SO_SNDTIMEO` if that
@@ -372,14 +374,19 @@ succeed. Let `R0` and `S0` be the receive/send option states at entry and `T` th
 A receive failure leaves `{R0, S0}`; a send failure leaves `{T, S0}`; success leaves `{T, T}`.
 After either option failure, every compatible caller must treat the connection as retired, perform
 no further read, write, configuration, reader-or-writer construction, or retry on it, and pass the
-still-owned connection to its ordinary free/Drop path exactly once; that close discards either entry
-or partial option state. The row itself allocates, retains, rolls back, closes, or consumes nothing.
-`pkg.kv` calls it only with a fresh exclusively owned unpublished connection whose entry states are
-both clear, and on either nonzero option result immediately closes it without reopening resolution
-or trying another address. A parameterized direct-runtime owner pre-arms both option states and
-fixes the exact `timeval`, option order, option-call counts, returned status, `{R0,S0}`/`{T,S0}`/
-`{T,T}` post-state, exclusive-call precondition, zero overlapping or post-failure reader/writer
-constructor calls, caller retirement, and later close/Drop behavior.
+still-owned connection to its ordinary free/Drop path exactly once; the zero-derived-shell entry
+precondition means there is no shell or retaining wrapper to retire or order against that close.
+Success preserves usability and may be followed by reader/writer construction, but another timeout
+call is compatible only after every derived shell and value retaining one has been dropped, restoring
+the same zero-shell entry state. The row itself allocates, retains, rolls back, closes, or consumes
+nothing. `pkg.kv` calls it only with a fresh exclusively owned unpublished connection whose entry
+states are both clear and before constructing either shell; on either nonzero option result it
+immediately closes the connection without reopening resolution or trying another address. A
+parameterized direct-runtime owner pre-arms both option states and fixes the exact `timeval`, option
+order, option-call counts, returned status, `{R0,S0}`/`{T,S0}`/`{T,T}` post-state, exclusive-call
+precondition, zero live derived shells or retaining values at entry, zero overlapping or
+post-failure reader/writer constructor calls, the success-construct-Drop-reconfigure cycle, caller
+retirement, and later close/Drop behavior.
 It is a mandatory base
 export, source-reachable compatible extern, and collision-reserved unkeyed identity. It reuses an
 existing ABI shape, so activation changes the exact base/maximum counts from 347/355 to 348/356
@@ -498,7 +505,7 @@ integration risk because every reply kind closes against the same state machine 
 | DEL semantics | One-key request, every official signed/leading-zero spelling of values 0/1, server error, every other value/type. | False/true and sign/leading-zero/negative/two/overflow/type mutation matrix with reuse/close checks. |
 | Error, native status, and poison state | Invalid before I/O; bounded UTF-8 Server and complete non-UTF-8 Decode reusable; exact `0/1/2/3/4/>=5` status decode; reader `{invalid negative, admitted negative, zero, admitted positive, oversized positive}` x view length x `{null, non-null}` pointer representation with checked i32 narrowing and raw-header validation before typed-slice construction; invalid-negative/oversized-positive abort before header inspection; Io/too-large/protocol/truncation/partial-write close; selected terminal error retained over cleanup; every later call Closed with zero I/O; malformed private resource state is not Closed and reaches `process.abort` before native I/O/untrusted access; every impossible native product reaches `process.abort` before parser/publication/ownership change. | Error-producer x command x before/during/after-frame x reuse table; every category/representative code/width/count/length/pointer/malformed product, including early-abort no-header inspection, both empty pointer forms, and positive-null abort; operation/Drop x one-field-at-a-time malformed resource state pins `ProcessAbort` with zero native calls; native call counters, explicit `ProcessAbort` IR/capability retention, no-import negative, and selected-error/cleanup-failure probes. |
 | Ownership and cleanup | Resource formation, move-in/out/return/replacement, if/match/else/?/map_err/branch/loop/early return, source nulling, state/socket/wrapper/scratch/result Drop once, malformed state abort before untrusted access. | Resource/drop counters, allocation parity, parameterized control-flow owner, state semantic-to-byte and byte-to-semantic goldens, and operation/Drop x malformed-field abort products. |
-| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; range-rejection retry versus option-failure retry prohibition, zero reader/writer-constructor calls, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std/direct/slice/builder/logger/`io.copy` writer owners; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
+| ABI, effects, capabilities, and cache | Null-then-range/no-side-effect validation and atomic activation of fixed-symbol `TcpConnSetIoTimeout`; every non-null caller supplies a live/unfreed/exclusive connection with zero live reader/writer shells or values retaining one derived from it at entry and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap; exact pre-armed receive/send entry and post-state products; option failure mandates caller retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection preserves an otherwise live connection and success preserves usability; any later timeout call requires every success-derived shell/retainer to be dropped first; default-C A04/no-curated-attribute identity; existing connection-writer sink provenance and partial/EINTR/zero/EPIPE/timeout mapping through slice and builder overloads; Linux/macOS SIGPIPE state and transitive routes without writer ABI/count changes; no new ABI shape, language builtin, HIR/MIR row, or selector; Impure operations; module-wide TCP/I/O/buffer/`ProcessAbort` retention; package absence; exact own-source/public-interface/private-dependency cache outcomes. | Exact registry/golden/base-export/type/attribute/collision/source-reuse, null x range, live/dangling/aliased/overlap plus zero-derived-shell entry preconditions, exact-timeval, pre-armed `{R0,S0}` x receive-fail/no-send, send-fail/`{T,S0}`, and both-success/`{T,T}` owners; entry-state products distinguish never-constructed zero, constructed-then-dropped zero, live direct reader, live buffered reader, live direct writer, live logger-retained writer, and moved/call-transferred reader or writer, with only the two zero-live states compatible; range-rejection retry versus option-failure retry prohibition, zero overlapping/post-failure reader/writer-constructor calls, each compatible success-construct-Drop-reconfigure retainer kind, retirement, package close/no-address-retry, and compatible-caller free/Drop; failed-install/retry/overlap/Drop plus file/std/direct/slice/builder/logger/`io.copy` writer owners; package whole/per-unit IR/link runs, effect checks, exact `ProcessAbort` dependency, six-field resource mutations, no-package negative, private/public/add/remove/edit/revert cache twins. |
 
 ## Sources of truth and author consistency pass
 
@@ -514,7 +521,7 @@ During candidate review, `docs/open-questions.md` keeps this item under Open and
 Settled, add its history record, change every candidate status to accepted/inactive as applicable,
 and only then authorize implementation.
 
-After the third finding-ledger repair, the third author-side ledger-to-prose and closure-matrix
+After the fourth finding-ledger repair, the fourth author-side ledger-to-prose and closure-matrix
 consistency pass completed on 2026-09-02 before another fresh complete review:
 
 - every public argument/result has one exact type, evaluation order, default, ownership, lifetime,
@@ -537,9 +544,10 @@ consistency pass completed on 2026-09-02 before another fresh complete review:
 - canonical RESP scalars, tags, sequence order, malformed rejection, and independent
   semantic-to-byte plus byte-to-semantic goldens are fixed;
 - the resource record, RESP state machine, and source-reachable timeout row fix every
-  state/tag/reserved/pointer/length product, live/exclusive overlap exclusion including constructor
-  calls, failed-second-option no-operation/construction/retry retirement, error preservation, and
-  Drop order;
+  state/tag/reserved/pointer/length product, zero-derived-shell entry state, live/exclusive overlap
+  exclusion including constructor calls, success-construct-Drop-reconfigure cycle,
+  failed-second-option no-operation/construction/retry retirement, error preservation, and Drop
+  order;
 - exact existing producer-owned runtime rows supply native state without reflection or artifact I/O;
   slice and builder writer overloads converge on the same hardened sink;
 - examples use accepted syntax and separate declarations from positional calls; and
@@ -565,7 +573,7 @@ complete review may accept the design.
 | P2 timeout quantization/precedence | Use monotonic start-plus-budget arithmetic for the complete positive-i64 range. Positive connect and `process.command` waits ceil ns to milliseconds and recheck an early zero; connect lets immediate/readiness events win while command keeps its existing timeout-wins checkpoints. Positive `std.net`/`std.http` I/O options ceil ns to normalized microseconds. Exact/next/maximum and readiness-at-deadline owners pin every shared consumer. |
 | P2 multi-address selection | Map nonzero resolver failure before iteration; then attempt usable entries in order and return first success. With no usable successful-resolution entry, the substrate returns `AL_INVALID` and package source maps it to `Io(core.Error.Invalid)`; with attempted failures, return the last socket/connect/mode failure. Post-selection timeout configuration never restarts resolution. Symbolic EAI and mixed-address owners pin the distinct branches, ordering, cleanup, and native/package error layers. |
 | P2 native status decode | Package source implements the fixed `0/1/2/3/4/>=5` table; exhausts invalid-negative/admitted-negative/zero/positive reader count x view-length x pointer-representation products with checked i32 narrowing and raw-header validation before typed-slice construction; checks connect-status/output products; and uses its explicit `std.process`/`ProcessAbort` dependency for every impossible ABI result. Category/code/width/product and whole/per-unit capability owners close it. |
-| P2 new-row malformed input | `TcpConnSetIoTimeout` validates null first, then the inclusive timeout range, returning `AL_INVALID` before fd access; every non-null caller must supply one live/unfreed/exclusive connection with no read/write/configuration/reader-or-writer construction/free/Drop overlap. Direct runtime evidence covers null x range, overlap/provenance preconditions, exact `timeval`, and pre-armed `{R0,S0}` transitions for receive-fail/no-send/`{R0,S0}`, send-fail/`{T,S0}`, and both-success/`{T,T}`. Range rejection preserves the live connection; any admitted-input option failure prohibits later read/write/configuration/reader-or-writer construction/retry and mandates caller retirement plus one later free/Drop. The package closes without publication or address retry. |
+| P2 new-row malformed input | `TcpConnSetIoTimeout` validates null first, then the inclusive timeout range, returning `AL_INVALID` before fd access; every non-null caller must supply one live/unfreed/exclusive connection with zero live derived reader/writer shells or retaining values and no read/write/configuration/reader-or-writer construction/free/Drop overlap. Direct runtime evidence covers null x range, entry-shell/overlap/provenance preconditions, exact `timeval`, and pre-armed `{R0,S0}` transitions for receive-fail/no-send/`{R0,S0}`, send-fail/`{T,S0}`, and both-success/`{T,T}`. Range rejection preserves the live connection; any admitted-input option failure prohibits later read/write/configuration/reader-or-writer construction/retry and mandates caller retirement plus one later free/Drop. The package closes without publication or address retry. |
 | P2 RESP error grammar | Frame bounded error payload bytes excluding CR/LF while admitting NUL and invalid UTF-8, validate the exact terminal CRLF and same-read trailing bytes, then select UTF-8 `Server` or non-UTF-8 reusable `Decode`. Empty/invalid UTF-8 plus exact/next-cap and lone/split CR/LF vectors own the distinction and precedence. |
 | P2 empty owned allocation | Empty GET/`Server` results use canonical `{null, 0}` with no final buffer; only nonempty results own one. Empty/nonempty allocation and Drop counters own the rule. |
 | P2 SIGPIPE state evidence | Add failed-install/no-send→retry, overlapping-shell order, Drop/no-clear, connection-close, and direct slice/builder/logger/`io.copy` closed-peer owners on the applicable platforms; the existing `IoWriterWriteBuilder` identity remains unchanged and delegates into the hardened write row. |
@@ -582,7 +590,7 @@ source-reachable-native-boundary matrix axes:
 | Finding | Authoritative correction and closure owner |
 |---|---|
 | P1 reader count/view pointer | Classify count first: invalid-negative/oversized-positive abort before raw-header inspection. Then inspect raw `{ptr,len}` before typed-slice construction. Admitted negative/zero requires zero length, accepts null or non-null empty pointers, and never dereferences; admitted positive requires exact length and non-null pointer. Count x length x pointer owners include early-abort/no-header, both empty forms, and positive-null abort. |
-| P2 timeout compatible-caller lifecycle | Every non-null compatible caller supplies one live/unfreed/exclusive connection with no read/write/configuration/reader-or-writer construction/free/Drop overlap. Pre-armed `{R0,S0}` transitions to `{R0,S0}`, `{T,S0}`, or `{T,T}`; either option failure mandates retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection and success preserve usability. Direct and package owners distinguish allowed range-rejection retry from forbidden option-failure retry, require zero later constructor calls, prohibit publication, and close once. |
+| P2 timeout compatible-caller lifecycle | Every non-null compatible caller supplies one live/unfreed/exclusive connection with zero live derived reader/writer shells or retaining values and no read/write/configuration/reader-or-writer construction/free/Drop overlap. Pre-armed `{R0,S0}` transitions to `{R0,S0}`, `{T,S0}`, or `{T,T}`; either option failure mandates retirement, forbids later read/write/configuration/reader-or-writer construction/retry, and requires one later free/Drop, while validation rejection and success preserve usability. Direct and package owners distinguish allowed range-rejection retry from forbidden option-failure retry, require zero overlapping or later constructor calls, prohibit publication, and close once; a success-construct-Drop-reconfigure owner restores the zero-shell entry state before another call. |
 | P2 resolver failure partition | A nonzero `getaddrinfo` result precedes iteration: name/no-data maps to `Io(Invalid)`, other symbolic EAI values map to `Io(Code)`, output stays null, transient storage drops, and no socket is attempted. Symbolic EAI owners distinguish this from a successful empty/skipped list. |
 | P2 Simple Error CR/LF | Payload admits arbitrary bytes except CR/LF; CRLF is the sole terminator. Exact/next-cap x lone/split CR/LF x fragmentation/trailing owners pin `ResponseTooLarge` versus `Protocol` before UTF-8 classification. |
 
@@ -598,6 +606,15 @@ post-failure-construction-exclusion and malformed-state-error-partition axes:
 | P3 timeout action-list synchronization | One canonical lifecycle now governs every source and summary: the call excludes overlapping read/write/configuration/reader-or-writer construction/free/Drop; after either option failure the caller performs no read/write/configuration/reader-or-writer construction/retry and performs exactly one free/Drop. Compatible-caller owners assert zero reader/writer constructor calls both during overlap attempts and after failure. |
 | P3 malformed-state `Closed` contradiction | Keep the exact public `Closed` producer set unchanged. A malformed private resource record is an internal invariant violation, not a recoverable package error: every operation and Drop reaches the explicit existing `ProcessAbort` dependency before native I/O or untrusted pointer access. Operation/Drop x one-field-at-a-time record corruption owners assert abort and zero native calls. |
 
-The malformed-state correction changes an internal safety strategy and the lifecycle correction
-closes a source-reachable dangling-shell path, so candidate status remains Open until a fresh full
-review of this complete repair is clean.
+The malformed-state correction changed an internal safety strategy and the lifecycle correction
+closed a source-reachable dangling-shell path, so the complete repair received another fresh full
+review. The exact review of
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...7148d4414355365a6c2cbb77d169b1ac8181c5bf`
+returned one P2 finding. This fourth repair reopens the derived-shell-entry-state matrix axis:
+
+| Finding | Authoritative correction and closure owner |
+|---|---|
+| P2 pre-existing derived shell | A non-null compatible caller has zero live reader/writer shells and zero values retaining such a shell derived from the connection at entry; a live direct shell, moved shell, buffered shell, logger, or other retainer is an unsafe-precondition violation even while idle. No constructor overlaps the call. Success may construct shells afterward, but every such shell/retainer must Drop before a later timeout call; either option failure starts from zero shells, forbids construction, and closes the connection once with no shell cleanup ordering. Entry-state owners distinguish never-constructed zero, constructed-then-dropped zero, live direct/buffered reader, live direct/logger-retained writer, and moved/call-transferred reader or writer; package sequencing pins timeout-before-reader-before-writer. |
+
+This finding closes the remaining pre-entry half of the same source-reachable dangling-shell class.
+Candidate status remains Open until a fresh full review of the fourth complete repair is clean.

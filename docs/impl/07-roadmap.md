@@ -3990,14 +3990,19 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   dependency and existing keyed `ProcessAbort` before native I/O or untrusted pointer access. Its
   implementation atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
   installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
-  live connection exclusively with no read/write/configuration/reader-or-writer construction/free/
-  Drop overlap; pre-armed receive/send state distinguishes unchanged receive-option
+  live connection exclusively with no live reader/writer shell derived from it and no other value
+  retaining one at entry, and no read/write/configuration/reader-or-writer construction/free/Drop
+  overlap;
+  pre-armed receive/send state distinguishes unchanged receive-option
   failure, send-option failure with receive changed, and success. Either failure mandates caller
   retirement, prohibits later read/write/configuration/reader-or-writer construction/retry, and
-  requires one free/Drop while the package closes its fresh unpublished connection. A fresh complete
+  requires one free/Drop. Success may construct shells only after the call; another call requires
+  all derived shells/retainers to Drop first, while the package configures its fresh unpublished
+  connection before shell construction and closes either failure. A fresh complete
   review found four native/wire boundary gaps; the next complete review found two P3 consistency
-  gaps in the timeout action lists and malformed-state error partition. A fresh complete review of
-  the third repair is pending, and no public contract is accepted. Exact
+  gaps in the timeout action lists and malformed-state error partition; the following review found
+  one P2 in the pre-existing-derived-shell entry state. A fresh complete review of the fourth repair
+  is pending, and no public contract is accepted. Exact
   ledger and implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.
