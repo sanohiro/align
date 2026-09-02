@@ -202,9 +202,11 @@ every item below has since completed as recorded in the per-milestone sections, 
    of them risks the wrong op set (premature). See `open-questions.md` "bytes / buffer". So the
    next *build* is #3.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. **DONE** (slices ①–③
-   + ④a–④c, PRs #104–117; only fully-escaping fn values — return / struct-field / array-element —
-   stay deferred, see the M7 section above). Design SETTLED (`open-questions.md`); closures are the
-   foundation, `task_group` the consumer. Built in slices:
+   + ④a–④c, PRs #104–117; returned fn values and environment-bearing or capturing fn values
+   carried out of every enclosing region through a struct field or array element stay deferred.
+   Locally used `Static`/noncapturing named fn values in those aggregates are supported; see the M7
+   section above). Design SETTLED (`open-questions.md`); closures are the foundation, `task_group`
+   the consumer. Built in slices:
    **① non-capturing function values DONE** — a top-level fn used as a value is a function pointer
    (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
    f(5)`; scalar signatures). **②a lambda-as-value DONE** — a non-capturing lambda with typed
@@ -1190,11 +1192,14 @@ already lives in `docs/open-questions.md`.
   `ParPool` and propagates a failing task's `Err`; `t.get()` reads a result after the join (a
   `get`-before-`wait` use is a compile-time flow error). Tasks may be impure (I/O); safety from
   by-value capture. Runtime: `align_rt_tg_begin/alloc/register/wait/end`.
-- [deferred] **fully-escaping function values** — returning a fn value from a function, or storing
-  one in a struct field / array element, is **not** supported: it needs a **heap-owned** closure
-  environment with its own drop (the "escapes every region" model), whose design is not yet settled
-  and which has no consumer today (`task_group` uses the region env). Deliberately deferred — see
-  `open-questions.md` "First-class closures + task_group" (the escape-every-region note).
+- [deferred] **returned and environment-escaping function values** — returning a fn value from a
+  function remains unsupported. Carrying an environment-bearing or capturing fn value out of every
+  enclosing region through a struct field or array element is also unsupported: that shape needs a
+  **heap-owned** closure environment with its own drop (the "escapes every region" model), whose
+  design is not yet settled and which has no consumer today (`task_group` uses the region env).
+  Locally used `Static`/noncapturing named fn values in struct fields and arrays are supported;
+  aggregate placement alone is not a full escape. Deliberately deferred — see `open-questions.md`
+  "First-class closures + task_group" (the escape-every-region note).
 - async/await is not included (`non-goals.md`).
 
 **Parallel correctness/output-IR companion record (2026-07-12):**

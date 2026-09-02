@@ -163,39 +163,59 @@ fn drain_bounded<R: Read>(mut pipe: R, captured: &Arc<Mutex<Captured>>, cancel: 
 }
 
 #[cfg(unix)]
-fn make_pipe_nonblocking<R: std::os::fd::AsRawFd>(reader: &R) -> std::io::Result<()> {
+fn make_pipe_nonblocking<R: std::os::fd::AsRawFd>(
+    reader: &R,
+    deadline: Instant,
+) -> std::io::Result<()> {
     let fd = reader.as_raw_fd();
     // SAFETY: `fd` is the live descriptor borrowed from this owned child pipe. `F_GETFL` and
     // `F_SETFL` do not outlive the call or access Rust memory.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let flags = loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            break flags;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted && Instant::now() < deadline {
+            continue;
+        }
+        return Err(error);
+    };
     // SAFETY: same live descriptor; preserving the existing flags and adding `O_NONBLOCK` makes
     // the drain loop cancellable without changing pipe ownership.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(std::io::Error::last_os_error());
+    loop {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted && Instant::now() < deadline {
+            continue;
+        }
+        return Err(error);
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
-fn make_pipe_nonblocking<R>(_reader: &R) -> std::io::Result<()> {
+fn make_pipe_nonblocking<R>(_reader: &R, _deadline: Instant) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn start_drain<R>(reader: R, stream: &str) -> std::io::Result<DrainHandle>
+fn start_drain<R>(reader: R, stream: &str, deadline: Instant) -> std::io::Result<DrainHandle>
 where
     R: Read + Send + std::os::fd::AsRawFd + 'static,
 {
-    make_pipe_nonblocking(&reader)?;
+    make_pipe_nonblocking(&reader, deadline)?;
     start_drain_thread(reader, stream)
 }
 
 #[cfg(not(unix))]
-fn start_drain<R: Read + Send + 'static>(reader: R, stream: &str) -> std::io::Result<DrainHandle> {
-    make_pipe_nonblocking(&reader)?;
+fn start_drain<R: Read + Send + 'static>(
+    reader: R,
+    stream: &str,
+    deadline: Instant,
+) -> std::io::Result<DrainHandle> {
+    make_pipe_nonblocking(&reader, deadline)?;
     start_drain_thread(reader, stream)
 }
 
@@ -424,6 +444,7 @@ fn try_run_command_bounded(
         .stderr(Stdio::piped())
         .spawn()?;
     let mut child = ChildGuard::new(child);
+    let deadline = Instant::now() + timeout;
     let stdout = match child.child_mut().stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -455,7 +476,7 @@ fn try_run_command_bounded(
             );
         }
     };
-    let stdout = match start_drain(stdout, "stdout") {
+    let stdout = match start_drain(stdout, "stdout", deadline) {
         Ok(stdout) => stdout,
         Err(error) => {
             drop(stderr);
@@ -471,7 +492,7 @@ fn try_run_command_bounded(
             );
         }
     };
-    let stderr = match start_drain(stderr, "stderr") {
+    let stderr = match start_drain(stderr, "stderr", deadline) {
         Ok(stderr) => stderr,
         Err(error) => {
             let deadline = Instant::now() + PIPE_DRAIN_TIMEOUT;
@@ -486,7 +507,6 @@ fn try_run_command_bounded(
             );
         }
     };
-    let deadline = Instant::now() + timeout;
     loop {
         match child.child_mut().try_wait() {
             Ok(Some(status)) => {

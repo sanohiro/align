@@ -677,8 +677,9 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 > successful-Wait proof described below is pending the am-w correction after its 2026-07-31 audit.
 > Returning function values, and environment-bearing or capturing function values carried out of
 > every enclosing region through a struct field or array element, remain deferred pending a
-> heap-owned environment and Drop model with a real consumer. A noncapturing named function value
-> may already occupy a locally used struct field; field placement alone is not a full escape.
+> heap-owned environment and Drop model with a real consumer. A `Static`/noncapturing named function
+> value may already occupy a locally used struct field or array element; aggregate placement alone
+> is not a full escape.
 **Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety comes from by-value capture (no shared mutable state). Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
 Record: `draft.md` §11 (Task Group), `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
@@ -710,9 +711,11 @@ review recorded here (a lambda capturing an arena-backed view escaped the arena 
 use-after-free; `f := arena { v := fs.read_bytes_view(p)?; fn { v[0] } }` passed `check` and
 SIGSEGVed at `f()`) is closed: `Ty::Fn` is now `tracks_region`, and `region_of` folds a closure's
 region over its captures, so that program is rejected at `check`. Zero-capture closures stay
-`Static`; closures used entirely within the arena stay legal. When fully-escaping fn values
-(return / struct-field / array-element) land, this capture-region fold is the machinery they
-must preserve.
+`Static`; closures used entirely within the arena stay legal. Locally used `Static`/noncapturing
+named function values in struct fields and arrays are already supported; aggregate placement alone
+is not a full escape. When returned function values and environment-bearing or capturing values
+that escape every enclosing region land, this capture-region fold is the machinery they must
+preserve.
 
 ### `bytes` / `buffer` — design SETTLED; minimal `buffer` BUILT 2026-07-03; `str.bytes()` BUILT 2026-07-15
 **Decision (2026-06-23): `bytes` is `slice<u8>`; `buffer` is a distinct growable owned byte container.** Resolving the two forks left by `draft.md` §12 (which names the types but specs no operations):

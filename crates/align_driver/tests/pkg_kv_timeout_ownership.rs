@@ -1994,15 +1994,58 @@ const RENAMED_RUNTIME_SYMBOLS: &[(&str, &str)] = &[
     ("align_rt_log_free", "align_kv_owner_log_free"),
 ];
 
-struct TempArtifacts(Vec<PathBuf>);
+struct TempArtifacts {
+    dir: PathBuf,
+}
 
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl Drop for TempArtifacts {
     fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+struct ChildGuard {
+    child: Option<std::process::Child>,
+    cleanup_deadline: Option<Instant>,
+}
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child: Some(child),
+            cleanup_deadline: None,
         }
+    }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("armed child guard")
+    }
+
+    fn begin_cleanup(&mut self, deadline: Instant) {
+        self.cleanup_deadline = Some(deadline);
+    }
+
+    fn disarm_reaped(&mut self, _status: std::process::ExitStatus) {
+        self.child.take();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // This is the unwind backstop for every operation after spawn. Explicit cleanup installs
+        // its absolute deadline here before its first attempt, so unwinding cannot silently extend
+        // that bound. A panic before explicit cleanup receives one fresh bounded cleanup window.
+        let deadline = self
+            .cleanup_deadline
+            .unwrap_or_else(|| Instant::now() + PROCESS_CLEANUP_TIMEOUT);
+        let _ = kill_process_group_until(&child, deadline);
+        let _ = kill_direct_until(&mut child, deadline);
+        let _ = reap_child_until(&mut child, deadline);
     }
 }
 
@@ -2372,8 +2415,7 @@ enum ChildPrimary {
     PollFailed(String),
 }
 
-fn poll_child(child: &mut std::process::Child, timeout: Duration) -> ChildPrimary {
-    let deadline = Instant::now() + timeout;
+fn poll_child(child: &mut std::process::Child, deadline: Instant) -> ChildPrimary {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return ChildPrimary::Exited(status),
@@ -2396,17 +2438,21 @@ fn drain_text(drains: &[PipeDrain], label: &str) -> String {
 }
 
 fn cleanup_setup_failure(
-    child: &mut std::process::Child,
+    child: &mut ChildGuard,
     drains: &mut [PipeDrain],
     cancel: &AtomicBool,
     command_label: &str,
     setup_error: &str,
 ) -> ! {
     let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
-    let mut cleanup = cleanup_child_until(child, None, cleanup_deadline);
+    child.begin_cleanup(cleanup_deadline);
+    let mut cleanup = cleanup_child_until(child.child_mut(), None, cleanup_deadline);
     cleanup
         .issues
         .extend(finish_pipe_drains(drains, cancel, cleanup_deadline));
+    if let Some(status) = cleanup.status {
+        child.disarm_reaped(status);
+    }
     panic!(
         "{command_label}: {setup_error}; cleanup: {}; stdout: {}; stderr: {}",
         cleanup.issues.join("; "),
@@ -2419,13 +2465,19 @@ fn run_command_bounded(command: &mut Command, timeout: Duration, command_label: 
     isolate_process_group(command);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut drains = Vec::with_capacity(2);
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("cannot spawn {command_label}: {error}"));
-    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+    let mut child = ChildGuard::new(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("cannot spawn {command_label}: {error}")),
+    );
+    let deadline = Instant::now() + timeout;
+    let (stdout, stderr) = match (
+        child.child_mut().stdout.take(),
+        child.child_mut().stderr.take(),
+    ) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         (stdout, stderr) => {
             drop(stdout);
@@ -2464,19 +2516,23 @@ fn run_command_bounded(command: &mut Command, timeout: Duration, command_label: 
         ),
     }
 
-    let primary = poll_child(&mut child, timeout);
+    let primary = poll_child(child.child_mut(), deadline);
     let (initial_status, failure) = match primary {
         ChildPrimary::Exited(status) => (Some(status), None),
         ChildPrimary::TimedOut => (None, Some(format!("exceeded its {timeout:?} deadline"))),
         ChildPrimary::PollFailed(error) => (None, Some(format!("poll failed: {error}"))),
     };
     let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
-    let mut cleanup = cleanup_child_until(&mut child, initial_status, cleanup_deadline);
+    child.begin_cleanup(cleanup_deadline);
+    let mut cleanup = cleanup_child_until(child.child_mut(), initial_status, cleanup_deadline);
     cleanup.issues.extend(finish_pipe_drains(
         &mut drains,
         cancel.as_ref(),
         cleanup_deadline,
     ));
+    if let Some(status) = cleanup.status {
+        child.disarm_reaped(status);
+    }
     if cleanup.status.is_none() {
         cleanup
             .issues
@@ -2512,12 +2568,13 @@ fn cc_available_bounded() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     isolate_process_group(&mut command);
-    let mut child = match command.spawn() {
+    let mut child = ChildGuard::new(match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
         Err(error) => panic!("cannot spawn timeout ownership C compiler probe: {error}"),
-    };
-    let primary = poll_child(&mut child, CC_PROBE_TIMEOUT);
+    });
+    let deadline = Instant::now() + CC_PROBE_TIMEOUT;
+    let primary = poll_child(child.child_mut(), deadline);
     let (initial_status, failure) = match primary {
         ChildPrimary::Exited(status) => (Some(status), None),
         ChildPrimary::TimedOut => (
@@ -2527,7 +2584,11 @@ fn cc_available_bounded() -> bool {
         ChildPrimary::PollFailed(error) => (None, Some(format!("poll failed: {error}"))),
     };
     let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
-    let cleanup = cleanup_child_until(&mut child, initial_status, cleanup_deadline);
+    child.begin_cleanup(cleanup_deadline);
+    let cleanup = cleanup_child_until(child.child_mut(), initial_status, cleanup_deadline);
+    if let Some(status) = cleanup.status {
+        child.disarm_reaped(status);
+    }
     if failure.is_some() || !cleanup.issues.is_empty() || cleanup.status.is_none() {
         panic!(
             "timeout ownership C compiler probe {}; cleanup: {}",
@@ -2660,22 +2721,22 @@ fn build_lifecycle_executable(name: &str) -> (PathBuf, TempArtifacts) {
             |start| llvm[start..llvm.len().min(start + 2_000)].to_owned(),
         ),
     );
-    let dir = std::env::temp_dir();
     let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let stem = format!(
+    let dir = std::env::temp_dir().join(format!(
         "align-pkg-kv-timeout-owner-{}-{nonce}-{name}",
         std::process::id(),
-    );
-    let align_object = dir.join(format!("{stem}.o"));
-    let c_source = dir.join(format!("{stem}.c"));
-    let c_object = dir.join(format!("{stem}-fixture.o"));
-    let executable = dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
-    let artifacts = TempArtifacts(vec![
-        align_object.clone(),
-        c_source.clone(),
-        c_object.clone(),
-        executable.clone(),
-    ]);
+    ));
+    assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+    std::fs::create_dir(&dir).expect("create unique timeout ownership project directory");
+    // Arm cleanup before the first later fallible operation. `create_dir` rejects a stale path, so
+    // PID reuse cannot silently overwrite or compile against artifacts owned by another process.
+    let artifacts = TempArtifacts { dir };
+    let align_object = artifacts.dir.join("align.o");
+    let c_source = artifacts.dir.join("fixture.c");
+    let c_object = artifacts.dir.join("fixture.o");
+    let executable = artifacts
+        .dir
+        .join(format!("lifecycle{}", std::env::consts::EXE_SUFFIX));
 
     emit_object_file(
         &mir,
