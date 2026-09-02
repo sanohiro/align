@@ -1330,8 +1330,8 @@ pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 ```
 
-`pkg.kv` is a synchronous RESP2 GET/SET/DEL design candidate, listed below separately. It has no
-vendorable source subtree until its reviewed implementation ships.
+`pkg.kv` has an accepted synchronous RESP2 GET/SET/DEL design, listed below separately. It has no
+vendorable source subtree until implementation ships.
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
 packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
@@ -1367,7 +1367,7 @@ non-zeroizing string/buffer Drop. Any import retains the module-wide complete ca
 libcrypto, including session-only use. Exact errors, bounds, formats, precedence, and non-goals:
 `impl/pkg-design/auth.md`.
 
-The `pkg.kv` v1 design candidate proposes this exact root public surface:
+The accepted `pkg.kv` v1 design fixes this exact root public surface:
 
 ```text
 pkg.kv.client  // opaque Move resource
@@ -1470,10 +1470,10 @@ connection-derived writer in place with `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`
 builder write overloads reach that path, file and standard-stream writers retain their existing
 path, and no writer ABI identity/count changes. The
 timeout substrate and writer hardening are separate prerequisite capabilities; the new row lands
-with its package consumer. Exact revised candidate contract: `impl/pkg-design/kv.md`; its first
+with its package consumer. Exact accepted contract: `impl/pkg-design/kv.md`; its first
 independent review found contract gaps, the fresh complete review found four remaining native/wire
 boundary gaps, and the next complete review found two P3 consistency gaps in the timeout action
 lists and malformed-state error partition. The following review found one remaining P2 in the
 pre-existing-derived-shell entry state, and its repair review found one P3 in the recursively
-reachable reader/writer/logger carrier owner graph. A fresh complete review has not yet accepted the
-fifth repair.
+reachable reader/writer/logger carrier owner graph. A fresh complete review accepted the fifth
+repair with no P0–P3 finding; implementation remains pending.

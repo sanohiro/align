@@ -175,7 +175,7 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 > その場でデッドラインを設定し、その満了を reader/writer のバイト経路が `Err(Error.Timeout)` として表面化する。
 > raw な `tcp.connect(host, port)` サーフェスはタイムアウト無しのままでリテラル `0` を渡す。`std.http` の
 > `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は #634 で出荷済みで、同じ
-> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。下記の design-candidate
+> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。下記の accepted-design
 > prerequisite はこの public surface や ABI identity を変えず、positive-timeout の mode transition と
 > quantization を厳密化する。
 
@@ -229,9 +229,9 @@ configured blocking wait 後に `Err(Timeout)` を返す。
 
 ---
 
-## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
 
-> **ステータス:** 最初の independently useful prerequisite。`pkg.kv` design が accept されるまで未実装。
+> **ステータス:** 最初の independently useful prerequisite。accepted design、implementation pending。
 > public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
 
 各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
@@ -316,9 +316,9 @@ command pipe-drain/post-EOF reap を含む。
 
 ---
 
-## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — DESIGN CANDIDATE 2026-09-02)
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
 
-> **ステータス:** independently useful な safety prerequisite。`pkg.kv` design が accept されるまで未実装。
+> **ステータス:** independently useful な safety prerequisite。accepted design、implementation pending。
 > public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
 
 既存の `c.writer() -> writer` が唯一の TCP byte-write surface のまま。private runtime `Writer` state に

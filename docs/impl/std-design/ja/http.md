@@ -1023,9 +1023,9 @@ errno)、`Error.Denied`(TLS 検証失敗)、4xx/5xx ステータスを運ぶ通�
   写す(それ以外は `WANT_*` はリトライ、`SYSCALL` は errno を写す — 従来通りで、`ns == 0` はバイト一致・
   スピンなし)。ハンドシェイク(`SSL_connect`)も同じ arm された fd 上で走り、同一条件を `AL_TIMEOUT` に写す。
 
-### checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+### checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
 
-> **ステータス:** `pkg.kv` design が accept されるまで inactive。上の shipped timeout surface と ABI は
+> **ステータス:** accepted design。implementation まで inactive。上の shipped timeout surface と ABI は
 > 変更せず、この prerequisite は public signature、compiler operation、runtime symbol、ABI shape、
 > registry key、row count のいずれも変更しない。
 

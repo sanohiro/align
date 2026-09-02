@@ -3550,8 +3550,8 @@ pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 ```
 
-`pkg.kv` is a synchronous RESP2 GET/SET/DEL design candidate, listed below separately. It has no
-vendorable source subtree until its reviewed implementation ships.
+`pkg.kv` has an accepted synchronous RESP2 GET/SET/DEL design, listed below separately. It has no
+vendorable source subtree until implementation ships.
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
 versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
@@ -3655,7 +3655,7 @@ The exact contract and implementation closure matrix are
 `docs/impl/pkg-design/auth.md`. `pkg.auth` replaced the former `pkg.jwt` prototype outright; no
 compatibility alias is retained.
 
-The `pkg.kv` v1 design candidate proposes one synchronous plaintext RESP2 text-value client. Its
+The accepted `pkg.kv` v1 design fixes one synchronous plaintext RESP2 text-value client. Its
 exact public types and signatures are:
 
 ```text
@@ -3742,8 +3742,9 @@ V1 sends no PING, AUTH, SELECT, or HELLO and provides no TLS, RESP3 negotiation,
 reply value, pipeline, reconnect, redirect, replay, or hidden retry. It relies on the server's
 default RESP2 mode. Ordinary package source owns framing and parsing; no language builtin or
 checked-HIR/MIR operation is added. One package-internal runtime row remains planned and inactive
-while this contract is a candidate: `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both
-socket I/O timeouts and reuses ABI shape A04. It returns `AL_INVALID` for null then out-of-range
+until the package capability is implemented:
+`align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both socket I/O timeouts and reuses ABI
+shape A04. It returns `AL_INVALID` for null then out-of-range
 input before fd access. Every non-null compatible caller supplies one live, unfreed, exclusively
 held connection with no live reader/writer shell derived from it and no other value retaining one at
 entry, and excludes read/write/configuration/reader-or-writer construction/free/Drop overlap. From
@@ -3769,17 +3770,18 @@ uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and builder overloads 
 while file and standard-stream writers keep their existing path. No writer ABI identity or count
 changes. The timeout substrate and writer hardening are separate prerequisite capabilities; the
 new row lands with its package consumer. The revised
-candidate ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
+accepted ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
 review found four remaining native/wire boundary gaps. The next complete review found two P3
 consistency gaps in the timeout action lists and malformed-state error partition. The following
 review found one remaining P2 in the pre-existing-derived-shell entry state, and its repair review
 found one P3 in the recursively reachable reader/writer/logger carrier owner graph. A fresh complete
-review has not yet accepted the fifth repair.
+review accepted the fifth repair with no P0–P3 finding; implementation remains pending.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
-vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. A design
-candidate such as `pkg.kv` joins that set only when its source ships. First-party packages are
+vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. An
+accepted but unimplemented package such as `pkg.kv` joins that set only when its source ships.
+First-party packages are
 ordinary pkg-layer code, never ambiently resolvable: a consumer copies `pkg/web/` into their project
 exactly as they would a third-party dependency.
 

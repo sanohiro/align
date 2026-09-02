@@ -2,7 +2,8 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/kv.md`.
 >
-> **Status:** design candidate; no public contract is accepted until independent review closes.
+> **Status:** accepted design; implementation pending. The package source and planned runtime row
+> remain inactive until their recorded capability boundaries land.
 
 ## Authoritative public-contract ledger
 
@@ -551,10 +552,11 @@ This English ledger, `docs/impl/pkg-design/ja/kv.md`, `draft.md`,
 HIR ledger remains unchanged; any ABI change beyond the exact one-row reservation or any public
 writer-surface change reopens this design.
 
-During candidate review, `docs/open-questions.md` keeps this item under Open and
-`docs/history.md` has no settled entry. Acceptance must move the exact reviewed contract to
-Settled, add its history record, change every candidate status to accepted/inactive as applicable,
-and only then authorize implementation.
+The fresh full review of exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+accepted this contract with no P0–P3 finding. `docs/open-questions.md` records it as Settled and
+`docs/history.md` records the decision. Implementation is authorized only in the prerequisite order
+below; every unimplemented prerequisite and runtime row remains inactive.
 
 After the fifth finding-ledger repair, the fifth author-side ledger-to-prose and closure-matrix
 consistency pass completed on 2026-09-02 before another fresh complete review:
@@ -570,10 +572,10 @@ consistency pass completed on 2026-09-02 before another fresh complete review:
 - shared connect, HTTP socket, and command-capture timeout consumers fix start/budget arithmetic,
   ceil conversion, zero-result/exhaustion behavior, and their distinct terminal-event precedence;
 - native status, reader count x view length x pointer representation, connect status x output,
-  resolver EAI category, and receive/send option-call plus entry/post-state products
-  are exhaustive; impossible native products and every malformed private-resource operation/Drop
-  reach the explicit existing `std.process`/`ProcessAbort` dependency before native I/O, untrusted
-  access, parsing, publication, or later ownership change;
+  resolver EAI category, and receive/send option-call plus entry/post-state products are exhaustive;
+  impossible native products reach the explicit existing `std.process`/`ProcessAbort` dependency
+  before parsing, publication, or later ownership change; every malformed private-resource
+  operation/Drop reaches that dependency before native I/O or untrusted pointer access;
 - no endpoint, credential, database, retry, clock, resolver result, configuration, artifact, or
   runtime-inspected source input is ambient; vendored package files remain explicit compiler input;
 - canonical RESP scalars, tags, sequence order, malformed rejection, and independent
@@ -618,7 +620,7 @@ complete review may accept the design.
 | P2 physical-symbol recognition | Retain compiler registry recognition for exact ABI compatibility/collision/reachability while adding no language builtin, HIR/MIR operation, ABI shape, or call-spelling selector. Wrong-type/collision/source-reuse owners pin it. |
 | P2 resource interface identity | Pin all six serialized fields for non-generic `pkg.kv.client`, including exact generated thunk and `b"align-res-drop-1"`; mutate each independently in the interface owner. |
 | P2 cache identity | Any own-source byte edit misses its frontend; a semantic private-body edit misses its own object/final link but leaves consumer frontend/object hits; public interface edits miss transitive reverse dependencies; a source-only semantic no-op may object-hit. Exact edit/revert cache twins own each scope. |
-| P3 package inventory | Until source ships, normative summaries list four implemented vendorable subtrees and `pkg.kv` separately as a design candidate. |
+| P3 package inventory | Until source ships, normative summaries list four implemented vendorable subtrees and `pkg.kv` separately as an accepted but unimplemented design. |
 
 The fresh full review of
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...f300756f86c0f28c59556a15d4c64ff918ed590a`
@@ -664,5 +666,13 @@ returned one P3 finding. This fifth repair reopens the recursive-derived-shell-c
 | P3 recursive shell-carrier owner graph | Define a target retainer by runtime provenance through its complete active recursive Drop graph: direct/buffered reader, direct writer, or logger-owned writer leaves may travel through locals/calls, recursive struct fields, nested active `Option`/`Result`, admitted user-sum paths, and source-constructible fixed arrays of retaining structs. Derive one parameterized owner from the canonical formation/Drop graph and add an exhaustive storage-edge tripwire; cross active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple leaves. Any nonzero target count is incompatible without invoking the unsafe row. Each positive class executes configure → construct → move into carrier → move out where supported and Drop or recursively Drop → zero-count reconfigure. Direct handle collections/boxes/tuples and direct reader/writer sum payloads are formation negatives; nameable dynamic-array/slice shapes for retaining structs/sums, the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element, tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` keep explicit materializer/builder/decode/slice no-live-producer owners. |
 
 This finding closes the missing recursively reachable half of the same source-reachable
-dangling-shell class. Candidate status remains Open until a fresh full review of the fifth complete
-repair is clean.
+dangling-shell class. A fresh full review of exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+returned CLEAN with no P0–P3 finding. This exact contract is accepted; implementation remains
+pending in the recorded prerequisite order.
+
+The acceptance-status audit then found one P3 summary-only conflation: it joined impossible native
+products with malformed private records under a pre-I/O guarantee. The correction changes no
+public-contract ledger row or safety strategy. Impossible native products abort before parsing,
+publication, or ownership change; malformed private operations and Drop abort before native I/O or
+untrusted pointer access. A focused finding-to-fix inspection returned CLEAN.

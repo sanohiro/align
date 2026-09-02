@@ -15,14 +15,15 @@ owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
 `docs/impl/core-design/codec.md`; `pkg.frame` is implemented against
 `docs/impl/pkg-design/frame.md`; and `pkg.auth` is implemented against
-`docs/impl/pkg-design/auth.md`. The exact `pkg.kv` public-contract design candidate is authored in
+`docs/impl/pkg-design/auth.md`. The exact accepted `pkg.kv` public-contract design is recorded in
 `docs/impl/pkg-design/kv.md`. Its first independent review reopened the shared
 timeout/native/cache axes; the first fresh review then found four remaining raw-view,
 source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found two P3
 consistency gaps in the timeout action lists and malformed-state error partition. The following
 review found one P2 in the pre-existing-derived-shell entry state; its repair review found one P3 in
-the recursively reachable reader/writer/logger carrier owner graph. The fifth ledger-first repair is
-complete; a fresh complete review is next, and no public contract is accepted yet.
+the recursively reachable reader/writer/logger carrier owner graph. A fresh full review accepted the
+fifth ledger-first repair with no P0–P3 finding. Implementation is pending and starts with the
+independently useful shared timeout-substrate prerequisite.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -352,8 +353,8 @@ facts must live in this repository.
 - **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
   in-language test runner, bounded data/protocol library wave (`core.codec`,
   `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact fifth-revised design
-  candidate and remains the next language capability; another fresh complete review is pending.
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact accepted design and
+  remains the next language capability; implementation starts with its shared timeout prerequisite.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
@@ -409,8 +410,9 @@ facts must live in this repository.
   independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
   whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
   new compiler/runtime ABI or ambient clock/provider/key/session owner.
-- **Next language capability:** complete another fresh independent review of the fifth revised
-  exact `pkg.kv` public-contract candidate in `docs/impl/pkg-design/kv.md`. The first exact-SHA review found an
+- **Next language capability:** implement the first independently useful shared timeout-substrate
+  prerequisite of the accepted exact `pkg.kv` contract in `docs/impl/pkg-design/kv.md`. The first
+  exact-SHA review found an
   unenforceable positive-connect bound from unchecked `F_GETFL`/`F_SETFL`, plus timeout/address,
   native-status/ABI, RESP/allocation, SIGPIPE-owner, interface/cache, and inventory gaps. The repair
   adds a first shared timeout-substrate prerequisite (full-range start-plus-budget arithmetic,
@@ -439,8 +441,9 @@ facts must live in this repository.
   closes; the following review found the pre-existing-derived-shell entry gap, which the fourth
   repair closes. Its fresh review found one remaining recursive carrier-owner gap; the fifth repair
   defines the complete active Drop graph across reader/writer/logger leaves, struct and tagged/sum
-  carriers, target provenance, and zero/one/multiple leaves. TLS and the wider Redis surface remain
-  deferred. No public surface is accepted.
+  carriers, target provenance, and zero/one/multiple leaves. The next fresh full review was CLEAN,
+  so the exact design is accepted; package source and the planned ABI row remain unimplemented.
+  TLS and the wider Redis surface remain deferred.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

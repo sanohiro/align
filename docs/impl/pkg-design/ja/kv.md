@@ -4,7 +4,8 @@
 >
 > **注意:** 英語版 (`../kv.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** design candidate。独立レビューが閉じるまで公開契約は未承認。
+> **ステータス:** accepted design。implementation pending。package source と planned runtime row は、
+> 記録済み capability boundary が land するまで inactive。
 
 ## 公開契約台帳
 
@@ -504,9 +505,11 @@ package capability はおよそ 1,000 changed hand-written lines を超え得る
 一致しなければならない。HIR ledger は不変。
 exact 1-row reservation を越える ABI change、または public writer-surface change はこの design を reopen する。
 
-candidate review 中は `docs/open-questions.md` がこの項目を Open に置き、`docs/history.md` に Settled
-entry はない。acceptance 時は exact reviewed contract を Settled へ移し、history record を追加し、
-各 candidate status を accepted/inactive の該当状態へ変更してから implementation を許可する。
+exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+の fresh full review は P0–P3 finding なしでこの contract を accept した。`docs/open-questions.md` は
+Settled として記録し、`docs/history.md` は decision を記録する。implementation は下記 prerequisite order
+でのみ許可し、未実装 prerequisite と runtime row はすべて inactive のまま。
 
 5 回目の finding-ledger repair 後、5 回目の author-side ledger-to-prose および closure-matrix consistency
 pass は、another fresh complete review 前の 2026-09-02 に完了:
@@ -521,10 +524,10 @@ pass は、another fresh complete review 前の 2026-09-02 に完了:
 - shared connect、HTTP socket、command-capture timeout consumer の start/budget arithmetic、ceil conversion、
   zero-result/exhaustion behavior、それぞれの terminal-event precedence が固定。
 - native status、reader count x view length x pointer representation、connect status x output、resolver EAI
-  category、receive/send option-call と entry/post-state product が exhaustive。
-  impossible native product と全 malformed private-resource operation/Drop は native I/O、untrusted
-  access、parsing/publication/後続 ownership change 前に explicit existing `std.process`/`ProcessAbort`
-  dependency へ到達。
+  category、receive/send option-call と entry/post-state product が exhaustive。impossible native product は
+  parsing/publication/後続 ownership change 前に explicit existing `std.process`/`ProcessAbort` dependency
+  へ到達し、全 malformed private-resource operation/Drop は native I/O/untrusted access 前に同じ dependency
+  へ到達。
 - endpoint/credential/database/retry/clock/resolver result/configuration/artifact/runtime-inspected source input は
   ambient でなく、vendored package file は explicit compiler input のまま。
 - canonical RESP scalar/tag/sequence order/malformed rejection、independent semantic-to-byte と byte-to-semantic golden が固定。
@@ -565,7 +568,7 @@ synchronized summary へ伝播しなければならない。
 | P2 physical-symbol recognition | exact ABI compatibility/collision/reachability のため compiler registry recognition を維持する一方、language builtin、HIR/MIR operation、ABI shape、call-spelling selector を加えない。wrong-type/collision/source-reuse owner が pin。 |
 | P2 resource interface identity | non-generic `pkg.kv.client` の serialized field 6 個すべてを pin。exact generated thunk と `b"align-res-drop-1"` を含み、interface owner で各 field を独立に mutate。 |
 | P2 cache identity | own-source byte edit は frontend を miss。semantic private-body edit は自身の object/final link を miss する一方 consumer frontend/object は hit。public interface edit は transitive reverse dependency を miss。source-only semantic no-op は object-hit 可。exact edit/revert cache twin が各 scope を own。 |
-| P3 package inventory | source 出荷前、normative summary は implemented vendorable subtree 4 個と design candidate `pkg.kv` を分けて記載。 |
+| P3 package inventory | source 出荷前、normative summary は implemented vendorable subtree 4 個と accepted but unimplemented design `pkg.kv` を分けて記載。 |
 
 fresh full review
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...f300756f86c0f28c59556a15d4c64ff918ed590a`
@@ -608,4 +611,13 @@ fresh full review
 | P3 recursive shell-carrier owner graph | target retainer を complete active recursive Drop graph の runtime provenance で定義。direct/buffered reader、direct writer、logger-owned writer leaf は local/call、recursive struct field、nested active `Option`/`Result`、admitted user-sum path、retaining struct の source-constructible fixed array を移動できる。canonical formation/Drop graph から parameterized owner 1 個を derive し exhaustive storage-edge tripwire を追加。active/inactive/moved-out state、target/other/mixed provenance、zero/one/multiple leaf を cross し、nonzero target count は unsafe row を invoke せず incompatible。各 positive class は configure → construct → carrier へ move → supported なら move-out 後 Drop または recursive Drop → zero-count reconfigure。direct handle collection/box/tuple と direct reader/writer sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/slice element、tuple、builtin `Option`/`Result` edge は explicit materializer/builder/decode/slice no-live-producer owner を維持。 |
 
 この finding は、同じ source-reachable dangling-shell class の recursively reachable な未閉包 half を閉じる。
-fifth complete repair の fresh full review が clean になるまで candidate status は Open のまま。
+exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+の fresh full review は P0–P3 finding なしで CLEAN を返した。この exact contract は accepted で、
+implementation は記録済み prerequisite order のまま pending。
+
+その後の acceptance-status audit は summary-only conflation の P3 1 件を返した。impossible native product と
+malformed private record を pre-I/O guarantee 1 個にまとめていた。修正は public-contract ledger row と safety
+strategy を変更しない。impossible native product は parsing/publication/ownership change 前に abort し、
+malformed private operation/Drop は native I/O/untrusted pointer access 前に abort する。focused
+finding-to-fix inspection は CLEAN を返した。

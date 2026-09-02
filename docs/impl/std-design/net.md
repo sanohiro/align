@@ -178,7 +178,7 @@ Linux backend behind the same signatures, not a semantic change.
 > `Err(Error.Timeout)`. The raw `tcp.connect(host, port)` surface stays timeout-less and lowers a
 > literal `0`. The `std.http` `cl.timeout(ns)` / `r.timeout(ns)` surface (http.md "I/O timeouts")
 > SHIPPED in #634, threading its effective timeout through this same `align_rt_tcp_connect`
-> parameter. The design-candidate prerequisite below tightens positive-timeout mode transitions and
+> parameter. The accepted-design prerequisite below tightens positive-timeout mode transitions and
 > quantization without changing this public surface or an ABI identity.
 
 `std.http`'s per-request timeout (http.md "I/O timeouts") rests on the net rail, so the substrate is
@@ -232,10 +232,10 @@ expiry. A conn whose peer accepts then never sends, with `read_timeout_ns` set �
 
 ---
 
-## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
 
-> **Status:** first independently useful prerequisite; not implemented until the `pkg.kv` design is
-> accepted. No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
+> **Status:** first independently useful prerequisite; accepted design, implementation pending.
+> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
 > row count changes.
 
 For every usable resolver address and positive `timeout_ns`, `align_rt_tcp_connect` records a
@@ -335,10 +335,10 @@ plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
 
 ---
 
-## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — DESIGN CANDIDATE 2026-09-02)
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
 
-> **Status:** independently useful safety prerequisite; not implemented until the `pkg.kv` design
-> is accepted. No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
+> **Status:** independently useful safety prerequisite; accepted design, implementation pending.
+> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
 > row count changes.
 
 The existing `c.writer() -> writer` remains the one TCP byte-write surface. Its private runtime

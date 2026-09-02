@@ -414,9 +414,9 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 7. **実装済み:** bytes 層 `c.run_bytes()` とコマンドローカルな `max_capture_bytes` 上限 —
    align-llm Request 11。
 
-## shared timeout-budget hardening (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+## shared timeout-budget hardening (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
 
-> **ステータス:** `pkg.kv` design が accept されるまで inactive。それまで shipped `process.command`
+> **ステータス:** accepted design。implementation まで inactive。それまで shipped `process.command`
 > surface と behavior が active のままである。この prerequisite は public signature、compiler operation、
 > runtime symbol、ABI shape、registry key、row count のいずれも変更しない。
 
@@ -472,7 +472,7 @@ UTF-8 precedence は変更しない。scheduler delay で return が遅くなる
 - import が必須であること。
 - planned shared-timeout owner: exact millisecond、next nanosecond、maximum-positive i64 budget、
   `EINTR` remainder recomputation、時間が残る early zero poll result、次の poll 前の exhausted remainder、
-  no early expiry。これらは上の design-candidate prerequisite とともにだけ activate する。
+  no early expiry。これらは上の accepted-design prerequisite とともにだけ activate する。
 
 # 拡張 — 有界 text/byte キャプチャ（align-llm Request 11）
 
@@ -603,7 +603,7 @@ entry を無効化する。
 | Exact-limit text success | 共通 drain は empty、`L`、stdout-only、stderr-only、同時 `L`/`L` を受理し、`run_output` は既存 code/text view を保つ。Owner: `command_capture_exact_limit_and_reuse`。 |
 | One-byte overflow | どちらかが `L + 1`、または両 pipe 同時圧力でも `Error.Invalid`、output 非公開、group/direct pid kill、fd close、direct child 1回 reap。Owner: `command_capture_overflow_kills_group_and_discards_partial`。 |
 | Timeout/cap/exit/UTF-8 precedence | timeout-before-overflow、overflow-before-timeout、nonzero-overflow、in-bound invalid UTF-8、両 stream close 後も deadline 超過まで生存する子で上記 checkpoint order を検証。Owner: `command_capture_error_precedence` と `command_timeout_covers_post_eof_wait`。 |
-| Planned timeout-budget quantization | 変更のない post-fork anchor で exact-ms、next-ns、maximum-positive i64 budget が monotonic start+duration subtractionを使う。`EINTR` と early-zero result は再計算し、exhaustion は次の poll 前に返り、early expiry と最後の timeout-zero probe は無い。既存の post-syscall timeout/error precedence も green を保つ。Owner: `command_timeout_budget_quantization` (この design-candidate shared prerequisite とともに activate)。 |
+| Planned timeout-budget quantization | 変更のない post-fork anchor で exact-ms、next-ns、maximum-positive i64 budget が monotonic start+duration subtractionを使う。`EINTR` と early-zero result は再計算し、exhaustion は次の poll 前に返り、early expiry と最後の timeout-zero probe は無い。既存の post-syscall timeout/error precedence も green を保つ。Owner: `command_timeout_budget_quantization` (この accepted-design shared prerequisite とともに activate)。 |
 | Hard pipe/wait error | non-`EINTR` poll、`POLLNVAL`、stdout/stderr hard read、post-EOF `waitpid` error を注入。観測済み timeout が勝ち、それ以外は stdout が stderr より先、元の固定 errno が cleanup 後も残り、partial result 無し、owned group (存在時)/direct pid kill、fd close、direct child reap または既に `ECHILD`。Owner: `command_capture_hard_io_errors_are_terminal`。 |
 | Post-fork lifecycle | `{pipes open/EOF} × {child live/exited} × {untimed/timed/bounded}` を parameterize。成功には両 EOF と direct child reap が必要。timed EOF/live child は WNOHANG + allocation-free zero-fd poll で exit/deadline まで進む。Owner: `command_capture_lifecycle_state_matrix`。 |
 | Binary tier | `run_bytes` は invalid UTF-8 と embedded NUL を byte-for-byte で保ち、region-bound byte view、nonzero exit、exact-cap 動作を共有。Owner: `command_run_bytes_preserves_arbitrary_output`。 |

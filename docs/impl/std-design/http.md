@@ -1053,9 +1053,9 @@ effective-timeout resolution (request override else client default) happens in `
   exactly as before — so `ns == 0` is byte-identical, no spin). The handshake (`SSL_connect`) runs over
   the same armed fd and maps the identical condition to `AL_TIMEOUT`.
 
-### Checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — DESIGN CANDIDATE 2026-09-02)
+### Checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
 
-> **Status:** inactive until the `pkg.kv` design is accepted. The shipped timeout surface and ABI
+> **Status:** accepted design; inactive until implementation. The shipped timeout surface and ABI
 > above remain unchanged; this prerequisite changes no public signature, compiler operation,
 > runtime symbol, ABI shape, registry key, or row count.
 

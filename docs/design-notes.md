@@ -1435,8 +1435,8 @@ linking that the current whole/per-unit machinery does not provide.
 ## Why `pkg.kv` is a typed RESP2 client, not a generic Redis protocol API
 
 One Redis connection carries a sequential byte stream, so a generic command/reply escape hatch
-would let an incomplete nested reply silently desynchronize every later operation. The candidate
-instead admits only `GET`, `SET`, and one-key `DEL`, each with a closed reply shape. An opaque Move
+would let an incomplete nested reply silently desynchronize every later operation. The accepted
+design instead admits only `GET`, `SET`, and one-key `DEL`, each with a closed reply shape. An opaque Move
 client and call-bounded `borrow mut` make one request/one reply the only concurrency model. A
 transport failure, oversized response, or reply whose framing cannot be proved complete retires the
 client before returning; only a complete bounded grammar-valid Simple Error payload (NUL/invalid
@@ -1498,14 +1498,15 @@ GET values and server errors are ordinary owned strings; keys and SET values are
 their synchronous write. No reply or scratch view escapes, and the configured response cap bounds
 the only value-sized receive allocation. Empty owned results use canonical `{null, 0}` without a
 final buffer; nonempty results allocate one. V1 deliberately stays on plaintext RESP2 with no protocol
-negotiation or TLS. The exact candidate contract, byte grammar, error precedence, runtime
+negotiation or TLS. The exact accepted contract, byte grammar, error precedence, runtime
 reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
 review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
 raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found
 two P3 consistency gaps in the timeout action lists and malformed-state error partition; the
 following review found one remaining P2 in the pre-existing-derived-shell entry state, and its
 repair review found one P3 in the recursively reachable reader/writer/logger carrier owner graph.
-No public contract is accepted until a fresh complete review closes this fifth repair.
+A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation remains
+pending in the recorded prerequisite order.
 
 ## Why tests are Result blocks run in separate processes
 

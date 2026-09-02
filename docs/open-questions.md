@@ -3225,11 +3225,9 @@ decorate step records those keys; comparisons never invoke the callable again. T
 shipped behavior normative without fixing the internal sorting algorithm. Full context:
 `impl/12-pipeline-closure-memory-io-simd-audit.md` §3.2.
 
-## Open (to be decided)
+### `pkg.kv` v1 typed RESP2 client — SETTLED 2026-09-02
 
-### `pkg.kv` v1 typed RESP2 client — REVISED DESIGN CANDIDATE 2026-09-02
-
-The candidate public surface is one opaque Move `client`, explicit `ClientOptions`, a closed
+The settled public surface is one opaque Move `client`, explicit `ClientOptions`, a closed
 `SetCondition` and `SetOptions`, the exact error sum `Invalid | Io(core.Error) | Server(string) |
 Decode | ResponseTooLarge | Protocol | Closed`, and four Impure operations: `connect`, `get`,
 `set`, and single-key `delete`. GET returns an owned `Option<string>`; SET reports whether its
@@ -3281,8 +3279,12 @@ acceptance owners are recorded in `impl/pkg-design/kv.md` and
 gaps; the next complete review found two P3 consistency gaps in the timeout action lists and
 malformed-state error partition; the following review found one remaining P2 in the pre-existing-
 derived-shell entry state; its repair review found one P3 in the recursively reachable
-reader/writer/logger carrier owner graph. This item remains open until a fresh complete adversarial
-review accepts the fifth repair, after which it may move to Settled and authorize implementation.
+reader/writer/logger carrier owner graph. A fresh complete adversarial review of exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+accepted the fifth repair with no P0–P3 finding. This item is Settled and authorizes implementation
+in the recorded prerequisite order; no package source or planned ABI row is active yet.
+
+## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 

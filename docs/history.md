@@ -1,5 +1,26 @@
 # History of Align
 
+## 2026-09-02: pkg.kv is one typed synchronous plaintext RESP2 client
+
+The accepted `pkg.kv` design fixes one opaque Move `client`, explicit connect and I/O timeouts plus
+an inclusive response cap, owned-string GET, conditional/expiring SET, and one-key DEL. It is one
+synchronous plaintext RESP2 text-value surface with no generic command value, default endpoint,
+credential, database selector, retry, redirect, pool, transaction, script, pub/sub, protocol
+negotiation, TLS, client clock, or ambient configuration.
+
+Implementation begins with two independently useful shared prerequisites: checked full-range
+timeout/deadline handling across TCP, HTTP, and process capture, then SIGPIPE-safe writes through
+the existing connection-derived writer. The package activates one checked fixed-symbol socket-
+timeout row only with its source consumer. Its connection lifecycle is closed over the complete
+runtime-provenance reader/writer/logger retention graph, including recursive struct/tagged/sum and
+fixed Move-struct-array carriers. Native impossibilities abort before parsing, publication, or
+ownership change; malformed private state aborts before native I/O or untrusted pointer access.
+
+A fresh full review accepted the fifth repaired ledger with no P0–P3 finding. The package remains
+unimplemented, the planned ABI row remains inactive, and the implemented first-party inventory
+remains four vendorable subtrees until source ships. Exact surface, ownership, wire grammar, error
+precedence, prerequisites, and implementation matrix: `docs/impl/pkg-design/kv.md`.
+
 ## 2026-09-01: auth composes fixed protocols over the one crypto substrate
 
 The first `pkg.auth` implementation shipped HS256 JWT, Argon2id PHC password records, and 256-bit opaque

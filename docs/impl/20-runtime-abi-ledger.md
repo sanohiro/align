@@ -57,7 +57,7 @@ six keyed rows. The `core.test` child-control extension then added four unkeyed 
 added six keyed rows, `core.codec` then added eight, and `pkg.frame` added two. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
 are 330 keyed records, 347 base records, and 355 records in the maximum optional-probe export table.
-No probe category changed. The `pkg.kv` design candidate below reserves one source-reachable
+No probe category changed. The accepted `pkg.kv` design below reserves one source-reachable
 unkeyed identity that reuses an existing ABI shape; it is inactive and excluded from these shipped
 counts until implementation. Its two independently useful prerequisites first harden the shared
 TCP timeout substrate and existing TCP-derived writers without changing a symbol, key, shape,
@@ -107,7 +107,7 @@ harness returns. The independent driver codecs and the runtime codecs both pin t
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
 
-## Planned `pkg.kv` TCP prerequisites and substrate (design candidate; inactive)
+## Planned `pkg.kv` TCP prerequisites and substrate (accepted design; inactive until implementation)
 
 The first independently useful prerequisite hardens the shipped shared timeout substrate without
 changing an ABI identity. For every usable address and positive `timeout_ns`,
