@@ -72,8 +72,8 @@ consumer needs to branch on them). Resolver failures are EAI values, not errno:
 `encoded := AL_CODE.saturating_add(eai.saturating_abs())`, then
 `Error.Code(encoded - AL_CODE)`. Partial
 read/write is handled by the reused reader/writer. Connection reset
-mid-stream surfaces as a read/write Error; the `pkg.kv` prerequisite below closes the current Linux
-SIGPIPE hole so a write to a closed peer cannot terminate the process first.
+mid-stream surfaces as a read/write Error; the implemented `pkg.kv` prerequisite below has closed
+the former SIGPIPE hole, so a write to a closed peer cannot terminate the process first.
 
 **`l.accept()` is the exception, and deliberately so: a failure of ONE inbound connection is not a
 failure of the listener.** `accept(2)` reports both through the same errno, so the ones that

@@ -74,8 +74,8 @@ syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECO
 `encoded := AL_CODE.saturating_add(eai.saturating_abs())`、次に
 `Error.Code(encoded - AL_CODE)` にする。
 部分的な read/write は再利用する reader/writer が処理する。ストリーム途中の connection reset は read/write
-Error として表面化する。下記の `pkg.kv` prerequisite は現在の Linux SIGPIPE hole を閉じ、closed peer への
-write が Error を返す前に process を terminate しないようにする。
+Error として表面化する。下記の implemented `pkg.kv` prerequisite は従来の SIGPIPE hole を閉じており、
+closed peer への write が Error を返す前に process を terminate しない。
 
 **`l.accept()` だけは例外であり、それは意図的である: inbound コネクション 1 本の失敗は、listener の失敗
 ではない。** `accept(2)` は両者を同じ errno で報告するので、コネクションを記述しているほうは返さずに内部で

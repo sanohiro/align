@@ -26335,6 +26335,12 @@ mod tests {
 
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_flags = unsafe { libc::fcntl(pipe_fds[0], libc::F_GETFL) };
+        assert_ne!(read_flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe_fds[0], libc::F_SETFL, read_flags | libc::O_NONBLOCK) },
+            0,
+        );
         let generic = align_rt_io_writer_std(pipe_fds[1], 0);
         assert_eq!(unsafe { (*generic).sink }, WriterSink::GenericFd);
         assert_eq!(unsafe { align_rt_io_writer_write(generic, b"g".as_ptr(), 1) }, 0);
@@ -26352,6 +26358,8 @@ mod tests {
         }
 
         let (socket, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bounded socket peer reads");
         let fd = socket.into_raw_fd();
         let conn = Box::into_raw(Box::new(TcpConn { fd }));
         let writer = unsafe { align_rt_tcp_conn_writer(conn) };
@@ -26432,6 +26440,7 @@ mod tests {
             peer.read(&mut byte).expect_err("shell Drop sends no hidden bytes").kind(),
             std::io::ErrorKind::WouldBlock,
         );
+        peer.set_nonblocking(false).expect("restore bounded blocking peer read");
         unsafe { align_rt_tcp_conn_free(conn) };
         assert_eq!(
             peer.read(&mut byte).expect("read EOF after connection close"),

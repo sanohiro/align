@@ -491,6 +491,7 @@ jobs:
 
       - name: TCP writer SIGPIPE regressions (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 15
         run: >
           scripts/run-quiet.sh "CI test: TCP writer SIGPIPE" --
           scripts/cargo.sh test -p align_runtime --lib --locked tcp_writer_
