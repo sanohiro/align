@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 PROJECT="$WORK_ROOT/project"
 mkdir -p "$PROJECT/pkg"
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg; do
+for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
 done
 cat > "$PROJECT/main.align" <<'ALIGN'
@@ -44,6 +44,7 @@ import pkg.web.cors
 import pkg.web.multipart
 import pkg.frame
 import pkg.auth
+import pkg.kv
 
 fn main() -> i32 = 0
 ALIGN

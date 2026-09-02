@@ -232,8 +232,8 @@ configured blocking wait 後に `Err(Timeout)` を返す。
 ## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
 > **ステータス:** 最初の independently useful prerequisite として implemented。public signature、
-> compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。planned checked
-> package row は package implementation まで inactive のまま。
+> compiler operation、runtime symbol、ABI shape、registry key、row count は変更しなかった。この
+> boundary では checked package row は inactive のままで、現在は `pkg.kv` と共に active。
 
 各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
 monotonic start と positive `Duration` budget を記録し、次に `F_GETFL` と
@@ -271,13 +271,13 @@ nonzero `SO_ERROR`、blocking-restore `F_GETFL`、blocking-restore `F_SETFL` の
 mixed-address owner は各 failure class の後に skipped entry と later success を置き、all-failure variant は
 last attempted status と close count を固定する。
 
-同じ prerequisite が public `read_timeout_ns`/`write_timeout_ns` と planned checked package row で共有する
+同じ prerequisite が public `read_timeout_ns`/`write_timeout_ns` と現在 active な checked package row で共有する
 socket-timeout conversion を修正する。全 positive nanosecond 値を `ceil(ns / 1000)` microseconds とし、それを
 normalized `timeval { tv_sec, tv_usec: 0..999999 }` に分割する。exact microsecond は exact のまま、zero は既存の
 clear/no-timeout 意味を保つ。option は 1 回の blocking progress wait を bound し、multi-read/multi-write operation 全体を
 bound しない。
 
-planned source-reachable `TcpConnSetIoTimeout` consumer は全 non-null compatible caller に、call 全体で
+active な source-reachable `TcpConnSetIoTimeout` consumer は全 non-null compatible caller に、call 全体で
 exclusive な 1 個の live/unfreed connection を要求する。entry 時にその connection 由来の live
 reader/writer shell またはその shell を retain する value はなく、read/write/configuration/
 reader-or-writer construction/free/Drop の overlap も禁止。exact normalized `timeval` を使い receive を send より先に install。entry option state を
@@ -326,8 +326,8 @@ end-to-end timeout と command cleanup/precedence owner を組み合わせる。
 ## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — IMPLEMENTED 2026-09-02)
 
 > **ステータス:** 第二の independently useful な safety prerequisite として implemented。public signature、
-> compiler operation、runtime symbol、ABI shape、registry key、row count は変更なし。package source と
-> planned checked-timeout row は joint capability boundary まで inactive。
+> compiler operation、runtime symbol、ABI shape、registry key、row count は変更なし。この boundary では
+> package source と checked-timeout row は inactive のままで、現在は両方とも active。
 
 既存の `c.writer() -> writer` が唯一の TCP byte-write surface のまま。private runtime `Writer` state に
 sink kind と macOS/BSD readiness bit を加え、`align_rt_tcp_conn_writer` だけが socket/not-ready に設定。
@@ -353,8 +353,9 @@ sink kind を継承する。
 
 既存の keyed `IoWriterWriteBuilder` identity、A19
 `i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration、
-`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI、attribute、shipped 330/347/355
-keyed/base/maximum count への inclusion は変わらない。source-visible builder overload は builder byte を
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI、attribute、当時 shipped だった
+330/347/355 keyed/base/maximum count への inclusion は writer-prerequisite boundary で変わらなかった。
+後続の `pkg.kv` row により現在の total は 330/348/356。source-visible builder overload は builder byte を
 borrow して hardened `IoWriterWrite` row に delegate するので、socket sink policy を迂回できない。
 
 acceptance owner は macOS/BSD での failed install/no send 後の retry、overlap する shell の両方の
@@ -366,7 +367,7 @@ Linux/macOS の subprocess closed-peer test は direct slice/builder overload、
 `tcp_writer_macos_nosigpipe_state_matrix`、`tcp_writer_generic_fd_parity_and_socket_lifecycle`、
 `tcp_writer_closed_peer_routes_do_not_sigpipe`。
 
-両 prerequisite は着地済み。planned `TcpConnSetIoTimeout` row とその `pkg.kv` package consumer は
-次の capability で同時に activate する。exact package consumption と implementation boundary は
-`../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
+両 prerequisite は着地済み。`TcpConnSetIoTimeout` row とその `pkg.kv` package consumer も
+着地し、同時に active となった。exact package consumption と implementation boundary は
+`../pkg-design/kv.md`、active な one-row delta と prerequisite の不変 ABI identity は
 `../20-runtime-abi-ledger.md` に記録する。

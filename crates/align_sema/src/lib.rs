@@ -66421,6 +66421,14 @@ fn resolve_user_type(
             None => Ty::Error,
         };
     }
+    if !args.is_empty()
+        && (cx.struct_ids.contains_key(canonical)
+            || cx.enum_ids.contains_key(canonical)
+            || cx.resource_ids.contains_key(canonical))
+    {
+        diags.error(format!("'{canonical}' takes no type arguments"), span);
+        return Ty::Error;
+    }
     match cx.struct_ids.get(canonical) {
         Some(&id) => Ty::Struct(id),
         None => match cx.enum_ids.get(canonical) {

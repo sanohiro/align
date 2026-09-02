@@ -34,3 +34,8 @@ notify = "8.2.0"
 
 [build-dependencies]
 align_hash = { path = "../align_hash" }
+
+[dev-dependencies]
+# Test-only runtime probe used by `tests/pkg_kv_alloc.rs`. This does not affect production
+# `align_driver` builds; Cargo enables the counters only while compiling driver test targets.
+align_runtime = { path = "../align_runtime", features = ["alloc-count"] }

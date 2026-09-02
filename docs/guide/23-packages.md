@@ -1,8 +1,8 @@
-# Packages: vendored source, pkg.web, pkg.frame, pkg.auth, and pkg.db
+# Packages: vendored source, pkg.web, pkg.frame, pkg.auth, pkg.kv, and pkg.db
 
 > 🌐 **English** · [Japanese](./ja/23-packages.md)
 
-`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.frame`, `pkg.auth`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
+`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.frame`, `pkg.auth`, `pkg.kv`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
 
 ## A package is a source tree
 
@@ -14,11 +14,15 @@ pkg/
   db.align
   auth.align
   frame.align
+  kv.align
   web.align
   db/
     sqlite.align
     postgres.align
     pool.align
+  kv/
+    internal/
+      resource.align
   web/
     types.align
     cookie.align
@@ -28,7 +32,7 @@ pkg/
 
 `import pkg.web` resolves to `pkg/web.align`; `import pkg.web.cookie` resolves to `pkg/web/cookie.align`. Calls and types remain fully qualified, such as `pkg.web.get(...)` and `pkg.web.types.Ctx`.
 
-Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
+Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), [apps/kv/pkg](../../apps/kv/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
 
 There is no package manifest, lockfile, registry, version solver, or download command. Imports plus the filesystem are the dependency graph, and one `pkg/<name>` exists per source tree. Updating or auditing a dependency means updating or auditing the vendored source.
 
@@ -102,9 +106,40 @@ fn main() -> Result<(), Error> {
 
 Verification authenticates the compact bytes before parsing JSON, pins the algorithm to HS256, and compares signatures in constant time. The required `now_ns` checks optional integer-form `exp` and `nbf` claims without a hidden clock read. Password verification enforces the caller's three work ceilings before Argon2 runs. There is no default password policy, key lookup, issuer/audience policy, cookie, or session store; the exact bounds and errors are recorded in [`pkg.auth`'s design](../impl/pkg-design/auth.md).
 
+## `pkg.kv`
+
+`pkg.kv` is a synchronous plaintext RESP2 client for typed GET, SET, and single-key DEL operations. Connection and I/O timeouts and the maximum response size are explicit. The Move `client` is used through one `borrow mut` operation at a time, and Drop is its public close operation.
+
+```align
+import pkg.kv
+
+fn open_store() -> Result<pkg.kv.client, pkg.kv.Error> {
+    options := pkg.kv.ClientOptions {
+        connect_timeout_ns: 1000000000,
+        io_timeout_ns: 1000000000,
+        max_response_bytes: 1048576,
+    }
+    return pkg.kv.connect("127.0.0.1", 6379, options)
+}
+
+fn create_session(
+    borrow mut store: pkg.kv.client,
+    key: str,
+    payload: str,
+) -> Result<bool, pkg.kv.Error> {
+    options := pkg.kv.SetOptions {
+        condition: pkg.kv.SetCondition.IfAbsent,
+        expires_in_ns: Some(900000000000),
+    }
+    return pkg.kv.set(store, key, payload, options)
+}
+```
+
+`get` returns an owned optional string, `set` reports whether its `Always` / `IfAbsent` / `IfPresent` condition applied, and `delete` reports whether the key existed. Transport, oversized, or malformed replies retire the client; a later operation then returns `Closed`. There is no default endpoint, authentication, TLS, RESP3 negotiation, generic command API, pipeline, retry, redirect, pool, transaction, script, or pub/sub surface. Root `pkg.kv` and its private `pkg.kv.internal.resource` implementation ship together; the exact bounds and error rules are recorded in [`pkg.kv`'s design](../impl/pkg-design/kv.md).
+
 ## `pkg.db` — complete committed roadmap
 
-`pkg.db` is the first-party database package, vendored the same way as the other three: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
+`pkg.db` is the first-party database package, vendored the same way as the other four: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
 
 Complete: the first public release scope. Typed static queries and commands are checked against real schema metadata at compile time, execute on both SQLite and PostgreSQL, and regenerate that metadata offline. Prepared statements, transactions, typed row streams with deadlines and cancellation, compound one-to-many and many-to-one outputs, migration lifecycle tooling, and read-only catalog inspection with `EXPLAIN` are all in.
 

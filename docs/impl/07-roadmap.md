@@ -3842,8 +3842,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`HANDOFF.md` names `pkg.kv` design as the next language capability after the implemented
-`pkg.auth` package. Promotion of an optimization slice is a separate explicit
+`pkg.kv` is implemented after `pkg.auth`; the planned domain order places `pkg.csv` next, with no
+accepted surface yet. Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -3964,7 +3964,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv — ACCEPTED DESIGN 2026-09-02; PREREQUISITES 1–2 IMPLEMENTED; PACKAGE PENDING** — one synchronous plaintext RESP2 client with an
+- **pkg.kv — IMPLEMENTED 2026-09-02** — one synchronous plaintext RESP2 client with an
   opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
   owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
   positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
@@ -3989,7 +3989,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   products use an explicit `std.process` dependency and existing keyed `ProcessAbort` before
   parsing, publication, or ownership change; every malformed private resource operation/Drop uses
   the same dependency before native I/O or untrusted pointer access. Its
-  implementation atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
+  implementation atomically activates one compiler-recognized fixed-symbol row for checked socket timeout
   installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
   live connection exclusively with no live reader/writer shell derived from it and no other value
   retaining one at entry, and no read/write/configuration/reader-or-writer construction/free/Drop
@@ -4009,8 +4009,8 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   quantization, deterministic resolver/transition owners, HTTP plain/TLS/pool/stream rearm evidence,
   and command pipe/post-EOF evidence. The second shared writer prerequisite is also implemented with
   checked SIGPIPE suppression, complete-write parity, non-owning socket-writer lifecycle, and direct
-  slice/builder/logger/`io.copy` closed-peer evidence. The package source and planned ABI row remain
-  inactive and are the next joint capability. Exact ledger and implementation closure matrix:
+  slice/builder/logger/`io.copy` closed-peer evidence. The package source and checked ABI row are
+  active together. Exact ledger and implementation closure matrix:
   `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.

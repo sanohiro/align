@@ -191,9 +191,10 @@ pub(super) enum UnkeyedRuntimeKey {
     TestFdCloexecV1 = 14,
     TestAckV1 = 15,
     TestReportV1 = 16,
+    TcpConnSetIoTimeout = 17,
 }
 
-pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 17] = [
+pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 18] = [
     UnkeyedRuntimeKey::ReportError,
     UnkeyedRuntimeKey::ArgsBuild,
     UnkeyedRuntimeKey::ArenaReset,
@@ -211,6 +212,7 @@ pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 17] = [
     UnkeyedRuntimeKey::TestFdCloexecV1,
     UnkeyedRuntimeKey::TestAckV1,
     UnkeyedRuntimeKey::TestReportV1,
+    UnkeyedRuntimeKey::TcpConnSetIoTimeout,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1994,12 +1996,12 @@ pub(super) fn validate_registry() -> Result<(), String> {
     if RuntimeKey::ALL.len() != 330 || keyed_runtime_abis().len() != 330 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 347 {
+    if runtime_abis().count() != 348 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(347);
+    let mut symbols = HashSet::with_capacity(348);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -2134,6 +2136,11 @@ pub(super) fn unkeyed_runtime_abi(key: UnkeyedRuntimeKey) -> RuntimeAbi {
             key: id,
             symbol: "align_rt_test_report_v1",
             shape: RuntimeAbiShape::A113,
+        },
+        UnkeyedRuntimeKey::TcpConnSetIoTimeout => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_tcp_conn_set_io_timeout",
+            shape: RuntimeAbiShape::A04,
         },
     }
 }
@@ -3644,21 +3651,21 @@ mod tests {
         assert_ord::<RuntimeAbiId>();
         assert_eq!(
             UNKEYED_RUNTIME_KEYS.map(|key| key as u8),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 347);
+        assert_eq!(rows.len(), 348);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            347
+            348
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            347
+            348
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3688,7 +3695,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 347);
+        assert_eq!(rows.len(), 348);
 
         for row in rows {
             let symbol = row.symbol;

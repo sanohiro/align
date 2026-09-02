@@ -11,12 +11,13 @@ surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
-raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, and `pkg.frame`, there
+raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, and
+`pkg.kv`, there
 are 330 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
-ordinary typed keys; they may no longer bypass the registry. Seventeen always-built
-runtime records have no `RuntimeKey` and instead use the seventeen-variant
+ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
+runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `UnkeyedRuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
@@ -24,9 +25,9 @@ runtime records have no `RuntimeKey` and instead use the seventeen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
-`core.test` child-control rows recorded below. The base native registry
-therefore has 347 records. Request 12 adds the keyed bounded-builder stack
-initializer and consuming status/out-slot finish; both reuse existing ABI shapes
+`core.test` child-control rows recorded below and the package-internal checked TCP timeout row
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 348 records. Request 12
+adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
 test/benchmark-only counter definitions. `par-map-probe` may expose four more:
@@ -36,10 +37,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 347 base records.
+The compiler-visible native registry is always exactly the 348 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 355.
+records extend only the verification-time maximum runtime-export table to 356.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -54,14 +55,13 @@ The raw HTTP receive-stream capability subsequently added six keyed rows for buf
 inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
 six keyed rows. The `core.test` child-control extension then added four unkeyed rows, and `std.log`
-added six keyed rows, `core.codec` then added eight, and `pkg.frame` added two. Their runtime
+added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, and `pkg.kv` added one
+source-reachable unkeyed row. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 330 keyed records, 347 base records, and 355 records in the maximum optional-probe export table.
-No probe category changed. The accepted `pkg.kv` design below reserves one source-reachable
-unkeyed identity that reuses an existing ABI shape; it is inactive and excluded from these shipped
-counts until implementation. Its two independently useful prerequisites first harden the shared
-TCP timeout substrate and existing TCP-derived writers without changing a symbol, key, shape,
-attribute, or count.
+are 330 keyed records, 348 base records, and 356 records in the maximum optional-probe export table.
+No probe category changed. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
+independently useful prerequisites first hardened the shared TCP timeout substrate and existing
+TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
 ## core.test child-control extension
 
@@ -107,11 +107,11 @@ harness returns. The independent driver codecs and the runtime codecs both pin t
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
 
-## `pkg.kv` TCP prerequisites and substrate (prerequisites 1 and 2 implemented 2026-09-02)
+## `pkg.kv` TCP capability and prerequisites (implemented 2026-09-02)
 
 The two independently useful prerequisites are implemented in the shipped shared timeout and
-TCP-writer substrates without changing an ABI identity. The planned checked package row remains
-inactive. For every usable address and positive `timeout_ns`,
+TCP-writer substrates without changing an ABI identity. The checked package row and its consumer
+are also implemented. For every usable address and positive `timeout_ns`,
 `align_rt_tcp_connect` records a monotonic start and positive `Duration` budget immediately before
 the first `F_GETFL`, then checks `F_GETFL` and `F_SETFL(flags | O_NONBLOCK)` before `connect`.
 Either failure records its fixed errno-mapped status, closes that candidate, and continues to the
@@ -153,7 +153,7 @@ attempted status and candidate close count. DNS and the sum across addresses hav
 deadline.
 
 The same prerequisite makes the shared positive-nanosecond socket-timeout conversion exact for
-`std.net`, `std.http`, and the planned checked package row:
+`std.net`, `std.http`, and the checked package row:
 `ceil(timeout_ns / 1000)` microseconds, split into normalized
 `timeval { tv_sec, tv_usec: 0..999999 }`; exact microseconds remain exact and zero retains the
 existing clear/no-timeout meaning.
@@ -194,9 +194,10 @@ direct slice overload, builder overload, `std.log`, and `io.copy`, plus file/sta
 partial/EINTR/timeout/zero-progress parity. In particular, the existing keyed
 `IoWriterWriteBuilder` identity keeps A19's
 `i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration and
-`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI. It remains in the same shipped
-330/347/355 keyed/base/maximum counts and delegates its borrowed builder bytes to the hardened
-`IoWriterWrite` row. The existing `TcpConnWriter`, `IoWriterWrite`, `IoWriterWriteBuilder`, and
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI. At that prerequisite boundary it
+remained in the then-shipped 330/347/355 keyed/base/maximum counts and delegated its borrowed
+builder bytes to the hardened `IoWriterWrite` row. The existing `TcpConnWriter`, `IoWriterWrite`,
+`IoWriterWriteBuilder`, and
 `IoWriterFree` identities, LLVM declarations, Rust exports, attributes, registry entries,
 fingerprints, and counts remain unchanged.
 
@@ -204,7 +205,7 @@ The direct runtime owners are `tcp_writer_complete_send_transition_matrix`,
 `tcp_writer_macos_nosigpipe_state_matrix`, `tcp_writer_generic_fd_parity_and_socket_lifecycle`, and
 `tcp_writer_closed_peer_routes_do_not_sigpipe`.
 
-After those prerequisites, the `pkg.kv` capability reserves exactly one package-internal,
+The implemented `pkg.kv` capability adds exactly one package-internal,
 source-reachable unkeyed row. It closes the checked-configuration failure domain that the existing
 public timeout setters cannot: those setters return Unit and discard `setsockopt` failure. The new
 row is a general TCP-connection operation rather than a RESP parser or package-specific helper:
@@ -259,15 +260,17 @@ zero-derived-shell entry preconditions, the exact normalized `timeval`, option o
 returned status, the
 `{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
 prohibition, zero overlapping/post-failure reader/writer-constructor calls, retirement, and later
-free/Drop. One parameterized structural owner derives its traversal from the canonical type-
-formation and recursive Drop graph; a storage-edge tripwire makes every future edge require
-classification. It crosses direct/buffered reader, direct writer, logger-owned writer, struct/
-tagged/sum/fixed-struct-array placement, active/inactive/moved-out state, target/other/mixed
-provenance, and zero/one/multiple target leaves, and separately pins the formation/no-live-producer
-edges above. It excludes every nonzero target count without invoking the unsafe row. For each
-positive carrier class, the success cycle configures at zero, constructs and moves the leaf into
-that carrier, moves it out where supported and drops it or recursively drops the smallest owning
-carrier, observes zero, and reconfigures. The package
+free/Drop. One source-derived parameterized owner traverses the canonical recursive `DropPlan` and
+matches every `DropPlan` node exhaustively, so a future cleanup-node variant requires
+classification. Fixed arrays of retaining structs add no `DropPlan` node, so a separate owner pins
+their `ty_is_move` and element-plan composition; source formation and no-live-producer negatives
+own the admitted and excluded storage edges. Together they cross direct/buffered reader, direct
+writer, logger-owned writer, struct/tagged/sum/fixed-struct-array placement,
+active/inactive/moved-out state, target/other/mixed provenance, and zero/one/multiple target leaves.
+They exclude every nonzero target count without invoking the unsafe row. For each positive carrier
+class, the success cycle configures at zero, constructs and moves the leaf into that carrier, moves
+it out where supported and drops it or recursively drops the smallest owning carrier, observes
+zero, and reconfigures. The package
 calls only on a fresh exclusively owned unpublished
 connection with both entry options clear and before shell construction; its owner
 closes after either option failure and proves that resolution is not reopened, no other address is
@@ -280,12 +283,11 @@ checked-HIR or MIR operation, call-spelling selector, or new ABI shape.
 
 At package implementation, the one new key, symbol, definition, collision reservation, typed
 registry row, runtime ABI fingerprint input, base/maximum export entry, and source-compatible extern
-reuse activate atomically. It increases the unkeyed/base/maximum counts by one and the keyed count
-by zero: the exact keyed/base/maximum counts become 330/348/356. It reuses an existing shape, so
-A123 remains the next unreserved shape. Until then it is not a runtime export or legal
-compatible-native definition. The unkeyed count becomes eighteen, thirteen of which are
-source-reachable. Both prerequisite hardenings have landed; the new row remains inactive and
-activates atomically only with its `pkg.kv` consumer.
+reuse activated atomically. It increased the unkeyed/base/maximum counts by one and the keyed count
+by zero: the exact current keyed/base/maximum counts are 330/348/356. It reuses an existing shape,
+so A123 remains the next unreserved shape. The current unkeyed count is eighteen, thirteen of which
+are source-reachable. Both prerequisite hardenings and the new row are active with the `pkg.kv`
+consumer.
 Exact public consumption, poisoning, and owner matrix: `pkg-design/kv.md`.
 
 ## Implemented std.log extension (2026-08-31)
@@ -604,7 +606,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A01 | `i32 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_str_eq`, `align_rt_str_starts_with`, `align_rt_str_ends_with`, `align_rt_str_cmp`, `align_rt_str_eq_ignore_case` |
 | A02 | `i32 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_contains` |
 | A03 | `i32 @SYM(ptr)` | `align_rt_io_writer_flush`, `align_rt_http_stream_finish` |
-| A04 | `i32 @SYM(ptr, i64)` | `align_rt_json_doc_kind`, `align_rt_fs_exists`, `align_rt_fs_remove`, `align_rt_child_kill` |
+| A04 | `i32 @SYM(ptr, i64)` | `align_rt_json_doc_kind`, `align_rt_fs_exists`, `align_rt_fs_remove`, `align_rt_child_kill`, `align_rt_tcp_conn_set_io_timeout` |
 | A05 | `i32 @SYM(ptr, i64, i32, ptr)` | `align_rt_json_decode_array`, `align_rt_json_decode_scalar` |
 | A06 | `i32 @SYM(ptr, i64, i64, i64, ptr)` | `align_rt_tcp_connect` |
 | A07 | `i32 @SYM(ptr, i64, i64, ptr)` | `align_rt_json_doc_key`, `align_rt_tcp_listen`, `align_rt_udp_bind`, `align_rt_compress_gzip_compress`, `align_rt_compress_zstd_compress`, `align_rt_http_serve`, `align_rt_http_serve_shared` |
@@ -747,6 +749,7 @@ Unkeyed native records:
 | PostgreSQL codec | `i64 @align_rt_f64_text_len(double) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
 | PostgreSQL codec | `i64 @align_rt_f32_text_write(float, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
 | PostgreSQL codec | `i64 @align_rt_f64_text_write(double, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| pkg.kv TCP configuration | `i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64)` | always linked; package-internal compatible extern; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_alloc_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_free_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | finder probe | `i64 @align_rt_str_finder_new_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
@@ -763,13 +766,13 @@ and attribute authorities with one typed `RuntimeAbi` row per identity:
 `{ key, symbol, return type, ordered parameter types, return attrs, parameter
 attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
 that row. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
-`Unkeyed(UnkeyedRuntimeKey)`. The seventeen base unkeyed records use the same
+`Unkeyed(UnkeyedRuntimeKey)`. The eighteen base unkeyed records use the same
 typed-row machinery; only `ReportError` and `ArgsBuild` have a dedicated Align main-wrapper
 declaration policy and yield typed wrapper handles when that wrapper requires
-them. The other fifteen yield no unconditional compiler handle. An exact
+them. The other sixteen yield no unconditional compiler handle. An exact
 compatible source extern may declare or reuse every non-test-control unkeyed row except
 `ArgsBuild` through the ordinary extern path. The four compiler-private
-`core.test` rows reject source reuse by policy. The remaining twelve unkeyed rows
+`core.test` rows reject source reuse by policy. The remaining thirteen unkeyed rows
 are source-reachable. `ArgsBuild`
 returns the native `{ptr, i64}` argv view, which no source-valid extern return
 can express: `str`/slice view returns are rejected, `raw` is not a valid
@@ -820,23 +823,23 @@ Tests compare:
 - all 330 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 347 base native symbols against default-feature `align_runtime` exports,
+- the 348 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 351 `alloc-count` and 351 `par-map-probe` native symbols against
+- the 352 `alloc-count` and 352 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 355 maximum native symbols against `align_runtime` built with
+- the 356 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 347 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  347 exact registry function types through the production compatibility
+- all 348 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  348 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
-  ordinal; source-valid compatible reuse for a keyed builtin and the twelve
+  ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
   source-valid `layout(C) { u64, i64 }` aggregate mismatch; and
   compatible reuse representatives for each of the five checked-in attribute

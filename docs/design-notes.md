@@ -1469,8 +1469,8 @@ existing `std.net`/`std.http`; the same poll conversion and start/budget rule cl
 positive-i64 range for `process.command` without changing its timeout-wins checkpoint order. It is
 not package-local policy or a claim that kernel scheduling supplies a strict wall-clock return.
 
-RESP framing and validation remain ordinary package source. The only planned runtime addition is
-one generic package-internal row for checked receive/send timeout installation. A non-null
+RESP framing and validation remain ordinary package source. The only runtime addition is the
+now-active generic package-internal row for checked receive/send timeout installation. A non-null
 compatible caller must hold one live/unfreed connection exclusively with no live reader/writer shell
 derived from it and no other value retaining one at entry, and no read/write/configure/
 reader-or-writer construction/free/Drop overlap. From entry `{R0,S0}`, receive failure retains both
@@ -1499,14 +1499,14 @@ their synchronous write. No reply or scratch view escapes, and the configured re
 the only value-sized receive allocation. Empty owned results use canonical `{null, 0}` without a
 final buffer; nonempty results allocate one. V1 deliberately stays on plaintext RESP2 with no protocol
 negotiation or TLS. The exact accepted contract, byte grammar, error precedence, runtime
-reservation, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
+ABI delta, and implementation closure matrix are in `impl/pkg-design/kv.md`. Its first independent
 review reopened the timeout/native/cache axes, and the fresh complete review found four remaining
 raw-view, source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found
 two P3 consistency gaps in the timeout action lists and malformed-state error partition; the
 following review found one remaining P2 in the pre-existing-derived-shell entry state, and its
 repair review found one P3 in the recursively reachable reader/writer/logger carrier owner graph.
-A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation remains
-pending in the recorded prerequisite order.
+A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation then
+followed the recorded prerequisite order and activated the package and checked timeout row together.
 
 ## Why tests are Result blocks run in separate processes
 

@@ -35,7 +35,7 @@ PROJECT="$WORK_ROOT/project"
 WARM_ROOT="$WORK_ROOT/writable"
 mkdir -p "$PROJECT/pkg"
 
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg; do
+for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
 done
 
@@ -53,6 +53,7 @@ import pkg.web.cors
 import pkg.web.multipart
 import pkg.frame
 import pkg.auth
+import pkg.kv
 
 fn main() -> i32 = 0
 ALIGN

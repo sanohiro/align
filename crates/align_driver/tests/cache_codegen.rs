@@ -67,7 +67,11 @@ impl Project {
         proj
     }
     fn write(&self, name: &str, src: &str) {
-        std::fs::write(self.dir.join(name), src).expect("write source");
+        let path = self.dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create source parent");
+        }
+        std::fs::write(path, src).expect("write source");
     }
     fn entry_path(&self) -> PathBuf {
         self.dir.join(&self.entry)
@@ -171,6 +175,110 @@ impl Emitted {
 
 fn no_exports() -> Vec<String> {
     Vec::new()
+}
+
+fn pkg_kv_codegen_sources() -> (String, String) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("apps")
+        .join("kv")
+        .join("pkg")
+        .join("kv");
+    let package =
+        std::fs::read_to_string(root.with_extension("align")).expect("read pkg.kv source");
+    let resource = std::fs::read_to_string(root.join("internal").join("resource.align"))
+        .expect("read pkg.kv resource source");
+    (package, resource)
+}
+
+#[test]
+fn pkg_kv_nested_source_codegen_cache_scope_is_exact() {
+    if !backend() {
+        return;
+    }
+    let (package, resource) = pkg_kv_codegen_sources();
+    let main = "import pkg.kv\n\nfn main() -> i32 = 0\n";
+    let project = Project::new(
+        "pkg-kv-nested-source",
+        &[
+            ("pkg/kv.align", &package),
+            ("pkg/kv/internal/resource.align", &resource),
+            ("main.align", main),
+        ],
+        "main.align",
+    );
+    let cache = project.cache();
+    let emit = |project: &Project| {
+        emit_all(
+            project,
+            &cache,
+            Profile::Release,
+            BuildTarget::Baseline,
+            &no_exports(),
+            false,
+        )
+    };
+
+    let cold = emit(&project);
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+    assert!(
+        emit(&project).all_hit(),
+        "an unchanged pkg.kv graph must hit"
+    );
+
+    project.write(
+        "pkg/kv/internal/resource.align",
+        &format!("// cache comment probe\n{resource}"),
+    );
+    assert!(
+        emit(&project).all_hit(),
+        "a comment-only source edit retains every structural object"
+    );
+    project.write("pkg/kv/internal/resource.align", &resource);
+    assert!(emit(&project).all_hit(), "an exact comment revert must hit");
+
+    let private_resource = resource.replace(
+        "MAX_RESPONSE_BYTES: i64 := 536870912",
+        "MAX_RESPONSE_BYTES: i64 := 536870911",
+    );
+    assert_ne!(private_resource, resource);
+    project.write("pkg/kv/internal/resource.align", &private_resource);
+    let internal_edit = emit(&project);
+    assert!(!internal_edit.outcome("pkg.kv.internal.resource").hit);
+    assert!(internal_edit.outcome("pkg.kv").hit);
+    assert!(internal_edit.outcome("main").hit);
+    project.write("pkg/kv/internal/resource.align", &resource);
+    assert!(
+        emit(&project).all_hit(),
+        "an exact internal revert must hit"
+    );
+
+    let private_package = package.replace(
+        "READ_CHUNK_BYTES: i64 := 32768",
+        "READ_CHUNK_BYTES: i64 := 16384",
+    );
+    assert_ne!(private_package, package);
+    project.write("pkg/kv.align", &private_package);
+    let root_edit = emit(&project);
+    assert!(root_edit.outcome("pkg.kv.internal.resource").hit);
+    assert!(!root_edit.outcome("pkg.kv").hit);
+    assert!(root_edit.outcome("main").hit);
+    project.write("pkg/kv.align", &package);
+    assert!(emit(&project).all_hit(), "an exact root revert must hit");
+
+    let public_package = package.replace(
+        "  max_response_bytes: i64,\n}",
+        "  max_response_bytes: i64,\n  cache_identity_probe: i64,\n}",
+    );
+    assert_ne!(public_package, package);
+    project.write("pkg/kv.align", &public_package);
+    let public_edit = emit(&project);
+    assert!(public_edit.outcome("pkg.kv.internal.resource").hit);
+    assert!(!public_edit.outcome("pkg.kv").hit);
+    assert!(!public_edit.outcome("main").hit);
+    project.write("pkg/kv.align", &package);
+    assert!(emit(&project).all_hit(), "an exact public revert must hit");
 }
 
 // ---- Gate 1: no-op rebuild → all hit ------------------------------------------------------------

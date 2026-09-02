@@ -14,8 +14,8 @@ implementation merged in PR #916. Its retained-temporary repair merged in PR #92
 owner-test closure against the accepted ledger. `std.log` is
 implemented against `docs/impl/std-design/log.md`; `core.codec` is implemented against
 `docs/impl/core-design/codec.md`; `pkg.frame` is implemented against
-`docs/impl/pkg-design/frame.md`; and `pkg.auth` is implemented against
-`docs/impl/pkg-design/auth.md`. The exact accepted `pkg.kv` public-contract design is recorded in
+`docs/impl/pkg-design/frame.md`; `pkg.auth` is implemented against
+`docs/impl/pkg-design/auth.md`; and `pkg.kv` is implemented against the exact accepted contract in
 `docs/impl/pkg-design/kv.md`. Its first independent review reopened the shared
 timeout/native/cache axes; the first fresh review then found four remaining raw-view,
 source-reachable-lifecycle, resolver, and RESP-grammar gaps. The next complete review found two P3
@@ -23,8 +23,8 @@ consistency gaps in the timeout action lists and malformed-state error partition
 review found one P2 in the pre-existing-derived-shell entry state; its repair review found one P3 in
 the recursively reachable reader/writer/logger carrier owner graph. A fresh full review accepted the
 fifth ledger-first repair with no P0–P3 finding. Both independently useful shared prerequisites—the
-timeout substrate and generic TCP-writer/SIGPIPE hardening—are implemented; the package row and
-source are next and remain inactive until their joint capability boundary.
+timeout substrate and generic TCP-writer/SIGPIPE hardening—and the package source and checked row
+are implemented and active at their joint capability boundary.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -354,9 +354,9 @@ facts must live in this repository.
 - **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
   in-language test runner, bounded data/protocol library wave (`core.codec`,
   `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` has an exact accepted design and
-  remains the next language capability. Its shared timeout and generic TCP-writer/SIGPIPE
-  prerequisites are implemented; the package source and checked-timeout row are next.
+  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` was implemented after that
+  checkpoint; its shared timeout and generic TCP-writer/SIGPIPE prerequisites, package source, and
+  checked-timeout row are active together.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
@@ -405,25 +405,18 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `pkg.auth` is implemented against
-  `docs/impl/pkg-design/auth.md`. It replaces `pkg.jwt` outright with bounded HS256 encode/verify,
-  canonical bounded Argon2id PHC hash/verify, and one 256-bit session token over shipped JSON,
-  crypto, and encoding. The owner set closes strict JSON, authentication/error precedence,
-  independent JWT/Argon2 vectors, exact bounds and PHC grammar, owned results, Impure effects,
-  whole/per-unit execution, public-surface identity, and module-wide libcrypto retention without a
-  new compiler/runtime ABI or ambient clock/provider/key/session owner.
-- **Latest runtime capability:** the second `pkg.kv` prerequisite is implemented against
-  `docs/impl/pkg-design/kv.md`. The existing connection-derived writer now keeps complete
-  partial-write/EINTR/timeout/zero-progress behavior while Linux sends with `MSG_NOSIGNAL` and
-  macOS/BSD performs checked, retryable `SO_NOSIGPIPE` installation before a shell's first send.
-  Slice, builder, logger, and `io.copy` routes share that hardened sink; connection-derived writer
-  Drop remains non-owning, and file/standard-stream paths remain unchanged. No public signature,
-  compiler operation, runtime symbol, ABI shape, registry key, or count changed.
-- **Next language capability:** implement the accepted `pkg.kv` package capability and atomically
-  activate its planned checked `TcpConnSetIoTimeout` row. The exact source, ownership, RESP,
-  poisoning, native-status, ABI, and acceptance closure is fixed in
-  `docs/impl/pkg-design/kv.md`. The package source and row remain inactive until that joint
-  capability boundary; TLS and the wider Redis surface remain deferred.
+- **Latest language capability:** `pkg.kv` is implemented against
+  `docs/impl/pkg-design/kv.md` as one synchronous plaintext RESP2 client with an opaque Move owner,
+  explicit connect/I/O timeouts and response cap, owned-string GET, conditional/expiring SET, and
+  one-key DEL. The vendorable subtree contains root `pkg.kv` and
+  `pkg.kv.internal.resource`; TLS and the wider Redis surface remain deferred.
+- **Latest runtime capability:** `pkg.kv` activates the checked, package-internal
+  `TcpConnSetIoTimeout` row after its two shared prerequisites. The exact current inventory is 330
+  keyed plus 18 unkeyed records, 13 of those unkeyed records source-reachable: 348 base exports,
+  352 with either four-row probe feature alone, and 356 at the maximum combined probe surface.
+  A123 remains the next unreserved ABI shape.
+- **Next language capability:** no next domain surface is accepted yet. The planned order places
+  `pkg.csv` after the implemented `pkg.kv`; any public contract still goes through its design gate.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

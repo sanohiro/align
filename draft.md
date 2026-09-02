@@ -3538,7 +3538,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The implemented first-party packages in this repository are exactly four vendorable subtrees:
+The implemented first-party packages in this repository are exactly five vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3548,10 +3548,11 @@ pkg.db.postgres    // driver submodule
 pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
+pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 ```
 
-`pkg.kv` has an accepted synchronous RESP2 GET/SET/DEL design, listed below separately. It has no
-vendorable source subtree until implementation ships.
+`pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
+`pkg.kv.internal.resource`.
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
 versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
@@ -3655,7 +3656,8 @@ The exact contract and implementation closure matrix are
 `docs/impl/pkg-design/auth.md`. `pkg.auth` replaced the former `pkg.jwt` prototype outright; no
 compatibility alias is retained.
 
-The accepted `pkg.kv` v1 design fixes one synchronous plaintext RESP2 text-value client. Its
+The implemented `pkg.kv` v1 follows its accepted design as one synchronous plaintext RESP2
+text-value client. Its
 exact public types and signatures are:
 
 ```text
@@ -3741,8 +3743,7 @@ frontend/objects hit; a semantic no-op may re-hit its structural object.
 V1 sends no PING, AUTH, SELECT, or HELLO and provides no TLS, RESP3 negotiation, generic command or
 reply value, pipeline, reconnect, redirect, replay, or hidden retry. It relies on the server's
 default RESP2 mode. Ordinary package source owns framing and parsing; no language builtin or
-checked-HIR/MIR operation is added. One package-internal runtime row remains planned and inactive
-until the package capability is implemented:
+checked-HIR/MIR operation is added. One package-internal, source-reachable runtime row is active:
 `align_rt_tcp_conn_set_io_timeout: i32(ptr, i64)` installs both socket I/O timeouts and reuses ABI
 shape A04. It returns `AL_INVALID` for null then out-of-range
 input before fd access. Every non-null compatible caller supplies one live, unfreed, exclusively
@@ -3769,19 +3770,19 @@ hardens the existing connection-derived `writer` in place: its unchanged write r
 uses `MSG_NOSIGNAL` or checked `SO_NOSIGPIPE`; both slice and builder overloads reach that path,
 while file and standard-stream writers keep their existing path. No writer ABI identity or count
 changes. The timeout substrate and writer hardening are separate prerequisite capabilities; the
-new row lands with its package consumer. The revised
+new row landed with its package consumer. The revised
 accepted ledger, ownership/cleanup rules, wire goldens, error precedence, and closure matrix are
 `docs/impl/pkg-design/kv.md`; its first independent review found contract gaps and a fresh complete
 review found four remaining native/wire boundary gaps. The next complete review found two P3
 consistency gaps in the timeout action lists and malformed-state error partition. The following
 review found one remaining P2 in the pre-existing-derived-shell entry state, and its repair review
 found one P3 in the recursively reachable reader/writer/logger carrier owner graph. A fresh complete
-review accepted the fifth repair with no P0–P3 finding; implementation remains pending.
+review accepted the fifth repair with no P0–P3 finding; implementation then shipped the accepted
+package source and runtime row together.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
-vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship. An
-accepted but unimplemented package such as `pkg.kv` joins that set only when its source ships.
-First-party packages are
+vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship.
+A proposed package joins that set only when its source ships. First-party packages are
 ordinary pkg-layer code, never ambiently resolvable: a consumer copies `pkg/web/` into their project
 exactly as they would a third-party dependency.
 

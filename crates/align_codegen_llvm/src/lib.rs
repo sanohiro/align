@@ -23704,6 +23704,26 @@ fn main() -> i32 = 0
             1,
         );
 
+        let tcp_timeout = ir(
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64) -> i32\n\
+             fn main() -> i32 = 0\n",
+        );
+        assert_eq!(
+            tcp_timeout
+                .lines()
+                .filter(|line| {
+                    line.starts_with("declare ")
+                        && line.contains("@align_rt_tcp_conn_set_io_timeout(")
+                })
+                .count(),
+            1,
+        );
+        let without_tcp_timeout = ir("fn main() -> i32 = 0\n");
+        assert!(
+            !without_tcp_timeout.contains("@align_rt_tcp_conn_set_io_timeout("),
+            "the package-internal row must not become reachable without a source declaration"
+        );
+
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let ext = |name: &str, params: Vec<Ty>, ret: Ty| align_mir::ProgramExtern {
@@ -23752,6 +23772,56 @@ fn main() -> i32 = 0
         assert_eq!(
             error.to_string(),
             "lowering failed: native extern ABI mismatch:616c69676e5f72745f7072696e745f693634"
+        );
+
+        for declaration in [
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout() -> i32\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw) -> i32\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64, extra: i32) -> i32\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: i64, timeout_ns: i64) -> i32\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i32) -> i32\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64) -> i64\n",
+            "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64)\n",
+        ] {
+            let program = mir(&format!("{declaration}fn main() -> i32 = 0\n"));
+            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("an incompatible timeout extern must fail before declaration emission");
+            assert_eq!(
+                error.to_string(),
+                "lowering failed: native extern ABI mismatch:616c69676e5f72745f7463705f636f6e6e5f7365745f696f5f74696d656f7574"
+            );
+        }
+
+        let collision = mir(
+            "fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64) -> i32 = 7\n\
+             fn main() -> i32 = 0\n",
+        );
+        let collision_ir = match emit_llvm_ir(
+            &collision,
+            &BuildTarget::Baseline,
+            false,
+            &[],
+            None,
+        ) {
+            Ok(ir) => ir,
+            Err(error) => panic!("a non-exported source collision must remain internal: {error}"),
+        };
+        let program_symbol =
+            encoded_program_symbol(&program_call("align_rt_tcp_conn_set_io_timeout"));
+        assert!(collision_ir.lines().any(|line| {
+            line.starts_with("define internal i32 ") && line.contains(&program_symbol)
+        }));
+        let collision = emit_llvm_ir(
+            &collision,
+            &BuildTarget::Baseline,
+            false,
+            &["align_rt_tcp_conn_set_io_timeout".to_owned()],
+            None,
+        )
+        .expect_err("an explicit export cannot claim the timeout row's fixed native identity");
+        assert_eq!(
+            collision.to_string(),
+            "lowering failed: callable external identity collision:616c69676e5f72745f7463705f636f6e6e5f7365745f696f5f74696d656f7574"
         );
     }
 

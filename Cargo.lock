@@ -57,6 +57,7 @@ dependencies = [
  "align_lexer",
  "align_mir",
  "align_parser",
+ "align_runtime",
  "align_sema",
  "align_span",
  "align_watch",

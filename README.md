@@ -111,7 +111,7 @@ Prefer drills? **[The Little Aligner](docs/little-aligner/README.md)** ([Japanes
 - `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs
-- `apps/` — first-party package workspaces, including `pkg.web` and `pkg.auth`
+- `apps/` — first-party package workspaces, including `pkg.web`, `pkg.auth`, and `pkg.kv`
 - `editors/` — Vim / Emacs / VS Code support (syntax, snippets)
 - `crates/` — the `alignc` compiler workspace
 

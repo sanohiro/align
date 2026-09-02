@@ -11,6 +11,23 @@ use common::*;
 use align_interface::IType;
 
 #[test]
+fn non_generic_nominal_types_reject_type_arguments() {
+    for (name, declaration, annotation) in [
+        ("struct", "Point { x: i32 }", "Point<i32>"),
+        ("sum", "Choice { Yes No }", "Choice<i32>"),
+    ] {
+        let source = format!(
+            "{declaration}\nfn invalid(value: {annotation}) -> i32 = 0\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(&format!("non-generic-{name}-arguments"), &source);
+        assert!(
+            diagnostics.contains("takes no type arguments"),
+            "non-generic {name} must reject a generic alias:\n{diagnostics}",
+        );
+    }
+}
+
+#[test]
 fn identity_and_pick() {
     if !backend_available() {
         return;
