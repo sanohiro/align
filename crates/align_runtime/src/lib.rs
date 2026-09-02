@@ -15916,15 +15916,17 @@ unsafe extern "C" {
     #[cfg(target_os = "linux")]
     fn accept4(sockfd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i32;
     // `fcntl` — the non-Linux `FD_CLOEXEC` fallback (platforms without an atomic CLOEXEC-at-creation
-    // variant) AND the `O_NONBLOCK` `F_GETFL`/`F_SETFL` toggle used on every platform by the
-    // `command.run()` capture drain (`set_nonblocking`). Variadic in C; keep the declaration
-    // variadic so the call uses the platform's actual ABI for the optional third argument.
+    // variant) AND the `O_NONBLOCK` `F_GETFL`/`F_SETFL` queries/toggles used on every platform by
+    // timeout-aware TCP connects (`tcp_set_nonblocking`) and command capture drains
+    // (`set_capture_nonblocking`). Variadic in C; keep the declaration variadic so the call uses the
+    // platform's actual ABI for the optional third argument.
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
-/// `fcntl` file-status-flag commands (`F_GETFL`/`F_SETFL`) + the `O_NONBLOCK`/`O_CLOEXEC` bits used by
-/// the `command.run()` capture pipes. `F_GETFL`/`F_SETFL` are `3`/`4` on Linux and macOS/BSD alike; the
-/// `O_*` bit values differ per platform (octal on Linux, distinct hex on macOS/BSD).
+/// `fcntl` file-status-flag commands (`F_GETFL`/`F_SETFL`) plus the bits used by timeout-aware TCP
+/// connects and command capture pipes. `O_NONBLOCK` is shared; `O_CLOEXEC` is capture-only.
+/// `F_GETFL`/`F_SETFL` are `3`/`4` on Linux and macOS/BSD alike; the `O_*` bit values differ per
+/// platform (octal on Linux, distinct hex on macOS/BSD).
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 #[cfg(target_os = "linux")]
@@ -40554,6 +40556,11 @@ event: first\nevent:\ndata: x\n\n";
         assert_eq!(armed.len(), 4, "TLS handshake and request each arm receive/send");
         let tls_fd = assert_pair(&armed[..2], 5_000_000_001, 5, 1, None);
         assert_pair(&armed[2..], 5_000_000_001, 5, 1, Some(tls_fd));
+        unsafe { align_rt_http_client_timeout(client, 7_000_000_001) };
+        begin_http_timeout_trace();
+        perform("pooled TLS positive", client, &url);
+        let rearmed = finish_http_timeout_trace();
+        assert_pair(&rearmed, 7_000_000_001, 7, 1, Some(tls_fd));
         unsafe { align_rt_http_client_timeout(client, 0) };
         begin_http_timeout_trace();
         perform("pooled TLS zero", client, &url);
