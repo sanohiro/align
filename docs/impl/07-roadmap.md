@@ -3964,7 +3964,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv — ACCEPTED DESIGN 2026-09-02; PREREQUISITE 1 IMPLEMENTED; PACKAGE PENDING** — one synchronous plaintext RESP2 client with an
+- **pkg.kv — ACCEPTED DESIGN 2026-09-02; PREREQUISITES 1–2 IMPLEMENTED; PACKAGE PENDING** — one synchronous plaintext RESP2 client with an
   opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
   owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
   positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
@@ -3981,7 +3981,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   transitions, ceil/rechecked connect waits, named EAI mapping before resolver-order
   first-success/last-failure selection,
   shared `std.net`/`std.http` positive-I/O-ns ceil-to-microsecond conversion, and the same
-  poll conversion for `process.command`. A second prerequisite hardens the existing
+  poll conversion for `process.command`. The implemented second prerequisite hardens the existing
   connection-derived writer in place for
   SIGPIPE-safe complete writes and explicit fail/retry/overlap/transitive-route owners, with no
   ABI/count change, including the existing builder overload. Package source owns RESP and exact
@@ -4007,8 +4007,11 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   the fifth repair with no P0–P3 finding. The first shared timeout-substrate prerequisite is now
   implemented with checked mode transitions, complete-range monotonic budgets, exact ceil
   quantization, deterministic resolver/transition owners, HTTP plain/TLS/pool/stream rearm evidence,
-  and command pipe/post-EOF evidence. Prerequisite 2, package source, and the planned ABI row remain
-  inactive. Exact ledger and implementation closure matrix: `pkg-design/kv.md`.
+  and command pipe/post-EOF evidence. The second shared writer prerequisite is also implemented with
+  checked SIGPIPE suppression, complete-write parity, non-owning socket-writer lifecycle, and direct
+  slice/builder/logger/`io.copy` closed-peer evidence. The package source and planned ABI row remain
+  inactive and are the next joint capability. Exact ledger and implementation closure matrix:
+  `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.
 - **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to

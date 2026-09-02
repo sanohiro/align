@@ -233,7 +233,7 @@ configured blocking wait 後に `Err(Timeout)` を返す。
 
 > **ステータス:** 最初の independently useful prerequisite として implemented。public signature、
 > compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。planned checked
-> package row と prerequisite 2 は inactive のまま。
+> package row は package implementation まで inactive のまま。
 
 各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
 monotonic start と positive `Duration` budget を記録し、次に `F_GETFL` と
@@ -323,10 +323,11 @@ end-to-end timeout と command cleanup/precedence owner を組み合わせる。
 
 ---
 
-## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — IMPLEMENTED 2026-09-02)
 
-> **ステータス:** independently useful な safety prerequisite。accepted design、implementation pending。
-> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+> **ステータス:** 第二の independently useful な safety prerequisite として implemented。public signature、
+> compiler operation、runtime symbol、ABI shape、registry key、row count は変更なし。package source と
+> planned checked-timeout row は joint capability boundary まで inactive。
 
 既存の `c.writer() -> writer` が唯一の TCP byte-write surface のまま。private runtime `Writer` state に
 sink kind と macOS/BSD readiness bit を加え、`align_rt_tcp_conn_writer` だけが socket/not-ready に設定。
@@ -361,7 +362,11 @@ success/failure order、option clear 無しの shell Drop、setting を破棄す
 Linux/macOS の subprocess closed-peer test は direct slice/builder overload、logger、`io.copy` route を覆い、SIGPIPE で終了せず
 必ず `Error` を返す。direct partial/EINTR/timeout/zero-progress test と file/std writer parity は別個の owner のまま。
 
-checked timeout substrate は着地済みで、writer hardening が 2 番目の prerequisite。その後、planned
-`TcpConnSetIoTimeout` row とその `pkg.kv` package consumer を同時に activate する。exact package consumption と
-implementation boundary は `../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
+出荷済みの direct owner は `tcp_writer_complete_send_transition_matrix`、
+`tcp_writer_macos_nosigpipe_state_matrix`、`tcp_writer_generic_fd_parity_and_socket_lifecycle`、
+`tcp_writer_closed_peer_routes_do_not_sigpipe`。
+
+両 prerequisite は着地済み。planned `TcpConnSetIoTimeout` row とその `pkg.kv` package consumer は
+次の capability で同時に activate する。exact package consumption と implementation boundary は
+`../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
 `../20-runtime-abi-ledger.md` に記録する。

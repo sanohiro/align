@@ -2,8 +2,8 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/kv.md`.
 >
-> **Status:** accepted design; prerequisite 1 implemented 2026-09-02. Prerequisite 2, the package
-> source, and the planned runtime row remain inactive until their recorded capability boundaries.
+> **Status:** accepted design; prerequisites 1 and 2 implemented 2026-09-02. The package source and
+> planned runtime row remain inactive until their recorded joint capability boundary.
 
 ## Authoritative public-contract ledger
 
@@ -270,9 +270,9 @@ and Drop cannot report a later close failure.
 The writer prerequisite directly owns macOS/BSD failed-install/no-send followed by retry and
 success, two overlapping shells with success/failure in both orders, shell Drop without option
 clear, and connection close discarding the setting. Linux/macOS subprocess owners cover direct
-writer, logger, and `io.copy` routes to a closed peer and require a returned `Error` rather than
-signal termination. File/standard-stream parity and partial/EINTR/timeout/zero-progress owners
-remain independent of those state-transition tests.
+slice and builder writer overloads, logger, and `io.copy` routes to a closed peer and require a
+returned `Error` rather than signal termination. File/standard-stream parity and
+partial/EINTR/timeout/zero-progress owners remain independent of those state-transition tests.
 
 ## Ownership, allocation, state, and cleanup
 
@@ -523,9 +523,14 @@ shared connect/I/O quantization for the already-shipped `std.http` and `std.net`
 changing an ABI identity. This prerequisite may exceed roughly 1,000 changed hand-written lines
 once its deterministic resolver, transition, process, and HTTP consumer owners are included; one
 boundary avoids duplicating the shared quantization proof and prevents separately landed consumers
-from drifting across incompatible timeout rules. The generic TCP-writer hardening is a second
-independently useful prerequisite with a closed signal-safety failure domain and likewise no public signature or ABI
-identity change. The remaining new timeout row plus client/resource/parser/three commands form one
+from drifting across incompatible timeout rules. The generic TCP-writer hardening has landed as the
+second independently useful prerequisite with a closed signal-safety failure domain and likewise no
+public signature or ABI identity change. It may exceed roughly 1,000 changed hand-written lines once
+raw-syscall classification, both platform state machines, transitive-route subprocess owners, the
+macOS execution owner, and synchronized status mirrors are counted. Keeping them in one boundary
+avoids a dormant sink policy and duplicate signal-safety proof across strict producer/consumer
+halves. The remaining new timeout row plus
+client/resource/parser/three commands form one
 strict producer-to-consumer chain. A dormant row, parser-only, or connection-only package PR would
 leave no stable public consumer, while splitting commands would repeat the same synchronization,
 poisoning, fake-server, capability, and Drop proof. The package capability may exceed roughly 1,000
@@ -558,8 +563,8 @@ writer-surface change reopens this design.
 The fresh full review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 accepted this contract with no P0–P3 finding. `docs/open-questions.md` records it as Settled and
-`docs/history.md` records the decision. Implementation is authorized only in the prerequisite order
-below; every unimplemented prerequisite and runtime row remains inactive.
+`docs/history.md` records the decision. Implementation follows the prerequisite order below; the
+remaining runtime row stays inactive until its joint package boundary.
 
 After the fifth finding-ledger repair, the fifth author-side ledger-to-prose and closure-matrix
 consistency pass completed on 2026-09-02 before another fresh complete review:
@@ -671,8 +676,8 @@ returned one P3 finding. This fifth repair reopens the recursive-derived-shell-c
 This finding closes the missing recursively reachable half of the same source-reachable
 dangling-shell class. A fresh full review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
-returned CLEAN with no P0–P3 finding. This exact contract is accepted; the shared timeout
-prerequisite is implemented, while writer hardening and package implementation remain pending in
+returned CLEAN with no P0–P3 finding. This exact contract is accepted; the shared timeout and generic
+writer-hardening prerequisites are implemented, while package implementation remains pending in
 the recorded order.
 
 The acceptance-status audit then found one P3 summary-only conflation: it joined impossible native

@@ -4,8 +4,8 @@
 >
 > **注意:** 英語版 (`../kv.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** accepted design。prerequisite 1 は 2026-09-02 に implemented。prerequisite 2、
-> package source、planned runtime row は記録済み capability boundary まで inactive。
+> **ステータス:** accepted design。prerequisite 1 と 2 は 2026-09-02 に implemented。package source と
+> planned runtime row は記録済みの joint capability boundary まで inactive。
 
 ## 公開契約台帳
 
@@ -252,9 +252,9 @@ Drop は後の close failure を報告できない。
 
 writer prerequisite は、macOS/BSD の failed-install/no-send から retry/success、2 個の overlapping shell
 について両順序の success/failure、option clear を伴わない shell Drop、setting を破棄する connection
-close を直接 own する。Linux/macOS subprocess owner は closed peer に対する direct writer、logger、
-`io.copy` route を覆い、signal termination でなく返却された `Error` を要求する。file/standard-stream
-parity と partial/EINTR/timeout/zero-progress owner は、これら state-transition test と独立に保つ。
+close を直接 own する。Linux/macOS subprocess owner は closed peer に対する direct slice/builder
+writer overload、logger、`io.copy` route を覆い、signal termination でなく返却された `Error` を要求する。
+file/standard-stream parity と partial/EINTR/timeout/zero-progress owner は、これら state-transition test と独立に保つ。
 
 ## ownership・allocation・state・cleanup
 
@@ -478,8 +478,11 @@ deadline を enforceable にし、nonblocking connection の公開を防ぎ、AB
 transition、process、HTTP consumer owner を含めると、この prerequisite もおよそ 1,000 changed
 hand-written lines を超え得る。shared quantization proof の重複を避け、別々に land した consumer が
 互換性のない timeout rule へ drift するのを防ぐため、1 boundary とする。generic TCP-writer
-hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite で、
-同様に public signature/ABI identity を変更しない。残る新 timeout row と
+hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite として着地済みで、
+同様に public signature/ABI identity を変更しない。raw-syscall classification、両 platform state
+machine、transitive-route subprocess owner、macOS execution owner、同期 status mirror を数えると、
+およそ 1,000 changed hand-written lines を超え得る。strict producer/consumer half に分けて dormant
+sink policy と signal-safety proof の重複を作らないため、1 boundary とする。残る新 timeout row と
 client/resource/parser/3 command は 1 本の strict producer-to-consumer chain。dormant row、parser-only、
 connection-only package PR は stable public consumer を残さず、command 分割は同じ
 synchronization/poisoning/fake-server/capability/Drop proof を重複させる。adversarial owner matrix を含め
@@ -511,8 +514,8 @@ exact 1-row reservation を越える ABI change、または public writer-surfac
 exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 の fresh full review は P0–P3 finding なしでこの contract を accept した。`docs/open-questions.md` は
-Settled として記録し、`docs/history.md` は decision を記録する。implementation は下記 prerequisite order
-でのみ許可し、未実装 prerequisite と runtime row はすべて inactive のまま。
+Settled として記録し、`docs/history.md` は decision を記録する。implementation は下記 prerequisite order に
+従い、残る runtime row は joint package boundary まで inactive のまま。
 
 5 回目の finding-ledger repair 後、5 回目の author-side ledger-to-prose および closure-matrix consistency
 pass は、another fresh complete review 前の 2026-09-02 に完了:
@@ -617,7 +620,7 @@ fresh full review
 exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
 の fresh full review は P0–P3 finding なしで CLEAN を返した。この exact contract は accepted で、shared
-timeout prerequisite は implemented、writer hardening と package implementation は記録済み order のまま pending。
+timeout と generic writer-hardening prerequisite は implemented、package implementation は記録済み order のまま pending。
 
 その後の acceptance-status audit は summary-only conflation の P3 1 件を返した。impossible native product と
 malformed private record を pre-I/O guarantee 1 個にまとめていた。修正は public-contract ledger row と safety

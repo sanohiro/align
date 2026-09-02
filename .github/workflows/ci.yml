@@ -489,6 +489,12 @@ jobs:
           scripts/run-quiet.sh "CI build: workspace" --
           scripts/cargo.sh build --workspace --locked
 
+      - name: TCP writer SIGPIPE regressions (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          scripts/run-quiet.sh "CI test: TCP writer SIGPIPE" --
+          scripts/cargo.sh test -p align_runtime --lib --locked tcp_writer_
+
       - name: Owned-JSON boundary regressions (macOS)
         if: runner.os == 'macOS'
         run: >
