@@ -1053,11 +1053,11 @@ effective-timeout resolution (request override else client default) happens in `
   exactly as before — so `ns == 0` is byte-identical, no spin). The handshake (`SSL_connect`) runs over
   the same armed fd and maps the identical condition to `AL_TIMEOUT`.
 
-### Checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+### Checked shared-timeout prerequisite (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **Status:** accepted design; inactive until implementation. The shipped timeout surface and ABI
-> above remain unchanged; this prerequisite changes no public signature, compiler operation,
-> runtime symbol, ABI shape, registry key, or row count.
+> **Status:** implemented. The shipped timeout surface and ABI remain unchanged; this prerequisite
+> changes no public signature, compiler operation, runtime symbol, ABI shape, registry key, or row
+> count. The planned checked package row remains inactive.
 
 HTTP connect inherits the checked net-rail transition recorded in `net.md`. For each usable
 resolver address and positive effective timeout, the runtime records a monotonic start and positive
@@ -1087,7 +1087,10 @@ Acceptance owners cover exact/next/maximum ns-to-ms and ns-to-us boundaries, fai
 installation/restoration, immediate errno classes, `EINTR`, early-zero versus exhausted/no-call
 poll behavior, readiness in flight at expiry,
 re-arm/zero-clear on pooled connections, normalized `timeval` fields, and no early expiry. They
-activate with the prerequisite, not with the already-shipped Request 2 tests above.
+are active with the prerequisite and complement the already-shipped Request 2 tests above.
+`http_timeout_quantization_plain_tls_pool_rearm` directly observes the normalized receive/send pair
+on fresh plaintext, dependent response-stream, TLS-handshake, request-I/O, pooled rearm, and pooled
+zero-clear paths.
 
 ### Test / gate
 
@@ -1101,11 +1104,11 @@ preserves the current blocking behavior. A normal fast request is unaffected. **
 `AL_TIMEOUT` (connect path, Linux), and fast-response-unaffected — plus `crates/align_driver/tests/
 http_timeout.rs` E2E through the Align surface (`cl.timeout` / `r.timeout` → `Err(Error.Timeout)` on a
 silent server, per-request override, inert-when-fast, and the unbound-receiver / non-i64 compile
-gates). The TLS timeout path is covered by the shared `SO_*TIMEO` mechanism and the plaintext E2E (the
-positive TLS round-trip is not drivable from the driver harness — the `#[cfg(test)]` trust hook is
-absent there, as recorded in Slice 5); the `has_deadline` mapping in `tls_read`/`tls_write_all` is the
-one place the TLS transport differs, documented above. Every pre-existing http/TLS/pool/get_many/stream
-test passes unchanged (the effective-0 byte-identical invariant).
+gates). The runtime owner above covers positive TLS handshake/request arms and pooled TLS zero-clear;
+the positive TLS round-trip is not drivable from the driver harness because its `#[cfg(test)]` trust
+hook is absent there, as recorded in Slice 5. The `has_deadline` mapping in `tls_read`/
+`tls_write_all` is the one place the TLS transport differs, documented above. Every pre-existing
+http/TLS/pool/get_many/stream test passes unchanged (the effective-0 byte-identical invariant).
 
 ## Client response framing (align-llm Request 4 — DESIGNED + IMPLEMENTED 2026-08-14)
 

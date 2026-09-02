@@ -427,10 +427,9 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
 7. **SHIPPED:** the bytes tier `c.run_bytes()` and command-local `max_capture_bytes` bound —
    align-llm Request 11.
 
-## Shared timeout-budget hardening (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+## Shared timeout-budget hardening (`pkg.kv` prerequisite 1 — IMPLEMENTED 2026-09-02)
 
-> **Status:** accepted design; inactive until implementation. The shipped `process.command`
-> surface and behavior remain active until then. This prerequisite changes no public signature,
+> **Status:** implemented without changing the shipped `process.command` surface, public signature,
 > compiler operation, runtime symbol, ABI shape, registry key, or row count.
 
 The runtime's `poll_timeout_ms` helper is shared by TCP connect and command capture, so the checked
@@ -453,6 +452,11 @@ interpreted; after `waitpid`, consumption of a reaped child is recorded first an
 timeout wins before result classification. Otherwise the existing stdout-before-stderr
 hard-error/cap order, child-exit handling, cleanup, and UTF-8 precedence are unchanged. Scheduler
 delay may make a return late, but rounding never expires a logical timeout early.
+
+`command_timeout_budget_quantization` owns the complete positive-i64 saturated chunk, exact/next
+millisecond conversion, spurious zero and EINTR recomputation, post-syscall timeout precedence, and
+post-EOF exhausted/no-final-poll cases. The existing capture lifecycle, error-precedence, timeout,
+cleanup, and UTF-8 owners remain unchanged.
 
 ## Pitfalls
 
@@ -488,10 +492,9 @@ delay may make a return late, but rounding never expires a logical timeout early
 - `.stdout()` view escaping past `out` Drop → rejected (P9).
 - `command` / `run_output` as an array element → rejected.
 - import-required.
-- Planned shared-timeout owners: exact millisecond, the next nanosecond, and maximum-positive i64
+- Implemented shared-timeout owners: exact millisecond, the next nanosecond, and maximum-positive i64
   budgets; `EINTR` remainder recomputation; an early zero poll result with time remaining; exhausted
-  remainder before another poll; and no early expiry. These activate only with the accepted-design
-  prerequisite above.
+  remainder before another poll; and no early expiry.
 
 # Extension — bounded text and byte capture (align-llm Request 11)
 
@@ -642,7 +645,7 @@ source-derived frontend/object cache entry.
 | Exact-limit text success | Shared drain admits empty, `L`, stdout-only, stderr-only, and simultaneous `L`/`L`; `run_output` retains existing code/text views. Owner: `command_capture_exact_limit_and_reuse`. |
 | One-byte overflow | Either stream at `L + 1`, including simultaneous pipe pressure, returns `Error.Invalid`, exposes no output, kills the group/direct pid, closes fds, and reaps the direct child once. Owner: `command_capture_overflow_kills_group_and_discards_partial`. |
 | Timeout/cap/exit/UTF-8 precedence | Checkpoint order above is exercised for timeout-before-overflow, overflow-before-timeout, nonzero-overflow, in-bound invalid UTF-8, and a child that closes both streams then remains alive beyond the deadline. Owner: `command_capture_error_precedence` plus `command_timeout_covers_post_eof_wait`. |
-| Planned timeout-budget quantization | At the unchanged post-fork anchor, exact-ms, next-ns, and maximum-positive i64 budgets use monotonic start+duration subtraction; `EINTR` and early-zero results recompute, exhaustion returns before another poll, and no case expires early or performs a final timeout-zero probe. Existing post-syscall timeout/error precedence remains green. Owner: `command_timeout_budget_quantization` (activates with the accepted-design shared prerequisite). |
+| Timeout-budget quantization | At the unchanged post-fork anchor, exact-ms, next-ns, and maximum-positive i64 budgets use monotonic start+duration subtraction; `EINTR` and early-zero results recompute, exhaustion returns before another poll, and no case expires early or performs a final timeout-zero probe. Existing post-syscall timeout/error precedence remains green. Owner: `command_timeout_budget_quantization`. |
 | Hard pipe/wait errors | Inject non-`EINTR` poll, `POLLNVAL`, stdout/stderr hard read, and post-EOF `waitpid` errors. Timeout wins when already observable; otherwise stdout precedes stderr, the original fixed errno survives cleanup, no partial result escapes, an owned group (if present) and direct pid are killed, fds close, and the direct child is reaped or already `ECHILD`. Owner: `command_capture_hard_io_errors_are_terminal`. |
 | Post-fork lifecycle | Parameterize `{pipes open/EOF} × {child live/exited} × {untimed/timed/bounded}`. Success requires both EOF and a reaped direct child; a timed EOF/live child uses WNOHANG plus allocation-free zero-fd poll until exit/deadline. Owner: `command_capture_lifecycle_state_matrix`. |
 | Binary tier | `run_bytes` preserves invalid UTF-8 and embedded NUL byte-for-byte, exposes region-bound byte views, supports nonzero exit, and shares exact-cap behavior. Owner: `command_run_bytes_preserves_arbitrary_output`. |

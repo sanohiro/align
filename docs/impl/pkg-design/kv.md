@@ -2,8 +2,8 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/kv.md`.
 >
-> **Status:** accepted design; implementation pending. The package source and planned runtime row
-> remain inactive until their recorded capability boundaries land.
+> **Status:** accepted design; prerequisite 1 implemented 2026-09-02. Prerequisite 2, the package
+> source, and the planned runtime row remain inactive until their recorded capability boundaries.
 
 ## Authoritative public-contract ledger
 
@@ -517,11 +517,14 @@ ledger; none is reserved behind a string or option tag here.
 
 ## Implementation closure matrix
 
-The shared timeout substrate is the first distinct prerequisite capability: it makes positive
-connect deadlines enforceable, prevents publication of a nonblocking connection, and fixes the
+The shared timeout substrate has landed as the first distinct prerequisite capability: it makes
+positive connect deadlines enforceable, prevents publication of a nonblocking connection, and fixes the
 shared connect/I/O quantization for the already-shipped `std.http` and `std.net` consumers without
-changing an ABI identity. The generic TCP-writer hardening is a second independently useful
-prerequisite with a closed signal-safety failure domain and likewise no public signature or ABI
+changing an ABI identity. This prerequisite may exceed roughly 1,000 changed hand-written lines
+once its deterministic resolver, transition, process, and HTTP consumer owners are included; one
+boundary avoids duplicating the shared quantization proof and prevents separately landed consumers
+from drifting across incompatible timeout rules. The generic TCP-writer hardening is a second
+independently useful prerequisite with a closed signal-safety failure domain and likewise no public signature or ABI
 identity change. The remaining new timeout row plus client/resource/parser/three commands form one
 strict producer-to-consumer chain. A dormant row, parser-only, or connection-only package PR would
 leave no stable public consumer, while splitting commands would repeat the same synchronization,
@@ -668,8 +671,9 @@ returned one P3 finding. This fifth repair reopens the recursive-derived-shell-c
 This finding closes the missing recursively reachable half of the same source-reachable
 dangling-shell class. A fresh full review of exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
-returned CLEAN with no P0–P3 finding. This exact contract is accepted; implementation remains
-pending in the recorded prerequisite order.
+returned CLEAN with no P0–P3 finding. This exact contract is accepted; the shared timeout
+prerequisite is implemented, while writer hardening and package implementation remain pending in
+the recorded order.
 
 The acceptance-status audit then found one P3 summary-only conflation: it joined impossible native
 products with malformed private records under a pre-I/O guarantee. The correction changes no

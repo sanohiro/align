@@ -4,8 +4,8 @@
 >
 > **注意:** 英語版 (`../kv.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** accepted design。implementation pending。package source と planned runtime row は、
-> 記録済み capability boundary が land するまで inactive。
+> **ステータス:** accepted design。prerequisite 1 は 2026-09-02 に implemented。prerequisite 2、
+> package source、planned runtime row は記録済み capability boundary まで inactive。
 
 ## 公開契約台帳
 
@@ -472,9 +472,12 @@ consumer と exact ledger を要し、ここで string/option tag の背後に r
 
 ## 実装 closure matrix
 
-shared timeout substrate が最初の distinct prerequisite capability。positive connect deadline を
-enforceable にし、nonblocking connection の公開を防ぎ、ABI identity を変えずに既に出荷済みの
-`std.http`/`std.net` consumer の shared connect/I/O quantization を修正する。generic TCP-writer
+shared timeout substrate は最初の distinct prerequisite capability として着地済み。positive connect
+deadline を enforceable にし、nonblocking connection の公開を防ぎ、ABI identity を変えずに既に出荷済みの
+`std.http`/`std.net` consumer の shared connect/I/O quantization を修正する。deterministic resolver、
+transition、process、HTTP consumer owner を含めると、この prerequisite もおよそ 1,000 changed
+hand-written lines を超え得る。shared quantization proof の重複を避け、別々に land した consumer が
+互換性のない timeout rule へ drift するのを防ぐため、1 boundary とする。generic TCP-writer
 hardening は、閉じた signal-safety failure domain を持つ第二の independently useful prerequisite で、
 同様に public signature/ABI identity を変更しない。残る新 timeout row と
 client/resource/parser/3 command は 1 本の strict producer-to-consumer chain。dormant row、parser-only、
@@ -613,8 +616,8 @@ fresh full review
 この finding は、同じ source-reachable dangling-shell class の recursively reachable な未閉包 half を閉じる。
 exact range
 `ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
-の fresh full review は P0–P3 finding なしで CLEAN を返した。この exact contract は accepted で、
-implementation は記録済み prerequisite order のまま pending。
+の fresh full review は P0–P3 finding なしで CLEAN を返した。この exact contract は accepted で、shared
+timeout prerequisite は implemented、writer hardening と package implementation は記録済み order のまま pending。
 
 その後の acceptance-status audit は summary-only conflation の P3 1 件を返した。impossible native product と
 malformed private record を pre-I/O guarantee 1 個にまとめていた。修正は public-contract ledger row と safety
