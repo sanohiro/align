@@ -13,8 +13,10 @@
 低レベルのソケット群である: tcp、udp、dns、socket。いずれも syscall に裏打ちされる。設計の要は再利用に
 ある。接続済みソケットの fd は、**既存の M9 reader/writer** にそのまま差し込める。多態性は construction
 の側 — fd を所有するハンドルを返す net 側のコンストラクタ — にあり、read/write と Drop での fd close の
-仕組みは全く同一である(draft §18.2 の io 原則。reader/writer が fd に対して汎用であることで実現してい
-る)。つまり net が足すのはソケットのライフサイクルと DNS だけで、新しい I/O パスは足さない。
+仕組みは同一である(draft §18.2 の io 原則。reader/writer が fd に対して汎用であることで実現している)。
+つまり net が足すのはソケットのライフサイクルと DNS だけで、新しい I/O パスは足さない。下記の
+`pkg.kv` prerequisite は writer ABI を 1 個のまま保ち、socket write が SIGPIPE を安全に抑止できる
+private sink provenance だけを加える。
 
 ## Signatures
 
@@ -67,9 +69,13 @@ net の操作はすべて **impure**(syscall)である — `par_map` のクロ�
 
 syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECONNREFUSED/ETIMEDOUT/EHOSTUNREACH は
 `Error.Code(errno)` になる(v1 では専用バリアントを設けず、これらで分岐したい消費者が現れたときに初めて
-テーブルを拡張する)。ENOENT 系の DNS 失敗は、resolve 専用の `Error.Invalid` か `Error.Code` にする。
-部分的な read/write は、再利用する reader/writer 側がすでに正しく処理している。ストリーム途中のコネクション
-リセットは read/write の Error として表面化する。
+テーブルを拡張する)。resolver failure は errno でなく EAI value であり、
+`EAI_NONAME`/`EAI_NODATA` は `Error.Invalid`、他の nonzero EAI value は
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())`、次に
+`Error.Code(encoded - AL_CODE)` にする。
+部分的な read/write は再利用する reader/writer が処理する。ストリーム途中の connection reset は read/write
+Error として表面化する。下記の `pkg.kv` prerequisite は現在の Linux SIGPIPE hole を閉じ、closed peer への
+write が Error を返す前に process を terminate しないようにする。
 
 **`l.accept()` だけは例外であり、それは意図的である: inbound コネクション 1 本の失敗は、listener の失敗
 ではない。** `accept(2)` は両者を同じ errno で報告するので、コネクションを記述しているほうは返さずに内部で
@@ -100,8 +106,9 @@ std ではなく pkg の領分である。
 
 必要になるものは次のとおり。Move 型の `Ty` 3 種(TcpConn/TcpListener/UdpSocket)+ ランタイム構造体 +
 Drop(close)。ソケットのライフサイクル用ランタイム関数(socket/connect/bind/listen/accept、`dns.resolve`
-用の getaddrinfo、sendto/recvfrom)。バイトパスは M9 の reader/writer をそのまま再利用する(ここが最大の
-利点)。借用した reader/writer をその conn に束縛する `region_of` 分岐。そして `std.http` の `get_many` が
+用の getaddrinfo、sendto/recvfrom)。バイトパスは M9 の reader/writer ABI を再利用し(ここが最大の利点)、
+下記の private socket-sink hardening を加える。借用した reader/writer をその conn に束縛する `region_of`
+分岐。そして `std.http` の `get_many` が
 土台にする `task_group` + ブロッキングプールの基盤(バッチング自体は net ではなく http の担当)。新しい
 effect も、新しい I/O パスも、async ランタイムも要らない。
 
@@ -147,6 +154,7 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 
 - `dns.resolve` の localhost に 127.0.0.1 が含まれる
 - ローカルの listener へ connect し、reader/writer 経由でバイトを往復させる
+- connection-derived writer で closed peer へ write すると、SIGPIPE で process termination せず Error を返す
 - conn の Drop 後に reader を使う → コンパイルエラー(P2)
 - accept ループが N 個のクライアントをさばく
 - udp の `send_to`/`recv_from` の往復
@@ -167,7 +175,9 @@ effect も、新しい I/O パスも、async ランタイムも要らない。
 > その場でデッドラインを設定し、その満了を reader/writer のバイト経路が `Err(Error.Timeout)` として表面化する。
 > raw な `tcp.connect(host, port)` サーフェスはタイムアウト無しのままでリテラル `0` を渡す。`std.http` の
 > `cl.timeout(ns)` / `r.timeout(ns)` サーフェス(http.md「I/O timeouts」)は #634 で出荷済みで、同じ
-> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。
+> `align_rt_tcp_connect` パラメータを通して有効タイムアウトを渡す。下記の accepted-design
+> prerequisite はこの public surface や ABI identity を変えず、positive-timeout の mode transition と
+> quantization を厳密化する。
 
 `std.http` のリクエスト単位タイムアウト(http.md「I/O timeouts」)は net 基盤（レール）に載るので、基盤はここで
 設計する;net は raw-socket 呼び出し側向けにこれを直接も公開する。動機は `align-llm` の LLM API 呼び出し
@@ -192,9 +202,11 @@ read/write 箇所はデッドライン武装済みの `EAGAIN` を明示的に `
 
 ### Connect timeout — the shared substrate
 
-**connect** デッドラインは `align_rt_tcp_connect`(ランタイム `:679`;現在は「no connect timeout」、`:621`)に
-宿る:これが `timeout_ns` パラメータを得る — non-blocking `connect` → `EINPROGRESS` → ns デッドラインで
-`poll(POLLOUT)` → `SO_ERROR` を確認;poll タイムアウトは `AL_TIMEOUT` を返す。`timeout_ns == 0` は現在の
+**connect** デッドラインは `align_rt_tcp_connect` に宿る: positive `timeout_ns` は
+non-blocking mode を使う。immediate zero は成功、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は
+`poll(POLLOUT)` へ入り、その他の immediate errno は map する。readiness は `SO_ERROR` で解決し、poll
+timeout は `AL_TIMEOUT` を返す。下記 inactive prerequisite が mode installation/restoration を checked にする。
+`timeout_ns == 0` は現在の
 ブロッキング connect を正確に保つ。`std.http` はこの同じパラメータを通して有効リクエストタイムアウトを渡す。
 raw-`net` の `tcp.connect(host, port)` シグネチャは v1 ではタイムアウト無しのまま(デッドラインを設定する
 connect 前のハンドルが無く、Align には任意引数が無い);raw-socket の消費者が有界 connect を必要とするなら、
@@ -210,6 +222,139 @@ connect 前のハンドルが無く、Align には任意引数が無い);raw-soc
 
 ### Test / gate
 
-ブラックホール化された(決して accept しない)アドレスへ上限付きで connect → 上限内で `Err(Timeout)`。相手が
-accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が上限内で `Err(Timeout)` を返す。
+ブラックホール化されたアドレスへ logical wait deadline 付きで connect → early expiry せず
+`Err(Timeout)`。相手が accept した後に決して送らない conn で `read_timeout_ns` を設定 → read が
+configured blocking wait 後に `Err(Timeout)` を返す。
 `ns == 0` はブロッキング挙動を保つ。
+
+---
+
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+
+> **ステータス:** 最初の independently useful prerequisite。accepted design、implementation pending。
+> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+
+各 usable resolver address と positive `timeout_ns` に対し、`align_rt_tcp_connect` は最初の `F_GETFL` 直前に
+monotonic start と positive `Duration` budget を記録し、次に `F_GETFL` と
+`F_SETFL(flags | O_NONBLOCK)` を検査する。いずれかの failure で fixed errno-mapped status を記録し、
+candidate を close し、`connect` を呼ばず次の address へ進む。checked installation 後に immediate
+`connect` を正確に 1 回呼ぶ。zero は成功、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` は wait へ入り、その他の
+errno は直ちに map する。いずれの immediate terminal result も同時に budget が exhaust していても優先する。
+in-progress path は同じ start/budget pair を継続する。absolute `start + budget` は作らないので、
+`Instant::checked_add` overflow が huge positive timeout を unbounded wait に変えることはない。
+
+- 各 iteration で budget から `start.elapsed()` を引く。positive remainder は次の millisecond へ切り上げ、
+  1 回の `poll` 用に `i32::MAX` で saturate するため、positive i64 全域は repeated chunk で bounded のまま。
+  exhausted remainder は次の poll を行わず `AL_TIMEOUT` を返し、最後の zero-timeout `poll` call も行わない。
+- EINTR は remainder を再計算し、その他の poll error は直ちに map する。`poll` の zero は再度
+  monotonic recheck を行い、まだ時間が残る場合だけ再度 poll、budget を使い切っていれば追加の poll 無しで
+  `AL_TIMEOUT` とする。
+- positive readiness/error event は同時に使い切った budget より優先し、`SO_ERROR` で解決する。
+
+各 immediate/polled success 後に `F_GETFL` と `F_SETFL(flags & !O_NONBLOCK)` を検査する。
+restoration failure はその status を記録し、candidate を close して次へ進む。blocking mode の checked
+restoration が済むまで connection は publish しない。nonpositive raw-ABI blocking path は不変で、public HTTP
+caller はこの ABI 前に negative value を拒否し、raw `tcp.connect` は zero を渡す。DNS と複数 address の合計に end-to-end
+deadline は無く、scheduler/kernel delay で address の logical deadline 後に return することはある。
+
+nonzero `getaddrinfo` result は address iteration 前に返る。`EAI_NONAME`/`EAI_NODATA` は `AL_INVALID`、
+他の symbolic EAI value は `AL_CODE.saturating_add(eai.saturating_abs())` へ map。
+connection output は null のまま、transient host/service storage は drop、address-list owner は escape せず、
+socket を試さない。symbolic EAI owner が両 category、null output、cleanup、zero socket call を pin。
+
+resolution 成功後の resolver order は observable。unsupported family、null address、zero address length は
+last failure を変えずに skip する。最初に成功した usable address が勝つ。usable address が無ければ
+`AL_INVALID` を返し、attempt した candidate がすべて失敗すれば socket creation、nonblocking `F_GETFL`、
+nonblocking `F_SETFL`、immediate connect errno、poll error/timeout、`getsockopt(SO_ERROR)` failure、
+nonzero `SO_ERROR`、blocking-restore `F_GETFL`、blocking-restore `F_SETFL` のうち最後の status を返す。
+mixed-address owner は各 failure class の後に skipped entry と later success を置き、all-failure variant は
+last attempted status と close count を固定する。
+
+同じ prerequisite が public `read_timeout_ns`/`write_timeout_ns` と planned checked package row で共有する
+socket-timeout conversion を修正する。全 positive nanosecond 値を `ceil(ns / 1000)` microseconds とし、それを
+normalized `timeval { tv_sec, tv_usec: 0..999999 }` に分割する。exact microsecond は exact のまま、zero は既存の
+clear/no-timeout 意味を保つ。option は 1 回の blocking progress wait を bound し、multi-read/multi-write operation 全体を
+bound しない。
+
+planned source-reachable `TcpConnSetIoTimeout` consumer は全 non-null compatible caller に、call 全体で
+exclusive な 1 個の live/unfreed connection を要求する。entry 時にその connection 由来の live
+reader/writer shell またはその shell を retain する value はなく、read/write/configuration/
+reader-or-writer construction/free/Drop の overlap も禁止。exact normalized `timeval` を使い receive を send より先に install。entry option state を
+`{R0,S0}`、requested state を `T` とすると、receive failure は `setsockopt` を exact 1 回呼び mapped status を
+返して send call なし、state は `{R0,S0}`。send failure は exact 2 回、send mapped status、state は `{T,S0}`。
+success は exact 2 回、zero、state は `{T,T}`。どちらかの option failure は compatible caller に retirement、
+後続 read/write/configuration/reader-or-writer construction/retry 禁止、exact 1 回の free/Drop を要求する。
+zero-derived-shell entry state により、その close と順序付ける shell cleanup はない。success は usability を
+保ち、その後 shell を構築できるが、後の overwrite 前に全 derived shell/retaining value を Drop する。
+package は fresh unpublished clear/clear connection だけで shell construction 前に call し、どちらの failure も
+resolution 再開/別 address 試行なしで close。owner は live/exclusive/zero-derived-shell entry precondition、
+pre-armed state、option order/call count/returned status、retry prohibition、overlap 中/failure 後の
+constructor call zero、retirement、close/Drop を pin。structural owner 1 個が complete active recursive
+Drop graph を通じた target-connection provenance で retainer を分類する。local/call、struct field、nested
+`Option`/`Result`、admitted user-sum path にある direct/buffered reader、writer、logger-owned writer leaf を
+walk し、retaining struct の source-constructed fixed array element も含む。この last path は既存 struct-field と
+fixed Move-struct-array rule を compose し、direct handle array element を admit しない。canonical formation/Drop graph から
+derive し new-edge tripwire を持ち、inactive/moved-out state、other/mixed-connection shell、zero/one/multiple
+target leaf を cross。zero だけ compatible。各 positive carrier class は configure-construct-move-into-
+move-out-where-supported-or-recursive-Drop-reconfigure を完了。direct handle collection/box/tuple と direct
+reader/writer user-sum payload は formation negative。nameable dynamic-array/slice retaining-struct/sum shape、
+admitted non-tuple shape の user-struct-field closure、direct `DynStructArray` に許容される dynamic-array/
+slice element、tuple、builtin `Option`/`Result` edge は explicit no-live-producer owner を維持。
+
+ceil-to-microsecond conversion は出荷済み `std.http` の plain/TLS/pool rearm にも届く。
+poll-millisecond helper は `process.command` にも届き、その consumer は従来の post-syscall
+timeout-wins precedence を保ったまま、positive-i64 全域に同じ monotonic start-plus-budget arithmetic と
+ceil conversion を使う。これらは package-local conversion の分岐ではなく、1 個の shared prerequisite である。
+
+acceptance owner は exact/next/maximum-positive ns、us、ms、chunk、deadline boundary、immediate/polled
+success での `F_GETFL`/`F_SETFL` installation/restoration failure、early zero-result recheck と
+exhausted/no-call poll、`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` とその他 immediate errno、EINTR remainder
+recomputation、deadline 時の readiness、全 resolver skip/last-status failure class、symbolic EAI branch、
+mixed-address close/continuation、no early expiry、publish する全 connection の blocking-mode probe、
+exact-timeval と pre-armed receive/send state および caller-retirement product、HTTP plain/TLS/pool rearm、
+command pipe-drain/post-EOF reap を含む。
+
+---
+
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
+
+> **ステータス:** independently useful な safety prerequisite。accepted design、implementation pending。
+> public signature、compiler operation、runtime symbol、ABI shape、registry key、row count は変更しない。
+
+既存の `c.writer() -> writer` が唯一の TCP byte-write surface のまま。private runtime `Writer` state に
+sink kind と macOS/BSD readiness bit を加え、`align_rt_tcp_conn_writer` だけが socket/not-ready に設定。
+standard-stream/file constructor は generic-fd kind を設定。socket-kind の nonempty `w.write(...)` は
+1 本の complete-write loop と exact existing Result taxonomy を維持し、platform rule は次のとおり。
+
+- Linux は全 attempt で `send(MSG_NOSIGNAL)` を呼ぶ。
+- macOS/BSD はその writer shell の最初の send 前に `SO_NOSIGPIPE` を lazy install し、成功だけを cache。
+  option installation failure はその call が byte を送る前に fixed errno-mapped `Error` を返し、shell は
+  not-ready のまま後続 call で retry する。成功後は今回以降の write で `send` を使う。
+- partial send は残り view を進め、EINTR は retry。armed blocking-socket の
+  `EAGAIN`/`EWOULDBLOCK` は `Error.Timeout` のまま。positive-length zero progress は spin/stale errno
+  でなく deterministic `Error.Code(0)`。
+
+process-global signal handler/mask はない。同じ call の earlier attempt が byte を送った後に failure が
+起こり得るため、caller が error を受け replay policy を所有する。file/standard-stream writer は既存の
+`write(2)` path を byte-for-byte で維持。connection-derived writer は unbuffered かつ
+`owns_fd: false` のままで、`flush`/Drop に pending write はなく socket を close するのは `tcp_conn` だけ。
+`SO_NOSIGPIPE` は monotone/idempotent な per-socket setting。overlap する shell は各々設定を試せるが、
+各 shell は自身の成功後だけ send し、失敗した shell は retryable。shell Drop は clear せず、connection
+close が破棄する。同じ connection-derived writer を使う logger/`io.copy` は第二 path を開かず socket
+sink kind を継承する。
+
+既存の keyed `IoWriterWriteBuilder` identity、A19
+`i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration、
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI、attribute、shipped 330/347/355
+keyed/base/maximum count への inclusion は変わらない。source-visible builder overload は builder byte を
+borrow して hardened `IoWriterWrite` row に delegate するので、socket sink policy を迂回できない。
+
+acceptance owner は macOS/BSD での failed install/no send 後の retry、overlap する shell の両方の
+success/failure order、option clear 無しの shell Drop、setting を破棄する connection close を含む。
+Linux/macOS の subprocess closed-peer test は direct slice/builder overload、logger、`io.copy` route を覆い、SIGPIPE で終了せず
+必ず `Error` を返す。direct partial/EINTR/timeout/zero-progress test と file/std writer parity は別個の owner のまま。
+
+checked timeout substrate を最初、writer hardening を 2 番目に出荷する。その後、planned
+`TcpConnSetIoTimeout` row とその `pkg.kv` package consumer を同時に activate する。exact package consumption と
+implementation boundary は `../pkg-design/kv.md`、one-row reservation と prerequisite の不変 ABI identity は
+`../20-runtime-abi-ledger.md` に記録する。

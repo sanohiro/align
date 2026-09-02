@@ -57,7 +57,11 @@ six keyed rows. The `core.test` child-control extension then added four unkeyed 
 added six keyed rows, `core.codec` then added eight, and `pkg.frame` added two. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
 are 330 keyed records, 347 base records, and 355 records in the maximum optional-probe export table.
-No probe category changed.
+No probe category changed. The accepted `pkg.kv` design below reserves one source-reachable
+unkeyed identity that reuses an existing ABI shape; it is inactive and excluded from these shipped
+counts until implementation. Its two independently useful prerequisites first harden the shared
+TCP timeout substrate and existing TCP-derived writers without changing a symbol, key, shape,
+attribute, or count.
 
 ## core.test child-control extension
 
@@ -102,6 +106,176 @@ successful `process.exec` closes it through close-on-exec or process termination
 harness returns. The independent driver codecs and the runtime codecs both pin the three semantic
 goldens in `core-design/test.md`; malformed-input, EINTR, short-send, export-parity, whole/per-unit,
 and reserved-child-exit owners land with the rows.
+
+## Planned `pkg.kv` TCP prerequisites and substrate (accepted design; inactive until implementation)
+
+The first independently useful prerequisite hardens the shipped shared timeout substrate without
+changing an ABI identity. For every usable address and positive `timeout_ns`,
+`align_rt_tcp_connect` records a monotonic start and positive `Duration` budget immediately before
+the first `F_GETFL`, then checks `F_GETFL` and `F_SETFL(flags | O_NONBLOCK)` before `connect`.
+Either failure records its fixed errno-mapped status, closes that candidate, and continues to the
+next address without calling `connect`. After checked installation, exactly one immediate
+`connect` is issued: zero succeeds, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` enter the wait, and every
+other errno is mapped immediately. Either immediate terminal result wins even if the budget is
+simultaneously exhausted. The in-progress path continues against the same start/budget pair; it
+never forms an absolute `start + budget`, so `Instant::checked_add` overflow cannot turn a huge
+positive timeout into an unbounded wait. Each iteration subtracts `start.elapsed()` from the
+budget. A positive remainder is rounded up to the next millisecond and saturated at `i32::MAX` for
+one `poll`, so the complete positive i64 range remains bounded through repeated chunks; an
+exhausted remainder returns `AL_TIMEOUT` before another poll. It does not issue a final
+zero-timeout `poll` call.
+EINTR recomputes the remainder, any other poll error is mapped immediately, and a zero result
+causes another monotonic recheck and re-poll only when time remains or returns `AL_TIMEOUT` without
+another poll when the budget is exhausted. A positive readiness/error event wins over a
+simultaneously exhausted budget and is resolved through `SO_ERROR`. Every immediate or polled
+success then checks `F_GETFL` and
+`F_SETFL(flags & !O_NONBLOCK)`. Restoration failure closes that candidate, records the failure, and
+continues, so no connection is published before checked blocking-mode restoration. The existing
+nonpositive raw-ABI blocking path stays unchanged: public HTTP callers reject negative values before
+this ABI, and raw `tcp.connect` supplies zero.
+
+A nonzero `getaddrinfo` result returns before address iteration. `EAI_NONAME`/`EAI_NODATA` maps to
+`AL_INVALID`; every other symbolic EAI value maps to
+`AL_CODE.saturating_add(eai.saturating_abs())`. The already-cleared connection output remains null,
+no socket is attempted, no address-list owner escapes, and transient host/service storage drops
+before return. Direct symbolic EAI owners pin both mapping categories, null output, zero socket
+calls, and cleanup.
+
+After successful resolution, resolver order is observable. Unsupported families, null addresses,
+and zero address lengths are skipped without changing the last failure. The first successful usable
+address wins. No usable address returns `AL_INVALID`; if every attempted candidate fails, the
+runtime returns the last status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`,
+an immediate connect errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`,
+blocking-restore `F_GETFL`, or blocking-restore `F_SETFL`. Direct mixed-address owners place a
+skipped entry and a later success after every failure class; all-failure variants pin the last
+attempted status and candidate close count. DNS and the sum across addresses have no end-to-end
+deadline.
+
+The same prerequisite makes the shared positive-nanosecond socket-timeout conversion exact for
+`std.net`, `std.http`, and the planned checked package row:
+`ceil(timeout_ns / 1000)` microseconds, split into normalized
+`timeval { tv_sec, tv_usec: 0..999999 }`; exact microseconds remain exact and zero retains the
+existing clear/no-timeout meaning.
+
+The command-capture consumer of the same poll-millisecond conversion also replaces its absolute
+`Instant::checked_add` deadline with a monotonic start and positive `Duration` budget. Its complete
+positive-i64 range therefore cannot degrade to an unbounded run; every positive remainder rounds up
+and saturates exactly as above, while its existing post-syscall timeout-wins checkpoint order stays
+unchanged. Direct owners cover exact/next and maximum-positive ns, us, ms, chunk, and deadline
+boundaries; `F_GETFL`/`F_SETFL` install and restore failures on immediate and polled success; early
+zero-result recheck versus exhausted/no-call poll, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` versus other
+immediate errno, EINTR remainder recomputation, readiness at the deadline, every resolver skip and
+last-status failure class, candidate close/continuation, a blocking-mode probe on every published
+connection, HTTP plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
+
+The second independently useful prerequisite repairs the already-shipped
+`TcpConnWriter` -> `IoWriterWrite` path rather than adding a second write ABI. The private runtime
+`Writer` gains a socket sink kind and macOS/BSD readiness bit; only `align_rt_tcp_conn_writer` sets
+the kind. A nonempty socket-kind write keeps the existing complete partial-write loop, EINTR retry,
+and `EAGAIN`/`EWOULDBLOCK` timeout mapping, but Linux calls `send(MSG_NOSIGNAL)` and macOS/BSD
+performs checked `SO_NOSIGPIPE` before the first send on that writer shell, caching only success.
+The option failure sends nothing through that call and remains retryable; positive-length zero
+progress deterministically returns `AL_CODE` (`core.Error.Code(0)`). File and standard-stream
+writers retain the existing generic `write(2)` path. Connection-derived writers remain unbuffered
+and non-owning, so `IoWriterFree` performs no write and does not close the socket.
+`SO_NOSIGPIPE` is monotone and idempotent per socket: overlapping shells may each attempt it, each
+sends only after its own successful result, a failed shell remains retryable, no shell Drop clears
+it, and connection close discards it. No process-global signal state changes. Direct owners cover a
+failed install with no send followed by retry, both success/failure orders for overlapping shells,
+shell Drop without option clear, connection close, and closed-peer subprocess routes through the
+direct slice overload, builder overload, `std.log`, and `io.copy`, plus file/standard-stream and
+partial/EINTR/timeout/zero-progress parity. In particular, the existing keyed
+`IoWriterWriteBuilder` identity keeps A19's
+`i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration and
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI. It remains in the same shipped
+330/347/355 keyed/base/maximum counts and delegates its borrowed builder bytes to the hardened
+`IoWriterWrite` row. The existing `TcpConnWriter`, `IoWriterWrite`, `IoWriterWriteBuilder`, and
+`IoWriterFree` identities, LLVM declarations, Rust exports, attributes, registry entries,
+fingerprints, and counts remain unchanged.
+
+After those prerequisites, the `pkg.kv` capability reserves exactly one package-internal,
+source-reachable unkeyed row. It closes the checked-configuration failure domain that the existing
+public timeout setters cannot: those setters return Unit and discard `setsockopt` failure. The new
+row is a general TCP-connection operation rather than a RESP parser or package-specific helper:
+
+| Unkeyed key | Exact symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
+|---|---|---|---|
+| `TcpConnSetIoTimeout` | `align_rt_tcp_conn_set_io_timeout` | A04: `i32 @SYM(ptr, i64)` | `unsafe extern "C" fn(*mut TcpConn, i64) -> i32` |
+
+`TcpConnSetIoTimeout` first rejects a null connection with `AL_INVALID`, then rejects
+`timeout_ns` outside `1..=86400000000000` with `AL_INVALID`; either rejection occurs before reading
+the fd or calling `setsockopt`, and a live connection remains usable after the range rejection.
+Every non-null call has the unsafe precondition that the pointer names one live, unfreed `TcpConn`
+held with exclusive logical access for the complete call, with no live reader/writer shell derived
+from that connection and no other value retaining one at entry. A dangling or concurrently
+aliased pointer or a live derived shell violates that precondition and is not detectable; no read,
+write, other configuration, reader-or-writer construction, free, or Drop may overlap.
+
+A target-connection retainer is classified by runtime provenance rather than numeric-fd equality:
+its active recursive Drop graph reaches an initialized direct/buffered reader derived from that
+connection, a derived writer, or a logger owning such a writer. The positive value graph uses
+direct leaves, acyclic user-struct fields, nested active `Option`/`Result`, active user-sum paths
+rooted in a logger/retaining struct/nested sum/tagged carrier, and elements of source-constructed
+fixed arrays of retaining structs, including ordinary local, parameter, return, move, and by-value-
+call placement. The fixed-array element is the retaining struct, so this composes existing struct-
+field and fixed Move-struct-array rules rather than widening direct handle placement. Direct handle
+collection/fixed-array/tuple/box elements and direct reader/writer
+user-sum payloads reject formation. The admitted dynamic-array/slice shapes for retaining
+structs/sums can name a type. A direct `DynStructArray` may additionally occupy a dynamic-array/
+slice element, tuple element, or builtin `Option`/`Result` payload. Every admitted shape in this
+paragraph except the tuple wrapper may occupy a user-struct field and then recurse through the
+ordinary acyclic struct/tagged/sum carrier grammar. Every current
+materializer, builder, decode, and
+Move-slice producer rejects a live handle-retaining value. Inactive arms,
+moved/null leaves, and carriers containing only other-
+connection shells have target count zero; a compatible call requires zero even when a carrier can
+otherwise reach multiple or mixed-provenance leaves.
+
+For an admitted input the row uses the normalized ceil-to-microsecond `timeval` above, then installs
+`SO_RCVTIMEO`. A failure returns its fixed errno-mapped status without attempting `SO_SNDTIMEO`;
+otherwise it installs `SO_SNDTIMEO` and returns that status, or zero only after both succeed. Let
+`R0` and `S0` be the receive/send option states at entry and `T` the requested state. Receive failure
+leaves `{R0,S0}`, send failure leaves `{T,S0}`, and success leaves `{T,T}`. After either option
+failure, a compatible caller must retire the still-owned connection, perform no read, write,
+configuration, reader-or-writer construction, or retry on it, and invoke its ordinary free/Drop
+path exactly once; the zero-derived-shell entry state leaves no shell cleanup to order against that
+close. Success preserves usability and may construct derived shells afterward, but a later timeout
+call may overwrite both options only after every such shell and retaining value has dropped. The row
+itself allocates, retains, rolls back, closes, or consumes nothing. The null x
+range product directly owns validation order and the no-fd/no-option side-effect rule.
+Parameterized direct-runtime owners pre-arm both option states and pin live/exclusive plus
+zero-derived-shell entry preconditions, the exact normalized `timeval`, option order, call counts,
+returned status, the
+`{R0,S0}`/`{T,S0}`/`{T,T}` post-state product, range-rejection retry versus option-failure retry
+prohibition, zero overlapping/post-failure reader/writer-constructor calls, retirement, and later
+free/Drop. One parameterized structural owner derives its traversal from the canonical type-
+formation and recursive Drop graph; a storage-edge tripwire makes every future edge require
+classification. It crosses direct/buffered reader, direct writer, logger-owned writer, struct/
+tagged/sum/fixed-struct-array placement, active/inactive/moved-out state, target/other/mixed
+provenance, and zero/one/multiple target leaves, and separately pins the formation/no-live-producer
+edges above. It excludes every nonzero target count without invoking the unsafe row. For each
+positive carrier class, the success cycle configures at zero, constructs and moves the leaf into
+that carrier, moves it out where supported and drops it or recursively drops the smallest owning
+carrier, observes zero, and reconfigures. The package
+calls only on a fresh exclusively owned unpublished
+connection with both entry options clear and before shell construction; its owner
+closes after either option failure and proves that resolution is not reopened, no other address is
+attempted, and no partially configured client is published.
+
+The LLVM and Rust definitions use A04's default C calling convention and have no curated function,
+return, or parameter attributes. The compiler recognizes the fixed physical symbol for exact ABI
+compatibility, collision reservation, and source reachability. This adds no language builtin,
+checked-HIR or MIR operation, call-spelling selector, or new ABI shape.
+
+At package implementation, the one new key, symbol, definition, collision reservation, typed
+registry row, runtime ABI fingerprint input, base/maximum export entry, and source-compatible extern
+reuse activate atomically. It increases the unkeyed/base/maximum counts by one and the keyed count
+by zero: the exact keyed/base/maximum counts become 330/348/356. It reuses an existing shape, so
+A123 remains the next unreserved shape. Until then it is not a runtime export or legal
+compatible-native definition. The unkeyed count becomes eighteen, thirteen of which are
+source-reachable. The timeout hardening lands first, the writer hardening second, and the new row
+activates atomically with its `pkg.kv` consumer.
+Exact public consumption, poisoning, and owner matrix: `pkg-design/kv.md`.
 
 ## Implemented std.log extension (2026-08-31)
 

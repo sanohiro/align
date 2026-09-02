@@ -11,10 +11,11 @@ module.
 ## Overview
 
 Low-level sockets: tcp, udp, dns, socket. Syscall-backed. The keystone reuse: a connected
-socket's fd plugs into the **existing M9 reader/writer** unchanged — polymorphism lives in
+socket's fd plugs into the **existing M9 reader/writer** — polymorphism lives in
 construction (a net-side constructor returning an fd-owning handle), the read/write/Drop-closes-fd
 machinery is identical (draft §18.2 io principle; realized by reader/writer being fd-generic). So
-net adds socket lifecycle + DNS, NOT a new I/O path.
+net adds socket lifecycle + DNS, NOT a new I/O path. The `pkg.kv` prerequisite below keeps that one
+writer ABI and adds only private sink provenance so socket writes can suppress SIGPIPE safely.
 
 ## Signatures
 
@@ -66,9 +67,13 @@ All net ops are **impure** (syscalls) — never in a `par_map` closure.
 
 Syscall failures go through the **shared errno→Error table** (M9): ECONNREFUSED/ETIMEDOUT/
 EHOSTUNREACH → `Error.Code(errno)` (no dedicated variant in v1 — extend the table only if a
-consumer needs to branch on them), ENOENT-class DNS failure → a resolve-specific `Error.Invalid`
-or `Error.Code`. Partial read/write handled by the reused reader/writer (already correct).
-Connection reset mid-stream surfaces as a read/write Error.
+consumer needs to branch on them). Resolver failures are EAI values, not errno:
+`EAI_NONAME`/`EAI_NODATA` → `Error.Invalid`; every other nonzero EAI value →
+`encoded := AL_CODE.saturating_add(eai.saturating_abs())`, then
+`Error.Code(encoded - AL_CODE)`. Partial
+read/write is handled by the reused reader/writer. Connection reset
+mid-stream surfaces as a read/write Error; the `pkg.kv` prerequisite below closes the current Linux
+SIGPIPE hole so a write to a closed peer cannot terminate the process first.
 
 **`l.accept()` is the exception, and deliberately so: a failure of ONE inbound connection is not a
 failure of the listener.** `accept(2)` reports both through the same errno, so the ones that
@@ -99,7 +104,8 @@ HTTP/3, TLS, socket tuning (TFO/REUSEPORT/thread-per-core) are pkg, not std.
 
 3 new Move `Ty` (TcpConn/TcpListener/UdpSocket) + runtime structs + Drop(close); socket-lifecycle
 runtime fns (socket/connect/bind/listen/accept, getaddrinfo for `dns.resolve`, sendto/recvfrom);
-reuse M9 reader/writer verbatim for the byte path (the win); `region_of` arms binding borrowed
+reuse the M9 reader/writer ABI for the byte path (the win), with the private socket-sink hardening
+recorded below; `region_of` arms binding borrowed
 reader/writer to their conn; the `task_group` + blocking-pool substrate that `std.http`'s
 `get_many` builds on (batching itself is http's, not net's). No new effect, no new I/O path, no
 async runtime.
@@ -148,6 +154,7 @@ just supplies the `task_group` + blocking-pool substrate, already available.)
 
 - `dns.resolve` localhost → contains 127.0.0.1
 - connect to a local listener + round-trip bytes through reader/writer
+- connection-derived writer to a closed peer returns Error without SIGPIPE process termination
 - reader used past conn Drop → compile error (P2)
 - accept loop serves N clients
 - udp `send_to`/`recv_from` round-trip
@@ -170,7 +177,9 @@ Linux backend behind the same signatures, not a semantic change.
 > SO_SNDTIMEO)`) set an in-place deadline whose expiry the reader/writer byte path surfaces as
 > `Err(Error.Timeout)`. The raw `tcp.connect(host, port)` surface stays timeout-less and lowers a
 > literal `0`. The `std.http` `cl.timeout(ns)` / `r.timeout(ns)` surface (http.md "I/O timeouts")
-> SHIPPED in #634, threading its effective timeout through this same `align_rt_tcp_connect` parameter.
+> SHIPPED in #634, threading its effective timeout through this same `align_rt_tcp_connect`
+> parameter. The accepted-design prerequisite below tightens positive-timeout mode transitions and
+> quantization without changing this public surface or an ABI identity.
 
 `std.http`'s per-request timeout (http.md "I/O timeouts") rests on the net rail, so the substrate is
 designed here; net also exposes it directly for raw-socket callers. Motivated by `align-llm`'s LLM
@@ -196,9 +205,11 @@ timeout-unarmed fds).
 
 ### Connect timeout — the shared substrate
 
-The **connect** deadline lives in `align_rt_tcp_connect` (runtime `:679`; today "no connect timeout",
-`:621`): it gains a `timeout_ns` parameter — non-blocking `connect` → `EINPROGRESS` →
-`poll(POLLOUT)` with the ns deadline → check `SO_ERROR`; poll-timeout returns `AL_TIMEOUT`.
+The **connect** deadline lives in `align_rt_tcp_connect`: a positive `timeout_ns` uses
+non-blocking mode; immediate zero succeeds, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` enter
+`poll(POLLOUT)`, and every other immediate errno is mapped. Readiness is resolved through
+`SO_ERROR`; poll timeout returns `AL_TIMEOUT`. The inactive prerequisite below makes mode
+installation and restoration checked.
 `timeout_ns == 0` preserves the current blocking connect exactly. `std.http` passes its effective
 request timeout through this same parameter. The raw-`net` `tcp.connect(host, port)` signature stays
 timeout-less in v1 (it has no pre-connect handle to set a deadline on, and Align has no optional
@@ -215,6 +226,160 @@ path — this is socket options on the existing blocking rail.
 
 ### Test / gate
 
-Connect to a black-holed (never-accepting) address with a bound → `Err(Timeout)` within the bound. A
-conn whose peer accepts then never sends, with `read_timeout_ns` set → a read returns `Err(Timeout)`
-within the bound. `ns == 0` preserves blocking behavior.
+Connect to a black-holed address with a logical wait deadline → `Err(Timeout)` without early
+expiry. A conn whose peer accepts then never sends, with `read_timeout_ns` set → a read returns
+`Err(Timeout)` after its configured blocking wait. `ns == 0` preserves blocking behavior.
+
+---
+
+## Checked shared timeout substrate (`pkg.kv` prerequisite 1 — ACCEPTED DESIGN 2026-09-02)
+
+> **Status:** first independently useful prerequisite; accepted design, implementation pending.
+> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
+> row count changes.
+
+For every usable resolver address and positive `timeout_ns`, `align_rt_tcp_connect` records a
+monotonic start and positive `Duration` budget immediately before the first `F_GETFL`, then checks
+`F_GETFL` and `F_SETFL(flags | O_NONBLOCK)`. Either failure records its fixed errno-mapped status,
+closes that candidate, and continues to the next address without calling `connect`. After checked
+installation, exactly one immediate `connect` is issued: zero succeeds,
+`EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` enter the wait, and every other errno is mapped immediately.
+Either immediate terminal result wins even if the budget is simultaneously exhausted. The
+in-progress path continues against the same start/budget pair; it never forms an absolute
+`start + budget`, so `Instant::checked_add` overflow cannot turn a huge positive timeout into an
+unbounded wait:
+
+- each iteration subtracts `start.elapsed()` from the budget; a positive remainder is rounded up to
+  the next millisecond and saturated at `i32::MAX` for one `poll`, so the complete positive i64
+  range remains bounded through repeated chunks; an exhausted remainder returns `AL_TIMEOUT`
+  before another poll and does not issue a final zero-timeout `poll` call;
+- EINTR recomputes the remainder, any other poll error is mapped immediately, and zero from `poll`
+  causes another monotonic recheck and another poll only when time remains, or `AL_TIMEOUT` without
+  another poll when the budget is exhausted; and
+- a positive readiness/error event wins over a simultaneously exhausted budget and is resolved
+  through `SO_ERROR`.
+
+Every immediate or polled success then checks `F_GETFL` and
+`F_SETFL(flags & !O_NONBLOCK)`. A restoration failure records that status, closes the candidate, and
+continues. No connection is published until blocking mode was checked-restored. The nonpositive
+raw-ABI blocking path stays unchanged: public HTTP callers reject negative values before this ABI,
+and raw `tcp.connect` supplies zero. DNS and the sum across multiple addresses have no end-to-end
+deadline; scheduler/kernel delay may return after an address's logical deadline.
+
+A nonzero `getaddrinfo` result returns before address iteration:
+`EAI_NONAME`/`EAI_NODATA` maps to `AL_INVALID`, while every other symbolic EAI value maps to
+`AL_CODE.saturating_add(eai.saturating_abs())`. The connection output remains null,
+transient host/service storage drops, no address-list owner escapes, and no socket is attempted.
+Symbolic EAI owners pin both categories, null output, cleanup, and zero socket calls.
+
+After successful resolution, resolver order is observable. Unsupported families, null addresses,
+and zero address lengths are skipped without changing the last failure. The first successful usable
+address wins. No usable address returns `AL_INVALID`; if every attempted candidate fails, the
+runtime returns the last status from socket creation, nonblocking `F_GETFL`, nonblocking `F_SETFL`,
+an immediate connect errno, poll error/timeout, `getsockopt(SO_ERROR)` failure, nonzero `SO_ERROR`,
+blocking-restore `F_GETFL`, or blocking-restore `F_SETFL`. Mixed-address owners put a skipped entry
+and a later success after each failure class; all-failure variants pin the last attempted status and
+close count.
+
+The same prerequisite fixes the shared socket-timeout conversion used by public
+`read_timeout_ns`/`write_timeout_ns` and the planned checked package row. Every positive nanosecond
+value becomes `ceil(ns / 1000)` microseconds and then a normalized
+`timeval { tv_sec, tv_usec: 0..999999 }`; exact microseconds remain exact, and zero retains the
+existing clear/no-timeout meaning. The option bounds one blocking wait for progress, not the total
+duration of a multi-read or multi-write operation.
+
+The planned source-reachable `TcpConnSetIoTimeout` consumer requires every non-null compatible caller
+to hold one live, unfreed connection exclusively across the call, with no live reader/writer shell
+derived from it and no other value retaining one at entry, and no overlapping read/write/
+configuration/reader-or-writer construction/free/Drop. It uses the exact normalized `timeval` and
+installs receive before send. With entry option states `{R0,S0}` and requested state `T`, receive
+failure performs exactly one `setsockopt`, returns its mapped status, makes no send call, and leaves
+`{R0,S0}`; send failure performs exactly two calls, returns the send mapped status, and leaves
+`{T,S0}`; success performs exactly two calls, returns zero, and leaves `{T,T}`. Either option failure
+requires the compatible caller to retire the connection, perform no read/write/configuration/
+reader-or-writer construction/retry, and free/Drop it exactly once; its zero-derived-shell entry
+state leaves no shell cleanup to order against that close. Success preserves usability and may
+construct derived shells afterward, but a later overwrite requires all such shells and retaining
+values to Drop first. The package calls only on a fresh unpublished clear/clear connection before
+shell construction and closes either failure without reopening resolution or trying another
+address. Owners pin live/exclusive/zero-derived-shell entry preconditions, pre-armed states, option
+order, call counts, returned status, retry prohibition, zero overlapping/post-failure constructor
+calls, retirement, and close/Drop. One structural owner classifies retainers by target-connection
+provenance through the complete active recursive Drop graph: direct/buffered reader, writer, or
+logger-owned writer leaves in locals/calls, struct fields, nested `Option`/`Result`, and admitted
+user-sum paths, plus elements of source-constructed fixed arrays of retaining structs. That last
+path composes the existing struct-field and fixed Move-struct-array rules and does not admit a
+direct handle array element. Derived from
+the canonical formation/Drop graph with a new-edge tripwire, it crosses inactive/moved-out states,
+other/mixed-connection shells, and zero/one/multiple target leaves; only zero is compatible. Every
+positive carrier class completes configure-construct-move-into-move-out-where-supported-or-
+recursive-Drop-reconfigure. Direct handle collections/boxes/tuples and direct reader/writer user-sum
+payloads remain formation negatives; nameable dynamic-array/slice shapes for retaining structs/sums,
+the admitted non-tuple shapes' user-struct-field closure, and the direct dynamic-array/slice element,
+tuple, and builtin `Option`/`Result` edges admitted for `DynStructArray` retain explicit no-live-
+producer owners.
+
+The ceil-to-microsecond conversion also serves shipped `std.http` plain/TLS/pool rearming. The
+poll-millisecond helper also serves `process.command`; that consumer adopts the same monotonic
+start-plus-budget arithmetic and ceil conversion for the complete positive-i64 range while keeping
+its existing post-syscall timeout-wins precedence. These are one shared prerequisite, not divergent
+package-local conversions.
+
+Acceptance owners cover exact/next and maximum-positive ns, us, ms, chunk, and deadline boundaries;
+failed `F_GETFL`/`F_SETFL` installation and restoration on immediate and polled success; early
+zero-result recheck versus exhausted/no-call poll, `EINPROGRESS`/`EAGAIN`/`EWOULDBLOCK` versus other
+immediate errno, EINTR remainder recomputation, readiness at the deadline, every resolver skip and
+last-status failure class, symbolic EAI branch, mixed-address close/continuation, no early expiry, a blocking-mode probe
+on every published connection, exact-timeval and pre-armed receive/send state plus caller-retirement products, HTTP
+plain/TLS/pool rearm, and command pipe-drain/post-EOF reap.
+
+---
+
+## SIGPIPE-safe connection-derived writer (`pkg.kv` prerequisite 2 — ACCEPTED DESIGN 2026-09-02)
+
+> **Status:** independently useful safety prerequisite; accepted design, implementation pending.
+> No public signature, compiler operation, runtime symbol, ABI shape, registry key, or
+> row count changes.
+
+The existing `c.writer() -> writer` remains the one TCP byte-write surface. Its private runtime
+`Writer` state gains a sink kind and macOS/BSD readiness bit set to socket/not-ready only by
+`align_rt_tcp_conn_writer`; standard-stream and file constructors set the generic-fd kind. A
+nonempty socket-kind `w.write(...)` keeps the one
+complete-write loop and exact existing Result taxonomy, with these platform rules:
+
+- Linux calls `send(MSG_NOSIGNAL)` for every attempt.
+- macOS/BSD lazily installs `SO_NOSIGPIPE` before the first send on that writer shell and caches only
+  success. A failed option installation returns its fixed errno-mapped `Error` before that call
+  sends bytes, leaves the shell not-ready for a later retry, and a successful installation then uses
+  `send` for this and later writes.
+- A partial send advances the remaining view, EINTR retries, an armed blocking-socket
+  `EAGAIN`/`EWOULDBLOCK` remains `Error.Timeout`, and positive-length zero progress is deterministic
+  `Error.Code(0)` rather than a spin or stale errno.
+
+There is no process-global signal handler or mask. A failure may follow bytes already written by an
+earlier attempt in the same call, so the caller receives the error and owns replay policy. File and
+standard-stream writers retain the existing `write(2)` path byte-for-byte. Connection-derived
+writers remain unbuffered and `owns_fd: false`; their `flush`/Drop has no pending write and only the
+`tcp_conn` closes the socket. `SO_NOSIGPIPE` is monotone and idempotent per socket: overlapping
+shells may each attempt it, each sends only after its own successful result, a failed shell remains
+retryable, no shell Drop clears it, and connection close discards it. A logger or `io.copy` that
+uses the same connection-derived writer inherits the socket sink kind instead of opening a second
+path.
+
+The existing keyed `IoWriterWriteBuilder` identity, A19
+`i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration,
+`unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI, attributes, and inclusion in the
+shipped 330/347/355 keyed/base/maximum counts do not change. Its source-visible builder overload
+borrows the builder bytes and delegates to the hardened `IoWriterWrite` row, so it cannot bypass the
+socket sink policy.
+
+Acceptance owners include failed macOS/BSD install with no send followed by retry, overlapping
+shells with success/failure in both orders, shell Drop without option clear, and connection close
+discarding the setting. Linux/macOS subprocess closed-peer tests cover direct slice and builder
+overloads, logger, and `io.copy` routes and must return `Error`, never die from SIGPIPE. Direct
+partial/EINTR/timeout/zero-progress tests and file/std writer parity remain separate owners.
+
+The checked timeout substrate lands first and the writer hardening second. After both, the planned
+`TcpConnSetIoTimeout` row and its `pkg.kv` package consumer activate together. Exact package
+consumption and the implementation boundary are in `../pkg-design/kv.md`; the one-row reservation
+and unchanged prerequisite ABI identities are recorded in `../20-runtime-abi-ledger.md`.

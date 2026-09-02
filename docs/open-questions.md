@@ -3225,6 +3225,65 @@ decorate step records those keys; comparisons never invoke the callable again. T
 shipped behavior normative without fixing the internal sorting algorithm. Full context:
 `impl/12-pipeline-closure-memory-io-simd-audit.md` §3.2.
 
+### `pkg.kv` v1 typed RESP2 client — SETTLED 2026-09-02
+
+The settled public surface is one opaque Move `client`, explicit `ClientOptions`, a closed
+`SetCondition` and `SetOptions`, the exact error sum `Invalid | Io(core.Error) | Server(string) |
+Decode | ResponseTooLarge | Protocol | Closed`, and four Impure operations: `connect`, `get`,
+`set`, and single-key `delete`. GET returns an owned `Option<string>`; SET reports whether its
+explicit `Always` / `IfAbsent` / `IfPresent` condition applied and optionally maps a positive
+nanosecond duration upward to Redis `PX` milliseconds; DEL reports whether one key was removed.
+
+V1 is synchronous RESP2 over explicit plaintext TCP only. Endpoint, per-address connect timeout,
+socket I/O timeout, and inclusive response cap are caller inputs; request keys/values and reply
+payloads have an exact 512 MiB ceiling. There is no generic command/reply value, URL, default,
+credential, database selection, retry, redirect, pool, transaction, script, pub/sub, protocol
+negotiation, TLS, client clock, or ambient configuration. One `borrow mut` operation owns each
+request/reply exchange. Transport, size, or uncertain framing failure closes the client; only a
+fully consumed bounded grammar-valid Simple Error payload (NUL/invalid UTF-8 admitted, CR/LF
+excluded, exact CRLF terminator) or non-UTF-8 GET payload is reusable. A CR/LF violation is retiring
+`Protocol`; error grammar/cap/framing/trailing validation precedes UTF-8 classification. Empty owned
+results use canonical null/zero without a final allocation.
+
+The first exact-SHA review found that the shipped positive-connect path ignored nonblocking install
+and blocking-restore failure and did not fix timeout quantization/precedence. The revised closure
+matrix therefore adds a first shared timeout-substrate prerequisite: monotonic start-plus-budget
+arithmetic across the complete positive-i64 range, checked fd-mode transitions,
+close-and-next-address failure, ceil/rechecked millisecond connect waits, named EAI mapping before
+resolver-order first-success/last failure, positive socket-I/O ns rounded up to normalized
+microseconds for
+`std.net`/`std.http`, and the same ceil/start-budget correction for `process.command`. RESP assembly,
+native-status decoding, and parsing stay in package source. Internal modules explicitly import
+`std.process`; every impossible status/count/view-length/view-pointer/output product reaches the
+existing keyed `ProcessAbort` before parsing or publication. A malformed private resource record is
+not a `Closed` producer; every operation and Drop reaches the same abort dependency before native
+I/O or untrusted pointer access. Implementation would then harden the
+existing connection-derived writer for SIGPIPE across its slice and builder overloads without an
+ABI/count change, and finally activate
+one planned fixed-symbol runtime row for checked socket timeout configuration with the package.
+Every non-null compatible caller must hold one live/unfreed connection exclusively with no live
+reader/writer shell derived from it and no other value retaining one at entry, and no read/write/
+configuration/reader-or-writer construction/free/Drop overlap; pre-armed
+receive/send state distinguishes unchanged receive-option failure, send-option failure with receive
+changed, and both-success.
+Either option failure mandates caller retirement, prohibits later read/write/configuration/
+reader-or-writer construction/retry, and requires exactly one later free/Drop. Success may construct
+derived shells, but another timeout call requires all such shells and retaining values to Drop
+first; the package calls before shell construction and closes its fresh unpublished connection
+without retry.
+Compiler registry recognition supplies exact extern compatibility/collision/reachability but none
+of these changes adds a language/HIR/MIR operation or public networking surface. Exact inputs, validation
+precedence, ownership, allocation, wire grammar, reuse/retirement rules, ABI reservation, and
+acceptance owners are recorded in `impl/pkg-design/kv.md` and
+`impl/20-runtime-abi-ledger.md`. The first fresh review found four remaining native/wire boundary
+gaps; the next complete review found two P3 consistency gaps in the timeout action lists and
+malformed-state error partition; the following review found one remaining P2 in the pre-existing-
+derived-shell entry state; its repair review found one P3 in the recursively reachable
+reader/writer/logger carrier owner graph. A fresh complete adversarial review of exact range
+`ad5d6969194c26b4cbd8c7521d15ed6ac05f49f7...d85efdb94cf81036e7555d4a1621c5356d602be3`
+accepted the fifth repair with no P0–P3 finding. This item is Settled and authorizes implementation
+in the recorded prerequisite order; no package source or planned ABI row is active yet.
+
 ## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)

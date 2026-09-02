@@ -3964,8 +3964,49 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   `Error.Invalid`; and module-wide capability collection means
   even session-only use retains libcrypto. Exact ledger and implementation matrix:
   `pkg-design/auth.md`.
-- **pkg.kv** — RESP2 typed Redis client; Move client; owned-string values; fail-closed on
-  protocol violation. (rediss:// TLS deferred; plaintext TCP v1.)
+- **pkg.kv — ACCEPTED DESIGN 2026-09-02; IMPLEMENTATION PENDING** — one synchronous plaintext RESP2 client with an
+  opaque Move owner; explicit connect and socket-I/O timeouts plus an inclusive response cap;
+  owned-string GET; SET with exact `Always` / `IfAbsent` / `IfPresent` conditions and optional
+  positive nanosecond expiry rounded upward to Redis `PX` milliseconds; and one-key DEL. The only
+  public operations are `connect`, `get`, `set`, and `delete`; uncertain transport/framing/size
+  failure retires the client, while a fully consumed bounded grammar-valid Simple Error payload
+  (NUL/invalid UTF-8 admitted, CR/LF excluded, exact CRLF terminator) or non-UTF-8 GET reply remains
+  synchronized; grammar/cap/trailing validation precedes UTF-8 classification and CR/LF violation
+  is retiring `Protocol`; empty owned results use canonical null/zero. There is no generic
+  command/reply value, default endpoint, credential,
+  database, retry, redirect, pool, transaction, script, pub/sub, protocol negotiation, client
+  clock, or TLS. The first exact-SHA review found unchecked nonblocking install/restore and
+  under-specified timeout/address/native/cache behavior. The revised first prerequisite hardens the
+  shared timeout substrate with full-range start-plus-budget arithmetic, checked fd-mode
+  transitions, ceil/rechecked connect waits, named EAI mapping before resolver-order
+  first-success/last-failure selection,
+  shared `std.net`/`std.http` positive-I/O-ns ceil-to-microsecond conversion, and the same
+  poll conversion for `process.command`. A second prerequisite hardens the existing
+  connection-derived writer in place for
+  SIGPIPE-safe complete writes and explicit fail/retry/overlap/transitive-route owners, with no
+  ABI/count change, including the existing builder overload. Package source owns RESP and exact
+  native-status/count/view-length/view-pointer decoding before typed-slice construction. Impossible
+  products use an explicit `std.process` dependency and existing keyed `ProcessAbort` before
+  parsing, publication, or ownership change; every malformed private resource operation/Drop uses
+  the same dependency before native I/O or untrusted pointer access. Its
+  implementation atomically activates one planned compiler-recognized fixed-symbol row for checked socket timeout
+  installation without a language/HIR/MIR operation. Its non-null compatible callers must hold a
+  live connection exclusively with no live reader/writer shell derived from it and no other value
+  retaining one at entry, and no read/write/configuration/reader-or-writer construction/free/Drop
+  overlap;
+  pre-armed receive/send state distinguishes unchanged receive-option
+  failure, send-option failure with receive changed, and success. Either failure mandates caller
+  retirement, prohibits later read/write/configuration/reader-or-writer construction/retry, and
+  requires one free/Drop. Success may construct shells only after the call; another call requires
+  all derived shells/retainers to Drop first, while the package configures its fresh unpublished
+  connection before shell construction and closes either failure. A fresh complete
+  review found four native/wire boundary gaps; the next complete review found two P3 consistency
+  gaps in the timeout action lists and malformed-state error partition; the following review found
+  one P2 in the pre-existing-derived-shell entry state; its repair review found one P3 in the
+  recursively reachable reader/writer/logger carrier owner graph. A fresh complete review accepted
+  the fifth repair with no P0–P3 finding. Package source and the planned ABI row remain inactive;
+  implementation starts with the first shared timeout-substrate prerequisite. Exact ledger and
+  implementation closure matrix: `pkg-design/kv.md`.
 - **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
   fields only are arena-normalized; BOM stripped once.
 - **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to
