@@ -811,7 +811,7 @@ new `Ty` or `Scalar` variant or format version is reserved. Their exact definiti
 
 | Reserved record | Exact checked contract |
 |---|---|
-| `CsvDecode` | Non-child `row: Ty` is template-only `Ty::Param(p)` during the discarded abstract check, with the exact matching existing `SoaParam(p)` result and `SoaPlain` bound, or emitted `Ty::Struct(id)` naming one concrete record in the complete existing `SoaPlain` domain with no CSV-specific field-count cap and unique source names. Explicit AoS layout/alignment does not narrow the bound. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. The concrete result is canonical `Result<soa<id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance. No fact reaches the error alternative. |
+| `CsvDecode` | Non-child `row: Ty` is template-only `Ty::Param(p)` during the discarded abstract check, with the exact matching existing `SoaParam(p)` result and `SoaPlain` bound, or emitted `Ty::Struct(id)` naming one concrete record in the complete existing `SoaPlain` domain with no CSV-specific field-count cap and unique source names. Explicit AoS layout/alignment does not narrow the bound. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. The concrete result is canonical `Result<soa<id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance, including the existing `Frame`-bounded synthetic owner when `input` auto-borrows an unbound owned `string` temporary. That owner survives fresh and control-wrapped input formation and follows the ordinary later-child cleanup/no-cleanup rule. No fact reaches the error alternative. |
 
 Sema may form the record only for the exact compiler-private call spelling
 `pkg.csv.internal.descriptor.decode` in the canonical vendored root `pkg.csv` public generic
@@ -841,6 +841,14 @@ record once into header tag, line-ending tag, and row bound; it retains the conc
 destination region, result/provenance, and private status map. Status 0 publishes `Ok`, 1 publishes
 `Err(Invalid)`, 2 publishes `Err(LimitExceeded)`, and every other status reaches the canonical
 package's explicit `ProcessAbort` dependency without publishing output.
+
+For a string-bearing schema, region, escape, storage-generation, and borrow traversals preserve an
+auto-borrowed owned input's path-local synthetic owner through direct function/literal results,
+blocks, `if`, `match`, `else`, `?`, `map_err`, and value-carrying loops. The result remains
+`Frame`-bounded and cannot escape by return. If the already-completed input is followed by a
+terminating arena or options child, no operation/result fact is published; cleanup-carrying exits
+drop the armed owner exactly once and no-cleanup sinks invent no Drop. Primitive-only schemas do not
+publish the input owner in the result fact.
 
 Activation must update every expression match, replay/clone/depth/effect/region/escape/type-
 placement/storage-generation traversal, canonical HIR codec, semantic projection, interface and

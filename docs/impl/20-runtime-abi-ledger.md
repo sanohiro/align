@@ -439,8 +439,11 @@ cannot prove an arbitrary nonnull address's backing range and do not make an oth
 unsafe call defined.
 
 `CsvField` is target-native `#[repr(C)]` / non-packed LLVM
-`{ name_ptr: ptr, name_len: i64, tag: i32, reserved: i32 }`. The global uses at least the exact
-`repr(C)` alignment, size, and field offsets. Names are nonempty static source identifiers in
+`{ name_ptr: ptr, name_len: i64, name_hash: u64, tag: i32, reserved: i32 }`. The global uses at least the exact
+`repr(C)` alignment, size, and five field offsets. `name_hash` is 64-bit FNV-1a over the exact name
+bytes, with offset basis `14695981039346656037` followed for each byte by xor and wrapping multiply
+by `1099511628211`. Runtime name validation recomputes and authenticates it before later header
+projection reads the stored hash without rehashing the descriptor. Names are nonempty static source identifiers in
 declaration order: first byte ASCII `_`/letter, remaining bytes ASCII `_`/letter/digit, and not one
 of exact reserved tokens `fn`, `return`, `mut`, `pub`, `module`, `import`, `if`, `else`, `true`,
 `false`, `arena`, `task_group`, `match`, `loop`, `break`, `template`, `unsafe`, `extern`, or `as`.
@@ -449,17 +452,28 @@ descriptor phase. `reserved` is zero. `tag` is `(signed << 16) | (kind << 8) | w
 integer kind 0 with width 1/2/4/8 and sign bit 16; bool kind 1 width 1; float kind 2 width 4/8; str
 kind 3 width 16; char kind 4 width 4. All other bits are zero. Before input access or arena effects,
 the runtime validates output and arena, every count/range/pointer product, every descriptor field,
-and descriptor-name uniqueness.
+and each name's grammar while hashing its bytes once. It does not compare descriptor names with one
+another. Record validation and checked descriptor emission prove declaration-order uniqueness for
+compiler-produced calls; an exact-compatible unsafe caller must provide the same pairwise-unique
+precondition. A violation is outside the unsafe contract, is not authenticated by the runtime, and
+is not promised `-1`.
 
 Validation order is output, arena, output zeroing; header tag, line-ending tag, row bound;
 positive representable descriptor count, table size/alignment/non-null guards, then each declaration-
-order record's positive name length, name range/source-identifier bytes, tag, and zero reserved
-field, followed by pairwise uniqueness in ascending right/left ordinal; input representation; complete UTF-8
-validation; CSV/header/data/layout; and finally a
+order record's positive name length, name range/source-identifier bytes and one hash, matching
+`name_hash`, tag, and zero reserved field; input representation; complete UTF-8 validation;
+CSV/header/data/layout; and finally a
 nonempty allocation/fill. Thus negative `max_rows` returns 1 before malformed descriptor inspection
 whenever output and arena are valid. Invalid UTF-8 returns `-1` before BOM/CSV parsing and arena
 allocation. Malformed private input returns `-1`; descriptor and input are never inspected before
 their preceding phase.
+
+For `F` descriptor records containing `B` total name bytes, the pre-input phase visits exactly `F`
+records and hashes exactly `B` bytes. Absent-header decode performs no later name lookup. Present-
+header decode has `H <= 1024` physical names and performs one bounded fixed-table lookup per
+descriptor; confirmed-collision candidate comparisons are at most `F * H`, with at most `B * H`
+descriptor-name bytes compared. Test counters pin these bounds for wide and common-prefix schemas,
+so the uncapped descriptor domain has no quadratic descriptor-to-descriptor path.
 
 Activation is one atomic package/HIR/MIR/runtime capability: it adds the key, exact declaration
 golden, definition/export, collision reservation, capability collection, fingerprints, and all

@@ -4027,7 +4027,10 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   zero rows as `{null, 0}` without allocation; nonempty output then uses one exact arena allocation
   and direct column fill. Clean text borrows input spans and only doubled-
   quote fields are normalized into the output block. Primitive schemas retain `out`, string-bearing
-  schemas retain `input` and `out`, and recoverable errors leave the arena unchanged. Canonical
+  schemas retain `input` and `out`, including the frame-bounded synthetic owner of an auto-borrowed
+  owned input temporary, and recoverable errors leave the arena unchanged. Checked descriptor
+  emission proves unique names; runtime validation hashes each name once and has no uncapped
+  pairwise descriptor scan. Canonical
   package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only
   together. Abstract generic checking uses a discarded parameter-shaped operation and only concrete
   monomorph rechecking emits it; the schema accepts the complete existing `SoaPlain` domain without

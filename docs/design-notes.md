@@ -1532,6 +1532,14 @@ lifetimes visible in the result type while avoiding per-field strings, an AoS st
 transpose. Streaming needs a different chunk/view lifetime and is therefore a later capability,
 not an overload of this materializer.
 
+An owned `string` supplied where `input: str` is expected uses the existing path-local synthetic
+owner. A string-bearing result carries that owner at `Frame` through all value-producing control
+forms, so zero-copy columns cannot outlive a temporary. Descriptor uniqueness is already proved by
+record formation and checked emission. The runtime therefore validates and hashes every descriptor
+name once to authenticate the pinned `name_hash` field, relies on the same invariant from an
+exact-compatible unsafe caller, and performs no
+uncapped pairwise descriptor scan; bounded Present-header lookup supplies the work ceiling.
+
 The checked `CsvDecode` operation and reserved A123 runtime row must activate together with the
 canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR while making LLVM a
 pure descriptor-and-call lowering. The generic wrapper's abstract check uses the existing symbolic

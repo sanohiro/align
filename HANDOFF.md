@@ -423,7 +423,9 @@ facts must live in this repository.
   ABI shape A123 must activate atomically. Its generic wrapper uses a discarded symbolic form during
   abstract checking and emits only concretely rechecked monomorphs over the complete existing
   `SoaPlain` domain with no CSV schema-count cap. Raw ABI input is UTF-8-prevalidated and 1024 limits
-  only physical Present headers; implementation is next. The design changes no shipped
+  only physical Present headers. String-bearing output retains any auto-borrowed owned input's
+  frame-bounded synthetic owner, while checked emission replaces any uncapped pairwise descriptor
+  scan with compiler-owned name uniqueness and one validation/hash pass; implementation is next. The design changes no shipped
   package or runtime inventory until that boundary lands.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar

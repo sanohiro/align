@@ -12,8 +12,10 @@ A raw-ABI UTF-8 prevalidation followed by a complete allocation-free first decod
 grammar, selected scalar conversions, bounds, and layout. Zero rows return canonical `{null, 0}` without allocation; a nonempty second decode pass allocates
 an exact arena block and fills columns directly. Clean strings borrow the input; only doubled-quote
 fields are normalized into the arena. Primitive records retain
-only the output region, while string-bearing records retain both input and output. Errors publish
-no partial result and do not advance the arena.
+only the output region, while string-bearing records retain both input and output, including the
+existing frame-bounded synthetic owner for an auto-borrowed owned input temporary. Checked record
+formation proves emitted descriptor-name uniqueness, avoiding an uncapped pairwise runtime scan.
+Errors publish no partial result and do not advance the arena.
 
 Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
 operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a
@@ -44,7 +46,8 @@ shipped root `pkg.kv`, `pkg.kv.internal.resource`, and the checked ABI row toget
 implemented first-party inventory to five vendorable subtrees. The current runtime inventory is 330
 keyed plus 18 unkeyed records, 13 of the unkeyed records source-reachable: 348 base exports, 352
 with either four-row probe feature alone, and 356 at the maximum combined probe surface. A123
-remains the next unreserved ABI shape. Exact surface, ownership, wire grammar, error precedence,
+was then the next unreserved ABI shape; the later accepted `pkg.csv` design reserves it without
+activation or a count change. Exact surface, ownership, wire grammar, error precedence,
 prerequisites, and implementation matrix: `docs/impl/pkg-design/kv.md`.
 
 ## 2026-09-01: auth composes fixed protocols over the one crypto substrate

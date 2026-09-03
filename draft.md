@@ -3815,7 +3815,12 @@ decode pass then validates the document. A zero-row success returns canonical `{
 otherwise the second decode pass allocates one exact arena block and fills SoA columns directly, with no
 AoS intermediate or transpose. Clean `str` cells borrow input spans; only fields
 containing doubled quotes are decoded into the output block. Primitive-only results depend on
-`out`; results containing `str` depend on both `input` and `out`. Error leaves `out` unchanged.
+`out`; results containing `str` depend on both `input` and `out`. An implicit borrow of an unbound
+owned `string` input retains its existing synthetic owner at `Frame` through every value-carrying
+control wrapper and cannot escape that frame. Error leaves `out` unchanged. Compiler-produced
+descriptors inherit unique names from checked record formation; the runtime validates and hashes
+each descriptor once, retains the pinned value in `CsvField.name_hash`, and performs no uncapped
+descriptor-to-descriptor uniqueness scan.
 
 The implementation must add one checked `CsvDecode` HIR/MIR operation and reserved keyed ABI shape
 A123 atomically with canonical package admission and owner tests. Abstract generic checking uses a

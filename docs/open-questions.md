@@ -36,7 +36,11 @@ input, exact scalar conversions, row bound, and layout without allocation. Zero 
 `{null, 0}` without allocation; the second decode pass makes one exact arena allocation only for nonempty output and fills SoA columns directly.
 Clean text borrows input spans; only doubled-quote text is normalized into the same
 block. A primitive-only result depends on `out`; a string-bearing result depends on `input` and
-`out`. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
+`out`. An auto-borrowed owned `string` input keeps its path-local synthetic owner at `Frame` through
+all value-carrying control wrappers and cannot escape that frame. Compiler-produced descriptors use
+checked record-name uniqueness; runtime validation hashes each name once and never performs an
+uncapped descriptor-to-descriptor scan, retaining the pinned result in `CsvField.name_hash` for
+Present lookup. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
 conversion are `Invalid`; the header cap, first complete row beyond the inclusive bound, and
 unrepresentable layout are `LimitExceeded`; OOM and impossible private states abort.
 

@@ -1509,7 +1509,11 @@ allocation-free first decode pass validates the complete successful document. Ze
 canonical `{null, 0}` without allocation; only a nonempty second decode pass makes one exact arena
 allocation and fills SoA columns directly. Clean strings borrow input spans, while
 only doubled-quote strings are normalized into the output block. Primitive-only results retain
-`out`; string-bearing results retain `input` and `out`. Error does not advance the arena.
+`out`; string-bearing results retain `input` and `out`. An implicit borrow of an unbound owned
+`string` input retains its existing synthetic owner at `Frame` through value-carrying control and
+cannot escape that frame. Error does not advance the arena. Checked record formation proves
+compiler descriptor-name uniqueness; runtime descriptor validation is one record/name-hash pass,
+retains the pinned value in `CsvField.name_hash`, and is not an uncapped pairwise name scan.
 
 Implementation activates canonical package admission, checked `CsvDecode` HIR/MIR, and reserved
 keyed ABI shape A123 atomically. Abstract generic checking uses a discarded parameter-shaped HIR
