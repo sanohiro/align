@@ -425,7 +425,9 @@ facts must live in this repository.
   `SoaPlain` domain with no CSV schema-count cap. Raw ABI input is UTF-8-prevalidated and 1024 limits
   only physical Present headers. String-bearing output retains any auto-borrowed owned input's
   frame-bounded synthetic owner, while checked emission replaces any uncapped pairwise descriptor
-  scan with compiler-owned name uniqueness and one validation/hash pass; implementation is next. The design changes no shipped
+  scan with compiler-owned name uniqueness and one validation/hash pass. `CsvDecode` remains Pure
+  for sequential use, but its required `region` is non-Send; the shared parallel-worker gate rejects
+  both `spawn` and `par_map` captures before publication or allocation. Implementation is next. The design changes no shipped
   package or runtime inventory until that boundary lands.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar

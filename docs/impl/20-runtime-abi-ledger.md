@@ -394,9 +394,11 @@ an error publishes no output.
 
 The right input is always indexed in ascending ordinal order. The runtime counts stable matches
 before one exact output allocation, probes again to fill left-major/right-ascending pairs, confirms
-equality after every hash match, and retains no input pointer. Activation moves the
-keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and makes A123 the next
-unreserved shape. Exact public semantics and owner matrix: `pkg-design/frame.md`.
+equality after every hash match, and retains no input pointer. Activation moved the
+keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and made A123 the next
+unreserved shape at that time. The later accepted inactive `pkg.csv` design reserves A123, so A124 is
+now the next unreserved design shape. Exact public semantics and owner matrix:
+`pkg-design/frame.md`.
 
 ## Reserved `pkg.csv` extension (designed 2026-09-03; inactive)
 

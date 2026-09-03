@@ -476,7 +476,10 @@ ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight 
 The range kernel loops over typed input/output GEPs, loads Copy captures once from the immutable
 call-scoped context, calls the Pure Align function directly, and stores each output. LLVM can inline
 and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
-element. A chunk source is an owned array of borrowed `{ptr,len}` slice headers, so the same typed
+element. Every capture type must also be worker-Send. Checked HIR rejects exact `ArenaHandle`
+before MIR; codegen defensively rejects the same type in handcrafted `ParMapParallel` and
+`ParMapReduce` MIR before context layout, kernel/global publication, or a runtime declaration/call.
+A chunk source is an owned array of borrowed `{ptr,len}` slice headers, so the same typed
 loop passes one `slice<T>` value to the chunk function and the caller drops the header buffer after
 the synchronous runtime call. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses
 plain wrapping addition, and stores one partial at the range output pointer; the runtime combines the

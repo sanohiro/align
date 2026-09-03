@@ -231,9 +231,10 @@ Both are C calling convention and `nounwind`, with no curated memory, return, or
 attribute. The final output pointer is an
 aligned writable `AlignStr` header, not an Align source `str`; its pointer names an allocation of
 16-byte `RowPair` elements and its length is an element count. The two symbols, keyed rows,
-checked-HIR discriminators, package interface, and owners are active atomically. They move the
-keyed/base/maximum-optional-probe inventories from 328/345/353 to 330/347/355 and make A123 the
-next unreserved shape.
+checked-HIR discriminators, package interface, and owners are active atomically. Their activation
+moved the keyed/base/maximum-optional-probe inventories from 328/345/353 to 330/347/355 and made
+A123 the next unreserved shape at that time. The later accepted inactive `pkg.csv` design reserves A123, so A124
+is now the next unreserved design shape.
 
 ## Complexity and performance boundary
 

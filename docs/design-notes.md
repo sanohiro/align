@@ -462,6 +462,14 @@ There is no allocator trait, lifetime parameter, cross-arena sharing, or automat
 explicit `clone_in(out)` marks the unavoidable transition from a short-lived input view to
 owned output.
 
+**Pure does not make a destination region Send.** Allocation into a named arena can be Pure for
+ordinary sequential evaluation while still requiring exclusive lexical ownership of that arena's
+cursor. The `region` capability therefore cannot cross any parallel-worker boundary: `spawn` and
+`par_map` share one capture rejection, independent of effect inference. Sequential direct calls,
+closures, `map`, and `reduce` remain valid when the normal region analysis proves the lifetime.
+This keeps parallel safety in the general capability rule instead of making an allocating package
+Impure or adding a package-specific synchronization exception.
+
 **Static SQL is one statement-artifact mechanism, not a Query-only exception.** A row-returning
 Query and a rowless command differ only in Row/result/decode data. Both use the same item identity,
 source/wire SQL split, generated Params binder, retention plan, per-driver checked state, producer
@@ -578,9 +586,11 @@ for a closure that escapes *every* region — e.g. one returned to an unbounded 
 the deferred first-class-closure design; the `task_group` consumer is scope-bounded and clean.)
 
 The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
-captured values but not mutate external state), which is what makes data-parallel execution safe
-without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
-safety comes from capture being by value (no shared mutable state) rather than from purity.
+captured values but not mutate external state), and every worker capture must independently be
+Send. In particular, the Copy `region` capability is non-Send because it can advance one shared
+arena cursor. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its safety
+comes from by-value capture of Send values rather than from purity; it rejects the same region
+capability.
 Successful-Wait evidence follows the Result value only through transparent local/control
 operations. It is not inferred through a call, return, capture, import, or aggregate: those
 boundaries would require a second hidden effect/provenance summary. Each fallible Wait also has a
@@ -1539,6 +1549,11 @@ record formation and checked emission. The runtime therefore validates and hashe
 name once to authenticate the pinned `name_hash` field, relies on the same invariant from an
 exact-compatible unsafe caller, and performs no
 uncapped pairwise descriptor scan; bounded Present-header lookup supplies the work ceiling.
+
+The decoder is Pure for sequential use, but every call carries an explicit destination `region`.
+Because that capability is non-Send independently of effect, neither a `spawn` nor `par_map` worker
+may capture it to call the decoder. The shared parallel-worker gate rejects before a worker, MIR,
+generated identity, runtime call, or allocation is published.
 
 The checked `CsvDecode` operation and reserved A123 runtime row must activate together with the
 canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR while making LLVM a

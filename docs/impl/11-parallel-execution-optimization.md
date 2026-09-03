@@ -116,7 +116,9 @@ uses the same stable count/prefix/scatter path as a callable filter.
 Otherwise it appends a normal `map` stage and executes the sequential collect loop
 ([MIR lowering](../../crates/align_mir/src/lib.rs#L2874-L2921)). In particular:
 
-- a capturing `par_map` with Copy captures uses the range kernel and immutable context;
+- a capturing `par_map` with worker-Send Copy captures uses the range kernel and immutable context;
+- exact `ArenaHandle` is non-Send and rejects before MIR even when the callable is Pure; backend
+  validation rejects a handcrafted MIR recurrence before context/kernel/runtime publication;
 - Move captures remain rejected by the existing ownership checks;
 - primitive-scalar `map(...).par_map(...)` chains use the same range kernel, including their stage
   captures;
@@ -429,7 +431,8 @@ node's parallel contract. No generic parallel reduction is implied.
 The source semantics already say a non-escaping pipeline lambda uses captures as parameters. The
 range kernel now carries one immutable context pointer:
 
-1. codegen builds a typed call-scoped record from captured Copy values;
+1. codegen builds a typed call-scoped record from captured worker-Send Copy values; exact
+   `ArenaHandle` is rejected before layout as a defensive malformed-MIR check;
 2. the synchronous runtime call receives its address and never retains or dereferences it after a
    successful range claim;
 3. the generated range kernel loads invariant fields once and passes them as direct extra

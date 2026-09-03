@@ -16,6 +16,9 @@ only the output region, while string-bearing records retain both input and outpu
 existing frame-bounded synthetic owner for an auto-borrowed owned input temporary. Checked record
 formation proves emitted descriptor-name uniqueness, avoiding an uncapped pairwise runtime scan.
 Errors publish no partial result and do not advance the arena.
+The decoder stays Pure for sequential use, while the general non-Send region rule rejects its
+explicit destination capability at both `spawn` and `par_map` worker boundaries before publication
+or allocation.
 
 Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
 operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a

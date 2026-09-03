@@ -364,9 +364,11 @@ trusting the stored bits:
    `FnTy` has `Unknown`; unrelated equal source signatures retain distinct
    cells. `Impure` dominates `Unknown`, which dominates `Pure`.
 9. Require every `ArrayParMap` and widened parallel-stage callable to resolve
-   to complete replayed `Pure`. `Unknown`, `Impure`, an absent target, and an
-   incomplete boundary cell reject before any MIR or generated-kernel identity
-   is constructed.
+   to complete replayed `Pure`. Independently require every staged and terminal
+   capture to exclude exact `Ty::ArenaHandle`, using the same non-Send authority
+   as `spawn`. `Unknown`, `Impure`, an absent target, an incomplete boundary
+   cell, and any region capture reject before any MIR, generated-kernel identity,
+   runtime call, or allocation is constructed.
 10. Re-run the producer's per-`task_group` successful-wait dominance fact.
     A group starts with no completed task generation. Each group has one
     compiler-only preorder `group: usize`, abstract `current_generation` and
@@ -1052,7 +1054,7 @@ means:
 | `ArrayToSoa` | `env[struct_id]`: in-range nonempty SoA-admissible flat struct and the expression is lexically inside an active arena. `child[source]`; `post[source fixed/dynamic StructArray(struct_id); result Soa(struct_id); source borrowed; result storage belongs to that exact active arena]`. |
 | `ArrayMapInto` | `env[stages,elem]`: elem is admitted Copy scalar and every stage is length-preserving (`Map`/`Project`, no filter). `child[source,stage children,dst]`; `post[PIPE final element elem; dst writable Slice(elem), exact equal-length runtime contract and semantic no-alias proof; result Unit; dst mutated, no allocation]`. |
 | `ArrayPartition` | `env[stages,func,elem,captures.len]`: predicate resolves. `child[source,stage children,captures]`; `post[PIPE final element elem; predicate params elem,captures→Bool; result is exact interned tuple (DynArray(elem),DynArray(elem)); two owned allocations]`. |
-| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and its structural signature is exact; the `complete reachable effect == Pure` requirement is an am-b4 producer fact, not consumed by the dormant am-b2b1 body slice. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
+| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and its structural signature is exact; the `complete reachable effect == Pure` and exact `Ty::ArenaHandle`-free staged/terminal capture requirements are am-b4 producer facts, not consumed by the dormant am-b2b1 body slice. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy and no region capability; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
 | `ArrayChunks` | `env[elem]`: primitive Copy scalar. `child[source,n]`; `post[source fixed/dynamic array or Slice(elem), n i64; result DynSliceArray(prim(elem)); owned header array whose elements view source; source remains live]`. |
 | `ArrayToSlice` | `env[]`; `child[array]`; `post[array is fixed Array(s,n), fixed StructArray(id,n), DynArray(s), or AoS DynStructArray(id); fixed sources are Local or ArrayLit, element identity is exact, and result is matching Slice(s/Struct(id)); view borrows array storage, no allocation]`. |
 | `Len` | `env[]`; `child[recv]`; `post[recv is exactly Str, String, Slice(_), DynArray(_), DynStructArray(_,_), DynSliceArray(_), DynResponseArray, or Soa(_); result i64; recv borrowed. Fixed-array lengths are Int literals and never Len records]`. |
