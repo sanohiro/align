@@ -10259,6 +10259,7 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayDictEncode { struct_id, .. } => {
                 remap_id(struct_id, &remap.structs, valid)
             }
+            ExprKind::CsvDecode { row, .. } => remap_ty(row, remap, valid),
             ExprKind::JsonOwnedEncode { plan, .. }
             | ExprKind::JsonOwnedEncodeBounded { plan, .. }
             | ExprKind::JsonOwnedDecode { plan, .. } => {

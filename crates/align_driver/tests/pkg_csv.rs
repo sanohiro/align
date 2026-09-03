@@ -119,6 +119,8 @@ fn generic_forwarding_and_explicit_row_layouts_keep_the_soa_plain_domain() {
 import pkg.csv
 layout(C) CRow { small: i8, wide: i64 }
 align(16) ARow { value: f64 }
+Wrap<T> { value: T }
+fn keep<T>(value: Wrap<T>) -> Wrap<T> = value
 fn forward<R: SoaPlain>(input: str, out: region, options: pkg.csv.DecodeOptions) -> Result<soa<R>, pkg.csv.Error> =
   pkg.csv.decode(input, out, options)
 fn main() -> i32 {
@@ -126,9 +128,12 @@ fn main() -> i32 {
     options := pkg.csv.DecodeOptions { header: pkg.csv.Header.Absent, line_ending: pkg.csv.LineEnding.Lf, max_rows: 1 }
     c: Result<soa<CRow>, pkg.csv.Error> := forward("2,40", out, options)
     a: Result<soa<ARow>, pkg.csv.Error> := forward("0.5", out, options)
+    w: Result<soa<Wrap<i64>>, pkg.csv.Error> := forward("0", out, options)
     c_rows := c else { return 1 }
     a_rows := a else { return 2 }
-    return c_rows.small[0] as i32 + c_rows.wide[0] as i32 + a_rows.value[0] as i32
+    w_rows := w else { return 3 }
+    _ := keep(Wrap { value: 0 })
+    return c_rows.small[0] as i32 + c_rows.wide[0] as i32 + a_rows.value[0] as i32 + w_rows.value[0] as i32
   }
 }
 
