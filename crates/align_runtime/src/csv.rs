@@ -267,22 +267,32 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn field_width(tag: i32) -> Option<usize> {
+fn field_shape(tag: i32) -> Option<(u32, bool, usize)> {
     let bits = u32::try_from(tag).ok()?;
     let signed = bits >> 16;
     let kind = (bits >> 8) & 0xff;
-    let width = (bits & 0xff) as usize;
+    let width = usize::try_from(bits & 0xff).ok()?;
     if bits & 0xff00_0000 != 0 || signed > 1 {
         return None;
     }
     match (kind, width, signed) {
-        (KIND_INT, 1 | 2 | 4 | 8, 0 | 1) => Some(width),
-        (KIND_BOOL, 1, 0) => Some(1),
-        (KIND_FLOAT, 4 | 8, 0) => Some(width),
-        (KIND_STR, 16, 0) => Some(16),
-        (KIND_CHAR, 4, 0) => Some(4),
+        (KIND_INT, 1 | 2 | 4 | 8, 0 | 1)
+        | (KIND_BOOL, 1, 0)
+        | (KIND_FLOAT, 4 | 8, 0)
+        | (KIND_STR, 16, 0)
+        | (KIND_CHAR, 4, 0) => Some((kind, signed != 0, width)),
         _ => None,
     }
+}
+
+fn field_width(tag: i32) -> Option<usize> {
+    field_shape(tag).map(|(_, _, width)| width)
+}
+
+fn header_slot(hash: u64) -> usize {
+    // The fixed 2048-entry table makes both conversions lossless on every Rust target.
+    let mask = u64::try_from(HEADER_TABLE_CAP - 1).unwrap_or_else(|_| align_rt_alloc_size_fail());
+    usize::try_from(hash & mask).unwrap_or_else(|_| align_rt_alloc_size_fail())
 }
 
 fn source_identifier(bytes: &[u8]) -> bool {
@@ -300,10 +310,10 @@ fn source_identifier(bytes: &[u8]) -> bool {
 
 fn descriptor_name(field: &CsvField) -> Result<&[u8], i32> {
     let n = safe_len(field.name_len).map_err(|()| STATUS_BAD_ABI)?;
-    if n == 0 || field.name_ptr.is_null() || n > isize::MAX as usize {
+    if n == 0 || field.name_ptr.is_null() || n > isize::MAX.unsigned_abs() {
         return Err(STATUS_BAD_ABI);
     }
-    let start = field.name_ptr as usize;
+    let start = field.name_ptr.addr();
     start.checked_add(n).filter(|end| *end >= start).ok_or(STATUS_BAD_ABI)?;
     Ok(unsafe { slice::from_raw_parts(field.name_ptr, n) })
 }
@@ -363,21 +373,18 @@ fn parse_integer(bytes: &[u8], signed: bool, width: usize) -> Option<u64> {
             let value = (0u128.wrapping_sub(magnitude)) & ((1u128 << bits) - 1);
             u64::try_from(value).ok()
         } else {
-            (magnitude <= max).then_some(magnitude as u64)
+            (magnitude <= max).then(|| u64::try_from(magnitude).ok()).flatten()
         }
     } else {
         let max = (1u128 << bits) - 1;
-        (magnitude <= max).then_some(magnitude as u64)
+        (magnitude <= max).then(|| u64::try_from(magnitude).ok()).flatten()
     }
 }
 
 fn validate_cell(cell: Cell, src: &[u8], field: &CsvField) -> bool {
     #[cfg(test)]
     probe_update(|probe| probe.conversions += 1);
-    let bits = field.tag as u32;
-    let signed = bits >> 16 != 0;
-    let kind = (bits >> 8) & 0xff;
-    let width = (bits & 0xff) as usize;
+    let Some((kind, signed, width)) = field_shape(field.tag) else { return false };
     let Some(bytes) = decoded_ascii(cell, src) else {
         return kind == KIND_STR || (kind == KIND_CHAR && cell.decoded_len(src) == Some(1));
     };
@@ -392,17 +399,14 @@ fn validate_cell(cell: Cell, src: &[u8], field: &CsvField) -> bool {
 }
 
 unsafe fn write_cell(cell: Cell, src: &[u8], field: &CsvField, dst: *mut u8, text: &mut *mut u8) -> Option<()> {
-    let bits = field.tag as u32;
-    let signed = bits >> 16 != 0;
-    let kind = (bits >> 8) & 0xff;
-    let width = (bits & 0xff) as usize;
+    let (kind, signed, width) = field_shape(field.tag)?;
     match kind {
         KIND_INT => {
             let value = parse_integer(decoded_ascii(cell, src)?, signed, width)?;
             match width {
-                1 => unsafe { ptr::write(dst, value as u8) },
-                2 => unsafe { ptr::write_unaligned(dst.cast::<u16>(), value as u16) },
-                4 => unsafe { ptr::write_unaligned(dst.cast::<u32>(), value as u32) },
+                1 => unsafe { ptr::write(dst, u8::try_from(value).ok()?) },
+                2 => unsafe { ptr::write_unaligned(dst.cast::<u16>(), u16::try_from(value).ok()?) },
+                4 => unsafe { ptr::write_unaligned(dst.cast::<u32>(), u32::try_from(value).ok()?) },
                 8 => unsafe { ptr::write_unaligned(dst.cast::<u64>(), value) },
                 _ => return None,
             }
@@ -431,13 +435,13 @@ unsafe fn write_cell(cell: Cell, src: &[u8], field: &CsvField, dst: *mut u8, tex
         KIND_CHAR => {
             let value = if cell.escaped {
                 if cell.decoded_len(src)? != 1 { return None; }
-                b'"' as u32
+                u32::from(b'"')
             } else {
                 let s = str::from_utf8(&src[cell.start..cell.end]).ok()?;
                 let mut chars = s.chars();
                 let one = chars.next()?;
                 if chars.next().is_some() { return None; }
-                one as u32
+                u32::from(one)
             };
             unsafe { ptr::write_unaligned(dst.cast::<u32>(), value) };
         }
@@ -460,11 +464,11 @@ fn column_layout(fields: &[CsvField], rows: usize) -> Option<(usize, usize)> {
 
 unsafe fn checked_slice<'a, T>(raw: *const T, count: i64) -> Result<&'a [T], i32> {
     let n = safe_len(count).map_err(|()| STATUS_BAD_ABI)?;
-    if n == 0 || raw.is_null() || !(raw as usize).is_multiple_of(mem::align_of::<T>()) {
+    if n == 0 || raw.is_null() || !raw.addr().is_multiple_of(mem::align_of::<T>()) {
         return Err(STATUS_BAD_ABI);
     }
-    let bytes = n.checked_mul(mem::size_of::<T>()).filter(|n| *n <= isize::MAX as usize).ok_or(STATUS_BAD_ABI)?;
-    (raw as usize).checked_add(bytes).ok_or(STATUS_BAD_ABI)?;
+    let bytes = n.checked_mul(mem::size_of::<T>()).filter(|n| *n <= isize::MAX.unsigned_abs()).ok_or(STATUS_BAD_ABI)?;
+    raw.addr().checked_add(bytes).ok_or(STATUS_BAD_ABI)?;
     Ok(unsafe { slice::from_raw_parts(raw, n) })
 }
 
@@ -485,8 +489,8 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
     max_rows: i64,
     out: *mut AlignStr,
 ) -> i32 {
-    if out.is_null() || !(out as usize).is_multiple_of(mem::align_of::<AlignStr>()) || arena.is_null()
-        || !(arena as usize).is_multiple_of(mem::align_of::<Arena>())
+    if out.is_null() || !out.addr().is_multiple_of(mem::align_of::<AlignStr>()) || arena.is_null()
+        || !arena.addr().is_multiple_of(mem::align_of::<Arena>())
     {
         return STATUS_BAD_ABI;
     }
@@ -498,7 +502,7 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
     if let Err(e) = validate_descriptors(fields) { return e; }
     let input_len = match safe_len(input_len) { Ok(n) => n, Err(()) => return STATUS_BAD_ABI };
     if input_len > 0 && input.is_null() { return STATUS_BAD_ABI; }
-    if (input as usize).checked_add(input_len).is_none() { return STATUS_BAD_ABI; }
+    if input.addr().checked_add(input_len).is_none() { return STATUS_BAD_ABI; }
     let src = if input_len == 0 { &[][..] } else { unsafe { slice::from_raw_parts(input, input_len) } };
     if str::from_utf8(src).is_err() { return STATUS_BAD_ABI; }
 
@@ -520,7 +524,7 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
         for i in 0..header_count {
             if physical[i].decoded_len(src) == Some(0) { return STATUS_INVALID; }
             hashes[i] = match physical[i].hash(src) { Some(h) => h, None => return STATUS_INVALID };
-            let mut slot = hashes[i] as usize & (HEADER_TABLE_CAP - 1);
+            let mut slot = header_slot(hashes[i]);
             loop {
                 let stored = header_table[slot];
                 if stored == 0 {
@@ -541,7 +545,7 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
         if fields.len() > HEADER_CAP { return STATUS_INVALID; }
         for (field_index, field) in fields.iter().enumerate() {
             let name = match descriptor_name(field) { Ok(v) => v, Err(e) => return e };
-            let mut slot = field.name_hash as usize & (HEADER_TABLE_CAP - 1);
+            let mut slot = header_slot(field.name_hash);
             let found = loop {
                 let stored = header_table[slot];
                 if stored == 0 {
@@ -572,13 +576,13 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
             if header == HEADER_ABSENT {
                 let Some(field) = fields.get(ordinal) else { return Err(STATUS_INVALID) };
                 if !validate_cell(cell, src, field) { return Err(STATUS_INVALID); }
-                if ((field.tag as u32 >> 8) & 0xff) == KIND_STR && cell.escaped {
+                if field_shape(field.tag).is_some_and(|(kind, _, _)| kind == KIND_STR) && cell.escaped {
                     normalized = normalized.checked_add(cell.decoded_len(src).ok_or(STATUS_INVALID)?).ok_or(STATUS_LIMIT)?;
                 }
             } else if let Some(&field_index) = selected.get(ordinal).filter(|index| **index != usize::MAX) {
                 let field = &fields[field_index];
                 if !validate_cell(cell, src, field) { return Err(STATUS_INVALID); }
-                if ((field.tag as u32 >> 8) & 0xff) == KIND_STR && cell.escaped {
+                if field_shape(field.tag).is_some_and(|(kind, _, _)| kind == KIND_STR) && cell.escaped {
                     normalized = normalized.checked_add(cell.decoded_len(src).ok_or(STATUS_INVALID)?).ok_or(STATUS_LIMIT)?;
                 }
             }
@@ -591,7 +595,7 @@ pub unsafe extern "C" fn align_rt_csv_decode_soa_v1(
         rows = match rows.checked_add(1) { Some(n) => n, None => return STATUS_LIMIT };
     }
     let (columns_bytes, align) = match column_layout(fields, rows) { Some(v) => v, None => return STATUS_LIMIT };
-    let total = match columns_bytes.checked_add(normalized) { Some(n) if n <= isize::MAX as usize => n, _ => return STATUS_LIMIT };
+    let total = match columns_bytes.checked_add(normalized) { Some(n) if n <= isize::MAX.unsigned_abs() => n, _ => return STATUS_LIMIT };
     if rows == 0 { return STATUS_OK; }
     #[cfg(test)]
     probe_update(|probe| probe.allocations += 1);
@@ -694,10 +698,10 @@ mod tests {
         assert_eq!(unsafe { *base.add(16) }, 1);
         assert_eq!(unsafe { *base.add(17) }, 0);
         let notes = unsafe { slice::from_raw_parts(base.add(32).cast::<AlignStr>(), 2) };
-        assert_eq!(unsafe { slice::from_raw_parts(notes[0].ptr, notes[0].len as usize) }, b"clean");
-        assert_eq!(unsafe { slice::from_raw_parts(notes[1].ptr, notes[1].len as usize) }, b"say \"hi\"");
-        assert!((notes[0].ptr as usize) >= input.as_ptr() as usize && (notes[0].ptr as usize) < input.as_ptr() as usize + input.len());
-        assert!((notes[1].ptr as usize) >= out.ptr as usize);
+        assert_eq!(unsafe { slice::from_raw_parts(notes[0].ptr, usize::try_from(notes[0].len).unwrap_or_default()) }, b"clean");
+        assert_eq!(unsafe { slice::from_raw_parts(notes[1].ptr, usize::try_from(notes[1].len).unwrap_or_default()) }, b"say \"hi\"");
+        assert!(notes[0].ptr.addr() >= input.as_ptr().addr() && notes[0].ptr.addr() < input.as_ptr().addr() + input.len());
+        assert!(notes[1].ptr.addr() >= out.ptr.addr());
     }
 
     #[test]
@@ -708,7 +712,7 @@ mod tests {
         assert_eq!(status, STATUS_OK);
         assert_eq!(unsafe { *out.ptr.cast::<i64>() }, 9);
         let symbol = unsafe { *out.ptr.add(16).cast::<AlignStr>() };
-        assert_eq!(unsafe { slice::from_raw_parts(symbol.ptr, symbol.len as usize) }, b"AX");
+        assert_eq!(unsafe { slice::from_raw_parts(symbol.ptr, usize::try_from(symbol.len).unwrap_or_default()) }, b"AX");
     }
 
     #[test]
@@ -831,10 +835,10 @@ mod tests {
         assert_eq!(unsafe { decode(b"True", &bool_fields, HEADER_ABSENT, EOL_LF, 1) }.0, STATUS_INVALID);
         let char_fields = [field(b"value", 0x0404)];
         let (_, out, _arena) = unsafe { decode("🦀".as_bytes(), &char_fields, HEADER_ABSENT, EOL_LF, 1) };
-        assert_eq!(unsafe { *out.ptr.cast::<u32>() }, '🦀' as u32);
+        assert_eq!(unsafe { *out.ptr.cast::<u32>() }, u32::from('🦀'));
         assert_eq!(unsafe { decode("ab".as_bytes(), &char_fields, HEADER_ABSENT, EOL_LF, 1) }.0, STATUS_INVALID);
         let (_, out, _arena) = unsafe { decode(b"\"\"\"\"", &char_fields, HEADER_ABSENT, EOL_LF, 1) };
-        assert_eq!(unsafe { *out.ptr.cast::<u32>() }, '"' as u32);
+        assert_eq!(unsafe { *out.ptr.cast::<u32>() }, u32::from('"'));
     }
 
     #[test]
@@ -851,7 +855,7 @@ mod tests {
             let (status, out, _arena) = unsafe { decode(input, &strings, HEADER_ABSENT, EOL_LF, 1) };
             assert_eq!(status, STATUS_OK, "{input:?}");
             let value = unsafe { *out.ptr.cast::<AlignStr>() };
-            assert_eq!(unsafe { slice::from_raw_parts(value.ptr, value.len as usize) }, expected);
+            assert_eq!(unsafe { slice::from_raw_parts(value.ptr, usize::try_from(value.len).unwrap_or_default()) }, expected);
         }
         for input in [&b"\"unterminated"[..], &b"a\"b"[..], &b"\"a\"x"[..], &b"a\rb"[..]] {
             assert_eq!(unsafe { decode(input, &strings, HEADER_ABSENT, EOL_LF, 1) }.0, STATUS_INVALID, "{input:?}");

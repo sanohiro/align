@@ -68614,11 +68614,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.frame` adds one checked operation family with two closed kind values. The
-        // wildcard-free policy above classifies it explicitly beside the fifteen core.codec
-        // expressions.
+        // `pkg.csv` adds one checked operation family. The wildcard-free policy above classifies
+        // it explicitly beside the existing package and core operations.
         assert_eq!(
-            variants, 301,
+            variants, 302,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

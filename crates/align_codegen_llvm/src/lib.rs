@@ -19698,10 +19698,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 "csv.decode",
             )
             .map_err(|error| self.err(error))?;
-        Ok(call
-            .try_as_basic_value()
+        call.try_as_basic_value()
             .basic()
-            .expect("CSV decode returns i32"))
+            .ok_or_else(|| self.err("CSV decode runtime call returned no value"))
     }
 
     /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the

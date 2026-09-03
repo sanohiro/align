@@ -11376,11 +11376,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // pkg.frame adds one checked operation family with two closed kind values; keep this count
-        // synchronized with the exhaustive validation, source-shape, replay-clone, and
-        // canonical-graph matches.
+        // pkg.csv adds one checked operation family; keep this count synchronized with the
+        // exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        301,
+        302,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
