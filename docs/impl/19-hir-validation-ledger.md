@@ -811,7 +811,7 @@ new `Ty` or `Scalar` variant or format version is reserved. Their exact definiti
 
 | Reserved record | Exact checked contract |
 |---|---|
-| `CsvDecode` | Non-child `struct_id` names one concrete natural-layout `SoaPlain` record with 1..=1024 fields and unique source names. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. Result is the canonical `Result<soa<struct_id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance. No fact reaches the error alternative. |
+| `CsvDecode` | Non-child `row: Ty` is template-only `Ty::Param(p)` during the discarded abstract check, with the exact matching existing `SoaParam(p)` result and `SoaPlain` bound, or emitted `Ty::Struct(id)` naming one concrete record in the complete existing `SoaPlain` domain with 1..=1024 fields and unique source names. Explicit AoS layout/alignment does not narrow the bound. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. The concrete result is canonical `Result<soa<id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance. No fact reaches the error alternative. |
 
 Sema may form the record only for the exact compiler-private call spelling
 `pkg.csv.internal.descriptor.decode` in the canonical vendored root `pkg.csv` public generic
@@ -824,6 +824,15 @@ function/extern, an added internal item, a changed package graph/body, or a nonc
 remains ordinary source or rejects package admission. Direct/imported/local/function-field and
 control-selected public function values execute the ordinary wrapper and converge on its one
 checked record.
+
+The abstract wrapper check forms `row = Ty::Param(p)` only when `p` has the `SoaPlain` bound and
+stores the matching `Result<SoaParam(p), pkg.csv.Error>` expression type. It performs no concrete
+schema, descriptor, layout, provenance, MIR, or native work. The existing template path discards
+that HIR and retains source AST for interface monomorphization. A concrete instantiation rechecks
+the body under substitution and forms `row = Ty::Struct(id)` plus `Result<Soa(id), Error>`; generic
+forwarding repeats the symbolic check until its outer concrete instantiation. Canonical HIR encoding,
+body validation, MIR lowering, capability collection, and artifact publication reject every
+`Ty::Param`/`SoaParam` row/result: only the concrete rechecked form may enter emitted `Program`.
 
 Validation checks scalar identity and package/schema facts before the three children, then checks
 children in source evaluation order and the relational result/effect/provenance rule. A terminating

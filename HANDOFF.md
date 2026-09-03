@@ -420,7 +420,9 @@ facts must live in this repository.
   it is absent from all current counts.
 - **Next language capability:** `pkg.csv` has an accepted design for one explicit typed in-memory
   direct-to-SoA decode. Canonical package admission, checked `CsvDecode` HIR/MIR, and reserved keyed
-  ABI shape A123 must activate atomically; implementation is next. The design changes no shipped
+  ABI shape A123 must activate atomically. Its generic wrapper uses a discarded symbolic form during
+  abstract checking and emits only concretely rechecked monomorphs over the complete existing
+  `SoaPlain` domain; implementation is next. The design changes no shipped
   package or runtime inventory until that boundary lands.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar

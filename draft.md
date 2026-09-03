@@ -3795,7 +3795,8 @@ pkg.csv.decode<R: SoaPlain>(
 ```
 
 There are no defaults or ambient dialect settings. `R` is inferred from the expected result and
-has 1..=1024 natural-layout `SoaPlain` fields. `Header.Absent` maps an exact-width document by
+uses the complete existing `SoaPlain` domain with 1..=1024 fields; explicit AoS record layout does
+not affect SoA columns. `Header.Absent` maps an exact-width document by
 declaration order. `Header.Present` consumes one 1..=1024-field header whose decoded names are
 nonempty and byte-unique, maps every declared field exactly once by byte-exact name, admits extra
 unique columns, and grammar-validates without converting those extras. `LineEnding` explicitly
@@ -3815,7 +3816,9 @@ containing doubled quotes are decoded into the output block. Primitive-only resu
 `out`; results containing `str` depend on both `input` and `out`. Error leaves `out` unchanged.
 
 The implementation must add one checked `CsvDecode` HIR/MIR operation and reserved keyed ABI shape
-A123 atomically with canonical package admission and owner tests; the design alone activates none
+A123 atomically with canonical package admission and owner tests. Abstract generic checking uses a
+discarded parameter-shaped HIR form; only a concretely rechecked monomorph reaches emitted HIR/MIR.
+The design alone activates none
 of them and does not change shipped package or runtime inventories. Streaming, encoding, files,
 dialect inference, dynamic/owned rows, nullable columns, and recovery remain outside v1. Exact
 grammar, conversions, precedence, lifetime, cache identity, ABI reservation, and closure matrix:

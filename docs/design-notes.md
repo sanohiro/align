@@ -1534,8 +1534,11 @@ not an overload of this materializer.
 
 The checked `CsvDecode` operation and reserved A123 runtime row must activate together with the
 canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR while making LLVM a
-pure descriptor-and-call lowering. The design contract, exact lexical conversions, ABI record,
-and closure matrix are in `impl/pkg-design/csv.md`.
+pure descriptor-and-call lowering. The generic wrapper's abstract check uses the existing symbolic
+SoA parameter form and discards it; concrete rechecking alone produces the schema descriptor and
+emitted operation. CSV admits the whole existing `SoaPlain` domain because AoS layout annotations
+do not affect its SoA columns. The design contract, exact lexical conversions, ABI record, and
+closure matrix are in `impl/pkg-design/csv.md`.
 
 ## Why tests are Result blocks run in separate processes
 

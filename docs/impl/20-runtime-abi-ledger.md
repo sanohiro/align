@@ -408,24 +408,39 @@ definition, export, collision identity, fingerprint input, or count:
 | `CsvDecodeSoaV1` | `align_rt_csv_decode_soa_v1` | A123: `i32 @SYM(ptr, i64, ptr, i64, ptr, i32, i32, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const CsvField, i64, *mut Arena, i32, i32, i64, *mut AlignStr) -> i32` |
 
 Arguments are input pointer/byte length, descriptor pointer/count, destination arena, checked
-header tag, checked line-ending tag, inclusive row bound, and a nonnull aligned writable output
-header. The row is C calling convention and `nounwind`, with no other curated function, return, or
-parameter attribute. The runtime zeroes output before public validation. Status 0 is success, 1 is
+header tag, checked line-ending tag, inclusive row bound, and a nonnull writable output header.
+The arena pointer has Rust `align_of::<Arena>()`; the descriptor and output pointers have their
+target-native `repr(C)` alignments.
+The row is C calling convention and `nounwind`, with no other curated function, return, or parameter
+attribute. The runtime zeroes output before public validation. Status 0 is success, 1 is
 only `pkg.csv.Error.Invalid`, 2 is only `LimitExceeded`, and `-1` is only malformed private ABI.
 The runtime returns no other status; the canonical wrapper aborts on `-1` or any forged other i32.
 OOM and an impossible second-pass mismatch also
 abort. Recoverable error publishes no output and does not advance the arena.
 
+Input length zero accepts either input pointer and performs no dereference or slice formation;
+positive length requires a nonnull readable range of exactly that many bytes. The arena is nonnull,
+aligned to `align_of::<Arena>()`, live, and exclusive. The output is nonnull, aligned to
+`align_of::<AlignStr>()`, writable, and exclusive. The descriptor count is 1..=1024; its nonnull
+pointer is aligned to `align_of::<CsvField>()` and denotes that many immutable records. Every
+positive name length has a nonnull readable byte range. Counts, lengths, byte products, and address
+additions fit the declared integer and target pointer-offset domains before any Rust reference,
+slice, or typed load is formed.
+
 Input bytes, descriptor records, and descriptor-name bytes remain immutable for the complete call.
-The live arena control object and output header are separately exclusive and disjoint from each
-other and from those immutable ranges. Input may occupy a prior live allocation of the same arena;
-the next arena allocation cannot overlap it. Exact-compatible unsafe source externs establish these
-provenance and overlap preconditions, while checked compiler-produced calls derive them before
-lowering.
+The live arena control object and output header are disjoint from each other and those immutable
+ranges. Input may occupy a prior live allocation of the same arena; the next arena allocation
+cannot overlap it. The runtime returns `-1` for a mechanically detectable
+negative/null/misaligned/overflowing representation before typed access. Once those guards pass,
+exact-compatible unsafe source callers establish dereferenceability, lifetime, provenance,
+immutability, and overlap; checked compiler-produced calls derive them before lowering. The guards
+cannot prove an arbitrary nonnull address's backing range and do not make an otherwise invalid
+unsafe call defined.
 
 `CsvField` is target-native `#[repr(C)]` / non-packed LLVM
-`{ name_ptr: ptr, name_len: i64, tag: i32, reserved: i32 }`. Names are nonempty static UTF-8 bytes
-in declaration order and `reserved` is zero. `tag` is `(signed << 16) | (kind << 8) | width`:
+`{ name_ptr: ptr, name_len: i64, tag: i32, reserved: i32 }`. The global uses at least the exact
+`repr(C)` alignment, size, and field offsets. Names are nonempty static UTF-8 bytes in declaration
+order and `reserved` is zero. `tag` is `(signed << 16) | (kind << 8) | width`:
 integer kind 0 with width 1/2/4/8 and sign bit 16; bool kind 1 width 1; float kind 2 width 4/8; str
 kind 3 width 16; char kind 4 width 4. All other bits are zero. Before input access or arena effects,
 the runtime validates output and arena, every count/range/pointer product, every descriptor field,

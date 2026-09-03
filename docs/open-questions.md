@@ -43,7 +43,10 @@ unrepresentable layout are `LimitExceeded`; OOM and impossible private states ab
 Streaming, encoding, file/mmap input, dialect inference, dynamic or owned rows, nullable columns,
 recovery, and diagnostic payloads remain separate consumer-backed capabilities. Canonical package
 admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only as one
-implementation boundary.
+implementation boundary. The generic wrapper's abstract check uses a discarded parameter-shaped
+HIR form and concrete monomorph rechecking produces the only emitted form. The schema admits the
+complete existing `SoaPlain` domain, including explicit AoS layout/alignment, because SoA column
+layout is independent.
 
 Record: `docs/impl/pkg-design/csv.md`, `draft.md` §18.3, `docs/language-spec.md`
 

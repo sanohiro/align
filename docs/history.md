@@ -16,7 +16,9 @@ only the output region, while string-bearing records retain both input and outpu
 no partial result and do not advance the arena.
 
 Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
-operation, and reserved keyed runtime shape A123 atomically. The design itself changes neither the
+operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a
+discarded parameter-shaped record, while only concrete monomorph rechecking emits the operation;
+the schema accepts the complete existing `SoaPlain` domain. The design itself changes neither the
 five shipped package subtrees nor the 330-keyed/348-base runtime inventory. Exact surface, grammar,
 conversions, precedence, ABI, ownership, and implementation matrix:
 `docs/impl/pkg-design/csv.md`.

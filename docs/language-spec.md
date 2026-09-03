@@ -1491,8 +1491,9 @@ pkg.csv.decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions)
   -> Result<soa<R>, Error>
 ```
 
-There are no defaults. Expected result type supplies the 1..=1024-field natural-layout
-`SoaPlain` record `R`. Absent headers map an exact width by declaration order. Present headers are
+There are no defaults. Expected result type supplies a 1..=1024-field record `R` from the complete
+existing `SoaPlain` domain; explicit AoS record layout does not affect SoA columns. Absent headers
+map an exact width by declaration order. Present headers are
 nonempty and byte-unique, map every declared field exactly once by byte-exact name, and may contain
 extra grammar-valid columns that are not converted. The caller explicitly selects CRLF or LF; mixed
 or lone-CR separators are invalid. One leading UTF-8 BOM is stripped. RFC 4180 quoting admits
@@ -1509,6 +1510,8 @@ only doubled-quote strings are normalized into the output block. Primitive-only 
 `out`; string-bearing results retain `input` and `out`. Error does not advance the arena.
 
 Implementation activates canonical package admission, checked `CsvDecode` HIR/MIR, and reserved
-keyed ABI shape A123 atomically; this accepted design changes no shipped inventory. Streaming,
+keyed ABI shape A123 atomically. Abstract generic checking uses a discarded parameter-shaped HIR
+form; only a concretely rechecked monomorph reaches emitted HIR/MIR. This accepted design changes no
+shipped inventory. Streaming,
 encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
 outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.

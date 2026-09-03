@@ -4028,7 +4028,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   quote fields are normalized into the output block. Primitive schemas retain `out`, string-bearing
   schemas retain `input` and `out`, and recoverable errors leave the arena unchanged. Canonical
   package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only
-  together. Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
+  together. Abstract generic checking uses a discarded parameter-shaped operation and only concrete
+  monomorph rechecking emits it; the schema accepts the complete existing `SoaPlain` domain.
+  Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
   and recovery are deferred. Exact ledger and implementation closure matrix:
   `pkg-design/csv.md`.
 - **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to
