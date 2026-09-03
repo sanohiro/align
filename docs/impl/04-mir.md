@@ -388,12 +388,13 @@ source.chunks(n)                 → Rvalue::Chunks (a collection/view operation
 task_group                       → TgBegin; SpawnTask…; TgWait/TgWaitResult; TgEnd
 ```
 
-`par_map` requires a Pure callable (`03 §8`) and independently rejects every capture whose completed
-callable-target/environment provenance reaches `ArenaHandle` before any MIR node is formed. The
-rule follows nested closures, moves, joins, and direct/imported/indirect helper transfer summaries;
-unavailable provenance fails closed and a noncapturing function's empty environment passes. It
-applies to the explicit `par_map` surface even when an unsupported shape currently selects the
-sequential fallback, and shares the same non-Send authority as `spawn`. The dedicated node lets codegen call the runtime's
+`par_map` already requires a Pure callable (`03 §8`). Before `pkg.csv` activates, its pending
+worker-sendability prerequisite must independently reject every capture whose completed callable-
+target/environment provenance reaches `ArenaHandle` before any MIR node is formed. The rule must
+follow nested closures, moves, joins, and direct/imported/indirect helper transfer summaries;
+unavailable provenance must fail closed and a noncapturing function's empty environment passes. It
+must apply to the explicit `par_map` surface even when an unsupported shape currently selects the
+sequential fallback, and must share the same non-Send authority as `spawn`. The dedicated node lets codegen call the runtime's
 parallel-map API with a generated whole-range kernel. Direct-source worker-Send Copy captures are lowered once
 into a call-scoped immutable context; the kernel loads them and passes them as direct trailing
 arguments. The kernel contains the typed counted loop and direct calls for primitive scalar, `str`,

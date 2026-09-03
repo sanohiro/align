@@ -476,12 +476,13 @@ ParMapReduce { src, func, captures, capture_tys, elem_in, elem_out, work_weight 
 The range kernel loops over typed input/output GEPs, loads Copy captures once from the immutable
 call-scoped context, calls the Pure Align function directly, and stores each output. LLVM can inline
 and vectorize that loop; the runtime invokes the function pointer once per coarse range, not once per
-element. Every capture value must also be transitively worker-Send. Checked HIR follows concrete
-callable targets and their capture environments and rejects every reachable `ArenaHandle` before
-MIR. MIR intentionally strips that analysis-local provenance, so codegen defensively rejects a
+element. The pending `pkg.csv` worker-sendability prerequisite must require every capture value to
+be transitively worker-Send. Checked HIR must follow concrete callable targets and their capture
+environments and reject every reachable `ArenaHandle` before MIR. MIR intentionally strips that
+analysis-local provenance, so the same activation must add a defensive codegen rejection for a
 direct `ArenaHandle` in handcrafted `ParMapParallel` and `ParMapReduce` MIR before context layout,
 kernel/global publication, or a runtime declaration/call; malformed nested function environments
-are owned by the earlier checked-HIR gate rather than guessed from an opaque MIR function value.
+belong to the earlier checked-HIR gate rather than an opaque MIR guess.
 A chunk source is an owned array of borrowed `{ptr,len}` slice headers, so the same typed
 loop passes one `slice<T>` value to the chunk function and the caller drops the header buffer after
 the synchronous runtime call. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses

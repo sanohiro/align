@@ -625,3 +625,10 @@ callable-provenance and canonical-hash authorities instead of adding parallel re
 |---|---|
 | P1: an exact-type capture check lets a sequential closure close over `out`, then lets a worker capture and invoke that function value | Consume the existing `BorrowFact` trie and concrete `CallableProvenance` at every worker-transfer sink. Recursively follow `ClosureTarget`/`ClosureCapture` paths through nested closures, moves, reassignment, and control joins; translate full same-program helper summaries and imported `parallel_transfer_params` against completed actual values; fail closed on unavailable target/environment provenance. A known noncapturing function has an empty environment. Checked HIR owns this transitive fact before MIR; backend's malformed-MIR defense remains exact for the direct self-describing `ArenaHandle` case. Add one-/two-level closure, helper, join, malformed-HIR, whole/per-unit, concrete-monomorph, and region-free controls. |
 | P2: CSV specified a second FNV-1a implementation after Align settled one canonical non-cryptographic hash | Define `CsvField.name_hash` as `align_hash::wyhash(name_bytes, WY_SEED)` with seed 0. Codegen and runtime call the same crate implementation; retain independent semantic vectors for `a`, `_`, `field_1025`, `common_prefix_0001`, and the settled `score` canary so descriptor constants and validation cannot drift. |
+
+The fresh review of candidate `ac2ec9a5` found one P2. It did not change a public surface or safety
+strategy, so no matrix axis reopened; the finding-to-fix ledger is:
+
+| Finding | Fix |
+|---|---|
+| P2: a SHIPPED parallel-context section described the new worker-sendability gate as already implemented | Mark the transitive checked-HIR and direct malformed-MIR defenses as pending `pkg.csv` prerequisites. Audit every touched implementation/status document for the same present-tense claim, while retaining the settled normative contract in the language specification and design sources. |

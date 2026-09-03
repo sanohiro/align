@@ -447,3 +447,10 @@ authority を再利用した。
 |---|---|
 | P1: exact-type capture check では sequential closure が `out` を閉じ、worker がその function value を capture/invoke できる | 全 worker-transfer sink で既存 `BorrowFact` trie/concrete `CallableProvenance` を消費。nested closure、move/reassignment/control join の `ClosureTarget`/`ClosureCapture` を再帰追跡し、same-program helper の full summary と imported `parallel_transfer_params` を completed actual に写し、unknown target/environment は fail closed。known noncapturing function は empty environment。checked HIR が MIR 前に transitive fact を所有し、backend malformed-MIR defense は self-describing direct `ArenaHandle` に限定。1-/2-level closure、helper、join、malformed-HIR、whole/per-unit、concrete-monomorph、region-free control を追加。 |
 | P2: one canonical non-crypto hash settlement 後も CSV が別 FNV-1a を指定 | `CsvField.name_hash` を seed 0 の `align_hash::wyhash(name_bytes, WY_SEED)` とする。codegen/runtime は同じ crate implementation を呼び、`a`/`_`/`field_1025`/`common_prefix_0001` と settled `score` canary の independent semantic vector を固定。 |
+
+candidate `ac2ec9a5` の fresh review は P2 1 件。public surface/safety strategy は変わらないため
+matrix axis は再オープンせず、finding-to-fix ledger は次のとおり。
+
+| finding | fix |
+|---|---|
+| P2: SHIPPED parallel-context section が新 worker-sendability gate を実装済みと記述 | transitive checked-HIR と direct malformed-MIR defense を pending `pkg.csv` prerequisite と明記。同じ present-tense claim を全 touched implementation/status document で監査し、language spec/design source の settled normative contract は維持。 |

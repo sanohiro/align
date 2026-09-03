@@ -379,9 +379,10 @@ arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
 
 A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
 binding outside the arena, captured by any parallel worker (`spawn` or `par_map`), or passed to FFI.
-Worker sendability follows every concrete callable target and its environment captures recursively;
-moves, joins, nested closures, and helper calls preserve that provenance, and an unavailable target
-or environment fails closed. A noncapturing function has an empty environment. This non-Send rule
+The pending `pkg.csv` implementation prerequisite must make worker sendability follow every
+concrete callable target and its environment captures recursively; moves, joins, nested closures,
+and helper calls must preserve that provenance, and an unavailable target or environment must fail
+closed. A noncapturing function has an empty environment. This non-Send rule
 is independent of effect; sequential closures and pipelines may capture the capability under the
 ordinary lexical-region proof. An interface signature with a
 `region` parameter carries `ReturnRegionSummary::Roots { params, captures: [] }`, allowing an imported caller to
@@ -406,10 +407,10 @@ A function/lambda has its effect inferred from its body:
   if none of the above             → Pure
 ```
 
-Every callable moved into `par_map` requires `Pure`, and every staged or terminal capture must be
-worker-Send through its complete callable-target/environment provenance. The Copy `region`
-capability is non-Send at any reachable capture depth and rejects independently of effect through
-the same authority as `spawn`. Ordinary sequential `map` / `where` / `reduce` / `scan` /
+Every callable moved into `par_map` requires `Pure`. The pending `pkg.csv` prerequisite must also
+require every staged or terminal capture to be worker-Send through its complete callable-target/
+environment provenance. The Copy `region` capability is non-Send at any reachable capture depth
+and must reject independently of effect through the same authority as `spawn`. Ordinary sequential `map` / `where` / `reduce` / `scan` /
 `partition` / `any` / `all` accepts Impure callables; effect and inactive-lane legality restrict
 fusion/vectorization without changing evaluation order or count.
 
