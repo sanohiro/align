@@ -1542,3 +1542,29 @@ form; only a concretely rechecked monomorph reaches emitted HIR/MIR. This accept
 shipped inventory. Streaming,
 encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
 outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.
+
+The designed, not-yet-implemented `pkg.ws` v1 adds one RFC 6455 GET Upgrade route to the existing
+`pkg.web` route table. Its public operations are `route(pattern, protocols, pump)`, bounded
+`receive(borrow mut http_upgrade, max_message_bytes)`, borrowed `send_text` / `send_binary`, and a
+consuming `close(http_upgrade, code, reason, timeout_ns)`. Receive returns
+`Message { Text(string), Binary(array<u8>), Close(Close) }`, where Close contains optional i64 code
+and owned UTF-8 reason. There are no defaults.
+
+Routing, middleware, request views, 404/405 behavior, explicit workers, and `SO_REUSEPORT` remain
+`pkg.web` ownership. The package validates the RFC token/key/version handshake, chooses the first
+server-order offered subprotocol, and keeps its fixed accept SHA-1 helper private. The
+protocol-neutral `http_upgrade` Move handle is published only after a checked, fully written
+HTTP/1.1 101 while the spent request context stays alive for pump views. It admits local and
+by-value/borrow/borrow-mut parameter use but no user return, aggregate/tag/collection/box,
+global/out/extern, capture/task, or parallel carrier. Exact read, write-all, one strict positive
+cumulative monotonic deadline, shutdown, and Drop own one fd and sticky builtin error. The deadline
+does not reset per call, partial transfer, or frame.
+
+Client frames must be masked, extension-free, minimally length-encoded, and structurally valid.
+Receive assembles fragments under an explicit inclusive 512 MiB ceiling, answers Ping, consumes
+Pong, validates complete Text/Close UTF-8, and returns owned complete messages. Protocol/text/limit
+failure sends 1002/1007/1009 when transport permits; peer Close is echoed. Server sends borrow
+payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
+handshake without Ping/data resetting its budget before closing TCP. Nine planned runtime keys reuse
+existing ABI shapes, leaving A124 unused; the
+design changes no shipped package/runtime inventory. Exact contract: `impl/pkg-design/ws.md`.

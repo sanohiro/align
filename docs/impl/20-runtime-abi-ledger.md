@@ -485,6 +485,46 @@ cannot activate the row or select checked `CsvDecode`; exact compatible source-
 extern reuse follows the ordinary registry rule. No partial producer may land. Exact semantics,
 validation order, allocation contract, and closure matrix: `pkg-design/csv.md`.
 
+## `pkg.ws` reservation (designed; not active)
+
+The accepted `pkg.ws` design reserves nine future keyed identities, all on existing ABI shapes:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `HttpRespondUpgrade` | `align_rt_http_respond_upgrade` | A24: `i32 @SYM(ptr, ptr, ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *mut ResponseBuilder, *mut *mut HttpUpgrade) -> i32` |
+| `HttpUpgradeReadExact` | `align_rt_http_upgrade_read_exact` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, *mut Buffer, i64) -> i32` |
+| `HttpUpgradeWrite` | `align_rt_http_upgrade_write` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, *const u8, i64) -> i32` |
+| `HttpUpgradeDeadline` | `align_rt_http_upgrade_deadline` | A04: `i32 @SYM(ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, i64) -> i32` |
+| `HttpUpgradeShutdown` | `align_rt_http_upgrade_shutdown` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpUpgrade) -> i32` |
+| `HttpUpgradeFree` | `align_rt_http_upgrade_free` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpUpgrade)` |
+| `HttpHeadersCount` | `align_rt_http_headers_count` | A37: `i64 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i64` |
+| `HttpHeadersTokensValid` | `align_rt_http_headers_tokens_valid` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i32` |
+| `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
+
+These rows remain absent from `RuntimeKey`, declarations, definitions, exports, collision identity,
+fingerprints, and count assertions until one atomic implementation activates the complete
+capability. The current inventory therefore remains 331 keyed records, 349 base records, 353 with
+either optional four-row probe, and 357 with both; A124 remains the next unreserved active shape.
+
+`HttpRespondUpgrade` first validates and zeroes its writable aligned output. Invalid output returns
+`AL_INVALID` without inspecting or consuming inputs. It then requires and takes a nonnull aligned
+builder before ctx validation, so every later result consumes it. It publishes the handle only after
+the validated HTTP/1.1 101 head writes completely and the fd moves
+from the request context. Read clears the buffer and publishes length only after exact success;
+write borrows bytes and is SIGPIPE-safe write-all. Deadline retains one monotonic start-plus-budget
+in the opaque handle; every later read/write recomputes the same remaining budget before each
+syscall, rounds positive waits up, rechecks an early native timeout wakeup, and makes no call after
+exhaustion. Shutdown invokes native `SHUT_RDWR` once, treats ENOTCONN as success, then performs one
+no-retry cleanup close; other shutdown errors are returned after close. Free performs close only.
+Each operation closes at most once. Every stateful I/O failure closes, stores one builtin status, and later operations replay
+it without I/O.
+
+Header query pointers borrow the live request context for the call and retain nothing. All
+pointer/length/count/capacity/address products are rejected before Rust reference or slice
+formation. All rows are C calling convention and `nounwind`, with no additional curated function,
+return, or parameter attributes. Exact public semantics, status mapping, validation order,
+ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:

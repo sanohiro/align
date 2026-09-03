@@ -647,6 +647,29 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 ハンドラはこのファイルから**抽出**され、実物の `apps/web/pkg/**` に対してコンパイルされる。よって
 ドキュメントの例がコンパイルできなくなればスイートが落ちる。
 
+## `pkg.ws` 用 protocol-neutral Upgrade seam（設計済み、未実装）
+
+`pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
+worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
+`UpgradeAccepted { response, selected }`、`UpgradeDecision { Accept, Reject, Failed }`、
+`UpgradeHandler { prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
+`Upgrade(UpgradeHandler)`、`Route` の末尾 field は `upgrade_values: slice<str>` である。
+
+exact constructor は `pkg.web.upgrade(method, pattern, values, prepare, pump) -> Route`。Pure かつ
+protocol-blind で、values は prepare 用 Copy config。既存 routing/middleware 後に prepare を一回
+実行し、Reject は通常 respond、Failed は既存 log+fixed 500、Accept は
+`ctx.respond_upgrade`。fully written 101 の success だけが transport と selected string を所有する
+pump を呼び、spent ctx が Ctx view を保持する。Accept error は selected を drop、ordinary handler
+diagnostic を一回 log し同じ ctx で fixed 500 を試す。validation failure なら unspent なので回答でき、
+write failure 後は spent なので fallback は silently fail。pump Ok は log なし、Err は既存 Stream と同じ
+method/path/error diagnostic で、追加 HTTP response は送らない。HEAD fallback は `stream_type == ""` ではなく
+actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values を
+そのまま copy。validation は Stream だけ nonempty stream_type、Respond/Upgrade は empty を要求。
+
+Upgrade は Stream と同様 sequential worker 一つを占有する。第二 listener/router/pool/task/
+registry はなく、hot path は closed Handler tag match 一つだけ増える。この seam は `pkg.ws` と
+同時に activate し、design 文書だけでは出荷しない。exact ledger は `../ws.md`。
+
 ## スライス（計画の F3）
 
 - **W1 — router コア。完了。** パターン解析 + 検証。**radix tree**（static/param/wildcard ノード、

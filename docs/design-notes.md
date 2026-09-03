@@ -1568,6 +1568,34 @@ and schema width do not affect its SoA columns; the 1024 cap belongs only to a p
 header. The design contract, exact lexical conversions, ABI record, and
 closure matrix are in `impl/pkg-design/csv.md`.
 
+## Why `pkg.ws` is an Upgrade route instead of another server
+
+WebSocket begins as HTTP and is commonly deployed beside ordinary endpoints on the same port. A
+second `serve`, router, middleware stack, listener policy, or worker pool would duplicate exactly
+the ownership that `pkg.web` already makes explicit. V1 therefore adds one third handler kind to
+the ordinary Copy route table: middleware and radix dispatch run first, then a protocol prepare
+function either rejects through normal HTTP or publishes one upgraded byte transport to its pump.
+REST, SSE, and WebSocket continue to use one `pkg.web.serve(..., workers)` call and the same visible
+`SO_REUSEPORT` concurrency choice.
+
+The shared layer stops at protocol-neutral ownership transfer. `http_upgrade` means only that a
+validated HTTP/1.1 101 moved the accepted fd out of the request context. It exposes exact buffered
+reads, write-all, one cumulative monotonic deadline, shutdown, and close-only Drop, but no raw fd, socket
+conversion, parser, or address. Its carrier is narrower than an ordinary resource: the pump owns it
+locally and may call borrowed helpers, but cannot hide it in data, a closure, a task, parallel work,
+an extern, or a return. The spent context remains alive beside it so request views stay valid for
+the pump exactly as they do for HTTP streaming.
+
+`pkg.ws` owns everything that gives the bytes WebSocket meaning: header token validation, canonical
+key/version proof, server-order subprotocol choice, masking, minimal frame lengths, fragmentation,
+message bounds, UTF-8, automatic Ping/Pong, and closing handshake. The fixed SHA-1 calculation is a
+private accept-proof helper rather than a new public crypto algorithm. Receive handles control
+frames inside one call until it can return a complete owned Text/Binary message or Close, avoiding a
+hidden sidecar or connection registry. Sends borrow payload without copying; server Close takes an
+explicit cumulative deadline and waits for peer Close without resetting its budget rather than
+pretending an immediate TCP close completed the protocol. The exact contract and closure matrix are
+in `impl/pkg-design/ws.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private

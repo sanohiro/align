@@ -425,9 +425,14 @@ facts must live in this repository.
   doubled-quote strings occupy the output tail, and errors leave the arena unchanged. The required
   `region` remains Pure for sequential use but non-Send through direct and transitively captured
   callable environments at both `spawn` and `par_map` boundaries.
-- **Next language capability:** `pkg.ws` is next in the accepted package ordering. It has no locked
-  public contract yet; begin with its design ledger and prerequisites rather than inferring a
-  surface from the one-line roadmap outline.
+- **Next language capability:** `pkg.ws` now has an implementation-pending design ledger at
+  `docs/impl/pkg-design/ws.md`. It composes one RFC 6455 Upgrade route into `pkg.web`, owns the
+  private handshake/SHA-1/frame state in package source, and uses a restricted protocol-neutral
+  `http_upgrade` Move handle. The implementation boundary also adds three allocation-free repeated
+  header/token queries, one checked 101 transfer, exact transport I/O/deadline/shutdown, and the
+  third `pkg.web` Handler variant. Its nine planned keys reuse existing ABI shapes; current counts
+  stay 331 keyed/349 base and A124 remains the next unused active shape until implementation.
+  The author consistency pass is complete; run the independent design review before coding.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

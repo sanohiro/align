@@ -1383,6 +1383,57 @@ no-wildcard storage-graph classifier に変える。全 non-builtin-tag edge は
 carrier-provenance substrate を first-PR capability、SSE block state を second-PR transaction とし、どちらの proof も
 後続 fixup に分散させない。
 
+## protocol-neutral server Upgrade prerequisite (`pkg.ws`; DESIGNED, not shipped)
+
+`pkg.ws` ledger は一つの HTTP ownership seam と、汎用 repeated-header query 三つを要求する。protocol はこの層より
+上に留める。std は一つの HTTP/1.1 connection を検証して transfer するが、WebSocket accept value の計算、frame
+parse、subprotocol selection、SHA-1 の追加はしない。
+
+```text
+hs.count(name: str) -> i64
+hs.tokens_valid(name: str) -> bool
+hs.contains_token(name: str, token: str) -> bool
+
+ctx.respond_upgrade(rb: response_builder) -> Result<http_upgrade, Error>
+u.read_exact(out: mut buffer, count: i64) -> Result<(), Error>
+u.write(data: slice<u8>) -> Result<(), Error>
+u.deadline(timeout_ns: i64) -> Result<(), Error>
+u.shutdown() -> Result<(), Error>
+```
+
+header name と `contains_token` argument は既存の nonempty ASCII RFC token rule を使い、不正なら scan 前に abort
+する。`count` は physical row を case-insensitive に数える。`tokens_valid` は全 repeated row の全 comma member を
+検査し、absent は true。`contains_token` は全 row/member を ASCII-case-insensitive に検索するが、隣接 member の
+妥当性は証明しない。三つとも Pure、allocation-free、cursor-free で、既存 request table を call 中だけ borrow
+する。
+
+`respond_upgrade` は builder だけを consume する。byte write/fd ownership move 前の順序は HTTP/1.1、exact
+status 101、body absent、既存 insertion-order header guard、nonempty token-list Upgrade row exactly one、
+Upgrade token を持つ valid Connection row exactly one、Content-Length absent、Transfer-Encoding absent。
+validation failure は ctx unspent。validation 後に head を serialize、fd を lift、ctx を
+spent にして complete head を書く。success だけ Move handle を publish する。write failure は fd を close して ctx
+spent のまま。ctx は pump view の request buffer を保持し、upgraded fd を park しない。
+
+`http_upgrade` はその fd と sticky terminal error state を所有する。local/pump-only Move carrier で、direct
+constructor Ok、by-value/borrow/borrow-mut parameter、local は可。user return、他の tag、aggregate、collection、
+box、global、out、extern、capture、task、parallel value は拒否する。`read_exact` は mutable bare-local buffer と
+`0..=capacity` を要求し、output を clear、grow/overread せず complete success だけ publish。途中 EOF は NotFound。
+`write` は empty-safe、SIGPIPE-safe write-all で data を retain/copy しない。`deadline` は
+`1..=86400000000000` ns を要求し、一つの monotonic start-plus-budget を記録する。後続の各 read/write は各 syscall
+前に同じ残予算を再計算し、positive ceil quantization を使い、call/partial transfer ごとに reset しない。
+native timeout wakeup は clock を再確認して予算が残れば retry し、exhaustion は次の syscall なしで Timeout。
+`shutdown` は terminal で、native `SHUT_RDWR` を一回呼び、ENOTCONN を already shutdown として扱った後、
+一回の no-retry cleanup close を行う。その他 shutdown errno は close 後に返し、successful repeat は
+idempotent。stateful failure は
+close/poison し、後続 call は I/O 無しで同じ builtin Error を返す。Drop は protocol write 無しの close-only。
+
+九 keyed row は `HttpHeadersCount` A37、`HttpHeadersTokensValid` A20、
+`HttpHeadersContainsToken` A120、`HttpRespondUpgrade` A24、`HttpUpgradeReadExact` A20、
+`HttpUpgradeWrite` A20、`HttpUpgradeDeadline` A04、`HttpUpgradeShutdown` A03、
+`HttpUpgradeFree` A62。新 ABI shape は予約しない。この prerequisite は combined `pkg.ws` implementation
+capability だけで activate し、current shipped count と A124 は不変。exact validation、pointer、ownership、cache、
+test contract は `../pkg-design/ws.md`。
+
 ## Pitfalls
 
 - **P1 (黙ってダウングレードしない — 実 TLS で)**: `https://` は決して平文で送ってはならない。スライス 5

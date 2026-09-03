@@ -3855,6 +3855,60 @@ dialect inference, dynamic/owned rows, nullable columns, and recovery remain out
 grammar, conversions, precedence, lifetime, cache identity, ABI reservation, and closure matrix:
 `docs/impl/pkg-design/csv.md`.
 
+The designed `pkg.ws` v1 surface is one RFC 6455 server route over `pkg.web`:
+
+```text
+pkg.ws.Message { Text(string), Binary(array<u8>), Close(pkg.ws.Close) }
+pkg.ws.Close { code: Option<i64>, reason: string }
+pkg.ws.route(pattern: str, protocols: slice<str>,
+  pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>)
+  -> pkg.web.types.Route
+pkg.ws.receive(borrow mut connection: http_upgrade, max_message_bytes: i64)
+  -> Result<pkg.ws.Message, Error>
+pkg.ws.send_text(borrow mut connection: http_upgrade, text: str) -> Result<(), Error>
+pkg.ws.send_binary(borrow mut connection: http_upgrade, data: slice<u8>) -> Result<(), Error>
+pkg.ws.close(connection: http_upgrade, code: i64, reason: str, timeout_ns: i64)
+  -> Result<(), Error>
+```
+
+There are no defaults. `route` produces a GET Upgrade row in the same Copy route table as Respond
+and Stream handlers; routing, middleware, 404/405 behavior, request views, explicit workers, and
+`SO_REUSEPORT` remain owned by `pkg.web`. Protocol lists contain unique nonempty RFC tokens. An
+empty list selects no subprotocol; otherwise the first server-list entry offered byte-exactly by
+the client wins and no match rejects the handshake. The router admits only exact GET to this row;
+other methods retain ordinary 404/405 behavior. After middleware Proceed, the HTTP prepare callback
+defensively rechecks GET, then validates empty body, one Host/key/version, all repeated token rows,
+canonical 16-byte base64 key, and version 13 before producing the header-only 101. The SHA-1 accept
+proof is private package source and adds
+no public crypto operation.
+
+`http_upgrade` is a protocol-neutral `std.http` Move handle published only after a validated and
+fully written HTTP/1.1 101. The request context stays spent but alive, retaining its views for the
+pump. The handle may live in a local or cross a function boundary by value, borrow, or mutable
+borrow, including the direct Ok slot of its constructor. It may not be returned by a user function
+or enter any other tagged/aggregate/collection/box/global/out/extern/capture/task/parallel carrier.
+Exact read into a caller buffer, write-all, one strict positive cumulative monotonic deadline,
+shutdown, and close-only Drop are Impure; read/write failure closes and stores one sticky builtin
+`Error`. The deadline budget is never reset by another call, partial transfer, or frame.
+
+Receive requires an explicit inclusive `0..=536870912` message bound and returns one complete owned
+Text/Binary message or peer Close. It accepts RFC fragmentation and interleaved control frames,
+requires client masking and minimal 7/16/64-bit lengths, answers Ping with identical Pong, consumes
+Pong, validates Text and Close UTF-8, and echoes a valid Close before server shutdown. Protocol,
+text, and bound failure best-effort send 1002, 1007, and 1009 respectively, then close; a transport
+failure while fulfilling that reply wins. Server data frames are unmasked, FIN-complete, and borrow
+payload without copying. Server-initiated close validates the pinned sendable IANA code set and a
+123-byte reason, installs an explicit positive cumulative deadline, waits for peer Close while
+answering Ping without resetting that budget, then performs the server TCP close. Client mode,
+HTTP/2, extensions/compression, raw frames,
+standalone serving, async/background heartbeat, and connection registries are outside v1.
+
+Implementation activates the third web handler variant, three repeated-header/token queries,
+checked 101 transfer, upgraded transport operations, package source, and nine runtime keys in one
+closure-matrix boundary. Every key reuses an existing ABI shape, so A124 remains unused. The design
+alone changes no shipped inventory. Exact surface, validation order, frame/close grammar,
+allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
+
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship.
 A proposed package joins that set only when its source ships. First-party packages are

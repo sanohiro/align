@@ -447,7 +447,25 @@ explicit ownership/parallel operation in the emitted MIR.
 
 ---
 
-## 9. Remaining design refinements
+## 9. Planned HTTP Upgrade MIR (`pkg.ws` prerequisite)
+
+The `pkg.ws` implementation adds dedicated backend-agnostic MIR operations for
+`HttpRespondUpgrade { ctx, rb, out }`, `HttpUpgradeReadExact { upgrade, buffer, count }`,
+`HttpUpgradeWrite { upgrade, data }`, `HttpUpgradeDeadline { upgrade, timeout_ns }`, and
+`HttpUpgradeShutdown { upgrade }`, plus the three header-table queries. MIR owns evaluation order,
+Result construction, source nulling, ctx-spent transition, mutable generations, sticky-error
+control, and Drop on every normal/error/early/control-flow path. Protocol handshake/frame semantics
+remain ordinary `pkg.web`/`pkg.ws` source and do not become MIR variants.
+
+Checked lowering must reject a vanished or malformed operation before any MIR/native identity is
+published. RespondUpgrade nulls the builder on every result but never nulls ctx; its runtime out
+slot initializes a local `HttpUpgrade` only on zero status. Read clears the destination buffer
+generation before its A20 call and publishes no partial bytes on error. Deadline and shutdown keep
+one live/spent/poisoned owner and free exactly once. A no-wildcard operation sweep, print form,
+effect/work scan, Move/drop scan, whole/per-unit lowering, and optimized/unoptimized equality are
+required by `pkg-design/ws.md`. This section reserves no active variant today.
+
+## 10. Remaining design refinements
 
 ```text
 - precise rules for fusion boundaries (how far to do partial fusion of scan / group_by)

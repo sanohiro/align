@@ -19,6 +19,34 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### WebSocket v1 is one typed RFC 6455 Upgrade route (SETTLED 2026-09-03)
+
+**Decision:** `pkg.ws` does not own another listener, router, concurrency model, or request context.
+`pkg.ws.route(pattern, protocols, pump)` produces a GET Upgrade row in the existing `pkg.web`
+route table, so REST, SSE, middleware, 404/405 behavior, and explicit `SO_REUSEPORT` workers remain
+one system. A protocol-neutral `http_upgrade` Move handle is published only after a validated,
+fully written HTTP/1.1 101; the spent request context retains request views for the pump. The handle
+admits local/by-value/borrow/borrow-mut use but no aggregate, tag, collection, capture, task,
+parallel, extern, out, global, or user-return carrier.
+
+The package validates the canonical RFC 6455 header/token/key/version handshake and selects the
+first server-order subprotocol offered by the client. Its fixed accept SHA-1 implementation is
+private package source, not a public crypto primitive. Receive assembles one bounded Text/Binary
+message or Close across fragmentation, requires client masks and minimal lengths, automatically
+answers Ping, consumes Pong, validates complete Text/Close UTF-8, and sends 1002/1007/1009 for
+protocol/text/limit failure. A peer Close is echoed before server shutdown. Server sends are
+unmasked and payload-copy-free; an initiated Close takes an explicit timeout and waits for peer
+Close while continuing required Ping replies. The generic transport exposes exact bounded-buffer
+reads, write-all, one cumulative monotonic deadline that never resets per I/O/frame, shutdown, and
+close-only Drop.
+
+Nine planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
+new ABI shape and A124 remains next. HTTP/2 extended CONNECT, client mode, TLS termination,
+extensions/permessage-deflate, raw frames, standalone serving, async/background heartbeat,
+connection registries, and broadcast are separate consumer-backed capabilities.
+
+Record: `docs/impl/pkg-design/ws.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### CSV v1 is one explicit typed direct-to-SoA decode (SETTLED 2026-09-03)
 
 **Decision:** `pkg.csv` exposes `Header { Present, Absent }`,

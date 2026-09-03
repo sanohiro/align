@@ -1426,6 +1426,60 @@ name on a prose blacklist, and a new `Ty`/`Scalar` discriminator reopens the com
 The boundary above makes that carrier-provenance substrate a first-PR capability and makes SSE block
 state transactional in the second, rather than distributing either proof across later fixups.
 
+## Protocol-neutral server Upgrade prerequisite (`pkg.ws`; DESIGNED, not shipped)
+
+The `pkg.ws` ledger requires one HTTP ownership seam and three general repeated-header queries. The
+protocol stays above this layer: std validates and transfers one HTTP/1.1 connection but never
+computes a WebSocket accept value, parses a frame, selects a subprotocol, or adds SHA-1.
+
+```text
+hs.count(name: str) -> i64
+hs.tokens_valid(name: str) -> bool
+hs.contains_token(name: str, token: str) -> bool
+
+ctx.respond_upgrade(rb: response_builder) -> Result<http_upgrade, Error>
+u.read_exact(out: mut buffer, count: i64) -> Result<(), Error>
+u.write(data: slice<u8>) -> Result<(), Error>
+u.deadline(timeout_ns: i64) -> Result<(), Error>
+u.shutdown() -> Result<(), Error>
+```
+
+Header names and the `contains_token` argument use the existing nonempty ASCII RFC token rule and
+abort before scanning when invalid. `count` is case-insensitive over physical rows. `tokens_valid`
+checks every comma member of every repeated row and returns true for absence; `contains_token`
+searches all rows/members ASCII-case-insensitively but does not certify its neighbors. All three are
+Pure, allocation-free, cursor-free, and borrow only the existing request table.
+
+`respond_upgrade` consumes only the builder. Before bytes or fd ownership move it checks in order:
+HTTP/1.1, exact status 101, absent body, existing insertion-order header guards, exactly one
+nonempty token-list Upgrade row, exactly one valid Connection row containing the Upgrade token,
+absent Content-Length, then absent Transfer-Encoding. Validation failure
+leaves ctx unspent. After validation it serializes the head, lifts the fd, marks ctx spent, and
+writes the complete head; success alone publishes the Move handle. Write failure closes the fd and
+leaves ctx spent. The ctx retains the request buffer for pump views and never parks the upgraded fd.
+
+`http_upgrade` owns that fd plus sticky terminal error state. It is a local/pump-only Move carrier:
+direct constructor Ok, by-value/borrow/borrow-mut parameters, and locals are admitted; user returns,
+other tags, aggregates, collections, boxes, globals, out, externs, captures, tasks, and parallel
+values reject. `read_exact` requires a mutable bare-local buffer and `0..=capacity`, clears output,
+never grows or overreads, and publishes only complete success. Premature EOF is NotFound. `write` is
+empty-safe, SIGPIPE-safe write-all and retains/copies no data. `deadline` requires
+`1..=86400000000000` ns and records one monotonic start-plus-budget deadline. Every later read/write
+recomputes the same remaining budget before each syscall, uses positive ceil quantization, and never
+resets it per call or partial transfer. A native timeout wakeup rechecks the clock and retries when
+budget remains; exhaustion returns Timeout without another syscall. `shutdown` is terminal: it
+invokes native `SHUT_RDWR` once, accepts ENOTCONN as already shut down, then performs one no-retry
+cleanup close; another shutdown errno is returned after close, while repeated success is idempotent.
+Any stateful failure closes/poisons and later calls replay
+the same builtin Error without I/O. Drop is close-only with no protocol write.
+
+The nine keyed rows are `HttpHeadersCount` A37, `HttpHeadersTokensValid` A20,
+`HttpHeadersContainsToken` A120, `HttpRespondUpgrade` A24, `HttpUpgradeReadExact` A20,
+`HttpUpgradeWrite` A20, `HttpUpgradeDeadline` A04, `HttpUpgradeShutdown` A03, and
+`HttpUpgradeFree` A62. No new ABI shape is reserved. This prerequisite activates only in the
+combined `pkg.ws` implementation capability; current shipped counts and A124 remain unchanged.
+Exact validation, pointer, ownership, cache, and test contracts: `../pkg-design/ws.md`.
+
 ## Pitfalls
 
 - **P1 (no silent downgrade — now via real TLS)**: `https://` must NEVER be sent as plaintext.

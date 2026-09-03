@@ -695,6 +695,55 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 `from` guards. The `upload` handler above is EXTRACTED from this file and compiled against the real
 `apps/web/pkg/**`, so a documented example that stops compiling fails the suite.
 
+## Planned protocol-neutral Upgrade seam for `pkg.ws`
+
+`pkg.ws` is a separate package, but it must share this package's route table, middleware order,
+request views, and prefork worker ownership. Its design ledger adds one protocol-neutral extension
+without making `pkg.web` depend on WebSocket semantics:
+
+```align
+pub UpgradeAccepted { response: response_builder, selected: string }
+pub UpgradeDecision {
+  Accept(UpgradeAccepted)
+  Reject(response_builder)
+  Failed(Error)
+}
+pub UpgradeHandler {
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
+}
+```
+
+`Handler` gains trailing `Upgrade(UpgradeHandler)`. `Route` gains trailing
+`upgrade_values: slice<str>`; every existing constructor writes `[]`, while the new exact constructor
+is:
+
+```text
+pkg.web.upgrade(method: str, pattern: str, values: slice<str>,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>) -> Route
+```
+
+The constructor is Pure and protocol-blind. `values` are retained Copy configuration for prepare.
+After the existing route and middleware decision, prepare runs once. Reject uses ordinary
+`ctx.respond`; Failed uses the existing error log plus fixed 500; Accept passes its builder to
+`ctx.respond_upgrade`. Only a successful fully written 101 invokes pump, which owns the transport
+and selected string while the spent context keeps `Ctx` views alive. An Accept error drops selected,
+logs the ordinary handler diagnostic once, and tries the fixed 500 through the same ctx: validation
+failure left it unspent and can answer, while a write failure left it spent and the fallback silently
+fails. Pump `Ok` emits no log; pump
+`Err` uses the existing Stream method/path/error diagnostic and cannot send another HTTP response.
+HEAD fallback now tests the
+actual `Respond` variant rather than the historical `stream_type == ""` proxy; Stream and Upgrade
+GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values` unchanged. Startup route
+validation requires empty `stream_type` for Respond/Upgrade and nonempty only for Stream.
+
+An open Upgrade occupies one sequential worker exactly like Stream. No second listener, router,
+worker pool, hidden task, app registry, or WebSocket rule enters this package. Existing hot paths
+perform only the additional closed Handler tag match; the zero-allocation routing contract remains.
+This seam and `pkg.ws` activate together; it is not shipped by this design document alone. Exact
+cross-package ledger and closure matrix: `ws.md`.
+
 ## Slices (F3 of the plan)
 
 - **W1 — router core. DONE.** Pattern parse + validation; the **radix tree** (static/param/wildcard
