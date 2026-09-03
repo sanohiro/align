@@ -411,8 +411,9 @@ Arguments are input pointer/byte length, descriptor pointer/count, destination a
 header tag, checked line-ending tag, inclusive row bound, and a nonnull aligned writable output
 header. The row is C calling convention and `nounwind`, with no other curated function, return, or
 parameter attribute. The runtime zeroes output before public validation. Status 0 is success, 1 is
-only `pkg.csv.Error.Invalid`, and 2 is only `LimitExceeded`; every other i32 is a compiler-private
-invariant failure and the canonical wrapper aborts. OOM and an impossible second-pass mismatch also
+only `pkg.csv.Error.Invalid`, 2 is only `LimitExceeded`, and `-1` is only malformed private ABI.
+The runtime returns no other status; the canonical wrapper aborts on `-1` or any forged other i32.
+OOM and an impossible second-pass mismatch also
 abort. Recoverable error publishes no output and does not advance the arena.
 
 Input bytes, descriptor records, and descriptor-name bytes remain immutable for the complete call.
@@ -429,6 +430,12 @@ integer kind 0 with width 1/2/4/8 and sign bit 16; bool kind 1 width 1; float ki
 kind 3 width 16; char kind 4 width 4. All other bits are zero. Before input access or arena effects,
 the runtime validates output and arena, every count/range/pointer product, every descriptor field,
 and descriptor-name uniqueness.
+
+Validation order is output, arena, output zeroing; header tag, line-ending tag, row bound;
+descriptor count/table/fields/names; input representation; CSV/header/data/layout; and finally a
+nonempty allocation/fill. Thus negative `max_rows` returns 1 before malformed descriptor inspection
+whenever output and arena are valid. Malformed private input returns `-1`; descriptor and input are
+never inspected before their preceding phase.
 
 Activation is one atomic package/HIR/MIR/runtime capability: it adds the key, exact declaration
 golden, definition/export, collision reservation, capability collection, fingerprints, and all

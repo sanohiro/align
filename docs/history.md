@@ -9,8 +9,9 @@ headers provide a bounded byte-exact named projection, absent headers require ex
 order, and RFC 4180 quoting is extended only to UTF-8 text and explicit LF separators.
 
 A complete allocation-free first pass validates grammar, selected scalar conversions, bounds, and
-layout. One second pass allocates an exact arena block and fills columns directly. Clean strings
-borrow the input; only doubled-quote fields are normalized into the arena. Primitive records retain
+layout. Zero rows return canonical `{null, 0}` without allocation; a nonempty second pass allocates
+an exact arena block and fills columns directly. Clean strings borrow the input; only doubled-quote
+fields are normalized into the arena. Primitive records retain
 only the output region, while string-bearing records retain both input and output. Errors publish
 no partial result and do not advance the arena.
 

@@ -32,8 +32,9 @@ outside-quote separator. One leading BOM is stripped, and the RFC 4180 quote mod
 preserves UTF-8, NUL, whitespace, and quoted line breaks.
 
 The first pass validates the complete successful input, exact scalar conversions, row bound, and
-layout without allocation. The second makes one exact arena allocation and fills SoA columns
-directly. Clean text borrows input spans; only doubled-quote text is normalized into the same
+layout without allocation. Zero rows return canonical `{null, 0}` without allocation; the second
+pass makes one exact arena allocation only for nonempty output and fills SoA columns directly.
+Clean text borrows input spans; only doubled-quote text is normalized into the same
 block. A primitive-only result depends on `out`; a string-bearing result depends on `input` and
 `out`. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
 conversion are `Invalid`; the header cap, first complete row beyond the inclusive bound, and

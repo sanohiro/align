@@ -16,7 +16,7 @@ surface, producer, error, allocation, or input that is absent here.
 | `pub LineEnding { CrLf, Lf }` | Closed source/discriminator order is exactly `CrLf = 0`, `Lf = 1`. The selected sequence is the only record separator outside quotes; a final record may omit it. `CrLf` rejects lone CR/LF and `Lf` rejects every outside-quote CR. There is no auto-detect, mixed mode, lone-CR mode, platform default, or ambient newline setting. | Copy and Pure. Line breaks inside a quoted field remain data byte-for-byte, including CR, LF, and CRLF. No allocation or retained state. | `pkg.csv` owns the nominal sum and interface identity. The runtime receives one checked i32 tag. | Shipped closed sums. Exact tag/order; final-terminated/unterminated and mixed/lone separator products; whole/per-unit and malformed-HIR owners. |
 | `pub DecodeOptions { header: Header, line_ending: LineEnding, max_rows: i64 }` | Exact field/source order as shown. No defaults. `max_rows` is an inclusive nonnegative data-row bound; a negative value is `Error.Invalid`, zero admits a header or empty document but no data row, exact fit succeeds, and the next complete otherwise-valid row is `Error.LimitExceeded`. | Copy and Pure. Validation occurs in field order before descriptor/input inspection or arena allocation. The value is retained nowhere and allocates nothing. | `pkg.csv` owns the nominal record and complete reachable definition graph. All fields participate in interface/dependency/cache identity. | Shipped records and i64 bounds. Field/order/default, negative/zero/exact/next, direct/imported/generic, whole/per-unit, and cache owners. |
 | `pub Error { Invalid, LimitExceeded }` | Closed source/discriminator order is exactly `Invalid = 0`, `LimitExceeded = 1`. `Invalid` covers invalid options, CSV grammar, selected line ending, header identity/uniqueness/completeness, record width, and selected-field conversion. `LimitExceeded` covers more than 1024 physical header columns, the first row beyond `max_rows`, or exact output/normalization layout not representable in i64 and the target allocation domain. | Copy and Pure. OOM and an impossible compiler/runtime status remain hard aborts. No message, path, row/column position, partial output, fallback, retry, logging, or second cleanup error exists. | Ordinary package sum identity. Private runtime statuses map bijectively as `0 = success`, `1 = Invalid`, `2 = LimitExceeded`; every other result reaches the package's explicit `std.process` dependency and `process.abort()`. | Shipped `Result`, tag-only sums, and abort. Every producer/status/tag/order, multi-invalid precedence, malformed ABI, whole/per-unit, and exhaustive-match owners. |
-| `pub fn decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>` | Arguments evaluate exactly once, left-to-right. `R` is inferred only from the expected result type and must be a nonempty natural-layout record with at most 1024 fields, each an integer, float, `bool`, `char`, or `str`. One leading UTF-8 BOM is removed at absolute byte zero; another is data. `Header.Present` requires 1..=1024 unique nonempty decoded header names, maps every declared field exactly once by byte-exact name, and grammar-validates but does not convert extra columns. `Header.Absent` requires exactly `R`'s field count in declaration order. Every data record has the selected physical width. Scalar cells use the exact lexical conversions below; `str` preserves decoded CSV text. | Pure. Pass 1 validates the complete successful input, selected conversions, row bound, normalized byte count, and output layout without heap or arena allocation. Only then pass 2 allocates one exact aligned arena block and fills columns directly, with no AoS intermediate or transpose. Unquoted and quoted-without-doubled-quote `str` cells borrow exact input subranges; only quoted cells containing `""` are copied once, with each pair collapsed to `"`, into the same output arena block. Primitive-only results depend on `out`; a result containing `str` depends on both `input` and `out`. The returned `soa<R>` is Copy, cannot outlive `out`, and carries no Drop. Error leaves `out` unchanged by this call. | Canonical `pkg.csv` source owns one public generic wrapper and one private exact bridge; application source cannot construct or invoke the bridge directly. Sema forms one checked `CsvDecode` operation after exact package/signature/schema validation; HIR/MIR retain `R`, input, destination region, options, effect, and region facts. LLVM emits one immutable compiler-owned `CsvField` table and calls reserved row A123 `align_rt_csv_decode_soa_v1`. Interface and persistent frontend/object/final-link keys include the package source, concrete `R` definition, bridge identity, checked operation, descriptor bytes, runtime key, ABI version, and implementation body; no file, locale, MIME metadata, CPU feature, environment, or allocator setting is an input. | Shipped generics/`SoaPlain`, named regions, SoA layout, source package sealing, checked-HIR validation, arena allocation, and two-pass typed decode patterns. Acceptance crosses formation/visibility, exact schema/header/grammar/value products, BOM, bounds, zero-copy/copy placement, region/storage generations, no-allocation error, direct-to-column layout, ABI/descriptor/status, whole/per-unit/generic monomorphization, cache edit/revert, optimized/unoptimized lowering, and local allocation/work-count evidence. |
+| `pub fn decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>` | Arguments evaluate exactly once, left-to-right. `R` is inferred only from the expected result type and must be a nonempty natural-layout record with at most 1024 fields, each an integer, float, `bool`, `char`, or `str`. One leading UTF-8 BOM is removed at absolute byte zero; another is data. `Header.Present` requires 1..=1024 unique nonempty decoded header names, maps every declared field exactly once by byte-exact name, and grammar-validates but does not convert extra columns. `Header.Absent` requires exactly `R`'s field count in declaration order. Every data record has the selected physical width. Scalar cells use the exact lexical conversions below; `str` preserves decoded CSV text. | Pure. Pass 1 validates the complete successful input, selected conversions, row bound, normalized byte count, and output layout without heap or arena allocation. For `N > 0` only, pass 2 then allocates one exact aligned arena block and fills columns directly, with no AoS intermediate or transpose; `N == 0` returns canonical `{ null, 0 }` without allocation. Unquoted and quoted-without-doubled-quote `str` cells borrow exact input subranges; only quoted cells containing `""` are copied once, with each pair collapsed to `"`, into the same output arena block. Primitive-only results depend on `out`; a result containing `str` depends on both `input` and `out`. The returned `soa<R>` is Copy, cannot outlive `out`, and carries no Drop. Error leaves `out` unchanged by this call. | Canonical root `pkg.csv` owns one public generic wrapper whose body calls the compiler-private spelling `pkg.csv.internal.descriptor.decode`; that internal module declares no source function and the package `internal` rule prevents application imports. Sema forms one checked `CsvDecode` operation only at that exact call after package/signature/schema validation; HIR/MIR retain `R`, input, destination region, options, effect, and region facts. LLVM emits one immutable compiler-owned `CsvField` table and calls reserved row A123 `align_rt_csv_decode_soa_v1`. Interface/frontend identity includes canonical root/internal source, the generic body, concrete nominal `R` graph, checked operation, and descriptor semantics. Object/final-link keys additionally retain all ordinary explicit target, CPU/feature, profile, pipeline, runtime, and linker inputs. No ambient runtime CPU detection, file, locale, MIME metadata, environment, or allocator setting changes CSV semantics. | Shipped generics/`SoaPlain`, named regions, SoA layout, source package sealing, compiler-private internal descriptor spelling, checked-HIR validation, arena allocation, and two-pass typed decode patterns. Acceptance crosses formation/visibility, exact schema/header/grammar/value products, BOM, bounds, zero-copy/copy placement, region/storage generations, no-allocation error, direct-to-column layout, ABI/descriptor/status, whole/per-unit/generic monomorphization, cache edit/revert, optimized/unoptimized lowering, and local allocation/work-count evidence. |
 
 ## Decision and scope
 
@@ -39,6 +39,7 @@ The source declarations are:
 module pkg.csv
 
 import std.process
+import pkg.csv.internal.descriptor
 
 pub Header {
   Present
@@ -61,23 +62,27 @@ pub Error {
   LimitExceeded
 }
 
-fn decode_bridge<R: SoaPlain>(
-  input: str,
-  out: region,
-  options: DecodeOptions,
-) -> Result<soa<R>, Error> = process.abort()
-
 pub fn decode<R: SoaPlain>(
   input: str,
   out: region,
   options: DecodeOptions,
-) -> Result<soa<R>, Error> = decode_bridge(input, out, options)
+) -> Result<soa<R>, Error> = pkg.csv.internal.descriptor.decode(input, out, options)
 ```
 
-`decode_bridge` is compiler-recognized only as that private declaration and body inside canonical
-`pkg.csv`. It is not exported in the package interface. A same-named application function, extern,
-or noncanonical vendored package is an ordinary declaration and cannot select `CsvDecode`; the
-canonical package validator rejects a changed bridge before evaluating its placeholder body.
+The vendorable subtree also contains exact module `pkg.csv.internal.descriptor`, with no imports or
+source items:
+
+```align
+module pkg.csv.internal.descriptor
+```
+
+Its `decode` spelling is a compiler-private descriptor operation, like the shipped
+`pkg.db.internal.descriptor` family, rather than a private source declaration. This keeps the public
+generic body self-contained in its interface: it references no omitted private item, and an
+importing unit can monomorphize the retained body against the vendored internal module identity.
+The package `internal` rule prevents application source from importing that module. A same-named
+application function, extern, added internal item, changed wrapper, or noncanonical package cannot
+select `CsvDecode`; canonical package admission rejects it before body evaluation.
 
 ## Public use
 
@@ -201,30 +206,33 @@ written order. A terminating expression prevents every later evaluation and nati
 
 The private runtime boundary follows this exact order:
 
-1. Validate the writable output header, live destination arena, descriptor count/table, every
-   descriptor name range/tag/reserved field, and descriptor-name uniqueness before forming any
-   slice, loading input, or allocating. Set the private output header to `{ null, 0 }`. A failure is
-   the impossible private status and the wrapper aborts.
+1. Validate the writable output header and live destination arena before forming any slice,
+   loading input, or allocating. Set the private output header to `{ null, 0 }`. A failure is the
+   impossible private status and the wrapper aborts.
 2. Validate `Header`, then `LineEnding`, then `max_rows >= 0`. Source-valid enum values make the first
    two checks invariant guards; a negative row bound returns `Invalid` before input inspection.
-3. Validate the input pointer/length representation, strip one leading BOM, and select the empty or
+3. Validate the descriptor count/table, every descriptor name range/tag/reserved field, and
+   descriptor-name uniqueness. A failure returns the impossible private status. Thus a negative
+   row bound wins over a malformed descriptor whenever output and arena are valid.
+4. Validate the input pointer/length representation, strip one leading BOM, and select the empty or
    first-record path. Invalid private representation is impossible; public malformed CSV is not.
-4. When present, parse and validate the complete header in physical order: grammar and selected
+5. When present, parse and validate the complete header in physical order: grammar and selected
    EOL, 1024-column bound, nonempty names, duplicate names, then required declared-name coverage.
    `LimitExceeded` is selected only for the 1025th header column; every earlier lexical/name error
    wins.
-5. Parse data records in source order and cells in physical order. For each cell validate CSV
+6. Parse data records in source order and cells in physical order. For each cell validate CSV
    grammar first, then the selected target conversion when any. Validate record width after its
    fields. Only after a complete otherwise-valid row would increment the count, compare it to
    `max_rows`; that rejected-next row returns `LimitExceeded`. Earlier malformed content wins, and
    later input is not inspected after the limit result.
-6. After successful EOF, validate normalized escaped-string byte accumulation, every current SoA
+7. After successful EOF, validate normalized escaped-string byte accumulation, every current SoA
    column offset/size/alignment computation, the appended normalized-byte area, total i64 size, and
    target allocation-size representation. Any failure returns `LimitExceeded` before allocation.
-7. Allocate one exact aligned block from `out`, rescan the already-validated input, fill each
-   declared column directly, and copy only doubled-quote `str` cells into the normalized tail. A
-   mismatch in this infallible fill pass is an internal invariant violation and aborts; it never
-   returns a partial `soa` or changes the selected public error.
+8. For `N == 0`, publish canonical `{ null, 0 }` without allocation. For `N > 0`, allocate one exact
+   aligned block from `out`, rescan the already-validated input, fill each declared column directly,
+   and copy only doubled-quote `str` cells into the normalized tail. A mismatch in this infallible
+   fill pass is an internal invariant violation and aborts; it never returns a partial `soa` or
+   changes the selected public error.
 
 This establishes one observable precedence: private invariant abort; invalid options; header
 grammar/identity; earliest data grammar/conversion/width; row limit; final representability; OOM or
@@ -293,9 +301,18 @@ identity plus the complete ordered reachable definition graph; `SoaPlain` makes 
 one primitive. The runtime descriptor is intentionally structural execution metadata and cannot
 erase the nominal compiler/cache distinction.
 
+The frontend/interface key consumes canonical root and empty-internal module source, the retained
+generic body, its checked-operation identity, and the complete nominal `R` graph. The object action
+key additionally consumes the existing target triple/object format, resolved CPU and feature set,
+profile, pass pipeline, optimization/relocation/code model, LLVM version, runtime-LTO mode/digest,
+PGO mode, exports, and dependency hashes. Final-link identity consumes its ordinary ordered object,
+runtime, and library inputs. CSV adds no ambient runtime feature detection or data-dependent cache
+input; it does not remove any existing explicit build input.
+
 MIR retains the same struct id and children and yields private i32 status plus a zeroed SoA output
 slot. Status 0 constructs `Ok`; 1 constructs `Err(Invalid)`; 2 constructs
-`Err(LimitExceeded)`; every other i32 reaches `process.abort()`. The error edge publishes no output
+`Err(LimitExceeded)`; private `-1` and every other i32 reach `process.abort()`. The runtime returns
+`-1` for a malformed private ABI and never returns another status. The error edge publishes no output
 and performs no Drop. Bounds and region semantics exist in MIR; LLVM performs pure lowering and may
 not invent a package rule.
 
@@ -332,6 +349,12 @@ checked regions and compiler-owned static descriptors before lowering.
 4 width 4. All other bits are zero. Names are nonempty static UTF-8 field-name bytes in declaration
 order. The runtime validates the complete table before input or arena effects. The descriptor is
 compiler-owned inspection data, not reflection: no pointer or field metadata reaches source.
+
+The exact native order is writable output, live arena, output zeroing; header tag, line-ending tag,
+then row bound; descriptor count/table/fields/names; input representation; CSV/header/data/layout;
+and only then a nonempty allocation/fill. Malformed private ABI returns `-1`; a negative row bound
+returns 1 before descriptor inspection; public parse/conversion errors return 1; public bound/layout
+errors return 2. This is the same order as the preceding public precedence ledger.
 
 Activation atomically adds the key, symbol, exact declaration golden, runtime definition/export,
 checked operation, and owner tests. It advances the keyed/base/each-four-row-probe/maximum totals
@@ -402,17 +425,17 @@ is no smaller stable consumer to extract.
 
 | Axis | Required implementation closure | Exact owner evidence |
 |---|---|---|
-| Public formation and identity | Canonical `pkg.csv`; exact four public records/one wrapper/one private bridge; inferred concrete `R`; 1..=1024 `SoaPlain` fields; no same-name/intercepted bridge; direct/imported/local/function-field/control-joined calls. | Package source/interface byte and hash owner; positive/negative schema matrix; exact bridge-body mutation; parameterized call-target shapes; whole/per-unit/generic monomorphs. |
+| Public formation and identity | Canonical root plus empty `pkg.csv.internal.descriptor`; exact four public types/one public generic wrapper/one compiler-private internal operation spelling and no private source item; inferred concrete `R`; 1..=1024 `SoaPlain` fields; no application import/same-name interception; direct/imported/local/function-field/control-joined calls. | Root/internal source and interface byte/hash owner; producer acceptance proves the public generic body has no private-item reference; positive/negative schema/module/body matrix; added-internal-item mutation; parameterized call-target shapes; whole/per-unit/generic monomorphs. |
 | Evaluation, checked HIR, and MIR | Input/out/options once left-to-right; terminating child stops later work; exact child/type/id/effect/region records; status mapping and no error output; every traversal/replay/validation pass explicit. | Variant sweep tripwire; one-field HIR mutations; source termination/control matrix; MIR status/output and process-abort assertions. |
 | CSV lexical closure | BOM position/count; unquoted/quoted/doubled quote; comma; spaces/NUL/UTF-8; CRLF/LF choice; quoted line breaks; final EOL/EOF; blank/trailing-empty records. | Independent grammar oracle; exhaustive bounded mutation/fuzz corpus; exact accepted/rejected byte vectors for every lexical state and EOF transition. |
 | Header/projection closure | Present/Absent; declaration/physical reorder; unknown skip; all names nonempty/unique; every declared name once; 1/1024/1025; hash collisions; exact width per row. | Fixed vectors plus generated unique/duplicate/collision tables; conversion counters prove unknown fields skipped; mapping-to-column oracle. |
 | Typed conversion | Every integer width/sign edge; float lexical/exact bits/overflow/underflow; bool case; char scalar count; empty/whitespace; selected versus unselected. | Parameterized field-kind oracle and rejected-next twins; optimized/unoptimized, endian, and whole/per-unit parity; no conversion of extras. |
-| Bounds and precedence | Invalid enum/HIR, negative/zero/exact/next rows, header cap, normalized-byte arithmetic, every SoA offset/size/alignment and target-size overflow; earliest lexical/conversion/width before row limit; no later scan after terminal error. | Multi-invalid pairwise precedence matrix; target-representability twins; counters for last inspected row/field and zero allocator calls. |
+| Bounds and precedence | Invalid enum/HIR, negative/zero/exact/next rows, header cap, normalized-byte arithmetic, every SoA offset/size/alignment and target-size overflow; output/arena before options, options before descriptor/input, earliest lexical/conversion/width before row limit; no later scan after terminal error. | Multi-invalid pairwise precedence matrix including negative bound plus malformed descriptor; target-representability twins; counters for last inspected row/field and zero allocator calls. |
 | Allocation and atomicity | Pass 1 no heap/arena; pass 2 one exact aligned arena block only after full success; no AoS/transpose; zero-row null/zero; OOM abort; fill invariant abort; error leaves arena unchanged. | Arena/heap allocation and byte counters; failpoints at layout/allocation/fill boundaries; exact one-block topology inspection; pre/post arena cursor owner. |
 | String ownership and regions | Clean unquoted/quoted input views; doubled-quote normalized tail; mixed cells; type-level input+out retention; primitive-only out retention; input already rooted in `out`; direct/field/Option/Result/join/projection/pipeline/storage generations. | Pointer-range classification plus exact bytes; distinct-owner and same-arena input/output twins; input/out escape and mutation negatives; primitive input-release positive; generic and control-flow carrier matrix. |
 | SoA layout and pipeline | One shared layout authority; direct declaration-order columns; every field alignment/base residue; index/projection/window/where/map/reduce; str columns read-only; no new pipeline path. | Independent layout oracle; current SoA regression bundle; base residues 0..7; generated mixed-width schemas and str pipeline owners. |
 | Native ABI and descriptor | Exact A123 signature/key/symbol/attributes/export; full `CsvField` layout/tag/reserved/name validation before input/allocation; null/negative/overflow pointer products; output zeroing; no unwind. | Registry/golden/export/compatibility mutation owners; direct runtime malformed-ABI matrix; rt-LTO on/off; allocation provenance. |
-| Cache and distribution | Package source/bridge, concrete schema graph, checked op, descriptor, runtime key/body invalidate exact frontend/object/link identities; unrelated source and ambient inputs do not; vendorable/prebuilt inventory changes only when source ships. | Whole/per-unit source/private/public/schema/runtime edit-revert twins; prebuilt add/remove/layout owners; no-op and unrelated-unit hits. |
+| Cache and distribution | Root/internal source, generic body, concrete nominal schema graph, checked op, descriptor, runtime key/body invalidate their exact frontend/object/link identities; all existing explicit target/CPU/features/profile/pipeline/runtime/link inputs remain keyed; unrelated source and ambient runtime detection do not; vendorable/prebuilt inventory changes only when source ships. | Whole/per-unit root/internal/public/schema/runtime and explicit-target edit-revert twins; prebuilt add/remove/layout owners; no-op, ambient-runtime, and unrelated-unit hits. |
 | Performance shape | Two scans; direct selected-column fill; unknown/clean text not copied; no heap/per-row/AoS/transpose; SIMD implementations match scalar when present. | Producer counters plus `bench/csv_decode`; scalar/x86/ARM64 equality owners; benchmark remains non-gating. |
 
 ## Sources of truth and author consistency pass
@@ -443,3 +466,15 @@ The author-side pass must prove:
   and
 - no implementation cell consumes streaming, nullable SoA, owned rows, dialect inference, or any
   other later capability.
+
+## Independent design review
+
+The fresh full-diff review of candidate `5f9f978f` reported one P1 and three P2 findings. The
+authoritative ledger changed first, and the synchronized repair closes the complete finding set:
+
+| Finding | Ledger-first repair |
+|---|---|
+| P1: a public generic template cannot reference a private helper omitted from its interface | Replace the private source bridge with the shipped compiler-private `pkg.csv.internal.descriptor.decode` spelling in an exact empty internal module. Package-internal import sealing, root-only formation, retained generic-body/interface identity, and whole/per-unit monomorph owners close the boundary. |
+| P2: the options ledger preceded descriptor inspection while the native sequence did the reverse | Split safe output/arena validation from descriptor validation; validate header tag, line-ending tag, and row bound before the complete descriptor. Pin negative-bound-plus-malformed-descriptor precedence. |
+| P2: the cache sentence excluded CPU features even though object keys require them | Preserve every ordinary explicit target/CPU/features/profile/pipeline/runtime/link input and exclude only ambient runtime detection or data-dependent CSV state. Add explicit-target edit/revert owners. |
+| P2: summary prose promised an allocation for zero-row success | Make `{ null, 0 }` and zero allocation exact for `N == 0` in the ledger and every normative summary; the one-block promise applies only to `N > 0`. |

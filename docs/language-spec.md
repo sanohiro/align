@@ -1502,8 +1502,9 @@ fixed full-cell lexical grammars, and only `str` admits empty text.
 `max_rows` is inclusive and nonnegative. Invalid options, grammar, header identity, row width, or
 selected conversion is `Invalid`; the 1025th header column, first complete otherwise-valid row past
 the bound, or unrepresentable exact layout is `LimitExceeded`. OOM and impossible private states
-abort. An allocation-free first pass validates the complete successful input; a second pass makes
-one exact arena allocation and fills SoA columns directly. Clean strings borrow input spans, while
+abort. An allocation-free first pass validates the complete successful input. Zero rows return
+canonical `{null, 0}` without allocation; only a nonempty second pass makes one exact arena
+allocation and fills SoA columns directly. Clean strings borrow input spans, while
 only doubled-quote strings are normalized into the output block. Primitive-only results retain
 `out`; string-bearing results retain `input` and `out`. Error does not advance the arena.
 

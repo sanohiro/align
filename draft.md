@@ -3808,8 +3808,9 @@ ledger; empty is admitted only for `str`. `max_rows` is an inclusive nonnegative
 Invalid options, grammar, header identity, width, and selected conversion return `Invalid`; the
 1025th header column, first complete otherwise-valid row beyond the bound, or unrepresentable exact
 layout returns `LimitExceeded`. OOM and impossible private statuses abort. Validation is a complete
-allocation-free first pass. Success then allocates one exact arena block and fills SoA columns
-directly, with no AoS intermediate or transpose. Clean `str` cells borrow input spans; only fields
+allocation-free first pass. A zero-row success returns canonical `{null, 0}` without allocation;
+otherwise the second pass allocates one exact arena block and fills SoA columns directly, with no
+AoS intermediate or transpose. Clean `str` cells borrow input spans; only fields
 containing doubled quotes are decoded into the output block. Primitive-only results depend on
 `out`; results containing `str` depend on both `input` and `out`. Error leaves `out` unchanged.
 

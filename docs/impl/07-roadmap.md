@@ -4022,8 +4022,9 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   CRLF/LF, destination arena, and inclusive row limit are explicit. Present headers provide a
   bounded nonempty byte-unique named projection; absent headers require exact declaration order.
   One leading BOM is stripped, RFC 4180 quoting admits UTF-8/NUL/quoted line breaks, and selected
-  scalar fields use fixed full-cell lexical grammars. A complete allocation-free pass precedes one
-  exact arena allocation and direct column fill; clean text borrows input spans and only doubled-
+  scalar fields use fixed full-cell lexical grammars. A complete allocation-free pass returns
+  zero rows as `{null, 0}` without allocation; nonempty output then uses one exact arena allocation
+  and direct column fill. Clean text borrows input spans and only doubled-
   quote fields are normalized into the output block. Primitive schemas retain `out`, string-bearing
   schemas retain `input` and `out`, and recoverable errors leave the arena unchanged. Canonical
   package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only

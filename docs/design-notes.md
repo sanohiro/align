@@ -1524,8 +1524,9 @@ explicit LF form. The declared record fixes every scalar conversion. Extra named
 grammar-validated but never converted, so wide inputs can be projected without reflection.
 
 Two passes preserve failure atomicity and the physical result shape. The first validates the whole
-successful document and exact layout without allocating. The second allocates one arena block and
-writes declaration-order columns directly. Clean text remains a view into the input; only doubled-
+successful document and exact layout without allocating. Zero rows return canonical `{null, 0}`;
+for nonempty output the second allocates one arena block and writes declaration-order columns
+directly. Clean text remains a view into the input; only doubled-
 quote fields need normalized bytes, which live in the same block. This makes input and arena
 lifetimes visible in the result type while avoiding per-field strings, an AoS staging table, and a
 transpose. Streaming needs a different chunk/view lifetime and is therefore a later capability,

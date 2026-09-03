@@ -813,14 +813,17 @@ new `Ty` or `Scalar` variant or format version is reserved. Their exact definiti
 |---|---|
 | `CsvDecode` | Non-child `struct_id` names one concrete natural-layout `SoaPlain` record with 1..=1024 fields and unique source names. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. Result is the canonical `Result<soa<struct_id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance. No fact reaches the error alternative. |
 
-Sema may form the record only for the exact private `decode_bridge` call in the canonical vendored
-root `pkg.csv` public wrapper. The bridge and wrapper have the exact accepted generic signatures;
-the bridge body is `process.abort()` and the wrapper body is the one positional bridge call using
-its parameters once in declaration order. A same-named application function/extern, a changed
-package definition graph or body, a function value of the private bridge, or a noncanonical package
+Sema may form the record only for the exact compiler-private call spelling
+`pkg.csv.internal.descriptor.decode` in the canonical vendored root `pkg.csv` public generic
+wrapper. The exact internal descriptor module contains no import or source item, so the public
+generic body references no private declaration omitted from its interface. The retained generic
+body and internal module identity are available to importing-unit monomorphization, while the
+package `internal` rule prevents application import. The wrapper body is the one positional
+internal operation call using its parameters once in declaration order. A same-named application
+function/extern, an added internal item, a changed package graph/body, or a noncanonical package
 remains ordinary source or rejects package admission. Direct/imported/local/function-field and
 control-selected public function values execute the ordinary wrapper and converge on its one
-checked bridge record.
+checked record.
 
 Validation checks scalar identity and package/schema facts before the three children, then checks
 children in source evaluation order and the relational result/effect/provenance rule. A terminating
