@@ -1,5 +1,25 @@
 # History of Align
 
+## 2026-09-03: pkg.csv settles on one typed direct-to-SoA materializer
+
+The first `pkg.csv` design accepts one in-memory UTF-8 decoder whose expected `soa<R>` result is the
+schema. Header presence, CRLF/LF selection, destination arena, and inclusive row bound are explicit;
+there is no dialect inference, parser object, dynamic row model, or row-major result. Present
+headers provide a bounded byte-exact named projection, absent headers require exact declaration
+order, and RFC 4180 quoting is extended only to UTF-8 text and explicit LF separators.
+
+A complete allocation-free first pass validates grammar, selected scalar conversions, bounds, and
+layout. One second pass allocates an exact arena block and fills columns directly. Clean strings
+borrow the input; only doubled-quote fields are normalized into the arena. Primitive records retain
+only the output region, while string-bearing records retain both input and output. Errors publish
+no partial result and do not advance the arena.
+
+Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
+operation, and reserved keyed runtime shape A123 atomically. The design itself changes neither the
+five shipped package subtrees nor the 330-keyed/348-base runtime inventory. Exact surface, grammar,
+conversions, precedence, ABI, ownership, and implementation matrix:
+`docs/impl/pkg-design/csv.md`.
+
 ## 2026-09-02: pkg.kv is one typed synchronous plaintext RESP2 client
 
 The accepted `pkg.kv` design fixes one opaque Move `client`, explicit connect and I/O timeouts plus

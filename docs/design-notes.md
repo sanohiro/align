@@ -1508,6 +1508,34 @@ repair review found one P3 in the recursively reachable reader/writer/logger car
 A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation then
 followed the recorded prerequisite order and activated the package and checked timeout row together.
 
+## Why `pkg.csv` decodes directly to typed SoA instead of exposing a parser object
+
+CSV is useful here when it becomes columns without creating a second dynamic value model. The
+expected `soa<R>` type is the schema: absent headers map exact declaration order, while present
+headers provide one bounded byte-exact projection. A parser object, dynamic row map, iterator, or
+row-major intermediate would add hidden allocation and lifetime states and would make the common
+path pay for a representation the data-oriented pipeline immediately discards.
+
+The caller therefore supplies every policy that changes interpretation: header presence, CRLF or
+LF, destination arena, and an inclusive row bound. The package does not infer a dialect from data,
+the platform, a MIME header, or locale. Its RFC 4180 quote/record model is strict enough to make
+width and error precedence deterministic, but admits UTF-8, NUL, quoted line breaks, and the common
+explicit LF form. The declared record fixes every scalar conversion. Extra named columns are
+grammar-validated but never converted, so wide inputs can be projected without reflection.
+
+Two passes preserve failure atomicity and the physical result shape. The first validates the whole
+successful document and exact layout without allocating. The second allocates one arena block and
+writes declaration-order columns directly. Clean text remains a view into the input; only doubled-
+quote fields need normalized bytes, which live in the same block. This makes input and arena
+lifetimes visible in the result type while avoiding per-field strings, an AoS staging table, and a
+transpose. Streaming needs a different chunk/view lifetime and is therefore a later capability,
+not an overload of this materializer.
+
+The checked `CsvDecode` operation and reserved A123 runtime row must activate together with the
+canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR while making LLVM a
+pure descriptor-and-call lowering. The design contract, exact lexical conversions, ABI record,
+and closure matrix are in `impl/pkg-design/csv.md`.
+
 ## Why tests are Result blocks run in separate processes
 
 An Align test reuses the language's one error model. Its body is a compiler-private

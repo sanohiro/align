@@ -3780,6 +3780,46 @@ found one P3 in the recursively reachable reader/writer/logger carrier owner gra
 review accepted the fifth repair with no P0–P3 finding; implementation then shipped the accepted
 package source and runtime row together.
 
+The accepted, not-yet-implemented `pkg.csv` v1 surface is one typed in-memory decoder:
+
+```text
+pkg.csv.Header { Present, Absent }
+pkg.csv.LineEnding { CrLf, Lf }
+pkg.csv.DecodeOptions { header: Header, line_ending: LineEnding, max_rows: i64 }
+pkg.csv.Error { Invalid, LimitExceeded }
+pkg.csv.decode<R: SoaPlain>(
+  input: str,
+  out: region,
+  options: DecodeOptions,
+) -> Result<soa<R>, Error>
+```
+
+There are no defaults or ambient dialect settings. `R` is inferred from the expected result and
+has 1..=1024 natural-layout `SoaPlain` fields. `Header.Absent` maps an exact-width document by
+declaration order. `Header.Present` consumes one 1..=1024-field header whose decoded names are
+nonempty and byte-unique, maps every declared field exactly once by byte-exact name, admits extra
+unique columns, and grammar-validates without converting those extras. `LineEnding` explicitly
+selects CRLF or LF outside quotes; mixed separators and lone CR are invalid. One UTF-8 BOM is
+stripped only at absolute byte zero. Quoting follows the RFC 4180 record model, including doubled
+quotes and embedded quoted line breaks; spaces, NUL, and non-ASCII UTF-8 remain data.
+
+Integer, float, bool, and char fields use the fixed full-cell lexical grammars in the package
+ledger; empty is admitted only for `str`. `max_rows` is an inclusive nonnegative data-row bound.
+Invalid options, grammar, header identity, width, and selected conversion return `Invalid`; the
+1025th header column, first complete otherwise-valid row beyond the bound, or unrepresentable exact
+layout returns `LimitExceeded`. OOM and impossible private statuses abort. Validation is a complete
+allocation-free first pass. Success then allocates one exact arena block and fills SoA columns
+directly, with no AoS intermediate or transpose. Clean `str` cells borrow input spans; only fields
+containing doubled quotes are decoded into the output block. Primitive-only results depend on
+`out`; results containing `str` depend on both `input` and `out`. Error leaves `out` unchanged.
+
+The implementation must add one checked `CsvDecode` HIR/MIR operation and reserved keyed ABI shape
+A123 atomically with canonical package admission and owner tests; the design alone activates none
+of them and does not change shipped package or runtime inventories. Streaming, encoding, files,
+dialect inference, dynamic/owned rows, nullable columns, and recovery remain outside v1. Exact
+grammar, conversions, precedence, lifetime, cache identity, ABI reservation, and closure matrix:
+`docs/impl/pkg-design/csv.md`.
+
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship.
 A proposed package joins that set only when its source ships. First-party packages are

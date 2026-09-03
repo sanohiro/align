@@ -392,8 +392,9 @@ close/Drop を固定する。
 mandatory base export、
 source-reachable compatible extern、collision-reserved unkeyed identity である。既存 ABI
 shape を再利用するため、activation は exact base/maximum count を 347/355 から 348/356 に変え、keyed
-count は 330 のまま。unkeyed count は 18、そのうち source-reachable は 13 になり、A123 は次の
-unreserved shape のまま。LLVM/Rust definition は既存の A04/default-C-calling-convention contract を
+count は 330 のまま。unkeyed count は 18、そのうち source-reachable は 13。A123 は当時次の
+unreserved shape であり、後続の accepted `pkg.csv` design が count を変えず inactive のまま予約した。
+LLVM/Rust definition は既存の A04/default-C-calling-convention contract を
 使い、curated function/return/parameter attribute はない。
 
 通常 package source は全 native status を明示的に decode する。常に `core.Error.Code(status)` を構築する

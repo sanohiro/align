@@ -3847,8 +3847,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`pkg.kv` is implemented after `pkg.auth`; the planned domain order places `pkg.csv` next, with no
-accepted surface yet. Promotion of an optimization slice is a separate explicit
+`pkg.kv` is implemented after `pkg.auth`; `pkg.csv` now has an accepted design and is the next
+implementation capability. Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -4017,8 +4017,19 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   slice/builder/logger/`io.copy` closed-peer evidence. The package source and checked ABI row are
   active together. Exact ledger and implementation closure matrix:
   `pkg-design/kv.md`.
-- **pkg.csv** — RFC 4180 → columns (SoA); field views region-bound to input+arena; escaped
-  fields only are arena-normalized; BOM stripped once.
+- **pkg.csv — DESIGNED 2026-09-03; IMPLEMENTATION NEXT** — exactly one typed in-memory
+  `decode<R: SoaPlain>(input, out, options) -> Result<soa<R>, Error>` materializer. Header presence,
+  CRLF/LF, destination arena, and inclusive row limit are explicit. Present headers provide a
+  bounded nonempty byte-unique named projection; absent headers require exact declaration order.
+  One leading BOM is stripped, RFC 4180 quoting admits UTF-8/NUL/quoted line breaks, and selected
+  scalar fields use fixed full-cell lexical grammars. A complete allocation-free pass precedes one
+  exact arena allocation and direct column fill; clean text borrows input spans and only doubled-
+  quote fields are normalized into the output block. Primitive schemas retain `out`, string-bearing
+  schemas retain `input` and `out`, and recoverable errors leave the arena unchanged. Canonical
+  package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only
+  together. Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
+  and recovery are deferred. Exact ledger and implementation closure matrix:
+  `pkg-design/csv.md`.
 - **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to
   the package (not added to public crypto).
 - **pkg.template** — escape-by-default HTML builder; `raw` is the one unescaped path; shares the

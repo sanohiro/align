@@ -1479,3 +1479,35 @@ pre-existing-derived-shell entry state, and its repair review found one P3 in th
 reachable reader/writer/logger carrier owner graph. A fresh complete review accepted the fifth
 repair with no P0–P3 finding; implementation then shipped the accepted package source and runtime
 row together.
+
+The accepted, not-yet-implemented `pkg.csv` v1 surface is:
+
+```text
+pkg.csv.Header { Present, Absent }
+pkg.csv.LineEnding { CrLf, Lf }
+pkg.csv.DecodeOptions { header: Header, line_ending: LineEnding, max_rows: i64 }
+pkg.csv.Error { Invalid, LimitExceeded }
+pkg.csv.decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions)
+  -> Result<soa<R>, Error>
+```
+
+There are no defaults. Expected result type supplies the 1..=1024-field natural-layout
+`SoaPlain` record `R`. Absent headers map an exact width by declaration order. Present headers are
+nonempty and byte-unique, map every declared field exactly once by byte-exact name, and may contain
+extra grammar-valid columns that are not converted. The caller explicitly selects CRLF or LF; mixed
+or lone-CR separators are invalid. One leading UTF-8 BOM is stripped. RFC 4180 quoting admits
+doubled quotes and quoted line breaks; spaces, NUL, and UTF-8 remain data. Selected scalar cells use
+fixed full-cell lexical grammars, and only `str` admits empty text.
+
+`max_rows` is inclusive and nonnegative. Invalid options, grammar, header identity, row width, or
+selected conversion is `Invalid`; the 1025th header column, first complete otherwise-valid row past
+the bound, or unrepresentable exact layout is `LimitExceeded`. OOM and impossible private states
+abort. An allocation-free first pass validates the complete successful input; a second pass makes
+one exact arena allocation and fills SoA columns directly. Clean strings borrow input spans, while
+only doubled-quote strings are normalized into the output block. Primitive-only results retain
+`out`; string-bearing results retain `input` and `out`. Error does not advance the arena.
+
+Implementation activates canonical package admission, checked `CsvDecode` HIR/MIR, and reserved
+keyed ABI shape A123 atomically; this accepted design changes no shipped inventory. Streaming,
+encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
+outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.

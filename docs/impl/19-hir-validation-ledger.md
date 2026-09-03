@@ -798,6 +798,45 @@ missing child, wrong order/type/result, lost generation, retained region, or mis
 Both records, their canonical encoder/decoder arms, public/private package-body admission,
 interface/compiler fingerprint inputs, cache identity, and runtime keys are active as one boundary.
 
+### Reserved `pkg.csv` record (designed 2026-09-03; inactive)
+
+The accepted `pkg.csv` design reserves one expression discriminator, `CsvDecode`. It is not in the
+current enum, canonical codec, validator, lowering, capability collector, or inventory. Those
+producers activate only atomically with canonical package source and runtime row A123.
+
+`Header`, `LineEnding`, `DecodeOptions`, and `Error` use existing nominal enum/record families; no
+new `Ty` or `Scalar` variant or format version is reserved. Their exact definition graph is
+`Present=0, Absent=1`; `CrLf=0, Lf=1`; ordered fields `header`, `line_ending`, `max_rows`; and
+`Invalid=0, LimitExceeded=1`.
+
+| Reserved record | Exact checked contract |
+|---|---|
+| `CsvDecode` | Non-child `struct_id` names one concrete natural-layout `SoaPlain` record with 1..=1024 fields and unique source names. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. Result is the canonical `Result<soa<struct_id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance. No fact reaches the error alternative. |
+
+Sema may form the record only for the exact private `decode_bridge` call in the canonical vendored
+root `pkg.csv` public wrapper. The bridge and wrapper have the exact accepted generic signatures;
+the bridge body is `process.abort()` and the wrapper body is the one positional bridge call using
+its parameters once in declaration order. A same-named application function/extern, a changed
+package definition graph or body, a function value of the private bridge, or a noncanonical package
+remains ordinary source or rejects package admission. Direct/imported/local/function-field and
+control-selected public function values execute the ordinary wrapper and converge on its one
+checked bridge record.
+
+Validation checks scalar identity and package/schema facts before the three children, then checks
+children in source evaluation order and the relational result/effect/provenance rule. A terminating
+child suppresses every later child and native action. MIR projects the already-evaluated options
+record once into header tag, line-ending tag, and row bound; it retains the concrete schema,
+destination region, result/provenance, and private status map. Status 0 publishes `Ok`, 1 publishes
+`Err(Invalid)`, 2 publishes `Err(LimitExceeded)`, and every other status reaches the canonical
+package's explicit `ProcessAbort` dependency without publishing output.
+
+Activation must update every expression match, replay/clone/depth/effect/region/escape/type-
+placement/storage-generation traversal, canonical HIR codec, semantic projection, interface and
+cache identity, whole/per-unit monomorphization, capability discovery, and the compile-time variant
+sweep. The exact malformed-field, control-flow, provenance, allocation, ABI, cache, and package-
+admission owners are the closure matrix in `pkg-design/csv.md`. Until that matrix lands, this
+section is a reservation and changes no checked-HIR contract.
+
 ## Header-adjacent records
 
 | Record | Exact contract |

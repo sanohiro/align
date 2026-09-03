@@ -84,8 +84,9 @@ production `process.command` continues to select its shipped runtime entries unc
 | `TestReportV1` | A113: `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
 These declarations occupy A110 through A113. The implemented `std.log` design occupies A114 through
-A117, `core.codec` occupies A118 through A120, and `pkg.frame` occupies A121/A122 below, so A123 is
-the next unreserved shape. All
+A117, `core.codec` occupies A118 through A120, and `pkg.frame` occupies A121/A122 below. Accepted
+`pkg.csv` design reserves inactive A123 below, so A124 is the next unreserved design shape while
+A123 remains absent from every current registry and export count. All
 four declarations carry the existing
 generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
@@ -285,7 +286,8 @@ At package implementation, the one new key, symbol, definition, collision reserv
 registry row, runtime ABI fingerprint input, base/maximum export entry, and source-compatible extern
 reuse activated atomically. It increased the unkeyed/base/maximum counts by one and the keyed count
 by zero: the exact current keyed/base/maximum counts are 330/348/356. It reuses an existing shape,
-so A123 remains the next unreserved shape. The current unkeyed count is eighteen, thirteen of which
+so A123 remains the next unused active shape and is reserved only by the accepted `pkg.csv` design
+below. The current unkeyed count is eighteen, thirteen of which
 are source-reachable. Both prerequisite hardenings and the new row are active with the `pkg.kv`
 consumer.
 Exact public consumption, poisoning, and owner matrix: `pkg-design/kv.md`.
@@ -395,6 +397,46 @@ before one exact output allocation, probes again to fill left-major/right-ascend
 equality after every hash match, and retains no input pointer. Activation moves the
 keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and makes A123 the next
 unreserved shape. Exact public semantics and owner matrix: `pkg-design/frame.md`.
+
+## Reserved `pkg.csv` extension (designed 2026-09-03; inactive)
+
+The accepted design reserves one keyed shape without adding a current `RuntimeKey`, declaration,
+definition, export, collision identity, fingerprint input, or count:
+
+| Reserved runtime key | Symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
+|---|---|---|---|
+| `CsvDecodeSoaV1` | `align_rt_csv_decode_soa_v1` | A123: `i32 @SYM(ptr, i64, ptr, i64, ptr, i32, i32, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const CsvField, i64, *mut Arena, i32, i32, i64, *mut AlignStr) -> i32` |
+
+Arguments are input pointer/byte length, descriptor pointer/count, destination arena, checked
+header tag, checked line-ending tag, inclusive row bound, and a nonnull aligned writable output
+header. The row is C calling convention and `nounwind`, with no other curated function, return, or
+parameter attribute. The runtime zeroes output before public validation. Status 0 is success, 1 is
+only `pkg.csv.Error.Invalid`, and 2 is only `LimitExceeded`; every other i32 is a compiler-private
+invariant failure and the canonical wrapper aborts. OOM and an impossible second-pass mismatch also
+abort. Recoverable error publishes no output and does not advance the arena.
+
+Input bytes, descriptor records, and descriptor-name bytes remain immutable for the complete call.
+The live arena control object and output header are separately exclusive and disjoint from each
+other and from those immutable ranges. Input may occupy a prior live allocation of the same arena;
+the next arena allocation cannot overlap it. Exact-compatible unsafe source externs establish these
+provenance and overlap preconditions, while checked compiler-produced calls derive them before
+lowering.
+
+`CsvField` is target-native `#[repr(C)]` / non-packed LLVM
+`{ name_ptr: ptr, name_len: i64, tag: i32, reserved: i32 }`. Names are nonempty static UTF-8 bytes
+in declaration order and `reserved` is zero. `tag` is `(signed << 16) | (kind << 8) | width`:
+integer kind 0 with width 1/2/4/8 and sign bit 16; bool kind 1 width 1; float kind 2 width 4/8; str
+kind 3 width 16; char kind 4 width 4. All other bits are zero. Before input access or arena effects,
+the runtime validates output and arena, every count/range/pointer product, every descriptor field,
+and descriptor-name uniqueness.
+
+Activation is one atomic package/HIR/MIR/runtime capability: it adds the key, exact declaration
+golden, definition/export, collision reservation, capability collection, fingerprints, and all
+owners together. It changes current keyed/base/either-four-row-probe/maximum totals from
+330/348/352/356 to 331/349/353/357 and makes A124 the next unreserved active shape. A source extern
+cannot activate the row or select checked `CsvDecode`; after activation, exact compatible source-
+extern reuse follows the ordinary registry rule. No partial producer may land. Exact semantics,
+validation order, allocation contract, and closure matrix: `pkg-design/csv.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 

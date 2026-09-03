@@ -19,6 +19,33 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### CSV v1 is one explicit typed direct-to-SoA decode (SETTLED 2026-09-03)
+
+**Decision:** `pkg.csv` exposes `Header { Present, Absent }`,
+`LineEnding { CrLf, Lf }`, `DecodeOptions { header, line_ending, max_rows }`,
+`Error { Invalid, LimitExceeded }`, and exactly one
+`decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>`.
+There are no defaults. The expected result supplies `R`; header absence maps exact declaration
+order, while a present bounded nonempty byte-unique header maps every declared name exactly once
+and may carry grammar-valid unconverted extras. The selected CRLF or LF spelling is the only
+outside-quote separator. One leading BOM is stripped, and the RFC 4180 quote model otherwise
+preserves UTF-8, NUL, whitespace, and quoted line breaks.
+
+The first pass validates the complete successful input, exact scalar conversions, row bound, and
+layout without allocation. The second makes one exact arena allocation and fills SoA columns
+directly. Clean text borrows input spans; only doubled-quote text is normalized into the same
+block. A primitive-only result depends on `out`; a string-bearing result depends on `input` and
+`out`. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
+conversion are `Invalid`; the header cap, first complete row beyond the inclusive bound, and
+unrepresentable layout are `LimitExceeded`; OOM and impossible private states abort.
+
+Streaming, encoding, file/mmap input, dialect inference, dynamic or owned rows, nullable columns,
+recovery, and diagnostic payloads remain separate consumer-backed capabilities. Canonical package
+admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only as one
+implementation boundary.
+
+Record: `docs/impl/pkg-design/csv.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### Auth v1 is explicit bounded protocol assembly (SETTLED 2026-09-01)
 
 **Decision:** `pkg.auth` is ordinary package source over existing JSON, encoding, and crypto. Its
