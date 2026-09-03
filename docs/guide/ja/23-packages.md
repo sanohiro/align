@@ -32,7 +32,7 @@ pkg/
 
 `import pkg.web` は `pkg/web.align`、`import pkg.web.cookie` は `pkg/web/cookie.align` に解決されます。呼び出しや型名は `pkg.web.get(...)`、`pkg.web.types.Ctx` のように常に完全修飾します。
 
-Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/frame/pkg](../../../apps/frame/pkg)、[apps/auth/pkg](../../../apps/auth/pkg)、[apps/kv/pkg](../../../apps/kv/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
+Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/frame/pkg](../../../apps/frame/pkg)、[apps/auth/pkg](../../../apps/auth/pkg)、[apps/kv/pkg](../../../apps/kv/pkg)、[apps/csv/pkg](../../../apps/csv/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
 
 パッケージ用のマニフェスト、lockfile、レジストリ、バージョンソルバ、ダウンロードコマンドはありません。依存グラフは `import` とファイルシステムから決まり、1つのソースツリーに存在できる `pkg/<name>` は1つです。依存関係の更新や監査は、vendoring したソース自体の更新や監査として行います。
 

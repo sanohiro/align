@@ -4,7 +4,7 @@
 >
 > **注意:** 英語版 (`../csv.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** 設計済み（2026-09-03）。未実装。
+> **ステータス:** 実装済み（2026-09-03）。
 
 ## 公開契約台帳
 
@@ -253,9 +253,9 @@ MIR status は 0=`Ok`、1=`Err(Invalid)`、2=`Err(LimitExceeded)`。private `-1`
 `process.abort()`。runtime は malformed private ABI に `-1` だけを返し他 status は返さない。error edge は
 output を公開せず Drop なし。semantics は MIR にあり LLVM は pure lowering。
 
-## Runtime ABI reservation
+## Runtime ABI
 
-design は current count を変えず keyed A123 を予約する。
+実装は keyed A123 を activate し current count を進める。
 
 | runtime key | exact symbol | exact LLVM declaration | exact Rust ABI |
 |---|---|---|---|

@@ -1556,7 +1556,9 @@ fn mutable_replacement_backing_compatible(
 /// receiving one from an unresolved producer must not mint a destination-local alias identity.
 fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
     match &expression.kind {
-        ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => true,
+        ExprKind::ArrayToSoa { .. }
+        | ExprKind::JsonDecodeSoa { .. }
+        | ExprKind::CsvDecode { .. } => true,
         ExprKind::OptionSome(inner)
         | ExprKind::ResultOk(inner)
         | ExprKind::ResultErr(inner)
@@ -7451,6 +7453,150 @@ fn ast_type_i64(ty: &ast::Type) -> bool {
     ast_named_type_is(ty, &["i64"], &[])
 }
 
+fn ast_type_str(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["str"], &[])
+}
+
+fn ast_type_region(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["region"], &[])
+}
+
+fn ast_type_csv_header(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["Header"], &[])
+}
+
+fn ast_type_csv_line_ending(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["LineEnding"], &[])
+}
+
+fn ast_type_csv_options(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["DecodeOptions"], &[])
+}
+
+fn ast_type_csv_row_param(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["R"], &[])
+}
+
+fn ast_type_csv_soa(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["soa"], &[ast_type_csv_row_param])
+}
+
+fn ast_type_csv_error(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["Error"], &[])
+}
+
+fn ast_type_csv_result(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["Result"], &[ast_type_csv_soa, ast_type_csv_error])
+}
+
+fn ast_csv_enum_is(item: &ast::Item, name: &str, variants: &[&str]) -> bool {
+    let ast::Item::Enum(definition) = item else {
+        return false;
+    };
+    definition.vis == ast::Vis::Pub
+        && definition.name.name == name
+        && definition.type_params.is_empty()
+        && definition.variants.len() == variants.len()
+        && definition
+            .variants
+            .iter()
+            .zip(variants)
+            .all(|(actual, expected)| actual.name.name == *expected && actual.payload.is_empty())
+}
+
+fn ast_csv_decode_body(body: &ast::FnBody) -> bool {
+    let ast::FnBody::Expr(expression) = body else {
+        return false;
+    };
+    let ast::ExprKind::Call { callee, args } = &expression.kind else {
+        return false;
+    };
+    let ast::ExprKind::FieldAccess { recv, field } = &callee.kind else {
+        return false;
+    };
+    field.name == "decode"
+        && flatten_module_path(recv).as_deref() == Some("pkg.csv.internal.descriptor")
+        && matches!(
+            args.as_slice(),
+            [input, out, options]
+                if matches!(&input.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["input"]))
+                    && matches!(&out.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["out"]))
+                    && matches!(&options.kind, ast::ExprKind::Path(path) if ast_path_is(path, &["options"]))
+        )
+}
+
+fn canonical_pkg_csv_module(file: &ast::File) -> bool {
+    if file.imports.len() != 2
+        || !ast_path_is(&file.imports[0], &["std", "process"])
+        || !ast_path_is(&file.imports[1], &["pkg", "csv", "internal", "descriptor"])
+    {
+        return false;
+    }
+    let [header, line_ending, options, error, decode] = file.items.as_slice() else {
+        return false;
+    };
+    let options_is_valid = matches!(
+        options,
+        ast::Item::Struct(definition)
+            if definition.vis == ast::Vis::Pub
+                && definition.name.name == "DecodeOptions"
+                && definition.type_params.is_empty()
+                && definition.align.is_none()
+                && !definition.c_repr
+                && matches!(definition.fields.as_slice(), [header, line_ending, max_rows]
+                    if header.name.name == "header" && ast_type_csv_header(&header.ty)
+                        && line_ending.name.name == "line_ending" && ast_type_csv_line_ending(&line_ending.ty)
+                        && max_rows.name.name == "max_rows" && ast_type_i64(&max_rows.ty))
+    );
+    let decode_is_valid = matches!(
+        decode,
+        ast::Item::Fn(function)
+            if function.vis == ast::Vis::Pub
+                && function.name.name == "decode"
+                && matches!(function.type_params.as_slice(), [parameter]
+                    if parameter.name.name == "R"
+                        && parameter.bound.as_ref().is_some_and(|bound| bound.name == "SoaPlain"))
+                && matches!(function.params.as_slice(), [input, out, options]
+                    if input.mode == ast::ParamMode::ByValue
+                        && input.name.name == "input" && ast_type_str(&input.ty)
+                        && out.mode == ast::ParamMode::ByValue
+                        && out.name.name == "out" && ast_type_region(&out.ty)
+                        && options.mode == ast::ParamMode::ByValue
+                        && options.name.name == "options" && ast_type_csv_options(&options.ty))
+                && function.ret.as_ref().is_some_and(ast_type_csv_result)
+                && ast_csv_decode_body(&function.body)
+    );
+    ast_csv_enum_is(header, "Header", &["Present", "Absent"])
+        && ast_csv_enum_is(line_ending, "LineEnding", &["CrLf", "Lf"])
+        && options_is_valid
+        && ast_csv_enum_is(error, "Error", &["Invalid", "LimitExceeded"])
+        && decode_is_valid
+}
+
+fn validate_pkg_csv_modules(modules: &[Module], diags: &mut Diagnostics) {
+    for module in modules {
+        let valid = match module.path.as_str() {
+            "pkg.csv" if !module.interface_only => canonical_pkg_csv_module(module.file),
+            "pkg.csv.internal.descriptor" if !module.interface_only => {
+                module.file.imports.is_empty() && module.file.items.is_empty()
+            }
+            _ => continue,
+        };
+        if valid {
+            continue;
+        }
+        let span = module
+            .file
+            .module
+            .as_ref()
+            .map_or_else(|| Span::new(0, 0, 0), |path| path.span);
+        diags.error(
+            format!("module `{}` must match the canonical package definition", module.path),
+            span,
+        );
+    }
+}
+
 fn ast_type_row_pair(ty: &ast::Type) -> bool {
     ast_named_type_is(ty, &["RowPair"], &[])
 }
@@ -7643,6 +7789,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     diags: &mut Diagnostics,
 ) -> CheckedProgram {
     validate_pkg_frame_modules(modules, diags);
+    validate_pkg_csv_modules(modules, diags);
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -10112,6 +10259,7 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayDictEncode { struct_id, .. } => {
                 remap_id(struct_id, &remap.structs, valid)
             }
+            ExprKind::CsvDecode { row, .. } => remap_ty(row, remap, valid),
             ExprKind::JsonOwnedEncode { plan, .. }
             | ExprKind::JsonOwnedEncodeBounded { plan, .. }
             | ExprKind::JsonOwnedDecode { plan, .. } => {
@@ -16015,6 +16163,16 @@ impl EffectScan<'_> {
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
             | ExprKind::JsonScan { input, .. } => walk!(input),
+            ExprKind::CsvDecode {
+                input,
+                arena,
+                options,
+                ..
+            } => {
+                walk!(input);
+                walk!(arena);
+                walk!(options);
+            }
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => walk!(input),
@@ -19538,6 +19696,18 @@ impl<'a> EscapeCheck<'a> {
                     self.pipeline_escape_element_value(source, &[])
                 }
                 ExprKind::JsonDecodeSoa { input, .. } => self.completed_escape_value(input),
+                ExprKind::CsvDecode {
+                    row,
+                    input,
+                    arena,
+                    ..
+                } => {
+                    let mut facts = vec![self.completed_escape_value(arena)];
+                    if matches!(row, Ty::Struct(id) if self.struct_has_str(*id)) {
+                        facts.push(self.completed_escape_value(input));
+                    }
+                    Self::join_escape_value_facts(facts)
+                }
                 _ => EscapeValueFact::default(),
             },
             // `clone_in` recursively copies every view-bearing leaf into the named destination.
@@ -22182,6 +22352,22 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecodeSoa { .. } => {
                 values.push(self.allocation_region(expression));
             }
+            ExprKind::CsvDecode {
+                row,
+                input,
+                arena,
+                ..
+            } => {
+                if matches!(row, Ty::Struct(id) if self.struct_has_str(*id)) {
+                    push_fold(
+                        &mut work,
+                        Region::Static,
+                        vec![(arena, depth, None), (input, depth, None)],
+                    );
+                } else {
+                    work.push(Work::Eval(arena, depth));
+                }
+            }
             // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
@@ -23291,6 +23477,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDecodeScalar { .. }
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
+            | ExprKind::CsvDecode { .. }
             | ExprKind::JsonDecodeUnion { .. }
             // The `json.doc` ops produce a `json.doc` / `str` / scalar — never a local-backed
             // `slice<u8>`. Their escape is enforced by `tracks_region` + `region_of` (J4).
@@ -24444,7 +24631,7 @@ impl<'a> EscapeCheck<'a> {
             // call that retains its existing contents.
             return value_region;
         }
-        if matches!(argument.kind, ExprKind::CloneIn { .. })
+        if matches!(argument.kind, ExprKind::CloneIn { .. } | ExprKind::CsvDecode { .. })
             || matches!(argument.kind, ExprKind::ArrayBuilderBuild(_))
                 && value_region.is_region_owned()
         {
@@ -26563,6 +26750,16 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonOwnedEncode { .. } => {}
             ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => self.walk(max_bytes, depth),
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
+            ExprKind::CsvDecode {
+                input,
+                arena,
+                options,
+                ..
+            } => {
+                self.walk(input, depth);
+                self.walk(arena, depth);
+                self.walk(options, depth);
+            }
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
             ExprKind::JsonScan { input, .. } => self.walk(input, depth),
@@ -28827,7 +29024,9 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         ExprKind::ArrayPartition { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::PartitionElement)
         }
-        ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => {
+        ExprKind::ArrayToSoa { .. }
+        | ExprKind::JsonDecodeSoa { .. }
+        | ExprKind::CsvDecode { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::SoaColumns)
         }
         ExprKind::CloneIn { .. } => {
@@ -33232,7 +33431,10 @@ impl<'a> MoveCheck<'a> {
             } else {
                 roots.insert(BorrowRoot::Param(position));
             }
-        } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
+        } else if self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle)
+            || self.local_owns_view_storage(id)
+            || self.local_may_borrow(id)
+        {
             roots.insert(BorrowRoot::Local(id));
         }
         roots
@@ -33274,7 +33476,10 @@ impl<'a> MoveCheck<'a> {
             .map(|position| position as u32);
         if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
             fact.direct.insert(BorrowRoot::Param(position));
-        } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
+        } else if self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle)
+            || self.local_owns_view_storage(id)
+            || self.local_may_borrow(id)
+        {
             fact.direct.insert(BorrowRoot::Local(id));
         }
         fact
@@ -35277,6 +35482,50 @@ impl<'a> MoveCheck<'a> {
         self.parallel_transfer_roots.extend(roots);
     }
 
+    fn named_parallel_capture_roots(&self, target: &str, captures: &[Expr]) -> BorrowRoots {
+        let Some(hir::ReturnBorrowSummary::Roots { captures: required, .. }) =
+            self.named_parallel_transfer.get(target)
+        else {
+            return BorrowRoots::new();
+        };
+        required
+            .iter()
+            .filter_map(|index| captures.get(*index as usize))
+            .flat_map(|capture| self.borrow_sources(capture))
+            .collect()
+    }
+
+    fn root_is_region_capability(&self, root: &BorrowRoot) -> bool {
+        let local = match root {
+            BorrowRoot::Local(local)
+            | BorrowRoot::StorageLocal(_, local, _)
+            | BorrowRoot::EndedLocal(local, _)
+            | BorrowRoot::EndedStorageLocal(_, local, _, _) => Some(*local),
+            BorrowRoot::Param(position)
+            | BorrowRoot::ParamStorage(position)
+            | BorrowRoot::EndedParam(position, _)
+            | BorrowRoot::EndedParamStorage(position, _) => {
+                self.f.params.get(*position as usize).copied()
+            }
+            BorrowRoot::IterTemp(_) | BorrowRoot::EndedIterTemp(_, _) => None,
+        };
+        local.is_some_and(|local| {
+            self.f.locals
+                .get(local as usize)
+                .is_some_and(|local| local.ty == Ty::ArenaHandle)
+        })
+    }
+
+    fn reject_worker_region_requirement(&mut self, roots: &BorrowRoots, span: Span) {
+        if roots.iter().any(|root| self.root_is_region_capability(root)) {
+            self.diags.error(
+                "a parallel worker cannot invoke a function that reaches a region capability (arena allocation is lexical and non-Send)"
+                    .to_string(),
+                span,
+            );
+        }
+    }
+
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
@@ -35898,6 +36147,26 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     BorrowRoots::new()
                 }
+            }
+            ExprKind::CsvDecode {
+                row,
+                input,
+                arena,
+                ..
+            } => {
+                let mut roots = self.storage_roots(arena);
+                if matches!(row, Ty::Struct(id) if self.structs.get(*id as usize).is_some_and(|s| {
+                    s.fields.iter().any(|f| ty_may_borrow(
+                        f.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ))
+                })) {
+                    roots.extend(self.storage_roots(input));
+                }
+                roots
             }
             // A decoded shape-directed union (J1b) borrows the input only if a variant payload is a
             // `str` view (or a `str`-bearing object) — then its live view is rooted in the input;
@@ -39480,6 +39749,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Spawn { closure, .. } => {
                 self.parallel_transfer_roots
                     .extend(self.borrow_sources(closure));
+                let required = self
+                    .indirect_parallel_transfer_fact_from_facts(closure, &[])
+                    .flatten();
+                self.reject_worker_region_requirement(&required, expression.span);
             }
             ExprKind::ResultMapErr { result, f } => {
                 let active = self.active_sum_paths(result);
@@ -41823,6 +42096,24 @@ impl<'a> MoveCheck<'a> {
                         self.parallel_transfer_roots
                             .extend(self.borrow_sources(capture));
                     }
+                    if let ExprKind::ArrayParMap {
+                        stages,
+                        func,
+                        captures,
+                        ..
+                    } = &e.kind
+                    {
+                        for stage in stages {
+                            if let StageKind::Map { func, captures }
+                            | StageKind::Where { func, captures } = &stage.kind
+                            {
+                                let required = self.named_parallel_capture_roots(func, captures);
+                                self.reject_worker_region_requirement(&required, e.span);
+                            }
+                        }
+                        let required = self.named_parallel_capture_roots(func, captures);
+                        self.reject_worker_region_requirement(&required, e.span);
+                    }
                 }
             }
             // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
@@ -42207,6 +42498,17 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::JsonDecodeSoa { input, .. }
             | ExprKind::JsonDecodeUnion { input, .. } => {
                 move_expr!(self, input, moved, false, false)
+            }
+            ExprKind::CsvDecode {
+                input,
+                arena,
+                options,
+                ..
+            } => {
+                move_expr!(self, input, moved, false, false);
+                move_expr!(self, arena, moved, false, false);
+                move_expr!(self, options, moved, false, false);
+                self.parallel_transfer_roots.extend(self.storage_roots(arena));
             }
             // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
             ExprKind::JsonScan { input, .. } => move_expr!(self, input, moved, false, false),
@@ -48532,6 +48834,9 @@ impl<'a, 't> Checker<'a, 't> {
                 if modpath == "pkg.db.internal.descriptor" {
                     return self.check_static_descriptor_op(method, args, expected, span);
                 }
+                if modpath == "pkg.csv.internal.descriptor" && method == "decode" {
+                    return self.check_csv_decode_op(args, expected, span);
+                }
                 match self.resolve_qualified_fn(&modpath, method, span) {
                     Ok(Some(mangled)) => {
                         let display = format!("{modpath}.{method}");
@@ -49295,6 +49600,112 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
+    }
+
+    /// Closed compiler/package bridge for the canonical `pkg.csv` generic wrapper. The abstract
+    /// template form is checked and discarded; only a concretely rechecked `SoaPlain` row reaches
+    /// emitted HIR.
+    fn check_csv_decode_op(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if self.cur_module != "pkg.csv" {
+            self.diags.error(
+                "CSV descriptor operations are compiler-private to the canonical `pkg.csv` wrapper"
+                    .to_owned(),
+                span,
+            );
+            return err;
+        }
+        if !self.user_imports.contains("pkg.csv.internal.descriptor") {
+            self.diags.error(
+                "CSV descriptor operations require `import pkg.csv.internal.descriptor`".to_owned(),
+                span,
+            );
+            return err;
+        }
+        self.require_import("std.process", "pkg.csv decode abort path", span);
+        let [input_ast, arena_ast, options_ast] = args else {
+            self.diags.error(
+                format!("CSV descriptor operation 'decode' expects 3 argument(s), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let Some(csv_error) = self.enum_ids.get("pkg.csv$Error").copied() else {
+            self.diags.error("canonical `pkg.csv.Error` is unavailable".to_owned(), span);
+            return err;
+        };
+        let Some(options_id) = self.struct_ids.get("pkg.csv$DecodeOptions").copied() else {
+            self.diags.error("canonical `pkg.csv.DecodeOptions` is unavailable".to_owned(), span);
+            return err;
+        };
+        let result = expected.map(|ty| self.resolve(ty));
+        let row = match result {
+            Some(Ty::Result(Scalar::Soa(id), Scalar::Enum(error))) if error == csv_error => {
+                let row = Ty::Struct(id);
+                if let Some(reason) = self.soa_plain_error(row) {
+                    self.diags.error(
+                        format!("CSV row `{}` does not satisfy `SoaPlain`: {reason}", self.ty_display(row)),
+                        span,
+                    );
+                    return err;
+                }
+                row
+            }
+            Some(Ty::Result(Scalar::SoaParam(parameter), Scalar::Enum(error)))
+                if error == csv_error && self.param_bound(parameter) == Bound::SoaPlain =>
+            {
+                Ty::Param(parameter)
+            }
+            Some(other) => {
+                self.diags.error(
+                    format!("CSV decode requires an expected `Result<soa<R>, pkg.csv.Error>`, got {}", self.ty_display(other)),
+                    span,
+                );
+                return err;
+            }
+            None => {
+                self.diags.error(
+                    "cannot infer the CSV row type; annotate the result as `Result<soa<R>, csv.Error>`"
+                        .to_owned(),
+                    span,
+                );
+                return err;
+            }
+        };
+
+        let input = self.check_str_init(input_ast);
+        let arena = self.check_expr(arena_ast, Some(Ty::ArenaHandle));
+        let options = self.check_expr(options_ast, Some(Ty::Struct(options_id)));
+        if input.ty == Ty::Error || arena.ty == Ty::Error || options.ty == Ty::Error {
+            return err;
+        }
+        if !self.source_ty_matches(arena.ty, Ty::ArenaHandle)
+            || !self.source_ty_matches(options.ty, Ty::Struct(options_id))
+        {
+            return err;
+        }
+        let result_ty = match row {
+            Ty::Struct(id) => Ty::Result(Scalar::Soa(id), Scalar::Enum(csv_error)),
+            Ty::Param(parameter) => {
+                Ty::Result(Scalar::SoaParam(parameter), Scalar::Enum(csv_error))
+            }
+            _ => unreachable!("CSV row formation is concrete or template-only"),
+        };
+        Expr {
+            kind: ExprKind::CsvDecode {
+                row,
+                input: Box::new(input),
+                arena: Box::new(arena),
+                options: Box::new(options),
+            },
+            ty: result_ty,
+            span,
+        }
     }
 
     /// Closed compiler/package bridge for Q2 static database descriptors. These operations are
@@ -62157,6 +62568,17 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::JsonDecodeStructArray { input, .. }
             | ExprKind::JsonDecodeSoa { input, .. }
             | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
+            ExprKind::CsvDecode {
+                row,
+                input,
+                arena,
+                options,
+            } => {
+                *row = self.finalize(*row);
+                self.finalize_expr(input);
+                self.finalize_expr(arena);
+                self.finalize_expr(options);
+            }
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
             ExprKind::JsonScan { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
@@ -68192,11 +68614,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.frame` adds one checked operation family with two closed kind values. The
-        // wildcard-free policy above classifies it explicitly beside the fifteen core.codec
-        // expressions.
+        // `pkg.csv` adds one checked operation family. The wildcard-free policy above classifies
+        // it explicitly beside the existing package and core operations.
         assert_eq!(
-            variants, 301,
+            variants, 302,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

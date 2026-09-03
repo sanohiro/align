@@ -21,11 +21,12 @@ explicit destination capability at both `spawn` and `par_map` worker boundaries 
 or allocation. Worker-transfer provenance follows callable targets and capture environments
 recursively, so a nested function value cannot conceal the capability.
 
-Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
-operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a
+Implementation activates canonical package admission, one checked `CsvDecode` HIR/MIR operation,
+and keyed runtime shape A123 atomically. Abstract generic checking carries a
 discarded parameter-shaped record, while only concrete monomorph rechecking emits the operation;
-the schema accepts the complete existing `SoaPlain` domain without a CSV field-count cap. The design itself changes neither the
-five shipped package subtrees nor the 330-keyed/348-base runtime inventory. Exact surface, grammar,
+the schema accepts the complete existing `SoaPlain` domain without a CSV field-count cap. This makes
+six shipped package subtrees and advances the runtime inventory to 331 keyed and 349 base rows.
+Exact surface, grammar,
 conversions, precedence, ABI, ownership, and implementation matrix:
 `docs/impl/pkg-design/csv.md`.
 
@@ -47,7 +48,7 @@ ownership change; malformed private state aborts before native I/O or untrusted 
 
 A fresh full review accepted the fifth repaired ledger with no P0–P3 finding. Implementation then
 shipped root `pkg.kv`, `pkg.kv.internal.resource`, and the checked ABI row together, bringing the
-implemented first-party inventory to five vendorable subtrees. The current runtime inventory is 330
+then-implemented first-party inventory to five vendorable subtrees. The then-current runtime inventory was 330
 keyed plus 18 unkeyed records, 13 of the unkeyed records source-reachable: 348 base exports, 352
 with either four-row probe feature alone, and 356 at the maximum combined probe surface. A123
 was then the next unreserved ABI shape; the later accepted `pkg.csv` design reserves it without

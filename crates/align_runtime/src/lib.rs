@@ -18,6 +18,8 @@ mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;
 pub use crypto_asymmetric::*;
+mod csv;
+pub use csv::*;
 
 /// Builtin `print` for integers: write the decimal value + newline to stdout.
 ///
@@ -5390,16 +5392,23 @@ fn soa_layout(widths: &[usize], n: usize) -> Option<SoaLayout> {
     let mut cols = Vec::with_capacity(widths.len());
     let mut off = 0usize;
     for (j, &w) in widths.iter().enumerate() {
-        if j > 0 && w > 1 {
-            // align_up(off, w) — each column starts at its field's alignment (= its width).
-            let mask = w - 1;
-            off = off.checked_add(mask)? & !mask;
-        }
+        off = soa_column_start(off, w, j == 0)?;
         cols.push((off, w));
         off = off.checked_add(n.checked_mul(w)?)?; // advance past this column's `n` elements
     }
     let max_align = widths.iter().copied().max().unwrap_or(1);
     Some((cols, off, max_align))
+}
+
+/// Shared allocation-free column-offset step. Direct-fill decoders use this rather than copying
+/// the layout formula; [`soa_layout`] remains the vector-producing adapter for JSON's descriptor
+/// machinery.
+fn soa_column_start(off: usize, width: usize, first: bool) -> Option<usize> {
+    if first || width <= 1 {
+        return Some(off);
+    }
+    let mask = width.checked_sub(1)?;
+    off.checked_add(mask).map(|aligned| aligned & !mask)
 }
 
 /// `json.decode(input)` straight into a column-major `soa<Struct>` (the direct-fill rail) — no AoS
@@ -25713,8 +25722,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 348);
-        assert_eq!(registry.len(), 348);
+        assert_eq!(runtime.len(), 349);
+        assert_eq!(registry.len(), 349);
         assert_eq!(runtime, registry);
     }
 

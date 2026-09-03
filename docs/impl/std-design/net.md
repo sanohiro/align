@@ -376,7 +376,8 @@ The existing keyed `IoWriterWriteBuilder` identity, A19
 `i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration,
 `unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI, attributes, and inclusion in the
 then-shipped 330/347/355 keyed/base/maximum counts did not change at the writer-prerequisite
-boundary. The later `pkg.kv` row makes the current totals 330/348/356. Its source-visible builder overload
+boundary. The later `pkg.kv` row made the totals 330/348/356, and `pkg.csv` subsequently makes them
+331/349/357. Its source-visible builder overload
 borrows the builder bytes and delegates to the hardened `IoWriterWrite` row, so it cannot bypass the
 socket sink policy.
 

@@ -146,8 +146,8 @@ public wrapper 自体は通常の callable value のままである。
 両方 C calling convention、`nounwind` で、それ以外の curated attribute は持たない。
 最終 pointer は aligned writable `AlignStr` header で、source `str` ではない。2 symbol、keyed row、
 checked-HIR discriminator、package interface、owner は原子的に有効である。inventory は
-328/345/353 から 330/347/355 になり、activation 時点では A123 が次だった。後に accepted となった
-inactive `pkg.csv` design が A123 を予約したため、現在の次の unreserved design shape は A124 である。
+328/345/353 から 330/347/355 になり、activation 時点では A123 が次だった。後に実装済み
+`pkg.csv` が A123 を使用したため、現在の次の unreserved design shape は A124 である。
 
 ## 計算量と性能境界
 

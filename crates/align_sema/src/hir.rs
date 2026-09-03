@@ -1014,6 +1014,15 @@ pub enum ExprKind {
     /// Fields must be primitive scalars (the `soa<T>` rule, so no `str` columns / input region tie),
     /// and it needs an enclosing `arena {}`. The expression `ty` is `Result<soa<Struct>, Error>`.
     JsonDecodeSoa { struct_id: u32, input: Box<Expr> },
+    /// Canonical `pkg.csv.decode<R: SoaPlain>` compiler/package bridge. Abstract template checking
+    /// carries `Ty::Param(p)` and the matching `SoaParam(p)` result only until that HIR is discarded;
+    /// every emitted monomorph carries a concrete `Ty::Struct(id)` row.
+    CsvDecode {
+        row: crate::Ty,
+        input: Box<Expr>,
+        arena: Box<Expr>,
+        options: Box<Expr>,
+    },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value and select the variant by its shape class (Str/Number/Bool/Object). The `str`
     /// payloads are zero-copy views into the input, so the result is region-tied to it (see

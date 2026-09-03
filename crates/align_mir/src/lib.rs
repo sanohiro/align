@@ -1293,6 +1293,16 @@ pub enum Rvalue {
         out: Slot,
         arena: Operand,
     },
+    /// Checked `pkg.csv.decode<R>` direct-to-SoA materialization. `options` is the canonical
+    /// `pkg.csv.DecodeOptions` aggregate; codegen projects its three fields once before A123.
+    CsvDecode {
+        struct_id: u32,
+        options_struct_id: u32,
+        input: Operand,
+        arena: Operand,
+        options: Operand,
+        out: Slot,
+    },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value, select the variant by its shape class (Str/Number/Bool/Object; O(1) first-byte
     /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
@@ -2834,6 +2844,8 @@ pub enum ValidationPass {
     DeclarationHeaders,
     /// `validate_hir::json_scan_validation_reason`.
     JsonScan,
+    /// `validate_hir::csv_decode_validation_reason`.
+    CsvDecode,
     /// `align_sema::checked_hir_test_catalog_is_valid` at the test-only lowering boundary.
     TestCatalog,
     /// `validate_hir::body_only_metadata_is_valid`; carries the rejected function name.
@@ -2854,6 +2866,7 @@ impl ValidationPass {
             Self::NominalLink => "nominal_link_metadata_is_valid",
             Self::DeclarationHeaders => "declaration_header_metadata_is_valid",
             Self::JsonScan => "json_scan_validation_reason",
+            Self::CsvDecode => "csv_decode_validation_reason",
             Self::TestCatalog => "checked_hir_test_catalog_is_valid",
             Self::Bodies => "body_only_metadata_is_valid",
             Self::BodyFacts => "checked_hir_body_facts_are_valid",
@@ -2994,7 +3007,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
     hir_program_validation_reason(program).is_ok()
 }
 
-/// Run the eight gates in their fixed order, naming the first one that refuses.
+/// Run the nine gates in their fixed order, naming the first one that refuses.
 ///
 /// The order is load-bearing: each gate assumes the bounds and ids the previous ones established.
 fn hir_program_validation_reason(
@@ -3002,7 +3015,7 @@ fn hir_program_validation_reason(
 ) -> Result<(), (ValidationPass, Option<String>)> {
     /// One gate: its identity and its predicate.
     type Gate = (ValidationPass, fn(&hir::Program) -> bool);
-    let gates: [Gate; 7] = [
+    let gates: [Gate; 8] = [
         (
             ValidationPass::BodyDepth,
             align_sema::checked_hir_body_depth_is_valid,
@@ -3025,6 +3038,9 @@ fn hir_program_validation_reason(
         ),
         (ValidationPass::JsonScan, |program| {
             validate_hir::json_scan_validation_reason(program).is_ok()
+        }),
+        (ValidationPass::CsvDecode, |program| {
+            validate_hir::csv_decode_validation_reason(program).is_ok()
         }),
         // `Bodies` is checked between JsonScan and BodyFacts, below, so it can name its function.
         (
@@ -6893,6 +6909,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::JsonDecodeSoa { struct_id, input } => {
                 lower_json_decode_soa(b, *struct_id, input, e.ty)
+            }
+            hir::ExprKind::CsvDecode {
+                row,
+                input,
+                arena,
+                options,
+            } => {
+                let Ty::Struct(struct_id) = row else {
+                    b.terminate(Term::Unreachable);
+                    break 'lower_expr terminated_operand();
+                };
+                lower_csv_decode(b, *struct_id, input, arena, options, e.ty)
             }
             hir::ExprKind::JsonDecodeUnion { enum_id, input } => {
                 lower_json_decode_union(b, *enum_id, input, e.ty)
@@ -13632,6 +13660,142 @@ fn lower_json_decode_soa(
     let r = b.fresh_value(result_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+/// Lower the checked `pkg.csv.decode<R>` node. All three source arguments are evaluated once in
+/// written order. The runtime's closed status set is mapped to the nominal package error; any
+/// impossible private status aborts without running cleanup.
+fn lower_csv_decode(
+    b: &mut Builder,
+    struct_id: u32,
+    input: &hir::Expr,
+    arena: &hir::Expr,
+    options: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let soa_ty = Ty::Soa(struct_id);
+    let borrows_input = b
+        .structs
+        .get(struct_id as usize)
+        .is_some_and(|definition| definition.fields.iter().any(|field| field.ty == Ty::Str));
+    let out = b.new_slot(soa_ty);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let arena = lower_required!(b, lower_expr(b, arena), Operand::Const(Const::Unit));
+    let options = lower_required!(b, lower_expr(b, options), Operand::Const(Const::Unit));
+    let code = b.fresh_value(status_ty());
+    let options_struct_id = b
+        .structs
+        .iter()
+        .position(|definition| definition.source_name == "pkg.csv$DecodeOptions")
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(u32::MAX);
+    b.push(Stmt::Let(
+        code,
+        Rvalue::CsvDecode {
+            struct_id,
+            options_struct_id,
+            input: inp.clone(),
+            arena,
+            options,
+            out,
+        },
+    ));
+
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok = b.new_block();
+    let classify_error = b.new_block();
+    let invalid = b.new_block();
+    let check_limit = b.new_block();
+    let limit = b.new_block();
+    let impossible = b.new_block();
+    let join = b.new_block();
+    let result_slot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok, classify_error));
+
+    b.cur = ok;
+    let soa = b.fresh_value(soa_ty);
+    b.push(Stmt::Let(soa, Rvalue::Load(out)));
+    let wrapped = b.fresh_value(result_ty);
+    b.push(Stmt::Let(wrapped, Rvalue::ResultOk(Operand::Value(soa))));
+    b.push(Stmt::Store(result_slot, Operand::Value(wrapped)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = classify_error;
+    let is_invalid = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_invalid,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(1, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(
+        Operand::Value(is_invalid),
+        invalid,
+        check_limit,
+    ));
+
+    b.cur = check_limit;
+    let is_limit = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_limit,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(2, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(Operand::Value(is_limit), limit, impossible));
+
+    let Ty::Result(_, Scalar::Enum(error_enum)) = result_ty else {
+        b.cur = impossible;
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
+    for (block, variant) in [(invalid, 0), (limit, 1)] {
+        b.cur = block;
+        let error = b.fresh_value(Ty::Enum(error_enum));
+        b.push(Stmt::Let(
+            error,
+            Rvalue::MakeEnum {
+                enum_id: error_enum,
+                variant,
+                payload: Vec::new(),
+            },
+        ));
+        let wrapped = b.fresh_value(result_ty);
+        b.push(Stmt::Let(
+            wrapped,
+            Rvalue::ResultErr(Operand::Value(error)),
+        ));
+        b.push(Stmt::Store(result_slot, Operand::Value(wrapped)));
+        b.terminate(Term::Goto(join));
+    }
+
+    b.cur = impossible;
+    let aborted = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        aborted,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = join;
+    let result = b.fresh_value(result_ty);
+    b.push(Stmt::Let(result, Rvalue::Load(result_slot)));
+    if borrows_input {
+        inherit_borrow_owners(b, result, [&inp]);
+    }
+    Operand::Value(result)
 }
 
 /// `s.group_by(.key).<op>(…)` — column-oriented grouped aggregate over a `soa<Struct>` local. Reads

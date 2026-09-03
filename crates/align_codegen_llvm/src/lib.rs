@@ -5995,7 +5995,6 @@ fn parallel_capture_ty_is_valid(ty: Ty, program: &Program) -> bool {
             | Ty::Fn(_)
             | Ty::Vec(_, _)
             | Ty::Mask(_, _)
-            | Ty::ArenaHandle
     )
 }
 
@@ -6941,7 +6940,18 @@ fn callable_preflight(
                                 .collect::<Result<Vec<_>, _>>()?,
                         });
                     }
-                    Rvalue::SpawnTask { r, fallible, .. } => {
+                    Rvalue::SpawnTask {
+                        capture_tys,
+                        r,
+                        fallible,
+                        ..
+                    } => {
+                        if capture_tys.contains(&Ty::ArenaHandle) {
+                            return Err(CodegenError::Lowering(
+                                "spawn worker metadata contains a non-Send region capability"
+                                    .to_string(),
+                            ));
+                        }
                         generated.push(GeneratedId::Task {
                             fallible: *fallible,
                             result: canonical_metadata(CanonicalTy::from_program(*r, program))?,
@@ -8841,6 +8851,12 @@ struct DescTable<'c> {
     phf_ptr: inkwell::values::PointerValue<'c>,
     phf_len: u64,
     phf_seed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CsvDescTable<'c> {
+    descs: inkwell::values::PointerValue<'c>,
+    n_fields: u64,
 }
 
 /// The canonical `wyhash`, seeded — the hash behind the compile-time perfect-hash field dispatch.
@@ -15324,6 +15340,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
                 self.gen_json_decode_soa(*struct_id, input, *out, arena)?
             }
+            Rvalue::CsvDecode {
+                struct_id,
+                options_struct_id,
+                input,
+                arena,
+                options,
+                out,
+            } => self.gen_csv_decode(
+                *struct_id,
+                *options_struct_id,
+                input,
+                arena,
+                options,
+                *out,
+            )?,
             Rvalue::JsonDecodeUnion { enum_id, input, out, arena } => self.gen_json_decode_union(*enum_id, input, *out, arena.as_ref())?,
             // json.doc (J4). `get`/`at` are void (the runtime writes the child handle into `out`).
             Rvalue::JsonDoc { input, arena, out } => self.gen_json_doc(input, arena, *out)?,
@@ -19540,6 +19571,136 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_soa returns i32"))
+    }
+
+    fn csv_desc_ty(&self) -> inkwell::types::StructType<'c> {
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        self.ctx.struct_type(
+            &[
+                ptr.into(),
+                self.ctx.i64_type().into(),
+                self.ctx.i64_type().into(),
+                self.ctx.i32_type().into(),
+                self.ctx.i32_type().into(),
+            ],
+            false,
+        )
+    }
+
+    fn emit_csv_desc_table(
+        &mut self,
+        struct_id: u32,
+    ) -> Result<CsvDescTable<'c>, CodegenError> {
+        let fields = self
+            .structs
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err(format!("unknown CSV row struct id {struct_id}")))?
+            .fields
+            .clone();
+        if fields.is_empty() {
+            return Err(self.err("CSV row schema is empty"));
+        }
+        let desc_ty = self.csv_desc_ty();
+        let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
+        let mut records = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let (name_ptr, name_len) = self.str_global(&field.name);
+            let tag = match field.ty {
+                Ty::Int(integer) if matches!(integer.bits, 8 | 16 | 32 | 64) => {
+                    ((integer.signed as u64) << 16) | u64::from(integer.bits / 8)
+                }
+                Ty::Bool => (1 << 8) | 1,
+                Ty::Float(float) if matches!(float.bits, 32 | 64) => {
+                    (2 << 8) | u64::from(float.bits / 8)
+                }
+                Ty::Str => (3 << 8) | 16,
+                Ty::Char => (4 << 8) | 4,
+                other => {
+                    return Err(self.err(format!(
+                        "CSV descriptor field is outside SoaPlain: {other:?}"
+                    )));
+                }
+            };
+            let hash = align_hash::wyhash(field.name.as_bytes(), align_hash::WY_SEED);
+            records.push(desc_ty.const_named_struct(&[
+                name_ptr.into(),
+                name_len.into(),
+                i64t.const_int(hash, false).into(),
+                i32t.const_int(tag, false).into(),
+                i32t.const_zero().into(),
+            ]));
+        }
+        let value = desc_ty.const_array(&records);
+        let global = self.module.add_global(value.get_type(), None, "csv_fields");
+        global.set_initializer(&value);
+        global.set_constant(true);
+        global.set_alignment(self.target_data.get_abi_alignment(&desc_ty));
+        mark_private_unnamed_addr(global);
+        Ok(CsvDescTable {
+            descs: global.as_pointer_value(),
+            n_fields: fields.len() as u64,
+        })
+    }
+
+    fn gen_csv_decode(
+        &mut self,
+        struct_id: u32,
+        options_struct_id: u32,
+        input: &Operand,
+        arena: &Operand,
+        options: &Operand,
+        out: Slot,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        let (input_ptr, input_len) = self.split_str(input)?;
+        let arena = self.operand(arena)?;
+        let options = self.operand(options)?.into_struct_value();
+        let header = self
+            .builder
+            .build_extract_value(options, self.checked_pfield(options_struct_id, 0)?, "csv.header")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let line_ending = self
+            .builder
+            .build_extract_value(options, self.checked_pfield(options_struct_id, 1)?, "csv.eol")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let max_rows = self
+            .builder
+            .build_extract_value(options, self.checked_pfield(options_struct_id, 2)?, "csv.max_rows")
+            .map_err(|error| self.err(error))?;
+        let header = self
+            .builder
+            .build_extract_value(header, 0, "csv.header.tag")
+            .map_err(|error| self.err(error))?;
+        let line_ending = self
+            .builder
+            .build_extract_value(line_ending, 0, "csv.eol.tag")
+            .map_err(|error| self.err(error))?;
+        let table = self.emit_csv_desc_table(struct_id)?;
+        let count = self.ctx.i64_type().const_int(table.n_fields, false);
+        let call = self
+            .builder
+            .build_call(
+                self.runtime(RuntimeKey::CsvDecodeSoaV1),
+                &[
+                    input_ptr.into(),
+                    input_len.into(),
+                    table.descs.into(),
+                    count.into(),
+                    arena.into(),
+                    header.into(),
+                    line_ending.into(),
+                    max_rows.into(),
+                    out_ptr.into(),
+                ],
+                "csv.decode",
+            )
+            .map_err(|error| self.err(error))?;
+        call.try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("CSV decode runtime call returned no value"))
     }
 
     /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the
@@ -27313,6 +27474,61 @@ fn main() -> i32 = 0
             text.contains("has no LLVM value"),
             "the missing-value read must say so, got: {text}"
         );
+    }
+
+    #[test]
+    fn malformed_parallel_mir_cannot_publish_a_region_capability() {
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let spawn_error = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::SpawnTask {
+                    tg: Operand::Const(Const::Unit),
+                    closure: Operand::Const(Const::Unit),
+                    capture_tys: vec![Ty::ArenaHandle],
+                    r: i32_ty,
+                    fallible: false,
+                },
+            )],
+            vec![Ty::Box(Scalar::Int(IntTy { bits: 32, signed: true }))],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("spawn metadata must reject a direct region capability before publication");
+        assert_lowering(
+            spawn_error,
+            "spawn worker metadata contains a non-Send region capability",
+        );
+
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let par_error = codegen_program(
+            vec![
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(1, Rvalue::Load(1)),
+                Stmt::Let(
+                    2,
+                    Rvalue::ParMapReduce {
+                        src: Operand::Value(0),
+                        func: program_call("unreachable_worker"),
+                        captures: vec![Operand::Value(1)],
+                        capture_tys: vec![Ty::ArenaHandle],
+                        elem_in: i64_ty,
+                        elem_out: i64_ty,
+                        work_weight: 1,
+                    },
+                ),
+            ],
+            vec![source_ty, Ty::ArenaHandle, i64_ty],
+            vec![source_ty, Ty::ArenaHandle],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("par_map metadata must reject a direct region capability before publication");
+        assert_lowering(par_error, "callable metadata invalid:InvalidGraph");
     }
 
     #[test]

@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 330] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 331] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -127,6 +127,7 @@ runtime_keys! {
     CryptoSha512 => "crypto_sha512",
     CryptoSign => "crypto_sign",
     CryptoVerify => "crypto_verify",
+    CsvDecodeSoaV1 => "csv_decode_soa_v1",
     DictEncodeStr => "dict_encode_str",
     DictLookup => "dict_lookup",
     DivFail => "div_fail",
@@ -355,7 +356,7 @@ runtime_keys! {
     Utf8Valid => "utf8_valid",
 }
 
-const _: [(); 330] = [(); RuntimeKey::ALL.len()];
+const _: [(); 331] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -364,7 +365,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 330);
+        assert_eq!(RuntimeKey::ALL.len(), 331);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

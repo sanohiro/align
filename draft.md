@@ -3554,7 +3554,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The implemented first-party packages in this repository are exactly five vendorable subtrees:
+The implemented first-party packages in this repository are exactly six vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3565,10 +3565,13 @@ pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
+pkg.csv            // typed in-memory CSV direct-to-SoA decoder
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
 `pkg.kv.internal.resource`.
+`pkg.csv` is one vendorable subtree with root `pkg.csv` and empty compiler-private descriptor
+module `pkg.csv.internal.descriptor`.
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
 versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
@@ -3796,7 +3799,7 @@ found one P3 in the recursively reachable reader/writer/logger carrier owner gra
 review accepted the fifth repair with no P0–P3 finding; implementation then shipped the accepted
 package source and runtime row together.
 
-The accepted, not-yet-implemented `pkg.csv` v1 surface is one typed in-memory decoder:
+The implemented `pkg.csv` v1 surface is one typed in-memory decoder:
 
 ```text
 pkg.csv.Header { Present, Absent }

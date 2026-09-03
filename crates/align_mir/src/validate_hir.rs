@@ -126,6 +126,130 @@ pub(crate) fn json_scan_copy_rows_are_valid(program: &hir::Program) -> bool {
     json_scan_validation_reason(program).is_ok()
 }
 
+/// The first checked-HIR contract failure for one emitted `pkg.csv` decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CsvDecodeValidationReason {
+    InvalidSpan,
+    Origin,
+    Row,
+    Schema,
+    PackageTypes,
+    Result,
+    Input,
+    Arena,
+    Options,
+}
+
+fn tag_only_enum_is(definition: &hir::EnumDef, source_name: &str, variants: &[&str]) -> bool {
+    definition.source_name == source_name
+        && definition.variants.len() == variants.len()
+        && definition
+            .variants
+            .iter()
+            .zip(variants)
+            .all(|(actual, expected)| actual.name == *expected && actual.payload.is_empty())
+}
+
+/// Validate every emitted concrete CSV operation before the general body validator consumes its
+/// children. Package identity and the relational result shape are part of this gate rather than
+/// backend convention.
+pub(crate) fn csv_decode_validation_reason(
+    program: &hir::Program,
+) -> Result<(), CsvDecodeValidationReason> {
+    let header = program
+        .enums
+        .iter()
+        .position(|definition| definition.source_name == "pkg.csv$Header");
+    let line_ending = program
+        .enums
+        .iter()
+        .position(|definition| definition.source_name == "pkg.csv$LineEnding");
+    let error = program
+        .enums
+        .iter()
+        .position(|definition| definition.source_name == "pkg.csv$Error");
+    let options = program
+        .structs
+        .iter()
+        .position(|definition| definition.source_name == "pkg.csv$DecodeOptions");
+
+    for function in &program.fns {
+        let mut work = Vec::new();
+        for statement in &function.body.stmts {
+            push_statement_expressions(statement, &mut work);
+        }
+        if let Some(value) = function.body.value.as_deref() {
+            work.push(value);
+        }
+        while let Some(expression) = work.pop() {
+            if let hir::ExprKind::CsvDecode {
+                row,
+                input,
+                arena,
+                options: options_expr,
+            } = &expression.kind
+            {
+                if !valid_span(expression.span) {
+                    return Err(CsvDecodeValidationReason::InvalidSpan);
+                }
+                if function.origin != hir::FnOrigin::Monomorph
+                    || !function.name.starts_with("pkg.csv$decode$")
+                {
+                    return Err(CsvDecodeValidationReason::Origin);
+                }
+                let Ty::Struct(row_id) = row else {
+                    return Err(CsvDecodeValidationReason::Row);
+                };
+                if !align_sema::soa_plain_ok(*row_id, &program.structs) {
+                    return Err(CsvDecodeValidationReason::Schema);
+                }
+                let (Some(header), Some(line_ending), Some(error), Some(options)) =
+                    (header, line_ending, error, options)
+                else {
+                    return Err(CsvDecodeValidationReason::PackageTypes);
+                };
+                if !tag_only_enum_is(
+                    &program.enums[header],
+                    "pkg.csv$Header",
+                    &["Present", "Absent"],
+                ) || !tag_only_enum_is(
+                    &program.enums[line_ending],
+                    "pkg.csv$LineEnding",
+                    &["CrLf", "Lf"],
+                ) || !tag_only_enum_is(
+                    &program.enums[error],
+                    "pkg.csv$Error",
+                    &["Invalid", "LimitExceeded"],
+                ) || program.structs[options].align.is_some()
+                    || program.structs[options].c_repr
+                    || !program.structs[options].fields.iter().map(|field| (field.name.as_str(), field.ty)).eq([
+                        ("header", Ty::Enum(header as u32)),
+                        ("line_ending", Ty::Enum(line_ending as u32)),
+                        ("max_rows", Ty::Int(IntTy { bits: 64, signed: true })),
+                    ]) {
+                    return Err(CsvDecodeValidationReason::PackageTypes);
+                }
+                if expression.ty
+                    != Ty::Result(Scalar::Soa(*row_id), Scalar::Enum(error as u32))
+                {
+                    return Err(CsvDecodeValidationReason::Result);
+                }
+                if input.ty != Ty::Str {
+                    return Err(CsvDecodeValidationReason::Input);
+                }
+                if arena.ty != Ty::ArenaHandle {
+                    return Err(CsvDecodeValidationReason::Arena);
+                }
+                if options_expr.ty != Ty::Struct(options as u32) {
+                    return Err(CsvDecodeValidationReason::Options);
+                }
+            }
+            work.extend(align_sema::direct_expr_children(expression));
+        }
+    }
+    Ok(())
+}
+
 fn push_statement_expressions<'a>(statement: &'a hir::Stmt, work: &mut Vec<&'a hir::Expr>) {
     match statement {
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => work.push(init),
@@ -4002,6 +4126,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::JsonDecodeSoa { struct_id, .. } => {
                 self.json_soa_struct_ok(*struct_id)
             }
+            // Package identity, concrete row/result relation, and all three child types are owned
+            // by the earlier dedicated CSV gate. The body validator still walks the children.
+            hir::ExprKind::CsvDecode { .. } => true,
             hir::ExprKind::JsonDecodeUnion { enum_id, .. } => {
                 self.json_union_descriptor_ok(*enum_id, false)
             }
@@ -6339,6 +6466,16 @@ impl<'a> BodyValidator<'a> {
                 | hir::ExprKind::JsonDecodeUnion { input, .. }
                 | hir::ExprKind::JsonScan { input, .. }
             | hir::ExprKind::JsonDoc { input } => push_expr!(input, context.clone()),
+            hir::ExprKind::CsvDecode {
+                input,
+                arena,
+                options,
+                ..
+            } => {
+                push_expr!(options, context.clone());
+                push_expr!(arena, context.clone());
+                push_expr!(input, context.clone());
+            }
             hir::ExprKind::JsonDocKind { doc }
             | hir::ExprKind::JsonDocAsStr { doc }
             | hir::ExprKind::JsonDocAsScalar { doc, .. }
@@ -10042,6 +10179,29 @@ impl<'a> BodyValidator<'a> {
                     falls,
                     breaks,
                 ))
+            }
+            hir::ExprKind::CsvDecode {
+                input,
+                arena,
+                options,
+                ..
+            } => {
+                let input = self.expr_flow(input)?;
+                let arena = self.expr_flow(arena)?;
+                let options = self.expr_flow(options)?;
+                let canonical_options = self
+                    .program
+                    .structs
+                    .iter()
+                    .position(|definition| definition.source_name == "pkg.csv$DecodeOptions")?;
+                if input.ty != Ty::Str
+                    || arena.ty != Ty::ArenaHandle
+                    || options.ty != Ty::Struct(canonical_options as u32)
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[input, arena, options]);
+                Some((expression.ty, falls, breaks))
             }
             hir::ExprKind::JsonDecodeUnion { enum_id, input } => {
                 let flow = self.expr_flow(input)?;
