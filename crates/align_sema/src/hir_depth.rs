@@ -816,6 +816,16 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Block(then), child_depth));
                     work.push((BodyRecord::Block(els), child_depth));
                 }
+                ExprKind::CsvDecode {
+                    input,
+                    arena,
+                    options,
+                    ..
+                } => {
+                    work.push((BodyRecord::Expr(input), child_depth));
+                    work.push((BodyRecord::Expr(arena), child_depth));
+                    work.push((BodyRecord::Expr(options), child_depth));
+                }
                 ExprKind::TupleIndex { recv, .. }
                 | ExprKind::StrTrim { recv, .. }
                 | ExprKind::ArrayToSoa { source: recv, .. }

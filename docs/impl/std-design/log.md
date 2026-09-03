@@ -74,7 +74,7 @@ export-parity rows, runtime ABI fingerprint, whole/per-unit selection, and check
 golden activate atomically. At that capability boundary, the implementation changed the exact
 inventories from 314/331/339 keyed/base/maximum records to 320/337/345 and extended the shape range
 through A117. `core.codec` subsequently occupied A118 through A120, making A121 next at that point;
-`pkg.frame` later occupied A121 and A122, and the accepted inactive `pkg.csv` design reserves A123.
+`pkg.frame` later occupied A121 and A122, and the implemented `pkg.csv` row occupies A123.
 A124 is now the next unreserved design shape. Logging adds no optional feature or target-dependent
 row.
 

@@ -659,6 +659,19 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
             format!("json_decode_soa(struct#{struct_id}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
         }
+        Rvalue::CsvDecode {
+            struct_id,
+            options_struct_id: _,
+            input,
+            arena,
+            options,
+            out,
+        } => format!(
+            "csv_decode(struct#{struct_id}, {}, arena={}, options={}, -> _{out})",
+            operand_str(input),
+            operand_str(arena),
+            operand_str(options)
+        ),
         Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => {
             format!("json_decode_union(enum#{enum_id}, {}, -> _{out})", operand_str(input))
         }

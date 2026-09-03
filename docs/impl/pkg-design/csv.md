@@ -1,7 +1,7 @@
 # pkg.csv design
 
-Status: **DESIGNED**. This document is the authority for the first `pkg.csv` capability. The
-implementation must not widen it. V1 decodes one in-memory UTF-8 CSV document directly into an
+Status: **IMPLEMENTED 2026-09-03**. This document is the authority for the first `pkg.csv`
+capability. The implementation does not widen it. V1 decodes one in-memory UTF-8 CSV document directly into an
 arena-backed `soa<R>`; streaming, encoding, files, dialect inference, and owned rows are separate
 capabilities.
 
@@ -356,10 +356,9 @@ slot. Status 0 constructs `Ok`; 1 constructs `Err(Invalid)`; 2 constructs
 and performs no Drop. Bounds and region semantics exist in MIR; LLVM performs pure lowering and may
 not invent a package rule.
 
-## Runtime ABI reservation
+## Runtime ABI
 
-The design reserves keyed runtime shape A123 without activating it or changing current inventory
-counts:
+The implementation activates keyed runtime shape A123 and advances the current inventory counts:
 
 | Runtime key | Exact symbol | Exact LLVM declaration | Exact Rust ABI |
 |---|---|---|---|
@@ -439,7 +438,7 @@ errors return 2. This is the same order as the preceding public precedence ledge
 Activation atomically adds the key, symbol, exact declaration golden, runtime definition/export,
 checked operation, and owner tests. It advances the keyed/base/each-four-row-probe/maximum totals
 from 330/348/352/356 to 331/349/353/357 and makes A124 the next unreserved shape. A source extern
-declaration cannot activate the row or select `CsvDecode`; after activation, exact compatible
+declaration cannot activate the row or select `CsvDecode`; exact compatible
 source-extern reuse follows the ordinary registry rule. No partial producer may activate separately.
 
 ## Deterministic examples and golden vectors

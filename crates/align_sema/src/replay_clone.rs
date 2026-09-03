@@ -849,6 +849,17 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             struct_id: *struct_id,
             input: boxed!(input),
         },
+        ExprKind::CsvDecode {
+            row,
+            input,
+            arena,
+            options,
+        } => ExprKind::CsvDecode {
+            row: *row,
+            input: boxed!(input),
+            arena: boxed!(arena),
+            options: boxed!(options),
+        },
         ExprKind::JsonDecodeUnion { enum_id, input } => ExprKind::JsonDecodeUnion {
             enum_id: *enum_id,
             input: boxed!(input),
@@ -2465,6 +2476,16 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(cond);
             block!(then);
             block!(els);
+        }
+        ExprKind::CsvDecode {
+            input,
+            arena,
+            options,
+            ..
+        } => {
+            one!(input);
+            one!(arena);
+            one!(options);
         }
         ExprKind::TupleIndex { recv, .. }
         | ExprKind::StrTrim { recv, .. }

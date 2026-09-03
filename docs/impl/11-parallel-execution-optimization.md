@@ -117,9 +117,8 @@ Otherwise it appends a normal `map` stage and executes the sequential collect lo
 ([MIR lowering](../../crates/align_mir/src/lib.rs#L2874-L2921)). In particular:
 
 - a capturing `par_map` with worker-Send Copy captures uses the range kernel and immutable context;
-- pending before `pkg.csv` activation, `ArenaHandle` must become non-Send at every reachable
-  callable-environment depth and reject before MIR even when the callable is Pure; that activation
-  must also add backend rejection of a direct handcrafted-MIR occurrence before
+- `ArenaHandle` is non-Send at every reachable callable-environment depth and rejects before MIR
+  even when the callable is Pure; the backend also rejects a direct handcrafted-MIR occurrence before
   context/kernel/runtime publication;
 - Move captures remain rejected by the existing ownership checks;
 - primitive-scalar `map(...).par_map(...)` chains use the same range kernel, including their stage
@@ -433,9 +432,9 @@ node's parallel contract. No generic parallel reduction is implied.
 The source semantics already say a non-escaping pipeline lambda uses captures as parameters. The
 range kernel now carries one immutable context pointer:
 
-1. shipped codegen builds a typed call-scoped record from captured Copy values; the pending
-   `pkg.csv` prerequisite must first make checked HIR prove each value transitively worker-Send
-   through callable-target/environment provenance and must add a defensive direct-`ArenaHandle`
+1. shipped codegen builds a typed call-scoped record from captured Copy values; checked HIR first
+   proves each value transitively worker-Send through callable-target/environment provenance, and
+   codegen adds a defensive direct-`ArenaHandle`
    malformed-MIR rejection before layout;
 2. the synchronous runtime call receives its address and never retains or dereferences it after a
    successful range claim;

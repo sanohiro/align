@@ -1,0 +1,31 @@
+module pkg.csv
+
+import std.process
+import pkg.csv.internal.descriptor
+
+pub Header {
+  Present
+  Absent
+}
+
+pub LineEnding {
+  CrLf
+  Lf
+}
+
+pub DecodeOptions {
+  header: Header,
+  line_ending: LineEnding,
+  max_rows: i64,
+}
+
+pub Error {
+  Invalid
+  LimitExceeded
+}
+
+pub fn decode<R: SoaPlain>(
+  input: str,
+  out: region,
+  options: DecodeOptions,
+) -> Result<soa<R>, Error> = pkg.csv.internal.descriptor.decode(input, out, options)

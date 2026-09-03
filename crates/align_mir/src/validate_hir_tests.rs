@@ -2085,6 +2085,135 @@ fn valid_header_does_not_consume_body_facts() {
     assert!(validate_hir::declaration_header_metadata_is_valid(&body_local_type));
 }
 
+fn csv_validation_program() -> hir::Program {
+    let mut program = baseline_program();
+    let header = program.enums.len() as u32;
+    program.enums.push(EnumDef {
+        name: "pkg.csv$Header".to_string(),
+        source_name: "pkg.csv$Header".to_string(),
+        variants: ["Present", "Absent"]
+            .into_iter()
+            .map(|name| EnumVariant { name: name.to_string(), payload: Vec::new(), field_base: 1 })
+            .collect(),
+    });
+    let line_ending = program.enums.len() as u32;
+    program.enums.push(EnumDef {
+        name: "pkg.csv$LineEnding".to_string(),
+        source_name: "pkg.csv$LineEnding".to_string(),
+        variants: ["CrLf", "Lf"]
+            .into_iter()
+            .map(|name| EnumVariant { name: name.to_string(), payload: Vec::new(), field_base: 1 })
+            .collect(),
+    });
+    let error = program.enums.len() as u32;
+    program.enums.push(EnumDef {
+        name: "pkg.csv$Error".to_string(),
+        source_name: "pkg.csv$Error".to_string(),
+        variants: ["Invalid", "LimitExceeded"]
+            .into_iter()
+            .map(|name| EnumVariant { name: name.to_string(), payload: Vec::new(), field_base: 1 })
+            .collect(),
+    });
+    let options = program.structs.len() as u32;
+    program.structs.push(StructDef {
+        name: "pkg.csv$DecodeOptions".to_string(),
+        source_name: "pkg.csv$DecodeOptions".to_string(),
+        fields: vec![
+            FieldDef { name: "header".to_string(), ty: Ty::Enum(header) },
+            FieldDef { name: "line_ending".to_string(), ty: Ty::Enum(line_ending) },
+            FieldDef { name: "max_rows".to_string(), ty: int(64) },
+        ],
+        align: None,
+        c_repr: false,
+    });
+    let expression = body_test_expr(
+        hir::ExprKind::CsvDecode {
+            row: Ty::Struct(0),
+            input: Box::new(body_test_expr(hir::ExprKind::Local(0), Ty::Str)),
+            arena: Box::new(body_test_expr(hir::ExprKind::Local(1), Ty::ArenaHandle)),
+            options: Box::new(body_test_expr(hir::ExprKind::Local(2), Ty::Struct(options))),
+        },
+        Ty::Result(Scalar::Soa(0), Scalar::Enum(error)),
+    );
+    let mut function = body_unit_case("pkg.csv$decode$Record", expression);
+    function.origin = hir::FnOrigin::Monomorph;
+    function.locals = vec![
+        body_test_local(0, "input", Ty::Str, false, true),
+        body_test_local(1, "out", Ty::ArenaHandle, false, true),
+        body_test_local(2, "options", Ty::Struct(options), false, true),
+    ];
+    function.params = vec![0, 1, 2];
+    function.param_modes = vec![align_ast::ParamMode::ByValue; 3];
+    program.fns.push(function);
+    program
+}
+
+fn csv_validation_expr(program: &mut hir::Program) -> &mut hir::Expr {
+    let hir::Stmt::Expr(expression) = &mut program.fns[0].body.stmts[0] else {
+        panic!("CSV validation fixture must store the operation as an expression statement");
+    };
+    expression
+}
+
+#[test]
+fn csv_decode_checked_hir_gate_rejects_each_relational_field() {
+    use validate_hir::CsvDecodeValidationReason as Reason;
+
+    let base = csv_validation_program();
+    assert_eq!(validate_hir::csv_decode_validation_reason(&base), Ok(()));
+
+    let mut invalid_span = base.clone();
+    csv_validation_expr(&mut invalid_span).span = align_span::Span::new(0, 2, 1);
+    assert_eq!(validate_hir::csv_decode_validation_reason(&invalid_span), Err(Reason::InvalidSpan));
+
+    let mut origin = base.clone();
+    origin.fns[0].origin = hir::FnOrigin::Source { is_entry: false, is_public: false };
+    assert_eq!(validate_hir::csv_decode_validation_reason(&origin), Err(Reason::Origin));
+
+    let mut row = base.clone();
+    if let hir::ExprKind::CsvDecode { row, .. } = &mut csv_validation_expr(&mut row).kind {
+        *row = Ty::Unit;
+    }
+    assert_eq!(validate_hir::csv_decode_validation_reason(&row), Err(Reason::Row));
+
+    let mut schema = base.clone();
+    schema.structs[0].fields[0].ty = Ty::String;
+    assert_eq!(validate_hir::csv_decode_validation_reason(&schema), Err(Reason::Schema));
+
+    let mut package = base.clone();
+    package.enums[1].variants[0].name = "Other".to_string();
+    assert_eq!(validate_hir::csv_decode_validation_reason(&package), Err(Reason::PackageTypes));
+
+    let mut package_layout = base.clone();
+    package_layout.structs[1].c_repr = true;
+    assert_eq!(
+        validate_hir::csv_decode_validation_reason(&package_layout),
+        Err(Reason::PackageTypes),
+    );
+
+    let mut result = base.clone();
+    csv_validation_expr(&mut result).ty = Ty::Unit;
+    assert_eq!(validate_hir::csv_decode_validation_reason(&result), Err(Reason::Result));
+
+    let mut input = base.clone();
+    if let hir::ExprKind::CsvDecode { input, .. } = &mut csv_validation_expr(&mut input).kind {
+        input.ty = Ty::String;
+    }
+    assert_eq!(validate_hir::csv_decode_validation_reason(&input), Err(Reason::Input));
+
+    let mut arena = base.clone();
+    if let hir::ExprKind::CsvDecode { arena, .. } = &mut csv_validation_expr(&mut arena).kind {
+        arena.ty = Ty::Unit;
+    }
+    assert_eq!(validate_hir::csv_decode_validation_reason(&arena), Err(Reason::Arena));
+
+    let mut options = base;
+    if let hir::ExprKind::CsvDecode { options, .. } = &mut csv_validation_expr(&mut options).kind {
+        options.ty = Ty::Unit;
+    }
+    assert_eq!(validate_hir::csv_decode_validation_reason(&options), Err(Reason::Options));
+}
+
 #[test]
 fn hir_body_validator_json_scan_copy_row() {
     let input = body_test_expr(hir::ExprKind::Str("[]".to_string()), Ty::Str);

@@ -355,7 +355,7 @@ sink kind を継承する。
 `i32 @align_rt_io_writer_write_builder(ptr, ptr)` declaration、
 `unsafe extern "C" fn(*mut Writer, *mut Builder) -> i32` Rust ABI、attribute、当時 shipped だった
 330/347/355 keyed/base/maximum count への inclusion は writer-prerequisite boundary で変わらなかった。
-後続の `pkg.kv` row により現在の total は 330/348/356。source-visible builder overload は builder byte を
+後続の `pkg.kv` row で total は 330/348/356、さらに `pkg.csv` で 331/349/357 になった。source-visible builder overload は builder byte を
 borrow して hardened `IoWriterWrite` row に delegate するので、socket sink policy を迂回できない。
 
 acceptance owner は macOS/BSD での failed install/no send 後の retry、overlap する shell の両方の

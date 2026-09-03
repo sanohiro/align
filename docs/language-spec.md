@@ -1331,7 +1331,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The implemented first-party packages in this repository are exactly five vendorable subtrees:
+The implemented first-party packages in this repository are exactly six vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1342,10 +1342,13 @@ pkg.db.pool        // explicit fixed-capacity connection pool
 pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
+pkg.csv            // typed in-memory CSV direct-to-SoA decoder
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
 `pkg.kv.internal.resource`.
+`pkg.csv` is one vendorable subtree with root `pkg.csv` and empty compiler-private descriptor
+module `pkg.csv.internal.descriptor`.
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
 packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
@@ -1493,7 +1496,7 @@ reachable reader/writer/logger carrier owner graph. A fresh complete review acce
 repair with no P0–P3 finding; implementation then shipped the accepted package source and runtime
 row together.
 
-The accepted, not-yet-implemented `pkg.csv` v1 surface is:
+The implemented `pkg.csv` v1 surface is:
 
 ```text
 pkg.csv.Header { Present, Absent }

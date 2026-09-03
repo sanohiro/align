@@ -32,7 +32,7 @@ pkg/
 
 `import pkg.web` resolves to `pkg/web.align`; `import pkg.web.cookie` resolves to `pkg/web/cookie.align`. Calls and types remain fully qualified, such as `pkg.web.get(...)` and `pkg.web.types.Ctx`.
 
-Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), [apps/kv/pkg](../../apps/kv/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
+Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), [apps/kv/pkg](../../apps/kv/pkg), [apps/csv/pkg](../../apps/csv/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
 
 There is no package manifest, lockfile, registry, version solver, or download command. Imports plus the filesystem are the dependency graph, and one `pkg/<name>` exists per source tree. Updating or auditing a dependency means updating or auditing the vendored source.
 

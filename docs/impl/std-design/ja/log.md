@@ -73,8 +73,8 @@ reservation、export-parity row、runtime ABI fingerprint、whole/per-unit selec
 declaration golden を atomic に有効化する。その実装は現在の exact inventory
 この capability boundary では 314/331/339 keyed/base/maximum record を 320/337/345 に変更し、
 shape range を A117 まで拡張した。その後 `core.codec` が A118–A120 を使用し、当時の次の
-unreserved shape は A121 だった。さらに `pkg.frame` が A121/A122 を使用し、accepted inactive
-`pkg.csv` design が A123 を予約したため、現在の次の unreserved design shape は A124 である。
+unreserved shape は A121 だった。さらに `pkg.frame` が A121/A122、実装済み `pkg.csv` が A123 を
+使用したため、現在の次の unreserved design shape は A124 である。
 logging は optional feature または target-dependent row を追加しない。
 
 `LogNew` は唯一の live writer pointer と checked tag を受け取る。compiler-generated call は

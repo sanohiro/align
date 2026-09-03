@@ -12,8 +12,8 @@ surfaces are independently compared with the Rust runtime exports.
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, and
-`pkg.kv`, there
-are 330 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+`pkg.kv`, and `pkg.csv`, there
+are 331 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -26,7 +26,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 348 records. Request 12
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 349 records. Request 12
 adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -37,10 +37,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 348 base records.
+The compiler-visible native registry is always exactly the 349 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 356.
+records extend only the verification-time maximum runtime-export table to 357.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -55,10 +55,10 @@ The raw HTTP receive-stream capability subsequently added six keyed rows for buf
 inspection, stream construction/access/read, and Drop. The SSE capability added four keyed rows for
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
 six keyed rows. The `core.test` child-control extension then added four unkeyed rows, and `std.log`
-added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, and `pkg.kv` added one
-source-reachable unkeyed row. Their runtime
+added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg.kv` added one
+source-reachable unkeyed row, and `pkg.csv` added one keyed row. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 330 keyed records, 348 base records, and 356 records in the maximum optional-probe export table.
+are 331 keyed records, 349 base records, and 357 records in the maximum optional-probe export table.
 No probe category changed. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -84,9 +84,8 @@ production `process.command` continues to select its shipped runtime entries unc
 | `TestReportV1` | A113: `i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32)` | `extern "C" fn(i32, u8, u8, i32, u32) -> i32` |
 
 These declarations occupy A110 through A113. The implemented `std.log` design occupies A114 through
-A117, `core.codec` occupies A118 through A120, and `pkg.frame` occupies A121/A122 below. Accepted
-`pkg.csv` design reserves inactive A123 below, so A124 is the next unreserved design shape while
-A123 remains absent from every current registry and export count. All
+A117, `core.codec` occupies A118 through A120, `pkg.frame` occupies A121/A122 below, and `pkg.csv`
+occupies A123. A124 is the next unreserved design shape. All
 four declarations carry the existing
 generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
@@ -285,9 +284,9 @@ checked-HIR or MIR operation, call-spelling selector, or new ABI shape.
 At package implementation, the one new key, symbol, definition, collision reservation, typed
 registry row, runtime ABI fingerprint input, base/maximum export entry, and source-compatible extern
 reuse activated atomically. It increased the unkeyed/base/maximum counts by one and the keyed count
-by zero: the exact current keyed/base/maximum counts are 330/348/356. It reuses an existing shape,
-so A123 remains the next unused active shape and is reserved only by the accepted `pkg.csv` design
-below. The current unkeyed count is eighteen, thirteen of which
+by zero: the exact then-current keyed/base/maximum counts were 330/348/356. It reused an existing
+shape, so A123 remained the next unused active shape until the later `pkg.csv` implementation below.
+The current unkeyed count is eighteen, thirteen of which
 are source-reachable. Both prerequisite hardenings and the new row are active with the `pkg.kv`
 consumer.
 Exact public consumption, poisoning, and owner matrix: `pkg-design/kv.md`.
@@ -396,16 +395,16 @@ The right input is always indexed in ascending ordinal order. The runtime counts
 before one exact output allocation, probes again to fill left-major/right-ascending pairs, confirms
 equality after every hash match, and retains no input pointer. Activation moved the
 keyed/base/maximum-optional-probe totals from 328/345/353 to 330/347/355 and made A123 the next
-unreserved shape at that time. The later accepted inactive `pkg.csv` design reserves A123, so A124 is
-now the next unreserved design shape. Exact public semantics and owner matrix:
+unreserved shape at that time. The later `pkg.csv` implementation occupies A123, so A124 is now the
+next unreserved design shape. Exact public semantics and owner matrix:
 `pkg-design/frame.md`.
 
-## Reserved `pkg.csv` extension (designed 2026-09-03; inactive)
+## `pkg.csv` extension (implemented 2026-09-03)
 
-The accepted design reserves one keyed shape without adding a current `RuntimeKey`, declaration,
-definition, export, collision identity, fingerprint input, or count:
+The implementation adds one keyed shape, `RuntimeKey`, declaration, definition, export, collision
+identity, fingerprint input, and count atomically:
 
-| Reserved runtime key | Symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
+| Runtime key | Symbol | ABI row and exact LLVM declaration | Exact Rust ABI |
 |---|---|---|---|
 | `CsvDecodeSoaV1` | `align_rt_csv_decode_soa_v1` | A123: `i32 @SYM(ptr, i64, ptr, i64, ptr, i32, i32, i64, ptr)` | `unsafe extern "C" fn(*const u8, i64, *const CsvField, i64, *mut Arena, i32, i32, i64, *mut AlignStr) -> i32` |
 
@@ -482,7 +481,7 @@ Activation is one atomic package/HIR/MIR/runtime capability: it adds the key, ex
 golden, definition/export, collision reservation, capability collection, fingerprints, and all
 owners together. It changes current keyed/base/either-four-row-probe/maximum totals from
 330/348/352/356 to 331/349/353/357 and makes A124 the next unreserved active shape. A source extern
-cannot activate the row or select checked `CsvDecode`; after activation, exact compatible source-
+cannot activate the row or select checked `CsvDecode`; exact compatible source-
 extern reuse follows the ordinary registry rule. No partial producer may land. Exact semantics,
 validation order, allocation contract, and closure matrix: `pkg-design/csv.md`.
 
@@ -910,24 +909,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 330 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 331 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 348 base native symbols against default-feature `align_runtime` exports,
+- the 349 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 352 `alloc-count` and 352 `par-map-probe` native symbols against
+- the 353 `alloc-count` and 353 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 356 maximum native symbols against `align_runtime` built with
+- the 357 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 348 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  348 exact registry function types through the production compatibility
+- all 349 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  349 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

@@ -3847,8 +3847,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`pkg.kv` is implemented after `pkg.auth`; `pkg.csv` now has an accepted design and is the next
-implementation capability. Promotion of an optimization slice is a separate explicit
+`pkg.csv` is implemented after `pkg.kv`; `pkg.ws` is the next package design capability.
+Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
 ```text
@@ -4017,7 +4017,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   slice/builder/logger/`io.copy` closed-peer evidence. The package source and checked ABI row are
   active together. Exact ledger and implementation closure matrix:
   `pkg-design/kv.md`.
-- **pkg.csv — DESIGNED 2026-09-03; IMPLEMENTATION NEXT** — exactly one typed in-memory
+- **pkg.csv — IMPLEMENTED 2026-09-03** — exactly one typed in-memory
   `decode<R: SoaPlain>(input, out, options) -> Result<soa<R>, Error>` materializer. Header presence,
   CRLF/LF, destination arena, and inclusive row limit are explicit. Present headers provide a
   bounded nonempty byte-unique named projection; absent headers require exact declaration order.
@@ -4031,11 +4031,11 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   owned input temporary, and recoverable errors leave the arena unchanged. Checked descriptor
   emission proves unique names; runtime validation hashes each name once through the shared seed-0
   `align_hash::wyhash` and has no uncapped pairwise descriptor scan. The decoder remains Pure for sequential use, while its required
-  `region` is non-Send; this implementation must add the shared `spawn`/`par_map` worker-transfer
-  provenance gate and reject before publication or allocation, including when the capability is
+  `region` is non-Send; the shared `spawn`/`par_map` worker-transfer provenance gate rejects before
+  publication or allocation, including when the capability is
   reachable only through a nested captured function value or helper summary. Canonical
-  package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only
-  together. Abstract generic checking uses a discarded parameter-shaped operation and only concrete
+  package admission, checked `CsvDecode` HIR/MIR, and keyed ABI shape A123 activate together.
+  Abstract generic checking uses a discarded parameter-shaped operation and only concrete
   monomorph rechecking emits it; the schema accepts the complete existing `SoaPlain` domain without
   a CSV count cap, while 1024 limits only physical Present headers.
   Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
