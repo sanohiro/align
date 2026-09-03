@@ -1523,9 +1523,9 @@ width and error precedence deterministic, but admits UTF-8, NUL, quoted line bre
 explicit LF form. The declared record fixes every scalar conversion. Extra named columns are
 grammar-validated but never converted, so wide inputs can be projected without reflection.
 
-Two passes preserve failure atomicity and the physical result shape. The first validates the whole
-successful document and exact layout without allocating. Zero rows return canonical `{null, 0}`;
-for nonempty output the second allocates one arena block and writes declaration-order columns
+After one raw-ABI UTF-8 prevalidation, two decode passes preserve failure atomicity and the physical
+result shape. The first validates the whole successful document and exact layout without allocating.
+Zero rows return canonical `{null, 0}`; for nonempty output the second allocates one arena block and writes declaration-order columns
 directly. Clean text remains a view into the input; only doubled-
 quote fields need normalized bytes, which live in the same block. This makes input and arena
 lifetimes visible in the result type while avoiding per-field strings, an AoS staging table, and a
@@ -1537,7 +1537,8 @@ canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR w
 pure descriptor-and-call lowering. The generic wrapper's abstract check uses the existing symbolic
 SoA parameter form and discards it; concrete rechecking alone produces the schema descriptor and
 emitted operation. CSV admits the whole existing `SoaPlain` domain because AoS layout annotations
-do not affect its SoA columns. The design contract, exact lexical conversions, ABI record, and
+and schema width do not affect its SoA columns; the 1024 cap belongs only to a physical Present
+header. The design contract, exact lexical conversions, ABI record, and
 closure matrix are in `impl/pkg-design/csv.md`.
 
 ## Why tests are Result blocks run in separate processes

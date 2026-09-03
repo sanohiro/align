@@ -1491,20 +1491,22 @@ pkg.csv.decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions)
   -> Result<soa<R>, Error>
 ```
 
-There are no defaults. Expected result type supplies a 1..=1024-field record `R` from the complete
-existing `SoaPlain` domain; explicit AoS record layout does not affect SoA columns. Absent headers
+There are no defaults. Expected result type supplies a record `R` from the complete existing
+`SoaPlain` domain with no CSV-specific schema-count cap; explicit AoS record layout does not affect SoA columns. Absent headers
 map an exact width by declaration order. Present headers are
 nonempty and byte-unique, map every declared field exactly once by byte-exact name, and may contain
-extra grammar-valid columns that are not converted. The caller explicitly selects CRLF or LF; mixed
+extra grammar-valid columns that are not converted. A schema wider than 1024 remains usable with an
+absent header but cannot be fully covered by a present header within its physical-column cap. The caller explicitly selects CRLF or LF; mixed
 or lone-CR separators are invalid. One leading UTF-8 BOM is stripped. RFC 4180 quoting admits
 doubled quotes and quoted line breaks; spaces, NUL, and UTF-8 remain data. Selected scalar cells use
 fixed full-cell lexical grammars, and only `str` admits empty text.
 
 `max_rows` is inclusive and nonnegative. Invalid options, grammar, header identity, row width, or
-selected conversion is `Invalid`; the 1025th header column, first complete otherwise-valid row past
+selected conversion is `Invalid`; the 1025th physical header column, first complete otherwise-valid row past
 the bound, or unrepresentable exact layout is `LimitExceeded`. OOM and impossible private states
-abort. An allocation-free first pass validates the complete successful input. Zero rows return
-canonical `{null, 0}` without allocation; only a nonempty second pass makes one exact arena
+abort. The raw ABI first validates complete UTF-8 and returns private `-1` for invalid bytes. An
+allocation-free first decode pass validates the complete successful document. Zero rows return
+canonical `{null, 0}` without allocation; only a nonempty second decode pass makes one exact arena
 allocation and fills SoA columns directly. Clean strings borrow input spans, while
 only doubled-quote strings are normalized into the output block. Primitive-only results retain
 `out`; string-bearing results retain `input` and `out`. Error does not advance the arena.

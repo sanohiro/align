@@ -8,8 +8,8 @@ there is no dialect inference, parser object, dynamic row model, or row-major re
 headers provide a bounded byte-exact named projection, absent headers require exact declaration
 order, and RFC 4180 quoting is extended only to UTF-8 text and explicit LF separators.
 
-A complete allocation-free first pass validates grammar, selected scalar conversions, bounds, and
-layout. Zero rows return canonical `{null, 0}` without allocation; a nonempty second pass allocates
+A raw-ABI UTF-8 prevalidation followed by a complete allocation-free first decode pass validates
+grammar, selected scalar conversions, bounds, and layout. Zero rows return canonical `{null, 0}` without allocation; a nonempty second decode pass allocates
 an exact arena block and fills columns directly. Clean strings borrow the input; only doubled-quote
 fields are normalized into the arena. Primitive records retain
 only the output region, while string-bearing records retain both input and output. Errors publish
@@ -18,7 +18,7 @@ no partial result and do not advance the arena.
 Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
 operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a
 discarded parameter-shaped record, while only concrete monomorph rechecking emits the operation;
-the schema accepts the complete existing `SoaPlain` domain. The design itself changes neither the
+the schema accepts the complete existing `SoaPlain` domain without a CSV field-count cap. The design itself changes neither the
 five shipped package subtrees nor the 330-keyed/348-base runtime inventory. Exact surface, grammar,
 conversions, precedence, ABI, ownership, and implementation matrix:
 `docs/impl/pkg-design/csv.md`.

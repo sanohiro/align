@@ -3795,8 +3795,8 @@ pkg.csv.decode<R: SoaPlain>(
 ```
 
 There are no defaults or ambient dialect settings. `R` is inferred from the expected result and
-uses the complete existing `SoaPlain` domain with 1..=1024 fields; explicit AoS record layout does
-not affect SoA columns. `Header.Absent` maps an exact-width document by
+uses the complete existing `SoaPlain` domain with no CSV-specific schema-count cap; explicit AoS
+record layout does not affect SoA columns. `Header.Absent` maps an exact-width document by
 declaration order. `Header.Present` consumes one 1..=1024-field header whose decoded names are
 nonempty and byte-unique, maps every declared field exactly once by byte-exact name, admits extra
 unique columns, and grammar-validates without converting those extras. `LineEnding` explicitly
@@ -3806,11 +3806,13 @@ quotes and embedded quoted line breaks; spaces, NUL, and non-ASCII UTF-8 remain 
 
 Integer, float, bool, and char fields use the fixed full-cell lexical grammars in the package
 ledger; empty is admitted only for `str`. `max_rows` is an inclusive nonnegative data-row bound.
-Invalid options, grammar, header identity, width, and selected conversion return `Invalid`; the
+For a schema wider than 1024, Absent mode remains valid while Present cannot cover every declared
+field within its physical-header cap. Invalid options, grammar, header identity, width, and selected conversion return `Invalid`; the
 1025th header column, first complete otherwise-valid row beyond the bound, or unrepresentable exact
-layout returns `LimitExceeded`. OOM and impossible private statuses abort. Validation is a complete
-allocation-free first pass. A zero-row success returns canonical `{null, 0}` without allocation;
-otherwise the second pass allocates one exact arena block and fills SoA columns directly, with no
+layout returns `LimitExceeded`. OOM and impossible private statuses abort. The raw ABI validates
+complete UTF-8 before CSV parsing and returns private `-1` for invalid bytes. An allocation-free
+decode pass then validates the document. A zero-row success returns canonical `{null, 0}` without allocation;
+otherwise the second decode pass allocates one exact arena block and fills SoA columns directly, with no
 AoS intermediate or transpose. Clean `str` cells borrow input spans; only fields
 containing doubled quotes are decoded into the output block. Primitive-only results depend on
 `out`; results containing `str` depend on both `input` and `out`. Error leaves `out` unchanged.

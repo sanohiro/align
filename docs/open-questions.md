@@ -31,9 +31,9 @@ and may carry grammar-valid unconverted extras. The selected CRLF or LF spelling
 outside-quote separator. One leading BOM is stripped, and the RFC 4180 quote model otherwise
 preserves UTF-8, NUL, whitespace, and quoted line breaks.
 
-The first pass validates the complete successful input, exact scalar conversions, row bound, and
-layout without allocation. Zero rows return canonical `{null, 0}` without allocation; the second
-pass makes one exact arena allocation only for nonempty output and fills SoA columns directly.
+The raw ABI first validates complete UTF-8. The first decode pass validates the complete successful
+input, exact scalar conversions, row bound, and layout without allocation. Zero rows return canonical
+`{null, 0}` without allocation; the second decode pass makes one exact arena allocation only for nonempty output and fills SoA columns directly.
 Clean text borrows input spans; only doubled-quote text is normalized into the same
 block. A primitive-only result depends on `out`; a string-bearing result depends on `input` and
 `out`. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
@@ -46,7 +46,8 @@ admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activa
 implementation boundary. The generic wrapper's abstract check uses a discarded parameter-shaped
 HIR form and concrete monomorph rechecking produces the only emitted form. The schema admits the
 complete existing `SoaPlain` domain, including explicit AoS layout/alignment, because SoA column
-layout is independent.
+layout is independent; CSV adds no schema-count cap, while 1024 remains only the physical
+Present-header cap.
 
 Record: `docs/impl/pkg-design/csv.md`, `draft.md` §18.3, `docs/language-spec.md`
 

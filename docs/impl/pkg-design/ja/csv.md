@@ -17,7 +17,7 @@ V1 はメモリ上の UTF-8 CSV 1 文書を arena-backed `soa<R>` へ直接 deco
 | `pub LineEnding { CrLf, Lf }` | 順は `CrLf=0`, `Lf=1`。選んだ列だけが quote 外の record separator。最終 record は separator なしでもよい。`CrLf` は lone CR/LF、`Lf` は quote 外 CR を拒否。auto/mixed/lone-CR/platform default なし。 | Copy/Pure。quoted field 内の CR/LF/CRLF は byte-for-byte data。allocation/保持なし。 | nominal sum を `pkg.csv` が所有し、runtime へ checked i32 tag を渡す。 | exact tag/order、terminated/unterminated × mixed/lone、whole/per-unit、malformed-HIR owner。 |
 | `pub DecodeOptions { header: Header, line_ending: LineEnding, max_rows: i64 }` | field/source 順は表示どおり。default なし。`max_rows` は nonnegative data-row inclusive bound。negative は `Invalid`、zero は header/empty を許すが data row は不可、exact は成功、次の完全な valid row は `LimitExceeded`。 | Copy/Pure。descriptor/input inspection と arena allocation より前に field 順で検証。保持・割当なし。 | nominal record と reachable graph は `pkg.csv` owner。全 field が interface/dependency/cache identity へ入る。 | record/i64 bounds。field/order/default、negative/zero/exact/next、direct/imported/generic、whole/per-unit/cache owner。 |
 | `pub Error { Invalid, LimitExceeded }` | 順は `Invalid=0`, `LimitExceeded=1`。前者は options、grammar、line ending、header identity/uniqueness/completeness、width、selected conversion。後者は 1025 番目の physical header column、最初の bound 超過 row、または exact output/normalization layout の i64/target allocation-domain 表現不能。 | Copy/Pure。OOM と impossible compiler/runtime status は hard abort。message/path/position/partial output/fallback/retry/log/cleanup error なし。 | ordinary package sum。private status は `0=success,1=Invalid,2=LimitExceeded`、他は明示的 `std.process` dependency の `process.abort()`。 | Result/tag sum/abort。producer/status/tag/order、multi-invalid precedence、malformed ABI、whole/per-unit owner。 |
-| `pub fn decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>` | 引数は左から 1 回ずつ。`R` は expected result だけから推論し、既存 `SoaPlain` 全域、すなわち 1..=1024 fields の nonempty record。field は integer/float/`bool`/`char`/`str`。explicit record layout/alignment は AoS のみで SoA column を制約しない。absolute byte 0 の UTF-8 BOM を 1 個だけ除去。Present header は 1..=1024 unique nonempty decoded names、全 declared field を byte-exact に 1 回 map、extra は grammar 検証のみ。Absent は declaration-order exact width。全 data record は physical width が一致。 | Pure。pass 1 は heap/arena allocation なしで完全な successful input、selected conversion、row bound、normalized bytes、layout を検証。`N>0` だけ pass 2 が exact aligned arena block 1 個を確保し、AoS/transpose なしで直接 column fill。`N==0` は allocation なしの `{null,0}`。unquoted と doubled quote なし quoted `str` は input span、`""` を含む quoted field だけ `"` へ collapse して同じ block へ copy。primitive-only result は `out`、`str` を含む result は `input+out` に依存。`soa<R>` は Copy/Drop なし。error は `out` を不変に保つ。 | canonical root `pkg.csv` は compiler-private spelling `pkg.csv.internal.descriptor.decode` を呼ぶ public generic wrapper 1 個を所有。internal module は source function を宣言せず application import は package `internal` rule が拒否。abstract template check は `row=Ty::Param(p)` と existing `SoaParam(p)` result の template-only `CsvDecode` を形成して破棄する。concrete monomorph の再チェックだけが `row=Ty::Struct(id)` の emitted operation を形成する。interface/frontend identity は root/internal source、generic body、nominal `R` graph、op/descriptor semantics。object/link key は既存 explicit target/CPU/features/profile/pipeline/runtime/link inputs も保持。ambient runtime CPU detection/file/locale/MIME/env/allocator setting は CSV semantics を変えない。 | shipped generics/`SoaPlain`/named region/SoA/package sealing/compiler-private internal descriptor/checked-HIR/arena/two-pass decode。abstract-template/concrete-monomorph formation、schema/header/grammar/value、BOM/bounds、zero-copy/copy、region/generation、no-allocation error、layout、ABI/status、whole/per-unit/generic/cache/lowering/work-count owner。 |
+| `pub fn decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>` | 引数は左から 1 回ずつ。`R` は expected result だけから推論し、field が integer/float/`bool`/`char`/`str` の任意の nonempty record という既存 `SoaPlain` 全域。CSV 固有 schema-count/layout 制約はなく、explicit AoS layout/alignment は SoA column を制約しない。absolute byte 0 の UTF-8 BOM を 1 個だけ除去。Present header は 1..=1024 unique nonempty decoded names、全 declared field を byte-exact に 1 回 map、extra は grammar 検証のみ。1024 超の schema は Absent だけ成功可能。Present が 1024 以下なら missing coverage で `Invalid`、1025th physical header があれば先に `LimitExceeded`。Absent は declaration-order exact width。全 data record は physical width が一致。 | Pure。raw ABI は最初に allocation なしで UTF-8 を検証し invalid bytes は private `-1`。decode pass 1 は heap/arena allocation なしで完全な successful input、selected conversion、row bound、normalized bytes、layout を検証。`N>0` だけ decode pass 2 が exact aligned arena block 1 個を確保し、AoS/transpose なしで直接 column fill。`N==0` は allocation なしの `{null,0}`。unquoted と doubled quote なし quoted `str` は input span、`""` を含む quoted field だけ `"` へ collapse して同じ block へ copy。primitive-only result は `out`、`str` を含む result は `input+out` に依存。`soa<R>` は Copy/Drop なし。error は `out` を不変に保つ。 | canonical root `pkg.csv` は compiler-private spelling `pkg.csv.internal.descriptor.decode` を呼ぶ public generic wrapper 1 個を所有。internal module は source function を宣言せず application import は package `internal` rule が拒否。abstract template check は `row=Ty::Param(p)` と existing `SoaParam(p)` result の template-only `CsvDecode` を形成して破棄する。concrete monomorph の再チェックだけが `row=Ty::Struct(id)` の emitted operation を形成する。interface/frontend identity は root/internal source、generic body、nominal `R` graph、op/descriptor semantics。object/link key は既存 explicit target/CPU/features/profile/pipeline/runtime/link inputs も保持。ambient runtime CPU detection/file/locale/MIME/env/allocator setting は CSV semantics を変えない。 | shipped generics/`SoaPlain`/named region/SoA/package sealing/compiler-private internal descriptor/checked-HIR/arena/UTF-8 prevalidation/two decode-pass。abstract-template/concrete-monomorph formation、unbounded schema と bounded Present header、grammar/value、BOM/bounds、zero-copy/copy、region/generation、no-allocation error、layout、ABI/status、whole/per-unit/generic/cache/lowering/work-count owner。 |
 
 ## 決定と範囲
 
@@ -139,6 +139,10 @@ header field は 1..=1024、decoded name は全て nonempty/byte-unique（undecl
 CSV quote decode 後の byte-exact/case-sensitive で Unicode normalization なし。全 declared name が exact
 1 回必要。extra unique column は position/width と grammar を検証するが convert/copy しない。
 
+physical header cap は schema cap ではない。1024 超の `SoaPlain` schema は Absent で動く。Present の
+grammar-valid 1024 以下 header は必ず declared field を欠いて coverage phase の `Invalid`、1025th physical
+field に達した input は coverage より先に `LimitExceeded`。
+
 header map は decoded hash/input span の fixed-capacity stack scratch。heap/arena allocation なし。
 hash hit は decoded byte equality で必ず確認し、result column は input order に関係なく `R` declaration order。
 
@@ -162,15 +166,15 @@ float grammar の dot は literal ASCII `.`。empty は `str` だけ。selected 
 
 ## Validation と error precedence
 
-source は canonical package/signature と concrete `R` を先に検証し、`R` は unique names の
-1..=1024-field existing `SoaPlain` 全域。explicit AoS layout/alignment は SoA column に影響しない。
+source は canonical package/signature と concrete `R` を先に検証し、`R` は nonempty/unique names の
+existing `SoaPlain` 全域で CSV 固有 schema-count cap はない。explicit AoS layout/alignment は SoA column に影響しない。
 input/out/options は written order で 1 回。terminating child は
 以後を止める。private runtime 順序は exact に次である。
 
 1. output header/live arena を slice formation、input load、allocation 前に検証し、output を `{null,0}`。失敗は abort。
 2. `Header`, `LineEnding`, `max_rows >= 0` の順。negative row は input 前に `Invalid`。
-3. descriptor count/table/name range/tag/reserved/uniqueness を検証。失敗は private abort。output/arena が valid なら negative row は malformed descriptor より先。
-4. input pointer/length を検証する。negative length と positive length の null は malformed private ABI。zero length は pointer を問わず dereference/slice formation なし。positive は nonnull/range-arithmetic guard を先に検証し、compiler/unsafe caller が complete call 中の exact readable range を保証する場合だけ slice を形成する。その後 BOM を 1 個除き first-record path を選ぶ。
+3. descriptor count の positive/exact representability、table byte-size/alignment/nonnull guard の順。その後 declaration order で各 record の positive name length、nonnull/range arithmetic、exact source-identifier bytes、tag、zero reserved を順に検証。全 record valid 後、right ordinal 昇順・earlier left ordinal 昇順で最初の duplicate を拒否。失敗は private abort。output/arena が valid なら negative row は malformed descriptor より先。
+4. input pointer/length を検証する。negative length と positive length の null は malformed private ABI。zero length は pointer を問わず dereference/slice formation なし。positive は nonnull/range-arithmetic guard を先に検証し、compiler/unsafe caller が complete call 中の exact readable range を保証する場合だけ byte slice を形成する。complete UTF-8 検証を行い、invalid は BOM/CSV/allocation 前に private `-1`。valid なら BOM を 1 個除き first-record path を選ぶ。
 5. Present header を physical 順に grammar/EOL、1024 cap、nonempty、duplicate、required coverage で検証。1025th だけ `LimitExceeded`、それ以前の invalid が先。
 6. data を source record/cell 順に grammar、selected conversion、width の順で検証。完全 otherwise-valid row が count を増やす直前に bound と比較し、次 row は `LimitExceeded`。後続は読まない。
 7. EOF 成功後、normalized bytes、全 SoA offset/size/alignment、tail、total i64/target allocation size を検証。失敗は allocation 前 `LimitExceeded`。
@@ -216,7 +220,7 @@ exact wrapper の abstract body check は `p: SoaPlain` と matching `SoaParam(p
 `row=Ty::Param(p)` を許す。concrete schema/descriptor/layout/provenance/MIR/native work は行わず、existing
 generic-template path がこの HIR を破棄して source AST を interface monomorphization 用に保持する。
 consumer instantiation は concrete substitution で body を再チェックし、そこでだけ `row=Ty::Struct(id)`
-と `soa<id>` を形成して existing `soa_plain_ok` と package/1024 rule を適用する。outer generic forwarding も
+と `soa<id>` を形成して existing `soa_plain_ok` と package identity を schema-count 制約なしで適用する。outer generic forwarding も
 concrete instantiation まで symbolic check を繰り返す。emitted validator は `Ty::Param`/`SoaParam`/non-Struct
 row を children 前に拒否する。`options` は record child として 1 回評価し MIR が fields を 1 回 project。
 全 traversal/replay/depth/effect/ownership/region/escape/type/storage/interface/monomorph/capability/
@@ -251,7 +255,7 @@ bound、writable output。C calling convention、`nounwind`、他 curated attrib
 call 全体で arena は nonnull、`align_of::<Arena>()` aligned、live/exclusive。output は nonnull、
 `align_of::<AlignStr>()` aligned、writable/exclusive。両者は互いと immutable ranges から disjoint。
 zero input length は null/non-null pointer の両方を許可し dereference なし。positive length は nonnull で
-exact readable range。descriptor count は 1..=1024、その pointer は nonnull、
+exact readable range。descriptor count は positive、exact `usize` 変換可能、CSV 固有 upper bound なし。その pointer は nonnull、
 `align_of::<CsvField>()` aligned で immutable records 全体を指す。positive name length は nonnull exact
 readable bytes。全 length/count/product/address addition は declared integer と target pointer-offset domain
 内で、reference/slice/typed load より前に検証する。
@@ -269,13 +273,17 @@ range を証明せず、otherwise-invalid unsafe call を defined にはしな�
 { name_ptr: ptr, name_len: i64, tag: i32, reserved: i32 }
 ```
 
-global は exact `repr(C)` size/alignment/field offsets 以上を使う。`reserved=0`。
+global は exact `repr(C)` size/alignment/field offsets 以上を使う。name は first byte ASCII `_`/letter、
+remaining byte ASCII `_`/letter/digit の source identifier で、exact reserved tokens `fn`, `return`, `mut`,
+`pub`, `module`, `import`, `if`, `else`, `true`, `false`, `arena`, `task_group`, `match`, `loop`, `break`,
+`template`, `unsafe`, `extern`, `as` を除く。NUL/non-ASCII/invalid UTF-8/punctuation/keyword/他 spelling は
+descriptor phase の private `-1`。name は pairwise byte-unique。`reserved=0`。
 `tag=(signed<<16)|(kind<<8)|width`: integer kind 0 width 1/2/4/8、sign bit 16、bool
 kind 1 width 1、float kind 2 width 4/8、str kind 3 width 16、char kind 4 width 4。他 bits は zero。
-static UTF-8 names は declaration order。table 全体を input/effect 前に検証する。
+table 全体を declaration order で input/arena effect 前に検証する。
 
-native order は output、arena、output zero、header tag、line-ending tag、row bound、descriptor
-count/table/fields/names、input representation、CSV/header/data/layout、最後に nonempty allocation/fill。
+native order は output、arena、output zero、header tag、line-ending tag、row bound、positive representable
+descriptor count/table/fields/names、input representation、complete UTF-8、CSV/header/data/layout、最後に nonempty allocation/fill。
 malformed private ABI は `-1`、negative row は descriptor inspection 前に 1、public parse/conversion は 1、
 public bound/layout は 2。この順序は前節の public precedence と同じ。
 
@@ -304,11 +312,12 @@ semantic field vector を valid quoted/unquoted CSV bytes へ独立に写し dec
 
 ## 複雑性と性能境界
 
-成功は sequential input pass 2 回、nonempty output の exact arena allocation 1 回、direct column write。
+positive-length 成功は complete UTF-8 prevalidation 1 回と decode pass 2 回の sequential input walk 3 回、
+nonempty output の exact arena allocation 1 回、direct column write。
 AoS/transpose/heap/per-row/per-field-owned-string/unselected-or-clean-text copy なし。header は bounded stack
 hash+equality。SIMD を使う場合も x86/ARM64/scalar は one oracle と一致する。throughput/latency/SIMD width
 は公開 promise でない。local non-gating `bench/csv_decode` は bytes/rows/physical-selected columns/
-normalized bytes/passes/arena allocations/conversions の producer counters を記録する。
+normalized bytes/UTF-8 and decode passes/arena allocations/conversions の producer counters を記録する。
 
 ## V1 non-goals と後続境界
 
@@ -325,7 +334,7 @@ boundary が dormant split より proof duplication と integration risk を小�
 
 | axis | required closure | exact owner evidence |
 |---|---|---|
-| Public formation/identity | canonical root + empty internal descriptor、4 public types/1 generic wrapper/1 compiler-private spelling/no private source item、`p: SoaPlain` の abstract `Ty::Param(p)`+`SoaParam(p)` から concrete `Ty::Struct(id)` recheck、explicit layout/alignment を含む existing `SoaPlain` 全域、1..=1024、application import/interception なし、全 call shape | root/internal/interface hash、generic body private-item 非参照、abstract wrapper/forwarder、concrete substitution/recheck、`layout(C)`/`align(N)` positive、wrong bound/abstract emission negative、schema/module/body/internal-item mutation、whole/per-unit/generic |
+| Public formation/identity | canonical root + empty internal descriptor、4 public types/1 generic wrapper/1 compiler-private spelling/no private source item、`p: SoaPlain` の abstract `Ty::Param(p)`+`SoaParam(p)` から concrete `Ty::Struct(id)` recheck、CSV schema-count cap なしで explicit layout/alignment を含む existing `SoaPlain` 全域、application import/interception なし、全 call shape | root/internal/interface hash、generic body private-item 非参照、abstract wrapper/forwarder、concrete substitution/recheck、Absent の 1/1024/1025/larger schema、Present missing coverage/1025th physical precedence、`layout(C)`/`align(N)` positive、wrong bound/abstract emission negative、schema/module/body/internal-item mutation、whole/per-unit/generic |
 | Evaluation/HIR/MIR | children once/order/termination、exact type/id/effect/region、status/no-error-output、全 traversal | variant tripwire、one-field mutation、control、MIR status/abort |
 | CSV lexical | BOM、quote/double、comma、space/NUL/UTF-8、EOL、EOF、blank/trailing | independent oracle、bounded mutation/fuzz、全 state transition |
 | Header/projection | modes/order/extra/identity/1-1025/collision/width | generated duplicate/collision、skip counter、mapping oracle |
@@ -334,9 +343,9 @@ boundary が dormant split より proof duplication と integration risk を小�
 | Allocation/atomicity | pass1 zero alloc、pass2 one block、no AoS、zero row、abort/error arena rule | arena/heap counters、failpoints、topology、cursor pre/post |
 | String regions | clean input/escaped tail、type-level input+out、same-arena input、全 carriers/generations | pointer ranges/bytes、distinct/same-arena twins、escape/mutation negative、primitive release positive |
 | SoA/pipeline | shared layout、alignment、projection/index/pipelines | independent layout oracle、current SoA bundle、residue/schema generation |
-| Native ABI | A123 identity/attrs/export、input null-zero/positive-range、aligned live arena/output、`align_of::<CsvField>()` aligned nonempty table、options 後の full descriptor/name validation、typed access 前 guard、output zero/no unwind | registry/golden/export/compat mutation、invalid address を dereference しない mechanically detectable null-zero/null-positive/unaligned arena-output-descriptor/negative-overflow/malformed name と negative-option+malformed-descriptor matrix、compiler provenance/range proof と unsafe-contract owner、rt-LTO |
+| Native ABI | A123 identity/attrs/export、input null-zero/positive-range、aligned live arena/output、`align_of::<CsvField>()` aligned positive representable uncapped table、options 後の source-identifier name validation、BOM/CSV 前 complete UTF-8、typed access 前 guard、output zero/no unwind | registry/golden/export/compat mutation、invalid address を dereference しない null-zero/null-positive/unaligned/zero-negative-overflow count/invalid start-continuation-nonASCII-NUL-duplicate name/invalid UTF-8 と negative-option+malformed descriptor-input matrix、compiler provenance/range/unsafe owner、rt-LTO |
 | Cache/distribution | root/internal/body/schema/op/descriptor/runtime の exact invalidation、既存 explicit target/CPU/features/profile/pipeline/runtime/link input 維持、ship 時だけ inventory | whole/per-unit/target edit-revert/prebuilt/no-op/ambient-runtime/unrelated owner |
-| Performance | two scans/direct selected fill/no clean copy/no heap/AoS/transpose、SIMD parity | producer counters、non-gating benchmark、scalar/x86/ARM64 equality |
+| Performance | UTF-8 prevalidation 1 + decode pass 2/direct selected fill/no clean copy/no heap/AoS/transpose、SIMD parity | producer counters、non-gating benchmark、scalar/x86/ARM64 equality |
 
 ## source of truth と author consistency pass
 
@@ -345,9 +354,10 @@ boundary が dormant split より proof duplication と integration risk を小�
 vendorable/prebuilt inventory は source が ship するまで shipped package だけを記載する。
 
 author pass は全 public field の type/order/default/effect/ownership/lifetime/allocation/owner/identity、全
-Header×EOL×document×quote×selection×field-type×limit product、UTF-8/NUL/header equality、multi-invalid
-precedence、abstract/forwarding/concrete recheck/emitted symbolic rejection、two-pass/direct-column counters、
-A123 の全 width/tag/order/pointer/null/length/alignment/range/status/attribute/count、全
+Header×EOL×document×quote×selection×field-type×limit product、public UTF-8/NUL、raw invalid UTF-8、
+descriptor source-identifier/NUL、header equality、multi-invalid
+precedence、abstract/forwarding/concrete recheck/emitted symbolic rejection、UTF-8/two-decode-pass/direct-column counters、
+A123 の全 width/tag/order/pointer/null/length/alignment/range/source-identifier/NUL/status/attribute/count、全
 compiler stage/cache/distribution の atomicity、全 example syntax、later capability 非依存を閉じる。
 
 ## 独立 design review
@@ -372,3 +382,12 @@ matrix を `generic-ffi-schema` 軸で再オープンし、line-local patch で�
 | P1: typed descriptor table の alignment precondition 欠落 | `align_of::<CsvField>()` を要求して typed access 前に guard、compiler global も align。arena/output も同じ class で監査。 |
 | P2: package-only natural-layout rule が existing `SoaPlain` bound を狭める | extra rule を削除。SoA layout は AoS record layout を無視し、`layout(C)`/`align(N)` を positive owner にする。 |
 | P2: precedence summary が全 private abort を options より前に置く | malformed output/arena と malformed descriptor/input を option phase の前後に分け、numbered order と一致。 |
+
+次の candidate `5b1b6aaf` の fresh review は P1 1 件、P2 2 件。P1 は reopened bound matrix が layout は
+閉じたが cardinality を閉じていないことを示したため、`bound-capacity-raw-text` で再度 open した。
+
+| finding | reopened-matrix repair |
+|---|---|
+| P1: 1024 schema-field cap がなお `SoaPlain` を狭める | sema/HIR/descriptor count/全 summary から schema cap を削除。1024 は physical Present-header cap だけ。Absent は 1025-field 以上も許可し、Present は missing coverage で `Invalid`、1025th physical header がある場合だけ先に `LimitExceeded`。 |
+| P2: raw input ABI の invalid UTF-8 semantics 欠落 | pointer/descriptor phase 後、BOM/CSV 前に allocation-free complete UTF-8 prevalidation。invalid は private `-1`。成功は UTF-8 walk 1 + decode pass 2。 |
+| P2: descriptor name の embedded-NUL semantics 欠落 | descriptor phase で exact ASCII source-identifier grammar と reserved-token exclusion を検証。NUL と全 non-source spelling は input 前 private `-1`。 |
