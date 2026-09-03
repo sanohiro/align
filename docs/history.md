@@ -1,5 +1,34 @@
 # History of Align
 
+## 2026-09-03: pkg.csv settles on one typed direct-to-SoA materializer
+
+The first `pkg.csv` design accepts one in-memory UTF-8 decoder whose expected `soa<R>` result is the
+schema. Header presence, CRLF/LF selection, destination arena, and inclusive row bound are explicit;
+there is no dialect inference, parser object, dynamic row model, or row-major result. Present
+headers provide a bounded byte-exact named projection, absent headers require exact declaration
+order, and RFC 4180 quoting is extended only to UTF-8 text and explicit LF separators.
+
+A raw-ABI UTF-8 prevalidation followed by a complete allocation-free first decode pass validates
+grammar, selected scalar conversions, bounds, and layout. Zero rows return canonical `{null, 0}` without allocation; a nonempty second decode pass allocates
+an exact arena block and fills columns directly. Clean strings borrow the input; only doubled-quote
+fields are normalized into the arena. Primitive records retain
+only the output region, while string-bearing records retain both input and output, including the
+existing frame-bounded synthetic owner for an auto-borrowed owned input temporary. Checked record
+formation proves emitted descriptor-name uniqueness, avoiding an uncapped pairwise runtime scan.
+Errors publish no partial result and do not advance the arena.
+The decoder stays Pure for sequential use, while the general non-Send region rule rejects its
+explicit destination capability at both `spawn` and `par_map` worker boundaries before publication
+or allocation. Worker-transfer provenance follows callable targets and capture environments
+recursively, so a nested function value cannot conceal the capability.
+
+Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
+operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a
+discarded parameter-shaped record, while only concrete monomorph rechecking emits the operation;
+the schema accepts the complete existing `SoaPlain` domain without a CSV field-count cap. The design itself changes neither the
+five shipped package subtrees nor the 330-keyed/348-base runtime inventory. Exact surface, grammar,
+conversions, precedence, ABI, ownership, and implementation matrix:
+`docs/impl/pkg-design/csv.md`.
+
 ## 2026-09-02: pkg.kv is one typed synchronous plaintext RESP2 client
 
 The accepted `pkg.kv` design fixes one opaque Move `client`, explicit connect and I/O timeouts plus
@@ -21,7 +50,8 @@ shipped root `pkg.kv`, `pkg.kv.internal.resource`, and the checked ABI row toget
 implemented first-party inventory to five vendorable subtrees. The current runtime inventory is 330
 keyed plus 18 unkeyed records, 13 of the unkeyed records source-reachable: 348 base exports, 352
 with either four-row probe feature alone, and 356 at the maximum combined probe surface. A123
-remains the next unreserved ABI shape. Exact surface, ownership, wire grammar, error precedence,
+was then the next unreserved ABI shape; the later accepted `pkg.csv` design reserves it without
+activation or a count change. Exact surface, ownership, wire grammar, error precedence,
 prerequisites, and implementation matrix: `docs/impl/pkg-design/kv.md`.
 
 ## 2026-09-01: auth composes fixed protocols over the one crypto substrate

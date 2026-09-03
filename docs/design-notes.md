@@ -462,6 +462,17 @@ There is no allocator trait, lifetime parameter, cross-arena sharing, or automat
 explicit `clone_in(out)` marks the unavoidable transition from a short-lived input view to
 owned output.
 
+**Pure does not make a destination region Send.** Allocation into a named arena can be Pure for
+ordinary sequential evaluation while still requiring exclusive lexical ownership of that arena's
+cursor. The `region` capability therefore cannot cross any parallel-worker boundary: `spawn` and
+`par_map` share one worker-transfer provenance check, independent of effect inference. It follows
+concrete callable targets and their capture environments recursively, including nested function
+values, moves, joins, and helper summaries; unavailable provenance is non-Send. A noncapturing
+function has no environment and remains admissible. Sequential direct calls, closures, `map`, and
+`reduce` remain valid when the normal region analysis proves the lifetime.
+This keeps parallel safety in the general capability rule instead of making an allocating package
+Impure or adding a package-specific synchronization exception.
+
 **Static SQL is one statement-artifact mechanism, not a Query-only exception.** A row-returning
 Query and a rowless command differ only in Row/result/decode data. Both use the same item identity,
 source/wire SQL split, generated Params binder, retention plan, per-driver checked state, producer
@@ -578,9 +589,11 @@ for a closure that escapes *every* region — e.g. one returned to an unbounded 
 the deferred first-class-closure design; the `task_group` consumer is scope-bounded and clean.)
 
 The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
-captured values but not mutate external state), which is what makes data-parallel execution safe
-without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
-safety comes from capture being by value (no shared mutable state) rather than from purity.
+captured values but not mutate external state), and every worker capture must independently be
+Send. In particular, the Copy `region` capability is non-Send because it can advance one shared
+arena cursor, and a function value that closes over that capability remains non-Send at every
+nested capture depth. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
+safety comes from by-value capture of transitively Send values rather than from purity.
 Successful-Wait evidence follows the Result value only through transparent local/control
 operations. It is not inferred through a call, return, capture, import, or aggregate: those
 boundaries would require a second hidden effect/provenance summary. Each fallible Wait also has a
@@ -1507,6 +1520,53 @@ following review found one remaining P2 in the pre-existing-derived-shell entry 
 repair review found one P3 in the recursively reachable reader/writer/logger carrier owner graph.
 A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation then
 followed the recorded prerequisite order and activated the package and checked timeout row together.
+
+## Why `pkg.csv` decodes directly to typed SoA instead of exposing a parser object
+
+CSV is useful here when it becomes columns without creating a second dynamic value model. The
+expected `soa<R>` type is the schema: absent headers map exact declaration order, while present
+headers provide one bounded byte-exact projection. A parser object, dynamic row map, iterator, or
+row-major intermediate would add hidden allocation and lifetime states and would make the common
+path pay for a representation the data-oriented pipeline immediately discards.
+
+The caller therefore supplies every policy that changes interpretation: header presence, CRLF or
+LF, destination arena, and an inclusive row bound. The package does not infer a dialect from data,
+the platform, a MIME header, or locale. Its RFC 4180 quote/record model is strict enough to make
+width and error precedence deterministic, but admits UTF-8, NUL, quoted line breaks, and the common
+explicit LF form. The declared record fixes every scalar conversion. Extra named columns are
+grammar-validated but never converted, so wide inputs can be projected without reflection.
+
+After one raw-ABI UTF-8 prevalidation, two decode passes preserve failure atomicity and the physical
+result shape. The first validates the whole successful document and exact layout without allocating.
+Zero rows return canonical `{null, 0}`; for nonempty output the second allocates one arena block and writes declaration-order columns
+directly. Clean text remains a view into the input; only doubled-
+quote fields need normalized bytes, which live in the same block. This makes input and arena
+lifetimes visible in the result type while avoiding per-field strings, an AoS staging table, and a
+transpose. Streaming needs a different chunk/view lifetime and is therefore a later capability,
+not an overload of this materializer.
+
+An owned `string` supplied where `input: str` is expected uses the existing path-local synthetic
+owner. A string-bearing result carries that owner at `Frame` through all value-producing control
+forms, so zero-copy columns cannot outlive a temporary. Descriptor uniqueness is already proved by
+record formation and checked emission. The runtime therefore validates and hashes every descriptor
+name once to authenticate the pinned `name_hash` field, relies on the same invariant from an
+exact-compatible unsafe caller, and performs no
+uncapped pairwise descriptor scan; bounded Present-header lookup supplies the work ceiling.
+
+The decoder is Pure for sequential use, but every call carries an explicit destination `region`.
+Because that capability is non-Send independently of effect, neither a `spawn` nor `par_map` worker
+may receive it directly or through a captured function value that calls the decoder. The shared
+parallel-worker provenance gate follows nested callable environments and helper transfer summaries,
+and rejects before a worker, MIR, generated identity, runtime call, or allocation is published.
+
+The checked `CsvDecode` operation and reserved A123 runtime row must activate together with the
+canonical package schema. That boundary keeps CSV semantics in checked HIR/MIR while making LLVM a
+pure descriptor-and-call lowering. The generic wrapper's abstract check uses the existing symbolic
+SoA parameter form and discards it; concrete rechecking alone produces the schema descriptor and
+emitted operation. CSV admits the whole existing `SoaPlain` domain because AoS layout annotations
+and schema width do not affect its SoA columns; the 1024 cap belongs only to a physical Present
+header. The design contract, exact lexical conversions, ABI record, and
+closure matrix are in `impl/pkg-design/csv.md`.
 
 ## Why tests are Result blocks run in separate processes
 

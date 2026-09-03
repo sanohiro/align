@@ -19,6 +19,46 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### CSV v1 is one explicit typed direct-to-SoA decode (SETTLED 2026-09-03)
+
+**Decision:** `pkg.csv` exposes `Header { Present, Absent }`,
+`LineEnding { CrLf, Lf }`, `DecodeOptions { header, line_ending, max_rows }`,
+`Error { Invalid, LimitExceeded }`, and exactly one
+`decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions) -> Result<soa<R>, Error>`.
+There are no defaults. The expected result supplies `R`; header absence maps exact declaration
+order, while a present bounded nonempty byte-unique header maps every declared name exactly once
+and may carry grammar-valid unconverted extras. The selected CRLF or LF spelling is the only
+outside-quote separator. One leading BOM is stripped, and the RFC 4180 quote model otherwise
+preserves UTF-8, NUL, whitespace, and quoted line breaks.
+
+The raw ABI first validates complete UTF-8. The first decode pass validates the complete successful
+input, exact scalar conversions, row bound, and layout without allocation. Zero rows return canonical
+`{null, 0}` without allocation; the second decode pass makes one exact arena allocation only for nonempty output and fills SoA columns directly.
+Clean text borrows input spans; only doubled-quote text is normalized into the same
+block. A primitive-only result depends on `out`; a string-bearing result depends on `input` and
+`out`. An auto-borrowed owned `string` input keeps its path-local synthetic owner at `Frame` through
+all value-carrying control wrappers and cannot escape that frame. Compiler-produced descriptors use
+checked record-name uniqueness; runtime validation hashes each name once and never performs an
+uncapped descriptor-to-descriptor scan, retaining the pinned result in `CsvField.name_hash` for
+Present lookup. Recoverable failure advances neither arena nor output. Invalid options/grammar/header/width/
+conversion are `Invalid`; the header cap, first complete row beyond the inclusive bound, and
+unrepresentable layout are `LimitExceeded`; OOM and impossible private states abort.
+The decoder remains Pure for sequential use, but its explicit destination `region` is non-Send:
+neither `spawn` nor `par_map` may receive that capability directly or through a nested captured
+function value, and rejection precedes worker publication, MIR, generated identity, runtime call,
+and allocation.
+
+Streaming, encoding, file/mmap input, dialect inference, dynamic or owned rows, nullable columns,
+recovery, and diagnostic payloads remain separate consumer-backed capabilities. Canonical package
+admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only as one
+implementation boundary. The generic wrapper's abstract check uses a discarded parameter-shaped
+HIR form and concrete monomorph rechecking produces the only emitted form. The schema admits the
+complete existing `SoaPlain` domain, including explicit AoS layout/alignment, because SoA column
+layout is independent; CSV adds no schema-count cap, while 1024 remains only the physical
+Present-header cap.
+
+Record: `docs/impl/pkg-design/csv.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### Auth v1 is explicit bounded protocol assembly (SETTLED 2026-09-01)
 
 **Decision:** `pkg.auth` is ordinary package source over existing JSON, encoding, and crypto. Its
@@ -650,7 +690,7 @@ Implementation slices: **S1 DONE** — tag-only + scalar-payload enums + `Type.V
 Record: `draft.md` §5 (Sum Type), `impl/07-roadmap.md`.
 
 ### Purity model
-**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, writing through caller-provided `slice`/`soa` storage (including `map_into` and vector stores), or calling an Impure function (fixpoint over the call graph). Private arithmetic, reads, builder/arena/heap, and owned-value moves remain Pure. `par_map(f)` rejects an Impure `f`; the view-write check is deliberately conservative because HIR does not retain enough provenance to prove that a view is private.
+**Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, writing through caller-provided `slice`/`soa` storage (including `map_into` and vector stores), or calling an Impure function (fixpoint over the call graph). Private arithmetic, reads, builder/arena/heap, and owned-value moves remain Pure. `par_map(f)` rejects an Impure `f`; the view-write check is deliberately conservative because HIR does not retain enough provenance to prove that a view is private. Effect and worker-sendability are distinct: every `par_map` staged/terminal capture recursively checks concrete callable targets and their environments and rejects a reachable non-Send `region` capability, even for a Pure callable, through the same authority as `spawn`. Unavailable callable provenance fails closed; a noncapturing function has an empty environment.
 Record: `impl/03-types.md` §8
 
 ### Ordinary sequential pipeline effects and evaluation order
@@ -660,13 +700,21 @@ order, exactly once for each element that reaches them. A false `where` suppress
 stage/reducer for that element; `any`/`all` do not short-circuit. Inferred effects constrain
 reordering, speculation, erasure, duplication, and parallelization instead of rejecting ordinary
 sequential code. Pure is not a proof of total/non-trapping execution. Explicit `par_map` remains
-Pure-required. `sort_by_key` is excluded pending its separate key-evaluation settlement below.
+Pure-required and independently rejects a non-Send `region` at every reachable callable-environment
+depth. `sort_by_key` is excluded
+pending its separate key-evaluation settlement below.
 **Implemented:** reducing MIR branches around every general callable after `where`, while safe field
 operations plus builtin `sum`/`count`/`min`/`max` retain the mask/identity-select vector shape.
 Record: `draft.md` §8, `docs/language-spec.md`, `impl/12-pipeline-closure-memory-io-simd-audit.md` §3
 
 ### Lambdas / closures — IMPLEMENTED (map/where/all reducers + capture)
 **Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site, so there is no closure environment / allocation. **Implemented L2b-a1 timing correction:** a pipeline snapshots each stage's Copy captures once at that stage's written position, then evaluates terminal arguments, then snapshots reducer/terminal captures; the fused loop reuses those operands rather than reloading enclosing locals per element. A view capture retains its owner dependency across intervening arguments, so `init` cannot invalidate it before callback execution. Capture is otherwise wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a direct-source capturing `par_map` and primitive-scalar length-preserving `map` stages now use the generated parallel range kernel with one call-scoped immutable capture context; callable primitive-scalar `where` stages use stable count/prefix/scatter compaction; AoS projection and field filters, plus the recognised invariant `str.contains` filter, use the same stable range path, while richer string-search, unsupported aggregate, and other unsupported forms retain the sequential path. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures in the same source order, and every callable entering the staged kernel is checked Pure. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
+Copy capture does not imply worker-sendability. When `par_map` moves staged and terminal callables
+into workers, the independently non-Send Copy `region` capability is rejected even when reachable
+only through a captured function value's target-relative environment. The same authority as
+`spawn` follows moves, joins, nested closures, and helper transfer summaries; sequential stages keep
+the ordinary lexical-region rule. Every callable entering the staged kernel is therefore both Pure
+and transitively region-capture-free.
 Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
 ### First-class closures + `task_group` — SETTLED + IMPLEMENTED (fully-escaping fn values deferred)
@@ -681,6 +729,9 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 > value may already occupy a locally used struct field or array element; aggregate placement alone
 > is not a full escape.
 **Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety comes from by-value capture (no shared mutable state). Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
+By-value capture still requires worker-sendability: the same general non-Send rule recursively
+rejects a `region` capability in any reachable callable environment before either a spawned
+environment or a `par_map` range is published.
 Record: `draft.md` §11 (Task Group), `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
 
 **Implementation plan (2026-06-23, revised), after closures ①–③ shipped.** `task_group` **does need the region-owned env** the settled design specified — a **fresh environment per `spawn`, allocated in the `task_group` region** (an arena-like bump region tied to the scope, freed at scope end). The ②b-2 frame-local env is a *single hoisted alloca slot per closure site*, so it cannot back a spawned closure: a `spawn` in a loop (or after reassigning a captured variable) reuses that one slot, and a **deferred** task (④a) would then read the final value, while a **concurrent** task (④b) would race the next iteration's overwrite. A fresh per-`spawn` allocation in the region gives each task a stable, private snapshot of its captures. (So `spawn` is the escape that triggers the region env — exactly "escape decides the representation". The frame-local env stays correct only for a closure that is *called within the frame*, never spawned.) Surface (all scalar `R` for now, matching the closure slices):
@@ -4298,7 +4349,11 @@ implemented; L2 still owns dynamic path-selected return cleanup bits.
 The anonymous `arena {}` form remains. `arena out { ... }` additionally binds a Copy,
 scope-limited `region` capability. Ordinary functions may accept `out: region` and allocate
 returned owned values into that exact arena. The capability cannot escape its lexical arena,
-be stored, be sent to a task, or cross FFI. Values allocated through it carry the named arena's
+be stored, be captured by or otherwise sent to any parallel worker (`spawn` or `par_map`), or cross
+FFI. A function value is non-Send when any concrete target environment recursively captures the
+capability; missing target/environment provenance fails closed, while a noncapturing function has
+an empty environment. This rule is independent of inferred purity; sequential closures and pipelines may
+capture it under the ordinary lexical region rule. Values allocated through it carry the named arena's
 inferred region; no lifetime or allocator type parameter is written by the user.
 
 This is not a second allocator model. It exposes the existing arena destination to ordinary

@@ -198,7 +198,9 @@ The compatibility default is now normative: sequential `map`/`where`/`reduce`/`s
 `any`/`all` callables may be Impure. They execute in input-index and stage order, exactly once for
 each element that reaches them; a false `where` suppresses the suffix. `any`/`all` do not
 short-circuit. Inferred effects restrict transformations rather than source acceptance. Explicit
-`par_map` remains Pure-required.
+`par_map` remains Pure-required. Its pending `pkg.csv` prerequisite must independently reject the
+non-Send `region` capability from every staged and terminal worker capture, including through a
+nested function-value environment.
 
 `sort_by_key` is stable and permits an Impure key callable. The implementation decorates in input
 order and calls the key exactly N times before reordering; the source contract now makes that
@@ -256,6 +258,14 @@ every region-bearing capture must outlive the innermost group. Static, frame, an
 captures remain accepted; a capture tied to any inner arena is rejected before MIR lowering. The
 checked HIR currently permits only a direct `FnValue` or `Closure`, but a whole-expression fallback
 keeps this pass fail-closed if `spawn` later accepts a local or block function expression.
+
+The shipped direct `spawn` check rejects a captured `Ty::ArenaHandle`, even when the arena outlives
+the group. Before `pkg.csv` activates, the pending worker-sendability prerequisite must extend that
+rule through nested function values and to `par_map` using one fail-closed worker-transfer
+provenance authority. It must follow concrete `ClosureTarget`/`ClosureCapture` paths through moves
+and joins, translate direct and imported helper summaries against completed actual values, and
+treat unavailable callable provenance as non-Send; an empty noncapturing environment passes.
+Ordinary region-bearing Copy views still follow the outlives rule above.
 
 `task_group.rs` pins the direct reproduction and captures wrapped in a struct, tuple, `Option`,
 `Result`, and another closure; a parenthesized lambda reaches the same gate because grouping is
@@ -790,6 +800,10 @@ at that stage's written position and each terminal/reducer capture once after th
 preceding arguments. The fused body reuses those SSA operands. Borrow provenance stays attached to
 a captured view across intervening terminal arguments, so an ownership-changing `init` or
 `map_into(dst)` expression that would invalidate the snapshot is rejected.
+Copy is not worker-sendability. The pending `pkg.csv` prerequisite must make every staged and
+terminal capture reject any `Ty::ArenaHandle` recursively reachable through a function-value
+environment when `par_map` owns the fused range. Sequential pipelines continue to admit the
+capability under the ordinary lexical-region proof.
 
 A fresh optimized-IR probe of:
 
@@ -872,7 +886,9 @@ documented closure surface.
 Name-based call graphs work for direct calls but cannot soundly summarize an unknown function value.
 Capturing `par_map` now uses the same direct range kernel for direct-source Copy captures. Preserve the
 inferred effect on `fn` types and require
-Pure at every explicit parallel boundary. Use the same fact as optimization legality for sequential
+Pure at every explicit parallel boundary. Keep worker-sendability distinct and reject
+`Ty::ArenaHandle` at every reachable callable-environment depth in staged and terminal `par_map`
+captures through the same authority as `spawn`. Use the effect fact as optimization legality for sequential
 fusion, subject to the normative settlement in section 3.2. A closure's effect includes its lifted
 body and the effect requirements of every higher-order parameter it invokes. Unknown/FFI function
 pointers fail closed at a Pure boundary.

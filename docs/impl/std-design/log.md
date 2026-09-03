@@ -73,8 +73,10 @@ six keys, symbols, declarations, definitions, collision reservations,
 export-parity rows, runtime ABI fingerprint, whole/per-unit selection, and checked-in declaration
 golden activate atomically. At that capability boundary, the implementation changed the exact
 inventories from 314/331/339 keyed/base/maximum records to 320/337/345 and extended the shape range
-through A117. `core.codec` subsequently occupied A118 through A120; A121 is now the next unreserved
-shape. Logging adds no optional feature or target-dependent row.
+through A117. `core.codec` subsequently occupied A118 through A120, making A121 next at that point;
+`pkg.frame` later occupied A121 and A122, and the accepted inactive `pkg.csv` design reserves A123.
+A124 is now the next unreserved design shape. Logging adds no optional feature or target-dependent
+row.
 
 `LogNew` receives the only live writer pointer and a checked tag. A compiler-generated call always
 supplies non-null provenance from an initialized writer and `0..=4`; construction transfers the

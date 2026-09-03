@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-09-02._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-03._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
@@ -24,7 +24,9 @@ review found one P2 in the pre-existing-derived-shell entry state; its repair re
 the recursively reachable reader/writer/logger carrier owner graph. A fresh full review accepted the
 fifth ledger-first repair with no P0–P3 finding. Both independently useful shared prerequisites—the
 timeout substrate and generic TCP-writer/SIGPIPE hardening—and the package source and checked row
-are implemented and active at their joint capability boundary.
+are implemented and active at their joint capability boundary in PR #933. `pkg.csv` now has the
+accepted public contract and implementation closure matrix in `docs/impl/pkg-design/csv.md`; its
+atomic package/HIR/MIR/runtime implementation is next.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -414,9 +416,22 @@ facts must live in this repository.
   `TcpConnSetIoTimeout` row after its two shared prerequisites. The exact current inventory is 330
   keyed plus 18 unkeyed records, 13 of those unkeyed records source-reachable: 348 base exports,
   352 with either four-row probe feature alone, and 356 at the maximum combined probe surface.
-  A123 remains the next unreserved ABI shape.
-- **Next language capability:** no next domain surface is accepted yet. The planned order places
-  `pkg.csv` after the implemented `pkg.kv`; any public contract still goes through its design gate.
+  A123 remains the next unused active ABI shape and is reserved by the accepted `pkg.csv` design;
+  it is absent from all current counts.
+- **Next language capability:** `pkg.csv` has an accepted design for one explicit typed in-memory
+  direct-to-SoA decode. Canonical package admission, checked `CsvDecode` HIR/MIR, and reserved keyed
+  ABI shape A123 must activate atomically. Its generic wrapper uses a discarded symbolic form during
+  abstract checking and emits only concretely rechecked monomorphs over the complete existing
+  `SoaPlain` domain with no CSV schema-count cap. Raw ABI input is UTF-8-prevalidated and 1024 limits
+  only physical Present headers. String-bearing output retains any auto-borrowed owned input's
+  frame-bounded synthetic owner, while checked emission replaces any uncapped pairwise descriptor
+  scan with compiler-owned name uniqueness and one validation pass using the shared seed-0
+  `align_hash::wyhash`. `CsvDecode` remains Pure
+  for sequential use, but its required `region` is non-Send; the implementation must make the
+  shared parallel-worker provenance gate follow callable targets/environments and helper summaries
+  recursively and reject both `spawn` and `par_map` transfers before publication or allocation.
+  Implementation is next. The design changes no shipped
+  package or runtime inventory until that boundary lands.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

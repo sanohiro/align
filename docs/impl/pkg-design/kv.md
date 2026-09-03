@@ -430,7 +430,8 @@ It is a mandatory base
 export, source-reachable compatible extern, and collision-reserved unkeyed identity. It reuses an
 existing ABI shape, so activation changes the exact base/maximum counts from 347/355 to 348/356
 while the keyed count remains 330. The unkeyed count becomes eighteen, thirteen of which are
-source-reachable, and A123 remains the next unreserved shape. Its LLVM and Rust definitions use the
+source-reachable. A123 was then the next unreserved shape; the later accepted `pkg.csv` design now
+reserves it without activating it or changing these counts. Its LLVM and Rust definitions use the
 existing A04/default-C-calling-convention contract with no curated function, return, or parameter
 attributes.
 

@@ -282,13 +282,20 @@ summaries, function parallel-transfer summaries, both Drop-local vectors, the ex
 assignment cleanup `Cell<bool>`, and every concrete `FnTy.effect` cell; imported
 return provenance, effect, and parallel-transfer seeds come only from the already validated
 imported declaration fields. Direct and concrete function-value transfer summaries translate to
-caller roots; an unresolved indirect target selects every compatible argument/capture. A diagnostic, fact mismatch, or panic from a
+caller roots through the existing `ClosureTarget`/`ClosureCapture` trie; moves, assignments,
+control joins, and nested closures retain that path. An unresolved indirect target selects every
+compatible argument/capture. The pending `pkg.csv` prerequisite must consume this same fact as the
+worker-sendability authority: a local `ArenaHandle` root rejects, an explicit parameter root is
+published in summary `params`, a lifted environment slot is published in `captures`, both are
+checked against completed actual values at their callers, and a known noncapturing function has an
+empty environment. A diagnostic, fact mismatch, or panic from a
 legacy analysis receiving a direct malformed-HIR call returns `false`.
 `ImportedFn.return_provenance_known` preserves whether the producer received
 an external provenance record: `false` retains the compatibility API's
 all-compatible-input fallback, while an explicit `None` is trusted only when
 the record was present. `ImportedFn.parallel_transfer_params` is the decoded interface-v6
-strictly increasing unique in-range borrow-capable root set; header validation authenticates it
+strictly increasing unique in-range borrow-capable root set, where borrow-capable includes
+`ArenaHandle`, `Fn`, and aggregates whose reachable fields carry those facts; header validation authenticates it
 before replay, and a compatibility omission conservatively selects every borrow-capable parameter.
 Both imported validation-only facts are stripped before MIR. This predicate is not the structural HIR validator;
 direct callers must supply the checked type, id, header, and body envelope,
@@ -364,9 +371,20 @@ trusting the stored bits:
    `FnTy` has `Unknown`; unrelated equal source signatures retain distinct
    cells. `Impure` dominates `Unknown`, which dominates `Pure`.
 9. Require every `ArrayParMap` and widened parallel-stage callable to resolve
-   to complete replayed `Pure`. `Unknown`, `Impure`, an absent target, and an
-   incomplete boundary cell reject before any MIR or generated-kernel identity
-   is constructed.
+   to complete replayed `Pure` (shipped). **Pending `pkg.csv` prerequisite:**
+   independently compute every staged and terminal capture's complete worker-transfer provenance using the same authority as
+   `spawn`. Follow concrete callable targets and environment captures recursively
+   through moves, assignment, and `if`/`match`/`else`/loop joins; translate direct,
+   imported, and concrete-indirect helper summaries against completed actual
+   arguments. A local `Ty::ArenaHandle` root rejects. A current-function explicit
+   parameter root enters summary `params`, while a lifted environment parameter
+   enters `captures`; only a public function's explicit parameter ordinals serialize
+   as interface-v6 `parallel_transfer_params`. Either root is rejected at any caller
+   whose translated actual reaches a region. `Unknown`, `Impure`, an
+   absent target, an incomplete boundary cell, or unavailable environment
+   provenance fails closed; a known noncapturing function has an empty environment.
+   Rejection occurs before any MIR, generated-kernel identity, runtime call, or
+   allocation is constructed.
 10. Re-run the producer's per-`task_group` successful-wait dominance fact.
     A group starts with no completed task generation. Each group has one
     compiler-only preorder `group: usize`, abstract `current_generation` and
@@ -798,6 +816,65 @@ missing child, wrong order/type/result, lost generation, retained region, or mis
 Both records, their canonical encoder/decoder arms, public/private package-body admission,
 interface/compiler fingerprint inputs, cache identity, and runtime keys are active as one boundary.
 
+### Reserved `pkg.csv` record (designed 2026-09-03; inactive)
+
+The accepted `pkg.csv` design reserves one expression discriminator, `CsvDecode`. It is not in the
+current enum, canonical codec, validator, lowering, capability collector, or inventory. Those
+producers activate only atomically with canonical package source and runtime row A123.
+
+`Header`, `LineEnding`, `DecodeOptions`, and `Error` use existing nominal enum/record families; no
+new `Ty` or `Scalar` variant or format version is reserved. Their exact definition graph is
+`Present=0, Absent=1`; `CrLf=0, Lf=1`; ordered fields `header`, `line_ending`, `max_rows`; and
+`Invalid=0, LimitExceeded=1`.
+
+| Reserved record | Exact checked contract |
+|---|---|
+| `CsvDecode` | Non-child `row: Ty` is template-only `Ty::Param(p)` during the discarded abstract check, with the exact matching existing `SoaParam(p)` result and `SoaPlain` bound, or emitted `Ty::Struct(id)` naming one concrete record in the complete existing `SoaPlain` domain with no CSV-specific field-count cap and unique source names. Explicit AoS layout/alignment does not narrow the bound. Children are exact `str input`, exact destination `region arena`, and exact nominal `pkg.csv.DecodeOptions options`, once in that source order. The concrete result is canonical `Result<soa<id>, pkg.csv.Error>` and effect is Pure. A primitive-only schema puts exactly the arena root in success provenance; a schema containing `str` puts the complete input storage root/generation plus arena root in success provenance, including the existing `Frame`-bounded synthetic owner when `input` auto-borrows an unbound owned `string` temporary. That owner survives fresh and control-wrapped input formation and follows the ordinary later-child cleanup/no-cleanup rule. No fact reaches the error alternative. |
+
+Sema may form the record only for the exact compiler-private call spelling
+`pkg.csv.internal.descriptor.decode` in the canonical vendored root `pkg.csv` public generic
+wrapper. The exact internal descriptor module contains no import or source item, so the public
+generic body references no private declaration omitted from its interface. The retained generic
+body and internal module identity are available to importing-unit monomorphization, while the
+package `internal` rule prevents application import. The wrapper body is the one positional
+internal operation call using its parameters once in declaration order. A same-named application
+function/extern, an added internal item, a changed package graph/body, or a noncanonical package
+remains ordinary source or rejects package admission. Direct/imported/local/function-field and
+control-selected public function values execute the ordinary wrapper and converge on its one
+checked record.
+
+The abstract wrapper check forms `row = Ty::Param(p)` only when `p` has the `SoaPlain` bound and
+stores the matching `Result<SoaParam(p), pkg.csv.Error>` expression type. It performs no concrete
+schema, descriptor, layout, provenance, MIR, or native work. The existing template path discards
+that HIR and retains source AST for interface monomorphization. A concrete instantiation rechecks
+the body under substitution and forms `row = Ty::Struct(id)` plus `Result<Soa(id), Error>`; generic
+forwarding repeats the symbolic check until its outer concrete instantiation. Canonical HIR encoding,
+body validation, MIR lowering, capability collection, and artifact publication reject every
+`Ty::Param`/`SoaParam` row/result: only the concrete rechecked form may enter emitted `Program`.
+
+Validation checks scalar identity and package/schema facts before the three children, then checks
+children in source evaluation order and the relational result/effect/provenance rule. A terminating
+child suppresses every later child and native action. MIR projects the already-evaluated options
+record once into header tag, line-ending tag, and row bound; it retains the concrete schema,
+destination region, result/provenance, and private status map. Status 0 publishes `Ok`, 1 publishes
+`Err(Invalid)`, 2 publishes `Err(LimitExceeded)`, and every other status reaches the canonical
+package's explicit `ProcessAbort` dependency without publishing output.
+
+For a string-bearing schema, region, escape, storage-generation, and borrow traversals preserve an
+auto-borrowed owned input's path-local synthetic owner through direct function/literal results,
+blocks, `if`, `match`, `else`, `?`, `map_err`, and value-carrying loops. The result remains
+`Frame`-bounded and cannot escape by return. If the already-completed input is followed by a
+terminating arena or options child, no operation/result fact is published; cleanup-carrying exits
+drop the armed owner exactly once and no-cleanup sinks invent no Drop. Primitive-only schemas do not
+publish the input owner in the result fact.
+
+Activation must update every expression match, replay/clone/depth/effect/region/escape/type-
+placement/storage-generation traversal, canonical HIR codec, semantic projection, interface and
+cache identity, whole/per-unit monomorphization, capability discovery, and the compile-time variant
+sweep. The exact malformed-field, control-flow, provenance, allocation, ABI, cache, and package-
+admission owners are the closure matrix in `pkg-design/csv.md`. Until that matrix lands, this
+section is a reservation and changes no checked-HIR contract.
+
 ## Header-adjacent records
 
 | Record | Exact contract |
@@ -993,7 +1070,7 @@ means:
 | `ArrayToSoa` | `env[struct_id]`: in-range nonempty SoA-admissible flat struct and the expression is lexically inside an active arena. `child[source]`; `post[source fixed/dynamic StructArray(struct_id); result Soa(struct_id); source borrowed; result storage belongs to that exact active arena]`. |
 | `ArrayMapInto` | `env[stages,elem]`: elem is admitted Copy scalar and every stage is length-preserving (`Map`/`Project`, no filter). `child[source,stage children,dst]`; `post[PIPE final element elem; dst writable Slice(elem), exact equal-length runtime contract and semantic no-alias proof; result Unit; dst mutated, no allocation]`. |
 | `ArrayPartition` | `env[stages,func,elem,captures.len]`: predicate resolves. `child[source,stage children,captures]`; `post[PIPE final element elem; predicate params elem,captures→Bool; result is exact interned tuple (DynArray(elem),DynArray(elem)); two owned allocations]`. |
-| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and its structural signature is exact; the `complete reachable effect == Pure` requirement is an am-b4 producer fact, not consumed by the dormant am-b2b1 body slice. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
+| `ArrayParMap` | `env[stages,func,elem,captures.len]`: callable resolves and its structural signature is exact. Complete reachable effect is the existing am-b4 producer fact; transitively region-free staged/terminal worker transfer is a pending `pkg.csv` prerequisite, not consumed by the dormant am-b2b1 body slice. `child[source,stage children,captures]`; `post[PIPE; callable params final element,captures and return elem; captures Copy; after the prerequisite activates, complete concrete callable-target/environment provenance reaches no region; result DynArray(payload(elem)) or supported struct-array result; one owned output; parallel eligibility facts equal producer]`. |
 | `ArrayChunks` | `env[elem]`: primitive Copy scalar. `child[source,n]`; `post[source fixed/dynamic array or Slice(elem), n i64; result DynSliceArray(prim(elem)); owned header array whose elements view source; source remains live]`. |
 | `ArrayToSlice` | `env[]`; `child[array]`; `post[array is fixed Array(s,n), fixed StructArray(id,n), DynArray(s), or AoS DynStructArray(id); fixed sources are Local or ArrayLit, element identity is exact, and result is matching Slice(s/Struct(id)); view borrows array storage, no allocation]`. |
 | `Len` | `env[]`; `child[recv]`; `post[recv is exactly Str, String, Slice(_), DynArray(_), DynStructArray(_,_), DynSliceArray(_), DynResponseArray, or Soa(_); result i64; recv borrowed. Fixed-array lengths are Int literals and never Len records]`. |
@@ -1578,7 +1655,7 @@ owners prove both halves against one candidate SHA.
 | Content and observer transition | After every accepted direct element write, the base, every possible backing root, and every already-live alias whose known backing or storage-borrow fact can observe one of those roots retain the incoming contained region and borrow fact. Observers include collection headers nested in each source-reachable aggregate form (struct, tuple, nested `Option`/`Result`, and user sum) rather than only locals whose top-level type is a mutable collection; the tuple owner covers a moved dynamic collection observed through its pre-move slice alias. A scalar element view such as `str` is not itself a collection-header observer and an unrelated slot write cannot retarget it. The region state joins the old and incoming contents. A direct fixed-array store at an exact constant index replaces that element fact; a computed fixed index joins every possible element. Dynamic arrays, slices, reverse aliases, aggregate aliases, and backing roots reached through a range have no shared offset map and conservatively join. Overwriting one exact element therefore need not clear an obsolete owner dependency from another observer until a common index abstraction is designed. | `indexed_str_store_distinguishes_exact_and_conservative_overwrites`; `indexed_and_out_str_stores_keep_source_owners_live_through_backing_roots`; `indexed_str_stores_update_preexisting_and_unresolved_alias_observers`; `indexed_str_store_updates_aggregate_alias_observers`; `scalar_element_views_are_not_collection_alias_observers`; `indexed_str_store_updates_the_contained_region_before_return`; `soa_str_field_store_keeps_the_installed_owner_live` |
 | Callee summary | Mutable-retention summaries cover both `borrow mut` and `out` destinations at every normal, explicit `return`, `?`, branch, match, loop-join, and forwarding edge. An `out` element store records the destination's previous compatible content plus the exact stored source roots. Recursive direct-call dependencies converge through the existing finite fixed point. The fact remains analysis-local and is not serialized. | `forwarded_and_branching_out_str_stores_retain_every_possible_source`; `recursive_and_try_exit_out_str_summaries_retain_the_installed_source`; `two_out_str_destinations_snapshot_regions_before_updates` |
 | Argument completion snapshots | Each eager argument snapshots four distinct facts when it finishes, before a later argument can rebind the same local: element contents, whole-value retained provenance, reachable storage, and mutable backing. An indirect callee is a fifth frozen operand: its target-relative captures complete before argument zero. Storage/backing snapshots are recorded for every storage-bearing collection even when its element type carries no borrow, and every stable `borrow mut` local/field actual also reserves that exact source place until the call action. Whole-value provenance includes the backing lifetime/owner when a slice header itself is copied into a `borrow mut` whole place or field; an `out` destination's self-source instead denotes its previous elements and may keep its completed header/backing value even when a later argument rebinds the syntactic local. A call-valued argument forms its result from that inner call's completed child facts rather than re-reading the child syntax from the later live state. Before advancing any destination, the call action rejects an earlier `borrow mut` reservation when a later eager argument retargets that place, advances a tracked storage generation, or writes an observable collection backing; it then consumes only the frozen facts and computes all destination updates before applying any of them. Thus a later argument may invalidate an earlier owner and reject the call, but it cannot silently retarget an already-evaluated callee, place, slice header, composite call result, storage root, or selected source. | `mutable_str_retention_uses_argument_completion_snapshots`; `nested_mutable_call_results_keep_completion_backing`; `borrow_mut_places_and_numeric_storage_use_argument_completion_snapshots`; `indirect_call_snapshots_the_callee_before_later_arguments`; `two_out_str_destinations_snapshot_regions_before_updates`; existing `pkg_db_q6::borrow_mut_shaper_retention` fixed/dynamic forwarding owners |
-| Parallel-transfer consumer | A direct one-argument transparent call, an eager multi-argument direct call, and an indirect function-value call each translate the callee's worker-transfer summary through completed pre-call argument facts before a mutable action advances or ends any destination generation. The callee body has already reduced its own source order to exact selected parameter/capture roots; the caller must not re-read those selected facts after `borrow mut` invalidation, because ended parameter/storage markers are intentionally absent from the published summary. | `mutable_calls_publish_parallel_transfer_before_advancing_destinations` parameterizes transparent direct, eager direct, and indirect calls |
+| Parallel-transfer consumer | A direct one-argument transparent call, an eager multi-argument direct call, and an indirect function-value call already translate the callee's worker-transfer summary through completed pre-call argument facts before a mutable action advances or ends any destination generation. The callee body has already reduced its own source order to exact selected `params`/`captures` roots; `ClosureTarget`/`ClosureCapture` projections recursively retain a nested function value's environment, and an unresolved target selects every compatible argument and environment root. The caller must not re-read those selected facts after `borrow mut` invalidation, because ended parameter/storage markers are intentionally absent from the published summary. The pending `pkg.csv` worker-send consumer must reject a translated region local and preserve a translated explicit parameter or lifted environment slot in the corresponding summary set for the next caller. | `mutable_calls_publish_parallel_transfer_before_advancing_destinations` parameterizes transparent direct, eager direct, and indirect calls; the pending worker-send owner adds direct/imported/unresolved one- and two-level closure environments, move/reassignment/control joins, and noncapturing-function controls. |
 | Post-call result completion | A mutable call publishes one expression-local post-call completion after all destination transitions. `borrow mut` strongly replaces the selected argument's normalized value, storage, and backing generation; `out` joins installed contents while preserving the pre-call header/backing. The direct or function-value return summary selects those post-call facts. Result value provenance and result allocation storage remain separate: fixed and every owned dynamic collection variant materialize their own result buffer and never inherit a selected argument's allocation fact, while a compatible slice/SoA view forwards selected storage roots. Return-summary backing identity is always unknown because dependency does not prove exact writable-header identity, but every compatible selected backing root remains available to observer propagation. The pending override exists only for mutable calls whose result needs a completion snapshot and is consumed exactly once by that call expression. | `mutable_call_results_use_post_call_completion`; `nested_mutable_call_results_snapshot_post_call_owners`; `mutable_call_owned_dynamic_results_materialize_their_own_storage`; `mutable_call_result_backing_reaches_the_replacement_source`; `unknown_soa_call_results_preserve_source_backing_roots`; `indexed_result_storage_materialization_inventory_is_closed`; existing direct/indirect selected-result owners |
 | Dynamic whole-place replacement | Replacing a whole dynamic array through `borrow mut` updates the destination's must-individual and may-individual allocation facts together with its content, storage, backing, and local-storage marker. A heap replacement strongly re-marks the destination as locally owned; a pure caller-region replacement clears obsolete local ownership and selects the caller storage. Fixed-array destinations never retarget inline storage, and projected dynamic owners remain fail-closed until a projection-aware ownership transfer exists. | `borrow_mut_dynamic_array_heap_replacement_re_marks_storage`; `borrow_mut_dynamic_array_region_replacement_clears_local_storage`; existing dynamic-storage locality owners |
 | Source-visible mutation actions | One exhaustive `SourceVisibleMutationAction` descriptor classifies every built-in that mutates a source binding, growable buffer/builder, RNG receiver, or caller-visible collection backing. Eager-operand classification, exact-destination self-exemption, and the post-operand action all consume that descriptor rather than maintaining parallel variant lists. The action invalidates any earlier overlapping `borrow mut` place reservation, including writes through a backing alias, but exempts its own exact destination snapshot from self-invalidation. A caller-owned `borrow mut` buffer ends its exact `ParamStorage` generation while preserving provenance contained by the parameter. `http_sse_stream.next` is the one compound storage-and-source action: it advances both the output buffer generation and the stream's committed-ID view, then publishes its nested event completion against the fresh output generation. A builder reallocation advances only its linear header/allocation generation: borrowed owners already copied into its elements remain content provenance, and a region builder's mutable storage stays its constructor-selected region rather than being capped by the header local's lexical frame. Distinct receivers/backings remain valid. Opaque runtime-handle interior changes are not source-place mutations unless their API publishes a view whose validity that mutation changes; raw/native calls cannot carry checked `borrow mut`/`out` modes and remain outside this transition. | storage growth owners `buffer_growth_invalidates_an_existing_view` and `read_line_growth_invalidates_an_existing_buffer_view`; SSE owners `sse_output_views_cannot_survive_buffer_reuse_or_stream_state_change` and the compiled event projection; `rand_receiver_mutation_invalidates_an_earlier_borrow_mut_place`; `mutating_a_distinct_rng_keeps_an_earlier_borrow_mut_place_valid`; `shuffle_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place`; `shuffling_a_distinct_backing_keeps_an_earlier_borrow_mut_place_valid`; `map_into_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place`; `region_builder_mutable_calls_keep_constructor_storage_separate_from_elements`; existing `pkg_db_q6::borrow_mut_shaper_retention` owners |

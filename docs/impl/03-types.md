@@ -378,7 +378,13 @@ the error message surface a region (for example, "this view is bound to an arena
 arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
 
 A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
-binding outside the arena, captured by a task, or passed to FFI. An interface signature with a
+binding outside the arena, captured by any parallel worker (`spawn` or `par_map`), or passed to FFI.
+The pending `pkg.csv` implementation prerequisite must make worker sendability follow every
+concrete callable target and its environment captures recursively; moves, joins, nested closures,
+and helper calls must preserve that provenance, and an unavailable target or environment must fail
+closed. A noncapturing function has an empty environment. This non-Send rule
+is independent of effect; sequential closures and pipelines may capture the capability under the
+ordinary lexical-region proof. An interface signature with a
 `region` parameter carries `ReturnRegionSummary::Roots { params, captures: [] }`, allowing an imported caller to
 tie returned owned data to the selected arena. `clone_in(out)` is the explicit copy from a
 shorter-lived view into that region; the checker never inserts it.
@@ -401,9 +407,12 @@ A function/lambda has its effect inferred from its body:
   if none of the above             → Pure
 ```
 
-Every callable moved into `par_map` requires `Pure`. Ordinary sequential `map` / `where` / `reduce`
-/ `scan` / `partition` / `any` / `all` accepts Impure callables; effect and inactive-lane legality
-restrict fusion/vectorization without changing evaluation order or count.
+Every callable moved into `par_map` requires `Pure`. The pending `pkg.csv` prerequisite must also
+require every staged or terminal capture to be worker-Send through its complete callable-target/
+environment provenance. The Copy `region` capability is non-Send at any reachable capture depth
+and must reject independently of effect through the same authority as `spawn`. Ordinary sequential `map` / `where` / `reduce` / `scan` /
+`partition` / `any` / `all` accepts Impure callables; effect and inactive-lane legality restrict
+fusion/vectorization without changing evaluation order or count.
 
 ```align
 mut total := 0;

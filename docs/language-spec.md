@@ -434,8 +434,14 @@ describe provenance and never reconstruct this ownership bit.
 
 `arena name {}` binds a scope-local `region` capability. Ordinary functions may accept that value to
 allocate into the exact caller-selected arena; returned arena values remain tied to the lexical
-block. The capability is Copy but cannot escape, enter aggregates/tasks/FFI, or be constructed by
-users. Anonymous `arena {}` is the same mechanism without a bound capability.
+block. The capability is Copy but cannot escape, enter aggregates or FFI, be captured by or
+otherwise sent to any parallel worker (`spawn` or `par_map`), or be constructed by users. A
+function value is Send only when every capture environment reachable through its concrete callable
+targets is Send; moves, joins, nested closures, and helpers cannot conceal a region. Missing target
+or environment provenance fails closed, while a noncapturing named or lifted function has an empty
+environment. This non-Send rule is independent of inferred purity; sequential closures and
+pipelines may capture a region when the ordinary lexical region rule permits it. Anonymous `arena {}` is the same mechanism
+without a bound capability.
 
 ### Error handling
 
@@ -521,13 +527,18 @@ Copy-capture snapshot, then terminal arguments and their captures. In `reduce(in
 `scan(init, fn ...)`, stage captures are snapshotted before `init`, while reducer captures are
 snapshotted after `init`. The loop reuses those snapshots rather than reloading enclosing locals.
 An intervening argument may not invalidate the owner of a captured view. A non-continuing operand
-suppresses every later snapshot and callback.
+suppresses every later snapshot and callback. Copy is not by itself worker-sendability: a
+`par_map` range rejects `region` in every staged and terminal capture, recursively including
+function-value environments, independently of effect, while sequential pipelines keep the
+ordinary lexical-region rule.
 
 Sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may be
 Impure. They run in input-index and stage order, exactly once for each element that reaches them; a
 false `where` suppresses every later stage and reducer for that element. `any` / `all` do not
 short-circuit. Effects restrict optimization legality, while explicit `par_map` still requires
-Pure callables. Pure alone does not make a trapping or nonterminating call safe to speculate.
+Pure callables and transitively worker-Send captures; `region` is rejected even when the callable
+is Pure or only a nested callable environment reaches it. Pure
+alone does not make a trapping or nonterminating call safe to speculate.
 `sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
 for each surviving element, in input-index order, before any reordering, and sorting never calls it
 again.
@@ -741,7 +752,9 @@ allocation arena: ordinary owned values keep individual ownership, and arena-onl
 require an explicit `arena {}`.
 
 `spawn` takes a lambda, not a bare call, and returns a `Task<R>`. `wait()?` is the single error
-boundary: it joins every task and propagates the **lowest-spawn-index** `Err`.
+boundary: it joins every task and propagates the **lowest-spawn-index** `Err`. Its by-value captures
+must be transitively worker-Send; a `region` capability reachable through a nested function-value
+environment is rejected before the spawned environment is published.
 
 `Task.get()` is valid only after a successful `wait()` on every reachable path for its task
 generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
@@ -1479,3 +1492,50 @@ pre-existing-derived-shell entry state, and its repair review found one P3 in th
 reachable reader/writer/logger carrier owner graph. A fresh complete review accepted the fifth
 repair with no P0–P3 finding; implementation then shipped the accepted package source and runtime
 row together.
+
+The accepted, not-yet-implemented `pkg.csv` v1 surface is:
+
+```text
+pkg.csv.Header { Present, Absent }
+pkg.csv.LineEnding { CrLf, Lf }
+pkg.csv.DecodeOptions { header: Header, line_ending: LineEnding, max_rows: i64 }
+pkg.csv.Error { Invalid, LimitExceeded }
+pkg.csv.decode<R: SoaPlain>(input: str, out: region, options: DecodeOptions)
+  -> Result<soa<R>, Error>
+```
+
+There are no defaults. Expected result type supplies a record `R` from the complete existing
+`SoaPlain` domain with no CSV-specific schema-count cap; explicit AoS record layout does not affect SoA columns. Absent headers
+map an exact width by declaration order. Present headers are
+nonempty and byte-unique, map every declared field exactly once by byte-exact name, and may contain
+extra grammar-valid columns that are not converted. A schema wider than 1024 remains usable with an
+absent header but cannot be fully covered by a present header within its physical-column cap. The caller explicitly selects CRLF or LF; mixed
+or lone-CR separators are invalid. One leading UTF-8 BOM is stripped. RFC 4180 quoting admits
+doubled quotes and quoted line breaks; spaces, NUL, and UTF-8 remain data. Selected scalar cells use
+fixed full-cell lexical grammars, and only `str` admits empty text.
+
+`max_rows` is inclusive and nonnegative. Invalid options, grammar, header identity, row width, or
+selected conversion is `Invalid`; the 1025th physical header column, first complete otherwise-valid row past
+the bound, or unrepresentable exact layout is `LimitExceeded`. OOM and impossible private states
+abort. The raw ABI first validates complete UTF-8 and returns private `-1` for invalid bytes. An
+allocation-free first decode pass validates the complete successful document. Zero rows return
+canonical `{null, 0}` without allocation; only a nonempty second decode pass makes one exact arena
+allocation and fills SoA columns directly. Clean strings borrow input spans, while
+only doubled-quote strings are normalized into the output block. Primitive-only results retain
+`out`; string-bearing results retain `input` and `out`. An implicit borrow of an unbound owned
+`string` input retains its existing synthetic owner at `Frame` through value-carrying control and
+cannot escape that frame. Error does not advance the arena. Checked record formation proves
+compiler descriptor-name uniqueness; runtime descriptor validation is one record/name-hash pass,
+retains the pinned value in `CsvField.name_hash`, and is not an uncapped pairwise name scan.
+
+The decoder remains Pure for sequential use. Its explicit destination `region` is non-Send, so a
+`spawn` or `par_map` worker cannot receive `out` directly or through a nested captured function
+value. The compiler follows callable environments and helper transfer summaries and rejects before
+worker publication, MIR, generated identity, runtime call, or allocation.
+
+Implementation activates canonical package admission, checked `CsvDecode` HIR/MIR, and reserved
+keyed ABI shape A123 atomically. Abstract generic checking uses a discarded parameter-shaped HIR
+form; only a concretely rechecked monomorph reaches emitted HIR/MIR. This accepted design changes no
+shipped inventory. Streaming,
+encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
+outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.
