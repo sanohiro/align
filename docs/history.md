@@ -18,7 +18,8 @@ formation proves emitted descriptor-name uniqueness, avoiding an uncapped pairwi
 Errors publish no partial result and do not advance the arena.
 The decoder stays Pure for sequential use, while the general non-Send region rule rejects its
 explicit destination capability at both `spawn` and `par_map` worker boundaries before publication
-or allocation.
+or allocation. Worker-transfer provenance follows callable targets and capture environments
+recursively, so a nested function value cannot conceal the capability.
 
 Implementation will activate canonical package admission, one checked `CsvDecode` HIR/MIR
 operation, and reserved keyed runtime shape A123 atomically. Abstract generic checking carries a

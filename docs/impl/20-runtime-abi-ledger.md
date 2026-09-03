@@ -442,9 +442,10 @@ unsafe call defined.
 
 `CsvField` is target-native `#[repr(C)]` / non-packed LLVM
 `{ name_ptr: ptr, name_len: i64, name_hash: u64, tag: i32, reserved: i32 }`. The global uses at least the exact
-`repr(C)` alignment, size, and five field offsets. `name_hash` is 64-bit FNV-1a over the exact name
-bytes, with offset basis `14695981039346656037` followed for each byte by xor and wrapping multiply
-by `1099511628211`. Runtime name validation recomputes and authenticates it before later header
+`repr(C)` alignment, size, and five field offsets. `name_hash` is the canonical
+`align_hash::wyhash(name_bytes, WY_SEED)` with `WY_SEED = 0`; codegen and runtime call the same
+shared implementation. `align_hash` owns the algorithm/seed convention; A123 owns descriptor
+validation order and the authenticated stored hash. Runtime name validation recomputes and authenticates it before later header
 projection reads the stored hash without rehashing the descriptor. Names are nonempty static source identifiers in
 declaration order: first byte ASCII `_`/letter, remaining bytes ASCII `_`/letter/digit, and not one
 of exact reserved tokens `fn`, `return`, `mut`, `pub`, `module`, `import`, `if`, `else`, `true`,

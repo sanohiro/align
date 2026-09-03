@@ -435,9 +435,12 @@ describe provenance and never reconstruct this ownership bit.
 `arena name {}` binds a scope-local `region` capability. Ordinary functions may accept that value to
 allocate into the exact caller-selected arena; returned arena values remain tied to the lexical
 block. The capability is Copy but cannot escape, enter aggregates or FFI, be captured by or
-otherwise sent to any parallel worker (`spawn` or `par_map`), or be constructed by users. This
-non-Send rule is independent of inferred purity; sequential closures and pipelines may capture a
-region when the ordinary lexical region rule permits it. Anonymous `arena {}` is the same mechanism
+otherwise sent to any parallel worker (`spawn` or `par_map`), or be constructed by users. A
+function value is Send only when every capture environment reachable through its concrete callable
+targets is Send; moves, joins, nested closures, and helpers cannot conceal a region. Missing target
+or environment provenance fails closed, while a noncapturing named or lifted function has an empty
+environment. This non-Send rule is independent of inferred purity; sequential closures and
+pipelines may capture a region when the ordinary lexical region rule permits it. Anonymous `arena {}` is the same mechanism
 without a bound capability.
 
 ### Error handling
@@ -525,14 +528,16 @@ Copy-capture snapshot, then terminal arguments and their captures. In `reduce(in
 snapshotted after `init`. The loop reuses those snapshots rather than reloading enclosing locals.
 An intervening argument may not invalidate the owner of a captured view. A non-continuing operand
 suppresses every later snapshot and callback. Copy is not by itself worker-sendability: a
-`par_map` range rejects `region` in every staged and terminal capture independently of effect,
-while sequential pipelines keep the ordinary lexical-region rule.
+`par_map` range rejects `region` in every staged and terminal capture, recursively including
+function-value environments, independently of effect, while sequential pipelines keep the
+ordinary lexical-region rule.
 
 Sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may be
 Impure. They run in input-index and stage order, exactly once for each element that reaches them; a
 false `where` suppresses every later stage and reducer for that element. `any` / `all` do not
 short-circuit. Effects restrict optimization legality, while explicit `par_map` still requires
-Pure callables and worker-Send captures; `region` is rejected even when the callable is Pure. Pure
+Pure callables and transitively worker-Send captures; `region` is rejected even when the callable
+is Pure or only a nested callable environment reaches it. Pure
 alone does not make a trapping or nonterminating call safe to speculate.
 `sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
 for each surviving element, in input-index order, before any reordering, and sorting never calls it
@@ -748,7 +753,8 @@ require an explicit `arena {}`.
 
 `spawn` takes a lambda, not a bare call, and returns a `Task<R>`. `wait()?` is the single error
 boundary: it joins every task and propagates the **lowest-spawn-index** `Err`. Its by-value captures
-must be worker-Send; a `region` capability is rejected before the spawned environment is published.
+must be transitively worker-Send; a `region` capability reachable through a nested function-value
+environment is rejected before the spawned environment is published.
 
 `Task.get()` is valid only after a successful `wait()` on every reachable path for its task
 generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
@@ -1523,7 +1529,8 @@ compiler descriptor-name uniqueness; runtime descriptor validation is one record
 retains the pinned value in `CsvField.name_hash`, and is not an uncapped pairwise name scan.
 
 The decoder remains Pure for sequential use. Its explicit destination `region` is non-Send, so a
-`spawn` or `par_map` worker cannot capture `out` to call it; the compiler rejects that capture before
+`spawn` or `par_map` worker cannot receive `out` directly or through a nested captured function
+value. The compiler follows callable environments and helper transfer summaries and rejects before
 worker publication, MIR, generated identity, runtime call, or allocation.
 
 Implementation activates canonical package admission, checked `CsvDecode` HIR/MIR, and reserved

@@ -1006,8 +1006,11 @@ arena out {
 
 `region` is a Copy, non-owning, scope-bound capability created only by `arena name {}`. It cannot be
 returned, stored in an aggregate, captured by or otherwise sent to any parallel worker (`spawn` or
-`par_map`), or passed through FFI. This non-Send rule is independent of inferred purity: sequential
-closures and pipelines may capture a region when the ordinary lexical region rule permits it. A value allocated through it
+`par_map`), or passed through FFI. Sending a function value also sends its complete reachable
+capture environment: moves, control-flow joins, nested closures, and direct or indirect helpers
+cannot hide a region from this check. An unavailable callable target or environment fails closed;
+a named or lifted noncapturing function has an empty environment and remains Send. This non-Send
+rule is independent of inferred purity: sequential closures and pipelines may capture a region when the ordinary lexical region rule permits it. A value allocated through it
 has that exact inferred arena region and cannot outlive the lexical arena block. Anonymous
 `arena {}` and named `arena out {}` are the same ownership mechanism; the latter only makes the
 allocation destination passable. There is no allocator trait or ambient caller-arena lookup.
@@ -1173,8 +1176,9 @@ reuses those snapshots; it does not reload enclosing locals per element. A captu
 view remains tied to its owner, so an intervening terminal argument cannot move, replace, or drop
 that owner before the callback action. If any earlier operand does not continue, no later snapshot
 or pipeline callback executes. Copy is not by itself worker-sendability: when `par_map` moves staged
-and terminal callables into a parallel range, every capture must also exclude the non-Send `region`
-capability. Sequential pipelines keep the ordinary lexical-region rule.
+and terminal callables into a parallel range, every capture's complete reachable function-value
+environment must exclude the non-Send `region` capability. Sequential pipelines keep the ordinary
+lexical-region rule.
 
 A field selector is shorthand for a one-field lambda — `where(.active)` is `where(fn u { u.active })`,
 and `.score` projects a field out of each element.
@@ -1195,7 +1199,12 @@ passing, joining, or indirectly calling a named function retains the exact mode 
 ABI; there is no mode-erasing adapter. It also preserves inferred return-borrow/region summaries
 for parameters and captured environment slots, so an indirect result cannot outlive any possible
 target input, closure environment, or captured owner. Target-relative capture roots move with the
-function value. The inferred effect and provenance summaries remain unwritten.
+function value. The same finite provenance graph makes worker sendability transitive through a
+function value's concrete target and environment captures; an unresolved target uses the
+conservative all-compatible-input/environment fallback. Direct and function-value helpers publish
+selected worker-transfer parameter roots, and imported declarations carry the same canonical root
+set, so checking resumes against completed actual arguments at the caller. The inferred effect and
+provenance summaries remain unwritten.
 
 A passed closure's captured environment lives in the caller's frame for the duration of the call, so
 no heap allocation is needed. A function value that *escapes* — returned from a function, stored
@@ -1226,7 +1235,8 @@ Fusion may preserve this order, but effect inference restricts transformations: 
 reordered, erased, duplicated, speculated, or parallelized only when its inferred effect and the
 specific operation make that transformation legal. Pure alone does not mean non-trapping or total.
 `par_map` remains different: every callable moved into its parallel range must be Pure (§11), and
-every staged or terminal capture must be worker-Send; `region` is rejected independently of effect.
+every staged or terminal capture must be transitively worker-Send through its complete callable
+environment; `region` is rejected independently of effect.
 `sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
 for each surviving element, in input-index order, before any reordering. Sorting compares the
 recorded keys and never calls the key callable again.
@@ -3829,8 +3839,9 @@ each descriptor once, retains the pinned value in `CsvField.name_hash`, and perf
 descriptor-to-descriptor uniqueness scan.
 
 The decoder remains Pure for sequential use. Its explicit destination `region` is non-Send,
-however, so a `spawn` or `par_map` worker cannot capture `out` to call it; rejection occurs before
-worker publication, MIR, generated identity, runtime call, or allocation.
+however, so a `spawn` or `par_map` worker cannot receive `out` directly or through a nested captured
+function value. Worker-transfer provenance follows callable environments and helper summaries;
+rejection occurs before worker publication, MIR, generated identity, runtime call, or allocation.
 
 The implementation must add one checked `CsvDecode` HIR/MIR operation and reserved keyed ABI shape
 A123 atomically with canonical package admission and owner tests. Abstract generic checking uses a

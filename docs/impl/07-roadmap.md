@@ -4029,10 +4029,11 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   quote fields are normalized into the output block. Primitive schemas retain `out`, string-bearing
   schemas retain `input` and `out`, including the frame-bounded synthetic owner of an auto-borrowed
   owned input temporary, and recoverable errors leave the arena unchanged. Checked descriptor
-  emission proves unique names; runtime validation hashes each name once and has no uncapped
-  pairwise descriptor scan. The decoder remains Pure for sequential use, while its required
-  `region` is non-Send and is rejected by the shared `spawn`/`par_map` worker-capture gate before
-  publication or allocation. Canonical
+  emission proves unique names; runtime validation hashes each name once through the shared seed-0
+  `align_hash::wyhash` and has no uncapped pairwise descriptor scan. The decoder remains Pure for sequential use, while its required
+  `region` is non-Send and is rejected by the shared `spawn`/`par_map` worker-transfer provenance
+  gate before publication or allocation, including when reachable only through a nested captured
+  function value or helper summary. Canonical
   package admission, checked `CsvDecode` HIR/MIR, and reserved keyed ABI shape A123 activate only
   together. Abstract generic checking uses a discarded parameter-shaped operation and only concrete
   monomorph rechecking emits it; the schema accepts the complete existing `SoaPlain` domain without

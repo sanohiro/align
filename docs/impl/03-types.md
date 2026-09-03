@@ -379,8 +379,11 @@ arenas use the implemented total order `Static ⊐ Frame ⊐ Arena(k)`.
 
 A `region` capability cannot be returned, placed in an aggregate/`Option`/`Result`, assigned to a
 binding outside the arena, captured by any parallel worker (`spawn` or `par_map`), or passed to FFI.
-This non-Send rule is independent of effect; sequential closures and pipelines may capture the
-capability under the ordinary lexical-region proof. An interface signature with a
+Worker sendability follows every concrete callable target and its environment captures recursively;
+moves, joins, nested closures, and helper calls preserve that provenance, and an unavailable target
+or environment fails closed. A noncapturing function has an empty environment. This non-Send rule
+is independent of effect; sequential closures and pipelines may capture the capability under the
+ordinary lexical-region proof. An interface signature with a
 `region` parameter carries `ReturnRegionSummary::Roots { params, captures: [] }`, allowing an imported caller to
 tie returned owned data to the selected arena. `clone_in(out)` is the explicit copy from a
 shorter-lived view into that region; the checker never inserts it.
@@ -404,7 +407,8 @@ A function/lambda has its effect inferred from its body:
 ```
 
 Every callable moved into `par_map` requires `Pure`, and every staged or terminal capture must be
-worker-Send. The Copy `region` capability is non-Send and rejects independently of effect through
+worker-Send through its complete callable-target/environment provenance. The Copy `region`
+capability is non-Send at any reachable capture depth and rejects independently of effect through
 the same authority as `spawn`. Ordinary sequential `map` / `where` / `reduce` / `scan` /
 `partition` / `any` / `all` accepts Impure callables; effect and inactive-lane legality restrict
 fusion/vectorization without changing evaluation order or count.
