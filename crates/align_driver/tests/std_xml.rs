@@ -229,15 +229,44 @@ fn xml_getters_abort_on_wrong_state_or_index() {
 }
 
 #[test]
+fn xml_name_views_are_capped_by_owned_reader_storage_and_preserve_borrowed_roots() {
+    for (name, source) in [
+        (
+            "direct",
+            "import std.xml\nfn bad(reader: xml.reader) -> str = reader.name()\n",
+        ),
+        (
+            "control",
+            "import std.xml\nfn bad(reader: xml.reader) -> str { if true { return reader.name() } else { return reader.name() } }\n",
+        ),
+        (
+            "carrier",
+            "import std.xml\nView { Name(str), Empty }\nfn bad(reader: xml.reader) -> View = View.Name(reader.name())\n",
+        ),
+    ] {
+        assert!(
+            check_errs(&format!("std-xml-view-escape-{name}"), source),
+            "an owned reader's {name} view escaped its Drop boundary"
+        );
+    }
+
+    let borrowed = "import std.xml\npub View { Name(str), Empty }\npub fn direct(borrow reader: xml.reader) -> str = reader.name()\npub fn control(borrow reader: xml.reader) -> str { if true { return reader.name() } else { return reader.name() } }\npub fn carrier(borrow reader: xml.reader) -> View = View.Name(reader.name())\n";
+    assert!(
+        !check_errs("std-xml-view-borrowed-root", borrowed),
+        "a name view rooted in a borrowed reader parameter must remain returnable"
+    );
+}
+
+#[test]
 fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
     let files = &[
         (
             "xml_support.align",
-            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
+            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub Concrete { Value(xml.reader), Empty }\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn carry_concrete(reader: xml.reader) -> Concrete = Concrete.Value(reader)\npub fn current_name(borrow reader: xml.reader) -> str = reader.name()\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
         ),
         (
             "main.align",
-            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  return Ok(())\n}\n",
+            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  concrete := xml_support.parse(\"<leaf/>\".clone())?\n  match xml_support.carry_concrete(concrete) {\n    Value(reader4) => print(xml_support.root_name(reader4)?)\n    Empty => print(\"empty\")\n  }\n  return Ok(())\n}\n",
         ),
     ];
     let differential = diff_check_multi("std-xml-interface", files, "main.align");
@@ -274,12 +303,31 @@ fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
             ],
         },
     );
+    let current_name = summary
+        .fns
+        .iter()
+        .find(|function| function.name == "current_name")
+        .expect("borrowed XML name interface");
+    assert_eq!(
+        current_name.return_borrow,
+        align_sema::hir::ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+    );
+    assert_eq!(
+        current_name.return_region,
+        align_sema::hir::ReturnRegionSummary::Roots {
+            params: vec![0],
+            captures: Vec::new(),
+        },
+    );
 
     if backend_available() {
         let output =
             build_per_unit_multi("std-xml-interface-run", files, "main.align").link_and_run();
         assert_eq!(output.status.code(), Some(0));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "root\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "root\nleaf\n");
     }
 }
 

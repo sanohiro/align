@@ -13,8 +13,46 @@ const TEXT_NONE: u8 = 0;
 const TEXT_ORDINARY: u8 = 1;
 const TEXT_CDATA: u8 = 2;
 
+#[cfg(test)]
+struct XmlWork {
+    name_bytes: core::cell::Cell<usize>,
+    normalize_passes: core::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+impl XmlWork {
+    fn name_bytes(&self) -> usize {
+        self.name_bytes.get()
+    }
+
+    fn set_name_bytes(&self, value: usize) {
+        self.name_bytes.set(value);
+    }
+
+    fn normalize_passes(&self) -> usize {
+        self.normalize_passes.get()
+    }
+
+    fn set_normalize_passes(&self, value: usize) {
+        self.normalize_passes.set(value);
+    }
+
+    fn reset(&self) {
+        self.name_bytes.set(0);
+        self.normalize_passes.set(0);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static XML_WORK: XmlWork = const { XmlWork {
+        name_bytes: core::cell::Cell::new(0),
+        normalize_passes: core::cell::Cell::new(0),
+    } };
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Span {
     start: usize,
     end: usize,
@@ -57,6 +95,7 @@ pub struct XmlReader {
     pending_end: u8,
     seen_root: u8,
     root_done: u8,
+    state_tag: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -88,12 +127,66 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
     a_start < b_end && b_start < a_end
 }
 
+fn tag_byte(tag: u64, byte: u8) -> u64 {
+    (tag ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+}
+
+fn tag_usize(mut tag: u64, value: usize) -> u64 {
+    for byte in value.to_le_bytes() {
+        tag = tag_byte(tag, byte);
+    }
+    tag
+}
+
+fn tag_span(tag: u64, span: Span) -> u64 {
+    tag_usize(tag_usize(tag, span.start), span.end)
+}
+
+// Authenticate every live private field without touching historic input bytes. The tag is an
+// invariant checksum, not a security boundary: callers cannot construct `xml.reader`, while raw
+// corruption of any one in-range field must still fail before a view or cursor action is exposed.
+fn shell_state_tag(shell: &XmlReader) -> u64 {
+    let mut tag = 0xcbf2_9ce4_8422_2325;
+    tag = tag_usize(tag, shell.input.addr());
+    for value in [shell.len, shell.cursor, shell.depth, shell.attr_count] {
+        tag = tag_usize(tag, value);
+    }
+    for value in [
+        shell.current,
+        shell.text_kind,
+        shell.pending_end,
+        shell.seen_root,
+        shell.root_done,
+    ] {
+        tag = tag_byte(tag, value);
+    }
+    tag = tag_span(tag, shell.current_name);
+    tag = tag_span(tag, shell.current_text);
+    tag = tag_span(tag, shell.pending_name);
+    for span in &shell.open_names[..shell.depth] {
+        tag = tag_span(tag, *span);
+    }
+    for attr in &shell.attrs[..shell.attr_count] {
+        tag = tag_span(tag, attr.name);
+        tag = tag_span(tag, attr.value);
+        for byte in attr.hash.to_le_bytes() {
+            tag = tag_byte(tag, byte);
+        }
+        tag = tag_byte(tag, attr.quote);
+    }
+    tag
+}
+
+fn seal_shell(shell: &mut XmlReader) {
+    shell.state_tag = shell_state_tag(shell);
+}
+
 fn pointer_shape<T>(value: *const T) -> Option<(usize, usize)> {
     if value.is_null() {
         return None;
     }
     let start = value.addr();
-    if start % mem::align_of::<T>() != 0 {
+    if !start.is_multiple_of(mem::align_of::<T>()) {
         return None;
     }
     Some((start, range_end(start, mem::size_of::<T>())?))
@@ -174,6 +267,8 @@ fn parse_name(bytes: &[u8], pos: &mut usize) -> Option<Span> {
         }
         *pos = next;
     }
+    #[cfg(test)]
+    XML_WORK.with(|work| work.set_name_bytes(work.name_bytes().saturating_add(*pos - start)));
     Some(Span { start, end: *pos })
 }
 
@@ -631,6 +726,8 @@ fn validate_document(bytes: &[u8]) -> bool {
 }
 
 fn normalized_len(raw: &[u8], mode: DecodeMode) -> Option<usize> {
+    #[cfg(test)]
+    XML_WORK.with(|work| work.set_normalize_passes(work.normalize_passes() + 1));
     let mut pos = 0usize;
     let mut output = 0usize;
     while pos < raw.len() {
@@ -660,8 +757,10 @@ fn normalized_len(raw: &[u8], mode: DecodeMode) -> Option<usize> {
     Some(output)
 }
 
-fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8]) -> bool {
-    if normalized_len(raw, mode) != Some(output.len()) {
+fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8], expected_len: usize) -> bool {
+    #[cfg(test)]
+    XML_WORK.with(|work| work.set_normalize_passes(work.normalize_passes() + 1));
+    if output.len() != expected_len {
         return false;
     }
     let mut pos = 0usize;
@@ -673,6 +772,9 @@ fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8]) -> bool {
             };
             let mut encoded = [0u8; 4];
             let bytes = ch.encode_utf8(&mut encoded).as_bytes();
+            if written.checked_add(bytes.len()).is_none_or(|end| end > output.len()) {
+                return false;
+            }
             output[written..written + bytes.len()].copy_from_slice(bytes);
             written += bytes.len();
             pos = next;
@@ -683,7 +785,10 @@ fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8]) -> bool {
             if raw.get(pos) == Some(&b'\n') {
                 pos += 1;
             }
-            output[written] = if matches!(mode, DecodeMode::Attribute) {
+            let Some(slot) = output.get_mut(written) else {
+                return false;
+            };
+            *slot = if matches!(mode, DecodeMode::Attribute) {
                 b' '
             } else {
                 b'\n'
@@ -692,7 +797,10 @@ fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8]) -> bool {
             continue;
         }
         if matches!(mode, DecodeMode::Attribute) && matches!(raw[pos], b'\n' | b'\t') {
-            output[written] = b' ';
+            let Some(slot) = output.get_mut(written) else {
+                return false;
+            };
+            *slot = b' ';
             written += 1;
             pos += 1;
             continue;
@@ -701,6 +809,9 @@ fn normalize_into(raw: &[u8], mode: DecodeMode, output: &mut [u8]) -> bool {
             return false;
         };
         let count = next - pos;
+        if written.checked_add(count).is_none_or(|end| end > output.len()) {
+            return false;
+        }
         output[written..written + count].copy_from_slice(&raw[pos..next]);
         written += count;
         pos = next;
@@ -723,7 +834,7 @@ unsafe fn publish_owned(raw: &[u8], mode: DecodeMode, out: *mut AlignStr) -> i32
         return AL_INVALID;
     }
     let target = unsafe { core::slice::from_raw_parts_mut(allocation, len) };
-    if !normalize_into(raw, mode, target) {
+    if !normalize_into(raw, mode, target, len) {
         unsafe { align_rt_free(allocation) };
         return AL_INVALID;
     }
@@ -759,6 +870,63 @@ unsafe fn shell_fields_valid(reader: *const XmlReader) -> Option<(*mut u8, usize
     let seen_root = unsafe { ptr::addr_of!((*reader).seen_root).read() };
     let root_done = unsafe { ptr::addr_of!((*reader).root_done).read() };
 
+    let initial = seen_root == 0
+        && cursor == 0
+        && depth == 0
+        && attr_count == 0
+        && current == CURRENT_NONE
+        && text_kind == TEXT_NONE
+        && pending_end == 0
+        && root_done == 0
+        && current_name == Span::default()
+        && current_text == Span::default()
+        && pending_name == Span::default();
+    let eof = seen_root == 1
+        && root_done == 1
+        && cursor == len
+        && depth == 0
+        && attr_count == 0
+        && current == CURRENT_NONE
+        && text_kind == TEXT_NONE
+        && pending_end == 0
+        && current_name == Span::default()
+        && current_text == Span::default()
+        && pending_name == Span::default();
+    let event_state = match current {
+        CURRENT_START => {
+            seen_root == 1
+                && root_done == 0
+                && cursor > 0
+                && text_kind == TEXT_NONE
+                && current_text == Span::default()
+                && ((pending_end == 1 && pending_name == current_name)
+                    || (pending_end == 0 && pending_name == Span::default() && depth > 0))
+        }
+        CURRENT_END => {
+            seen_root == 1
+                && cursor > 0
+                && attr_count == 0
+                && text_kind == TEXT_NONE
+                && pending_end == 0
+                && pending_name == Span::default()
+                && current_text == Span::default()
+                && ((root_done == 1 && depth == 0) || (root_done == 0 && depth > 0))
+        }
+        CURRENT_TEXT => {
+            seen_root == 1
+                && root_done == 0
+                && cursor > 0
+                && depth > 0
+                && attr_count == 0
+                && pending_end == 0
+                && pending_name == Span::default()
+                && current_name == Span::default()
+                && matches!(text_kind, TEXT_ORDINARY | TEXT_CDATA)
+        }
+        CURRENT_NONE => initial || eof,
+        _ => false,
+    };
+
     if magic != XML_MAGIC
         || len == 0
         || len > isize::MAX as usize
@@ -771,6 +939,7 @@ unsafe fn shell_fields_valid(reader: *const XmlReader) -> Option<(*mut u8, usize
         || pending_end > 1
         || seen_root > 1
         || root_done > 1
+        || !event_state
         || (current != CURRENT_START && attr_count != 0)
         || (matches!(current, CURRENT_START | CURRENT_END) && !current_name.nonempty_in(len))
         || (current == CURRENT_TEXT
@@ -780,12 +949,6 @@ unsafe fn shell_fields_valid(reader: *const XmlReader) -> Option<(*mut u8, usize
                 || !pending_name.nonempty_in(len)
                 || pending_name.start != current_name.start
                 || pending_name.end != current_name.end))
-        || (seen_root == 0
-            && (cursor != 0
-                || depth != 0
-                || current != CURRENT_NONE
-                || pending_end != 0
-                || root_done != 0))
         || (root_done == 1 && (seen_root != 1 || depth != 0 || pending_end != 0))
     {
         return None;
@@ -821,34 +984,28 @@ fn span_boundaries_valid(bytes: &[u8], span: Span) -> bool {
     span.valid_in(bytes.len()) && utf8_boundary(bytes, span.start) && utf8_boundary(bytes, span.end)
 }
 
-fn name_span_valid(bytes: &[u8], span: Span) -> bool {
-    if !span.nonempty_in(bytes.len()) || !span_boundaries_valid(bytes, span) {
-        return false;
-    }
-    let mut pos = span.start;
-    parse_name(bytes, &mut pos).is_some_and(|parsed| {
-        parsed.start == span.start && parsed.end == span.end && pos == span.end
-    })
-}
-
 fn shell_content_fields_valid(shell: &XmlReader, bytes: &[u8]) -> bool {
     utf8_boundary(bytes, shell.cursor)
         && shell.open_names[..shell.depth]
             .iter()
-            .all(|span| name_span_valid(bytes, *span))
+            .all(|span| span.nonempty_in(bytes.len()) && span_boundaries_valid(bytes, *span))
         && (!matches!(shell.current, CURRENT_START | CURRENT_END)
-            || name_span_valid(bytes, shell.current_name))
+            || (shell.current_name.nonempty_in(bytes.len())
+                && span_boundaries_valid(bytes, shell.current_name)))
         && (shell.current != CURRENT_TEXT || span_boundaries_valid(bytes, shell.current_text))
         && (shell.current != CURRENT_START
             || shell.attrs[..shell.attr_count].iter().all(|attr| {
-                name_span_valid(bytes, attr.name)
+                attr.name.nonempty_in(bytes.len())
+                    && span_boundaries_valid(bytes, attr.name)
                     && span_boundaries_valid(bytes, attr.value)
                     && attr.value.start > 0
                     && attr.value.end < bytes.len()
                     && bytes.get(attr.value.start - 1) == Some(&attr.quote)
                     && bytes.get(attr.value.end) == Some(&attr.quote)
             }))
-        && (shell.pending_end == 0 || name_span_valid(bytes, shell.pending_name))
+        && (shell.pending_end == 0
+            || (shell.pending_name.nonempty_in(bytes.len())
+                && span_boundaries_valid(bytes, shell.pending_name)))
 }
 
 unsafe fn checked_shell(reader: *const XmlReader, out: *mut AlignStr) -> Option<*const XmlReader> {
@@ -866,6 +1023,9 @@ unsafe fn checked_shell(reader: *const XmlReader, out: *mut AlignStr) -> Option<
         return None;
     }
     let shell = unsafe { &*reader };
+    if shell.state_tag != shell_state_tag(shell) {
+        return None;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(input, len) };
     if !shell_content_fields_valid(shell, bytes) {
         return None;
@@ -882,6 +1042,9 @@ unsafe fn checked_shell_mut(reader: *mut XmlReader) -> Option<*mut XmlReader> {
         return None;
     }
     let shell = unsafe { &*reader };
+    if shell.state_tag != shell_state_tag(shell) {
+        return None;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(input, len) };
     if !shell_content_fields_valid(shell, bytes) {
         return None;
@@ -890,6 +1053,12 @@ unsafe fn checked_shell_mut(reader: *mut XmlReader) -> Option<*mut XmlReader> {
 }
 
 #[unsafe(no_mangle)]
+/// Parse one owned UTF-8 XML buffer and publish its reader shell.
+///
+/// # Safety
+///
+/// `input` must be null exactly when `len` is zero or name a live runtime allocation of `len`
+/// bytes. `out` must name writable, aligned pointer storage and must not overlap `input`.
 pub unsafe extern "C" fn align_rt_xml_parse(
     input: *mut u8,
     len: i64,
@@ -935,13 +1104,20 @@ pub unsafe extern "C" fn align_rt_xml_parse(
         pending_end: 0,
         seen_root: 0,
         root_done: 0,
+        state_tag: 0,
     };
     unsafe { reader.write(shell) };
+    seal_shell(unsafe { &mut *reader });
     unsafe { out.write(reader) };
     0
 }
 
 #[unsafe(no_mangle)]
+/// Advance a validated XML reader by one event.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell returned by [`align_rt_xml_parse`].
 pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
     let Some(shell) = (unsafe { checked_shell_mut(reader) }) else {
         return -1;
@@ -952,10 +1128,14 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
         shell.pending_end = 0;
         shell.current = CURRENT_END;
         shell.current_name = shell.pending_name;
+        shell.pending_name = Span::default();
+        shell.current_text = Span::default();
+        shell.text_kind = TEXT_NONE;
         shell.attr_count = 0;
         if shell.depth == 0 {
             shell.root_done = 1;
         }
+        seal_shell(shell);
         return 2;
     }
     if shell.cursor == 0 {
@@ -967,7 +1147,12 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
     loop {
         if shell.cursor == shell.len {
             shell.current = CURRENT_NONE;
+            shell.current_name = Span::default();
+            shell.current_text = Span::default();
+            shell.pending_name = Span::default();
             shell.text_kind = TEXT_NONE;
+            shell.attr_count = 0;
+            seal_shell(shell);
             return 0;
         }
         let pos = shell.cursor;
@@ -987,9 +1172,11 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
                 continue;
             }
             shell.current = CURRENT_TEXT;
+            shell.current_name = Span::default();
             shell.text_kind = TEXT_CDATA;
             shell.current_text = content;
             shell.attr_count = 0;
+            seal_shell(shell);
             return 3;
         }
         if bytes.get(pos..pos.saturating_add(2)) == Some(&b"</"[..]) {
@@ -1009,10 +1196,14 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
             shell.cursor = tag.end;
             shell.current = CURRENT_END;
             shell.current_name = tag.name;
+            shell.current_text = Span::default();
+            shell.pending_name = Span::default();
+            shell.text_kind = TEXT_NONE;
             shell.attr_count = 0;
             if shell.depth == 0 {
                 shell.root_done = 1;
             }
+            seal_shell(shell);
             return 2;
         }
         if bytes.get(pos) == Some(&b'<') {
@@ -1022,6 +1213,7 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
             shell.cursor = tag.end;
             shell.current = CURRENT_START;
             shell.current_name = tag.name;
+            shell.current_text = Span::default();
             shell.attr_count = tag.attr_count;
             shell.text_kind = TEXT_NONE;
             shell.seen_root = 1;
@@ -1034,7 +1226,10 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
                 }
                 shell.open_names[shell.depth] = tag.name;
                 shell.depth += 1;
+                shell.pending_end = 0;
+                shell.pending_name = Span::default();
             }
+            seal_shell(shell);
             return 1;
         }
         let end = scan_ordinary_end(bytes, pos);
@@ -1046,14 +1241,23 @@ pub unsafe extern "C" fn align_rt_xml_next(reader: *mut XmlReader) -> i32 {
             return -1;
         }
         shell.current = CURRENT_TEXT;
+        shell.current_name = Span::default();
+        shell.pending_name = Span::default();
         shell.text_kind = TEXT_ORDINARY;
         shell.current_text = Span { start: pos, end };
         shell.attr_count = 0;
+        seal_shell(shell);
         return 3;
     }
 }
 
 #[unsafe(no_mangle)]
+/// Publish the current element name as a borrowed input view.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell and `out` must name writable, aligned `AlignStr`
+/// storage disjoint from both the shell and its input allocation.
 pub unsafe extern "C" fn align_rt_xml_name(reader: *const XmlReader, out: *mut AlignStr) -> i32 {
     let Some(shell) = (unsafe { checked_shell(reader, out) }) else {
         return AL_INVALID;
@@ -1082,6 +1286,11 @@ pub unsafe extern "C" fn align_rt_xml_name(reader: *const XmlReader, out: *mut A
 }
 
 #[unsafe(no_mangle)]
+/// Return the number of attributes on the current start event.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell returned by [`align_rt_xml_parse`].
 pub unsafe extern "C" fn align_rt_xml_attribute_count(reader: *const XmlReader) -> i64 {
     let Some((shell_start, shell_end)) = shell_shape(reader) else {
         return -1;
@@ -1096,6 +1305,9 @@ pub unsafe extern "C" fn align_rt_xml_attribute_count(reader: *const XmlReader) 
         return -1;
     }
     let shell = unsafe { &*reader };
+    if shell.state_tag != shell_state_tag(shell) {
+        return -1;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(input, len) };
     if !shell_content_fields_valid(shell, bytes) || shell.current != CURRENT_START {
         return -1;
@@ -1131,6 +1343,12 @@ unsafe fn attribute_shell(
 }
 
 #[unsafe(no_mangle)]
+/// Publish one current attribute name as a borrowed input view.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell and `out` must name writable, aligned `AlignStr`
+/// storage disjoint from both the shell and its input allocation.
 pub unsafe extern "C" fn align_rt_xml_attribute_name(
     reader: *const XmlReader,
     out: *mut AlignStr,
@@ -1154,6 +1372,12 @@ pub unsafe extern "C" fn align_rt_xml_attribute_name(
 }
 
 #[unsafe(no_mangle)]
+/// Decode one current attribute value into a newly allocated owned string.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell and `out` must name writable, aligned `AlignStr`
+/// storage disjoint from both the shell and its input allocation.
 pub unsafe extern "C" fn align_rt_xml_attribute_value(
     reader: *const XmlReader,
     out: *mut AlignStr,
@@ -1170,6 +1394,12 @@ pub unsafe extern "C" fn align_rt_xml_attribute_value(
 }
 
 #[unsafe(no_mangle)]
+/// Decode the current text event into a newly allocated owned string.
+///
+/// # Safety
+///
+/// `reader` must name a live reader shell and `out` must name writable, aligned `AlignStr`
+/// storage disjoint from both the shell and its input allocation.
 pub unsafe extern "C" fn align_rt_xml_text(reader: *const XmlReader, out: *mut AlignStr) -> i32 {
     let Some(shell) = (unsafe { checked_shell(reader, out) }) else {
         return AL_INVALID;
@@ -1196,6 +1426,12 @@ pub unsafe extern "C" fn align_rt_xml_text(reader: *const XmlReader, out: *mut A
 }
 
 #[unsafe(no_mangle)]
+/// Free one XML reader and its consumed source allocation.
+///
+/// # Safety
+///
+/// `reader` must be null or name a live shell returned by [`align_rt_xml_parse`] that has not
+/// already been freed.
 pub unsafe extern "C" fn align_rt_xml_free(reader: *mut XmlReader) {
     if reader.is_null() {
         return;
@@ -1493,6 +1729,8 @@ mod tests {
             assert_eq!(out.len, 11);
             (*reader).current_name = Span { start: 1, end: 2 };
 
+            let pending_end = (*reader).pending_end;
+            let pending_name = (*reader).pending_name;
             (*reader).pending_end = 1;
             (*reader).pending_name = Span { start: 2, end: 3 };
             out = AlignStr {
@@ -1501,7 +1739,8 @@ mod tests {
             };
             assert_eq!(align_rt_xml_name(reader, &mut out), AL_INVALID);
             assert_eq!((out.ptr.addr(), out.len), (5, 15));
-            (*reader).pending_end = 0;
+            (*reader).pending_end = pending_end;
+            (*reader).pending_name = pending_name;
 
             let alias = reader.cast::<AlignStr>();
             assert_eq!(align_rt_xml_name(reader, alias), AL_INVALID);
@@ -1529,6 +1768,106 @@ mod tests {
             (*reader).cursor += 1;
             assert_eq!(align_rt_xml_next(reader), -1);
             (*reader).cursor -= 1;
+            align_rt_xml_free(reader);
+        }
+    }
+
+    #[test]
+    fn in_range_private_state_mutations_are_rejected_relationally() {
+        unsafe {
+            let reader = parse(b"<a x='v'/>").unwrap();
+
+            macro_rules! rejects_initial_mutation {
+                ($field:ident, $bad:expr) => {{
+                    let saved = (*reader).$field;
+                    (*reader).$field = $bad;
+                    assert!(
+                        checked_shell_mut(reader).is_none(),
+                        "initial mutation of {} was accepted",
+                        stringify!($field)
+                    );
+                    (*reader).$field = saved;
+                }};
+            }
+            rejects_initial_mutation!(cursor, 1);
+            rejects_initial_mutation!(depth, 1);
+            rejects_initial_mutation!(attr_count, 1);
+            rejects_initial_mutation!(current, CURRENT_START);
+            rejects_initial_mutation!(text_kind, TEXT_ORDINARY);
+            rejects_initial_mutation!(pending_end, 1);
+            rejects_initial_mutation!(seen_root, 1);
+            rejects_initial_mutation!(root_done, 1);
+
+            assert_eq!(align_rt_xml_next(reader), 1);
+            macro_rules! rejects_start_mutation {
+                ($field:ident, $bad:expr) => {{
+                    let saved = (*reader).$field;
+                    (*reader).$field = $bad;
+                    assert!(
+                        checked_shell_mut(reader).is_none(),
+                        "start-event mutation of {} was accepted",
+                        stringify!($field)
+                    );
+                    (*reader).$field = saved;
+                }};
+            }
+            rejects_start_mutation!(pending_end, 0);
+            rejects_start_mutation!(seen_root, 0);
+            rejects_start_mutation!(root_done, 1);
+            rejects_start_mutation!(current, CURRENT_END);
+            rejects_start_mutation!(text_kind, TEXT_ORDINARY);
+            rejects_start_mutation!(cursor, (*reader).cursor - 1);
+            let hash = (*reader).attrs[0].hash;
+            (*reader).attrs[0].hash ^= 1;
+            assert!(
+                checked_shell_mut(reader).is_none(),
+                "an authenticated in-range attribute mutation was accepted"
+            );
+            (*reader).attrs[0].hash = hash;
+            align_rt_xml_free(reader);
+        }
+    }
+
+    #[test]
+    fn cursor_getters_do_not_rescan_historic_names_and_owned_views_take_two_passes() {
+        let root = "r".repeat(8192);
+        let children = "<b/>".repeat(100);
+        let source = format!("<{root} a='&amp;'>{children}</{root}>");
+        unsafe {
+            let reader = parse(source.as_bytes()).unwrap();
+            XML_WORK.with(XmlWork::reset);
+            assert_eq!(align_rt_xml_next(reader), 1);
+            assert_eq!(
+                XML_WORK.with(XmlWork::name_bytes),
+                root.len() + 1,
+                "the start event scans only its root and one attribute name"
+            );
+
+            XML_WORK.with(XmlWork::reset);
+            for _ in 0..50 {
+                assert_eq!(borrowed_view(reader, align_rt_xml_name), root);
+                assert_eq!(align_rt_xml_attribute_count(reader), 1);
+                let mut out = AlignStr {
+                    ptr: ptr::null(),
+                    len: 0,
+                };
+                assert_eq!(align_rt_xml_attribute_name(reader, &mut out, 0), 0);
+            }
+            assert_eq!(XML_WORK.with(XmlWork::name_bytes), 0);
+
+            assert_eq!(owned_value(reader, 0), "&");
+            assert_eq!(XML_WORK.with(XmlWork::normalize_passes), 2);
+
+            XML_WORK.with(XmlWork::reset);
+            for _ in 0..100 {
+                assert_eq!(align_rt_xml_next(reader), 1);
+                assert_eq!(align_rt_xml_next(reader), 2);
+            }
+            assert_eq!(
+                XML_WORK.with(XmlWork::name_bytes),
+                100,
+                "only each newly encountered one-byte child name may be scanned"
+            );
             align_rt_xml_free(reader);
         }
     }

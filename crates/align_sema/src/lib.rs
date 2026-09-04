@@ -4326,6 +4326,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("reader", Ty::Reader),
     ("writer", Ty::Writer),
     ("log.logger", Ty::Logger),
+    ("xml.reader", Ty::XmlReader),
     ("codec.batch", Ty::CodecBatch),
     ("codec.i64_column", Ty::CodecI64Column),
     ("codec.f64_column", Ty::CodecF64Column),
@@ -9038,6 +9039,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // `log.logger` may cross a sum-type boundary as an owned tagged carrier.
                     // The enum's tag-switched drop forwards the active handle to `log_free`.
                     Ty::Logger => payload.push(Scalar::Logger),
+                    // `xml.reader` is the same one-pointer Move leaf in concrete and generic sum
+                    // payloads. The active arm owns the reader and its consumed source string.
+                    Ty::XmlReader => payload.push(Scalar::XmlReader),
                     Ty::CodecBatch => payload.push(Scalar::CodecBatch),
                     Ty::CodecI64Column => payload.push(Scalar::CodecI64Column),
                     Ty::CodecF64Column => payload.push(Scalar::CodecF64Column),
@@ -23257,7 +23261,11 @@ impl<'a> EscapeCheck<'a> {
             // writer is Static; a writer borrowed from a connection remains connection-bound.
             ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
             ExprKind::XmlName { reader }
-            | ExprKind::XmlAttributeName { reader, .. } => work.push(Work::Eval(reader, depth)),
+            | ExprKind::XmlAttributeName { reader, .. } => push_fold(
+                &mut work,
+                self.borrowed_storage_cap(reader),
+                vec![(reader, depth, None)],
+            ),
             ExprKind::XmlParse { .. }
             | ExprKind::XmlNext { .. }
             | ExprKind::XmlAttributeCount { .. }

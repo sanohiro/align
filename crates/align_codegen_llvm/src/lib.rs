@@ -4169,6 +4169,28 @@ fn validate_template_html_mir_signatures(program: &Program) -> Result<(), Codege
 
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     validate_template_html_mir_signatures(program)?;
+    let xml_event_definition_valid = || {
+        let mut definitions = program.enums.iter().filter(|definition| {
+            definition.name == "xml.event" || definition.source_name == "xml.event"
+        });
+        let Some(definition) = definitions.next() else {
+            return false;
+        };
+        const NAMES: [&str; 3] = ["Start", "End", "Text"];
+        definitions.next().is_none()
+            && definition.name == "xml.event"
+            && definition.source_name == "xml.event"
+            && definition.variants.len() == NAMES.len()
+            && definition
+                .variants
+                .iter()
+                .zip(NAMES)
+                .all(|(variant, expected)| {
+                    variant.name == expected
+                        && variant.payload.is_empty()
+                        && variant.field_base == 1
+                })
+    };
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
             align_mir::Operand::Const(align_mir::Const::Int(_, ty))
@@ -4296,6 +4318,48 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         program.resources.get(*resource as usize).is_some()
                             && operand_ty(function, owner) == Some(Ty::Resource(*resource))
                             && result == Ty::Raw
+                    }
+                    Rvalue::XmlParse { input, out } => {
+                        operand_ty(function, input) == Some(Ty::String)
+                            && function.slots.get(*out as usize) == Some(&Ty::XmlReader)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlNext(reader) => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlAttributeCount(reader) => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && result == i64_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlName { reader, out } => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && function.slots.get(*out as usize) == Some(&Ty::Str)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlAttributeName { reader, index, out } => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && operand_ty(function, index) == Some(i64_ty)
+                            && function.slots.get(*out as usize) == Some(&Ty::Str)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlAttributeValue { reader, index, out } => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && operand_ty(function, index) == Some(i64_ty)
+                            && function.slots.get(*out as usize) == Some(&Ty::String)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
+                    }
+                    Rvalue::XmlText { reader, out } => {
+                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && function.slots.get(*out as usize) == Some(&Ty::String)
+                            && result == i32_ty
+                            && xml_event_definition_valid()
                     }
                     Rvalue::ResourceViewFromRaw {
                         owner,
@@ -4456,7 +4520,21 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     _ => continue,
                 };
                 if !valid {
-                    return Err(fail(function, "resource operation contract mismatch"));
+                    let detail = if matches!(
+                        rvalue,
+                        Rvalue::XmlParse { .. }
+                            | Rvalue::XmlNext(_)
+                            | Rvalue::XmlName { .. }
+                            | Rvalue::XmlAttributeCount(_)
+                            | Rvalue::XmlAttributeName { .. }
+                            | Rvalue::XmlAttributeValue { .. }
+                            | Rvalue::XmlText { .. }
+                    ) {
+                        "XML operation contract mismatch"
+                    } else {
+                        "resource operation contract mismatch"
+                    };
+                    return Err(fail(function, detail));
                 }
             }
         }
@@ -25922,6 +26000,174 @@ fn main() -> i32 = 0
             *resource = 9;
         }
         assert!(validate_resource_rvalues(&malformed).is_err());
+    }
+
+    #[test]
+    fn xml_mir_gate_rejects_every_operand_result_slot_and_event_mutation() {
+        let program = mir(
+            r#"import std.xml
+fn main() -> Result<(), Error> {
+  mut reader := xml.parse("<a x='v'>text</a>".clone())?
+  event := reader.next()
+  name := reader.name()
+  count := reader.attribute_count()
+  attribute_name := reader.attribute_name(0)
+  attribute_value := reader.attribute_value(0)
+  text := reader.text()
+  return Ok(())
+}
+"#,
+        );
+        assert!(validate_resource_rvalues(&program).is_ok());
+
+        let mut sites = Vec::new();
+        for (function_index, function) in program.fns.iter().enumerate() {
+            for (block_index, block) in function.blocks.iter().enumerate() {
+                for (statement_index, statement) in block.stmts.iter().enumerate() {
+                    if matches!(
+                        statement,
+                        Stmt::Let(
+                            _,
+                            Rvalue::XmlParse { .. }
+                                | Rvalue::XmlNext(_)
+                                | Rvalue::XmlName { .. }
+                                | Rvalue::XmlAttributeCount(_)
+                                | Rvalue::XmlAttributeName { .. }
+                                | Rvalue::XmlAttributeValue { .. }
+                                | Rvalue::XmlText { .. }
+                        )
+                    ) {
+                        sites.push((function_index, block_index, statement_index));
+                    }
+                }
+            }
+        }
+        assert_eq!(sites.len(), 7, "the source must exercise every XML rvalue");
+
+        for &(function_index, block_index, statement_index) in &sites {
+            let mut malformed_result = program.clone();
+            let result = match &malformed_result.fns[function_index].blocks[block_index].stmts
+                [statement_index]
+            {
+                Stmt::Let(result, _) => *result,
+                _ => unreachable!(),
+            };
+            malformed_result.fns[function_index].value_tys[result as usize] = Ty::Unit;
+            assert!(
+                validate_resource_rvalues(&malformed_result).is_err(),
+                "an XML result-type mutation was accepted at {function_index}:{block_index}:{statement_index}"
+            );
+
+            let mut malformed_operand = program.clone();
+            let Stmt::Let(_, rvalue) = &mut malformed_operand.fns[function_index].blocks
+                [block_index]
+                .stmts[statement_index]
+            else {
+                unreachable!()
+            };
+            match rvalue {
+                Rvalue::XmlParse { input, .. } => *input = Operand::Value(u32::MAX),
+                Rvalue::XmlNext(reader)
+                | Rvalue::XmlAttributeCount(reader)
+                | Rvalue::XmlName { reader, .. }
+                | Rvalue::XmlAttributeName { reader, .. }
+                | Rvalue::XmlAttributeValue { reader, .. }
+                | Rvalue::XmlText { reader, .. } => *reader = Operand::Value(u32::MAX),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_resource_rvalues(&malformed_operand).is_err(),
+                "an XML operand mutation was accepted at {function_index}:{block_index}:{statement_index}"
+            );
+
+            let mut malformed_out = program.clone();
+            let Stmt::Let(_, rvalue) = &mut malformed_out.fns[function_index].blocks[block_index]
+                .stmts[statement_index]
+            else {
+                unreachable!()
+            };
+            let out = match rvalue {
+                Rvalue::XmlParse { out, .. }
+                | Rvalue::XmlName { out, .. }
+                | Rvalue::XmlAttributeName { out, .. }
+                | Rvalue::XmlAttributeValue { out, .. }
+                | Rvalue::XmlText { out, .. } => Some(*out),
+                _ => None,
+            };
+            if let Some(out) = out {
+                malformed_out.fns[function_index].slots[out as usize] = Ty::Bool;
+                assert!(
+                    validate_resource_rvalues(&malformed_out).is_err(),
+                    "an XML out-slot mutation was accepted at {function_index}:{block_index}:{statement_index}"
+                );
+
+                let mut absent_out = program.clone();
+                let Stmt::Let(_, rvalue) = &mut absent_out.fns[function_index].blocks[block_index]
+                    .stmts[statement_index]
+                else {
+                    unreachable!()
+                };
+                match rvalue {
+                    Rvalue::XmlParse { out, .. }
+                    | Rvalue::XmlName { out, .. }
+                    | Rvalue::XmlAttributeName { out, .. }
+                    | Rvalue::XmlAttributeValue { out, .. }
+                    | Rvalue::XmlText { out, .. } => *out = u32::MAX,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    validate_resource_rvalues(&absent_out).is_err(),
+                    "an absent XML out slot was accepted at {function_index}:{block_index}:{statement_index}"
+                );
+            }
+
+            let mut malformed_index = program.clone();
+            let Stmt::Let(_, rvalue) = &mut malformed_index.fns[function_index].blocks[block_index]
+                .stmts[statement_index]
+            else {
+                unreachable!()
+            };
+            if let Rvalue::XmlAttributeName { index, .. }
+            | Rvalue::XmlAttributeValue { index, .. } = rvalue
+            {
+                *index = Operand::Value(u32::MAX);
+                assert!(
+                    validate_resource_rvalues(&malformed_index).is_err(),
+                    "an XML index mutation was accepted at {function_index}:{block_index}:{statement_index}"
+                );
+            }
+        }
+
+        let event_index = program
+            .enums
+            .iter()
+            .position(|definition| definition.name == "xml.event")
+            .expect("builtin xml.event definition");
+        let mut event_mutations = Vec::new();
+        let mut malformed = program.clone();
+        malformed.enums[event_index].name.push_str(".forged");
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].source_name.push_str(".forged");
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants.swap(0, 1);
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants[0].payload.push(Scalar::Bool);
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants[0].field_base = 2;
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants.pop();
+        event_mutations.push(malformed);
+        let mut malformed = program;
+        malformed.enums.push(malformed.enums[event_index].clone());
+        event_mutations.push(malformed);
+        for malformed in event_mutations {
+            assert!(validate_resource_rvalues(&malformed).is_err());
+        }
     }
 
     #[test]
