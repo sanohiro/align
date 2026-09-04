@@ -3729,24 +3729,29 @@ mod tests {
         let decoded = CanonicalTy::decode(optional.as_bytes());
         assert_eq!(decoded.as_ref().ok(), Some(&optional));
 
-        let xml_reader = CanonicalTy::from_program(Ty::XmlReader, &program).unwrap();
+        let xml_reader = CanonicalTy::from_program(Ty::XmlReader, &program)
+            .unwrap_or_else(|error| panic!("xml.reader must encode: {error:?}"));
         assert_eq!(xml_reader.as_bytes(), [3, 0, 0, 0, 0, 72]);
         assert_eq!(
-            CanonicalTy::decode(xml_reader.as_bytes()).unwrap(),
+            CanonicalTy::decode(xml_reader.as_bytes())
+                .unwrap_or_else(|error| panic!("xml.reader must decode: {error:?}")),
             xml_reader
         );
         let optional_xml =
-            CanonicalTy::from_program(Ty::Option(Scalar::XmlReader), &program).unwrap();
+            CanonicalTy::from_program(Ty::Option(Scalar::XmlReader), &program)
+                .unwrap_or_else(|error| panic!("Option<xml.reader> must encode: {error:?}"));
         assert_eq!(optional_xml.as_bytes(), [3, 0, 0, 0, 0, 4, 48]);
         assert_eq!(
-            CanonicalTy::decode(optional_xml.as_bytes()).unwrap(),
+            CanonicalTy::decode(optional_xml.as_bytes())
+                .unwrap_or_else(|error| panic!("Option<xml.reader> must decode: {error:?}")),
             optional_xml
         );
         let result_xml =
             CanonicalTy::from_program(Ty::Result(Scalar::XmlReader, Scalar::Enum(0)), &program)
-                .unwrap();
+                .unwrap_or_else(|error| panic!("Result<xml.reader, Error> must encode: {error:?}"));
         assert_eq!(
-            CanonicalTy::decode(result_xml.as_bytes()).unwrap(),
+            CanonicalTy::decode(result_xml.as_bytes())
+                .unwrap_or_else(|error| panic!("Result<xml.reader, Error> must decode: {error:?}")),
             result_xml
         );
 

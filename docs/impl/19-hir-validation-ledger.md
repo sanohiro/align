@@ -2037,8 +2037,19 @@ and enum grammar.
 
 Both type leaves and all seven checked expression families (`XmlParse`,
 `XmlNext`, `XmlName`, `XmlAttributeCount`, `XmlAttributeName`, `XmlAttributeValue`, `XmlText`)
-atomically with their clone/replay, depth, effect, ownership, current-cursor region, traversal,
-finalization, source-shape, semantic projection, and malformed validation arms activate atomically.
-The parameterized owners in `std-design/xml.md` fail on a missing form, wrong reader/event/result, lost mutable
-receiver or cursor generation, owned/view result confusion, unknown canonical tag, or status/event
-decode after unchecked HIR/MIR.
+activate atomically with their clone/replay, depth, effect, ownership, current-cursor region,
+traversal, finalization, source-shape, semantic projection, and malformed validation arms. Each
+family lowers to one semantic MIR rvalue whose primary value already has the public source result
+type. `XmlParse` additionally defines one distinct boolean cleanup companion and attaches it to the
+returned `Result`; it has no source-visible status or out slot.
+
+The LLVM preflight derives each XML operand's access class from its producer graph: parameter mode,
+ordinary slot moves and joins, fresh values, direct/indirect/imported call summaries, and aggregate
+projection. Parse admits only owned input, next admits owned or exclusive reader access, getters
+admit readable reader access, and `Out` or raw borrowed-place descriptors fail closed. The LLVM
+emitter alone maps parse status `0/-1`, next status `0/1/2/3`, attribute counts `0..=256`, and
+zero-only getter statuses to their final results; every other native status aborts. The
+parameterized owners in `std-design/xml.md` fail on a missing form, wrong reader/event/result,
+duplicate or aliased cleanup definition, lost mutable receiver or cursor generation, owned/view
+result confusion, unknown canonical tag, forged access provenance, or unchecked status/event
+decode in either whole-program or per-unit emission.

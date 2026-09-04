@@ -194,7 +194,7 @@ fn pointer_shape<T>(value: *const T) -> Option<(usize, usize)> {
 
 fn input_shape(input: *const u8, len: i64) -> Option<(usize, usize, usize)> {
     let len = usize::try_from(len).ok()?;
-    if len > isize::MAX as usize {
+    if len > isize::MAX.unsigned_abs() {
         return None;
     }
     if len == 0 {
@@ -236,12 +236,12 @@ fn next_char(bytes: &[u8], pos: usize) -> Option<(char, usize)> {
 }
 
 fn xml_char(ch: char) -> bool {
-    matches!(ch as u32, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+    matches!(u32::from(ch), 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
 }
 
 fn name_start(ch: char) -> bool {
     matches!(
-        ch as u32,
+        u32::from(ch),
         0x3A | 0x41..=0x5A | 0x5F | 0x61..=0x7A | 0xC0..=0xD6 | 0xD8..=0xF6
             | 0xF8..=0x2FF | 0x370..=0x37D | 0x37F..=0x1FFF | 0x200C..=0x200D
             | 0x2070..=0x218F | 0x2C00..=0x2FEF | 0x3001..=0xD7FF | 0xF900..=0xFDCF
@@ -251,7 +251,7 @@ fn name_start(ch: char) -> bool {
 
 fn name_char(ch: char) -> bool {
     name_start(ch)
-        || matches!(ch as u32, 0x2D | 0x2E | 0x30..=0x39 | 0xB7 | 0x300..=0x36F | 0x203F..=0x2040)
+        || matches!(u32::from(ch), 0x2D | 0x2E | 0x30..=0x39 | 0xB7 | 0x300..=0x36F | 0x203F..=0x2040)
 }
 
 fn parse_name(bytes: &[u8], pos: &mut usize) -> Option<Span> {
@@ -929,7 +929,7 @@ unsafe fn shell_fields_valid(reader: *const XmlReader) -> Option<(*mut u8, usize
 
     if magic != XML_MAGIC
         || len == 0
-        || len > isize::MAX as usize
+        || len > isize::MAX.unsigned_abs()
         || input.is_null()
         || cursor > len
         || depth > MAX_DEPTH
@@ -1468,6 +1468,10 @@ mod tests {
         if status == 0 { Ok(reader) } else { Err(status) }
     }
 
+    fn view_len(len: i64) -> usize {
+        usize::try_from(len).unwrap_or_else(|_| panic!("successful XML view has invalid length {len}"))
+    }
+
     unsafe fn borrowed_view(
         reader: *const XmlReader,
         f: unsafe extern "C" fn(*const XmlReader, *mut AlignStr) -> i32,
@@ -1477,7 +1481,7 @@ mod tests {
             len: 0,
         };
         assert_eq!(unsafe { f(reader, &mut out) }, 0);
-        let bytes = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) };
+        let bytes = unsafe { core::slice::from_raw_parts(out.ptr, view_len(out.len)) };
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
@@ -1493,7 +1497,7 @@ mod tests {
         let bytes = if out.len == 0 {
             &[][..]
         } else {
-            unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }
+            unsafe { core::slice::from_raw_parts(out.ptr, view_len(out.len)) }
         };
         let value = String::from_utf8(bytes.to_vec()).unwrap();
         unsafe { align_rt_free(out.ptr as *mut u8) };
@@ -1512,7 +1516,7 @@ mod tests {
         let bytes = if out.len == 0 {
             &[][..]
         } else {
-            unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }
+            unsafe { core::slice::from_raw_parts(out.ptr, view_len(out.len)) }
         };
         let value = String::from_utf8(bytes.to_vec()).unwrap();
         unsafe { align_rt_free(out.ptr as *mut u8) };
@@ -1532,7 +1536,7 @@ mod tests {
             };
             assert_eq!(align_rt_xml_attribute_name(reader, &mut attr_name, 0), 0);
             assert_eq!(
-                core::slice::from_raw_parts(attr_name.ptr, attr_name.len as usize),
+                core::slice::from_raw_parts(attr_name.ptr, view_len(attr_name.len)),
                 b"x"
             );
             assert_eq!(owned_value(reader, 0), "1 &\r");
