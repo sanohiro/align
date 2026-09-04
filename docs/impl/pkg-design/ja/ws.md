@@ -225,7 +225,7 @@ background heartbeat/async/broadcast registry/standalone listener は deferred�
 | P2 bounded owner lifecycle | spawn 直後に child RAII を設置し、startup/exchange/kill/wait/stderr completion を一つの deadline で制限。 |
 | P2 Upgrade method check order | arity と全 method operand を exclusive shared-receiver gate より先に検査し、両 diagnostic を要求する twin を置く。 |
 | P2 top-level web type drift | authoritative 英日 type overview の pending Upgrade と obsolete unary Route summary を active exact shape に置換。 |
-| P1 outbound-close evidence strength | negative/above-u16 code を close owner で reject。600 ms cumulative budget と per-frame reset を短い client read bound で区別し、frame head/code write 後の fault injection では reason write 成功を別 sentinel error に map して、assert する transport error をその write だけが生成可能にする。 |
+| P1 outbound-close evidence strength | negative/above-u16 code を close owner で reject。600 ms cumulative budget と per-frame reset を短い client read bound で区別し、frame head/code write 後の fault injection では synchronization-read failure と reason write success を別々の sentinel error に map して、assert する transport error を reason write だけが生成可能にする。 |
 | P2 empty protocol products | empty server list に対して client protocol を offer する選択なし path と、empty string を含む server list の startup reject を別々に所有。request/config omission と混同しない。 |
 | P2 fail-safe owner reaping | affected test socket の read/write 双方に shared deadline を設け、spawn child を bounded owner の return/unwind 前に kill-and-wait reaper へ transfer。reaper は caller deadline 後も child を保持し、全 wait error を reap まで retry するため poll error でも process ownership を破棄しない。 |
 
