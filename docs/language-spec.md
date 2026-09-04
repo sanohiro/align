@@ -1551,20 +1551,26 @@ consuming `close(http_upgrade, code, reason, timeout_ns)`. Receive returns
 and owned UTF-8 reason. There are no defaults.
 
 Routing, middleware, request views, 404/405 behavior, explicit workers, and `SO_REUSEPORT` remain
-`pkg.web` ownership. The package validates the RFC token/key/version handshake, chooses the first
-server-order offered subprotocol, and keeps its fixed accept SHA-1 helper private. The
+`pkg.web` ownership. A Pure package validator checks protocol configuration during pre-bind route
+validation. The package validates the RFC token/key/version handshake, chooses the first
+server-order offered subprotocol, and keeps its fixed accept SHA-1 helper private. HTTP/1.0 or a
+request with parser residual bytes takes the ordinary 400 path before accept calculation, and the
+checked transfer repeats those facts plus complete response-header syntax before any write. The
 protocol-neutral `http_upgrade` Move handle is published only after a checked, fully written
 HTTP/1.1 101 while the spent request context stays alive for pump views. It admits local and
-by-value/borrow/borrow-mut parameter use but no user return, aggregate/tag/collection/box,
-global/out/extern, capture/task, or parallel carrier. Exact read, write-all, one strict positive
-cumulative monotonic deadline, shutdown, and Drop own one fd and sticky builtin error. The deadline
-does not reset per call, partial transfer, or frame.
+by-value/borrow/borrow-mut parameter use plus one unnested same-frame Result Ok local from the
+constructor or `map_err`; no user return, other tag, aggregate/collection/box, global/out/extern,
+capture/task, or parallel carrier is admitted. Canonical type-record-v3 tags are 71/47. Exact read,
+write-all, one strict positive cumulative monotonic deadline, shutdown, and Drop own one fd and
+sticky builtin error. The deadline
+does not reset per call, partial transfer, or frame. Spent read/write/deadline return Invalid with no
+mutation, clock, or I/O, while repeated shutdown is idempotent; caller-invalid arguments win first.
 
 Client frames must be masked, extension-free, minimally length-encoded, and structurally valid.
 Receive assembles fragments under an explicit inclusive 512 MiB ceiling, answers Ping, consumes
 Pong, validates complete Text/Close UTF-8, and returns owned complete messages. Protocol/text/limit
 failure sends 1002/1007/1009 when transport permits; peer Close is echoed. Server sends borrow
 payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
-handshake without Ping/data resetting its budget before closing TCP. Nine planned runtime keys reuse
-existing ABI shapes, leaving A124 unused; the
-design changes no shipped package/runtime inventory. Exact contract: `impl/pkg-design/ws.md`.
+handshake without Ping/data resetting its budget before closing TCP. Ten planned runtime keys reuse
+existing ABI shapes, leaving A124 unused; the design changes no shipped package/runtime inventory.
+Exact contract: `impl/pkg-design/ws.md`.

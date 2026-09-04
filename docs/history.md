@@ -5,7 +5,8 @@
 The first `pkg.ws` design keeps HTTP ownership and concurrency singular. A WebSocket endpoint is a
 third handler kind in the existing `pkg.web` route table, after the same routing and middleware,
 and reuses its explicit `SO_REUSEPORT` worker loops. One protocol-neutral `http_upgrade` Move handle
-takes the accepted fd only after a checked and fully written HTTP/1.1 101; the spent request context
+takes the accepted fd only after a checked and fully written residual-free HTTP/1.1 101 with valid
+response-header syntax; the spent request context
 continues to own every request view during the pump. The carrier is deliberately narrow and cannot
 escape through aggregates, captures, tasks, parallel work, externs, or user returns.
 
@@ -17,9 +18,10 @@ Close is echoed; server-initiated Close uses one cumulative monotonic deadline a
 peer handshake without resetting its budget before the server closes TCP. The design adds no parser
 runtime operation or hidden sidecar.
 
-The prerequisite adds three general allocation-free header queries, checked 101 ownership
-transfer, exact upgraded transport I/O/deadline/shutdown, and one web Upgrade dispatch path. Its nine
-runtime keys all reuse existing ABI shapes, leaving A124 unused. Exact surface, precedence,
+The prerequisite adds three general allocation-free header queries, one HTTP-version/residual
+readiness query, checked 101 ownership transfer, exact live/spent/poisoned transport behavior, and
+one web Upgrade dispatch path with Pure pre-bind protocol validation. Its ten runtime keys all
+reuse existing ABI shapes, leaving A124 unused. Exact surface, precedence,
 ownership, ABI, and one-PR implementation closure matrix: `docs/impl/pkg-design/ws.md`.
 
 ## 2026-09-03: pkg.csv settles on one typed direct-to-SoA materializer

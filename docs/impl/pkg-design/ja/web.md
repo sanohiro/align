@@ -168,9 +168,10 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 
 ```text
 // 型
-web.Ctx    — リクエスト毎コンテキスト: view だけを持つ **Copy** struct（method, path, query,
-             マッチしたパターン、body の view、および切り離したヘッダーテーブルの view）。何も所有
-             しない — リクエストハンドルは `serve` に留まり、view はハンドラ呼び出しの間有効である。
+web.Ctx    — リクエストハンドルと view（method, path, query、マッチした pattern、body、切り離した
+             header table）を所有する Move struct。pending Upgrade capability は trailing Copy field
+             `upgrade_ready: bool` を追加する。HTTP/1.1 かつ parser residual なしの場合だけ true。
+             view は handler/pump call 中有効である。
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
@@ -652,19 +653,26 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 `pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
 worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
 `UpgradeAccepted { response, selected }`、`UpgradeDecision { Accept, Reject, Failed }`、
-`UpgradeHandler { prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
+`UpgradeHandler { validate, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
 `Upgrade(UpgradeHandler)`、`Route` の末尾 field は `upgrade_values: slice<str>` である。
 
-exact constructor は `pkg.web.upgrade(method, pattern, values, prepare, pump) -> Route`。Pure かつ
-protocol-blind で、values は prepare 用 Copy config。既存 routing/middleware 後に prepare を一回
+exact constructor は `pkg.web.upgrade(method, pattern, values, validate, prepare, pump) -> Route`。
+Pure かつ protocol-blind で、values は Copy config。noncapturing `validate` は Pure でなければならない。
+既存 pre-bind route validation が common method/pattern/prefix と handler-storage checks 後、segment/pair
+checks 前に Upgrade row ごと一回呼ぶ。false は exact text
+`pkg.web: route N (METHOD PATTERN) has invalid upgrade values` で bind/tree construction 前に abort する。
+既存 routing/middleware 後に prepare を一回
 実行し、Reject は通常 respond、Failed は既存 log+fixed 500、Accept は
 `ctx.respond_upgrade`。fully written 101 の success だけが transport と selected string を所有する
 pump を呼び、spent ctx が Ctx view を保持する。Accept error は selected を drop、ordinary handler
 diagnostic を一回 log し同じ ctx で fixed 500 を試す。validation failure なら unspent なので回答でき、
 write failure 後は spent なので fallback は silently fail。pump Ok は log なし、Err は既存 Stream と同じ
 method/path/error diagnostic で、追加 HTTP response は送らない。HEAD fallback は `stream_type == ""` ではなく
-actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values を
-そのまま copy。validation は Stream だけ nonempty stream_type、Respond/Upgrade は empty を要求。
+actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values と全 callback
+をそのまま copy。validation は Stream だけ nonempty stream_type、Respond/Upgrade は empty を要求。
+`Ctx` は trailing `upgrade_ready: bool` を持ち、middleware 前に
+`http_request_ctx.upgrade_ready()` から copy する。`pkg.ws` は false を通常の empty-body 400 にし、
+`respond_upgrade` は version/residual を再検証する。
 
 Upgrade は Stream と同様 sequential worker 一つを占有する。第二 listener/router/pool/task/
 registry はなく、hot path は closed Handler tag match 一つだけ増える。この seam は `pkg.ws` と

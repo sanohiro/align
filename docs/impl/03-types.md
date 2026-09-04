@@ -537,17 +537,21 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 The `pkg.ws` ledger introduces one protocol-neutral `Ty::HttpUpgrade` /
 `Scalar::HttpUpgrade`. It is Move, one pointer wide, non-Copy, non-comparable, non-printable, and
 Drop-bearing. Its positive carrier grammar is deliberately smaller than the general owned-handle
-rule: a local; the direct Ok leaf of `ctx.respond_upgrade`; or a by-value, shared-borrow, or
-mutable-borrow function parameter. A user function cannot return it. Every other Option/Result,
-user struct/sum, anonymous tuple, collection, slice, box, builder, global/constant, out, extern,
-closure capture/environment, task, or parallel element/result is forbidden. One exhaustive
-no-wildcard `Ty`/`Scalar` classifier and variant tripwire own future constructors.
+rule: a raw same-frame local or by-value/shared-borrow/mutable-borrow parameter; plus one unnested
+same-frame `Result<http_upgrade, E>` local whose complete `E` graph contains no upgrade handle. It
+may come from the constructor or `map_err` and be consumed by `?`, `else`, or `match`, but may not
+be a parameter, field, capture, or return. Raw user returns and every Option, reversed/nested
+Result, user aggregate, collection, box, global, out, extern, capture, task, or parallel placement
+are forbidden. Canonical type record v3 reserves the actual post-`pkg.csv` leaves
+`Ty::HttpUpgrade=71` and `Scalar::HttpUpgrade=47`; exact bidirectional and malformed goldens own them.
 
 The constructor borrows `http_request_ctx` and consumes only `response_builder`; success makes the
 ctx spent and transfers its fd while retaining the ctx generation for every pump `Ctx` view.
 `read_exact`, `write`, `deadline`, and `shutdown` require a bound local receiver; the first three
 mutably borrow and end the handle's storage generation. `read_exact` also requires a mutable bare
-local buffer, so a returned bytes view remains rooted in the buffer's fresh generation. All four
+local buffer, so a returned bytes view remains rooted in the buffer's fresh generation. Caller
+arguments precede state: spent read/write/deadline return Invalid without mutation/clock/I/O,
+poisoned calls replay their error, and shutdown alone is idempotent on spent. All four
 are Impure. Borrow overlap, move/drop/replacement, branch/loop joins, every value-carrying control
 form, whole/per-unit function-value pump signatures, and malformed checked HIR are cells in
 `pkg-design/ws.md`'s closure matrix. None is active in the current compiler.

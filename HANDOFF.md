@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-09-03._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-04._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
@@ -429,10 +429,18 @@ facts must live in this repository.
   `docs/impl/pkg-design/ws.md`. It composes one RFC 6455 Upgrade route into `pkg.web`, owns the
   private handshake/SHA-1/frame state in package source, and uses a restricted protocol-neutral
   `http_upgrade` Move handle. The implementation boundary also adds three allocation-free repeated
-  header/token queries, one checked 101 transfer, exact transport I/O/deadline/shutdown, and the
-  third `pkg.web` Handler variant. Its nine planned keys reuse existing ABI shapes; current counts
+  header/token queries, one HTTP-version/residual readiness query, one checked 101 transfer, exact
+  transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its ten planned keys reuse existing ABI shapes; current counts
   stay 331 keyed/349 base and A124 remains the next unused active shape until implementation.
-  The author consistency pass is complete; run the independent design review before coding.
+  The first independent review of candidate `3657a179` found six contract gaps: canonical type
+  tags, parser-residual rejection, spent-handle behavior, pre-handshake HTTP-version validation,
+  complete response-header syntax, and Pure route configuration validation. The coherent repair
+  uses post-`pkg.csv` tags 71/47, a version-plus-residual readiness query, spent Invalid/no-I/O
+  rules, strict header validation, and a Pure pre-bind Upgrade validator. Those decisions are
+  propagated through every source named by `ws.md`, including both Japanese mirrors; the author
+  consistency pass is complete. Perform the required fresh full-diff design review because the
+  repair changes public surface and strategy. The first review log is
+  `.git/align-review-3657a179beea4aefcd06faeeb433b75fa6714a37.log`.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

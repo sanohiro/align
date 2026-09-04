@@ -4051,7 +4051,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   package. `receive` assembles bounded Text/Binary messages, handles fragmentation, automatically
   answers Ping, ignores Pong, validates masked frames and UTF-8, and echoes a valid peer Close.
   Sends are unmasked and do not copy payload; server close has an explicit cumulative deadline and
-  completes the closing handshake without resetting its budget. Nine planned runtime keys reuse
+  completes the closing handshake without resetting its budget. Ten planned runtime keys reuse
   existing shapes, so A124 remains unused.
   WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
   heartbeat observation, and broadcast state are deferred. Exact ledger and implementation

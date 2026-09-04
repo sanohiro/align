@@ -1993,16 +1993,18 @@ now that the cross-derivation comparisons delegate. Track separately.
 ## Planned `pkg.ws` checked-HIR records
 
 The `pkg.ws` capability adds exact validation rows for `Ty/Scalar::HttpUpgrade` and these
-expressions: `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`,
+expressions: `HttpCtxUpgradeReady`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`,
 `HttpRespondUpgrade`, `HttpUpgradeReadExact`, `HttpUpgradeWrite`, `HttpUpgradeDeadline`, and
 `HttpUpgradeShutdown`. Each record fixes child count/order/type, bound-place class, result type,
 effect, region/borrow generation, consume/null behavior, and exact RuntimeKey. The type row admits
-only local/direct-constructor-Ok/by-value/borrow/borrow-mut placement and the closed
-`pkg.web.types.UpgradeHandler.pump` function signature; all other tag/aggregate/collection/capture/
-task/parallel/out/extern/global/return placements fail closed.
+raw same-frame locals/parameters and one unnested same-frame Result Ok local from the constructor or
+`map_err`, plus the closed `pkg.web.types.UpgradeHandler.pump` function signature; all other
+tag/aggregate/collection/capture/task/parallel/out/extern/global/return placements fail closed.
+Canonical record-v3 leaves are exactly Ty 71 and Scalar 47 with bidirectional and malformed owners.
 
 Validation reconstructs the header query contracts, complete 101 prerequisites, mutable bare-local
-buffer/count-capacity relation, positive cumulative-deadline bound, sticky owner state, and source cleanup. It
+buffer/count-capacity relation, readiness version/residual fact, positive cumulative-deadline bound,
+live/spent/poisoned precedence, sticky owner state, and source cleanup. It
 does not replay RFC 6455 handshake or frame semantics, which remain checked ordinary package
 source. Every scalar/id/key/result/effect/region/ownership field gets a mutation twin; a new HIR
 discriminator must extend the existing variant sweep. Any invalid record returns the canonical

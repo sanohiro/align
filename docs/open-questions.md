@@ -25,11 +25,15 @@ this file and the design gate in `CLAUDE.md`.
 `pkg.ws.route(pattern, protocols, pump)` produces a GET Upgrade row in the existing `pkg.web`
 route table, so REST, SSE, middleware, 404/405 behavior, and explicit `SO_REUSEPORT` workers remain
 one system. A protocol-neutral `http_upgrade` Move handle is published only after a validated,
-fully written HTTP/1.1 101; the spent request context retains request views for the pump. The handle
-admits local/by-value/borrow/borrow-mut use but no aggregate, tag, collection, capture, task,
-parallel, extern, out, global, or user-return carrier.
+fully written residual-free HTTP/1.1 101 with complete response-header syntax; the spent request
+context retains request views for the pump. The raw handle admits same-frame local and
+by-value/borrow/borrow-mut parameter use. Its only tagged carrier is an unnested same-frame Result
+Ok local from construction or `map_err`; no other aggregate, tag, collection, capture, task,
+parallel, extern, out, global, or user-return carrier is admitted. Canonical type tags are 71/47.
 
-The package validates the canonical RFC 6455 header/token/key/version handshake and selects the
+The package supplies a Pure total protocol-list validator which existing pre-bind route validation
+runs before bind/tree construction. It validates the canonical RFC 6455 header/token/key/version
+handshake only after an HTTP/1.1-and-residual-free readiness check and selects the
 first server-order subprotocol offered by the client. Its fixed accept SHA-1 implementation is
 private package source, not a public crypto primitive. Receive assembles one bounded Text/Binary
 message or Close across fragmentation, requires client masks and minimal lengths, automatically
@@ -38,9 +42,10 @@ protocol/text/limit failure. A peer Close is echoed before server shutdown. Serv
 unmasked and payload-copy-free; an initiated Close takes an explicit timeout and waits for peer
 Close while continuing required Ping replies. The generic transport exposes exact bounded-buffer
 reads, write-all, one cumulative monotonic deadline that never resets per I/O/frame, shutdown, and
-close-only Drop.
+close-only Drop. Spent read/write/deadline return Invalid without mutation, clock access, or I/O;
+shutdown remains idempotent and caller-invalid arguments take precedence over state.
 
-Nine planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
+Ten planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
 new ABI shape and A124 remains next. HTTP/2 extended CONNECT, client mode, TLS termination,
 extensions/permessage-deflate, raw frames, standalone serving, async/background heartbeat,
 connection registries, and broadcast are separate consumer-backed capabilities.

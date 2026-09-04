@@ -555,7 +555,7 @@ is an open backend decision.
 
 `http_upgrade` lowers as the same nullable one-pointer owned handle class as `http_stream`, with its
 own Drop key. LLVM contains no WebSocket handshake, SHA-1, frame, mask, UTF-8, subprotocol, or close
-semantics. It purely lowers the checked MIR operations to nine typed runtime keys using existing
+semantics. It purely lowers the checked MIR operations to ten typed runtime keys using existing
 ABI shapes A24/A20/A120/A37/A04/A03/A62, reconstructs builtin Results, nulls moved sources, and
 emits cleanup at the MIR-selected edges. `HttpRespondUpgrade` uses an alloca out slot initialized
 null; only zero status loads/publishes the handle. Read publishes buffer length only through the

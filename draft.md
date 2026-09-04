@@ -3873,23 +3873,32 @@ pkg.ws.close(connection: http_upgrade, code: i64, reason: str, timeout_ns: i64)
 
 There are no defaults. `route` produces a GET Upgrade row in the same Copy route table as Respond
 and Stream handlers; routing, middleware, 404/405 behavior, request views, explicit workers, and
-`SO_REUSEPORT` remain owned by `pkg.web`. Protocol lists contain unique nonempty RFC tokens. An
-empty list selects no subprotocol; otherwise the first server-list entry offered byte-exactly by
-the client wins and no match rejects the handshake. The router admits only exact GET to this row;
+`SO_REUSEPORT` remain owned by `pkg.web`. Protocol lists contain unique nonempty RFC tokens.
+Construction remains Pure: the package supplies a Pure total validator which `pkg.web.serve` runs
+during existing pre-bind route validation; an invalid list aborts before bind or radix-tree
+construction. An empty list selects no subprotocol; otherwise the first server-list entry offered
+byte-exactly by the client wins and no match rejects the handshake. The router admits only exact
+GET to this row;
 other methods retain ordinary 404/405 behavior. After middleware Proceed, the HTTP prepare callback
-defensively rechecks GET, then validates empty body, one Host/key/version, all repeated token rows,
-canonical 16-byte base64 key, and version 13 before producing the header-only 101. The SHA-1 accept
-proof is private package source and adds
-no public crypto operation.
+defensively rechecks GET, requires HTTP/1.1 with no parser residual, then validates empty body, one
+Host/key/version, all repeated token rows, canonical 16-byte base64 key, and version 13 before
+producing the header-only 101. The lower transfer boundary repeats the version/residual checks and
+validates complete response-header syntax before producing bytes. The SHA-1 accept proof is private
+package source and adds no public crypto operation.
 
 `http_upgrade` is a protocol-neutral `std.http` Move handle published only after a validated and
 fully written HTTP/1.1 101. The request context stays spent but alive, retaining its views for the
-pump. The handle may live in a local or cross a function boundary by value, borrow, or mutable
-borrow, including the direct Ok slot of its constructor. It may not be returned by a user function
-or enter any other tagged/aggregate/collection/box/global/out/extern/capture/task/parallel carrier.
+pump. The raw handle may be a same-frame local or a by-value/borrow/borrow-mut parameter. The only
+tagged carrier is one unnested same-frame `Result<http_upgrade, E>` local whose complete `E` graph
+contains no upgrade handle; it may come from the constructor or `map_err` and be consumed by `?`,
+`else`, or `match`. It may not be a parameter, field, capture, return, or any Option/reversed/nested
+Result, aggregate/collection/box/global/out/extern/task/parallel carrier. Canonical type-record-v3
+leaves are `Ty::HttpUpgrade=71` and `Scalar::HttpUpgrade=47`.
 Exact read into a caller buffer, write-all, one strict positive cumulative monotonic deadline,
 shutdown, and close-only Drop are Impure; read/write failure closes and stores one sticky builtin
-`Error`. The deadline budget is never reset by another call, partial transfer, or frame.
+`Error`. After shutdown, read/write/deadline return `Error.Invalid` without mutation, clock access,
+or I/O; repeated shutdown is idempotent. Caller argument invalidity precedes handle state. The
+deadline budget is never reset by another call, partial transfer, or frame.
 
 Receive requires an explicit inclusive `0..=536870912` message bound and returns one complete owned
 Text/Binary message or peer Close. It accepts RFC fragmentation and interleaved control frames,
@@ -3903,9 +3912,10 @@ answering Ping without resetting that budget, then performs the server TCP close
 HTTP/2, extensions/compression, raw frames,
 standalone serving, async/background heartbeat, and connection registries are outside v1.
 
-Implementation activates the third web handler variant, three repeated-header/token queries,
-checked 101 transfer, upgraded transport operations, package source, and nine runtime keys in one
-closure-matrix boundary. Every key reuses an existing ABI shape, so A124 remains unused. The design
+Implementation activates the third web handler variant, three repeated-header/token queries, one
+version/residual readiness query, checked 101 transfer, upgraded transport operations, package
+source, and ten runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
+so A124 remains unused. The design
 alone changes no shipped inventory. Exact surface, validation order, frame/close grammar,
 allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
 
