@@ -711,7 +711,7 @@ pub UpgradeDecision {
   Failed(Error)
 }
 pub UpgradeHandler {
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
   pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
 }
@@ -723,17 +723,20 @@ is:
 
 ```text
 pkg.web.upgrade(method: str, pattern: str, values: slice<str>,
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
   pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>) -> Route
 ```
 
-The constructor is Pure and protocol-blind. `values` are retained Copy configuration. The supplied
-noncapturing `validate` function must be inferred Pure. Existing pre-bind route validation invokes
-it once per Upgrade row after common method/pattern/prefix and handler-storage checks but before
-segment and pair checks; false aborts with exact text
+The constructor is Pure and protocol-blind. `values` are retained Copy configuration, while the
+protocol package computes `values_valid` exactly once before the call. Any side effects in a direct
+caller's boolean expression are ordinary source-visible argument evaluation; no validation
+callback is retained or replayed. Existing pre-bind route validation reads the stored boolean once
+per Upgrade row after common method/pattern/prefix and handler-storage checks but before segment
+and pair checks; false aborts with exact text
 `pkg.web: route N (METHOD PATTERN) has invalid upgrade values`. Thus a protocol package can keep its
-constructor Pure while dynamic configuration is still rejected before bind/tree construction.
+constructor Pure while dynamic configuration is still rejected before bind/tree construction,
+without requiring an effect-qualified function-value type that the language does not expose.
 After the existing route and middleware decision, prepare runs once. Reject uses ordinary
 `ctx.respond`; Failed uses the existing error log plus fixed 500; Accept passes its builder to
 `ctx.respond_upgrade`. Only a successful fully written 101 invokes pump, which owns the transport
@@ -744,7 +747,7 @@ fails. Pump `Ok` emits no log; pump
 `Err` uses the existing Stream method/path/error diagnostic and cannot send another HTTP response.
 HEAD fallback now tests the
 actual `Respond` variant rather than the historical `stream_type == ""` proxy; Stream and Upgrade
-GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values` and all callbacks
+GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values`, `values_valid`, and both callbacks
 unchanged. Startup route validation requires empty `stream_type` for Respond/Upgrade and nonempty
 only for Stream. `Ctx` gains the exact trailing `upgrade_ready: bool`, copied from the new
 protocol-neutral `http_request_ctx.upgrade_ready()` query before middleware; `pkg.ws` uses false for

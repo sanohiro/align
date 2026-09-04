@@ -26498,7 +26498,7 @@ pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
     }
 }
 
-// Compile-time pins for the eight feature-only verification exports. The compiled-symbol gate in
+// Compile-time pins for the eleven feature-only verification exports. The compiled-symbol gate in
 // `scripts/test-runtime-abi-exports.sh` owns their presence/absence; these assignments make every
 // promised parameter and return type part of the feature build itself.
 #[cfg(feature = "alloc-count")]

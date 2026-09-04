@@ -29,7 +29,7 @@ against the accepted public contract and implementation closure matrix in
 `docs/impl/pkg-design/csv.md`: the canonical package, checked HIR/MIR operation, transitive
 parallel-worker region gate, direct-to-SoA runtime, and A123 activate as one capability.
 `pkg.ws` is implemented against `docs/impl/pkg-design/ws.md`: the protocol-neutral HTTP Upgrade
-transport, third `pkg.web` Handler variant, package-owned RFC 6455 handshake/frame state, and ten
+transport, third `pkg.web` Handler variant, package-owned RFC 6455 handshake/frame state, and eleven
 reused-shape runtime rows activate as one capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against

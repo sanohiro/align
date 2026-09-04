@@ -675,7 +675,7 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
     match ri.handler {
       Respond(_) => {}
       Stream(_) => {}
-      Upgrade(handler) => { upgrade_values_valid = handler.validate(ri.upgrade_values) }
+      Upgrade(handler) => { upgrade_values_valid = handler.values_valid }
     }
     if !upgrade_values_valid {
       mut b := builder()

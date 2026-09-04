@@ -58,12 +58,12 @@ pub fn stream(method: str, pattern: str, content_type: str, pump: fn(pkg.web.typ
   pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump), upgrade_values: [] }
 
 // The protocol-neutral Upgrade route. A protocol package owns `values`, their Pure startup
-// validator, handshake preparation, and the upgraded-stream pump.
+// validation result, handshake preparation, and the upgraded-stream pump.
 pub fn upgrade(
   method: str,
   pattern: str,
   values: slice<str>,
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(pkg.web.types.Ctx, slice<str>) -> pkg.web.types.UpgradeDecision,
   pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>,
 ) -> pkg.web.types.Route =
@@ -74,7 +74,7 @@ pub fn upgrade(
     middleware: None,
     stream_type: "",
     handler: pkg.web.types.Handler.Upgrade(pkg.web.types.UpgradeHandler {
-      validate: validate,
+      values_valid: values_valid,
       prepare: prepare,
       pump: pump,
     }),

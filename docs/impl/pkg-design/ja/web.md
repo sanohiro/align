@@ -653,13 +653,14 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 `pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
 worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
 `UpgradeAccepted { response, selected }`、`UpgradeDecision { Accept, Reject, Failed }`、
-`UpgradeHandler { validate, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
+`UpgradeHandler { values_valid, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
 `Upgrade(UpgradeHandler)`、`Route` の末尾 field は `upgrade_values: slice<str>` である。
 
-exact constructor は `pkg.web.upgrade(method, pattern, values, validate, prepare, pump) -> Route`。
-Pure かつ protocol-blind で、values は Copy config。noncapturing `validate` は Pure でなければならない。
+exact constructor は `pkg.web.upgrade(method, pattern, values, values_valid, prepare, pump) -> Route`。
+Pure かつ protocol-blind で、values は Copy config、protocol package は call 前に values_valid を一回
+計算する。argument expression の effect は call site に明示され、callback として保持・再実行しない。
 既存 pre-bind route validation が common method/pattern/prefix と handler-storage checks 後、segment/pair
-checks 前に Upgrade row ごと一回呼ぶ。false は exact text
+checks 前に Upgrade row ごと boolean を一回読む。false は exact text
 `pkg.web: route N (METHOD PATTERN) has invalid upgrade values` で bind/tree construction 前に abort する。
 既存 routing/middleware 後に prepare を一回
 実行し、Reject は通常 respond、Failed は既存 log+fixed 500、Accept は
@@ -668,7 +669,7 @@ pump を呼び、spent ctx が Ctx view を保持する。Accept error は selec
 diagnostic を一回 log し同じ ctx で fixed 500 を試す。validation failure なら unspent なので回答でき、
 write failure 後は spent なので fallback は silently fail。pump Ok は log なし、Err は既存 Stream と同じ
 method/path/error diagnostic で、追加 HTTP response は送らない。HEAD fallback は `stream_type == ""` ではなく
-actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values と全 callback
+actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values、values_valid、二 callback
 をそのまま copy。validation は Stream だけ nonempty stream_type、Respond/Upgrade は empty を要求。
 `Ctx` は trailing `upgrade_ready: bool` を持ち、middleware 前に
 `http_request_ctx.upgrade_ready()` から copy する。`pkg.ws` は false を通常の empty-body 400 にし、

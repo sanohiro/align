@@ -51,7 +51,7 @@ pub UpgradeDecision {
 }
 
 pub UpgradeHandler {
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
   pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
 }
@@ -69,7 +69,8 @@ pub UpgradeHandler {
 //   - `Upgrade` — validate opaque route values before bind, prepare one HTTP Upgrade decision after
 //     middleware, then transfer the byte stream and owned selected metadata to the protocol pump.
 // Every payload is Copy: Respond/Stream contain one 16-byte `{fn_ptr, env_ptr}` value and Upgrade
-// contains three such function values in one Copy record. Therefore `Handler` and `Route` stay Copy.
+// contains one bool plus two such function values in one Copy record. Therefore `Handler` and
+// `Route` stay Copy.
 pub Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),

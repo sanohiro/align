@@ -269,7 +269,7 @@ pub fn route(
   protocols: slice<str>,
   pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>,
 ) -> pkg.web.types.Route =
-  pkg.web.upgrade("GET", pattern, protocols, protocols_valid, prepare, pump)
+  pkg.web.upgrade("GET", pattern, protocols, protocols_valid(protocols), prepare, pump)
 
 fn write_frame_head(borrow mut connection: http_upgrade, opcode: u8, length: i64) -> Result<(), Error> {
   mut header := [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,

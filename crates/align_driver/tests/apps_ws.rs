@@ -31,8 +31,13 @@ fn sources<'a>(main: &'a str) -> [(&'a str, &'a str); 6] {
 
 #[test]
 fn shipped_package_chain_checks_whole_and_per_unit() {
+    assert!(TYPES.contains("values_valid: bool"));
+    assert!(!TYPES.contains("validate: fn(slice<str>)"));
+    assert!(!ROUTER.contains("handler.validate("));
+    assert!(WS_ROOT.contains("protocols_valid(protocols)"));
     let main = r#"module main
 import pkg.ws
+import pkg.web
 import pkg.web.types
 
 fn header_queries(ctx: http_request_ctx) -> bool =
@@ -47,10 +52,16 @@ fn pump(c: pkg.web.types.Ctx, connection: http_upgrade, selected: string) -> Res
   return Ok(())
 }
 
+fn prepare(c: pkg.web.types.Ctx, values: slice<str>) -> pkg.web.types.UpgradeDecision =
+  pkg.web.types.UpgradeDecision.Failed(Error.Invalid)
+
 fn main() -> i32 {
   protocols := ["chat.v1"]
-  routes := [pkg.ws.route("/chat", protocols, pump)]
-  return routes.len() as i32 - 1
+  routes := [
+    pkg.ws.route("/chat", protocols, pump),
+    pkg.web.upgrade("GET", "/raw", protocols, true, prepare, pump),
+  ]
+  return routes.len() as i32 - 2
 }
 "#;
     let files = sources(main);
@@ -563,26 +574,48 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
     assert_ne!(bounded_ws, WS_ROOT, "the owner must rewrite the one shipped work constant");
     let server = start_server_with_ws(APP, &bounded_ws, "apps-ws-source-work");
 
-    let mut exact = open_websocket(server.port);
-    let mut exact_frames = Vec::new();
-    exact_frames.extend(masked_frame(false, 1, b"", [1, 2, 3, 4]));
-    exact_frames.extend(masked_frame(false, 0, b"", [2, 3, 4, 5]));
-    exact_frames.extend(masked_frame(true, 9, b"", [3, 4, 5, 6]));
-    exact_frames.extend(masked_frame(true, 0, b"x", [4, 5, 6, 7]));
-    exact.write_all(&exact_frames).unwrap();
-    assert_eq!(read_frame(&mut exact), (true, 10, Vec::new()), "empty Ping is charged and answered");
-    assert_eq!(read_frame(&mut exact), (true, 1, b"x".to_vec()), "exact work exhaustion is allowed");
-    finish_server_close(&mut exact, 1000);
+    for (opcode, label) in [(0u8, "continuation"), (9, "Ping"), (10, "Pong")] {
+        let mut exact = open_websocket(server.port);
+        let mut exact_frames = masked_frame(false, 1, b"", [1, 2, 3, 4]);
+        for mask in [[2, 3, 4, 5], [3, 4, 5, 6]] {
+            exact_frames.extend(masked_frame(opcode != 0, opcode, b"", mask));
+        }
+        exact_frames.extend(masked_frame(true, 0, b"x", [4, 5, 6, 7]));
+        exact.write_all(&exact_frames).unwrap();
+        if opcode == 9 {
+            for _ in 0..2 {
+                assert_eq!(
+                    read_frame(&mut exact),
+                    (true, 10, Vec::new()),
+                    "empty Ping is charged and answered",
+                );
+            }
+        }
+        assert_eq!(
+            read_frame(&mut exact),
+            (true, 1, b"x".to_vec()),
+            "exact {label} work exhaustion is allowed",
+        );
+        finish_server_close(&mut exact, 1000);
 
-    let mut rejected = open_websocket(server.port);
-    let mut rejected_frames = Vec::new();
-    rejected_frames.extend(masked_frame(false, 1, b"", [1, 1, 1, 1]));
-    for mask in [[2, 2, 2, 2], [3, 3, 3, 3], [4, 4, 4, 4]] {
-        rejected_frames.extend(masked_frame(false, 0, b"", mask));
+        let mut rejected = open_websocket(server.port);
+        let mut rejected_frames = masked_frame(false, 1, b"", [1, 1, 1, 1]);
+        for mask in [[2, 2, 2, 2], [3, 3, 3, 3], [4, 4, 4, 4]] {
+            rejected_frames.extend(masked_frame(opcode != 0, opcode, b"", mask));
+        }
+        rejected_frames.extend(masked_frame(true, 0, b"x", [5, 5, 5, 5]));
+        rejected.write_all(&rejected_frames).unwrap();
+        if opcode == 9 {
+            for _ in 0..3 {
+                assert_eq!(read_frame(&mut rejected), (true, 10, Vec::new()));
+            }
+        }
+        assert_eq!(
+            read_frame(&mut rejected),
+            (true, 8, vec![3, 241]),
+            "the rejected-next header after {label} work closes 1009",
+        );
     }
-    rejected_frames.extend(masked_frame(true, 0, b"x", [5, 5, 5, 5]));
-    rejected.write_all(&rejected_frames).unwrap();
-    assert_eq!(read_frame(&mut rejected), (true, 8, vec![3, 241]), "the rejected-next header closes 1009");
 }
 
 #[test]
