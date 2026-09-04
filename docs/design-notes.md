@@ -1259,6 +1259,23 @@ look-around, returns byte spans rather than allocating matched strings, and star
 compile/is_match/find/find_at. Captures/replacement/split can be added at the library boundary when a
 real consumer establishes their ownership and allocation shapes; none requires a language change.
 
+## Why XML validates before exposing a cursor
+
+Cloud storage APIs need XML structure, but not a DOM, DTD, namespace expansion, or a configurable
+general-purpose parser. `std.xml` therefore consumes one owned UTF-8 string, validates the complete
+XML 1.0 profile, and only then exposes a forward cursor. This keeps malformed service responses at
+one `Result` boundary: consumer code never processes a valid prefix before discovering a bad
+suffix. Retaining the consumed allocation avoids an implicit copy; lexical names are views into it,
+while entity-decoded text and attribute values use owned return types so their copies remain visible.
+
+Rejecting every DOCTYPE and DTD markup declaration, custom/external entity, and processing-instruction form is a
+grammar decision rather than a runtime security option. No resolver, catalog, URL, path, or callback
+exists, so XXE and exponential entity expansion are closed by construction. Namespace expansion is
+also omitted: S3 and Azure consumers match their lexical service element names, while a future
+namespace-aware API would require a distinct expanded-name and binding contract. Fixed inclusive
+depth and attribute limits make stack and current-tag storage constant without a hidden allocator;
+the reader stores no tree or event tape.
+
 ## Why asymmetric signature keys are algorithm-specific
 
 The post-`pkg.db` asymmetric crypto extension uses six compiler-provided Move key types rather

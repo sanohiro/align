@@ -2853,6 +2853,7 @@ std.cli
 std.log
 std.encoding
 std.regex
+std.xml
 std.compress
 std.rand
 std.crypto
@@ -3325,6 +3326,39 @@ fixed compiled pattern, with Unicode enabled by default. Look-around and backref
 supported; this is intentional to retain predictable search complexity. There is no implicit
 global cache, no `rx"..."` literal, and no compiler-time regex execution. Captures, replacement,
 iteration, and split remain additive library slices after a concrete application consumer appears.
+
+### std.xml
+
+`std.xml` is a secure, forward-only reader for one in-memory UTF-8 XML 1.0 document:
+
+```text
+xml.event { Start, End, Text }
+xml.reader
+xml.parse(input: string) -> Result<xml.reader, Error>
+r.next() -> Option<xml.event>
+r.name() -> str
+r.attribute_count() -> i64
+r.attribute_name(index: i64) -> str
+r.attribute_value(index: i64) -> string
+r.text() -> string
+```
+
+`parse` consumes the owned string so a successful Move reader retains its allocation without a
+hidden copy. It validates the complete document before publication; malformed or unsupported input
+is `Error.Invalid`, and `next` is therefore total until `None`. Element/attribute names are
+zero-copy lexical views tied to the current cursor state. Normalized attribute values and text are
+fresh owned strings because entity/reference decoding can make them non-contiguous. An empty tag
+emits `Start` then `End`; comments and the optional XML declaration emit no event.
+
+The accepted profile is XML 1.0 Fifth Edition over UTF-8, with exact version `1.0`, an absent or
+case-insensitive `UTF-8` encoding declaration, one root, depth at most 256, and at most 256
+attributes per element. It accepts comments, CDATA, the five predefined entities, numeric character
+references, and complete Unicode XML names. It rejects every DOCTYPE and DTD markup declaration, custom or
+external entity, and processing instruction before reader publication, closing XXE and exponential
+entity expansion by construction. Namespaces are not expanded or binding-validated: colons and
+`xmlns` remain lexical XML names/attributes. There is no DOM, schema validation, query API,
+serializer, file/network loader, implicit encoding, or ambient configuration. The exact grammar,
+event, allocation, ABI, and closure ledger is `docs/impl/std-design/xml.md`.
 
 ### std.compress
 

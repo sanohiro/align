@@ -589,6 +589,37 @@ sets. No probe category or ABI shape is added, and A124 remains the next unreser
 The exact 32-byte shell, validation order, escaping table reuse, zero-copy finish, ownership,
 allocation, cache identity, and closure matrix are owned by `pkg-design/template.md`.
 
+## Planned `std.xml` extension (designed 2026-09-05; inactive until implementation)
+
+The accepted XML capability plans eight keyed identities, all on existing ABI shapes:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `XmlParse` | `align_rt_xml_parse` | A08: `i32 @SYM(ptr, i64, ptr)` | `unsafe extern "C" fn(*mut u8, i64, *mut *mut XmlReader) -> i32` |
+| `XmlNext` | `align_rt_xml_next` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut XmlReader) -> i32` |
+| `XmlName` | `align_rt_xml_name` | A19: `i32 @SYM(ptr, ptr)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr) -> i32` |
+| `XmlAttributeCount` | `align_rt_xml_attribute_count` | A29: `i64 @SYM(ptr)` | `unsafe extern "C" fn(*const XmlReader) -> i64` |
+| `XmlAttributeName` | `align_rt_xml_attribute_name` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr, i64) -> i32` |
+| `XmlAttributeValue` | `align_rt_xml_attribute_value` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr, i64) -> i32` |
+| `XmlText` | `align_rt_xml_text` | A19: `i32 @SYM(ptr, ptr)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr) -> i32` |
+| `XmlFree` | `align_rt_xml_free` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut XmlReader)` |
+
+The Rust definitions use C calling convention and may not unwind across it. Generated declarations
+retain the reused A03/A08/A19/A20/A29/A62 shapes' empty curated function, return, memory, and
+parameter attribute sets. `XmlParse` consumes one allocator-compatible owned input: status zero
+publishes the sole shell, `-1` frees the input and means public `Error.Invalid`, and positive
+`AL_INVALID` is malformed private ABI. `XmlNext` returns only `0=None`, `1=Start`, `2=End`, or
+`3=Text`. Name/value/text entries first validate and initialize their writable `{ptr,i64}` outputs;
+name outputs are borrowed input views, while value/text outputs own runtime allocations. Count is
+only `0..=256`; every impossible getter result aborts. Free is null-safe and otherwise authenticates
+the shell before following and freeing the input.
+
+Design acceptance reserves no new shape: A124 remains the next unreserved shape and active
+keyed/base/probe totals do not change. Implementation must activate all eight keys, symbols,
+declarations, definitions, exports, collision identities, fingerprint rows, count assertions, and
+their type/Drop consumers atomically. The grammar, status mapping, ownership, validation order,
+allocation contract, and closure matrix are authoritative in `std-design/xml.md`.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:

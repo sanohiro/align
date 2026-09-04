@@ -660,3 +660,24 @@ points. The settled timing boundary treats construction as trusted setup without
 and signing as constant-time for secret contents at fixed public lengths under that pointer-verified
 built-in default-provider dependency. The public-contract and implementation-closure ledger is
 `docs/impl/std-design/crypto.md` “Asymmetric signature suite.”
+
+---
+
+## UTF-8 XML forward reader settled
+
+On 2026-09-05, the next post-`pkg.template` convergence capability was settled as `std.xml`.
+`xml.parse(string) -> Result<xml.reader, Error>` consumes one owned UTF-8 document, validates it
+completely, and only then publishes a Move forward cursor. The closed event stream is
+`Start`/`End`/`Text`; lexical element and attribute names are current-reader views, while normalized
+attribute values and text are fresh owned strings. Empty elements emit a start/end pair, comments
+and the XML declaration are skipped, and repeated EOF is `None`.
+
+The accepted XML 1.0 profile has one root, complete Unicode XML names, comments, CDATA, predefined
+and numeric references, and fixed inclusive depth/per-element-attribute limits of 256. It rejects
+every DOCTYPE and DTD markup declaration, custom or external entity, and processing-instruction form before
+publication, so it has no resolver and cannot express XXE or exponential entity expansion.
+Namespace prefixes remain lexical rather than expanded or binding-validated. The decision rejected
+a DOM, partial-invalid streaming, borrowed input with a hidden copy, file/network loading, schema,
+query, serializer, ambient encoding, and configurable security switches. The exact public contract,
+W3C profile, validation order, allocation/region rules, eight reused-shape runtime ABIs, type-codec
+tags, and implementation closure matrix are in `docs/impl/std-design/xml.md`.

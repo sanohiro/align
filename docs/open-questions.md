@@ -557,6 +557,20 @@ documented in `regex.md` and pinned by a test.
 Record: `draft.md` §18.2, `docs/language-spec.md`, `docs/design-notes.md`,
 `docs/impl/std-design/regex.md` + `ja/regex.md`, `docs/impl/07-roadmap.md`
 
+### XML — validated UTF-8 forward reader, no DTD/entities/namespaces (DESIGNED 2026-09-05)
+**Decision: `std.xml` validates the whole document before exposing one forward cursor.**
+`xml.parse(string) -> Result<xml.reader, Error>` consumes its owned UTF-8 input. A valid reader emits
+the closed `xml.event { Start, End, Text }` stream; names are current-reader lexical `str` views and
+normalized values/text are owned strings. XML 1.0 comments, CDATA, predefined/numeric references,
+and Unicode names are admitted under exact depth/per-element-attribute limits of 256. Every
+DOCTYPE and DTD markup declaration, custom/external entity, and processing instruction is rejected before
+publication. Namespace prefixes are neither expanded nor binding-validated. This is permanently a
+library contract, not syntax; DOM, query, schema, serializer, I/O loader, ambient encoding, and
+configurable entity resolution are excluded from the first capability.
+Record: `draft.md` §18.2, `docs/language-spec.md`, `docs/design-notes.md`,
+`docs/impl/std-design/xml.md` + `ja/xml.md`, `docs/impl/19-hir-validation-ledger.md`,
+`docs/impl/20-runtime-abi-ledger.md`, `docs/impl/07-roadmap.md`
+
 ### Compiler backend
 **Decision: LLVM. But always go through a backend-agnostic MIR.**
 "C backend first → LLVM later" is not adopted (deferral trap + loss of SIMD control). Semantics live in MIR; `MIR → LLVM` is pure lowering. Future alternate backends are handled by adding lowering.

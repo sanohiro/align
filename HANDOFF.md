@@ -31,6 +31,12 @@ parallel-worker region gate, direct-to-SoA runtime, and A123 activate as one cap
 `pkg.ws` is implemented against `docs/impl/pkg-design/ws.md`: the protocol-neutral HTTP Upgrade
 transport, third `pkg.web` Handler variant, package-owned RFC 6455 handshake/frame state, and eleven
 reused-shape runtime rows activate as one capability.
+`pkg.template` is implemented against `docs/impl/pkg-design/template.md`: its opaque Move HTML text
+builder, default escaping, explicit raw write, and consuming zero-copy finisher are shipped in PR
+#939. The next convergence capability, `std.xml`, is designed in
+`docs/impl/std-design/xml.md`: it consumes one UTF-8 string, validates the complete bounded XML 1.0
+profile before publishing a forward reader, rejects every DTD/entity-declaration/PI path, and keeps
+namespaces lexical. Implementation is the next work item; `std.time` named formatters follow it.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
