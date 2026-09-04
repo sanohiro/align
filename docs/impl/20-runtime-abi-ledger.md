@@ -12,8 +12,8 @@ surfaces are independently compared with the Rust runtime exports.
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
-`pkg.csv`, and `pkg.ws`, there
-are 342 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+`pkg.csv`, `pkg.ws`, and `pkg.template`, there
+are 347 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -26,7 +26,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 360 records. Request 12
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 365 records. Request 12
 adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose seven
@@ -39,10 +39,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 360 base records.
+The compiler-visible native registry is always exactly the 365 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 371.
+records extend only the verification-time maximum runtime-export table to 376.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -58,9 +58,10 @@ inspection, stream construction/access/read, and Drop. The SSE capability added 
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
 six keyed rows. The `core.test` child-control extension then added four unkeyed rows, and `std.log`
 added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg.kv` added one
-source-reachable unkeyed row, `pkg.csv` added one keyed row, and `pkg.ws` added eleven keyed rows. Their runtime
+source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
+`pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 342 keyed records, 360 base records, and 371 records in the maximum optional-probe export table.
+are 347 keyed records, 365 base records, and 376 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -506,9 +507,9 @@ The implemented `pkg.ws` capability activates eleven keyed identities, all on ex
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx) -> i32` |
 
 These rows activate together in `RuntimeKey`, declarations, definitions, exports, collision
-identity, fingerprints, and count assertions. The current inventory is therefore 342 keyed records,
-360 base records, 367 with the seven-row `alloc-count` probe, 364 with the four-row `par-map-probe`,
-and 371 with both; A124 remains the next
+identity, fingerprints, and count assertions. At that capability boundary the inventory became 342
+keyed records, 360 base records, 367 with the seven-row `alloc-count` probe, 364 with the four-row
+`par-map-probe`, and 371 with both; A124 remained the next
 unreserved active shape.
 
 The same capability hardens the existing HTTP accepted-socket setup without adding a key or shape.
@@ -567,6 +568,26 @@ LLVM declarations preserve the reused A03/A04/A20/A24/A37/A62/A120 shapes' curre
 function-attribute sets: this capability adds no `nounwind`, memory, return, or parameter attribute
 and does not mutate shared shape fingerprints. Exact public semantics, status mapping, validation
 order, ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
+
+## `pkg.template` extension (implemented 2026-09-04)
+
+The `pkg.template` capability activates five keyed identities on existing ABI shapes:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `TemplateHtmlNew` | `align_rt_template_html_new_v1` | A47: `ptr @SYM()` | `extern "C" fn() -> *mut TemplateHtmlBuilder` |
+| `TemplateHtmlWrite` | `align_rt_template_html_write_v1` | A73: `void @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut TemplateHtmlBuilder, *const u8, i64)` |
+| `TemplateHtmlRaw` | `align_rt_template_html_raw_v1` | A73: `void @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut TemplateHtmlBuilder, *const u8, i64)` |
+| `TemplateHtmlToString` | `align_rt_template_html_into_string_v1` | A83: `{ ptr, i64 } @SYM(ptr)` | `unsafe extern "C" fn(*mut TemplateHtmlBuilder) -> AlignStr` |
+| `TemplateHtmlFree` | `align_rt_template_html_free_v1` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut TemplateHtmlBuilder)` |
+
+All five rows activate together in `RuntimeKey`, declaration and export inventories, compatible-
+extern collision identity, fingerprints, and count assertions. The inventory is therefore 347
+keyed, 365 base, 372 with `alloc-count`, 369 with `par-map-probe`, and 376 with both optional probe
+sets. No probe category or ABI shape is added, and A124 remains the next unreserved shape.
+
+The exact 32-byte shell, validation order, escaping table reuse, zero-copy finish, ownership,
+allocation, cache identity, and closure matrix are owned by `pkg-design/template.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 
@@ -995,24 +1016,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 342 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 347 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 360 base native symbols against default-feature `align_runtime` exports,
+- the 365 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 367 `alloc-count` and 364 `par-map-probe` native symbols against
+- the 372 `alloc-count` and 369 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 371 maximum native symbols against `align_runtime` built with
+- the 376 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 360 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  360 exact registry function types through the production compatibility
+- all 365 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  365 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

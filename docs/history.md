@@ -1,5 +1,17 @@
 # History of Align
 
+## 2026-09-04: pkg.template ships one explicit HTML builder
+
+The first `pkg.template` implementation exposes one opaque Move `html_builder`, escaped `write`,
+explicitly trusted `raw`, and consuming zero-copy `to_string`. Its checked HIR/MIR operations bind
+the canonical package and resource identity before LLVM lowering. The exact 32-byte v1 runtime
+shell validates lifecycle, UTF-8, bounds, and input aliasing before mutation; five fixed exports
+own construction, escaped append, raw append, payload transfer, and unfinished Drop. Ordinary
+record fields and fixed Move-record arrays retain the resource without widening the forbidden
+direct-array, dynamic-array, capture, task, parallel, extern, or user-return carriers. Exact
+surface, ownership, escaping, ABI, and implementation closure matrix:
+`docs/impl/pkg-design/template.md`.
+
 ## 2026-09-03: pkg.ws composes one RFC 6455 route with pkg.web
 
 The first `pkg.ws` design keeps HTTP ownership and concurrency singular. A WebSocket endpoint is a

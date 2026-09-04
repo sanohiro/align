@@ -2,9 +2,9 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/template.md`.
 >
-> **Status:** DESIGNED (2026-09-04). This document is the authority for the first `pkg.template`
-> capability. Design acceptance activates no package source, compiler operation, runtime row, or
-> ABI shape.
+> **Status:** IMPLEMENTED (2026-09-04). This document is the authority for the first
+> `pkg.template` capability. Package source, checked operations, and five reused-shape runtime rows
+> activate together.
 
 ## Authoritative public-contract ledger
 
@@ -127,11 +127,14 @@ module/wrapper identity and exact types. At runtime each operation follows this 
 1. Require an exact-compatible caller to supply a live, dereferenceable, 8-aligned shell allocated
    by `align_rt_template_html_new_v1`, with exclusive access for the complete operation or Drop.
    A null or misaligned shell aborts before reference formation. Once the caller safety precondition
-   permits access, validate version, live state, reserved bytes, and the complete payload product.
+   permits access, validate version, live state, reserved bytes, lengths, payload nullness/range,
+   and shell/payload disjointness from raw scalar fields before forming a payload slice; then
+   validate the initialized payload prefix as UTF-8.
 2. For `write`/`raw`, validate signed length, target-address representability, and nullness before
-   forming an input slice. A zero length may use null; a positive length may not. Validate the
-   complete input as UTF-8, then reject any input address range overlapping either the 32-byte shell
-   or its complete payload allocation before measurement, reallocation, or mutation. A dangling
+   forming an input slice. A zero length may use null; a positive length may not. Reject any input
+   address range overlapping either the 32-byte shell or its complete payload allocation, then form
+   the slice and validate the complete input as UTF-8, all before measurement, reallocation, or
+   mutation. A dangling
    nonnull pointer and forged allocator provenance remain outside the detectable ABI contract.
 3. Compute the exact added byte count and checked final length before mutation. `write` measures
    with the shared entity table after UTF-8 validation; `raw` uses the validated input length.

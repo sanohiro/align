@@ -976,6 +976,7 @@ pub fn validate_thin_partition_program(
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
     Ok(())
@@ -3045,6 +3046,7 @@ fn build_module<'c>(
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -4005,7 +4007,168 @@ fn db_resource_matches_row(
     })
 }
 
+fn template_html_resource_matches(program: &Program, resource: u32) -> bool {
+    program
+        .resources
+        .get(resource as usize)
+        .is_some_and(|definition| {
+            definition.source_name == "pkg.template$html_builder"
+                && definition.name == "pkg.template$html_builder"
+                && definition.declaring_module == "pkg.template"
+                && definition.generic_arity == 0
+                && definition.drop_hook == "pkg.template.internal.resource$drop_html_builder"
+                && definition.drop_thunk == "__align_resource_drop$pkg.template$html_builder"
+                && definition.representation_version == 1
+                && definition.drop_abi_fingerprint == *b"align-res-drop-1"
+        })
+}
+
+fn template_html_callable_resource_matches(program: &Program, resource: u32) -> bool {
+    program
+        .resources
+        .get(resource as usize)
+        .is_some_and(|definition| {
+            definition.source_name == "pkg.template$html_builder"
+                && definition.name == "pkg.template$html_builder"
+                && definition.declaring_module == "pkg.template"
+                && definition.generic_arity == 0
+                && matches!(
+                    definition.drop_hook.as_str(),
+                    "pkg.template.internal.resource$drop_html_builder"
+                        | "pkg.template.internal.resource.__align_interface_drop_html_builder"
+                )
+                && definition.drop_thunk == "__align_resource_drop$pkg.template$html_builder"
+                && definition.representation_version == 1
+                && definition.drop_abi_fingerprint == *b"align-res-drop-1"
+        })
+}
+
+fn template_html_mir_signature(
+    name: &str,
+    resource: u32,
+) -> Option<(Vec<Ty>, Vec<align_ast::ParamMode>, Ty, hir::ReturnCleanupAbi)> {
+    use align_ast::ParamMode::{BorrowMut, ByValue};
+    Some(match name {
+        "pkg.template$html" => (
+            Vec::new(),
+            Vec::new(),
+            Ty::Resource(resource),
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        "pkg.template$write" | "pkg.template$raw" => (
+            vec![Ty::Resource(resource), Ty::Str],
+            vec![BorrowMut, ByValue],
+            Ty::Unit,
+            hir::ReturnCleanupAbi::None,
+        ),
+        "pkg.template$to_string" => (
+            vec![Ty::Resource(resource)],
+            vec![ByValue],
+            Ty::String,
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        _ => return None,
+    })
+}
+
+fn template_html_mir_operation_name(rvalue: &Rvalue) -> Option<&'static str> {
+    match rvalue {
+        Rvalue::TemplateHtmlNew { .. } => Some("pkg.template$html"),
+        Rvalue::TemplateHtmlWrite { .. } => Some("pkg.template$write"),
+        Rvalue::TemplateHtmlRaw { .. } => Some("pkg.template$raw"),
+        Rvalue::TemplateHtmlToString { .. } => Some("pkg.template$to_string"),
+        _ => None,
+    }
+}
+
+fn validate_template_html_mir_signatures(program: &Program) -> Result<(), CodegenError> {
+    let has_surface = program
+        .fns
+        .iter()
+        .any(|function| template_html_mir_signature(function.name.as_str(), 0).is_some())
+        || program
+            .imported_fns
+            .iter()
+            .any(|function| template_html_mir_signature(function.name.as_str(), 0).is_some());
+    if !has_surface {
+        return Ok(());
+    }
+    let Some(resource) = program
+        .resources
+        .iter()
+        .enumerate()
+        .find_map(|(resource, _)| {
+            let resource = u32::try_from(resource).ok()?;
+            template_html_callable_resource_matches(program, resource).then_some(resource)
+        })
+    else {
+        return Err(CodegenError::Lowering(
+            "pkg.template callable surface has no canonical resource".into(),
+        ));
+    };
+    for function in &program.fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_mir_signature(function.name.as_str(), resource)
+        else {
+            continue;
+        };
+        let actual = function
+            .params
+            .iter()
+            .map(|slot| function.slots.get(*slot as usize).copied())
+            .collect::<Option<Vec<_>>>();
+        if actual.as_deref() != Some(params.as_slice())
+            || function.param_modes != modes
+            || function.ret != ret
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+        {
+            return Err(CodegenError::Lowering(format!(
+                "pkg.template function '{}' has a malformed canonical signature",
+                function.name
+            )));
+        }
+        let operations = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|statement| match statement {
+                Stmt::Let(_, rvalue) => template_html_mir_operation_name(rvalue),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if operations.as_slice() != [function.name.as_str()] {
+            return Err(CodegenError::Lowering(format!(
+                "pkg.template function '{}' does not contain exactly one matching operation",
+                function.name
+            )));
+        }
+    }
+    for function in &program.imported_fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_mir_signature(function.name.as_str(), resource)
+        else {
+            continue;
+        };
+        if function.params != params
+            || function.param_modes != modes
+            || function.ret != ret
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+        {
+            return Err(CodegenError::Lowering(format!(
+                "imported pkg.template function '{}' has a malformed canonical signature",
+                function.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
+    validate_template_html_mir_signatures(program)?;
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
             align_mir::Operand::Const(align_mir::Const::Int(_, ty))
@@ -4020,6 +4183,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
             }
             align_mir::Operand::BorrowedPlace(place) => place.ty,
             align_mir::Operand::BorrowedElementPlace(place) => place.element_ty,
+            align_mir::Operand::BorrowedFixedElementPlace(place) => place.ty,
             align_mir::Operand::BorrowedCleanupArg(_) => Ty::Bool,
         })
     }
@@ -4256,6 +4420,39 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                 == Some(Ty::ResourceRef(*resource))
                             && result == Ty::Soa(*struct_id)
                     ,
+                    Rvalue::TemplateHtmlNew { resource } => {
+                        function.name.as_str() == "pkg.template$html"
+                            && template_html_resource_matches(program, *resource)
+                            && result == Ty::Resource(*resource)
+                    }
+                    Rvalue::TemplateHtmlWrite {
+                        resource,
+                        output,
+                        value,
+                    } => {
+                        function.name.as_str() == "pkg.template$write"
+                            && template_html_resource_matches(program, *resource)
+                            && operand_ty(function, output) == Some(Ty::Resource(*resource))
+                            && operand_ty(function, value) == Some(Ty::Str)
+                            && result == Ty::Unit
+                    }
+                    Rvalue::TemplateHtmlRaw {
+                        resource,
+                        output,
+                        value,
+                    } => {
+                        function.name.as_str() == "pkg.template$raw"
+                            && template_html_resource_matches(program, *resource)
+                            && operand_ty(function, output) == Some(Ty::Resource(*resource))
+                            && operand_ty(function, value) == Some(Ty::Str)
+                            && result == Ty::Unit
+                    }
+                    Rvalue::TemplateHtmlToString { resource, output } => {
+                        function.name.as_str() == "pkg.template$to_string"
+                            && template_html_resource_matches(program, *resource)
+                            && operand_ty(function, output) == Some(Ty::Resource(*resource))
+                            && result == Ty::String
+                    }
                     _ => continue,
                 };
                 if !valid {
@@ -6294,6 +6491,9 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
             .slots
             .get(place.base.slot as usize)
             .map(|_| place.element_ty),
+        Operand::BorrowedFixedElementPlace(place) => {
+            function.slots.get(place.base as usize).map(|_| place.ty)
+        }
         Operand::BorrowedCleanupArg(_) => Some(Ty::Bool),
     }
 }
@@ -6371,6 +6571,77 @@ fn validate_slice_index_rvalues(program: &Program) -> Result<(), CodegenError> {
                 {
                     return Err(CodegenError::Lowering(format!(
                         "slice-index MIR in function '{}' has a physical source/result contract mismatch",
+                        function.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a malformed fixed-record resource nulling statement before LLVM indexes a slot, record,
+/// or field table. This statement is emitted only after moving a canonical `pkg.template`
+/// resource leaf out of a source-formed fixed record array.
+fn validate_fixed_element_nulling(program: &Program) -> Result<(), CodegenError> {
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let Stmt::NullElemField(slot, index, path) = statement else {
+                    continue;
+                };
+                let Some(Ty::StructArray(mut struct_id, len)) =
+                    function.slots.get(*slot as usize).copied()
+                else {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has an invalid root slot",
+                        function.name
+                    )));
+                };
+                let Operand::Const(Const::Int(index, index_ty)) = index else {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has a non-constant index",
+                        function.name
+                    )));
+                };
+                if !matches!(index_ty, Ty::Int(_))
+                    || *index < 0
+                    || u32::try_from(*index).ok().is_none_or(|index| index >= len)
+                    || path.is_empty()
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has an invalid index or path",
+                        function.name
+                    )));
+                }
+                let mut leaf = None;
+                for (depth, field) in path.iter().copied().enumerate() {
+                    let Some(ty) = program
+                        .structs
+                        .get(struct_id as usize)
+                        .and_then(|record| record.fields.get(field as usize))
+                        .map(|field| field.ty)
+                    else {
+                        return Err(CodegenError::Lowering(format!(
+                            "fixed element nulling in function '{}' has an invalid field path",
+                            function.name
+                        )));
+                    };
+                    if depth + 1 == path.len() {
+                        leaf = Some(ty);
+                    } else if let Ty::Struct(next) = ty {
+                        struct_id = next;
+                    } else {
+                        return Err(CodegenError::Lowering(format!(
+                            "fixed element nulling in function '{}' crosses a non-record field",
+                            function.name
+                        )));
+                    }
+                }
+                if !matches!(leaf, Some(Ty::Resource(resource)) if template_html_callable_resource_matches(program, resource))
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' does not select the canonical template resource",
                         function.name
                     )));
                 }
@@ -6467,11 +6738,54 @@ fn operands_match_modes(
                             &program.tuples,
                             &program.enums,
                             &program.tagged_types,
-                        ) => true,
-                (Operand::BorrowedPlace(_) | Operand::BorrowedElementPlace(_), _) => false,
+                        ) =>
+                {
+                    true
+                }
+                (
+                    Operand::BorrowedPlace(_)
+                    | Operand::BorrowedElementPlace(_)
+                    | Operand::BorrowedFixedElementPlace(_),
+                    _,
+                ) => false,
                 (_, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut) => false,
                 _ => true,
             })
+}
+
+fn direct_operands_match_modes(
+    target: &ProgramCall,
+    args: &[Operand],
+    modes: &[align_ast::ParamMode],
+    types: &[Ty],
+    program: &Program,
+) -> bool {
+    if operands_match_modes(args, modes, types, program) {
+        return true;
+    }
+    if !matches!(target.as_str(), "pkg.template$write" | "pkg.template$raw")
+        || args.len() != 2
+        || modes
+            != [
+                align_ast::ParamMode::BorrowMut,
+                align_ast::ParamMode::ByValue,
+            ]
+    {
+        return false;
+    }
+    let Ty::Resource(resource) = types[0] else {
+        return false;
+    };
+    let projected = match &args[0] {
+        Operand::BorrowedPlace(place) => !place.path.is_empty() && place.cleanup.is_some(),
+        Operand::BorrowedFixedElementPlace(place) => {
+            !place.path.is_empty() && place.cleanup.is_some()
+        }
+        _ => false,
+    };
+    projected
+        && template_html_callable_resource_matches(program, resource)
+        && operands_match_modes(&args[1..], &modes[1..], &types[1..], program)
 }
 
 fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, program: &Program) -> bool {
@@ -6761,7 +7075,8 @@ fn callable_preflight(
                             None => false,
                         };
                         if !types_match
-                            || !operands_match_modes(
+                            || !direct_operands_match_modes(
+                                target,
                                 args,
                                 &declaration.signature.modes,
                                 &declaration.signature.params,
@@ -6797,7 +7112,8 @@ fn callable_preflight(
                             None => false,
                         };
                         if !types_match
-                            || !operands_match_modes(
+                            || !direct_operands_match_modes(
+                                target,
                                 args,
                                 &declaration.signature.modes,
                                 &declaration.signature.params,
@@ -12608,10 +12924,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // zeroing it with a 16-byte slice struct would clobber the next field.
                         // `handle_free_key` is the same predicate that decides its drop is a pointer
                         // free, so the two can never disagree about the field's shape.
-                        ty if handle_free_key(ty).is_some() => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
+                        ty if handle_free_key(ty).is_some() => self
+                            .ctx
+                            .ptr_type(AddressSpace::default())
+                            .const_null()
+                            .into(),
+                        Ty::Resource(_) => self
+                            .ctx
+                            .ptr_type(AddressSpace::default())
+                            .const_null()
+                            .into(),
                         _ => slice_struct_type(self.ctx).const_zero().into(),
-                    };
-                    self.builder.build_store(field_ptr, zero).map_err(|e| self.err(e))?;
+                        };
+                    self.builder
+                        .build_store(field_ptr, zero)
+                        .map_err(|e| self.err(e))?;
+                }
+                Stmt::NullElemField(slot, index, path) => {
+                    let field_ptr = self.elem_field_ptr(*slot, index, path)?;
+                    self.builder
+                        .build_store(
+                            field_ptr,
+                            self.ctx.ptr_type(AddressSpace::default()).const_null(),
+                        )
+                        .map_err(|e| self.err(e))?;
                 }
                 Stmt::Drop(slot) => {
                     let ty = self.f.slots[*slot as usize];
@@ -15315,6 +15651,54 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("builder_into_string returns a {ptr,len}")
             }
+            Rvalue::TemplateHtmlNew { .. } => self
+                .builder
+                .build_call(
+                    self.runtime(RuntimeKey::TemplateHtmlNew),
+                    &[],
+                    "template.html",
+                )
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("template_html_new returned no pointer value"))?,
+            Rvalue::TemplateHtmlWrite { output, value, .. }
+            | Rvalue::TemplateHtmlRaw { output, value, .. } => {
+                let output = self.operand(output)?;
+                let value = self.operand(value)?.into_struct_value();
+                let ptr = self
+                    .builder
+                    .build_extract_value(value, 0, "template.value.ptr")
+                    .map_err(|e| self.err(e))?;
+                let len = self
+                    .builder
+                    .build_extract_value(value, 1, "template.value.len")
+                    .map_err(|e| self.err(e))?;
+                let key = if matches!(rv, Rvalue::TemplateHtmlWrite { .. }) {
+                    RuntimeKey::TemplateHtmlWrite
+                } else {
+                    RuntimeKey::TemplateHtmlRaw
+                };
+                self.builder
+                    .build_call(
+                        self.runtime(key),
+                        &[output.into(), ptr.into(), len.into()],
+                        "",
+                    )
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::TemplateHtmlToString { output, .. } => self
+                .builder
+                .build_call(
+                    self.runtime(RuntimeKey::TemplateHtmlToString),
+                    &[self.operand(output)?.into()],
+                    "template.string",
+                )
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("template_html_to_string returned no string value"))?,
             Rvalue::Template(pieces, arena) => {
                 self.gen_template(result_id, pieces, arena.as_ref(), None)?
             }
@@ -22042,18 +22426,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| self.err(format!("parameter index {index} references missing slot {slot}")))
             }
             Operand::BorrowedPlace(place) => self.checked_borrowed_place_ty(place),
-            Operand::BorrowedElementPlace(place) => {
-                self.checked_borrowed_element_place_ty(place)
+            Operand::BorrowedElementPlace(place) => self.checked_borrowed_element_place_ty(place),
+            Operand::BorrowedFixedElementPlace(place) => {
+                self.checked_borrowed_fixed_element_place_ty(place)
             }
-            Operand::BorrowedCleanupArg(index) => {
-                self.f
-                    .borrow_mut_cleanup_slots
-                    .get(*index as usize)
-                    .copied()
-                    .flatten()
-                    .map(|_| Ty::Bool)
-                    .ok_or_else(|| self.err(format!("parameter {index} has no borrowed cleanup bit")))
-            }
+            Operand::BorrowedCleanupArg(index) => self
+                .f
+                .borrow_mut_cleanup_slots
+                .get(*index as usize)
+                .copied()
+                .flatten()
+                .map(|_| Ty::Bool)
+                .ok_or_else(|| self.err(format!("parameter {index} has no borrowed cleanup bit"))),
         }
     }
 
@@ -22185,6 +22569,55 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(element_ty)
     }
 
+    fn checked_borrowed_fixed_element_place_ty(
+        &self,
+        place: &align_mir::BorrowedFixedElementPlace,
+    ) -> Result<Ty, CodegenError> {
+        let Ty::StructArray(mut struct_id, len) = self
+            .f
+            .slots
+            .get(place.base as usize)
+            .copied()
+            .ok_or_else(|| {
+                self.err(format!(
+                    "borrowed fixed element references missing slot {}",
+                    place.base
+                ))
+            })?
+        else {
+            return Err(self.err("borrowed fixed element base is not a fixed record array"));
+        };
+        if place.index >= len || place.path.is_empty() {
+            return Err(self.err("borrowed fixed element index or field path is out of bounds"));
+        }
+        let mut leaf = None;
+        for (ordinal, field) in place.path.iter().copied().enumerate() {
+            let ty = self
+                .structs
+                .get(struct_id as usize)
+                .and_then(|definition| definition.fields.get(field as usize))
+                .map(|field| field.ty)
+                .ok_or_else(|| self.err("borrowed fixed element field path is out of bounds"))?;
+            leaf = Some(ty);
+            if ordinal + 1 < place.path.len() {
+                let Ty::Struct(next) = ty else {
+                    return Err(self.err("borrowed fixed element field path crosses a non-record"));
+                };
+                struct_id = next;
+            }
+        }
+        if leaf != Some(place.ty) {
+            return Err(self.err("borrowed fixed element type disagrees with its field path"));
+        }
+        if place
+            .cleanup
+            .is_some_and(|slot| self.f.slots.get(slot as usize) != Some(&Ty::Bool))
+        {
+            return Err(self.err("borrowed fixed element cleanup slot is missing or not bool"));
+        }
+        Ok(place.ty)
+    }
+
     fn mir_operand_same(left: &Operand, right: &Operand) -> bool {
         match (left, right) {
             (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt))) => {
@@ -22200,6 +22633,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             (Operand::BorrowedCleanupArg(a), Operand::BorrowedCleanupArg(b)) => a == b,
             (Operand::BorrowedPlace(a), Operand::BorrowedPlace(b)) => {
                 a.slot == b.slot
+                    && a.path == b.path
+                    && a.ty == b.ty
+                    && a.cleanup == b.cleanup
+            }
+            (
+                Operand::BorrowedFixedElementPlace(a),
+                Operand::BorrowedFixedElementPlace(b),
+            ) => {
+                a.base == b.base
+                    && a.index == b.index
                     && a.path == b.path
                     && a.ty == b.ty
                     && a.cleanup == b.cleanup
@@ -22226,6 +22669,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match operand {
             Operand::BorrowedPlace(place) => place.slot == root,
             Operand::BorrowedElementPlace(place) => place.base.slot == root,
+            Operand::BorrowedFixedElementPlace(place) => place.base == root,
             _ => false,
         }
     }
@@ -22240,6 +22684,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Operand::Arg(index) => self.f.params.get(*index as usize) == Some(&root),
             Operand::BorrowedPlace(place) => place.slot == root,
             Operand::BorrowedElementPlace(place) => place.base.slot == root,
+            Operand::BorrowedFixedElementPlace(place) => place.base == root,
             Operand::Value(value) if visited.insert(*value) => {
                 let Some((_, _, rvalue)) = self.unique_mir_value_def(*value) else {
                     return false;
@@ -22324,6 +22769,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Stmt::DropFlagInit(slot)
             | Stmt::NullTupleField(slot, _)
             | Stmt::NullStructField(slot, _)
+            | Stmt::NullElemField(slot, ..)
             | Stmt::Drop(slot)
             | Stmt::DropElem(slot, ..)
             | Stmt::DropElemField(slot, ..) => *slot == root,
@@ -22560,6 +23006,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
+    fn borrowed_fixed_element_ptr(
+        &self,
+        place: &align_mir::BorrowedFixedElementPlace,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        self.checked_borrowed_fixed_element_place_ty(place)?;
+        let index = Operand::Const(Const::Int(
+            i128::from(place.index),
+            Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+        ));
+        self.elem_field_ptr(place.base, &index, &place.path)
+    }
+
     fn borrowed_place_ptr(
         &self,
         place: &align_mir::BorrowedPlace,
@@ -22715,7 +23176,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if let Operand::BorrowedElementPlace(place) = op {
             return Ok(self.borrowed_element_ptr(place)?.into());
         }
-        let Operand::BorrowedPlace(place) = op else { return self.operand(op) };
+        if let Operand::BorrowedFixedElementPlace(place) = op {
+            let pointer = self.borrowed_fixed_element_ptr(place)?;
+            if let Some(cleanup) = place.cleanup {
+                let cleanup_pointer = self.slots.get(&cleanup).copied().ok_or_else(|| {
+                    self.err(format!("borrowed cleanup slot {cleanup} is missing"))
+                })?;
+                let pair = self.ctx.struct_type(
+                    &[
+                        self.ctx.ptr_type(AddressSpace::default()).into(),
+                        self.ctx.ptr_type(AddressSpace::default()).into(),
+                    ],
+                    false,
+                );
+                let with_pointer = self
+                    .builder
+                    .build_insert_value(pair.get_poison(), pointer, 0, "borrow.fixed.pair.ptr")
+                    .map_err(|error| self.err(error))?;
+                return Ok(self
+                    .builder
+                    .build_insert_value(
+                        with_pointer,
+                        cleanup_pointer,
+                        1,
+                        "borrow.fixed.pair.cleanup",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value()
+                    .into());
+            }
+            return Ok(pointer.into());
+        }
+        let Operand::BorrowedPlace(place) = op else {
+            return self.operand(op);
+        };
         let pointer = self.borrowed_place_ptr(place)?;
         if let Some(cleanup) = place.cleanup {
             let cleanup_pointer = self
@@ -22870,6 +23364,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Err(self.err(
                     "borrowed element place was used outside a shared-borrow call action",
                 ));
+            }
+            Operand::BorrowedFixedElementPlace(_) => {
+                return Err(
+                    self.err("borrowed fixed element place was used outside a borrow call action")
+                );
             }
             Operand::BorrowedCleanupArg(index) => {
                 let slot = *self
@@ -25169,6 +25668,165 @@ fn main() -> i32 = 0
             tuples: vec![],
         };
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+    }
+
+    fn template_mir_function(name: &str, rvalue: Rvalue, value_tys: Vec<Ty>) -> Function {
+        Function {
+            name: program_call(name),
+            params: vec![],
+            param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![],
+            slot_align: vec![],
+            value_tys,
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![Stmt::Let(0, rvalue)],
+                stmt_lines: vec![(1, 1)],
+                term: Term::Return(Some(Operand::Const(Const::Unit))),
+            }],
+            entry: 0,
+            exportable: true,
+        }
+    }
+
+    fn template_mir_program() -> Program {
+        let resource = 0;
+        let mut write = template_mir_function(
+            "pkg.template$write",
+            Rvalue::TemplateHtmlWrite {
+                resource,
+                output: Operand::Value(1),
+                value: Operand::Value(2),
+            },
+            vec![Ty::Unit, Ty::Resource(resource), Ty::Str],
+        );
+        write.ret = Ty::Unit;
+        write.params = vec![0, 1];
+        write.param_modes = vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue];
+        write.borrow_mut_cleanup_slots = vec![Some(2), None];
+        write.slots = vec![Ty::Resource(resource), Ty::Str, Ty::Bool];
+        write.slot_align = vec![None; 3];
+        let mut raw = write.clone();
+        raw.name = program_call("pkg.template$raw");
+        assert!(matches!(raw.blocks[0].stmts[0], Stmt::Let(..)));
+        if let Stmt::Let(_, rvalue) = &mut raw.blocks[0].stmts[0] {
+            *rvalue = Rvalue::TemplateHtmlRaw {
+                resource,
+                output: Operand::Value(1),
+                value: Operand::Value(2),
+            };
+        }
+        let mut finish = template_mir_function(
+            "pkg.template$to_string",
+            Rvalue::TemplateHtmlToString {
+                resource,
+                output: Operand::Value(1),
+            },
+            vec![Ty::String, Ty::Resource(resource)],
+        );
+        finish.ret = Ty::String;
+        finish.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+        finish.params = vec![0];
+        finish.param_modes = vec![align_ast::ParamMode::ByValue];
+        finish.borrow_mut_cleanup_slots = vec![None];
+        finish.slots = vec![Ty::Resource(resource)];
+        finish.slot_align = vec![None];
+        let mut html = template_mir_function(
+            "pkg.template$html",
+            Rvalue::TemplateHtmlNew { resource },
+            vec![Ty::Resource(resource)],
+        );
+        html.ret = Ty::Resource(resource);
+        html.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+        Program {
+            fns: vec![html, write, raw, finish],
+            sqlite_callback_effects: Default::default(),
+            externs: vec![],
+            imported_fns: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            resources: vec![hir::ResourceDef {
+                name: "pkg.template$html_builder".into(),
+                source_name: "pkg.template$html_builder".into(),
+                declaring_module: "pkg.template".into(),
+                generic_arity: 0,
+                drop_hook: "pkg.template.internal.resource$drop_html_builder".into(),
+                drop_thunk: "__align_resource_drop$pkg.template$html_builder".into(),
+                representation_version: 1,
+                drop_abi_fingerprint: *b"align-res-drop-1",
+            }],
+            tagged_types: vec![],
+            fn_types: vec![],
+            tuples: vec![],
+        }
+    }
+
+    #[test]
+    fn template_html_mir_gate_rejects_resource_type_operand_and_placement_mutations() {
+        let program = template_mir_program();
+        assert!(validate_resource_rvalues(&program).is_ok());
+
+        let mut malformed = program.clone();
+        malformed.resources[0].drop_thunk.push_str("_wrong");
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[0].value_tys[0] = Ty::Raw;
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[1].value_tys[2] = Ty::Bool;
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[2].name = program_call("main");
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[1].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[1].blocks[0].stmts.clear();
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        let duplicate = malformed.fns[2].blocks[0].stmts[0].clone();
+        malformed.fns[2].blocks[0].stmts.push(duplicate);
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut imported = program.clone();
+        imported.fns.clear();
+        imported.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("pkg.template$raw"),
+            params: vec![Ty::Resource(0), Ty::Str],
+            param_modes: vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue],
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+        });
+        assert!(validate_resource_rvalues(&imported).is_ok());
+        imported.imported_fns[0].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&imported).is_err());
+
+        let mut malformed = program;
+        assert!(matches!(
+            malformed.fns[3].blocks[0].stmts[0],
+            Stmt::Let(_, Rvalue::TemplateHtmlToString { .. })
+        ));
+        if let Stmt::Let(_, Rvalue::TemplateHtmlToString { resource, .. }) =
+            &mut malformed.fns[3].blocks[0].stmts[0]
+        {
+            *resource = 9;
+        }
+        assert!(validate_resource_rvalues(&malformed).is_err());
     }
 
     #[test]

@@ -860,6 +860,31 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             arena: boxed!(arena),
             options: boxed!(options),
         },
+        ExprKind::TemplateHtmlNew { resource } => ExprKind::TemplateHtmlNew {
+            resource: *resource,
+        },
+        ExprKind::TemplateHtmlWrite {
+            resource,
+            output,
+            value,
+        } => ExprKind::TemplateHtmlWrite {
+            resource: *resource,
+            output: boxed!(output),
+            value: boxed!(value),
+        },
+        ExprKind::TemplateHtmlRaw {
+            resource,
+            output,
+            value,
+        } => ExprKind::TemplateHtmlRaw {
+            resource: *resource,
+            output: boxed!(output),
+            value: boxed!(value),
+        },
+        ExprKind::TemplateHtmlToString { resource, output } => ExprKind::TemplateHtmlToString {
+            resource: *resource,
+            output: boxed!(output),
+        },
         ExprKind::JsonDecodeUnion { enum_id, input } => ExprKind::JsonDecodeUnion {
             enum_id: *enum_id,
             input: boxed!(input),
@@ -2106,7 +2131,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
         | ExprKind::RawNull
-        | ExprKind::HttpClient => {}
+        | ExprKind::HttpClient
+        | ExprKind::TemplateHtmlNew { .. } => {}
         ExprKind::Unary { expr, .. }
         | ExprKind::Cast(expr)
         | ExprKind::TaskGet(expr)
@@ -2566,6 +2592,12 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(arena);
             one!(options);
         }
+        ExprKind::TemplateHtmlWrite { output, value, .. }
+        | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+            one!(output);
+            one!(value);
+        }
+        ExprKind::TemplateHtmlToString { output, .. } => one!(output),
         ExprKind::TupleIndex { recv, .. }
         | ExprKind::StrTrim { recv, .. }
         | ExprKind::ArrayToSoa { source: recv, .. }

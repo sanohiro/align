@@ -364,7 +364,8 @@ fn walk_body_records<'a>(
                 | ExprKind::ProcessAbort
                 | ExprKind::RandSeed
                 | ExprKind::RawNull
-                | ExprKind::HttpClient => {}
+                | ExprKind::HttpClient
+                | ExprKind::TemplateHtmlNew { .. } => {}
                 ExprKind::Unary { expr, .. }
                 | ExprKind::Cast(expr)
                 | ExprKind::TaskGet(expr)
@@ -846,6 +847,14 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(input), child_depth));
                     work.push((BodyRecord::Expr(arena), child_depth));
                     work.push((BodyRecord::Expr(options), child_depth));
+                }
+                ExprKind::TemplateHtmlWrite { output, value, .. }
+                | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                    work.push((BodyRecord::Expr(output), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::TemplateHtmlToString { output, .. } => {
+                    work.push((BodyRecord::Expr(output), child_depth));
                 }
                 ExprKind::TupleIndex { recv, .. }
                 | ExprKind::StrTrim { recv, .. }

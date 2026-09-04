@@ -1,0 +1,9 @@
+module pkg.template.internal.resource
+
+extern "C" {
+  fn align_rt_template_html_free_v1(state: raw)
+}
+
+pub fn drop_html_builder(state: raw) {
+  unsafe { align_rt_template_html_free_v1(state) }
+}

@@ -190,6 +190,233 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+fn template_hir_program() -> hir::Program {
+    let resource = 0;
+    let owner = || body_test_expr(hir::ExprKind::Local(0), Ty::Resource(resource));
+    let mut functions = vec![
+        body_tail_case(
+            "pkg.template$html",
+            body_test_expr(
+                hir::ExprKind::TemplateHtmlNew { resource },
+                Ty::Resource(resource),
+            ),
+            Ty::Resource(resource),
+        ),
+        body_tail_case(
+            "pkg.template$write",
+            body_test_expr(
+                hir::ExprKind::TemplateHtmlWrite {
+                    resource,
+                    output: Box::new(owner()),
+                    value: Box::new(body_test_expr(hir::ExprKind::Str("x".into()), Ty::Str)),
+                },
+                Ty::Unit,
+            ),
+            Ty::Unit,
+        ),
+        body_tail_case(
+            "pkg.template$raw",
+            body_test_expr(
+                hir::ExprKind::TemplateHtmlRaw {
+                    resource,
+                    output: Box::new(owner()),
+                    value: Box::new(body_test_expr(hir::ExprKind::Str("x".into()), Ty::Str)),
+                },
+                Ty::Unit,
+            ),
+            Ty::Unit,
+        ),
+        body_tail_case(
+            "pkg.template$to_string",
+            body_test_expr(
+                hir::ExprKind::TemplateHtmlToString {
+                    resource,
+                    output: Box::new(owner()),
+                },
+                Ty::String,
+            ),
+            Ty::String,
+        ),
+    ];
+    let parameter = |id, name: &str, ty, is_mut| hir::Local {
+        id,
+        name: name.into(),
+        ty,
+        is_mut,
+        is_param: true,
+        align: None,
+    };
+    for function in &mut functions[1..3] {
+        function.params = vec![0, 1];
+        function.param_modes = vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue];
+        function.locals = vec![
+            parameter(0, "output", Ty::Resource(resource), true),
+            parameter(1, "value", Ty::Str, false),
+        ];
+    }
+    functions[3].params = vec![0];
+    functions[3].param_modes = vec![align_ast::ParamMode::ByValue];
+    functions[3].locals = vec![parameter(0, "output", Ty::Resource(resource), false)];
+    functions[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+    for function in &mut functions {
+        function.origin = hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: true,
+        };
+    }
+    let mut program = baseline_program();
+    program.resources = vec![ResourceDef {
+        name: "pkg.template$html_builder".into(),
+        source_name: "pkg.template$html_builder".into(),
+        declaring_module: "pkg.template".into(),
+        generic_arity: 0,
+        drop_hook: "pkg.template.internal.resource$drop_html_builder".into(),
+        drop_thunk: "__align_resource_drop$pkg.template$html_builder".into(),
+        representation_version: 1,
+        drop_abi_fingerprint: *b"align-res-drop-1",
+    }];
+    program.fns = functions;
+    program
+}
+
+#[test]
+fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
+    use crate::validate_hir::TemplateHtmlValidationReason as Reason;
+
+    let program = template_hir_program();
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&program),
+        Ok(())
+    );
+
+    let mut malformed = program.clone();
+    malformed.resources[0].drop_hook.push_str("_wrong");
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Resource)
+    );
+
+    let mut malformed = program.clone();
+    let Some(value) = malformed.fns[1].body.value.as_mut() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    value.ty = Ty::Bool;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::StoredType)
+    );
+
+    let mut malformed = program.clone();
+    malformed.fns[0].origin = hir::FnOrigin::Lifted { capture_count: 0 };
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Origin)
+    );
+
+    let mut malformed = program.clone();
+    malformed.fns[1].param_modes[0] = align_ast::ParamMode::ByValue;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Signature)
+    );
+
+    let mut malformed = program.clone();
+    malformed.fns[1].body.value = Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit)));
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::OperationCount)
+    );
+
+    let mut malformed = program.clone();
+    let Some(operation) = malformed.fns[2].body.value.as_deref().cloned() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    malformed.fns[2].body.stmts.push(hir::Stmt::Expr(operation));
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::OperationCount)
+    );
+
+    let mut imported = baseline_program();
+    imported.resources = program.resources.clone();
+    imported.resources[0].drop_hook =
+        "pkg.template.internal.resource.__align_interface_drop_html_builder".into();
+    imported.imported_fns.push(hir::ImportedFn {
+        name: "pkg.template$write".into(),
+        params: vec![Ty::Resource(0), Ty::Str],
+        param_modes: vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue],
+        ret: Ty::Unit,
+        return_provenance_known: true,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
+        effect: align_sema::FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
+    });
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&imported),
+        Ok(())
+    );
+    imported.imported_fns[0].param_modes[0] = align_ast::ParamMode::ByValue;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&imported),
+        Err(Reason::Signature)
+    );
+
+    let mut malformed = program.clone();
+    let Some(value) = malformed.fns[0].body.value.as_mut() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    value.ty = Ty::Unit;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Resource)
+    );
+
+    let mut malformed = program.clone();
+    let Some(write) = malformed.fns[1].body.value.as_mut() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    assert!(matches!(write.kind, hir::ExprKind::TemplateHtmlWrite { .. }));
+    if let hir::ExprKind::TemplateHtmlWrite { output, value, .. } = &mut write.kind {
+        output.ty = Ty::Raw;
+        value.ty = Ty::Bool;
+    }
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Output)
+    );
+
+    let mut malformed = program.clone();
+    let Some(write) = malformed.fns[1].body.value.as_mut() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    assert!(matches!(write.kind, hir::ExprKind::TemplateHtmlWrite { .. }));
+    if let hir::ExprKind::TemplateHtmlWrite { value, .. } = &mut write.kind {
+        value.ty = Ty::Bool;
+    }
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Value)
+    );
+
+    let mut malformed = program;
+    let Some(value) = malformed.fns[2].body.value.as_mut() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    value.span = align_span::Span::new(0, 2, 1);
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::InvalidSpan)
+    );
+}
+
 #[test]
 fn logger_hir_requires_the_builtin_level_id_and_closed_variant_set() {
     let source = r#"
@@ -11465,10 +11692,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // pkg.ws adds nine checked operation variants; keep this count synchronized with the
-        // exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
+        // pkg.ws adds nine checked operation variants and pkg.template adds four; keep this count
+        // synchronized with the exhaustive validation, source-shape, replay-clone, and
+        // canonical-graph matches.
         variants,
-        311,
+        315,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

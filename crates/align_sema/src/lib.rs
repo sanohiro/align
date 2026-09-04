@@ -7795,6 +7795,223 @@ fn validate_pkg_csv_modules(modules: &[Module], diags: &mut Diagnostics) {
     }
 }
 
+fn ast_type_template_builder(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["html_builder"], &[])
+}
+
+fn ast_type_string(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["string"], &[])
+}
+
+fn ast_type_raw(ty: &ast::Type) -> bool {
+    ast_named_type_is(ty, &["raw"], &[])
+}
+
+fn ast_body_single_expr(body: &ast::FnBody) -> Option<&ast::Expr> {
+    match body {
+        ast::FnBody::Expr(expression) => Some(expression),
+        ast::FnBody::Block(block) => match (block.stmts.as_slice(), block.tail.as_deref()) {
+            ([], Some(expression)) => Some(expression),
+            ([ast::Stmt::Expr(expression)], None) => Some(expression),
+            _ => None,
+        },
+    }
+}
+
+fn ast_template_descriptor_body(body: &ast::FnBody, method: &str, arguments: &[&str]) -> bool {
+    let Some(expression) = ast_body_single_expr(body) else {
+        return false;
+    };
+    let ast::ExprKind::Call { callee, args } = &expression.kind else {
+        return false;
+    };
+    let ast::ExprKind::FieldAccess { recv, field } = &callee.kind else {
+        return false;
+    };
+    field.name == method
+        && flatten_module_path(recv).as_deref() == Some("pkg.template.internal.descriptor")
+        && args.len() == arguments.len()
+        && args.iter().zip(arguments).all(|(argument, expected)| {
+            matches!(&argument.kind, ast::ExprKind::Path(path) if ast_path_is(path, &[*expected]))
+        })
+}
+
+type AstParamContract = (&'static str, ast::ParamMode, fn(&ast::Type) -> bool);
+
+fn ast_template_function_is(
+    item: &ast::Item,
+    name: &str,
+    params: &[AstParamContract],
+    ret: Option<fn(&ast::Type) -> bool>,
+) -> bool {
+    let ast::Item::Fn(function) = item else {
+        return false;
+    };
+    function.vis == ast::Vis::Pub
+        && function.name.name == name
+        && function.type_params.is_empty()
+        && function.params.len() == params.len()
+        && function
+            .params
+            .iter()
+            .zip(params)
+            .all(|(actual, expected)| {
+                actual.name.name == expected.0
+                    && actual.mode == expected.1
+                    && expected.2(&actual.ty)
+            })
+        && match (function.ret.as_ref(), ret) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => expected(actual),
+            _ => false,
+        }
+        && ast_template_descriptor_body(
+            &function.body,
+            name,
+            &params
+                .iter()
+                .map(|parameter| parameter.0)
+                .collect::<Vec<_>>(),
+        )
+}
+
+fn canonical_pkg_template_module(file: &ast::File) -> bool {
+    if file.imports.len() != 2
+        || !ast_path_is(
+            &file.imports[0],
+            &["pkg", "template", "internal", "descriptor"],
+        )
+        || !ast_path_is(
+            &file.imports[1],
+            &["pkg", "template", "internal", "resource"],
+        )
+    {
+        return false;
+    }
+    let [resource, html, write, raw, to_string] = file.items.as_slice() else {
+        return false;
+    };
+    let resource_is_valid = matches!(resource, ast::Item::Resource(declaration)
+    if declaration.vis == ast::Vis::Pub
+        && declaration.name.name == "html_builder"
+        && declaration.type_params.is_empty()
+        && ast_path_is(&declaration.drop_hook, &[
+            "pkg", "template", "internal", "resource", "drop_html_builder"
+        ]));
+    resource_is_valid
+        && ast_template_function_is(html, "html", &[], Some(ast_type_template_builder))
+        && ast_template_function_is(
+            write,
+            "write",
+            &[
+                (
+                    "output",
+                    ast::ParamMode::BorrowMut,
+                    ast_type_template_builder,
+                ),
+                ("value", ast::ParamMode::ByValue, ast_type_str),
+            ],
+            None,
+        )
+        && ast_template_function_is(
+            raw,
+            "raw",
+            &[
+                (
+                    "output",
+                    ast::ParamMode::BorrowMut,
+                    ast_type_template_builder,
+                ),
+                ("value", ast::ParamMode::ByValue, ast_type_str),
+            ],
+            None,
+        )
+        && ast_template_function_is(
+            to_string,
+            "to_string",
+            &[("output", ast::ParamMode::ByValue, ast_type_template_builder)],
+            Some(ast_type_string),
+        )
+}
+
+fn canonical_pkg_template_resource_module(file: &ast::File) -> bool {
+    fn drop_body_is_valid(body: &ast::FnBody) -> bool {
+        let Some(expression) = ast_body_single_expr(body) else {
+            return false;
+        };
+        let ast::ExprKind::Unsafe(block) = &expression.kind else {
+            return false;
+        };
+        let inner = match (block.stmts.as_slice(), block.tail.as_deref()) {
+            ([], Some(inner)) => inner,
+            ([ast::Stmt::Expr(inner)], None) => inner,
+            _ => return false,
+        };
+        let ast::ExprKind::Call { callee, args } = &inner.kind else {
+            return false;
+        };
+        matches!(&callee.kind, ast::ExprKind::Path(path)
+            if ast_path_is(path, &["align_rt_template_html_free_v1"]))
+            && matches!(args.as_slice(), [argument]
+                if matches!(&argument.kind, ast::ExprKind::Path(path)
+                    if ast_path_is(path, &["state"])))
+    }
+
+    let [extern_item, drop_item] = file.items.as_slice() else {
+        return false;
+    };
+    let extern_is_valid = matches!(extern_item, ast::Item::Extern(block)
+        if block.abi == "C" && block.link.is_none()
+            && matches!(block.fns.as_slice(), [function]
+                if function.name.name == "align_rt_template_html_free_v1"
+                    && function.ret.is_none()
+                    && matches!(function.params.as_slice(), [state]
+                        if state.mode == ast::ParamMode::ByValue
+                            && state.name.name == "state"
+                            && ast_type_raw(&state.ty))));
+    let drop_is_valid = matches!(drop_item, ast::Item::Fn(function)
+        if function.vis == ast::Vis::Pub
+            && function.name.name == "drop_html_builder"
+            && function.type_params.is_empty()
+            && function.ret.is_none()
+            && matches!(function.params.as_slice(), [state]
+                if state.mode == ast::ParamMode::ByValue
+                    && state.name.name == "state"
+                    && ast_type_raw(&state.ty))
+            && drop_body_is_valid(&function.body));
+    file.imports.is_empty() && extern_is_valid && drop_is_valid
+}
+
+fn validate_pkg_template_modules(modules: &[Module], diags: &mut Diagnostics) {
+    for module in modules {
+        let valid = match module.path.as_str() {
+            "pkg.template" if !module.interface_only => canonical_pkg_template_module(module.file),
+            "pkg.template.internal.descriptor" if !module.interface_only => {
+                module.file.imports.is_empty() && module.file.items.is_empty()
+            }
+            "pkg.template.internal.resource" if !module.interface_only => {
+                canonical_pkg_template_resource_module(module.file)
+            }
+            _ => continue,
+        };
+        if valid {
+            continue;
+        }
+        let span = module
+            .file
+            .module
+            .as_ref()
+            .map_or_else(|| Span::new(0, 0, 0), |path| path.span);
+        diags.error(
+            format!(
+                "module `{}` must match the canonical package definition",
+                module.path
+            ),
+            span,
+        );
+    }
+}
+
 fn ast_type_row_pair(ty: &ast::Type) -> bool {
     ast_named_type_is(ty, &["RowPair"], &[])
 }
@@ -7988,6 +8205,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
 ) -> CheckedProgram {
     validate_pkg_frame_modules(modules, diags);
     validate_pkg_csv_modules(modules, diags);
+    validate_pkg_template_modules(modules, diags);
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
     // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
@@ -10496,6 +10714,12 @@ fn compact_abstract_nominal_instances(
                 remap_id(struct_id, &remap.structs, valid)
             }
             ExprKind::CsvDecode { row, .. } => remap_ty(row, remap, valid),
+            ExprKind::TemplateHtmlNew { resource }
+            | ExprKind::TemplateHtmlWrite { resource, .. }
+            | ExprKind::TemplateHtmlRaw { resource, .. }
+            | ExprKind::TemplateHtmlToString { resource, .. } => {
+                remap_id(resource, &remap.resources, valid)
+            }
             ExprKind::JsonOwnedEncode { plan, .. }
             | ExprKind::JsonOwnedEncodeBounded { plan, .. }
             | ExprKind::JsonOwnedDecode { plan, .. } => {
@@ -16454,6 +16678,13 @@ impl EffectScan<'_> {
                 walk!(arena);
                 walk!(options);
             }
+            ExprKind::TemplateHtmlNew { .. } => {}
+            ExprKind::TemplateHtmlWrite { output, value, .. }
+            | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                walk!(output);
+                walk!(value);
+            }
+            ExprKind::TemplateHtmlToString { output, .. } => walk!(output),
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => walk!(input),
@@ -20992,6 +21223,12 @@ impl<'a> EscapeCheck<'a> {
                 ExprKind::StructLit { fields, .. } => {
                     work.extend(fields.iter().rev().map(|value| (value, depth)));
                 }
+                // A resource leaf always owns its raw handle through its own Drop thunk. The
+                // enclosing record or fixed record-array is inline storage, so selecting that
+                // leaf cannot turn the handle into arena-owned allocation merely because the
+                // aggregate's conservative joined region is shorter.
+                ExprKind::Field { .. } | ExprKind::ElemField { .. }
+                    if matches!(expression.ty, Ty::Resource(_)) => {}
                 ExprKind::OptionSome(inner)
                 | ExprKind::ResultOk(inner)
                 | ExprKind::ResultErr(inner)
@@ -22677,6 +22914,10 @@ impl<'a> EscapeCheck<'a> {
                     work.push(Work::Eval(arena, depth));
                 }
             }
+            ExprKind::TemplateHtmlNew { .. }
+            | ExprKind::TemplateHtmlWrite { .. }
+            | ExprKind::TemplateHtmlRaw { .. }
+            | ExprKind::TemplateHtmlToString { .. } => values.push(Region::Static),
             // `json.doc(input)` (J4): the tape is arena-allocated, and a decoded `str` view (from
             // `as_str`) borrows the input bytes. So the doc is region-tied to BOTH — the arena and the
             // input — i.e. the shorter of the two (like a str-bearing soa). Nothing escapes either.
@@ -23808,6 +24049,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::CsvDecode { .. }
+            | ExprKind::TemplateHtmlNew { .. }
+            | ExprKind::TemplateHtmlWrite { .. }
+            | ExprKind::TemplateHtmlRaw { .. }
+            | ExprKind::TemplateHtmlToString { .. }
             | ExprKind::JsonDecodeUnion { .. }
             // The `json.doc` ops produce a `json.doc` / `str` / scalar — never a local-backed
             // `slice<u8>`. Their escape is enforced by `tracks_region` + `region_of` (J4).
@@ -27099,6 +27344,13 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(arena, depth);
                 self.walk(options, depth);
             }
+            ExprKind::TemplateHtmlNew { .. } => {}
+            ExprKind::TemplateHtmlWrite { output, value, .. }
+            | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                self.walk(output, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::TemplateHtmlToString { output, .. } => self.walk(output, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
             ExprKind::JsonScan { input, .. } => self.walk(input, depth),
@@ -28054,10 +28306,11 @@ struct MoveCheck<'a> {
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
 /// partial tuple-field move (`a := t.0`, moving one owned element) coexist: each owned tuple field
 /// can be moved out independently, after which the tuple may no longer be used as a whole.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum MovedKey {
     Whole(LocalId),
     Field(LocalId, u32),
+    ElemField(LocalId, u32, Box<[u32]>),
 }
 
 type MovedSet = std::collections::HashSet<MovedKey>;
@@ -29406,9 +29659,10 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CsvDecode { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::SoaColumns)
         }
-        ExprKind::CloneIn { .. } => {
-            StorageVariantPolicy::Fresh(StorageContentInitializer::CloneIn)
+        ExprKind::TemplateHtmlNew { .. } | ExprKind::TemplateHtmlToString { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
+        ExprKind::CloneIn { .. } => StorageVariantPolicy::Fresh(StorageContentInitializer::CloneIn),
         ExprKind::JsonDecode { .. }
         | ExprKind::JsonOwnedDecode { .. }
         | ExprKind::JsonDecodeArray { .. }
@@ -29473,6 +29727,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::BuilderNew { .. }
         | ExprKind::BuilderWrite { .. }
         | ExprKind::BuilderToString(_)
+        | ExprKind::TemplateHtmlWrite { .. }
+        | ExprKind::TemplateHtmlRaw { .. }
         | ExprKind::ArrayZip { .. }
         | ExprKind::Select { .. }
         | ExprKind::VecSumWhere { .. }
@@ -31217,12 +31473,52 @@ type VariantList = Vec<(String, Vec<Scalar>)>;
 
 /// `id` is unusable as a whole if it was wholly moved or *any* of its fields was moved.
 fn whole_moved(moved: &MovedSet, id: LocalId) -> bool {
-    moved.contains(&MovedKey::Whole(id)) || moved.iter().any(|k| matches!(k, MovedKey::Field(l, _) if *l == id))
+    moved.contains(&MovedKey::Whole(id))
+        || moved.iter().any(|key| {
+            matches!(key, MovedKey::Field(local, _) | MovedKey::ElemField(local, _, _) if *local == id)
+        })
+}
+
+/// Element replacement needs the array shell but does not read a previously moved field. A whole
+/// local or outer field move still removes that shell; element-field moves do not.
+fn fixed_element_root_moved(moved: &MovedSet, id: LocalId) -> bool {
+    moved.contains(&MovedKey::Whole(id))
+        || moved
+            .iter()
+            .any(|key| matches!(key, MovedKey::Field(local, _) if *local == id))
+}
+
+/// Replacing one exact fixed-array element reinitializes every owned leaf below that element.
+fn clear_element_moved(moved: &mut MovedSet, id: LocalId, index: u32) {
+    moved.retain(|key| {
+        !matches!(key, MovedKey::ElemField(local, candidate, _) if *local == id && *candidate == index)
+    });
 }
 
 /// Field `n` of `id` is unusable if it (or the whole local) was moved.
 fn field_moved(moved: &MovedSet, id: LocalId, n: u32) -> bool {
     moved.contains(&MovedKey::Field(id, n)) || moved.contains(&MovedKey::Whole(id))
+}
+
+/// A fixed-element projection is unavailable when the same path, one of its parents, or one of
+/// its children was already moved. Sibling leaves remain independent owners.
+fn element_field_moved(
+    moved: &MovedSet,
+    local: LocalId,
+    index: u32,
+    path: &[u32],
+) -> bool {
+    moved.contains(&MovedKey::Whole(local))
+        || moved.iter().any(|key| {
+            matches!(
+                key,
+                MovedKey::ElemField(candidate, candidate_index, candidate_path)
+                    if *candidate == local
+                        && *candidate_index == index
+                        && (candidate_path.starts_with(path)
+                            || path.starts_with(candidate_path))
+            )
+        })
 }
 
 /// Whether a match scrutinee's result is assembled through a control-flow join. When an outer arm
@@ -31245,7 +31541,15 @@ fn match_scrutinee_materializes_result(e: &Expr) -> bool {
 
 /// Re-binding a local (`x := …`) clears every move record for it (whole and per-field).
 fn clear_moved(moved: &mut MovedSet, id: LocalId) {
-    moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
+    moved.retain(|key| {
+        !matches!(
+            key,
+            MovedKey::Whole(local)
+                | MovedKey::Field(local, _)
+                | MovedKey::ElemField(local, _, _)
+                if *local == id
+        )
+    });
 }
 
 fn borrowed_projection_locals(body: &hir::Block) -> std::collections::HashSet<LocalId> {
@@ -36554,6 +36858,10 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
+            ExprKind::TemplateHtmlNew { .. }
+            | ExprKind::TemplateHtmlWrite { .. }
+            | ExprKind::TemplateHtmlRaw { .. }
+            | ExprKind::TemplateHtmlToString { .. } => BorrowRoots::new(),
             // A decoded shape-directed union (J1b) borrows the input only if a variant payload is a
             // `str` view (or a `str`-bearing object) — then its live view is rooted in the input;
             // a scalar-only union borrows nothing.
@@ -38176,7 +38484,7 @@ impl<'a> MoveCheck<'a> {
         // iteration. `probe`'s end state includes it (statements are walked linearly), so zero the
         // back-edge in that case.
         let back_edge: MovedSet = if probe_falls_through {
-            probe.difference(&entry).copied().collect()
+            probe.difference(&entry).cloned().collect()
         } else {
             MovedSet::new()
         };
@@ -38438,12 +38746,18 @@ impl<'a> MoveCheck<'a> {
                 }
                 Stmt::AssignElem { base, index, value, .. } => {
                     self.check_borrow_use(*base, index.span);
-                    if whole_moved(moved, *base) {
+                    if fixed_element_root_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    if let ExprKind::Int(value) = index.kind
+                        && value >= 0
+                        && let Ok(index) = u32::try_from(value)
+                    {
+                        clear_element_moved(moved, *base, index);
+                    }
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
                     }
@@ -38646,6 +38960,7 @@ impl<'a> MoveCheck<'a> {
                         )
                         .needs_drop())
                         || is_move_handle(expression.ty)
+                        || matches!(expression.ty, Ty::Resource(_))
                         || matches!(
                             expression.ty,
                             Ty::Enum(id)
@@ -38683,6 +38998,41 @@ impl<'a> MoveCheck<'a> {
                             expression.span,
                         );
                     }
+                    return;
+                }
+                ExprKind::ElemField {
+                    recv, index, path, ..
+                } if !path.is_empty() => {
+                    let ExprKind::Local(base) = recv.kind else {
+                        return;
+                    };
+                    let Some(index) = (match index.kind {
+                        ExprKind::Int(value) if value >= 0 => u32::try_from(value).ok(),
+                        _ => None,
+                    }) else {
+                        self.diags.error(
+                            "moving an owned field out of a fixed array requires a constant index"
+                                .to_string(),
+                            expression.span,
+                        );
+                        return;
+                    };
+                    if self.borrowed_param_mode(base).is_some() {
+                        let name = &self.f.locals[base as usize].name;
+                        self.diags.error(
+                            format!("cannot move an element field out of borrowed parameter '{name}'"),
+                            expression.span,
+                        );
+                        return;
+                    }
+                    self.reject_live_resource_dependents(base, moved, expression.span);
+                    self.invalidate_mutable_place(base, &[]);
+                    self.invalidate_owner(base);
+                    moved.insert(MovedKey::ElemField(
+                        base,
+                        index,
+                        path.clone().into_boxed_slice(),
+                    ));
                     return;
                 }
                 ExprKind::Block(block)
@@ -42108,6 +42458,7 @@ impl<'a> MoveCheck<'a> {
                                 && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
                                     .needs_drop())
                             || is_move_handle(e.ty)
+                            || matches!(e.ty, Ty::Resource(_))
                             || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
                         if self.borrowed_projection_locals.contains(base) {
@@ -42507,11 +42858,69 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
-            // the index.
-            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
+            // `recv[index]` borrows the receiver (reads an element) and reads the index.
+            ExprKind::Index { recv, index } => {
                 move_expr!(self, recv, moved, false, false);
                 move_expr!(self, index, moved, false, false);
+            }
+            ExprKind::ElemField {
+                recv, index, path, ..
+            } => {
+                if let ExprKind::Local(base) = recv.kind
+                    && !path.is_empty()
+                {
+                    self.check_borrow_use(base, e.span);
+                    let exact_index = match index.kind {
+                        ExprKind::Int(value) if value >= 0 => u32::try_from(value).ok(),
+                        _ => None,
+                    };
+                    let already_moved = moved.contains(&MovedKey::Whole(base))
+                        || exact_index.is_some_and(|index| {
+                            element_field_moved(moved, base, index, path)
+                        })
+                        || exact_index.is_none()
+                            && moved.iter().any(|key| {
+                                matches!(key, MovedKey::ElemField(local, _, _) if *local == base)
+                            });
+                    if already_moved {
+                        let name = &self.f.locals[base as usize].name;
+                        self.diags
+                            .error(format!("use of moved element field of '{name}'"), e.span);
+                    }
+                    move_expr!(self, index, moved, false, false);
+                    if consuming && self.is_move_ty(e.ty) {
+                        let Some(index) = exact_index else {
+                            self.diags.error(
+                                "moving an owned field out of a fixed array requires a constant index"
+                                    .to_string(),
+                                e.span,
+                            );
+                            return true;
+                        };
+                        if self.borrowed_param_mode(base).is_some() {
+                            let name = &self.f.locals[base as usize].name;
+                            self.diags.error(
+                                format!("cannot move an element field out of borrowed parameter '{name}'"),
+                                e.span,
+                            );
+                            return true;
+                        }
+                        self.reject_live_resource_dependents(base, moved, e.span);
+                        // Mutable-place reservations use struct-field-only paths. Conservatively
+                        // ending the fixed-array root closes every alias before the selected
+                        // element resource is transferred.
+                        self.invalidate_mutable_place(base, &[]);
+                        self.invalidate_owner(base);
+                        moved.insert(MovedKey::ElemField(
+                            base,
+                            index,
+                            path.clone().into_boxed_slice(),
+                        ));
+                    }
+                } else {
+                    move_expr!(self, recv, moved, false, false);
+                    move_expr!(self, index, moved, false, false);
+                }
             }
             ExprKind::BorrowedIndex { base, index } => {
                 self.check_borrow_use(base.root_local, e.span);
@@ -42900,6 +43309,15 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, arena, moved, false, false);
                 move_expr!(self, options, moved, false, false);
                 self.parallel_transfer_roots.extend(self.storage_roots(arena));
+            }
+            ExprKind::TemplateHtmlNew { .. } => {}
+            ExprKind::TemplateHtmlWrite { output, value, .. }
+            | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                move_expr!(self, output, moved, false, false);
+                move_expr!(self, value, moved, false, false);
+            }
+            ExprKind::TemplateHtmlToString { output, .. } => {
+                move_expr!(self, output, moved, true, true);
             }
             // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
             ExprKind::JsonScan { input, .. } => move_expr!(self, input, moved, false, false),
@@ -47649,9 +48067,21 @@ impl<'a, 't> Checker<'a, 't> {
         if !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
             return;
         }
+        let template_move_borrow = mode == ast::ParamMode::BorrowMut
+            && matches!(
+                display,
+                "pkg.template.write"
+                    | "pkg.template.raw"
+                    | "pkg.template$write"
+                    | "pkg.template$raw"
+            );
         let root = match &argument.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Field { root, .. } => Some(*root),
+            ExprKind::ElemField { recv, .. } => match recv.kind {
+                ExprKind::Local(local) => Some(local),
+                _ => None,
+            },
             ExprKind::BorrowedIndex { base, .. } if mode == ast::ParamMode::Borrow => {
                 Some(base.root_local)
             }
@@ -47675,11 +48105,27 @@ impl<'a, 't> Checker<'a, 't> {
                 self.enums,
                 self.tagged_types,
             )
+            && !template_move_borrow
         {
             self.diags.error(
                 format!(
                     "cannot exclusively borrow a partial Move field for '{display}'; borrow the whole owner"
                 ),
+                argument.span,
+            );
+        }
+        if matches!(argument.kind, ExprKind::ElemField { .. })
+            && ty_is_move(
+                argument.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            && !template_move_borrow
+        {
+            self.diags.error(
+                format!("cannot borrow a Move field from a fixed array for '{display}'"),
                 argument.span,
             );
         }
@@ -49342,23 +49788,25 @@ impl<'a, 't> Checker<'a, 't> {
                         || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
                 })
         });
-        if !leftmost_is_local
-            && let Some(modpath) = flatten_module_path(recv) {
-                if modpath == "pkg.db.internal.descriptor" {
-                    return self.check_static_descriptor_op(method, args, expected, span);
-                }
-                if modpath == "pkg.csv.internal.descriptor" && method == "decode" {
-                    return self.check_csv_decode_op(args, expected, span);
-                }
-                match self.resolve_qualified_fn(&modpath, method, span) {
-                    Ok(Some(mangled)) => {
-                        let display = format!("{modpath}.{method}");
-                        return self.check_named_call(mangled, display, args, expected, span);
-                    }
-                    Ok(None) => {}
-                    Err(()) => return err,
-                }
+        if !leftmost_is_local && let Some(modpath) = flatten_module_path(recv) {
+            if modpath == "pkg.db.internal.descriptor" {
+                return self.check_static_descriptor_op(method, args, expected, span);
             }
+            if modpath == "pkg.csv.internal.descriptor" && method == "decode" {
+                return self.check_csv_decode_op(args, expected, span);
+            }
+            if modpath == "pkg.template.internal.descriptor" {
+                return self.check_template_descriptor_op(method, args, expected, span);
+            }
+            match self.resolve_qualified_fn(&modpath, method, span) {
+                Ok(Some(mangled)) => {
+                    let display = format!("{modpath}.{method}");
+                    return self.check_named_call(mangled, display, args, expected, span);
+                }
+                Ok(None) => {}
+                Err(()) => return err,
+            }
+        }
         // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
         if parse_int_arith(method).is_some() {
             return self.check_int_arith_method(recv, method, args, span);
@@ -50249,6 +50697,137 @@ impl<'a, 't> Checker<'a, 't> {
             },
             ty: result_ty,
             span,
+        }
+    }
+
+    /// Closed compiler/package bridge for the four canonical `pkg.template` wrappers. The empty
+    /// descriptor module exposes no ordinary function, so only this exact producer module can form
+    /// the checked HIR operations.
+    fn check_template_descriptor_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        if self.cur_module != "pkg.template" {
+            self.diags.error(
+                "template descriptor operations are compiler-private to the canonical `pkg.template` wrappers"
+                    .to_owned(),
+                span,
+            );
+            return err();
+        }
+        if !self
+            .user_imports
+            .contains("pkg.template.internal.descriptor")
+        {
+            self.diags.error(
+                "template descriptor operations require `import pkg.template.internal.descriptor`"
+                    .to_owned(),
+                span,
+            );
+            return err();
+        }
+        let Some(&resource) = self.resource_ids.get("pkg.template$html_builder") else {
+            self.diags.error(
+                "canonical `pkg.template.html_builder` is unavailable".to_owned(),
+                span,
+            );
+            return err();
+        };
+        let resource_ty = Ty::Resource(resource);
+        match method {
+            "html" => {
+                if !args.is_empty() {
+                    self.diags.error(
+                        format!(
+                            "template descriptor operation 'html' expects 0 argument(s), got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                    return err();
+                }
+                self.constrain(resource_ty, expected, span);
+                Expr {
+                    kind: ExprKind::TemplateHtmlNew { resource },
+                    ty: resource_ty,
+                    span,
+                }
+            }
+            "write" | "raw" => {
+                let [output_ast, value_ast] = args else {
+                    self.diags.error(
+                        format!("template descriptor operation '{method}' expects 2 argument(s), got {}", args.len()),
+                        span,
+                    );
+                    return err();
+                };
+                let output = self.check_expr(output_ast, Some(resource_ty));
+                let value = self.check_str_init(value_ast);
+                if output.ty == Ty::Error || value.ty == Ty::Error {
+                    return err();
+                }
+                if !self.source_ty_matches(output.ty, resource_ty)
+                    || !self.source_ty_matches(value.ty, Ty::Str)
+                {
+                    return err();
+                }
+                self.constrain(Ty::Unit, expected, span);
+                let kind = if method == "write" {
+                    ExprKind::TemplateHtmlWrite {
+                        resource,
+                        output: Box::new(output),
+                        value: Box::new(value),
+                    }
+                } else {
+                    ExprKind::TemplateHtmlRaw {
+                        resource,
+                        output: Box::new(output),
+                        value: Box::new(value),
+                    }
+                };
+                Expr {
+                    kind,
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
+            "to_string" => {
+                let [output_ast] = args else {
+                    self.diags.error(
+                        format!("template descriptor operation 'to_string' expects 1 argument(s), got {}", args.len()),
+                        span,
+                    );
+                    return err();
+                };
+                let output = self.check_expr(output_ast, Some(resource_ty));
+                if output.ty == Ty::Error || !self.source_ty_matches(output.ty, resource_ty) {
+                    return err();
+                }
+                self.constrain(Ty::String, expected, span);
+                Expr {
+                    kind: ExprKind::TemplateHtmlToString {
+                        resource,
+                        output: Box::new(output),
+                    },
+                    ty: Ty::String,
+                    span,
+                }
+            }
+            _ => {
+                self.diags.error(
+                    format!("unknown template descriptor operation '{method}'"),
+                    span,
+                );
+                err()
+            }
         }
     }
 
@@ -52713,7 +53292,9 @@ impl<'a, 't> Checker<'a, 't> {
             self.tuples,
             self.enums,
             self.tagged_types,
-        ) {
+        ) && !matches!(elem_ty, Ty::Struct(id)
+            if struct_is_move(id, self.structs, self.enums, self.tagged_types))
+        {
             self.diags.error(
                 "a resource or resource_ref cannot be an element of a fixed array".to_string(),
                 span,
@@ -52895,18 +53476,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // element's stride keeps the alignment. (A *dynamic* `array<align(N)Struct>` stays
                 // rejected — its heap buffer over-alignment is a separate, still-deferred concern.)
                 Some(id) => {
-                    if ty_mentions_resource(
-                        Ty::Struct(id),
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    ) {
-                        self.diags.error(
-                            "a resource or resource_ref cannot be an element of a fixed array"
-                                .to_string(),
-                            span,
-                        );
+                    if self.reject_fixed_array_element(Ty::Struct(id), span) {
                         Expr {
                             kind: ExprKind::Bool(false),
                             ty: Ty::Error,
@@ -61805,7 +62375,9 @@ impl<'a, 't> Checker<'a, 't> {
         // Fail closed for every other Move leaf. A runtime element index cannot record which
         // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
         // both the result and the array owning the same payload.
-        if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop() {
+        if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
+            && !matches!(leaf_ty, Ty::Resource(_))
+        {
             self.diags.error(
                 format!(
                     "reading a Move-type field {} out of an array element is not supported yet",
@@ -63315,6 +63887,13 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(arena);
                 self.finalize_expr(options);
             }
+            ExprKind::TemplateHtmlNew { .. } => {}
+            ExprKind::TemplateHtmlWrite { output, value, .. }
+            | ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                self.finalize_expr(output);
+                self.finalize_expr(value);
+            }
+            ExprKind::TemplateHtmlToString { output, .. } => self.finalize_expr(output),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
             ExprKind::JsonScan { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
@@ -69535,10 +70114,11 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.ws` adds nine checked operation variants. The wildcard-free policy above classifies
-        // them explicitly beside the existing package and core operations.
+        // `pkg.ws` adds nine checked operation variants and `pkg.template` adds four. The
+        // wildcard-free policy above classifies them explicitly beside the existing package and
+        // core operations.
         assert_eq!(
-            variants, 311,
+            variants, 315,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

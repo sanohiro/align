@@ -434,13 +434,15 @@ facts must live in this repository.
   `http_upgrade` Move handle. The implementation boundary also adds four allocation-free repeated
   header/token queries, one HTTP-version/residual readiness query, one checked 101 transfer, exact
   transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its eleven active keys
-  reuse existing ABI shapes. The current inventory is 342 keyed plus 18 unkeyed records, 13 of
+  reuse existing ABI shapes. At that boundary the inventory was 342 keyed plus 18 unkeyed records, 13 of
   those source-reachable: 360 base exports, 367 with the seven-row allocation probe, 364 with the
   four-row parallel probe, and 371 with both.
-  A124 remains the next unused active shape.
-- **Next package implementation capability:** `pkg.template` has an accepted public ledger and
-  implementation closure matrix in `docs/impl/pkg-design/template.md`. It remains unimplemented;
-  the implementation must close that matrix in one consumer-complete capability.
+  A124 remained the next unused active shape.
+- **Latest package implementation capability:** `pkg.template` is implemented as one opaque Move
+  HTML builder with default escaping, explicit raw append, and zero-copy consuming finish. Its
+  five keyed exports reuse existing ABI shapes, bringing the current inventory to 347 keyed and
+  365 base records, with 376 in the maximum optional-probe table. A124 remains unused. Its accepted
+  ledger and closed implementation matrix are `docs/impl/pkg-design/template.md`.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.
