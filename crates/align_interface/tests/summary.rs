@@ -1044,9 +1044,14 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     };
     assert_eq!(
         validate_for_import(&non_borrowing_root),
-        Ok(()),
-        "Move parameters may supply ownership provenance even when they carry no borrowed field"
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "by-value self-owned Move storage is not external borrow provenance"
     );
+    non_borrowing_root.fns[0].params[0].mode = ParamMode::Borrow;
+    assert_eq!(validate_for_import(&non_borrowing_root), Ok(()));
+    non_borrowing_root.fns[0].params[0].mode = ParamMode::BorrowMut;
+    assert_eq!(validate_for_import(&non_borrowing_root), Ok(()));
+    non_borrowing_root.fns[0].params[0].mode = ParamMode::ByValue;
 
     non_borrowing_root.fns[0].params[0].ty = IType::Named {
         path: "Option".to_string(),
@@ -1060,9 +1065,33 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     };
     assert_eq!(
         validate_for_import(&non_borrowing_root),
-        Ok(()),
-        "region-owned Move builtins may supply provenance without a cleanup bit"
+        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+        "by-value non-cleanup Move carriers are not external borrow provenance"
     );
+    non_borrowing_root.fns[0].params[0].mode = ParamMode::Borrow;
+    assert_eq!(validate_for_import(&non_borrowing_root), Ok(()));
+    non_borrowing_root.fns[0].params[0].mode = ParamMode::ByValue;
+
+    non_borrowing_root.fns[0].params[0].ty = IType::Named {
+        path: "xml.reader".to_string(),
+        args: vec![],
+    };
+    for mode in [ParamMode::ByValue, ParamMode::Out] {
+        non_borrowing_root.fns[0].params[0].mode = mode;
+        assert_eq!(
+            validate_for_import(&non_borrowing_root),
+            Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+            "{mode:?} xml.reader must not authenticate a returned view root"
+        );
+    }
+    for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
+        non_borrowing_root.fns[0].params[0].mode = mode;
+        assert_eq!(
+            validate_for_import(&non_borrowing_root),
+            Ok(()),
+            "{mode:?} xml.reader supplies caller-owned provenance"
+        );
+    }
 
     for builtin in [
         "Error",
@@ -1209,6 +1238,58 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
         validate_for_import(&nested_scalar_return),
         Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType)
     );
+
+    let mut reader_carriers = base.clone();
+    let mut concrete = reader_carriers
+        .structs
+        .iter()
+        .find(|definition| definition.name == "Wrapper")
+        .expect("Wrapper definition")
+        .clone();
+    concrete.name = "ConcreteReader".to_string();
+    concrete.type_params.clear();
+    concrete.generic_body = None;
+    concrete.fields[0].1 = IType::Named {
+        path: "xml.reader".to_string(),
+        args: vec![],
+    };
+    reader_carriers.structs.push(concrete);
+    sync_generic_type_bodies(&mut reader_carriers);
+    let reader = IType::Named {
+        path: "xml.reader".to_string(),
+        args: vec![],
+    };
+    for carrier in [
+        IType::Named {
+            path: "ConcreteReader".to_string(),
+            args: vec![],
+        },
+        IType::Named {
+            path: "Wrapper".to_string(),
+            args: vec![reader],
+        },
+    ] {
+        for mode in [ParamMode::ByValue, ParamMode::Out] {
+            let mut summary = reader_carriers.clone();
+            summary.fns[0].params[0].ty = carrier.clone();
+            summary.fns[0].params[0].mode = mode;
+            assert_eq!(
+                validate_for_import(&summary),
+                Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
+                "{mode:?} XML reader carrier must not authenticate returned-view provenance"
+            );
+        }
+        for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
+            let mut summary = reader_carriers.clone();
+            summary.fns[0].params[0].ty = carrier.clone();
+            summary.fns[0].params[0].mode = mode;
+            assert_eq!(
+                validate_for_import(&summary),
+                Ok(()),
+                "{mode:?} XML reader carrier supplies caller-owned provenance"
+            );
+        }
+    }
 
     let mut borrowing = base;
     borrowing.fns[0].params[0].ty = named("Outer", "str");

@@ -530,7 +530,7 @@ fn main() -> i32 = 0
         .enums
         .iter_mut()
         .find(|definition| definition.name == "xml.event")
-        .expect("builtin xml.event definition");
+        .unwrap_or_else(|| panic!("missing builtin xml.event definition"));
     event.variants.swap(0, 1);
     assert!(!body_core_metadata_is_valid(&wrong_event));
 

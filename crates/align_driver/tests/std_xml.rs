@@ -130,6 +130,61 @@ pub fn main() {
 }
 
 #[test]
+fn xml_parse_authenticates_owned_field_tagged_and_control_producers() {
+    if !backend_available() {
+        return;
+    }
+    let source = r#"import std.xml
+Holder { value: string }
+Choice { Text(string), Empty }
+fn keep_error(error: Error) -> Error = error
+fn name(reader: xml.reader) -> Result<string, Error> {
+  mut current := reader
+  event := current.next() else { return Err(Error.Invalid) }
+  return Ok(current.name().clone())
+}
+fn field(holder: Holder) -> Result<xml.reader, Error> = xml.parse(holder.value)
+fn optional(value: Option<string>) -> Result<xml.reader, Error> {
+  selected := value else { return Err(Error.Invalid) }
+  return xml.parse(selected)
+}
+fn fallible(value: Result<string, Error>) -> Result<xml.reader, Error> {
+  selected := value.map_err(keep_error)?
+  return xml.parse(selected)
+}
+fn branch(flag: bool) -> Result<xml.reader, Error> = xml.parse(if flag { "<if/>".clone() } else { "<else/>".clone() })
+fn selected(value: Choice) -> Result<xml.reader, Error> {
+  source := match value {
+    Text(text) => text
+    Empty => { return Err(Error.Invalid) }
+  }
+  return xml.parse(source)
+}
+fn looped() -> Result<xml.reader, Error> = xml.parse(loop { break "<loop/>".clone() })
+pub fn main() -> Result<(), Error> {
+  print(name(field(Holder { value: "<field/>".clone() })?)?)
+  print(name(optional(Some("<option/>".clone()))?)?)
+  print(name(fallible(Ok("<result/>".clone()))?)?)
+  print(name(branch(true)?)?)
+  print(name(selected(Choice.Text("<match/>".clone()))?)?)
+  print(name(looped()?)?)
+  return Ok(())
+}
+"#;
+    let output = build_and_run("std-xml-producer-paths", source);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "field\noption\nresult\nif\nmatch\nloop\n",
+    );
+}
+
+#[test]
 fn xml_surface_enforces_import_mutability_bound_receivers_and_cursor_views() {
     for (name, source) in [
         (
@@ -262,11 +317,11 @@ fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
     let files = &[
         (
             "xml_support.align",
-            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub Concrete { Value(xml.reader), Empty }\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn carry_concrete(reader: xml.reader) -> Concrete = Concrete.Value(reader)\npub fn current_name(borrow reader: xml.reader) -> str = reader.name()\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
+            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub Concrete { Value(xml.reader), Empty }\npub fn source() -> string = \"<branch/>\".clone()\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn carry_concrete(reader: xml.reader) -> Concrete = Concrete.Value(reader)\npub fn current_name(borrow reader: xml.reader) -> str = reader.name()\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
         ),
         (
             "main.align",
-            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  concrete := xml_support.parse(\"<leaf/>\".clone())?\n  match xml_support.carry_concrete(concrete) {\n    Value(reader4) => print(xml_support.root_name(reader4)?)\n    Empty => print(\"empty\")\n  }\n  return Ok(())\n}\n",
+            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  concrete := xml_support.parse(\"<leaf/>\".clone())?\n  match xml_support.carry_concrete(concrete) {\n    Value(reader4) => print(xml_support.root_name(reader4)?)\n    Empty => print(\"empty\")\n  }\n  imported_source := xml.parse(xml_support.source())?\n  print(xml_support.root_name(imported_source)?)\n  return Ok(())\n}\n",
         ),
     ];
     let differential = diff_check_multi("std-xml-interface", files, "main.align");
@@ -327,7 +382,10 @@ fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
         let output =
             build_per_unit_multi("std-xml-interface-run", files, "main.align").link_and_run();
         assert_eq!(output.status.code(), Some(0));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "root\nleaf\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "root\nleaf\nbranch\n"
+        );
     }
 }
 
@@ -361,6 +419,42 @@ pub fn main() -> Result<(), Error> {
     );
     let mir = align_driver::try_lower_to_mir(&checked.hir).expect("checked XML HIR must validate");
     let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("LLVM IR");
+    for fragment in [
+        "switch i32 %xml.parse.status, label %xml.parse.abort",
+        "i32 0, label %xml.parse.ok",
+        "i32 -1, label %xml.parse.invalid",
+        "%xml.parse.cleanup = phi i1 [ true, %xml.parse.ok ], [ false, %xml.parse.invalid ]",
+        "switch i32 %xml.next.status, label %xml.next.abort",
+        "i32 0, label %xml.next.none",
+        "i32 1, label %xml.next.start",
+        "i32 2, label %xml.next.end",
+        "i32 3, label %xml.next.text",
+        "[ { i8 1, %xml.event zeroinitializer }, %xml.next.start ]",
+        "[ { i8 1, %xml.event { i32 1 } }, %xml.next.end ]",
+        "[ { i8 1, %xml.event { i32 2 } }, %xml.next.text ]",
+        "%xml.attribute_count.nonnegative = icmp sge i64 %xml.attribute_count, 0",
+        "%xml.attribute_count.bounded = icmp sle i64 %xml.attribute_count, 256",
+    ] {
+        assert!(
+            llvm.contains(fragment),
+            "missing atomic XML status/result fragment `{fragment}`:\n{llvm}"
+        );
+    }
+    for operation in [
+        "xml_name",
+        "xml_attribute_name",
+        "xml_attribute_value",
+        "xml_text",
+    ] {
+        assert!(
+            llvm.contains(&format!("%{operation}.valid = icmp eq i32 %{operation}.status, 0")),
+            "{operation} must accept only zero:\n{llvm}"
+        );
+        assert!(
+            llvm.contains(&format!("{operation}.invalid:")),
+            "{operation} must have one invalid-status abort edge:\n{llvm}"
+        );
+    }
     for symbol in [
         "align_rt_xml_parse",
         "align_rt_xml_next",

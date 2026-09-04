@@ -766,29 +766,34 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::LogLine(logger, level, message) => format!("log_line({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogLineBuilder(logger, level, message) => format!("log_line_builder({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogFlush(logger) => format!("log_flush({})", operand_str(logger)),
-        Rvalue::XmlParse { input, out } => {
-            format!("xml_parse({}, -> _{out})", operand_str(input))
+        Rvalue::XmlParse {
+            input,
+            error_enum,
+            cleanup,
+        } => {
+            format!(
+                "xml_parse({}, error_enum={}, cleanup=%{})",
+                operand_str(input), error_enum, cleanup
+            )
         }
-        Rvalue::XmlNext(reader) => format!("xml_next({})", operand_str(reader)),
-        Rvalue::XmlName { reader, out } => {
-            format!("xml_name({}, -> _{out})", operand_str(reader))
+        Rvalue::XmlNext { reader, event_enum } => {
+            format!("xml_next({}, event_enum={})", operand_str(reader), event_enum)
         }
+        Rvalue::XmlName { reader } => format!("xml_name({})", operand_str(reader)),
         Rvalue::XmlAttributeCount(reader) => {
             format!("xml_attribute_count({})", operand_str(reader))
         }
-        Rvalue::XmlAttributeName { reader, index, out } => format!(
-            "xml_attribute_name({}, {}, -> _{out})",
+        Rvalue::XmlAttributeName { reader, index } => format!(
+            "xml_attribute_name({}, {})",
             operand_str(reader),
             operand_str(index)
         ),
-        Rvalue::XmlAttributeValue { reader, index, out } => format!(
-            "xml_attribute_value({}, {}, -> _{out})",
+        Rvalue::XmlAttributeValue { reader, index } => format!(
+            "xml_attribute_value({}, {})",
             operand_str(reader),
             operand_str(index)
         ),
-        Rvalue::XmlText { reader, out } => {
-            format!("xml_text({}, -> _{out})", operand_str(reader))
-        }
+        Rvalue::XmlText { reader } => format!("xml_text({})", operand_str(reader)),
         Rvalue::CodecOpen(input) => format!("codec_open({})", operand_str(input)),
         Rvalue::CodecBatchRows(batch) => format!("codec_batch_rows({})", operand_str(batch)),
         Rvalue::CodecBatchColumns(batch) => {

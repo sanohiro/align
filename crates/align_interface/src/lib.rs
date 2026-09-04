@@ -1931,6 +1931,16 @@ impl<'a> CapabilityAnalysis<'a> {
             || self.contains_noncleanup_move_builtin(ty)
     }
 
+    fn parameter_may_supply_return_provenance(
+        &self,
+        parameter: &IParam,
+        type_params: &[ITypeParam],
+    ) -> bool {
+        self.may_borrow(&parameter.ty, type_params)
+            || (matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+                && self.may_supply_return_provenance(&parameter.ty, type_params))
+    }
+
     fn contains_noncleanup_move_builtin(&self, ty: &IType) -> bool {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
@@ -2395,7 +2405,7 @@ fn validate_import_summaries(
     let ret_may_supply_provenance = analysis.may_supply_return_provenance(ret, type_params);
     let param_may_supply_provenance = params
         .iter()
-        .map(|param| analysis.may_supply_return_provenance(&param.ty, type_params))
+        .map(|param| analysis.parameter_may_supply_return_provenance(param, type_params))
         .collect::<Vec<_>>();
     for roots in [
         match borrow {
@@ -2421,7 +2431,7 @@ fn validate_import_summaries(
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            let Some((parameter, &may_supply_provenance)) = params
+            let Some((_, &may_supply_provenance)) = params
                 .get(index as usize)
                 .zip(param_may_supply_provenance.get(index as usize))
             else {
@@ -2429,9 +2439,7 @@ fn validate_import_summaries(
                     index,
                 ));
             };
-            if !may_supply_provenance
-                && !matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
-            {
+            if !may_supply_provenance {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));

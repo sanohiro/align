@@ -4167,17 +4167,291 @@ fn validate_template_html_mir_signatures(program: &Program) -> Result<(), Codege
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XmlAccessProvenance {
+    Owned,
+    Shared,
+    Exclusive,
+    Unreadable,
+    Mixed,
+    Unknown,
+}
+
+struct XmlSlotStores<'a> {
+    roots: Vec<Vec<&'a Operand>>,
+    fields: Vec<Vec<(&'a [u32], &'a Operand)>>,
+}
+
+struct XmlAccessGraph<'a> {
+    function: &'a align_mir::Function,
+    program: &'a Program,
+    value_definitions: &'a [Option<&'a Rvalue>],
+    duplicate_values: &'a [bool],
+    slot_stores: &'a XmlSlotStores<'a>,
+}
+
+fn merge_xml_access(
+    current: Option<XmlAccessProvenance>,
+    next: XmlAccessProvenance,
+) -> Option<XmlAccessProvenance> {
+    Some(match current {
+        None => next,
+        Some(current) if current == next => current,
+        Some(current @ (XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed)) => current,
+        Some(_) if matches!(next, XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed) => next,
+        Some(_) => XmlAccessProvenance::Mixed,
+    })
+}
+
+fn xml_argument_access(
+    function: &align_mir::Function,
+    index: u32,
+) -> XmlAccessProvenance {
+    match function.param_modes.get(index as usize) {
+        Some(align_ast::ParamMode::ByValue) => XmlAccessProvenance::Owned,
+        Some(align_ast::ParamMode::Borrow) => XmlAccessProvenance::Shared,
+        Some(align_ast::ParamMode::BorrowMut) => XmlAccessProvenance::Exclusive,
+        Some(align_ast::ParamMode::Out) => XmlAccessProvenance::Unreadable,
+        None => XmlAccessProvenance::Unknown,
+    }
+}
+
+fn xml_call_return_access(
+    graph: &XmlAccessGraph<'_>,
+    args: &[Operand],
+    borrow: &hir::ReturnBorrowSummary,
+    region: &hir::ReturnRegionSummary,
+    visiting: &mut HashSet<(bool, u32)>,
+) -> XmlAccessProvenance {
+    let mut roots = Vec::new();
+    if let hir::ReturnBorrowSummary::Roots { params, captures } = borrow {
+        if !captures.is_empty() {
+            return XmlAccessProvenance::Unknown;
+        }
+        roots.extend(params.iter().copied());
+    }
+    if let hir::ReturnRegionSummary::Roots { params, captures } = region {
+        if !captures.is_empty() {
+            return XmlAccessProvenance::Unknown;
+        }
+        roots.extend(params.iter().copied());
+    }
+    if roots.is_empty() {
+        return XmlAccessProvenance::Owned;
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+        .into_iter()
+        .try_fold(None, |current, root| {
+            let operand = args.get(root as usize)?;
+            Some(merge_xml_access(
+                current,
+                xml_operand_access(graph, operand, visiting),
+            ))
+        })
+        .flatten()
+        .unwrap_or(XmlAccessProvenance::Unknown)
+}
+
+fn xml_operand_access(
+    graph: &XmlAccessGraph<'_>,
+    operand: &Operand,
+    visiting: &mut HashSet<(bool, u32)>,
+) -> XmlAccessProvenance {
+    match operand {
+        Operand::Arg(index) => xml_argument_access(graph.function, *index),
+        Operand::Const(_) => XmlAccessProvenance::Owned,
+        Operand::BorrowedPlace(_)
+        | Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedFixedElementPlace(_)
+        | Operand::BorrowedCleanupArg(_) => XmlAccessProvenance::Unknown,
+        Operand::Value(value) => {
+            let Some(definition) = graph.value_definitions.get(*value as usize) else {
+                return XmlAccessProvenance::Unknown;
+            };
+            if graph.duplicate_values.get(*value as usize) != Some(&false)
+                || !visiting.insert((false, *value))
+            {
+                return XmlAccessProvenance::Unknown;
+            }
+            let access = definition.map_or(XmlAccessProvenance::Unknown, |rvalue| {
+                xml_rvalue_access(graph, rvalue, visiting)
+            });
+            visiting.remove(&(false, *value));
+            access
+        }
+    }
+}
+
+fn xml_slot_access(
+    graph: &XmlAccessGraph<'_>,
+    slot: Slot,
+    path: Option<&[u32]>,
+    visiting: &mut HashSet<(bool, u32)>,
+) -> XmlAccessProvenance {
+    let (Some(root_stores), Some(field_stores)) = (
+        graph.slot_stores.roots.get(slot as usize),
+        graph.slot_stores.fields.get(slot as usize),
+    ) else {
+        return XmlAccessProvenance::Unknown;
+    };
+    if !visiting.insert((true, slot)) {
+        return XmlAccessProvenance::Unknown;
+    }
+    let relevant = root_stores.iter().copied().chain(
+        field_stores
+            .iter()
+            .filter(|(stored_path, _)| path.is_none_or(|path| *stored_path == path))
+            .map(|(_, operand)| *operand),
+    );
+    let access = relevant.fold(None, |current, operand| {
+        merge_xml_access(
+            current,
+            xml_operand_access(graph, operand, visiting),
+        )
+    });
+    visiting.remove(&(true, slot));
+    access.unwrap_or(XmlAccessProvenance::Unknown)
+}
+
+fn xml_merge_operands(
+    graph: &XmlAccessGraph<'_>,
+    operands: impl IntoIterator<Item = Operand>,
+    visiting: &mut HashSet<(bool, u32)>,
+) -> XmlAccessProvenance {
+    operands
+        .into_iter()
+        .fold(None, |current, operand| {
+            merge_xml_access(
+                current,
+                xml_operand_access(graph, &operand, visiting),
+            )
+        })
+        .unwrap_or(XmlAccessProvenance::Unknown)
+}
+
+fn xml_rvalue_access(
+    graph: &XmlAccessGraph<'_>,
+    rvalue: &Rvalue,
+    visiting: &mut HashSet<(bool, u32)>,
+) -> XmlAccessProvenance {
+    let one = |operand: &Operand, visiting: &mut HashSet<(bool, u32)>| {
+        xml_operand_access(graph, operand, visiting)
+    };
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Un(_, operand)
+        | Rvalue::OptionSome(operand)
+        | Rvalue::OptionIsSome(operand)
+        | Rvalue::OptionUnwrap(operand)
+        | Rvalue::ResultOk(operand)
+        | Rvalue::ResultErr(operand)
+        | Rvalue::ResultIsOk(operand)
+        | Rvalue::ResultUnwrapOk(operand)
+        | Rvalue::ResultUnwrapErr(operand)
+        | Rvalue::BoxGet(operand)
+        | Rvalue::TupleIndex { tuple: operand, .. } => one(operand, visiting),
+        Rvalue::Load(slot) => xml_slot_access(graph, *slot, None, visiting),
+        Rvalue::Field(slot, path) => xml_slot_access(graph, *slot, Some(path), visiting),
+        Rvalue::Cast { operand, .. } => one(operand, visiting),
+        Rvalue::Bin(_, left, right) => {
+            xml_merge_operands(graph, [left.clone(), right.clone()], visiting)
+        }
+        Rvalue::IntArith { a, b, .. } => {
+            xml_merge_operands(graph, [a.clone(), b.clone()], visiting)
+        }
+        Rvalue::MathOp { operands, .. } => {
+            xml_merge_operands(graph, operands.clone(), visiting)
+        }
+        Rvalue::Select { cond, a, b } => {
+            xml_merge_operands(graph, [cond.clone(), a.clone(), b.clone()], visiting)
+        }
+        Rvalue::MakeEnum { payload, .. } => {
+            xml_merge_operands(graph, payload.clone(), visiting)
+        }
+        Rvalue::EnumPayload { operand, .. } => one(operand, visiting),
+        Rvalue::MakeTuple { elems, .. } => {
+            xml_merge_operands(graph, elems.clone(), visiting)
+        }
+        Rvalue::Call(DirectCall::Program(target), args) => graph
+            .program
+            .fns
+            .iter()
+            .find(|candidate| &candidate.name == target)
+            .map(|candidate| (&candidate.return_borrow, &candidate.return_region))
+            .or_else(|| {
+                graph
+                    .program
+                    .imported_fns
+                    .iter()
+                    .find(|candidate| &candidate.name == target)
+                    .map(|candidate| (&candidate.return_borrow, &candidate.return_region))
+            })
+            .map_or(XmlAccessProvenance::Unknown, |(borrow, region)| {
+                xml_call_return_access(graph, args, borrow, region, visiting)
+            }),
+        Rvalue::Call(DirectCall::Runtime(_), _) => XmlAccessProvenance::Owned,
+        Rvalue::CallWithCleanup(call) => graph
+            .program
+            .fns
+            .iter()
+            .find(|candidate| candidate.name == call.target)
+            .map(|candidate| (&candidate.return_borrow, &candidate.return_region))
+            .or_else(|| {
+                graph
+                    .program
+                    .imported_fns
+                    .iter()
+                    .find(|candidate| candidate.name == call.target)
+                    .map(|candidate| (&candidate.return_borrow, &candidate.return_region))
+            })
+            .map_or(XmlAccessProvenance::Unknown, |(borrow, region)| {
+                xml_call_return_access(graph, &call.args, borrow, region, visiting)
+            }),
+        Rvalue::CallIndirect { args, signature, .. } => xml_call_return_access(
+            graph,
+            args,
+            &signature.return_borrow,
+            &signature.return_region,
+            visiting,
+        ),
+        Rvalue::CallIndirectWithCleanup(call) => xml_call_return_access(
+            graph,
+            &call.args,
+            &call.signature.return_borrow,
+            &call.signature.return_region,
+            visiting,
+        ),
+        Rvalue::StrClone(_)
+        | Rvalue::BuilderToString(_)
+        | Rvalue::TemplateHtmlToString { .. }
+        | Rvalue::XmlParse { .. }
+        | Rvalue::XmlAttributeValue { .. }
+        | Rvalue::XmlText { .. } => XmlAccessProvenance::Owned,
+        Rvalue::XmlName { reader } | Rvalue::XmlAttributeName { reader, .. } => {
+            one(reader, visiting)
+        }
+        Rvalue::XmlNext { .. } | Rvalue::XmlAttributeCount(_) => XmlAccessProvenance::Owned,
+        _ => XmlAccessProvenance::Unknown,
+    }
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     validate_template_html_mir_signatures(program)?;
-    let xml_event_definition_valid = || {
-        let mut definitions = program.enums.iter().filter(|definition| {
-            definition.name == "xml.event" || definition.source_name == "xml.event"
-        });
-        let Some(definition) = definitions.next() else {
+    let xml_event_definition_valid = |event_enum: u32| {
+        let Some(definition) = program.enums.get(event_enum as usize) else {
             return false;
         };
         const NAMES: [&str; 3] = ["Start", "End", "Text"];
-        definitions.next().is_none()
+        program
+            .enums
+            .iter()
+            .filter(|candidate| {
+                candidate.name == "xml.event" || candidate.source_name == "xml.event"
+            })
+            .count()
+            == 1
             && definition.name == "xml.event"
             && definition.source_name == "xml.event"
             && definition.variants.len() == NAMES.len()
@@ -4262,6 +4536,78 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
         })
     };
     for function in &program.fns {
+        let mut primary_definitions = vec![0u32; function.value_tys.len()];
+        let mut auxiliary_definitions = vec![0u32; function.value_tys.len()];
+        let mut value_definitions = vec![None; function.value_tys.len()];
+        let mut duplicate_values = vec![false; function.value_tys.len()];
+        let mut slot_stores = XmlSlotStores {
+            roots: vec![Vec::new(); function.slots.len()],
+            fields: vec![Vec::new(); function.slots.len()],
+        };
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                match statement {
+                    Stmt::Let(value, rvalue) => {
+                        if let Some(count) = primary_definitions.get_mut(*value as usize) {
+                            *count = count.saturating_add(1);
+                        }
+                        if let Some(definition) = value_definitions.get_mut(*value as usize) {
+                            if definition.is_some() {
+                                duplicate_values[*value as usize] = true;
+                            } else {
+                                *definition = Some(rvalue);
+                            }
+                        }
+                        let auxiliary = match rvalue {
+                            Rvalue::CallWithCleanup(call) => Some(call.cleanup),
+                            Rvalue::CallIndirectWithCleanup(call) => Some(call.cleanup),
+                            Rvalue::XmlParse { cleanup, .. } => Some(*cleanup),
+                            _ => None,
+                        };
+                        if let Some(auxiliary) = auxiliary
+                            && let Some(count) = auxiliary_definitions.get_mut(auxiliary as usize)
+                        {
+                            *count = count.saturating_add(1);
+                        }
+                    }
+                    Stmt::Store(slot, operand) => {
+                        if let Some(stores) = slot_stores.roots.get_mut(*slot as usize) {
+                            stores.push(operand);
+                        }
+                    }
+                    Stmt::StoreField(slot, path, operand) => {
+                        if let Some(stores) = slot_stores.fields.get_mut(*slot as usize) {
+                            stores.push((path.as_slice(), operand));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let access_graph = XmlAccessGraph {
+            function,
+            program,
+            value_definitions: &value_definitions,
+            duplicate_values: &duplicate_values,
+            slot_stores: &slot_stores,
+        };
+        let xml_access = |operand: &Operand| {
+            xml_operand_access(&access_graph, operand, &mut HashSet::new())
+        };
+        let canonical_xml_value = |operand: &Operand| {
+            matches!(operand, Operand::Value(_) | Operand::Arg(_))
+        };
+        let readable_xml_index = |operand: &Operand| {
+            matches!(
+                operand,
+                Operand::Value(_) | Operand::Arg(_) | Operand::Const(Const::Int(_, _))
+            ) && matches!(
+                xml_access(operand),
+                XmlAccessProvenance::Owned
+                    | XmlAccessProvenance::Shared
+                    | XmlAccessProvenance::Exclusive
+            )
+        };
         for block in &function.blocks {
             for statement in &block.stmts {
                 match statement {
@@ -4282,6 +4628,19 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                if matches!(
+                    rvalue,
+                    Rvalue::XmlParse { .. }
+                        | Rvalue::XmlNext { .. }
+                        | Rvalue::XmlName { .. }
+                        | Rvalue::XmlAttributeCount(_)
+                        | Rvalue::XmlAttributeName { .. }
+                        | Rvalue::XmlAttributeValue { .. }
+                        | Rvalue::XmlText { .. }
+                ) && primary_definitions.get(*value as usize) != Some(&1)
+                {
+                    return Err(fail(function, "XML primary result definition is not unique"));
+                }
                 let valid = match rvalue {
                     Rvalue::RawIsNull(pointer) => {
                         operand_ty(function, pointer) == Some(Ty::Raw) && result == Ty::Bool
@@ -4319,47 +4678,90 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, owner) == Some(Ty::Resource(*resource))
                             && result == Ty::Raw
                     }
-                    Rvalue::XmlParse { input, out } => {
-                        operand_ty(function, input) == Some(Ty::String)
-                            && function.slots.get(*out as usize) == Some(&Ty::XmlReader)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                    Rvalue::XmlParse {
+                        input,
+                        error_enum,
+                        cleanup,
+                    } => {
+                        canonical_xml_value(input)
+                            && operand_ty(function, input) == Some(Ty::String)
+                            && xml_access(input) == XmlAccessProvenance::Owned
+                            && result
+                                == Ty::Result(Scalar::XmlReader, Scalar::Enum(*error_enum))
+                            && builtin_error_enum_is_exact(program, *error_enum)
+                            && *cleanup != *value
+                            && function.value_tys.get(*cleanup as usize) == Some(&Ty::Bool)
+                            && primary_definitions.get(*cleanup as usize) == Some(&0)
+                            && auxiliary_definitions.get(*cleanup as usize) == Some(&1)
                     }
-                    Rvalue::XmlNext(reader) => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                    Rvalue::XmlNext { reader, event_enum } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive
+                            )
+                            && result == Ty::Option(Scalar::Enum(*event_enum))
+                            && xml_event_definition_valid(*event_enum)
                     }
                     Rvalue::XmlAttributeCount(reader) => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned
+                                    | XmlAccessProvenance::Shared
+                                    | XmlAccessProvenance::Exclusive
+                            )
                             && result == i64_ty
-                            && xml_event_definition_valid()
                     }
-                    Rvalue::XmlName { reader, out } => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
-                            && function.slots.get(*out as usize) == Some(&Ty::Str)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                    Rvalue::XmlName { reader } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned
+                                    | XmlAccessProvenance::Shared
+                                    | XmlAccessProvenance::Exclusive
+                            )
+                            && result == Ty::Str
                     }
-                    Rvalue::XmlAttributeName { reader, index, out } => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                    Rvalue::XmlAttributeName { reader, index } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned
+                                    | XmlAccessProvenance::Shared
+                                    | XmlAccessProvenance::Exclusive
+                            )
                             && operand_ty(function, index) == Some(i64_ty)
-                            && function.slots.get(*out as usize) == Some(&Ty::Str)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                            && readable_xml_index(index)
+                            && result == Ty::Str
                     }
-                    Rvalue::XmlAttributeValue { reader, index, out } => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
+                    Rvalue::XmlAttributeValue { reader, index } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned
+                                    | XmlAccessProvenance::Shared
+                                    | XmlAccessProvenance::Exclusive
+                            )
                             && operand_ty(function, index) == Some(i64_ty)
-                            && function.slots.get(*out as usize) == Some(&Ty::String)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                            && readable_xml_index(index)
+                            && result == Ty::String
                     }
-                    Rvalue::XmlText { reader, out } => {
-                        operand_ty(function, reader) == Some(Ty::XmlReader)
-                            && function.slots.get(*out as usize) == Some(&Ty::String)
-                            && result == i32_ty
-                            && xml_event_definition_valid()
+                    Rvalue::XmlText { reader } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader),
+                                XmlAccessProvenance::Owned
+                                    | XmlAccessProvenance::Shared
+                                    | XmlAccessProvenance::Exclusive
+                            )
+                            && result == Ty::String
                     }
                     Rvalue::ResourceViewFromRaw {
                         owner,
@@ -4523,7 +4925,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     let detail = if matches!(
                         rvalue,
                         Rvalue::XmlParse { .. }
-                            | Rvalue::XmlNext(_)
+                            | Rvalue::XmlNext { .. }
                             | Rvalue::XmlName { .. }
                             | Rvalue::XmlAttributeCount(_)
                             | Rvalue::XmlAttributeName { .. }
@@ -15925,12 +16327,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..) => return self.gen_log_rvalue(rv),
             Rvalue::XmlParse { .. }
-            | Rvalue::XmlNext(_)
+            | Rvalue::XmlNext { .. }
             | Rvalue::XmlName { .. }
             | Rvalue::XmlAttributeCount(_)
             | Rvalue::XmlAttributeName { .. }
             | Rvalue::XmlAttributeValue { .. }
-            | Rvalue::XmlText { .. } => return self.gen_xml_rvalue(rv),
+            | Rvalue::XmlText { .. } => {
+                return self.gen_xml_rvalue(rv, result_ty)
+            }
             Rvalue::CodecOpen(_)
             | Rvalue::CodecBatchRows(_)
             | Rvalue::CodecBatchColumns(_)
@@ -20556,82 +20960,392 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(Some(value))
     }
 
+    fn xml_abort_unless(
+        &mut self,
+        condition: IntValue<'c>,
+        name: &str,
+    ) -> Result<(), CodegenError> {
+        let valid = self
+            .ctx
+            .append_basic_block(self.func, &format!("{name}.valid"));
+        let invalid = self
+            .ctx
+            .append_basic_block(self.func, &format!("{name}.invalid"));
+        self.builder
+            .build_conditional_branch(condition, valid, invalid)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(invalid);
+        self.builder
+            .build_call(
+                self.runtime(RuntimeKey::ProcessAbort),
+                &[],
+                &format!("{name}.abort"),
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unreachable()
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(valid);
+        Ok(())
+    }
+
     #[inline(never)]
-    fn gen_xml_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+    fn gen_xml_rvalue(
+        &mut self,
+        rv: &Rvalue,
+        result_ty: Ty,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let value = match rv {
-            Rvalue::XmlParse { input, out } => {
+            Rvalue::XmlParse {
+                input,
+                error_enum,
+                cleanup,
+            } => {
                 let (pointer, length) = self.split_str(input)?;
-                self.builder
+                let out = self.alloca_at_entry(self.llvm_type(Ty::XmlReader), "xml.parse.out")?;
+                let status = self
+                    .builder
                     .build_call(
                         self.runtime(RuntimeKey::XmlParse),
-                        &[pointer.into(), length.into(), self.slots[out].into()],
-                        "xml_parse",
+                        &[pointer.into(), length.into(), out.into()],
+                        "xml.parse.status",
                     )
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("xml_parse must return i32"))?
+                    .into_int_value();
+                let ok = self.ctx.append_basic_block(self.func, "xml.parse.ok");
+                let invalid = self.ctx.append_basic_block(self.func, "xml.parse.invalid");
+                let abort = self.ctx.append_basic_block(self.func, "xml.parse.abort");
+                let join = self.ctx.append_basic_block(self.func, "xml.parse.join");
+                let i32_type = self.ctx.i32_type();
+                self.builder
+                    .build_switch(
+                        status,
+                        abort,
+                        &[
+                            (i32_type.const_zero(), ok),
+                            (i32_type.const_int((-1_i32) as u64, true), invalid),
+                        ],
+                    )
+                    .map_err(|error| self.err(error))?;
+
+                let Ty::Result(ok_scalar, error_scalar) = result_ty else {
+                    return Err(self.err("xml.parse result is not Result<xml.reader, Error>"));
+                };
+                let result_type = result_struct_type(
+                    self.ctx,
+                    ok_scalar,
+                    error_scalar,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+
+                self.builder.position_at_end(ok);
+                let reader = self
+                    .builder
+                    .build_load(self.llvm_type(Ty::XmlReader), out, "xml.parse.reader")
+                    .map_err(|error| self.err(error))?;
+                let ok_result = self
+                    .builder
+                    .build_insert_value(result_type.const_zero(), reader, 1, "xml.parse.ok.value")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let ok_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("xml.parse ok block is absent"))?;
+
+                self.builder.position_at_end(invalid);
+                let error_type = *self
+                    .enum_types
+                    .get(*error_enum as usize)
+                    .ok_or_else(|| self.err("xml.parse Error enum type is absent"))?;
+                let error = self
+                    .builder
+                    .build_insert_value(
+                        error_type.const_zero(),
+                        i32_type.const_int(align_sema::ERROR_VARIANT_INVALID as u64, false),
+                        0,
+                        "xml.parse.error.invalid",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        result_type.const_zero(),
+                        self.ctx.i8_type().const_int(1, false),
+                        0,
+                        "xml.parse.err.tag",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let invalid_result = self
+                    .builder
+                    .build_insert_value(tagged, error, 2, "xml.parse.err.value")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let invalid_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("xml.parse invalid block is absent"))?;
+
+                self.builder.position_at_end(abort);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::ProcessAbort),
+                        &[],
+                        "xml.parse.status.abort",
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| self.err(error))?;
+
+                self.builder.position_at_end(join);
+                let result = self
+                    .builder
+                    .build_phi(result_type, "xml.parse.result")
+                    .map_err(|error| self.err(error))?;
+                result.add_incoming(&[
+                    (&ok_result, ok_end),
+                    (&invalid_result, invalid_end),
+                ]);
+                let cleanup_value = self
+                    .builder
+                    .build_phi(self.ctx.bool_type(), "xml.parse.cleanup")
+                    .map_err(|error| self.err(error))?;
+                cleanup_value.add_incoming(&[
+                    (&self.ctx.bool_type().const_int(1, false), ok_end),
+                    (&self.ctx.bool_type().const_zero(), invalid_end),
+                ]);
+                self.values.insert(*cleanup, cleanup_value.as_basic_value());
+                result.as_basic_value()
             }
-            Rvalue::XmlNext(reader) => self
-                .builder
-                .build_call(
-                    self.runtime(RuntimeKey::XmlNext),
-                    &[self.operand(reader)?.into()],
-                    "xml_next",
-                )
-                .map_err(|error| self.err(error))?
-                .try_as_basic_value()
-                .basic()
-                .ok_or_else(|| self.err("xml_next must return i32"))?,
-            Rvalue::XmlAttributeCount(reader) => self
-                .builder
-                .build_call(
-                    self.runtime(RuntimeKey::XmlAttributeCount),
-                    &[self.operand(reader)?.into()],
-                    "xml_attribute_count",
-                )
-                .map_err(|error| self.err(error))?
-                .try_as_basic_value()
-                .basic()
-                .ok_or_else(|| self.err("xml_attribute_count must return i64"))?,
-            Rvalue::XmlName { reader, out } | Rvalue::XmlText { reader, out } => {
+            Rvalue::XmlNext { reader, event_enum } => {
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlNext),
+                        &[self.operand(reader)?.into()],
+                        "xml.next.status",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_next must return i32"))?
+                    .into_int_value();
+                let cases = [
+                    self.ctx.append_basic_block(self.func, "xml.next.none"),
+                    self.ctx.append_basic_block(self.func, "xml.next.start"),
+                    self.ctx.append_basic_block(self.func, "xml.next.end"),
+                    self.ctx.append_basic_block(self.func, "xml.next.text"),
+                ];
+                let abort = self.ctx.append_basic_block(self.func, "xml.next.abort");
+                let join = self.ctx.append_basic_block(self.func, "xml.next.join");
+                let i32_type = self.ctx.i32_type();
+                let switch_cases = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(status, &block)| (i32_type.const_int(status as u64, false), block))
+                    .collect::<Vec<_>>();
+                self.builder
+                    .build_switch(status, abort, &switch_cases)
+                    .map_err(|error| self.err(error))?;
+                let Ty::Option(payload) = result_ty else {
+                    return Err(self.err("xml.next result is not Option<xml.event>"));
+                };
+                let option_type = option_struct_type(
+                    self.ctx,
+                    payload,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                let event_type = *self
+                    .enum_types
+                    .get(*event_enum as usize)
+                    .ok_or_else(|| self.err("xml.next event enum type is absent"))?;
+                let mut incoming = Vec::with_capacity(4);
+                for (status, &block) in cases.iter().enumerate() {
+                    self.builder.position_at_end(block);
+                    let option = if status == 0 {
+                        option_type.const_zero()
+                    } else {
+                        let event = self
+                            .builder
+                            .build_insert_value(
+                                event_type.const_zero(),
+                                i32_type.const_int((status - 1) as u64, false),
+                                0,
+                                "xml.next.event",
+                            )
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value();
+                        let tagged = self
+                            .builder
+                            .build_insert_value(
+                                option_type.const_zero(),
+                                self.ctx.i8_type().const_int(1, false),
+                                0,
+                                "xml.next.some.tag",
+                            )
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value();
+                        self.builder
+                            .build_insert_value(tagged, event, 1, "xml.next.some.value")
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value()
+                    };
+                    self.builder
+                        .build_unconditional_branch(join)
+                        .map_err(|error| self.err(error))?;
+                    let end = self
+                        .builder
+                        .get_insert_block()
+                        .ok_or_else(|| self.err("xml.next case block is absent"))?;
+                    incoming.push((option, end));
+                }
+                self.builder.position_at_end(abort);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::ProcessAbort),
+                        &[],
+                        "xml.next.status.abort",
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(join);
+                let option = self
+                    .builder
+                    .build_phi(option_type, "xml.next.result")
+                    .map_err(|error| self.err(error))?;
+                let incoming_refs = incoming
+                    .iter()
+                    .map(|(value, block)| (value as &dyn BasicValue<'c>, *block))
+                    .collect::<Vec<_>>();
+                option.add_incoming(&incoming_refs);
+                option.as_basic_value()
+            }
+            Rvalue::XmlAttributeCount(reader) => {
+                let count = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlAttributeCount),
+                        &[self.operand(reader)?.into()],
+                        "xml.attribute_count",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_attribute_count must return i64"))?
+                    .into_int_value();
+                let nonnegative = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        count,
+                        self.ctx.i64_type().const_zero(),
+                        "xml.attribute_count.nonnegative",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let bounded = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLE,
+                        count,
+                        self.ctx.i64_type().const_int(256, false),
+                        "xml.attribute_count.bounded",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let valid = self
+                    .builder
+                    .build_and(nonnegative, bounded, "xml.attribute_count.valid")
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, "xml.attribute_count")?;
+                count.into()
+            }
+            Rvalue::XmlName { reader } | Rvalue::XmlText { reader } => {
                 let key = if matches!(rv, Rvalue::XmlName { .. }) {
                     RuntimeKey::XmlName
                 } else {
                     RuntimeKey::XmlText
                 };
-                self.builder
+                let out = self.alloca_at_entry(self.llvm_type(result_ty), key.logical_name())?;
+                let status = self
+                    .builder
                     .build_call(
                         self.runtime(key),
-                        &[self.operand(reader)?.into(), self.slots[out].into()],
-                        key.logical_name(),
+                        &[self.operand(reader)?.into(), out.into()],
+                        &format!("{}.status", key.logical_name()),
                     )
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("XML getter must return i32"))?
+                    .into_int_value();
+                let valid = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.ctx.i32_type().const_zero(),
+                        &format!("{}.valid", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, key.logical_name())?;
+                self.builder
+                    .build_load(self.llvm_type(result_ty), out, key.logical_name())
+                    .map_err(|error| self.err(error))?
             }
-            Rvalue::XmlAttributeName { reader, index, out }
-            | Rvalue::XmlAttributeValue { reader, index, out } => {
+            Rvalue::XmlAttributeName { reader, index }
+            | Rvalue::XmlAttributeValue { reader, index } => {
                 let key = if matches!(rv, Rvalue::XmlAttributeName { .. }) {
                     RuntimeKey::XmlAttributeName
                 } else {
                     RuntimeKey::XmlAttributeValue
                 };
-                self.builder
+                let out = self.alloca_at_entry(self.llvm_type(result_ty), key.logical_name())?;
+                let status = self
+                    .builder
                     .build_call(
                         self.runtime(key),
                         &[
                             self.operand(reader)?.into(),
-                            self.slots[out].into(),
+                            out.into(),
                             self.operand(index)?.into(),
                         ],
-                        key.logical_name(),
+                        &format!("{}.status", key.logical_name()),
                     )
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("indexed XML getter must return i32"))?
+                    .into_int_value();
+                let valid = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.ctx.i32_type().const_zero(),
+                        &format!("{}.valid", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, key.logical_name())?;
+                self.builder
+                    .build_load(self.llvm_type(result_ty), out, key.logical_name())
+                    .map_err(|error| self.err(error))?
             }
             _ => return Err(self.err("gen_xml_rvalue on a non-XML operation")),
         };
@@ -26003,11 +26717,12 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn xml_mir_gate_rejects_every_operand_result_slot_and_event_mutation() {
+    fn xml_mir_gate_rejects_every_operand_result_cleanup_and_event_mutation() {
         let program = mir(
             r#"import std.xml
+fn source() -> string = "<a x='v'>text</a>".clone()
 fn main() -> Result<(), Error> {
-  mut reader := xml.parse("<a x='v'>text</a>".clone())?
+  mut reader := xml.parse(source())?
   event := reader.next()
   name := reader.name()
   count := reader.attribute_count()
@@ -26019,6 +26734,7 @@ fn main() -> Result<(), Error> {
 "#,
         );
         assert!(validate_resource_rvalues(&program).is_ok());
+        assert!(validate_thin_partition_program(&program, &[]).is_ok());
 
         let mut sites = Vec::new();
         for (function_index, function) in program.fns.iter().enumerate() {
@@ -26029,7 +26745,7 @@ fn main() -> Result<(), Error> {
                         Stmt::Let(
                             _,
                             Rvalue::XmlParse { .. }
-                                | Rvalue::XmlNext(_)
+                                | Rvalue::XmlNext { .. }
                                 | Rvalue::XmlName { .. }
                                 | Rvalue::XmlAttributeCount(_)
                                 | Rvalue::XmlAttributeName { .. }
@@ -26050,7 +26766,7 @@ fn main() -> Result<(), Error> {
                 [statement_index]
             {
                 Stmt::Let(result, _) => *result,
-                _ => unreachable!(),
+                _ => panic!("XML site inventory contains a non-let statement"),
             };
             malformed_result.fns[function_index].value_tys[result as usize] = Ty::Unit;
             assert!(
@@ -26063,61 +26779,89 @@ fn main() -> Result<(), Error> {
                 [block_index]
                 .stmts[statement_index]
             else {
-                unreachable!()
+                panic!("XML site inventory contains a non-let statement")
             };
             match rvalue {
                 Rvalue::XmlParse { input, .. } => *input = Operand::Value(u32::MAX),
-                Rvalue::XmlNext(reader)
+                Rvalue::XmlNext { reader, .. }
                 | Rvalue::XmlAttributeCount(reader)
                 | Rvalue::XmlName { reader, .. }
                 | Rvalue::XmlAttributeName { reader, .. }
                 | Rvalue::XmlAttributeValue { reader, .. }
                 | Rvalue::XmlText { reader, .. } => *reader = Operand::Value(u32::MAX),
-                _ => unreachable!(),
+                _ => panic!("XML site inventory contains a non-XML rvalue"),
             }
             assert!(
                 validate_resource_rvalues(&malformed_operand).is_err(),
                 "an XML operand mutation was accepted at {function_index}:{block_index}:{statement_index}"
             );
 
-            let mut malformed_out = program.clone();
-            let Stmt::Let(_, rvalue) = &mut malformed_out.fns[function_index].blocks[block_index]
-                .stmts[statement_index]
-            else {
-                unreachable!()
+            let expected = match &program.fns[function_index].blocks[block_index].stmts
+                [statement_index]
+            {
+                Stmt::Let(_, Rvalue::XmlParse { .. }) => Ty::String,
+                Stmt::Let(_, _) => Ty::XmlReader,
+                _ => panic!("XML site inventory contains a non-let statement"),
             };
-            let out = match rvalue {
-                Rvalue::XmlParse { out, .. }
-                | Rvalue::XmlName { out, .. }
-                | Rvalue::XmlAttributeName { out, .. }
-                | Rvalue::XmlAttributeValue { out, .. }
-                | Rvalue::XmlText { out, .. } => Some(*out),
-                _ => None,
+            let base = align_mir::BorrowedPlace {
+                slot: u32::MAX,
+                path: Vec::new(),
+                ty: expected,
+                cleanup: None,
             };
-            if let Some(out) = out {
-                malformed_out.fns[function_index].slots[out as usize] = Ty::Bool;
-                assert!(
-                    validate_resource_rvalues(&malformed_out).is_err(),
-                    "an XML out-slot mutation was accepted at {function_index}:{block_index}:{statement_index}"
-                );
-
-                let mut absent_out = program.clone();
-                let Stmt::Let(_, rvalue) = &mut absent_out.fns[function_index].blocks[block_index]
+            let forged_operands = [
+                Operand::BorrowedPlace(Box::new(base.clone())),
+                Operand::BorrowedElementPlace(Box::new(align_mir::BorrowedElementPlace {
+                    base: base.clone(),
+                    index: Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                    )),
+                    element_ty: expected,
+                    guard: align_mir::BorrowedElementGuard {
+                        reservation: u32::MAX,
+                        len: Operand::Const(Const::Int(
+                            1,
+                            Ty::Int(IntTy {
+                                bits: 64,
+                                signed: true,
+                            }),
+                        )),
+                    },
+                })),
+                Operand::BorrowedFixedElementPlace(Box::new(
+                    align_mir::BorrowedFixedElementPlace {
+                        base: u32::MAX,
+                        index: 0,
+                        path: Vec::new(),
+                        ty: expected,
+                        cleanup: None,
+                    },
+                )),
+            ];
+            for forged in forged_operands {
+                let mut malformed = program.clone();
+                let Stmt::Let(_, rvalue) = &mut malformed.fns[function_index].blocks[block_index]
                     .stmts[statement_index]
                 else {
-                    unreachable!()
+                    panic!("XML site inventory contains a non-let statement")
                 };
                 match rvalue {
-                    Rvalue::XmlParse { out, .. }
-                    | Rvalue::XmlName { out, .. }
-                    | Rvalue::XmlAttributeName { out, .. }
-                    | Rvalue::XmlAttributeValue { out, .. }
-                    | Rvalue::XmlText { out, .. } => *out = u32::MAX,
-                    _ => unreachable!(),
+                    Rvalue::XmlParse { input, .. } => *input = forged,
+                    Rvalue::XmlNext { reader, .. }
+                    | Rvalue::XmlAttributeCount(reader)
+                    | Rvalue::XmlName { reader, .. }
+                    | Rvalue::XmlAttributeName { reader, .. }
+                    | Rvalue::XmlAttributeValue { reader, .. }
+                    | Rvalue::XmlText { reader, .. } => *reader = forged,
+                    _ => panic!("XML site inventory contains a non-XML rvalue"),
                 }
                 assert!(
-                    validate_resource_rvalues(&absent_out).is_err(),
-                    "an absent XML out slot was accepted at {function_index}:{block_index}:{statement_index}"
+                    validate_resource_rvalues(&malformed).is_err(),
+                    "a forged borrowed XML operand was accepted at {function_index}:{block_index}:{statement_index}"
                 );
             }
 
@@ -26125,7 +26869,7 @@ fn main() -> Result<(), Error> {
             let Stmt::Let(_, rvalue) = &mut malformed_index.fns[function_index].blocks[block_index]
                 .stmts[statement_index]
             else {
-                unreachable!()
+                panic!("XML site inventory contains a non-let statement")
             };
             if let Rvalue::XmlAttributeName { index, .. }
             | Rvalue::XmlAttributeValue { index, .. } = rvalue
@@ -26138,11 +26882,130 @@ fn main() -> Result<(), Error> {
             }
         }
 
+        let parse_site = sites
+            .iter()
+            .copied()
+            .find(|&(function, block, statement)| {
+                matches!(
+                    program.fns[function].blocks[block].stmts[statement],
+                    Stmt::Let(_, Rvalue::XmlParse { .. })
+                )
+            })
+            .unwrap_or_else(|| panic!("missing xml.parse site"));
+        for cleanup in [u32::MAX, 0] {
+            let mut malformed = program.clone();
+            let (function, block, statement) = parse_site;
+            let Stmt::Let(_, Rvalue::XmlParse { cleanup: actual, .. }) =
+                &mut malformed.fns[function].blocks[block].stmts[statement]
+            else {
+                panic!("xml.parse inventory site changed shape")
+            };
+            *actual = cleanup;
+            assert!(validate_resource_rvalues(&malformed).is_err());
+        }
+        let mut wrong_cleanup_type = program.clone();
+        let (function, block, statement) = parse_site;
+        let Stmt::Let(_, Rvalue::XmlParse { cleanup, .. }) =
+            &wrong_cleanup_type.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let cleanup = *cleanup;
+        wrong_cleanup_type.fns[function].value_tys[cleanup as usize] = Ty::Unit;
+        assert!(validate_resource_rvalues(&wrong_cleanup_type).is_err());
+
+        let call_cleanup = program
+            .fns
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::CallWithCleanup(call)) => Some(call.cleanup),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing owned string call cleanup"));
+        let mut aliased_cleanup = program.clone();
+        let Stmt::Let(_, Rvalue::XmlParse { cleanup, .. }) =
+            &mut aliased_cleanup.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *cleanup = call_cleanup;
+        assert!(validate_resource_rvalues(&aliased_cleanup).is_err());
+
+        let mut duplicate_cleanup = program.clone();
+        let Stmt::Let(original_result, duplicate_parse) = duplicate_cleanup.fns[function].blocks
+            [block]
+            .stmts[statement]
+            .clone()
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let duplicate_result = duplicate_cleanup.fns[function].value_tys.len() as u32;
+        let duplicate_result_ty = duplicate_cleanup.fns[function].value_tys
+            [original_result as usize];
+        duplicate_cleanup.fns[function]
+            .value_tys
+            .push(duplicate_result_ty);
+        duplicate_cleanup.fns[function].blocks[block]
+            .stmts
+            .push(Stmt::Let(duplicate_result, duplicate_parse));
+        assert!(validate_resource_rvalues(&duplicate_cleanup).is_err());
+        assert!(validate_thin_partition_program(&duplicate_cleanup, &[]).is_err());
+
+        let mut duplicate_primary = program.clone();
+        let Stmt::Let(original_result, mut duplicate_parse) = duplicate_primary.fns[function]
+            .blocks[block]
+            .stmts[statement]
+            .clone()
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let duplicate_cleanup = duplicate_primary.fns[function].value_tys.len() as u32;
+        duplicate_primary.fns[function].value_tys.push(Ty::Bool);
+        let Rvalue::XmlParse { cleanup, .. } = &mut duplicate_parse else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *cleanup = duplicate_cleanup;
+        duplicate_primary.fns[function].blocks[block]
+            .stmts
+            .push(Stmt::Let(original_result, duplicate_parse));
+        assert!(validate_resource_rvalues(&duplicate_primary).is_err());
+
+        let mut wrong_error_enum = program.clone();
+        let Stmt::Let(_, Rvalue::XmlParse { error_enum, .. }) =
+            &mut wrong_error_enum.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *error_enum = u32::MAX;
+        assert!(validate_resource_rvalues(&wrong_error_enum).is_err());
+
+        let next_site = sites
+            .iter()
+            .copied()
+            .find(|&(function, block, statement)| {
+                matches!(
+                    program.fns[function].blocks[block].stmts[statement],
+                    Stmt::Let(_, Rvalue::XmlNext { .. })
+                )
+            })
+            .unwrap_or_else(|| panic!("missing xml.next site"));
+        let mut wrong_event_enum = program.clone();
+        let (function, block, statement) = next_site;
+        let Stmt::Let(_, Rvalue::XmlNext { event_enum, .. }) =
+            &mut wrong_event_enum.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.next inventory site changed shape")
+        };
+        *event_enum = u32::MAX;
+        assert!(validate_resource_rvalues(&wrong_event_enum).is_err());
+
         let event_index = program
             .enums
             .iter()
             .position(|definition| definition.name == "xml.event")
-            .expect("builtin xml.event definition");
+            .unwrap_or_else(|| panic!("missing builtin xml.event definition"));
         let mut event_mutations = Vec::new();
         let mut malformed = program.clone();
         malformed.enums[event_index].name.push_str(".forged");
@@ -26167,6 +27030,150 @@ fn main() -> Result<(), Error> {
         event_mutations.push(malformed);
         for malformed in event_mutations {
             assert!(validate_resource_rvalues(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn xml_mir_gate_derives_access_from_parameter_producers() {
+        let program = mir(
+            r#"import std.xml
+fn make() -> string = "<a/>".clone()
+fn parse_owned(source: string) -> Result<xml.reader, Error> = xml.parse(source)
+fn parse_direct() -> Result<xml.reader, Error> = xml.parse(make())
+fn parse_indirect() -> Result<xml.reader, Error> { maker := make; return xml.parse(maker()) }
+fn parse_control(flag: bool) -> Result<xml.reader, Error> = xml.parse(if flag { make() } else { make() })
+fn parse_loop() -> Result<xml.reader, Error> = xml.parse(loop { break make() })
+fn parse_join(first: string, second: string, flag: bool) -> Result<xml.reader, Error> = xml.parse(if flag { first } else { second })
+fn next_exclusive(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn name_shared(borrow reader: xml.reader) -> str = reader.name()
+fn count_shared(borrow reader: xml.reader) -> i64 = reader.attribute_count()
+fn attribute_name_shared(borrow reader: xml.reader, index: i64) -> str = reader.attribute_name(index)
+fn value_shared(borrow reader: xml.reader, index: i64) -> string = reader.attribute_value(index)
+fn text_shared(borrow reader: xml.reader) -> string = reader.text()
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            validate_resource_rvalues(&program).is_ok(),
+            "fresh, direct, indirect, and control-result producers must authenticate"
+        );
+
+        let function_index = |name: &str| {
+            program
+                .fns
+                .iter()
+                .position(|function| function.name.as_str() == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let parse = function_index("parse_owned");
+        for mode in [
+            align_ast::ParamMode::Borrow,
+            align_ast::ParamMode::BorrowMut,
+            align_ast::ParamMode::Out,
+        ] {
+            let mut malformed = program.clone();
+            malformed.fns[parse].param_modes[0] = mode;
+            assert!(
+                validate_resource_rvalues(&malformed).is_err(),
+                "xml.parse accepted {mode:?} input provenance through its load/store chain"
+            );
+        }
+
+        let next = function_index("next_exclusive");
+        let mut shared_next = program.clone();
+        shared_next.fns[next].param_modes[0] = align_ast::ParamMode::Borrow;
+        assert!(
+            validate_resource_rvalues(&shared_next).is_err(),
+            "xml.next accepted shared parameter provenance"
+        );
+        let mut owned_next = program.clone();
+        owned_next.fns[next].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&owned_next).is_ok());
+        let mut unreadable_next = program.clone();
+        unreadable_next.fns[next].param_modes[0] = align_ast::ParamMode::Out;
+        assert!(validate_resource_rvalues(&unreadable_next).is_err());
+
+        let getters = [
+            function_index("name_shared"),
+            function_index("count_shared"),
+            function_index("attribute_name_shared"),
+            function_index("value_shared"),
+            function_index("text_shared"),
+        ];
+        for getter in getters {
+            for mode in [
+                align_ast::ParamMode::ByValue,
+                align_ast::ParamMode::Borrow,
+                align_ast::ParamMode::BorrowMut,
+            ] {
+                let mut readable = program.clone();
+                readable.fns[getter].param_modes[0] = mode;
+                assert!(
+                    validate_resource_rvalues(&readable).is_ok(),
+                    "XML getter rejected readable {mode:?} provenance"
+                );
+            }
+            let mut unreadable = program.clone();
+            unreadable.fns[getter].param_modes[0] = align_ast::ParamMode::Out;
+            assert!(validate_resource_rvalues(&unreadable).is_err());
+        }
+
+        for indexed in [
+            function_index("attribute_name_shared"),
+            function_index("value_shared"),
+        ] {
+            let mut unreadable_index = program.clone();
+            unreadable_index.fns[indexed].param_modes[1] = align_ast::ParamMode::Out;
+            assert!(
+                validate_resource_rvalues(&unreadable_index).is_err(),
+                "XML index accepted an unreadable Out producer"
+            );
+        }
+
+        let join = function_index("parse_join");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::Out] {
+            let mut mixed = program.clone();
+            mixed.fns[join].param_modes[1] = mode;
+            assert!(
+                validate_resource_rvalues(&mixed).is_err(),
+                "xml.parse accepted an {mode:?} branch in a producer join"
+            );
+        }
+
+        for function in std::iter::once(parse)
+            .chain(std::iter::once(next))
+            .chain(getters)
+        {
+            let mut direct_arg = program.clone();
+            let rvalue = direct_arg.fns[function]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, rvalue @ Rvalue::XmlParse { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlNext { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlName { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeCount(_))
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeName { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeValue { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlText { .. }) => Some(rvalue),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing XML parameter operation"));
+            match rvalue {
+                Rvalue::XmlParse { input, .. } => *input = Operand::Arg(0),
+                Rvalue::XmlNext { reader, .. }
+                | Rvalue::XmlName { reader }
+                | Rvalue::XmlAttributeCount(reader)
+                | Rvalue::XmlAttributeName { reader, .. }
+                | Rvalue::XmlAttributeValue { reader, .. }
+                | Rvalue::XmlText { reader } => *reader = Operand::Arg(0),
+                _ => panic!("XML parameter operation changed shape"),
+            }
+            assert!(
+                validate_resource_rvalues(&direct_arg).is_ok(),
+                "a raw argument with the operation's canonical mode must remain valid"
+            );
         }
     }
 
