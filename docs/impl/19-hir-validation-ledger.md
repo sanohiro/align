@@ -1989,3 +1989,28 @@ that later inference mutates, so two structurally identical `fn(i64) -> i64`
 entries survive and multiply into duplicate struct/enum monomorphs. This costs
 duplicated monomorph records and mangled names; it is not a correctness defect
 now that the cross-derivation comparisons delegate. Track separately.
+
+## Planned `pkg.ws` checked-HIR records
+
+The `pkg.ws` capability adds exact validation rows for `Ty/Scalar::HttpUpgrade` and these
+expressions: `HttpCtxUpgradeReady`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`,
+`HttpRespondUpgrade`, `HttpUpgradeReadExact`, `HttpUpgradeWrite`, `HttpUpgradeDeadline`, and
+`HttpUpgradeShutdown`. Each record fixes child count/order/type, bound-place class, result type,
+effect, region/borrow generation, consume/null behavior, and exact RuntimeKey. The type row admits
+raw same-frame locals/parameters and one unnested same-frame Result Ok local from the constructor or
+`map_err`, plus the closed `pkg.web.types.UpgradeHandler.pump` function signature; all other
+tag/aggregate/collection/capture/task/parallel/out/extern/global/return placements fail closed.
+Canonical record-v3 leaves are exactly Ty 71 and Scalar 47 with bidirectional and malformed owners.
+
+Validation reconstructs the header query contracts, complete 101 prerequisites, mutable bare-local
+buffer/count-capacity relation, readiness version/residual fact, positive cumulative-deadline bound,
+live/spent/poisoned precedence, sticky owner state, and source cleanup. It
+does not replay RFC 6455 handshake or frame semantics, which remain checked ordinary package
+source. Every scalar/id/key/result/effect/region/ownership field gets a mutation twin; a new HIR
+discriminator must extend the existing variant sweep. Any invalid record returns the canonical
+empty MIR program (or `LoweringRejected` through the checked entry) before MIR/runtime identity,
+allocation, fd transfer, or I/O. These rows are reserved by `pkg-design/ws.md` and not active yet.
+Source-invalid header tokens abort before a query call is emitted. Runtime-only malformed native
+context/view inputs remain the direct ABI owner's hard-abort responsibility and cannot be
+represented as ordinary HIR zero/false results. The checked response-head size and allocation are
+runtime publication prerequisites after semantic validation, not a second HIR result state.

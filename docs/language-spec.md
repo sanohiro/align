@@ -1542,3 +1542,47 @@ form; only a concretely rechecked monomorph reaches emitted HIR/MIR. This accept
 shipped inventory. Streaming,
 encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
 outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.
+
+The designed, not-yet-implemented `pkg.ws` v1 adds one RFC 6455 GET Upgrade route to the existing
+`pkg.web` route table. Its public operations are `route(pattern, protocols, pump)`, bounded
+`receive(borrow mut http_upgrade, max_message_bytes)`, borrowed `send_text` / `send_binary`, and a
+consuming `close(http_upgrade, code, reason, timeout_ns)`. Receive returns
+`Message { Text(string), Binary(array<u8>), Close(Close) }`, where Close contains optional i64 code
+and owned UTF-8 reason. There are no defaults.
+
+Routing, middleware, request views, 404/405 behavior, explicit workers, and `SO_REUSEPORT` remain
+`pkg.web` ownership. A Pure package validator checks protocol configuration during pre-bind route
+validation. The package validates the RFC token/key/version handshake, chooses the first
+server-order offered subprotocol, and keeps its fixed accept SHA-1 helper private. HTTP/1.0 or a
+request with parser residual bytes takes the ordinary 400 path before accept calculation, and the
+checked transfer repeats those facts plus complete response-header syntax before any write. The
+transfer computes checked exact wire-head length and allocates one exact head plus its handle shell
+before fd move, counting their overlap with the still-live builder. Detectable malformed native
+header/readiness context/view shapes hard-abort before reference/slice formation and invalid token
+bytes before scanning; neither maps to ordinary zero/false. The
+protocol-neutral `http_upgrade` Move handle is published only after a checked, fully written
+HTTP/1.1 101 while the spent request context stays alive for pump views. It admits local and
+by-value/borrow/borrow-mut parameter use plus one unnested same-frame Result Ok local from the
+constructor or `map_err`; no user return, other tag, aggregate/collection/box, global/out/extern,
+capture/task, or parallel carrier is admitted. Canonical type-record-v3 tags are 71/47. Exact read,
+write-all, one strict positive cumulative monotonic deadline, shutdown, and Drop own one fd and
+sticky builtin error. The deadline
+does not reset per call, partial transfer, or frame. Spent read/write/deadline return Invalid with no
+mutation, clock, or I/O, while repeated shutdown is idempotent; caller-invalid arguments win first.
+Linux writes use `MSG_NOSIGNAL`; macOS/iOS accepts a socket into an HTTP request context only after
+checked `SO_NOSIGPIPE`, closing once and returning the mapped accept error on failure.
+
+Client frames must be masked, extension-free, minimally length-encoded, and structurally valid.
+Receive assembles fragments under an explicit inclusive 512 MiB ceiling and fixed 1 MiB per-call
+masked-header/control-payload source-work allowance, answers Ping, consumes Pong, validates complete
+Text/Close UTF-8, and returns owned complete messages. Protocol/text/either-limit failure sends
+1002/1007/1009 when transport permits. Peer Close is echoed except that client-only code 1010 gets
+an empty acknowledgment while its original value is returned. The exact 64-bit producer-requested
+live-heap ceiling for scratch, shells, simultaneous growth, and Text staging/result is 1073774720
+bytes, excluding allocator metadata. Server sends borrow
+payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
+handshake without Ping/data resetting its budget before closing TCP. Ten planned runtime keys reuse
+existing ABI shapes and their empty curated LLVM function-attribute sets, leaving A124 unused; no
+declaration-side `nounwind` or shared shape fingerprint change is added, and the design changes no
+shipped package/runtime inventory.
+Exact contract: `impl/pkg-design/ws.md`.

@@ -1426,6 +1426,97 @@ name on a prose blacklist, and a new `Ty`/`Scalar` discriminator reopens the com
 The boundary above makes that carrier-provenance substrate a first-PR capability and makes SSE block
 state transactional in the second, rather than distributing either proof across later fixups.
 
+## Protocol-neutral server Upgrade prerequisite (`pkg.ws`; DESIGNED, not shipped)
+
+The `pkg.ws` ledger requires one HTTP ownership seam and three general repeated-header queries. The
+protocol stays above this layer: std validates and transfers one HTTP/1.1 connection but never
+computes a WebSocket accept value, parses a frame, selects a subprotocol, or adds SHA-1.
+
+```text
+hs.count(name: str) -> i64
+hs.tokens_valid(name: str) -> bool
+hs.contains_token(name: str, token: str) -> bool
+ctx.upgrade_ready() -> bool
+
+ctx.respond_upgrade(rb: response_builder) -> Result<http_upgrade, Error>
+u.read_exact(out: mut buffer, count: i64) -> Result<(), Error>
+u.write(data: slice<u8>) -> Result<(), Error>
+u.deadline(timeout_ns: i64) -> Result<(), Error>
+u.shutdown() -> Result<(), Error>
+```
+
+Header names and the `contains_token` argument use the existing nonempty ASCII RFC token rule and
+abort before scanning when invalid. `count` is case-insensitive over physical rows. `tokens_valid`
+checks every comma member of every repeated row and returns true for absence; `contains_token`
+searches all rows/members ASCII-case-insensitively but does not certify its neighbors. All three are
+Pure, allocation-free, cursor-free, and borrow only the existing request table. At the native
+boundary, each checks the context before complete name and token views. Null/misaligned context
+hard-aborts before reference formation; negative or address-space-unrepresentable length and null
+positive-length range reject before slice formation; invalid token bytes hard-abort before table
+scanning. A dangling nonnull pointer is not
+detectable. There is no malformed-input sentinel that can be confused with zero or false.
+
+`upgrade_ready` is Pure, allocation-free, and true exactly when the parsed request is HTTP/1.1 and
+the parser retained no residual bytes after the complete request. `pkg.web.Ctx` copies that value
+into its trailing `upgrade_ready: bool` before middleware/dispatch. HTTP/1.0 and co-read post-request
+bytes therefore take the protocol package's normal 400 path before accept calculation, and the
+lower transfer boundary checks the same two facts again. Its native getter likewise hard-aborts on
+a null/misaligned context rather than returning false.
+
+`respond_upgrade` consumes only the builder. Before bytes or fd ownership move it checks in order:
+HTTP/1.1, no parser residual, exact status 101, absent body, every header in insertion order with a
+nonempty ASCII RFC-token name and a value restricted to HTAB/SP/visible-ASCII/obs-text bytes,
+exactly one nonempty token-list Upgrade row, exactly one valid Connection row containing the
+Upgrade token, absent Content-Length, then absent Transfer-Encoding. Validation failure
+leaves ctx unspent. Checked addition then computes exact wire-head length `H`; overflow is Invalid
+with ctx still unspent. Here `H = len("HTTP/1.1 101 Switching Protocols\r\n") +
+sum(len(name) + len(": ") + len(value) + len("\r\n")) + len("\r\n")`. One exact `H`-byte buffer is
+allocated and filled without growth or a second serialized copy, and the fixed handle shell is
+allocated, before fd transfer. With entry builder heap `B` and `U = size_of::<HttpUpgrade>()`, the
+exact producer-requested operation high-water excluding allocator-private metadata is `B + H + U`;
+compile-time layout assertions and an allocation probe own it. OOM hard-aborts before a
+wire byte or ownership transfer. The runtime then lifts the fd, marks ctx spent, and writes the
+complete head; success alone publishes the Move handle. The head and builder are freed before
+publication. Write failure closes the fd and leaves ctx spent. The ctx retains the request buffer
+for pump views and never parks the upgraded fd.
+
+`http_upgrade` owns that fd plus sticky terminal error state. It is a local/pump-only Move carrier:
+raw same-frame locals and by-value/borrow/borrow-mut parameters are admitted; one unnested
+same-frame `Result<http_upgrade, E>` local may come from the constructor or `map_err` and be consumed
+by `?`, `else`, or `match`, provided `E` has no reachable upgrade handle. User returns and every
+other tag, aggregate, collection, box, global, out, extern, capture, task, and parallel value reject.
+The canonical type-record-v3 leaves are the append-only post-`pkg.csv` tags
+`Ty::HttpUpgrade=71` and `Scalar::HttpUpgrade=47`; exact root bytes are
+`[3, 0, 0, 0, 0, 71]` and the field scalar is `[47]`.
+`read_exact` requires a mutable bare-local buffer and `0..=capacity`, clears output,
+never grows or overreads, and publishes only complete success. Premature EOF is NotFound. `write` is
+empty-safe, SIGPIPE-safe write-all and retains/copies no data. `deadline` requires
+`1..=86400000000000` ns and records one monotonic start-plus-budget deadline. Every later read/write
+recomputes the same remaining budget before each syscall, uses positive ceil quantization, and never
+resets it per call or partial transfer. A native timeout wakeup rechecks the clock and retries when
+budget remains; exhaustion returns Timeout without another syscall. `shutdown` is terminal: it
+invokes native `SHUT_RDWR` once, accepts ENOTCONN as already shut down, then performs one no-retry
+cleanup close; another shutdown errno is returned after close, while repeated success is idempotent.
+Any stateful failure closes/poisons and later calls replay the same builtin Error without I/O.
+After successful shutdown, read/write/deadline return `Error.Invalid` without buffer/state/clock/I/O
+mutation; repeated shutdown alone is idempotent Ok. Caller argument invalidity is selected before
+live/spent/poisoned state. Drop is close-only with no protocol write.
+
+SIGPIPE safety is established before a connection can reach this surface. Linux writes use
+`send(MSG_NOSIGNAL)`. On macOS/iOS, accepted-socket `SO_NOSIGPIPE` installation is checked before
+request read/context publication; failure closes that fd once and makes `srv.accept` return the
+mapped OS error. It cannot leave an Upgrade-capable socket with suppression merely attempted.
+
+The ten keyed rows are `HttpCtxUpgradeReady` A03, `HttpHeadersCount` A37, `HttpHeadersTokensValid` A20,
+`HttpHeadersContainsToken` A120, `HttpRespondUpgrade` A24, `HttpUpgradeReadExact` A20,
+`HttpUpgradeWrite` A20, `HttpUpgradeDeadline` A04, `HttpUpgradeShutdown` A03, and
+`HttpUpgradeFree` A62. No new ABI shape is reserved. This prerequisite activates only in the
+combined `pkg.ws` implementation capability; current shipped counts and A124 remain unchanged.
+The generated declarations retain those reused shapes' empty curated function-attribute sets; the
+Rust C exports do not unwind across C, but no LLVM `nounwind` attribute or shared shape mutation is
+introduced.
+Exact validation, pointer, ownership, cache, and test contracts: `../pkg-design/ws.md`.
+
 ## Pitfalls
 
 - **P1 (no silent downgrade — now via real TLS)**: `https://` must NEVER be sent as plaintext.

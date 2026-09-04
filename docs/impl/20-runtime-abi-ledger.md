@@ -485,6 +485,74 @@ cannot activate the row or select checked `CsvDecode`; exact compatible source-
 extern reuse follows the ordinary registry rule. No partial producer may land. Exact semantics,
 validation order, allocation contract, and closure matrix: `pkg-design/csv.md`.
 
+## `pkg.ws` reservation (designed; not active)
+
+The accepted `pkg.ws` design reserves ten future keyed identities, all on existing ABI shapes:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `HttpRespondUpgrade` | `align_rt_http_respond_upgrade` | A24: `i32 @SYM(ptr, ptr, ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *mut ResponseBuilder, *mut *mut HttpUpgrade) -> i32` |
+| `HttpUpgradeReadExact` | `align_rt_http_upgrade_read_exact` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, *mut Buffer, i64) -> i32` |
+| `HttpUpgradeWrite` | `align_rt_http_upgrade_write` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, *const u8, i64) -> i32` |
+| `HttpUpgradeDeadline` | `align_rt_http_upgrade_deadline` | A04: `i32 @SYM(ptr, i64)` | `unsafe extern "C" fn(*mut HttpUpgrade, i64) -> i32` |
+| `HttpUpgradeShutdown` | `align_rt_http_upgrade_shutdown` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpUpgrade) -> i32` |
+| `HttpUpgradeFree` | `align_rt_http_upgrade_free` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpUpgrade)` |
+| `HttpHeadersCount` | `align_rt_http_headers_count` | A37: `i64 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i64` |
+| `HttpHeadersTokensValid` | `align_rt_http_headers_tokens_valid` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i32` |
+| `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
+| `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx) -> i32` |
+
+These rows remain absent from `RuntimeKey`, declarations, definitions, exports, collision identity,
+fingerprints, and count assertions until one atomic implementation activates the complete
+capability. The current inventory therefore remains 331 keyed records, 349 base records, 353 with
+either optional four-row probe, and 357 with both; A124 remains the next unreserved active shape.
+
+The same capability hardens the existing HTTP accepted-socket setup without adding a key or shape.
+On macOS/iOS, after the existing best-effort `TCP_NODELAY` and `SO_KEEPALIVE`, `SO_NOSIGPIPE`
+installation is checked before reading a request or publishing a request context. Failure captures
+that errno, closes the accepted fd once without retry while ignoring the close result, and makes
+`srv.accept` return the original mapped OS error; no context or writable connection escapes. Linux
+retains `send(MSG_NOSIGNAL)`. A socket-option failpoint owns the failure ordering and close count.
+
+`HttpRespondUpgrade` first validates and zeroes its writable aligned output. Invalid output returns
+`AL_INVALID` without inspecting or consuming inputs. It then requires and takes a nonnull aligned
+builder before ctx validation, so every later result consumes it. After the exact semantic checks,
+checked addition computes `H = len("HTTP/1.1 101 Switching Protocols\r\n") +
+sum(len(name) + len(": ") + len(value) + len("\r\n")) + len("\r\n")`; an unrepresentable total
+returns `AL_INVALID` with ctx unspent. The runtime allocates and fills exactly one `H`-byte head
+without growth or a second serialized copy, then allocates the fixed handle shell, all before fd
+transfer or wire I/O. With entry builder heap `B` and `U = size_of::<HttpUpgrade>()`, the exact
+producer-requested operation high-water excluding allocator-private metadata is `B + H + U`;
+compile-time layout assertions and an allocation probe own it. OOM hard-aborts
+before transfer. It publishes the handle only after the validated HTTP/1.1, residual-free 101 head
+with complete RFC header syntax writes completely and the fd moves from the request context. The
+readiness getter returns true only for HTTP/1.1 with no parser residual. Read validates
+arguments/state before clearing a live buffer and publishes length only after exact success;
+write borrows bytes and is SIGPIPE-safe write-all. Deadline retains one monotonic start-plus-budget
+in the opaque handle; every later read/write recomputes the same remaining budget before each
+syscall, rounds positive waits up, rechecks an early native timeout wakeup, and makes no call after
+exhaustion. Shutdown invokes native `SHUT_RDWR` once, treats ENOTCONN as success, then performs one
+no-retry cleanup close; other shutdown errors are returned after close. Free performs close only.
+Each operation closes at most once. Caller-invalid precedes handle state; spent read/write/deadline
+return `AL_INVALID` without mutation/clock/I/O, shutdown is idempotent, and poisoned operations replay
+the stored status without I/O.
+
+Header query pointers borrow the live request context for the call and retain nothing. Count and
+token validation check context, then name; contains checks context, complete name view/token, then
+complete searched-token view/token. A null or misaligned context hard-aborts before Rust reference
+formation; negative or address-space-unrepresentable length and null positive-length range reject
+before slice formation; invalid token bytes hard-abort after safe view formation but before table
+scanning. `HttpCtxUpgradeReady` applies the same context rule.
+Dangling nonnull pointers remain outside the detectable ABI contract. No malformed query maps to
+an ordinary zero/false result. All other pointer/length/count/capacity/address products are rejected
+before Rust reference or slice formation as specified by their status-returning rows.
+
+All ten exports use the Rust C calling convention and must not unwind across it. Their generated
+LLVM declarations preserve the reused A03/A04/A20/A24/A37/A62/A120 shapes' current empty curated
+function-attribute sets: this capability adds no `nounwind`, memory, return, or parameter attribute
+and does not mutate shared shape fingerprints. Exact public semantics, status mapping, validation
+order, ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:

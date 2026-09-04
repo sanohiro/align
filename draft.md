@@ -3855,6 +3855,86 @@ dialect inference, dynamic/owned rows, nullable columns, and recovery remain out
 grammar, conversions, precedence, lifetime, cache identity, ABI reservation, and closure matrix:
 `docs/impl/pkg-design/csv.md`.
 
+The designed `pkg.ws` v1 surface is one RFC 6455 server route over `pkg.web`:
+
+```text
+pkg.ws.Message { Text(string), Binary(array<u8>), Close(pkg.ws.Close) }
+pkg.ws.Close { code: Option<i64>, reason: string }
+pkg.ws.route(pattern: str, protocols: slice<str>,
+  pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>)
+  -> pkg.web.types.Route
+pkg.ws.receive(borrow mut connection: http_upgrade, max_message_bytes: i64)
+  -> Result<pkg.ws.Message, Error>
+pkg.ws.send_text(borrow mut connection: http_upgrade, text: str) -> Result<(), Error>
+pkg.ws.send_binary(borrow mut connection: http_upgrade, data: slice<u8>) -> Result<(), Error>
+pkg.ws.close(connection: http_upgrade, code: i64, reason: str, timeout_ns: i64)
+  -> Result<(), Error>
+```
+
+There are no defaults. `route` produces a GET Upgrade row in the same Copy route table as Respond
+and Stream handlers; routing, middleware, 404/405 behavior, request views, explicit workers, and
+`SO_REUSEPORT` remain owned by `pkg.web`. Protocol lists contain unique nonempty RFC tokens.
+Construction remains Pure: the package supplies a Pure total validator which `pkg.web.serve` runs
+during existing pre-bind route validation; an invalid list aborts before bind or radix-tree
+construction. An empty list selects no subprotocol; otherwise the first server-list entry offered
+byte-exactly by the client wins and no match rejects the handshake. The router admits only exact
+GET to this row;
+other methods retain ordinary 404/405 behavior. After middleware Proceed, the HTTP prepare callback
+defensively rechecks GET, requires HTTP/1.1 with no parser residual, then validates empty body, one
+Host/key/version, all repeated token rows, canonical 16-byte base64 key, and version 13 before
+producing the header-only 101. The lower transfer boundary repeats the version/residual checks and
+validates complete response-header syntax before producing bytes. It computes the exact wire-head
+length with checked addition, allocates one exact head plus the handle shell before fd transfer, and
+counts their peak coexistence with builder-owned header storage; OOM therefore occurs before any
+wire byte. The three header queries and readiness getter hard-abort detectable malformed native
+context/view shapes before reference or slice formation and invalid token bytes before scanning,
+rather than returning ordinary zero/false. The
+SHA-1 accept proof is private package source and adds no public crypto operation.
+
+`http_upgrade` is a protocol-neutral `std.http` Move handle published only after a validated and
+fully written HTTP/1.1 101. The request context stays spent but alive, retaining its views for the
+pump. The raw handle may be a same-frame local or a by-value/borrow/borrow-mut parameter. The only
+tagged carrier is one unnested same-frame `Result<http_upgrade, E>` local whose complete `E` graph
+contains no upgrade handle; it may come from the constructor or `map_err` and be consumed by `?`,
+`else`, or `match`. It may not be a parameter, field, capture, return, or any Option/reversed/nested
+Result, aggregate/collection/box/global/out/extern/task/parallel carrier. Canonical type-record-v3
+leaves are `Ty::HttpUpgrade=71` and `Scalar::HttpUpgrade=47`.
+Exact read into a caller buffer, write-all, one strict positive cumulative monotonic deadline,
+shutdown, and close-only Drop are Impure; read/write failure closes and stores one sticky builtin
+`Error`. After shutdown, read/write/deadline return `Error.Invalid` without mutation, clock access,
+or I/O; repeated shutdown is idempotent. Caller argument invalidity precedes handle state. The
+deadline budget is never reset by another call, partial transfer, or frame. Linux writes use
+`MSG_NOSIGNAL`; macOS/iOS admits an accepted socket only after checked `SO_NOSIGPIPE`, closing it
+once and returning the mapped accept error before request publication if installation fails.
+
+Receive requires an explicit inclusive `0..=536870912` message bound and returns one complete owned
+Text/Binary message or peer Close. Each call also has a fixed 1048576-byte source-work allowance:
+exact masked-header bytes and control payload bytes are charged before their reads, so zero-length
+continuation and Ping/Pong floods terminate with 1009 without reading the rejected next unit. It
+accepts RFC fragmentation and interleaved control frames,
+requires client masking and minimal 7/16/64-bit lengths, answers Ping with identical Pong, consumes
+Pong, validates Text and Close UTF-8, and echoes a valid Close before server shutdown, except that
+client-only code 1010 receives an empty Close acknowledgment while its original code/reason is
+returned. Protocol,
+text, and bound failure best-effort send 1002, 1007, and 1009 respectively, then close; a transport
+failure while fulfilling that reply wins. The fixed 512 MiB payload cap, 32 KiB scratch, simultaneous
+old/new builder growth, Text staging/result allocations, and a 128-byte shell budget have an exact
+64-bit producer-requested live-heap ceiling of 1073774720 bytes, excluding allocator metadata and
+owned by a resource probe. Server data frames are unmasked, FIN-complete, and borrow
+payload without copying. Server-initiated close validates the pinned sendable IANA code set and a
+123-byte reason, installs an explicit positive cumulative deadline, waits for peer Close while
+answering Ping without resetting that budget, then performs the server TCP close. Client mode,
+HTTP/2, extensions/compression, raw frames,
+standalone serving, async/background heartbeat, and connection registries are outside v1.
+
+Implementation activates the third web handler variant, three repeated-header/token queries, one
+version/residual readiness query, checked 101 transfer, upgraded transport operations, package
+source, and ten runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
+preserving its empty curated LLVM function-attribute set rather than adding `nounwind` to shared
+shape identity; the Rust C exports still do not unwind across C, and A124 remains unused. The design
+alone changes no shipped inventory. Exact surface, validation order, frame/close grammar,
+allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
+
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship.
 A proposed package joins that set only when its source ships. First-party packages are

@@ -19,6 +19,51 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### WebSocket v1 is one typed RFC 6455 Upgrade route (SETTLED 2026-09-03)
+
+**Decision:** `pkg.ws` does not own another listener, router, concurrency model, or request context.
+`pkg.ws.route(pattern, protocols, pump)` produces a GET Upgrade row in the existing `pkg.web`
+route table, so REST, SSE, middleware, 404/405 behavior, and explicit `SO_REUSEPORT` workers remain
+one system. A protocol-neutral `http_upgrade` Move handle is published only after a validated,
+fully written residual-free HTTP/1.1 101 with complete response-header syntax; the spent request
+context retains request views for the pump. The raw handle admits same-frame local and
+by-value/borrow/borrow-mut parameter use. Its only tagged carrier is an unnested same-frame Result
+Ok local from construction or `map_err`; no other aggregate, tag, collection, capture, task,
+parallel, extern, out, global, or user-return carrier is admitted. Canonical type tags are 71/47.
+The transfer checks exact serialized-head length, allocates one exact head and the handle shell
+before fd ownership moves, and counts their overlap with builder storage. Detectable malformed
+native header/readiness context/view shapes hard-abort before reference/slice formation and invalid
+token bytes before scanning; neither can become ordinary zero/false. Reused ABI shapes retain their
+empty curated LLVM attribute sets.
+
+The package supplies a Pure total protocol-list validator which existing pre-bind route validation
+runs before bind/tree construction. It validates the canonical RFC 6455 header/token/key/version
+handshake only after an HTTP/1.1-and-residual-free readiness check and selects the
+first server-order subprotocol offered by the client. Its fixed accept SHA-1 implementation is
+private package source, not a public crypto primitive. Receive assembles one bounded Text/Binary
+message or Close across fragmentation, requires client masks and minimal lengths, and uses a fixed
+1 MiB per-call masked-header/control-payload source-work allowance so zero-length frame floods are
+bounded. It automatically
+answers Ping, consumes Pong, validates complete Text/Close UTF-8, and sends 1002/1007/1009 for
+protocol/text/limit failure. A peer Close is echoed before server shutdown except that client-only
+1010 receives an empty acknowledgment. The 512 MiB message cap has an exact 1073774720-byte 64-bit
+producer-requested live-heap ceiling including scratch, shell budget, simultaneous growth, and Text
+staging/result, excluding allocator metadata. Server sends are
+unmasked and payload-copy-free; an initiated Close takes an explicit timeout and waits for peer
+Close while continuing required Ping replies. The generic transport exposes exact bounded-buffer
+reads, write-all, one cumulative monotonic deadline that never resets per I/O/frame, shutdown, and
+close-only Drop. Spent read/write/deadline return Invalid without mutation, clock access, or I/O;
+shutdown remains idempotent and caller-invalid arguments take precedence over state.
+Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE` before request read/context publication,
+closing the accepted fd once and returning the mapped accept error if setup fails.
+
+Ten planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
+new ABI shape and A124 remains next. HTTP/2 extended CONNECT, client mode, TLS termination,
+extensions/permessage-deflate, raw frames, standalone serving, async/background heartbeat,
+connection registries, and broadcast are separate consumer-backed capabilities.
+
+Record: `docs/impl/pkg-design/ws.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### CSV v1 is one explicit typed direct-to-SoA decode (SETTLED 2026-09-03)
 
 **Decision:** `pkg.csv` exposes `Header { Present, Absent }`,

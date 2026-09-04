@@ -183,8 +183,10 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 ```text
 // types
 web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
-             pattern, the body view, and the detached header-table view). It owns NOTHING — the
-             request handle stays with `serve`, and the views are valid for the handler call.
+             pattern, the body view, and the detached header-table view). It owns nothing; `serve`
+             retains the request handle across prepare and pump. The pending Upgrade capability adds
+             one trailing Copy `upgrade_ready: bool`, true exactly for an HTTP/1.1 request with no
+             parser residual. Views remain valid for the handler/pump call.
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
@@ -243,8 +245,8 @@ param names remain build-time aborts.
 
 - **F1 — field-eligibility widening.** Shipped for the shapes `web.Ctx` and `Route` require:
   ① a **fn value** field (Copy pointer — `Route.handler`; effects flow through `FnTy`), ② a
-  **Move handle** field (`http_request_ctx` inside `Ctx`), and ③ a region-tracked
-  **`slice<str>`** field for parameter slots. Capturing escaping closures remain outside this
+  detached **`http_headers` view** field inside Copy `Ctx`, and ③ a region-tracked **`slice<str>`**
+  field for parameter slots. Capturing escaping closures remain outside this
   capability; pkg.web does not depend on them.
 - **F0 — pkg-foundation rules.** `internal`, pkg-layer import checks, and the package specification
   shipped, enabling `pkg.web.internal.*` for the radix implementation.
@@ -256,11 +258,11 @@ param names remain build-time aborts.
 ```text
 Route / route table   Copy data (str view of a literal + tag + fn pointer); Static; never dropped
 the radix tree        built once inside serve (arena- or startup-heap-owned; freed at serve exit)
-web.Ctx               Move struct (owns the request handle); created by serve per request,
-                      consumed exactly once by a responder; params are views (never dropped)
+web.Ctx               Copy struct of request views; serve retains the request handle and keeps
+                      every view valid through middleware/handler/pump completion
 web.serve             Impure; borrows the table; runs until setup-Err
-accessors             Pure; views region-bound to c (escape past the responder = compile error)
-responders            Impure; consume c
+accessors             Pure; views region-bound to serve's retained request owner
+responders            Pure; build a response and neither consume c nor touch the request handle
 handlers              Impure allowed; called through Route.handler (FnTy effect bits, fail-closed)
 ```
 
@@ -695,6 +697,65 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 `from` guards. The `upload` handler above is EXTRACTED from this file and compiled against the real
 `apps/web/pkg/**`, so a documented example that stops compiling fails the suite.
 
+## Planned protocol-neutral Upgrade seam for `pkg.ws`
+
+`pkg.ws` is a separate package, but it must share this package's route table, middleware order,
+request views, and prefork worker ownership. Its design ledger adds one protocol-neutral extension
+without making `pkg.web` depend on WebSocket semantics:
+
+```align
+pub UpgradeAccepted { response: response_builder, selected: string }
+pub UpgradeDecision {
+  Accept(UpgradeAccepted)
+  Reject(response_builder)
+  Failed(Error)
+}
+pub UpgradeHandler {
+  validate: fn(slice<str>) -> bool,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
+}
+```
+
+`Handler` gains trailing `Upgrade(UpgradeHandler)`. `Route` gains trailing
+`upgrade_values: slice<str>`; every existing constructor writes `[]`, while the new exact constructor
+is:
+
+```text
+pkg.web.upgrade(method: str, pattern: str, values: slice<str>,
+  validate: fn(slice<str>) -> bool,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>) -> Route
+```
+
+The constructor is Pure and protocol-blind. `values` are retained Copy configuration. The supplied
+noncapturing `validate` function must be inferred Pure. Existing pre-bind route validation invokes
+it once per Upgrade row after common method/pattern/prefix and handler-storage checks but before
+segment and pair checks; false aborts with exact text
+`pkg.web: route N (METHOD PATTERN) has invalid upgrade values`. Thus a protocol package can keep its
+constructor Pure while dynamic configuration is still rejected before bind/tree construction.
+After the existing route and middleware decision, prepare runs once. Reject uses ordinary
+`ctx.respond`; Failed uses the existing error log plus fixed 500; Accept passes its builder to
+`ctx.respond_upgrade`. Only a successful fully written 101 invokes pump, which owns the transport
+and selected string while the spent context keeps `Ctx` views alive. An Accept error drops selected,
+logs the ordinary handler diagnostic once, and tries the fixed 500 through the same ctx: validation
+failure left it unspent and can answer, while a write failure left it spent and the fallback silently
+fails. Pump `Ok` emits no log; pump
+`Err` uses the existing Stream method/path/error diagnostic and cannot send another HTTP response.
+HEAD fallback now tests the
+actual `Respond` variant rather than the historical `stream_type == ""` proxy; Stream and Upgrade
+GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values` and all callbacks
+unchanged. Startup route validation requires empty `stream_type` for Respond/Upgrade and nonempty
+only for Stream. `Ctx` gains the exact trailing `upgrade_ready: bool`, copied from the new
+protocol-neutral `http_request_ctx.upgrade_ready()` query before middleware; `pkg.ws` uses false for
+the ordinary empty-body 400 path, while `respond_upgrade` repeats its version/residual checks.
+
+An open Upgrade occupies one sequential worker exactly like Stream. No second listener, router,
+worker pool, hidden task, app registry, or WebSocket rule enters this package. Existing hot paths
+perform only the additional closed Handler tag match; the zero-allocation routing contract remains.
+This seam and `pkg.ws` activate together; it is not shipped by this design document alone. Exact
+cross-package ledger and closure matrix: `ws.md`.
+
 ## Slices (F3 of the plan)
 
 - **W1 — router core. DONE.** Pattern parse + validation; the **radix tree** (static/param/wildcard
@@ -759,11 +820,12 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
   — never per-app drift).
 - **P2 — the radix tree is the design, not an optimization.** Linear scan exists only as the W1
   differential-testing oracle. (Fiber/httprouter is the reference precisely for dispatch.)
-- **P3 — params/views escape discipline.** A view stored past the responder consume is a compile
+- **P3 — params/views escape discipline.** A view stored past the request callback is a compile
   error by design (#460 liveness); document `.clone()` as the explicit escape — never eager-copy
   "to be safe" (that breaks invariant 1).
-- **P4 — no hidden response state.** Responders consume `Ctx` (Move); no builder-inside-ctx
-  mutation pattern. Headers beyond the sugar → std.http `response_builder` directly.
+- **P4 — no hidden response state.** `serve` retains the request handle while Pure responders build
+  standalone response values; no builder-inside-ctx mutation pattern. Headers beyond the sugar →
+  std.http `response_builder` directly.
 - **P5 — nothing on the hot path may allocate.** Every W-slice PR states where its bytes live
   (view / arena / startup); the W5 bench is the enforcement, but review checks it first.
 - **P6 — 405 needs the per-path method set** from the tree (Allow header) — design it into the

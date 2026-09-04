@@ -4041,8 +4041,27 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
   and recovery are deferred. Exact ledger and implementation closure matrix:
   `pkg-design/csv.md`.
-- **pkg.ws** — RFC 6455 server; reuses pkg.web streaming + SO_REUSEPORT; SHA-1 kept internal to
-  the package (not added to public crypto).
+- **pkg.ws — DESIGNED 2026-09-03; implementation pending** — RFC 6455 HTTP/1.1 server integrated
+  into the existing `pkg.web` route table, middleware order, request views, and explicit
+  `SO_REUSEPORT` worker model through one protocol-neutral Upgrade handler. The new
+  `http_upgrade` Move handle owns the fd after a checked 101 and exposes exact read/write, one
+  cumulative monotonic deadline, shutdown, and close-only Drop; it cannot enter aggregates,
+  captures, tasks, parallel work, externs, or user returns. `pkg.ws.route` performs the canonical
+  key/version/token/subprotocol handshake, with server-order selection and SHA-1 private to the
+  package. `receive` assembles bounded Text/Binary messages under separate message-byte and fixed
+  frame-work caps, counts scratch/transient-growth/Text-conversion memory in one exact ceiling,
+  answers Ping, ignores Pong, validates masked frames and UTF-8, and echoes a valid peer Close except
+  that client-only 1010 receives an empty acknowledgment.
+  Header/readiness ABIs hard-abort detectable malformed inputs instead of aliasing zero/false. The
+  101 path allocates one checked exact head and its handle shell before fd transfer and instruments
+  their overlap with builder storage. Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE`
+  before request-context publication and closes once with a mapped accept error on failure.
+  Sends are unmasked and do not copy payload; server close has an explicit cumulative deadline and
+  completes the closing handshake without resetting its budget. Ten planned runtime keys reuse
+  existing shapes and their empty curated LLVM function-attribute sets, so A124 remains unused.
+  WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
+  heartbeat observation, and broadcast state are deferred. Exact ledger and implementation
+  closure matrix: `pkg-design/ws.md`.
 - **pkg.template** — escape-by-default HTML builder; `raw` is the one unescaped path; shares the
   shipped `encoding.html_escape` 5-entity table.
 - **std.xml** — well-formed-only read-only reader; DOCTYPE / DTD / PI / external entity rejected

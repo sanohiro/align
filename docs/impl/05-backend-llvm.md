@@ -550,3 +550,24 @@ crt0), and the driver links the object with `cc`. (History: M0 shipped on LLVM 1
 
 `Option`/`Result` use tagged aggregates, and SoA is selected by an explicit `soa<T>` type; neither
 is an open backend decision.
+
+## Planned `http_upgrade` lowering (`pkg.ws` prerequisite)
+
+`http_upgrade` lowers as the same nullable one-pointer owned handle class as `http_stream`, with its
+own Drop key. LLVM contains no WebSocket handshake, SHA-1, frame, mask, UTF-8, subprotocol, or close
+semantics. It purely lowers the checked MIR operations to ten typed runtime keys using existing
+ABI shapes A24/A20/A120/A37/A04/A03/A62, reconstructs builtin Results, nulls moved sources, and
+emits cleanup at the MIR-selected edges. `HttpRespondUpgrade` uses an alloca out slot initialized
+null; only zero status loads/publishes the handle. Its runtime computes checked exact wire-head
+length `H`, allocates one `H`-byte serialization plus the handle shell before fd transfer, and owns
+their overlap with still-live builder storage. Read publishes buffer length only through the
+runtime's successful return. The header queries and readiness getter hard-abort detectable malformed
+native context/view shapes before reference or slice formation, and invalid token bytes before
+table scanning, rather than mapping either class to zero/false.
+On macOS/iOS, checked `SO_NOSIGPIPE` acceptance precedes request-context publication; failure closes
+the accepted fd and returns its mapped error. Linux retains `MSG_NOSIGNAL`. Curated LLVM function
+attributes remain the reused shapes' exact empty sets; the Rust C exports do not unwind across C,
+but this capability adds no declaration-side `nounwind` and does not mutate a shared shape
+fingerprint. rt-LTO
+on/off, whole/per-unit, extern-collision, declaration/export, and malformed-MIR owners are fixed in
+`pkg-design/ws.md`. A124 remains unused. Nothing in this section is active before that capability.

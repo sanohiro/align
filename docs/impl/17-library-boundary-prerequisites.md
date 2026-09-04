@@ -4969,3 +4969,31 @@ measurement is not rerun for an unrelated compiler or package change.
 
 The goal is not zero instructions for safety. It is one general, statically checked mechanism whose
 cost and invalidation behavior remain visible and predictable.
+
+## 12. `pkg.ws` HTTP Upgrade prerequisite (designed; implementation pending)
+
+The next package capability is one vertical boundary, not another general resource wave. It adds
+the narrowly carried `http_upgrade` builtin handle because `pkg.web` cannot name a type owned by a
+package that imports it, and erased/capturing callbacks would either break type safety or require a
+heap closure environment. The shared seam ends at HTTP ownership transfer; RFC 6455 stays ordinary
+`pkg.ws` source. Exact public types, status/error precedence, carrier grammar, native signatures,
+and the implementation closure matrix are authoritative in `pkg-design/ws.md`.
+
+| Prerequisite cell | Exact closure | Owner evidence |
+|---|---|---|
+| header multiplicity/token query | Three Pure, allocation-free operations scan every repeated physical row, share one RFC token grammar, reject invalid source arguments before scan, and return no borrowed cursor/view. Their native rows hard-abort detectable null/alignment/length/range defects in ctx/name/token order before safe view formation and invalid token bytes before table scan; readiness does the same for ctx, so malformed input never aliases zero/false. | token differential oracle; repeated-row/malformed-neighbor matrix; direct-ABI subprocess aborts; HIR/runtime/whole-per-unit owners |
+| checked 101 transfer | Borrow ctx, consume builder, validate HTTP/1.1, no parser residual, status/body, complete header syntax, Upgrade/Connection/framing before fd lift/write; compute checked exact head length `H`, allocate/fill one `H`-byte head and the handle shell before transfer while counting their builder-storage overlap; expose readiness; publish only after full head write, retain spent ctx views, never park. | raw socket response and validation/write/OOM failpoints; exact head allocation high-water; version/residual matrix; Move/source-null/Drop matrix |
+| upgraded handle carrier | Exact canonical leaves 71/47; positive raw same-frame local/parameter plus unnested same-frame Result Ok grammar; exhaustive rejection of all other storage/capture/task/parallel/native/return edges. | bidirectional/malformed codec goldens, no-wildcard type graph, future-variant tripwire, control-flow and malformed-HIR owners |
+| exact transport operations | Mutable bare-buffer exact read without overread/partial publication, payload-copy-free write-all, one cumulative monotonic deadline with no per-call/frame reset, spent Invalid/no-I/O behavior, idempotent shutdown, sticky failure and close-only Drop. Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE` before request read/context publication, closes once, and returns the mapped accept error on failure. | caller-invalid x live/spent/poisoned state matrix and split/coalescing/deadline/SIGPIPE/fd/allocation counters across Linux/macOS, including socket-option failpoint |
+| web extension dispatch | Copy Pure validator/prepare/pump functions and opaque values slice, pre-bind protocol validation, closed third Handler variant, route/middleware/HEAD/405/group behavior, pump only after successful 101. | validator effect/order/diagnostic plus mixed-route E2E and interface/cache mutation owners |
+| package protocol | canonical handshake/private SHA-1, server-order subprotocol, RFC framing/masking/fragment/control/UTF-8/close under explicit message and fixed 1048576-byte source-work bounds; client-only 1010 gets an empty acknowledgment; exact 64-bit producer-requested live-heap ceiling 1073774720 counts scratch, shells, realloc old/new, and Text staging/result while excluding allocator metadata. | independent RFC/wire/browser oracle; randomized fragmentation, zero-length/control flood, 1010 acknowledgment, multi-invalid, and live-byte resource owners |
+
+All ten planned runtime keys reuse existing shapes; no new shape or active count is introduced by
+design. Implementation is one PR because no strict prefix leaves a useful consumer: the web variant
+is dormant without transport and the package cannot exercise transport without dispatch. The
+expected >1,000 hand-written lines are justified by eliminating an unusable intermediate ABI and
+closing fd ownership with one socket oracle. A strategy/public-surface finding reopens this matrix
+before code; an implementation that follows it gets the ordinary single preflight review.
+The generated declarations keep the reused shapes' empty curated function-attribute sets; Rust C
+exports do not unwind across C, but the capability adds no LLVM `nounwind` attribute and changes no
+shared shape fingerprint.
