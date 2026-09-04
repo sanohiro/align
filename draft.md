@@ -1805,7 +1805,7 @@ write_value(score)
 ```
 
 Only the plain `template "…"` language form is shipped. The former `html "…"`, JSON-template,
-and expression-level `raw(...)` sketches are not accepted syntax. The proposed `pkg.template`
+and expression-level `raw(...)` sketches are not accepted syntax. The designed `pkg.template`
 capability leaves this formatter unchanged and instead supplies an opaque HTML builder: ordinary
 `write` escapes text with the shared five-entity table, while the package's `raw` function is the
 one explicit unescaped append. Contextual language-template parsing remains deferred.
@@ -2701,9 +2701,9 @@ total := rows.where(.active).pay.sum()?
 
 ```text
 template          // shipped plain scalar formatter
-html              // deferred language form; proposed pkg.template is a separate opaque builder
+html              // deferred language form; designed pkg.template is a separate opaque builder
 json template     // deferred; json.encode owns shipped JSON formatting
-raw               // no expression form; proposed only as pkg.template's explicit append function
+raw               // no expression form; designed only as pkg.template's explicit append function
 ```
 
 ### core.hash
@@ -3925,13 +3925,13 @@ standalone serving, async/background heartbeat, and connection registries are ou
 
 Implementation activated the third web handler variant, three repeated-header/token queries, one
 version/residual readiness query, checked 101 transfer, upgraded transport operations, package
-source, and ten runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
+source, and eleven runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
 preserving its empty curated LLVM function-attribute set rather than adding `nounwind` to shared
 shape identity; the Rust C exports still do not unwind across C, and A124 remains unused. Exact
 surface, validation order, frame/close grammar,
 allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
 
-The proposed `pkg.template` v1 surface is one escape-by-default HTML text builder:
+The designed `pkg.template` v1 surface is one escape-by-default HTML text builder:
 
 ```text
 pkg.template.html_builder  // opaque Move resource
@@ -3951,20 +3951,24 @@ The opaque resource never exposes its ordinary builder or a partial view. `html`
 Move owner, both append operations borrow it mutably and allocate no temporary escaped string, and
 `to_string` is the sole finisher: it consumes the owner and transfers the allocator-compatible
 payload into an owned string without a copy. Unfinished Drop frees shell and payload once. There
-are no recoverable errors; detectable malformed compiler-private state and checked length overflow
-abort before mutation, while OOM aborts. Plain language `template "..."` remains the one scalar
-formatter and does not gain escaping.
+are no recoverable errors. The exact-compatible native boundary requires a live exclusively
+accessed constructor-owned shell; its payload is disjoint, allocator-compatible, and valid UTF-8.
+It validates detectable state, complete input UTF-8, and shell/payload aliasing before mutation;
+checked length overflow and OOM abort. Recursive ownership includes the shipped source-formed fixed
+arrays of Move records, and generic interface/monomorphization paths preserve the same identity and
+Drop. Plain language `template "..."` remains the one scalar formatter and does not gain escaping.
 
-The proposed canonical package has root `pkg.template`, empty compiler-private descriptor module
+The designed canonical package has root `pkg.template`, empty compiler-private descriptor module
 `pkg.template.internal.descriptor`, and private resource-hook module
 `pkg.template.internal.resource`. The otherwise-reserved `template` token is contextual only as a
 noninitial dotted path segment in module/import/type/value paths; expression-head `template` plus a
 string remains the existing template form, while bare and other keyword identifiers stay rejected.
-Four checked HIR/MIR operations plus one Drop call reuse existing
-ABI shapes and their empty curated LLVM attributes, so design acceptance alone activates no row and
-A124 remains unused. Contextual templates, components/includes, reflection, streaming/arena forms,
+Four checked HIR/MIR operations plus one Drop call reuse A47/A73/A83/A62 and their empty curated
+LLVM attributes. Design acceptance alone activates no row; implementation adds five keyed and
+source-reachable rows, producing 347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and
+376 maximum records while A124 remains unused. Contextual templates, components/includes, reflection, streaming/arena forms,
 HTML parsing/sanitizing, and URL/CSS/JavaScript encoders remain separate consumer-backed work.
-Exact proposed ledger and implementation closure matrix:
+Exact accepted ledger and implementation closure matrix:
 `docs/impl/pkg-design/template.md`.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as

@@ -730,9 +730,9 @@ implicit extension of the scanner surface.
 
 ```text
 template       // shipped plain scalar formatter
-html           // deferred language form; proposed pkg.template is a separate opaque builder
+html           // deferred language form; designed pkg.template is a separate opaque builder
 json template  // deferred; json.encode owns shipped JSON formatting
-raw            // no expression form; proposed only as pkg.template's explicit append function
+raw            // no expression form; designed only as pkg.template's explicit append function
 ```
 
 ### Parallelism
@@ -1583,12 +1583,12 @@ an empty acknowledgment while its original value is returned. The exact 64-bit p
 live-heap ceiling for scratch, shells, simultaneous growth, and Text staging/result is 1073774720
 bytes, excluding allocator metadata. Server sends borrow
 payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
-handshake without Ping/data resetting its budget before closing TCP. Ten active runtime keys reuse
+handshake without Ping/data resetting its budget before closing TCP. Eleven active runtime keys reuse
 existing ABI shapes and their empty curated LLVM function-attribute sets, leaving A124 unused; no
 declaration-side `nounwind` or shared shape fingerprint change is added.
 Exact contract: `impl/pkg-design/ws.md`.
 
-The proposed `pkg.template` v1 is one opaque Move HTML text builder:
+The designed `pkg.template` v1 is one opaque Move HTML text builder:
 
 ```text
 pkg.template.html_builder
@@ -1604,10 +1604,16 @@ attribute contents, not for unquoted attributes, URL/event/CSS/JavaScript semant
 constructed names. `raw` is the sole public unescaped append and marks the explicit trust boundary.
 The resource exposes neither its ordinary builder nor a partial view. Append operations retain no
 input and allocate no temporary string. `to_string` is the only finisher and transfers the payload
-without copying; unfinished Drop frees it exactly once. There is no recoverable error channel.
-Plain language `template "..."` remains the sole scalar formatter and is unchanged. The proposed
+without copying; unfinished recursive Drop frees it exactly once, including through source-formed
+fixed arrays of Move records. The exact-compatible native boundary requires a live exclusively
+accessed constructor-owned shell, a disjoint allocator-compatible payload, and valid UTF-8; it
+checks detectable state, input UTF-8, and aliasing before mutation. There is no recoverable error channel.
+Plain language `template "..."` remains the sole scalar formatter and is unchanged. The designed
 package requires only one syntax prerequisite: `template` is contextual as a noninitial segment
 after `.` in module/import/type/value paths, while expression-head `template` plus a string retains
-its existing meaning and bare/other keyword identifiers remain rejected. The design activates no
-package/runtime inventory; exact contract and closure matrix:
+its existing meaning and bare/other keyword identifiers remain rejected. Generic interface and
+monomorphization paths retain the resource and operation identity. The design activates no
+package/runtime inventory; implementation adds five keyed rows using A47/A73/A83/A62, for
+347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and 376 maximum records while A124
+remains unused. Exact contract and closure matrix:
 `impl/pkg-design/template.md`.

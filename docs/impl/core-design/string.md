@@ -80,7 +80,7 @@ Frame-regioned `str` (owned-structs work).
 - No direct `s[i]` byte access — use the explicit byte view `s.bytes()[i]` so dropping the UTF-8
   obligation is visible at the call site.
 - The §13/§18.1 language template variants (`html`, `raw`, json-template) — only plain
-  `template "…"` exists. The proposed `pkg.template` capability deliberately leaves that syntax
+  `template "…"` exists. The designed `pkg.template` capability deliberately leaves that syntax
   unchanged and instead provides an opaque HTML builder with default-escaped `write` plus explicit
   `raw`; contextual language-template parsing remains deferred.
 
