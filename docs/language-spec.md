@@ -1064,6 +1064,7 @@ std.cli
 std.log
 std.encoding
 std.regex
+std.xml
 std.compress
 std.rand
 std.crypto
@@ -1261,6 +1262,17 @@ boundaries. Invalid syntax/resource limits are `Error.Invalid`; an invalid `find
 programmer error and aborts. The engine guarantees automata-style predictable matching and excludes
 look-around/backreferences. No regex literal or implicit cache is part of the language. (`draft.md`
 §18.2.)
+
+`std.xml` consumes one owned UTF-8 `string` into a Move `xml.reader` after validating the complete
+document. Its cursor yields `Option<xml.event>` with exact `Start`/`End`/`Text` order; lexical names
+are zero-copy current-reader views, while decoded/normalized attribute values and text are fresh
+owned strings. The XML 1.0 profile accepts comments, CDATA, predefined/numeric references, and
+Unicode XML names, with depth and per-element attribute limits of 256. It rejects every
+DOCTYPE and DTD markup declaration, custom/external entity, and processing instruction before publication, so
+XXE and exponential entity expansion cannot be represented. Namespaces remain lexical and are not
+expanded or binding-validated. Malformed/unsupported input is `Error.Invalid`; valid readers reach
+only events and repeated `None` at EOF. The exact contract is `docs/impl/std-design/xml.md`.
+(`draft.md` §18.2.)
 
 ## In-Language Tests
 

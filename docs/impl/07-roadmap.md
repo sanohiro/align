@@ -3886,7 +3886,7 @@ pending. This section records their sequencing and status; it does not lock an u
      highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
 2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — IMPLEMENTED 2026-08-30
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
-3. Small pieces: std.xml (well-formed read-only) + std.time named formatters
+3. Small pieces: std.xml (well-formed read-only) — DESIGNED 2026-09-05; then std.time named formatters
      unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
      (encoding.percent_encode already shipped; only a '/'-passthrough path variant remains)
 4. Transport: mTLS / Unix domain socket / proxy, then HTTP/2
@@ -4069,8 +4069,12 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   safe only for element text or complete already-quoted attribute contents. Contextual markup,
   URL/CSS/JavaScript encoding, parsing/sanitizing, streaming, and components remain deferred. Exact
   accepted ledger and implementation closure matrix: `pkg-design/template.md`.
-- **std.xml** — well-formed-only read-only reader; DOCTYPE / DTD / PI / external entity rejected
-  (XXE / billion-laughs closed by construction); namespaces not expanded; consumers S3 + Azure Blob.
+- **std.xml — DESIGNED 2026-09-05** — whole-document-validated, forward-only UTF-8 XML 1.0 reader;
+  DOCTYPE / DTD markup or entity declarations / all PI / custom or external entity rejected before
+  publication; one conforming initial XML declaration is accepted and skipped
+  (XXE / billion-laughs closed by construction); lexical namespaces not expanded; inclusive depth
+  and per-element attribute bounds 256; consumers S3 + Azure Blob. Exact public, grammar, ABI,
+  allocation, and implementation closure ledger: `std-design/xml.md`.
 - **std.time formatters** — rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped
   i64-ns timeline; parse self-output + minimal compat; no strftime DSL, no locale/TZ (permanent
   non-goal). Plus `encoding.percent_encode_path`.

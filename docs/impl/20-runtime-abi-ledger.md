@@ -589,6 +589,59 @@ sets. No probe category or ABI shape is added, and A124 remains the next unreser
 The exact 32-byte shell, validation order, escaping table reuse, zero-copy finish, ownership,
 allocation, cache identity, and closure matrix are owned by `pkg-design/template.md`.
 
+## Planned `std.xml` extension (designed 2026-09-05; inactive until implementation)
+
+The accepted XML capability plans eight keyed identities, all on existing ABI shapes:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
+|---|---|---|---|
+| `XmlParse` | `align_rt_xml_parse` | A08: `i32 @SYM(ptr, i64, ptr)` | `unsafe extern "C" fn(*mut u8, i64, *mut *mut XmlReader) -> i32` |
+| `XmlNext` | `align_rt_xml_next` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut XmlReader) -> i32` |
+| `XmlName` | `align_rt_xml_name` | A19: `i32 @SYM(ptr, ptr)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr) -> i32` |
+| `XmlAttributeCount` | `align_rt_xml_attribute_count` | A29: `i64 @SYM(ptr)` | `unsafe extern "C" fn(*const XmlReader) -> i64` |
+| `XmlAttributeName` | `align_rt_xml_attribute_name` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr, i64) -> i32` |
+| `XmlAttributeValue` | `align_rt_xml_attribute_value` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr, i64) -> i32` |
+| `XmlText` | `align_rt_xml_text` | A19: `i32 @SYM(ptr, ptr)` | `unsafe extern "C" fn(*const XmlReader, *mut AlignStr) -> i32` |
+| `XmlFree` | `align_rt_xml_free` | A62: `void @SYM(ptr)` | `unsafe extern "C" fn(*mut XmlReader)` |
+
+The Rust definitions use C calling convention and may not unwind across it. Generated declarations
+retain the reused A03/A08/A19/A20/A29/A62 shapes' empty curated function, return, memory, and
+parameter attribute sets. These are `unsafe` boundaries. Before dereference, the runtime may inspect
+pointer integers and lengths to reject null where forbidden, misalignment, negative length,
+noncanonical empty, address-range overflow, and supplied-range alias. A caller may rely on those
+exact shape rejections. Every nonnull pointer that passes its shape checks and could then be accessed
+must have provenance, lifetime, dereferenceability, accessibility, and the declared shared or
+exclusive access for its exact range against access not represented by the call. Parse input is
+canonical `{null,0}` with no allocation or one positive-length allocator-compatible owned range.
+Getters/count share a shape-valid live shell allocation, while next and nonnull free hold it
+exclusively. When an operation follows the shell's stored input pointer, its live allocation and exact
+readable range are also caller preconditions unless the shell was published unchanged by this
+runtime. Violating a post-shape-check pointer/access precondition is outside the ABI contract and is
+not promised a safe abort.
+
+At parse, the runtime checks representable raw ranges and every detectable input/output alias before
+mutation, Rust reference creation, or slice creation. A mechanically rejected parse returns positive
+`AL_INVALID`, leaves output untouched, and accepts no input
+ownership. In particular, nonnull zero-length input is rejected and never freed. After that
+preflight it stores null and accepts no allocation for canonical empty or the positive-length owned
+input: status zero publishes the sole shell, while `-1` releases accepted input responsibility (a
+no-op for canonical empty) and means public `Error.Invalid`. An
+output-bearing getter leaves output untouched when any complete mechanical preflight step fails:
+address shape, output/fixed-shell disjointness, shell fields, stored shell/input internal disjointness,
+or output/input disjointness. It zeros `{ptr,i64}` only after that preflight; a later state/index
+failure leaves canonical zero for borrowed and owned results alike. Success fills a borrowed name
+view or publishes one completed
+owned value/text allocation. `XmlNext` returns only `0=None`, `1=Start`, `2=End`, or `3=Text`.
+Count is only `0..=256`; every impossible getter result aborts. Free is null-safe; a nonnull argument
+must be a genuine exclusively held shell, and detectable malformed fields abort before following an
+invalid stored input pointer. The runtime does not authenticate an arbitrary dangling address.
+
+Design acceptance reserves no new shape: A124 remains the next unreserved shape and active
+keyed/base/probe totals do not change. Implementation must activate all eight keys, symbols,
+declarations, definitions, exports, collision identities, fingerprint rows, count assertions, and
+their type/Drop consumers atomically. The grammar, status mapping, ownership, validation order,
+allocation contract, and closure matrix are authoritative in `std-design/xml.md`.
+
 ## HTTP client raw receive-stream substrate (implemented)
 
 The first HTTP receive-stream capability adds exactly six keyed records and no new ABI shape:
