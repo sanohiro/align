@@ -36,9 +36,14 @@ runs before bind/tree construction. It validates the canonical RFC 6455 header/t
 handshake only after an HTTP/1.1-and-residual-free readiness check and selects the
 first server-order subprotocol offered by the client. Its fixed accept SHA-1 implementation is
 private package source, not a public crypto primitive. Receive assembles one bounded Text/Binary
-message or Close across fragmentation, requires client masks and minimal lengths, automatically
+message or Close across fragmentation, requires client masks and minimal lengths, and uses a fixed
+1 MiB per-call masked-header/control-payload source-work allowance so zero-length frame floods are
+bounded. It automatically
 answers Ping, consumes Pong, validates complete Text/Close UTF-8, and sends 1002/1007/1009 for
-protocol/text/limit failure. A peer Close is echoed before server shutdown. Server sends are
+protocol/text/limit failure. A peer Close is echoed before server shutdown except that client-only
+1010 receives an empty acknowledgment. The 512 MiB message cap has an exact 1073774720-byte 64-bit
+producer-requested live-heap ceiling including scratch, shell budget, simultaneous growth, and Text
+staging/result, excluding allocator metadata. Server sends are
 unmasked and payload-copy-free; an initiated Close takes an explicit timeout and waits for peer
 Close while continuing required Ping replies. The generic transport exposes exact bounded-buffer
 reads, write-all, one cumulative monotonic deadline that never resets per I/O/frame, shutdown, and

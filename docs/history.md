@@ -13,8 +13,10 @@ escape through aggregates, captures, tasks, parallel work, externs, or user retu
 `pkg.ws` owns canonical RFC 6455 token/key/version validation, first-server-order subprotocol
 selection, private fixed-purpose SHA-1, client masking, minimal frame lengths, fragmentation,
 complete-message UTF-8, automatic Ping/Pong behavior, and close-code validation. Receive returns
-owned Text/Binary/Close values under an explicit message cap. Send does not copy its payload. Peer
-Close is echoed; server-initiated Close uses one cumulative monotonic deadline and waits for the
+owned Text/Binary/Close values under an explicit message cap and fixed per-call frame-work cap. The
+exact allocation ceiling includes scratch, transient growth, and Text conversion. Send does not
+copy its payload. Peer Close is echoed except that client-only 1010 receives an empty
+acknowledgment; server-initiated Close uses one cumulative monotonic deadline and waits for the
 peer handshake without resetting its budget before the server closes TCP. The design adds no parser
 runtime operation or hidden sidecar.
 

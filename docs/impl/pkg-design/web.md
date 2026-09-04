@@ -182,10 +182,11 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 
 ```text
 // types
-web.Ctx    — the per-request context: a Move struct owning the request handle plus views (method,
-             path, query, matched pattern, body, and detached header table). The pending Upgrade
-             capability adds one trailing Copy `upgrade_ready: bool`, true exactly for an HTTP/1.1
-             request with no parser residual. Views remain valid for the handler/pump call.
+web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
+             pattern, the body view, and the detached header-table view). It owns nothing; `serve`
+             retains the request handle across prepare and pump. The pending Upgrade capability adds
+             one trailing Copy `upgrade_ready: bool`, true exactly for an HTTP/1.1 request with no
+             parser residual. Views remain valid for the handler/pump call.
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
@@ -244,8 +245,8 @@ param names remain build-time aborts.
 
 - **F1 — field-eligibility widening.** Shipped for the shapes `web.Ctx` and `Route` require:
   ① a **fn value** field (Copy pointer — `Route.handler`; effects flow through `FnTy`), ② a
-  **Move handle** field (`http_request_ctx` inside `Ctx`), and ③ a region-tracked
-  **`slice<str>`** field for parameter slots. Capturing escaping closures remain outside this
+  detached **`http_headers` view** field inside Copy `Ctx`, and ③ a region-tracked **`slice<str>`**
+  field for parameter slots. Capturing escaping closures remain outside this
   capability; pkg.web does not depend on them.
 - **F0 — pkg-foundation rules.** `internal`, pkg-layer import checks, and the package specification
   shipped, enabling `pkg.web.internal.*` for the radix implementation.
@@ -257,11 +258,11 @@ param names remain build-time aborts.
 ```text
 Route / route table   Copy data (str view of a literal + tag + fn pointer); Static; never dropped
 the radix tree        built once inside serve (arena- or startup-heap-owned; freed at serve exit)
-web.Ctx               Move struct (owns the request handle); created by serve per request,
-                      consumed exactly once by a responder; params are views (never dropped)
+web.Ctx               Copy struct of request views; serve retains the request handle and keeps
+                      every view valid through middleware/handler/pump completion
 web.serve             Impure; borrows the table; runs until setup-Err
-accessors             Pure; views region-bound to c (escape past the responder = compile error)
-responders            Impure; consume c
+accessors             Pure; views region-bound to serve's retained request owner
+responders            Pure; build a response and neither consume c nor touch the request handle
 handlers              Impure allowed; called through Route.handler (FnTy effect bits, fail-closed)
 ```
 
@@ -819,11 +820,12 @@ cross-package ledger and closure matrix: `ws.md`.
   — never per-app drift).
 - **P2 — the radix tree is the design, not an optimization.** Linear scan exists only as the W1
   differential-testing oracle. (Fiber/httprouter is the reference precisely for dispatch.)
-- **P3 — params/views escape discipline.** A view stored past the responder consume is a compile
+- **P3 — params/views escape discipline.** A view stored past the request callback is a compile
   error by design (#460 liveness); document `.clone()` as the explicit escape — never eager-copy
   "to be safe" (that breaks invariant 1).
-- **P4 — no hidden response state.** Responders consume `Ctx` (Move); no builder-inside-ctx
-  mutation pattern. Headers beyond the sugar → std.http `response_builder` directly.
+- **P4 — no hidden response state.** `serve` retains the request handle while Pure responders build
+  standalone response values; no builder-inside-ctx mutation pattern. Headers beyond the sugar →
+  std.http `response_builder` directly.
 - **P5 — nothing on the hot path may allocate.** Every W-slice PR states where its bytes live
   (view / arena / startup); the W5 bench is the enforcement, but review checks it first.
 - **P6 — 405 needs the per-path method set** from the tree (Allow header) — design it into the

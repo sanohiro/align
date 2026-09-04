@@ -3901,11 +3901,19 @@ or I/O; repeated shutdown is idempotent. Caller argument invalidity precedes han
 deadline budget is never reset by another call, partial transfer, or frame.
 
 Receive requires an explicit inclusive `0..=536870912` message bound and returns one complete owned
-Text/Binary message or peer Close. It accepts RFC fragmentation and interleaved control frames,
+Text/Binary message or peer Close. Each call also has a fixed 1048576-byte source-work allowance:
+exact masked-header bytes and control payload bytes are charged before their reads, so zero-length
+continuation and Ping/Pong floods terminate with 1009 without reading the rejected next unit. It
+accepts RFC fragmentation and interleaved control frames,
 requires client masking and minimal 7/16/64-bit lengths, answers Ping with identical Pong, consumes
-Pong, validates Text and Close UTF-8, and echoes a valid Close before server shutdown. Protocol,
+Pong, validates Text and Close UTF-8, and echoes a valid Close before server shutdown, except that
+client-only code 1010 receives an empty Close acknowledgment while its original code/reason is
+returned. Protocol,
 text, and bound failure best-effort send 1002, 1007, and 1009 respectively, then close; a transport
-failure while fulfilling that reply wins. Server data frames are unmasked, FIN-complete, and borrow
+failure while fulfilling that reply wins. The fixed 512 MiB payload cap, 32 KiB scratch, simultaneous
+old/new builder growth, Text staging/result allocations, and a 128-byte shell budget have an exact
+64-bit producer-requested live-heap ceiling of 1073774720 bytes, excluding allocator metadata and
+owned by a resource probe. Server data frames are unmasked, FIN-complete, and borrow
 payload without copying. Server-initiated close validates the pinned sendable IANA code set and a
 123-byte reason, installs an explicit positive cumulative deadline, waits for peer Close while
 answering Ping without resetting that budget, then performs the server TCP close. Client mode,

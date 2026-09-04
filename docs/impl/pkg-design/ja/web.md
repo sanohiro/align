@@ -168,10 +168,10 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 
 ```text
 // 型
-web.Ctx    — リクエストハンドルと view（method, path, query、マッチした pattern、body、切り離した
-             header table）を所有する Move struct。pending Upgrade capability は trailing Copy field
-             `upgrade_ready: bool` を追加する。HTTP/1.1 かつ parser residual なしの場合だけ true。
-             view は handler/pump call 中有効である。
+web.Ctx    — view（method, path, query、マッチした pattern、body、切り離した header table）だけを
+             持つ **Copy** struct。何も所有せず、`serve` が prepare と pump の間も request handle を保持する。
+             pending Upgrade capability は trailing Copy field `upgrade_ready: bool` を追加する。
+             HTTP/1.1 かつ parser residual なしの場合だけ true。view は handler/pump call 中有効である。
 Route      — Copy struct { method: str, pattern: str,
                            handler: fn(Ctx) -> Result<response_builder, Error> }
 ```
@@ -227,7 +227,7 @@ httprouter/matchit/Fiber のリファレンスに反して `/assets/*file` で�
 
 - **F1 — フィールド許可拡張。** `web.Ctx` と `Route` が必要とする形を出荷済み:
   ① **fn 値**フィールド（Copy ポインタ — `Route.handler`; effect は `FnTy` を流れる）、
-  ② **Move ハンドル**フィールド（`Ctx` 内の `http_request_ctx`）、③ param スロット用の
+  ② Copy `Ctx` 内の detached **`http_headers` view** field、③ param スロット用の
   region 追跡される **`slice<str>`** フィールド。キャプチャする escaping クロージャはこの能力の
   対象外のままだが、pkg.web はそれに依存しない。
 - **F0 — pkg-foundation 規則。** `internal`、pkg 層 import 検査、パッケージ仕様が出荷され、
@@ -240,11 +240,11 @@ httprouter/matchit/Fiber のリファレンスに反して `/assets/*file` で�
 ```text
 Route / テーブル   Copy データ（リテラル str view + タグ + fn ポインタ）。Static。drop なし
 radix tree         serve 内で一度構築（arena か起動時ヒープ所有。serve 終了時解放）
-web.Ctx            Move struct（リクエストハンドル所有）。serve がリクエスト毎に生成、
-                   レスポンダがちょうど 1 回消費。params は view（drop なし）
+web.Ctx            request view の Copy struct。serve が request handle を保持し、
+                   middleware/handler/pump 完了まで全 view を有効にする
 web.serve          Impure。テーブル借用。セットアップ Err まで走る
-アクセサ           Pure。c に region 束縛された view（レスポンダ消費後の脱出 = コンパイルエラー）
-レスポンダ         Impure。c を消費
+アクセサ           Pure。serve が保持する request owner に region 束縛された view
+レスポンダ         Pure。response を構築し、c を消費せず request handle に触れない
 ハンドラ           Impure 可。Route.handler 経由呼び出し（FnTy effect ビット、fail-closed）
 ```
 
@@ -730,11 +730,12 @@ registry はなく、hot path は closed Handler tag match 一つだけ増える
   （DB プール等）は将来の 1 回の意図的決定（おそらく明示 state param で fn 型を一度だけ変える）。
 - **P2 — radix tree は設計であり最適化ではない。** 線形走査は W1 の差分テストオラクルとして
   のみ存在。（Fiber/httprouter はまさにディスパッチの参照。）
-- **P3 — params/view の脱出規律。** レスポンダ消費後まで view を保持するのは設計どおりコンパイル
+- **P3 — params/view の脱出規律。** request callback 終了後まで view を保持するのは設計どおりコンパイル
   エラー（#460 liveness）。脱出口は `.clone()` と文書化 — 「安全のため」の先回りコピーは不変条件 1
   を壊すので絶対にしない。
-- **P4 — 隠れたレスポンス状態なし。** レスポンダは `Ctx` を消費（Move）。ctx 内ビルダ変異
-  パターンなし。糖衣を超えるヘッダは std.http `response_builder` を直接。
+- **P4 — 隠れたレスポンス状態なし。** `serve` が request handle を保持し、Pure responder は独立した
+  response value を構築する。ctx 内ビルダ変異パターンなし。糖衣を超えるヘッダは std.http
+  `response_builder` を直接。
 - **P5 — ホットパスは何も割り当てない。** 各 W スライス PR は自分のバイトの居場所（view / arena /
   起動時）を明記。W5 ベンチが強制するが、レビューが先に確認する。
 - **P6 — 405 は tree のパス毎メソッド集合が必要**（Allow ヘッダ）— W1 のノードレイアウトに設計

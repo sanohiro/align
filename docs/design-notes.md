@@ -1593,10 +1593,13 @@ I/O and keeps shutdown idempotent.
 `pkg.ws` owns everything that gives the bytes WebSocket meaning: a Pure pre-bind protocol-list
 validator, header token validation, canonical
 key/version proof, server-order subprotocol choice, masking, minimal frame lengths, fragmentation,
-message bounds, UTF-8, automatic Ping/Pong, and closing handshake. The fixed SHA-1 calculation is a
+message bounds, a fixed per-call frame-work allowance, UTF-8, automatic Ping/Pong, and closing
+handshake. The fixed SHA-1 calculation is a
 private accept-proof helper rather than a new public crypto algorithm. Receive handles control
 frames inside one call until it can return a complete owned Text/Binary message or Close, avoiding a
-hidden sidecar or connection registry. Sends borrow payload without copying; server Close takes an
+hidden sidecar or connection registry. A client-only 1010 Close receives an empty acknowledgment;
+all other accepted peer Close payloads are echoed. The allocation contract counts scratch, shell
+budget, simultaneous growth, and Text staging/result rather than only retained payload. Sends borrow payload without copying; server Close takes an
 explicit cumulative deadline and waits for peer Close without resetting its budget rather than
 pretending an immediate TCP close completed the protocol. The exact contract and closure matrix are
 in `impl/pkg-design/ws.md`.

@@ -32,7 +32,7 @@ mask、message assembly、自動 control reply、close-code policy を所有す�
 | `pkg.ws.Message { Text(string), Binary(array<u8>), Close(Close) }` | tag/source order exact `0..=2`。continuation/Ping/Pong/raw control は公開しない。 | Move。complete UTF-8 text、complete bytes、validated peer close。 | nonempty payload は ordinary owned heap storage。connection/scratch を borrow しない。 | `pkg.ws` nominal sum graph。 | variants/order/interface、empty/nonempty allocation、move/drop。 |
 | `pkg.ws.Close { code: Option<i64>, reason: string }` | field order exact。None は empty payload。Some は `1000,1001,1002,1003,1007..1014`、registered `3000,3003,3008`、private `4000..4999` のみ。reason は valid UTF-8。 | Move。length 1、invalid code/UTF-8 は返さない。 | reason string のみ所有。 | nominal interface。 | empty/code/reason、全 code boundary、UTF-8、cleanup。 |
 | `pkg.ws.route(pattern, protocols, pump) -> pkg.web.types.Route` | 左から一度、default なし。constructor は protocol list を inspect せず保持。package の Pure startup validator が各 protocol の nonempty RFC token と byte-exact uniqueness を要求。empty は selection なし、nonempty は client offer match 必須、server-list 最初の match。 | Pure/zero-allocation。invalid config は `pkg.web.serve` の pre-bind validation だけで abort。GET Upgrade route。middleware が handshake より先。selected は owned string、`""` は none。 | Route が views を serve 中 retain。constructor allocation なし、nonempty selection だけ clone。 | ordinary `pkg.ws` source。private SHA-1 は public interface 外。 | protocol validator/selection、startup diagnostic、mixed routing/middleware、whole/per-unit、vendoring。 |
-| `pkg.ws.receive(borrow mut connection, max_message_bytes) -> Result<Message, Error>` | cap `0..=536870912`; invalid は allocation/I/O 前 abort。0 は zero-byte Text/Binary だけ。 | Impure。complete Text/Binary または Close 一つまで読む。fragment を assembly、interleaved Ping は identical Pong、Pong は consume/ignore。client mask 必須。RSV/reserved opcode/nonminimal length/control/continuation/cap/UTF-8/Close 不正を exact policy で fail。protocol/text/limit は 1002/1007/1009 を best-effort write、shutdown、Invalid。reply write error が優先。valid Close は byte-exact echo+shutdown 後 publish。abrupt EOF は NotFound。 | valid bound 後、fixed-capacity 32 KiB `buffer` 一 allocation と empty heap-mode `array_builder<u8>` accumulator を call 中所有。initialized length は cap 以下、nonempty growth は shipped `max(4, needed).next_power_of_two()` rule なので payload capacity は global 512 MiB 以下。mask removal は各 decoded byte を一回 append。control-only/zero payload は accumulator allocation なし。Binary は allocation transfer、Text は built byte array の complete view を validate して一回 clone 後 staging free、Close は nonempty reason だけ allocate。failure は unpublished storage free。 | RFC state は ordinary `pkg.ws` source、exact I/O は std。parser runtime key/sidecar/registry/HIR op なし。 | complete frame Cartesian product、cap、UTF-8 split、close、auto reply precedence、allocation/growth/copy/cleanup、official differential。 |
+| `pkg.ws.receive(borrow mut connection, max_message_bytes) -> Result<Message, Error>` | cap `0..=536870912`; invalid は allocation/I/O 前 abort。0 は zero-byte Text/Binary だけ。各 call は固定 1048576-byte source-work allowance も持つ。masked frame は exact 6/8/14 header bytes、control frame は payload bytes も charge。data payload は caller cap だけ。各 charged read 前に checked subtraction し、exact exhaustion は可、rejected next unit は読まない。 | Impure。complete Text/Binary または Close 一つまで読む。fragment assembly、Ping→Pong、Pong ignore。mask/RSV/opcode/length/control/continuation/message cap/source-work/UTF-8/Close 不正を exact policy で fail。protocol/text/either-limit は 1002/1007/1009 を best-effort write、shutdown、Invalid。valid peer Close は 1010 以外 byte-exact echo、client-only 1010 は empty Close で acknowledge し、original code/reason を返す。reply error が優先。abrupt EOF は NotFound。 | fixed 32 KiB buffer と empty heap-mode builder。initialized length と単一 retained capacity は最大 512 MiB。realloc は old/new payload を同時に、Text conversion は staging array と exact result string を同時に数える。64-bit target の call-attributable producer-requested live-heap ceiling は allocator metadata を除き exact `1073774720` bytes: shell budget 128 + buffer 32768 + payload 536870912 × 2。compile-time shell assertion と live-byte resource probe が所有。mask byte は一回 append。Binary は transfer、Text は one clone、Close は nonempty reason だけ allocate。failure は unpublished storage free。 | RFC state/source-work/resource probe は ordinary `pkg.ws` source、exact I/O は std。parser runtime key/sidecar/registry/HIR op なし。 | frame Cartesian product、message/source-work exact+rejected-next（zero continuation/Ping/Pong flood）、UTF-8、1010 empty acknowledgment、全 close、reply precedence、steady/realloc/Text peak、allocation/copy/cleanup、official differential。 |
 | `pkg.ws.send_text(borrow mut connection, text) -> Result<(), Error>` | valid str。empty/NUL 可、length は RFC 63-bit。 | unmasked FIN Text、minimal length header、borrowed payload を送る。header failure 後 payload なし。 | fixed header、payload copy/retain なし。 | ordinary source。 | 0/125/126/65535/65536/i64、wire/no-copy/failure/interop。 |
 | `pkg.ws.send_binary(borrow mut connection, data) -> Result<(), Error>` | empty/NUL/arbitrary bytes、同じ length。 | opcode 2 の同じ契約。 | payload copy なし。 | ordinary source。 | 同じ boundary/wire/error + binary identity。 |
 | `pkg.ws.close(connection, code, reason, timeout_ns) -> Result<(), Error>` | exact typed signature は英語 ledger。code/reason/timeout を左から検証後 handle transfer。server-sendable code は 1010 を除く上記 assigned code、reason `0..=123`、timeout `1..=86400000000000`。 | cumulative monotonic deadline を設定し、unmasked Close、peer Close まで同じ残予算で masked frame を読む。Closing 後 data/Pong は discard、Ping は budget reset なしで Pong。valid peer Close で handshake 完了し server TCP close。timeout/transport/protocol は close+その Error。 | fixed scratch/control payload、reason no-copy。consume handle を全 path で一回 cleanup。 | ordinary source over deadline/read/write/shutdown、IANA snapshot に pin。 | code/reason/deadline boundary/exhaustion、peer control/data/error、simultaneous close、endian、source null、close once。 |
@@ -118,10 +118,12 @@ middleware が判断する。extension は negotiate せず、RSV は常に不�
 - opcode 1/2 が Text/Binary を開始、0 は active fragment の continuation のみ。
 - control は FIN-only、最大 125、fragment 間に可。reserved opcode は 1002。
 - Ping は identical Pong 後 continue。Pong は consume/ignore。partial message は receive call 内。
-- Close empty は `code: None`。length 1、invalid code/reason は失敗。valid payload を exact echo
-  して shutdown 後に返す。
+- Close empty は `code: None`。length 1、invalid code/reason は失敗。valid payload は client-only
+  1010 以外 exact echo、1010 は empty Close で acknowledge し、original code/reason を shutdown 後に返す。
 - Text UTF-8 は reassembled message 全体で検証。
-- data cumulative cap exact は成功、next byte は payload を読まず 1009。control は cap 外。
+- data cumulative cap exact は成功、next byte は payload を読まず 1009。別に masked header の exact
+  6/8/14 bytes と control payload を固定 1048576-byte source-work allowance に charge する。exact
+  exhaustion は成功、next charged unit は読まず 1009。data payload は work 外、control は data cap 外。
 
 caller validation は transfer/I/O 前。frame syntax、length representability、message cap、payload
 transport、unmask、final UTF-8 の順。malformed+oversized は 1002、valid length cap excess は 1009。
@@ -169,17 +171,18 @@ std transport、web Handler、ws consumer は互いに dormant な一連の capa
 | headers/readiness | repeated row/token split/invalid args、HTTP version × residual、lifetime/no allocation differential oracle。 |
 | web dispatch | Respond/Stream/Upgrade × route/method/HEAD/405/group/middleware、validator true/false/effect/order、prepare/write/pump result。 |
 | handshake | seven validation phases、duplicate/case/token/key/version/protocol selection/extension/SHA-1 golden/browser interop。 |
-| frames | FIN/RSV/opcode/mask/length/fragment/control/TCP split/coalescing/mask position の oracle + mutation corpus。 |
-| messages | Text/Binary UTF-8、Ping/Pong policy、Close/outgoing send/timed close、全 code。 |
-| bounds | cap/length multi-invalid、caller-invalid × live/spent/poisoned、no-overread、reply/write/shutdown precedence。 |
-| allocation | fixed scratch/`array_builder<u8>` staging/Binary transfer/Text one-clone/no send copy/OOM/unpublished cleanup/fd close once。 |
+| frames | FIN/RSV/opcode/mask/length/fragment/control/TCP split/coalescing/mask position、exact header/control work charge の oracle + mutation corpus。 |
+| messages | Text/Binary UTF-8、Ping/Pong policy、1010 empty acknowledgment を含む Close、outgoing send/timed close、全 code。 |
+| bounds | message cap と固定 source-work allowance の exact/rejected-next（zero continuation/Ping/Pong flood）、length multi-invalid、caller-invalid × live/spent/poisoned、no-overread、reply/write/shutdown precedence。 |
+| allocation | fixed scratch/shell budget/`array_builder` staging/Binary transfer/Text clone/no send copy/OOM/cleanup/fd close once。requested live heap exact 1073774720、steady/realloc/Text peak の resource probe。 |
 | ABI/cache | ten keys、HIR/MIR/LLVM、runtime input matrix、rt-LTO、whole/per-unit、edit/revert、vendored inventory。 |
 
 ## 整合 pass と deferred
 
 英語 ledger に列挙した全 source of truth が一致し、public record の type/order/default/effect/
 ownership/allocation/error/identity/test、handshake product に HTTP version × residual、frame Cartesian
-product、multi-invalid precedence、native widths/pointers/count、caller-invalid × live/spent/poisoned、
+product、message/source-work exact+rejected-next、steady/realloc/Binary/Text allocation ceiling、
+multi-invalid precedence、native widths/pointers/count、caller-invalid × live/spent/poisoned、
 carrier restriction、syntax-checked example を閉じてから review
 する。Ping/Pong は call-local で sidecar/registry/hidden heartbeat を作らない。
 
@@ -197,6 +200,10 @@ background heartbeat/async/broadcast registry/standalone listener は deferred�
 | P2 response-header syntax | 全 name/value を insertion order で RFC syntax 検証し、Upgrade-specific field/write より前に reject。 |
 | P2 route purity | generic Upgrade に Pure total validator を追加し、protocol config は既存 pre-bind validation で exact diagnostic と共に reject。 |
 | Author carrier audit | raw same-frame handle と unnested same-frame Result Ok の positive grammar にし、`map_err`/consuming control を含め storage/escape を禁止。 |
+| P1 Copy web context | shipped Copy view record を維持し `serve` が request owner を保持。prepare と pump に同じ値を渡し、英日とも readiness bool だけ append。 |
+| P2 client-only close code | received 1010 は data として返すが server response は empty Close。ほかの accepted peer Close だけ byte-exact echo。 |
+| P2 frame-work bound | masked header と control payload の exact bytes を固定 per-call 1048576 allowance に charge。exact/rejected-next no-read と 1009 owner。 |
+| P2 transient allocation bound | scratch、shell budget、realloc old/new、Text staging/result を exact 1073774720 requested-live-byte ceiling と resource probe で所有。 |
 
 ## References
 

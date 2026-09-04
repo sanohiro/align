@@ -439,8 +439,13 @@ facts must live in this repository.
   rules, strict header validation, and a Pure pre-bind Upgrade validator. Those decisions are
   propagated through every source named by `ws.md`, including both Japanese mirrors; the author
   consistency pass is complete. Perform the required fresh full-diff design review because the
-  repair changes public surface and strategy. The first review log is
-  `.git/align-review-3657a179beea4aefcd06faeeb433b75fa6714a37.log`.
+  repair changes public surface and strategy. That fresh review then found four remaining gaps: an
+  accidental `Ctx` Move restatement, client-only close code 1010 echo, unbounded zero-length/control
+  frame work, and an incomplete transient allocation ceiling. The current repair preserves Copy
+  `Ctx`, acknowledges 1010 with an empty Close, charges a fixed 1 MiB source-work allowance, and
+  fixes the exact 64-bit producer-requested live-heap ceiling at 1073774720 bytes. The reopened
+  close/resource axis is propagated through the authority set and both Japanese mirrors. This
+  complete ledger is the implementation contract once its design PR merges.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

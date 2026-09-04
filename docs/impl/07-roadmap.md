@@ -4048,8 +4048,10 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   cumulative monotonic deadline, shutdown, and close-only Drop; it cannot enter aggregates,
   captures, tasks, parallel work, externs, or user returns. `pkg.ws.route` performs the canonical
   key/version/token/subprotocol handshake, with server-order selection and SHA-1 private to the
-  package. `receive` assembles bounded Text/Binary messages, handles fragmentation, automatically
-  answers Ping, ignores Pong, validates masked frames and UTF-8, and echoes a valid peer Close.
+  package. `receive` assembles bounded Text/Binary messages under separate message-byte and fixed
+  frame-work caps, counts scratch/transient-growth/Text-conversion memory in one exact ceiling,
+  answers Ping, ignores Pong, validates masked frames and UTF-8, and echoes a valid peer Close except
+  that client-only 1010 receives an empty acknowledgment.
   Sends are unmasked and do not copy payload; server close has an explicit cumulative deadline and
   completes the closing handshake without resetting its budget. Ten planned runtime keys reuse
   existing shapes, so A124 remains unused.

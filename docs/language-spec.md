@@ -1567,9 +1567,13 @@ does not reset per call, partial transfer, or frame. Spent read/write/deadline r
 mutation, clock, or I/O, while repeated shutdown is idempotent; caller-invalid arguments win first.
 
 Client frames must be masked, extension-free, minimally length-encoded, and structurally valid.
-Receive assembles fragments under an explicit inclusive 512 MiB ceiling, answers Ping, consumes
-Pong, validates complete Text/Close UTF-8, and returns owned complete messages. Protocol/text/limit
-failure sends 1002/1007/1009 when transport permits; peer Close is echoed. Server sends borrow
+Receive assembles fragments under an explicit inclusive 512 MiB ceiling and fixed 1 MiB per-call
+masked-header/control-payload source-work allowance, answers Ping, consumes Pong, validates complete
+Text/Close UTF-8, and returns owned complete messages. Protocol/text/either-limit failure sends
+1002/1007/1009 when transport permits. Peer Close is echoed except that client-only code 1010 gets
+an empty acknowledgment while its original value is returned. The exact 64-bit producer-requested
+live-heap ceiling for scratch, shells, simultaneous growth, and Text staging/result is 1073774720
+bytes, excluding allocator metadata. Server sends borrow
 payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
 handshake without Ping/data resetting its budget before closing TCP. Ten planned runtime keys reuse
 existing ABI shapes, leaving A124 unused; the design changes no shipped package/runtime inventory.
