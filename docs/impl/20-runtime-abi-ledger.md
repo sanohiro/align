@@ -606,23 +606,26 @@ The accepted XML capability plans eight keyed identities, all on existing ABI sh
 
 The Rust definitions use C calling convention and may not unwind across it. Generated declarations
 retain the reused A03/A08/A19/A20/A29/A62 shapes' empty curated function, return, memory, and
-parameter attribute sets. These are `unsafe` boundaries: an exact-compatible caller supplies every
-nonnull pointer with provenance, lifetime, dereferenceability, accessibility, and the declared shared
-or exclusive access for every exact range against access not represented by the call; null is allowed
-only where the ABI explicitly says so. Parse input is one
-allocator-compatible owned range. Supplied argument ranges may overlap only as a mechanically
-rejected call: the runtime checks parse output/input and getter output/shell/input disjointness before
-typed access. Getters/count share the live shell allocation, while next and nonnull free hold it
+parameter attribute sets. These are `unsafe` boundaries. Before dereference, the runtime may inspect
+pointer integers and lengths to reject null where forbidden, misalignment, negative length,
+noncanonical empty, address-range overflow, and supplied-range alias. A caller may rely on those
+exact shape rejections. Every nonnull pointer that passes its shape checks and could then be accessed
+must have provenance, lifetime, dereferenceability, accessibility, and the declared shared or
+exclusive access for its exact range against access not represented by the call. Parse input is
+canonical `{null,0}` with no allocation or one positive-length allocator-compatible owned range.
+Getters/count share a shape-valid live shell allocation, while next and nonnull free hold it
 exclusively. When an operation follows the shell's stored input pointer, its live allocation and exact
 readable range are also caller preconditions unless the shell was published unchanged by this
-runtime. Violating the pointer/access caller preconditions is outside the ABI contract and is not
-promised a safe abort.
+runtime. Violating a post-shape-check pointer/access precondition is outside the ABI contract and is
+not promised a safe abort.
 
 Within those preconditions, the runtime checks representable raw ranges and every detectable
 input/output/shell alias before mutation, Rust reference creation, or slice creation. A mechanically
-rejected parse returns positive `AL_INVALID`, leaves output untouched, and leaves input ownership
-with the unsafe caller. After that preflight it stores null and accepts the input: status zero
-publishes the sole shell, while `-1` frees the input and means public `Error.Invalid`. An
+rejected parse returns positive `AL_INVALID`, leaves output untouched, and accepts no input
+ownership. In particular, nonnull zero-length input is rejected and never freed. After that
+preflight it stores null and accepts no allocation for canonical empty or the positive-length owned
+input: status zero publishes the sole shell, while `-1` releases accepted input responsibility (a
+no-op for canonical empty) and means public `Error.Invalid`. An
 output-bearing getter likewise leaves output untouched on mechanical preflight failure, then zeros
 its `{ptr,i64}` output; any later wrong-state/index/private-state failure leaves canonical zero for
 borrowed and owned results alike. Success fills a borrowed name view or publishes one completed

@@ -4070,7 +4070,8 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   URL/CSS/JavaScript encoding, parsing/sanitizing, streaming, and components remain deferred. Exact
   accepted ledger and implementation closure matrix: `pkg-design/template.md`.
 - **std.xml — DESIGNED 2026-09-05** — whole-document-validated, forward-only UTF-8 XML 1.0 reader;
-  DOCTYPE / DTD / declarations / PI / custom or external entity rejected before publication
+  DOCTYPE / DTD markup or entity declarations / all PI / custom or external entity rejected before
+  publication; one conforming initial XML declaration is accepted and skipped
   (XXE / billion-laughs closed by construction); lexical namespaces not expanded; inclusive depth
   and per-element attribute bounds 256; consumers S3 + Azure Blob. Exact public, grammar, ABI,
   allocation, and implementation closure ledger: `std-design/xml.md`.
