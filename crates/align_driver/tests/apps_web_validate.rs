@@ -32,6 +32,14 @@ fn h(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {{\n\
   return pkg.web.text(\"ok\")\n\
 }}\n\
 \n\
+fn upgrade_prepare(c: pkg.web.types.Ctx, values: slice<str>) -> pkg.web.types.UpgradeDecision =\n\
+  pkg.web.types.UpgradeDecision.Failed(Error.Invalid)\n\
+\n\
+fn upgrade_pump(c: pkg.web.types.Ctx, connection: http_upgrade, selected: string) -> Result<(), Error> {{\n\
+  mut transport := connection\n\
+  return transport.shutdown()\n\
+}}\n\
+\n\
 pub fn main() -> Result<(), Error> {{\n\
   routes := [\n\
 {routes_src}\n\
@@ -142,6 +150,23 @@ fn malformed_tables_abort_at_startup_with_a_diagnosis() {
         "web-val-shadow",
         "    pkg.web.any(\"/x\", h),\n    pkg.web.get(\"/x\", h),",
         "unreachable route",
+    );
+    // Upgrade's stored protocol result follows common row validation but precedes segment and
+    // pair validation. Each multi-invalid twin changes diagnosis if the phase moves.
+    assert_aborts(
+        "web-val-upgrade-common-order",
+        "    pkg.web.upgrade(\"get\", \"/x\", [], false, upgrade_prepare, upgrade_pump),",
+        "unknown method",
+    );
+    assert_aborts(
+        "web-val-upgrade-segment-order",
+        "    pkg.web.upgrade(\"GET\", \"/:\", [], false, upgrade_prepare, upgrade_pump),",
+        "has invalid upgrade values",
+    );
+    assert_aborts(
+        "web-val-upgrade-pair-order",
+        "    pkg.web.upgrade(\"GET\", \"/x\", [], true, upgrade_prepare, upgrade_pump),\n    pkg.web.upgrade(\"GET\", \"/x\", [], false, upgrade_prepare, upgrade_pump),",
+        "has invalid upgrade values",
     );
 }
 

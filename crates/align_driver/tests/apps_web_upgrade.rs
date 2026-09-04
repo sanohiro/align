@@ -89,23 +89,63 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 struct Server {
     child: std::process::Child,
     port: u16,
+    deadline: Instant,
     _built: BuiltExeMulti,
+}
+
+fn terminate_child_by(child: &mut std::process::Child, deadline: Instant) {
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => break,
+        }
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_child_by(&mut self.child, self.deadline);
     }
 }
 
 impl Server {
     fn stop_and_stderr(&mut self) -> String {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        loop {
+            if self.child.try_wait().expect("poll stopped Upgrade owner").is_some() {
+                break;
+            }
+            assert!(Instant::now() < self.deadline, "Upgrade owner did not stop before its deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut stderr = String::new();
         self.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         stderr
+    }
+}
+
+struct PendingChild {
+    child: Option<std::process::Child>,
+    deadline: Instant,
+}
+
+impl PendingChild {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("pending child exists")
+    }
+
+    fn take(&mut self) -> std::process::Child {
+        self.child.take().expect("pending child exists")
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            terminate_child_by(child, self.deadline);
+        }
     }
 }
 
@@ -128,17 +168,24 @@ fn start_server() -> Server {
         ],
         "main.align",
     );
+    let deadline = Instant::now() + Duration::from_secs(30);
     for attempt in 0..8 {
         let port = free_loopback_port();
-        let mut child = std::process::Command::new(&built.exe)
-            .args(["--port", &port.to_string()])
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn Upgrade owner server");
+        let mut child = PendingChild {
+            child: Some(
+                std::process::Command::new(&built.exe)
+                .args(["--port", &port.to_string()])
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn Upgrade owner server"),
+            ),
+            deadline,
+        };
         std::thread::sleep(Duration::from_millis(300));
-        if let Some(status) = child.try_wait().expect("poll Upgrade owner server") {
+        assert!(Instant::now() < deadline, "Upgrade owner startup exceeded its deadline");
+        if let Some(status) = child.child().try_wait().expect("poll Upgrade owner server") {
             let mut stderr = String::new();
-            child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+            child.child().stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
             let bind_failed = matches!(status.code(), Some(48 | 98))
                 || stderr.to_ascii_lowercase().contains("address already in use");
             if bind_failed && attempt < 7 {
@@ -146,13 +193,12 @@ fn start_server() -> Server {
             }
             panic!("Upgrade owner exited at startup: {status:?}; stderr: {stderr}");
         }
-        return Server { child, port, _built: built };
+        return Server { child: child.take(), port, deadline, _built: built };
     }
     unreachable!("startup retry loop returns or panics")
 }
 
-fn connect_retry(port: u16) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn connect_retry(port: u16, deadline: Instant) -> TcpStream {
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(sock) => return sock,
@@ -162,9 +208,13 @@ fn connect_retry(port: u16) -> TcpStream {
     }
 }
 
-fn exchange(port: u16, request: &[u8]) -> String {
-    let mut sock = connect_retry(port);
-    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+fn exchange(server: &Server, request: &[u8]) -> String {
+    let mut sock = connect_retry(server.port, server.deadline);
+    let remaining = server
+        .deadline
+        .checked_duration_since(Instant::now())
+        .expect("Upgrade owner deadline exhausted before exchange");
+    sock.set_read_timeout(Some(remaining)).unwrap();
     sock.write_all(&one_shot(request)).unwrap();
     let mut response = Vec::new();
     sock.read_to_end(&mut response).unwrap();
@@ -189,35 +239,35 @@ fn upgrade_dispatch_group_middleware_prepare_transfer_and_pump_matrix() {
         ("/api/items/42", "/items/:id"),
         ("/mw/files/a/b", "/files/*rest"),
     ] {
-        let response = exchange(server.port, &get(path));
+        let response = exchange(&server, &get(path));
         assert!(response.starts_with("HTTP/1.1 101 "), "{path}: {response:?}");
         assert!(response.contains(&format!("X-Pattern: {pattern}\r\n")), "{path}: {response:?}");
     }
 
-    let head = exchange(server.port, b"HEAD /static HTTP/1.1\r\nHost: h\r\n\r\n");
+    let head = exchange(&server, b"HEAD /static HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(head.starts_with("HTTP/1.1 405 "), "Upgrade has no implicit HEAD: {head:?}");
     assert!(head.contains("Allow: GET\r\n"), "Upgrade contributes Allow: {head:?}");
-    let post = exchange(server.port, b"POST /api/items/42 HTTP/1.1\r\nHost: h\r\n\r\n");
+    let post = exchange(&server, b"POST /api/items/42 HTTP/1.1\r\nHost: h\r\n\r\n");
     assert!(post.starts_with("HTTP/1.1 405 "), "grouped param method: {post:?}");
 
-    let responded = exchange(server.port, &get("/mw/files/a?mw=respond"));
+    let responded = exchange(&server, &get("/mw/files/a?mw=respond"));
     assert!(responded.starts_with("HTTP/1.1 401 "), "middleware Respond: {responded:?}");
     assert!(responded.ends_with("middleware"), "middleware body: {responded:?}");
-    let middleware_failed = exchange(server.port, &get("/mw/files/a?mw=failed"));
+    let middleware_failed = exchange(&server, &get("/mw/files/a?mw=failed"));
     assert!(middleware_failed.starts_with("HTTP/1.1 500 "), "middleware Failed: {middleware_failed:?}");
 
-    let rejected = exchange(server.port, &get("/reject"));
+    let rejected = exchange(&server, &get("/reject"));
     assert!(rejected.starts_with("HTTP/1.1 403 "), "prepare Reject: {rejected:?}");
     assert!(rejected.ends_with("rejected"), "prepare Reject body: {rejected:?}");
-    let failed = exchange(server.port, &get("/failed"));
+    let failed = exchange(&server, &get("/failed"));
     assert!(failed.starts_with("HTTP/1.1 500 "), "prepare Failed: {failed:?}");
-    let invalid = exchange(server.port, &get("/invalid"));
+    let invalid = exchange(&server, &get("/invalid"));
     assert!(invalid.starts_with("HTTP/1.1 500 "), "pre-write validation fallback: {invalid:?}");
-    let pump_error = exchange(server.port, &get("/pump-err"));
+    let pump_error = exchange(&server, &get("/pump-err"));
     assert!(pump_error.starts_with("HTTP/1.1 101 "), "pump starts only after 101: {pump_error:?}");
     assert_eq!(pump_error.matches("HTTP/1.1 ").count(), 1, "pump Err cannot send a fallback");
 
-    let mut reset = connect_retry(server.port);
+    let mut reset = connect_retry(server.port, server.deadline);
     let linger = libc::linger { l_onoff: 1, l_linger: 0 };
     assert_eq!(
         unsafe {

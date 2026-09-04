@@ -184,11 +184,12 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 // types
 web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
              pattern, the body view, and the detached header-table view). It owns nothing; `serve`
-             retains the request handle across prepare and pump. The pending Upgrade capability adds
-             one trailing Copy `upgrade_ready: bool`, true exactly for an HTTP/1.1 request with no
-             parser residual. Views remain valid for the handler/pump call.
-Route      — Copy struct { method: str, pattern: str,
-                           handler: fn(Ctx) -> Result<response_builder, Error> }
+             retains the request handle across prepare and pump. The trailing Copy
+             `upgrade_ready: bool` is true exactly for an HTTP/1.1 request with no parser residual.
+             Views remain valid for the handler/pump call.
+Handler    — Copy sum of Respond, Stream, and Upgrade(UpgradeHandler).
+Route      — Copy struct { method, prefix, pattern, middleware, stream_type, handler,
+                           upgrade_values }; the exact types and callback shapes are recorded below.
 ```
 
 **Pattern syntax (Fiber/httprouter lineage — settled by the restored reference):** `/`-separated;

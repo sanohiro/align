@@ -596,7 +596,7 @@ fn same_claim(a: str, b: str) -> bool {
 // same path claim where the second can never win — the same method twice (a duplicate; also the
 // source of a duplicated 405 `Allow` join), or anything after an `any` route on that claim (an
 // empty method answers every method first, so the later row is unreachable).
-pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
+fn validate_rows(routes: slice<pkg.web.types.Route>) -> string {
   n := routes.len()
   mut i := 0
   loop {
@@ -736,8 +736,20 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
       b.write(seg_err)
       break b.to_string()
     }
-    // Pair checks against every LATER route (first-registered wins is the dispatch rule, so the
-    // later row of a clashing pair is the dead one).
+    i = i + 1
+  }
+}
+
+fn validate_pairs(routes: slice<pkg.web.types.Route>) -> string {
+  n := routes.len()
+  mut i := 0
+  loop {
+    if i >= n { break "".clone() }
+    ri := routes[i]
+    m := ri.method
+    pat := ri.pattern
+    // Pair checks run only after every row-local phase has succeeded. First-registered wins, so
+    // the later row of a clashing pair is the dead one.
     mut j := i + 1
     mut pair_err := ""
     mut pair_at := 0
@@ -780,6 +792,12 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
     }
     i = i + 1
   }
+}
+
+pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
+  row_error := validate_rows(routes)
+  if row_error.len() > 0 { return row_error }
+  return validate_pairs(routes)
 }
 
 // ── Route-table dispatch (W2) ─────────────────────────────────────────────────────────────────

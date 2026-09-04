@@ -60591,9 +60591,6 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        if !self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate") {
-            return err;
-        }
         let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
         match method {
             "read_exact" => {
@@ -60603,17 +60600,22 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 let out = self.check_expr(&args[0], Some(Ty::Buffer));
                 let count = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
-                if out.ty == Ty::Error || count.ty == Ty::Error {
-                    return err;
-                }
-                if out.ty != Ty::Buffer {
+                let mut operands_ok = out.ty != Ty::Error && count.ty != Ty::Error;
+                if out.ty != Ty::Error && out.ty != Ty::Buffer {
                     self.diags.error(format!("'.read_exact()' fills a buffer, got {}", ty_name(out.ty)), args[0].span);
-                    return err;
+                    operands_ok = false;
                 }
-                if !self.require_mut_buffer_local(&args[0], ".read_exact()") {
-                    return err;
+                if out.ty == Ty::Buffer && !self.require_mut_buffer_local(&args[0], ".read_exact()") {
+                    operands_ok = false;
                 }
-                if !self.require_i64_arg(count.ty, args[1].span, "'.read_exact()' count") {
+                if count.ty != Ty::Error
+                    && !self.require_i64_arg(count.ty, args[1].span, "'.read_exact()' count")
+                {
+                    operands_ok = false;
+                }
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if !operands_ok || !receiver_ok {
                     return err;
                 }
                 Expr {
@@ -60632,7 +60634,9 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
                 let data = self.check_bytes_init(&args[0], "'.write()'");
-                if data.ty == Ty::Error {
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if data.ty == Ty::Error || !receiver_ok {
                     return err;
                 }
                 Expr {
@@ -60647,9 +60651,11 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
                 let timeout_ns = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
-                if timeout_ns.ty == Ty::Error
-                    || !self.require_i64_arg(timeout_ns.ty, args[0].span, "'.deadline()' timeout_ns")
-                {
+                let operand_ok = timeout_ns.ty != Ty::Error
+                    && self.require_i64_arg(timeout_ns.ty, args[0].span, "'.deadline()' timeout_ns");
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if !operand_ok || !receiver_ok {
                     return err;
                 }
                 Expr {
@@ -60664,6 +60670,9 @@ impl<'a, 't> Checker<'a, 't> {
             "shutdown" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.shutdown()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                if !self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate") {
                     return err;
                 }
                 Expr { kind: ExprKind::HttpUpgradeShutdown { upgrade: Box::new(recv_expr) }, ty: result_ty, span }

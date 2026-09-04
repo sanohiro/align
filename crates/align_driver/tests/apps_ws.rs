@@ -78,6 +78,7 @@ fn bad_option(value: Option<http_upgrade>) -> i32 = 0
 fn bad_result_parameter(value: Result<http_upgrade, Error>) -> i32 = 0
 fn bad_out(out value: http_upgrade) -> i32 = 0
 fn bad_return(value: http_upgrade) -> http_upgrade = value
+fn bad_check_order(borrow transport: http_upgrade) -> Result<(), Error> = transport.write(missing)
 
 fn bad_local(value: http_upgrade) -> i32 {
   wrapped: Option<http_upgrade> := Some(value)
@@ -96,6 +97,8 @@ fn main() -> i32 = 0
             "http_upgrade cannot be an `out` parameter",
             "http_upgrade cannot be returned; consume or drop it in the current frame",
             "http_upgrade may be stored only as a bare local or one unnested Result<http_upgrade, E> local",
+            "undefined name: 'missing'",
+            "cannot mutate shared-borrowed http_upgrade 'transport' in 'write'",
         ] {
             assert!(diagnostics.contains(expected), "missing {expected:?}:\n{diagnostics}");
         }
@@ -408,6 +411,69 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: CHAT.V1\r\n\r\n",
     );
     assert!(case_mismatch.starts_with("HTTP/1.1 400 "), "subprotocol matching is byte-exact");
+
+    for (label, request, version_header) in [
+        (
+            "duplicate Host",
+            b"GET /chat HTTP/1.1\r\nHost: first\r\nHost: second\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n".as_slice(),
+            false,
+        ),
+        (
+            "duplicate version",
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n".as_slice(),
+            true,
+        ),
+        (
+            "duplicate key",
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n".as_slice(),
+            false,
+        ),
+        (
+            "malformed protocol offer",
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1,,other\r\n\r\n".as_slice(),
+            false,
+        ),
+        (
+            "parser residual",
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\nx".as_slice(),
+            false,
+        ),
+    ] {
+        let response = request_head(server.port, request);
+        assert!(response.starts_with("HTTP/1.1 400 "), "{label}: {response:?}");
+        assert_eq!(response.contains("Sec-WebSocket-Version: 13\r\n"), version_header, "{label}");
+    }
+
+    let repeated_protocol = request_head(
+        server.port,
+        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: other\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
+    );
+    assert!(repeated_protocol.starts_with("HTTP/1.1 101 "), "repeated protocol rows combine: {repeated_protocol:?}");
+    assert!(repeated_protocol.contains("Sec-WebSocket-Protocol: chat.v1\r\n"));
+
+    let empty_protocol_app = APP.replace(
+        "protocols := [\"chat.v1\"]",
+        "protocols: slice<str> := []",
+    );
+    let empty_protocol_server = start_server_with(&empty_protocol_app, "apps-ws-empty-protocols");
+    let empty_selected = request_head(
+        empty_protocol_server.port,
+        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    );
+    assert!(empty_selected.starts_with("HTTP/1.1 101 "), "empty server protocol list: {empty_selected:?}");
+    assert!(!empty_selected.contains("Sec-WebSocket-Protocol:"));
+
+    let ordered_protocol_app = APP.replace(
+        "protocols := [\"chat.v1\"]",
+        "protocols := [\"chat.v2\", \"chat.v1\"]",
+    );
+    let ordered_protocol_server = start_server_with(&ordered_protocol_app, "apps-ws-ordered-protocols");
+    let ordered = request_head(
+        ordered_protocol_server.port,
+        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1, chat.v2\r\n\r\n",
+    );
+    assert!(ordered.starts_with("HTTP/1.1 101 "), "multiple server protocols: {ordered:?}");
+    assert!(ordered.contains("Sec-WebSocket-Protocol: chat.v2\r\n"), "first server match wins: {ordered:?}");
 
     let mut sock = connect_retry(server.port);
     sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -737,39 +803,44 @@ fn invalid_server_protocol_aborts_before_bind_with_exact_route_diagnosis() {
     if !backend_available() {
         return;
     }
-    let invalid = APP.replace("protocols := [\"chat.v1\"]", "protocols := [\"bad protocol\"]");
-    let files = sources(&invalid);
-    let built = build_exe_multi("apps-ws-invalid-protocol", &files, "main.align");
-    let port = free_loopback_port();
-    let child = std::process::Command::new(&built.exe)
-        .args(["--port", &port.to_string()])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("run invalid WebSocket server");
-    // The executable must fail synchronously during route validation. Keep an RAII owner around
-    // it so a regression that reaches the accept loop cannot leak a server process from the test.
-    let mut child = Server { child, port, _built: built };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.child.try_wait().expect("poll invalid WebSocket server") {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "invalid startup did not terminate before the deadline");
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut stderr = String::new();
-    child
-        .child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .expect("read invalid WebSocket stderr");
-    assert!(!status.success(), "invalid startup must abort");
-    assert_eq!(
-        stderr,
-        "pkg.web: route 0 (GET /chat) has invalid upgrade values\n",
-    );
-    let probe = std::net::TcpListener::bind(("127.0.0.1", port));
-    assert!(probe.is_ok(), "route validation must happen before bind");
+    for (name, protocols) in [
+        ("apps-ws-invalid-protocol", "protocols := [\"bad protocol\"]"),
+        (
+            "apps-ws-duplicate-protocol",
+            "protocols := [\"chat.v1\", \"chat.v1\"]",
+        ),
+    ] {
+        let invalid = APP.replace("protocols := [\"chat.v1\"]", protocols);
+        let files = sources(&invalid);
+        let built = build_exe_multi(name, &files, "main.align");
+        let port = free_loopback_port();
+        let child = std::process::Command::new(&built.exe)
+            .args(["--port", &port.to_string()])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run invalid WebSocket server");
+        // The executable must fail synchronously during route validation. Keep an RAII owner
+        // around it so a regression that reaches the accept loop cannot leak a server process.
+        let mut child = Server { child, port, _built: built };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.child.try_wait().expect("poll invalid WebSocket server") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "invalid startup did not terminate before the deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut stderr = String::new();
+        child
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .expect("read invalid WebSocket stderr");
+        assert!(!status.success(), "invalid startup must abort");
+        assert_eq!(stderr, "pkg.web: route 0 (GET /chat) has invalid upgrade values\n");
+        let probe = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(probe.is_ok(), "route validation must happen before bind");
+    }
 }

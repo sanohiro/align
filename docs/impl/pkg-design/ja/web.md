@@ -170,10 +170,11 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 // 型
 web.Ctx    — view（method, path, query、マッチした pattern、body、切り離した header table）だけを
              持つ **Copy** struct。何も所有せず、`serve` が prepare と pump の間も request handle を保持する。
-             pending Upgrade capability は trailing Copy field `upgrade_ready: bool` を追加する。
-             HTTP/1.1 かつ parser residual なしの場合だけ true。view は handler/pump call 中有効である。
-Route      — Copy struct { method: str, pattern: str,
-                           handler: fn(Ctx) -> Result<response_builder, Error> }
+             trailing Copy field `upgrade_ready: bool` は HTTP/1.1 かつ parser residual なしの場合だけ
+             true。view は handler/pump call 中有効である。
+Handler    — Respond、Stream、Upgrade(UpgradeHandler) の Copy sum。
+Route      — Copy struct { method, prefix, pattern, middleware, stream_type, handler,
+                           upgrade_values }。exact type と callback shape は下記に固定する。
 ```
 
 **パターン構文（Fiber/httprouter 系譜 — 復元された参照により決定）:** `/` 区切り。リテラルは

@@ -169,13 +169,14 @@ std transport、web Handler、ws consumer は互いに dormant な一連の capa
 
 | Axis | Cells / evidence |
 |---|---|
-| type formation | exact 71/47 codec leaf、raw same-frame local/parameter、unnested same-frame Result Ok from constructor/`map_err`、全他 placement negative、semantic-byte/malformed owner、variant tripwire。 |
+| type formation | exact 71/47 codec leaf、raw same-frame local/parameter、unnested same-frame Result Ok from constructor/`map_err`、全他 placement negative、semantic-byte/malformed owner、variant tripwire。method operand を exclusive-receiver diagnostic より先に検査する shared-receiver/invalid-operand twin。 |
 | ownership | rb validation、checked serialized-head size/allocation、fd move 前の handle-shell allocation、ctx spend、publication、replacement、Result/pump move、`?`/else/match/map_err/branch/loop/early exit/Drop、fd/allocation counter、exact head high-water/OOM-before-transfer failpoint。 |
 | headers/readiness | repeated row/token split/source-invalid abort、native null/alignment/length/range は safe view formation 前、token byte は table scan 前に hard-abort、HTTP version × residual、lifetime/no allocation differential + direct-ABI subprocess oracle。 |
-| web dispatch | Respond/Stream/Upgrade × static/param/wildcard/method/HEAD/405/group/group_with/middleware 三結果、validation result evaluate-once/stored true/false/no callback、prepare 三結果、pre-write/committed-write failure、pump Ok/Err/log/fallback。専用 `apps_web_upgrade` raw-HTTP/socket owner。 |
-| handshake | seven validation phases、duplicate/case/token/key/version/protocol selection/extension/SHA-1 golden/browser interop。 |
+| web dispatch | Respond/Stream/Upgrade × static/param/wildcard/method/HEAD/405/group/group_with/middleware 三結果、validation result evaluate-once/stored true/false/no callback。false は common method/pattern/prefix/storage 後かつ segment/pair 前。prepare 三結果、pre-write/committed-write failure、pump Ok/Err/log/fallback。専用 `apps_web_upgrade` raw-HTTP/socket owner と common/segment/pair multi-invalid twin。 |
+| handshake | seven validation phases、duplicate Host/version/key/protocol、case/token/malformed offer、empty/duplicate/multiple server list、first-server selection、residual、extension/SHA-1 golden/browser interop。 |
 | frames | FIN/RSV/opcode/mask/length/fragment/control/TCP split/coalescing/mask position、exact header/control work charge の oracle + mutation corpus。 |
 | messages | Text/Binary UTF-8、Ping/Pong policy、empty/one-byte/123/124/1010 を含む Close、outgoing send/timed close、全 code。protocol/Ping/peer-Close reply failure を別 socket twin で force。 |
+| outbound close | server-sendable/forbidden code、reason 123/124、timeout 0/1/max/max+1 を transfer 前に検証。exact unmasked big-endian Close、単一 cumulative deadline、closing 中 Pong/data discard・Ping echo・peer Close complete、protocol/invalid Close/EOF/timeout/partial read/write の error precedence、source null、close once。専用 `apps_ws_close` raw-socket owner。 |
 | bounds | message cap と固定 source-work allowance の exact/rejected-next（zero continuation と nonempty Ping/Pong flood）、payload charge を削ると失敗する別 reduced-bound owner、length multi-invalid、caller-invalid × live/spent/poisoned、no-overread、reply/write/shutdown precedence。 |
 | allocation | builder storage と preallocated handle shell に共存する exact `H`-byte Upgrade response head、fixed scratch/shell budget/`array_builder` staging/Binary transfer/Text clone/no send copy/OOM/cleanup/fd close once。shipped max/scratch constant から導く receive requested live heap exact 1073774720。checked-`H` high-water、steady probe、non-null old/new realloc overlap を測る scaled fragmented Binary probe。 |
 | ABI/cache | eleven keys と reused shape の exact empty curated function-attribute set、native query hard-abort、checked `SO_NOSIGPIPE` accept failure、HIR/MIR/LLVM、direct runtime/subprocess、rt-LTO、whole/per-unit、edit/revert、vendored inventory。 |
@@ -219,6 +220,11 @@ background heartbeat/async/broadcast registry/standalone listener は deferred�
 | P1 owner operation matrix | shared framework dispatch を専用 `apps_web_upgrade` owner、WebSocket frame/resource を `apps_ws` に分け、group/middleware/prepare/fallback/pump、nonempty control charge、Close edge、protocol/Ping/peer-Close reply failure を mutation-discriminating raw socket で閉じる。 |
 | P2 maximum resource evidence | exact ceiling を shipped message/scratch constant から導き、non-null old/new builder buffer が同時 live になる scaled fragmented Binary path の peak を測る。 |
 | P2 activation prose drift | active type/HIR/MIR/backend status、eleven keys、exact web Handler/Route、英日 package prose、adjacent source comment を一 pass で同期。 |
+| P1 outbound-close boundary | public `pkg.ws.close` を専用 `apps_ws_close` owner に分け、outbound validation/wire、cumulative deadline、closing-state control/data、transport/protocol/EOF precedence、source null、close once を閉じる。 |
+| P2 validation and handshake products | stored false を invalid common/segment/pair と exact phase 順に交差。empty/duplicate/multiple server protocol と duplicate/malformed/residual client handshake を覆う。 |
+| P2 bounded owner lifecycle | spawn 直後に child RAII を設置し、startup/exchange/kill/wait/stderr completion を一つの deadline で制限。 |
+| P2 Upgrade method check order | arity と全 method operand を exclusive shared-receiver gate より先に検査し、両 diagnostic を要求する twin を置く。 |
+| P2 top-level web type drift | authoritative 英日 type overview の pending Upgrade と obsolete unary Route summary を active exact shape に置換。 |
 
 ## References
 
