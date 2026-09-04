@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 331] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 342] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -184,8 +184,13 @@ runtime_keys! {
     HttpCtxHeader => "http_ctx_header",
     HttpCtxMethod => "http_ctx_method",
     HttpCtxPath => "http_ctx_path",
+    HttpCtxUpgradeReady => "http_ctx_upgrade_ready",
     HttpGetMany => "http_get_many",
     HttpHeader => "http_header",
+    HttpHeadersContainsToken => "http_headers_contains_token",
+    HttpHeadersContainsTokenExact => "http_headers_contains_token_exact",
+    HttpHeadersCount => "http_headers_count",
+    HttpHeadersTokensValid => "http_headers_tokens_valid",
     HttpMaxResponseBodyBytes => "http_max_response_body_bytes",
     HttpParse => "http_parse",
     HttpRbBody => "http_rb_body",
@@ -203,6 +208,7 @@ runtime_keys! {
     HttpRespStatus => "http_resp_status",
     HttpRespond => "http_respond",
     HttpRespondStream => "http_respond_stream",
+    HttpRespondUpgrade => "http_respond_upgrade",
     HttpResponseFree => "http_response_free",
     HttpResponseNew => "http_response_new",
     HttpServe => "http_serve",
@@ -217,6 +223,11 @@ runtime_keys! {
     HttpStreamSend => "http_stream_send",
     HttpStreamSendEvent => "http_stream_send_event",
     HttpTimeout => "http_timeout",
+    HttpUpgradeDeadline => "http_upgrade_deadline",
+    HttpUpgradeFree => "http_upgrade_free",
+    HttpUpgradeReadExact => "http_upgrade_read_exact",
+    HttpUpgradeShutdown => "http_upgrade_shutdown",
+    HttpUpgradeWrite => "http_upgrade_write",
     IoCopy => "io_copy",
     IoFileCreate => "io_file_create",
     IoFileFree => "io_file_free",
@@ -356,7 +367,7 @@ runtime_keys! {
     Utf8Valid => "utf8_valid",
 }
 
-const _: [(); 331] = [(); RuntimeKey::ALL.len()];
+const _: [(); 342] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -365,7 +376,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 331);
+        assert_eq!(RuntimeKey::ALL.len(), 342);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

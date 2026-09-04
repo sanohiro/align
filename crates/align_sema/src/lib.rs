@@ -305,6 +305,9 @@ pub enum Scalar {
     /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
     /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
     HttpStream,
+    /// A protocol-neutral upgraded HTTP byte stream. Move, region-free, and admitted only in its
+    /// restricted same-frame local/parameter and unnested Result carrier grammar.
+    HttpUpgrade,
     /// A dependent raw HTTP client body stream. The active handle owns one checked-out connection
     /// and retains a shared borrow of its creating client. It may ride only the builtin
     /// Option/Result carrier grammar; every other enclosing storage edge is rejected.
@@ -344,7 +347,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -807,6 +810,9 @@ pub enum Ty {
     /// **Impure** (network).
     /// Opaque pointer.
     HttpStream,
+    /// A protocol-neutral HTTP/1.1 Upgrade transport. Owned Move handle with exclusive exact-I/O,
+    /// cumulative-deadline, and terminal-shutdown methods.
+    HttpUpgrade,
     /// A dependent client receive stream returned by `client.request_stream`. Move, Drop-bearing,
     /// and lifetime-tied to its creating `HttpClient` through borrow provenance.
     HttpReadStream,
@@ -956,6 +962,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::HttpRequestCtx
         | Ty::ResponseBuilder
         | Ty::HttpStream
+        | Ty::HttpUpgrade
         | Ty::HttpReadStream
         | Ty::HttpSseStream
         | Ty::HttpHeaders
@@ -1013,6 +1020,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpUpgrade
         | Scalar::HttpReadStream
         | Scalar::HttpSseStream
         | Scalar::RunOutput
@@ -1091,6 +1099,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::ResponseBuilder => Some(Scalar::ResponseBuilder),
         // A `http_stream` owned handle as the `Result` Ok payload of `ctx.respond_stream()`.
         Ty::HttpStream => Some(Scalar::HttpStream),
+        Ty::HttpUpgrade => Some(Scalar::HttpUpgrade),
         Ty::HttpReadStream => Some(Scalar::HttpReadStream),
         Ty::HttpSseStream => Some(Scalar::HttpSseStream),
         // A `run_output` owned handle as the `Result` Ok payload of `c.run()` (std.process Slice 4).
@@ -1114,25 +1123,22 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
     }
 }
 
-/// [`ty_to_scalar`] for a **first-class function-value / lambda signature**: the same payload-scalar
-/// mapping, but a `slice<T>` maps to `None`. A slice is a legitimate `Option`/`Result` payload (so it
-/// belongs in `ty_to_scalar` — `Result<slice<u8>, Error>` from `fs.read_bytes_view`), yet fn values
-/// take only true scalar / owned parameters today; a borrowed-slice parameter or return stays with
-/// the rest of the deferred non-scalar fn-value surface (`fn_values.rs`). Using this at the fn-value
-/// sites keeps that restriction after `Scalar::Slice` joined `ty_to_scalar`.
+/// [`ty_to_scalar`] for a **first-class function-value / lambda signature**. A slice is represented
+/// by the existing `Scalar::Slice` pair and is admitted here so package callbacks can validate
+/// borrowed configuration without allocating or capturing an environment.
 /// Whether `ty` may be the RETURN of a function value. Scalars as before, plus `Result<T, E>` — the
-/// shape every fallible callback has (`pkg.web`'s `fn(Ctx) -> Result<(), Error>`). Deliberately not
-/// "any type": widening is exactly what a consumer needed, so no untested aggregate-return ABI is
-/// admitted by accident.
+/// shape every fallible callback has (`pkg.web`'s `fn(Ctx) -> Result<(), Error>`). Borrowed slices
+/// are admitted as parameters only: returning one still lacks a function-value region contract.
+/// Deliberately not "any type": widening is exactly what a consumer needed, so no untested
+/// aggregate-return ABI is admitted by accident.
 pub fn fn_value_ret_ok(ty: Ty) -> bool {
-    ty != Ty::RunBytes && (fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..)))
+    ty != Ty::RunBytes
+        && (fn_sig_scalar(ty).is_some_and(|scalar| !matches!(scalar, Scalar::Slice(_)))
+            || matches!(ty, Ty::Result(..)))
 }
 
 pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
-    match ty_to_scalar(ty) {
-        Some(Scalar::Slice(_)) => None,
-        other => other,
-    }
+    ty_to_scalar(ty)
 }
 
 fn fn_sig_scalar_with_http_stream_carrier(
@@ -1166,9 +1172,11 @@ fn fn_value_ret_ok_with_http_stream_carrier(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    fn_value_ret_ok(ty)
-        || http_stream_carrier_class(ty, structs, tuples, enums, tagged_types)
-            == HttpStreamCarrierClass::Carrier
+    http_upgrade_carrier_class(ty, structs, tuples, enums, tagged_types)
+        == HttpUpgradeCarrierClass::None
+        && (fn_value_ret_ok(ty)
+            || http_stream_carrier_class(ty, structs, tuples, enums, tagged_types)
+                == HttpStreamCarrierClass::Carrier)
 }
 
 pub fn scalar_to_ty(s: Scalar) -> Ty {
@@ -1217,6 +1225,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
         Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
+        Scalar::HttpUpgrade => Ty::HttpUpgrade,
         Scalar::HttpReadStream => Ty::HttpReadStream,
         Scalar::HttpSseStream => Ty::HttpSseStream,
         Scalar::RunOutput => Ty::RunOutput,
@@ -2489,6 +2498,7 @@ pub fn drop_plan(
                         | Ty::HttpRequestCtx
                         | Ty::ResponseBuilder
                         | Ty::HttpStream
+                        | Ty::HttpUpgrade
                         | Ty::HttpReadStream
                         | Ty::HttpSseStream
                         | Ty::Command
@@ -2954,6 +2964,7 @@ pub fn ty_contains_signature_key(
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
             | Ty::HttpHeaders
@@ -3089,6 +3100,188 @@ pub enum HttpStreamCarrierClass {
     Forbidden,
 }
 
+/// Classification of the deliberately narrow `http_upgrade` placement grammar. A carrier is
+/// either the bare handle or exactly `Result<http_upgrade, E>` with an upgrade-free error graph.
+/// Any other reachable placement is forbidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpUpgradeCarrierClass {
+    None,
+    Carrier,
+    Forbidden,
+}
+
+fn ty_contains_http_upgrade(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut work = vec![root];
+    let mut seen_structs = HashSet::new();
+    let mut seen_tuples = HashSet::new();
+    let mut seen_enums = HashSet::new();
+    let mut seen_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::HttpUpgrade => return true,
+            Ty::Option(payload)
+            | Ty::Box(payload)
+            | Ty::Array(payload, _)
+            | Ty::Vec(payload, _)
+            | Ty::Mask(payload, _)
+            | Ty::Slice(payload)
+            | Ty::DynArray(payload)
+            | Ty::ArrayBuilder(payload)
+            | Ty::Task(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tagged(id) if seen_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Struct(id) if seen_structs.insert(id) => {
+                if let Some(definition) = structs.get(id as usize) {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) if seen_tuples.insert(id) => {
+                if let Some(definition) = tuples.get(id as usize) {
+                    work.extend(definition.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Enum(id) if seen_enums.insert(id) => {
+                if let Some(definition) = enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _)
+            | Ty::Soa(id)
+            | Ty::JsonScanner(id)
+            | Ty::DictEncoded(id, _) => work.push(Ty::Struct(id)),
+            Ty::DynVecArray(element, lanes) | Ty::VecArrayBuilder(element, lanes) => {
+                work.push(Ty::Vec(element, lanes));
+            }
+            Ty::DynMaskArray(element, lanes) | Ty::MaskArrayBuilder(element, lanes) => {
+                work.push(Ty::Mask(element, lanes));
+            }
+            Ty::DynFixedArray(element, length) | Ty::FixedArrayBuilder(element, length) => {
+                work.push(Ty::Array(element, length));
+            }
+            Ty::Int(_)
+            | Ty::Param(_)
+            | Ty::IntVar(_)
+            | Ty::Float(_)
+            | Ty::FloatVar(_)
+            | Ty::Bool
+            | Ty::Char
+            | Ty::SoaParam(_)
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::Str
+            | Ty::String
+            | Ty::ArenaHandle
+            | Ty::Raw
+            | Ty::Resource(_)
+            | Ty::ResourceRef(_)
+            | Ty::Builder
+            | Ty::Writer
+            | Ty::Logger
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::CodecStrColumn
+            | Ty::CodecEncoder
+            | Ty::Reader
+            | Ty::Buffer
+            | Ty::SignatureKey(_)
+            | Ty::StrFinder
+            | Ty::File
+            | Ty::Rng
+            | Ty::Regex
+            | Ty::Captures
+            | Ty::CliCommand
+            | Ty::CliParsed
+            | Ty::TcpConn
+            | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::Child
+            | Ty::Command
+            | Ty::RunOutput
+            | Ty::RunBytes
+            | Ty::HttpRequest
+            | Ty::HttpResponse
+            | Ty::HttpClient
+            | Ty::HttpServer
+            | Ty::HttpRequestCtx
+            | Ty::ResponseBuilder
+            | Ty::HttpStream
+            | Ty::HttpReadStream
+            | Ty::HttpSseStream
+            | Ty::HttpHeaders
+            | Ty::JsonDoc
+            | Ty::Fn(_)
+            | Ty::Unit
+            | Ty::Error
+            | Ty::Tagged(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Enum(_) => {}
+        }
+    }
+    false
+}
+
+pub fn http_upgrade_carrier_class(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> HttpUpgradeCarrierClass {
+    match root {
+        Ty::HttpUpgrade => HttpUpgradeCarrierClass::Carrier,
+        Ty::Result(Scalar::HttpUpgrade, err)
+            if !ty_contains_http_upgrade(
+                scalar_to_ty(err),
+                structs,
+                tuples,
+                enums,
+                tagged_types,
+            ) =>
+        {
+            HttpUpgradeCarrierClass::Carrier
+        }
+        other
+            if ty_contains_http_upgrade(other, structs, tuples, enums, tagged_types) =>
+        {
+            HttpUpgradeCarrierClass::Forbidden
+        }
+        _ => HttpUpgradeCarrierClass::None,
+    }
+}
+
 fn ty_contains_http_receive_stream(
     root: Ty,
     structs: &[StructDef],
@@ -3148,6 +3341,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::RunOutput
             | Scalar::RunBytes
             | Scalar::Fn(_)
@@ -3290,6 +3484,7 @@ fn ty_contains_http_receive_stream(
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Fn(_)
@@ -3362,6 +3557,7 @@ pub fn http_stream_carrier_class(
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::RunOutput
             | Scalar::RunBytes
             | Scalar::Fn(_)
@@ -3508,6 +3704,7 @@ pub fn http_stream_carrier_class(
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::JsonScanner(_)
@@ -4142,6 +4339,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("http_request_ctx", Ty::HttpRequestCtx),
     ("response_builder", Ty::ResponseBuilder),
     ("http_stream", Ty::HttpStream),
+    ("http_upgrade", Ty::HttpUpgrade),
     ("http_read_stream", Ty::HttpReadStream),
     ("http_sse_stream", Ty::HttpSseStream),
     ("array", Ty::DynArray(BRIDGE_ELEM)),
@@ -9012,6 +9210,30 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ),
                 _ => {}
             }
+            match http_upgrade_carrier_class(
+                ty,
+                &structs,
+                &tuples,
+                &enums,
+                &tagged_types,
+            ) {
+                HttpUpgradeCarrierClass::Forbidden => diags.error(
+                    "http_upgrade may appear only as a bare parameter or one same-frame Result Ok payload"
+                        .to_string(),
+                    parameter.ty.span(),
+                ),
+                HttpUpgradeCarrierClass::Carrier if ty != Ty::HttpUpgrade => diags.error(
+                    "Result<http_upgrade, E> is a same-frame local only and cannot be a parameter"
+                        .to_string(),
+                    parameter.ty.span(),
+                ),
+                HttpUpgradeCarrierClass::Carrier if parameter.mode.is_out() => diags.error(
+                    "http_upgrade cannot be an `out` parameter; pass it by value, `borrow`, or `borrow mut`"
+                        .to_string(),
+                    parameter.ty.span(),
+                ),
+                _ => {}
+            }
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -9076,6 +9298,20 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 {
                     diags.error(
                         "an HTTP receive stream return may use only the builtin Option/Result carrier grammar; structs, sums, tuples, collections, boxes, tasks, and other storage edges are forbidden"
+                            .to_string(),
+                        t.span(),
+                    );
+                }
+                if http_upgrade_carrier_class(
+                    r,
+                    &structs,
+                    &tuples,
+                    &enums,
+                    &tagged_types,
+                ) != HttpUpgradeCarrierClass::None
+                {
+                    diags.error(
+                        "http_upgrade cannot be returned; consume or drop it in the current frame"
                             .to_string(),
                         t.span(),
                     );
@@ -15672,6 +15908,38 @@ impl EffectScan<'_> {
                 walk!(rb);
                 self.impure_direct = true;
             }
+            ExprKind::HttpRespondUpgrade { ctx, rb } => {
+                walk!(ctx);
+                walk!(rb);
+                self.impure_direct = true;
+            }
+            ExprKind::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                walk!(upgrade);
+                walk!(out);
+                walk!(count);
+                self.impure_direct = true;
+            }
+            ExprKind::HttpUpgradeWrite { upgrade, data } => {
+                walk!(upgrade);
+                walk!(data);
+                self.impure_direct = true;
+            }
+            ExprKind::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                walk!(upgrade);
+                walk!(timeout_ns);
+                self.impure_direct = true;
+            }
+            ExprKind::HttpUpgradeShutdown { upgrade } => {
+                walk!(upgrade);
+                self.impure_direct = true;
+            }
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 walk!(stream);
                 walk!(chunk);
@@ -15702,10 +15970,23 @@ impl EffectScan<'_> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => walk!(ctx),
-            ExprKind::HttpCtxHeader { headers, name } => {
+            | ExprKind::HttpCtxHeaders { ctx }
+            | ExprKind::HttpCtxUpgradeReady { ctx } => walk!(ctx),
+            ExprKind::HttpCtxHeader { headers, name }
+            | ExprKind::HttpHeadersCount { headers, name }
+            | ExprKind::HttpHeadersTokensValid { headers, name } => {
                 walk!(headers);
                 walk!(name);
+            }
+            ExprKind::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+                ..
+            } => {
+                walk!(headers);
+                walk!(name);
+                walk!(token);
             }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
             // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
@@ -18433,6 +18714,15 @@ impl<'a> EscapeCheck<'a> {
         expression: &Expr,
         depth: u32,
     ) -> EscapeArgumentSnapshot {
+        // The canonical empty slice has no backing storage: MIR lowers it to `{null, 0}`. Treating
+        // its zero-length array literal as a frame borrow would make allocation-free constants
+        // such as a route's empty configuration impossible to return.
+        let canonical_empty_slice = matches!(expression.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+            || matches!(
+                &expression.kind,
+                ExprKind::ArrayToSlice(inner)
+                    if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+            );
         let owns_dynamic_storage = ty_owns_dyn_array_storage(
             expression.ty,
             self.structs,
@@ -18455,7 +18745,7 @@ impl<'a> EscapeCheck<'a> {
             retained_contained_region: self.retained_contained_region(expression, depth),
             storage_region: self.retained_storage_region(expression, depth),
             mutable_backing: self.backing_storage_of_expr(expression, depth),
-            storage_is_local: self.slice_is_local(expression),
+            storage_is_local: !canonical_empty_slice && self.slice_is_local(expression),
             individual,
             may_individual,
         }
@@ -19075,6 +19365,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
             | Ty::Command
@@ -19234,6 +19525,11 @@ impl<'a> EscapeCheck<'a> {
                 .get(local)
                 .cloned()
                 .unwrap_or_else(|| self.legacy_escape_value(expression)),
+            ExprKind::ArrayToSlice(inner)
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) =>
+            {
+                EscapeValueFact::default()
+            }
             ExprKind::ArrayToSlice(inner) => self.retarget_escape_root_header(
                 self.completed_escape_value(inner),
                 expression.ty,
@@ -19311,16 +19607,24 @@ impl<'a> EscapeCheck<'a> {
                 )
             }
             ExprKind::StructLit { fields, .. } => Self::join_escape_value_facts(
-                fields.iter().enumerate().map(|(index, field)| {
-                    self.completed_escape_value(field)
-                        .prefixed(BorrowProjection::StructField(index as u32))
-                }),
+                fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| self.region_bearing(field.ty))
+                    .map(|(index, field)| {
+                        self.completed_escape_value(field)
+                            .prefixed(BorrowProjection::StructField(index as u32))
+                    }),
             ),
             ExprKind::Tuple { elems, .. } => Self::join_escape_value_facts(
-                elems.iter().enumerate().map(|(index, element)| {
-                    self.completed_escape_value(element)
-                        .prefixed(BorrowProjection::TupleElement(index as u32))
-                }),
+                elems
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, element)| self.region_bearing(element.ty))
+                    .map(|(index, element)| {
+                        self.completed_escape_value(element)
+                            .prefixed(BorrowProjection::TupleElement(index as u32))
+                    }),
             ),
             ExprKind::OptionSome(value) => self
                 .completed_escape_value(value)
@@ -19333,16 +19637,20 @@ impl<'a> EscapeCheck<'a> {
                 .prefixed(BorrowProjection::ResultErr),
             ExprKind::EnumValue {
                 variant, payload, ..
-            } => Self::join_escape_value_facts(payload.iter().enumerate().map(
-                |(index, value)| {
-                    self.completed_escape_value(value).prefixed(
-                        BorrowProjection::EnumPayload {
-                            variant: *variant,
-                            index: index as u32,
-                        },
-                    )
-                },
-            )),
+            } => Self::join_escape_value_facts(
+                payload
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| self.region_bearing(value.ty))
+                    .map(|(index, value)| {
+                        self.completed_escape_value(value).prefixed(
+                            BorrowProjection::EnumPayload {
+                                variant: *variant,
+                                index: index as u32,
+                            },
+                        )
+                    }),
+            ),
             ExprKind::Closure { lifted, captures } => {
                 let Some(target) =
                     self.storage_callable_target_id(storage_provenance, lifted)
@@ -21189,6 +21497,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             // `command`/`run_output` are owned handles that borrow nothing (like `http response`): a
             // `run_output`'s `.stdout()`/`.stderr()` VIEWS carry its region, but the handle itself does
             // not, so it is freely returnable. The view exprs get their region in `region_of`.
@@ -22488,6 +22797,7 @@ impl<'a> EscapeCheck<'a> {
                     Region::Static,
                     elems
                         .iter()
+                        .filter(|element| self.region_bearing(element.ty))
                         .map(|element| (element, depth, None))
                         .collect(),
                 );
@@ -22500,6 +22810,7 @@ impl<'a> EscapeCheck<'a> {
                 Region::Static,
                 elems
                     .iter()
+                    .filter(|element| self.region_bearing(element.ty))
                     .map(|element| (element, depth, None))
                     .collect(),
             ),
@@ -22511,6 +22822,7 @@ impl<'a> EscapeCheck<'a> {
                 Region::Static,
                 payload
                     .iter()
+                    .filter(|element| self.region_bearing(element.ty))
                     .map(|element| (element, depth, None))
                     .collect(),
             ),
@@ -22570,6 +22882,11 @@ impl<'a> EscapeCheck<'a> {
             }
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
+            ExprKind::ArrayToSlice(inner)
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) =>
+            {
+                values.push(Region::Static);
+            }
             ExprKind::ArrayToSlice(inner) => push_fold(
                 &mut work,
                 Region::Static,
@@ -22794,6 +23111,7 @@ impl<'a> EscapeCheck<'a> {
                 Region::Static,
                 fields
                     .iter()
+                    .filter(|field| self.region_bearing(field.ty))
                     .map(|field| (field, depth, None))
                     .collect(),
             ),
@@ -23199,6 +23517,15 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpRbBody { .. }
             | ExprKind::HttpRespond { .. }
             | ExprKind::HttpRespondStream { .. }
+            | ExprKind::HttpHeadersCount { .. }
+            | ExprKind::HttpHeadersTokensValid { .. }
+            | ExprKind::HttpHeadersContainsToken { .. }
+            | ExprKind::HttpCtxUpgradeReady { .. }
+            | ExprKind::HttpRespondUpgrade { .. }
+            | ExprKind::HttpUpgradeReadExact { .. }
+            | ExprKind::HttpUpgradeWrite { .. }
+            | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
             | ExprKind::HttpStreamReject { .. }
@@ -23280,6 +23607,9 @@ impl<'a> EscapeCheck<'a> {
             // — local-backed like `buf.bytes()`, so returning it is rejected (its region arm above also
             // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
             // local-backed check is the one that catches its escape).
+            ExprKind::ArrayToSlice(inner)
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) => {}
+            ExprKind::ArrayLit { elems, .. } if elems.is_empty() => {}
             ExprKind::ArrayToSlice(_)
             | ExprKind::ArrayLit { .. }
             | ExprKind::BufferBytes { .. }
@@ -23650,11 +23980,20 @@ impl<'a> EscapeCheck<'a> {
             // `Option<str>`. Their escape is governed by `tracks_region` + `region_of` instead.
             | ExprKind::HttpCtxHeaders { .. }
             | ExprKind::HttpCtxHeader { .. }
+            | ExprKind::HttpHeadersCount { .. }
+            | ExprKind::HttpHeadersTokensValid { .. }
+            | ExprKind::HttpHeadersContainsToken { .. }
+            | ExprKind::HttpCtxUpgradeReady { .. }
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
             | ExprKind::HttpRbBody { .. }
             | ExprKind::HttpRespond { .. }
             | ExprKind::HttpRespondStream { .. }
+            | ExprKind::HttpRespondUpgrade { .. }
+            | ExprKind::HttpUpgradeReadExact { .. }
+            | ExprKind::HttpUpgradeWrite { .. }
+            | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
             | ExprKind::HttpStreamReject { .. }
@@ -27064,6 +27403,31 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(ctx, depth);
                 self.walk(rb, depth);
             }
+            ExprKind::HttpRespondUpgrade { ctx, rb } => {
+                self.walk(ctx, depth);
+                self.walk(rb, depth);
+            }
+            ExprKind::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                self.walk(upgrade, depth);
+                self.walk(out, depth);
+                self.walk(count, depth);
+            }
+            ExprKind::HttpUpgradeWrite { upgrade, data } => {
+                self.walk(upgrade, depth);
+                self.walk(data, depth);
+            }
+            ExprKind::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                self.walk(upgrade, depth);
+                self.walk(timeout_ns, depth);
+            }
+            ExprKind::HttpUpgradeShutdown { upgrade } => self.walk(upgrade, depth),
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.walk(stream, depth);
                 self.walk(chunk, depth);
@@ -27086,10 +27450,23 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.walk(ctx, depth),
-            ExprKind::HttpCtxHeader { headers, name } => {
+            | ExprKind::HttpCtxHeaders { ctx }
+            | ExprKind::HttpCtxUpgradeReady { ctx } => self.walk(ctx, depth),
+            ExprKind::HttpCtxHeader { headers, name }
+            | ExprKind::HttpHeadersCount { headers, name }
+            | ExprKind::HttpHeadersTokensValid { headers, name } => {
                 self.walk(headers, depth);
                 self.walk(name, depth);
+            }
+            ExprKind::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+                ..
+            } => {
+                self.walk(headers, depth);
+                self.walk(name, depth);
+                self.walk(token, depth);
             }
             // `std.crypto` — `constant_time_equal` returns a Copy `bool` (borrows nothing); `random`
             // fills the `buffer` in place (returns `()`, nothing escapes). Just recurse into the
@@ -29267,11 +29644,20 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpCtxPath { .. }
         | ExprKind::HttpCtxHeaders { .. }
         | ExprKind::HttpCtxHeader { .. }
+        | ExprKind::HttpHeadersCount { .. }
+        | ExprKind::HttpHeadersTokensValid { .. }
+        | ExprKind::HttpHeadersContainsToken { .. }
+        | ExprKind::HttpCtxUpgradeReady { .. }
         | ExprKind::HttpResponseBuilder { .. }
         | ExprKind::HttpRbHeader { .. }
         | ExprKind::HttpRbBody { .. }
         | ExprKind::HttpRespond { .. }
         | ExprKind::HttpRespondStream { .. }
+        | ExprKind::HttpRespondUpgrade { .. }
+        | ExprKind::HttpUpgradeReadExact { .. }
+        | ExprKind::HttpUpgradeWrite { .. }
+        | ExprKind::HttpUpgradeDeadline { .. }
+        | ExprKind::HttpUpgradeShutdown { .. }
         | ExprKind::HttpStreamSend { .. }
         | ExprKind::HttpStreamFinish { .. }
         | ExprKind::HttpStreamReject { .. }
@@ -36438,6 +36824,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
             | ExprKind::HttpResponseBuilder { .. } | ExprKind::HttpRbHeader { .. } | ExprKind::HttpRbBody { .. }
             | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
+            | ExprKind::HttpHeadersCount { .. } | ExprKind::HttpHeadersTokensValid { .. }
+            | ExprKind::HttpHeadersContainsToken { .. } | ExprKind::HttpCtxUpgradeReady { .. }
+            | ExprKind::HttpRespondUpgrade { .. } | ExprKind::HttpUpgradeReadExact { .. }
+            | ExprKind::HttpUpgradeWrite { .. } | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
@@ -42859,6 +43250,36 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ctx, moved, false, false);
                 move_expr!(self, rb, moved, true, true);
             }
+            ExprKind::HttpRespondUpgrade { ctx, rb } => {
+                move_expr!(self, ctx, moved, false, false);
+                move_expr!(self, rb, moved, true, true);
+            }
+            ExprKind::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                move_expr!(self, upgrade, moved, false, false);
+                move_expr!(self, out, moved, false, false);
+                move_expr!(self, count, moved, false, false);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(out);
+                }
+            }
+            ExprKind::HttpUpgradeWrite { upgrade, data } => {
+                move_expr!(self, upgrade, moved, false, false);
+                move_expr!(self, data, moved, false, false);
+            }
+            ExprKind::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                move_expr!(self, upgrade, moved, false, false);
+                move_expr!(self, timeout_ns, moved, false, false);
+            }
+            ExprKind::HttpUpgradeShutdown { upgrade } => {
+                move_expr!(self, upgrade, moved, false, false);
+            }
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 move_expr!(self, stream, moved, false, false);
                 move_expr!(self, chunk, moved, false, false);
@@ -42881,10 +43302,23 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => move_expr!(self, ctx, moved, false, false),
-            ExprKind::HttpCtxHeader { headers, name } => {
+            | ExprKind::HttpCtxHeaders { ctx }
+            | ExprKind::HttpCtxUpgradeReady { ctx } => move_expr!(self, ctx, moved, false, false),
+            ExprKind::HttpCtxHeader { headers, name }
+            | ExprKind::HttpHeadersCount { headers, name }
+            | ExprKind::HttpHeadersTokensValid { headers, name } => {
                 move_expr!(self, headers, moved, false, false);
                 move_expr!(self, name, moved, false, false);
+            }
+            ExprKind::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+                ..
+            } => {
+                move_expr!(self, headers, moved, false, false);
+                move_expr!(self, name, moved, false, false);
+                move_expr!(self, token, moved, false, false);
             }
             // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
             // (`random`, filled in place) — nothing is consumed. Recurse non-consuming to catch a
@@ -43756,6 +44190,30 @@ impl<'a, 't> Checker<'a, 't> {
                     ),
                     _ => {}
                 }
+                match http_upgrade_carrier_class(
+                    ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    HttpUpgradeCarrierClass::Forbidden => self.diags.error(
+                        "generic substitution placed http_upgrade behind a forbidden storage edge"
+                            .to_string(),
+                        parameter.ty.span(),
+                    ),
+                    HttpUpgradeCarrierClass::Carrier if ty != Ty::HttpUpgrade => self.diags.error(
+                        "generic substitution cannot produce a Result<http_upgrade, E> parameter"
+                            .to_string(),
+                        parameter.ty.span(),
+                    ),
+                    HttpUpgradeCarrierClass::Carrier if parameter.mode.is_out() => self.diags.error(
+                        "generic substitution cannot produce an `out` http_upgrade parameter"
+                            .to_string(),
+                        parameter.ty.span(),
+                    ),
+                    _ => {}
+                }
             }
             if http_stream_carrier_class(
                 ret,
@@ -43768,6 +44226,19 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error(
                     "generic substitution placed a returned HTTP receive stream behind a forbidden storage edge"
                         .to_string(),
+                    f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
+                );
+            }
+            if http_upgrade_carrier_class(
+                ret,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) != HttpUpgradeCarrierClass::None
+            {
+                self.diags.error(
+                    "generic substitution cannot produce an http_upgrade return".to_string(),
                     f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
                 );
             }
@@ -44075,6 +44546,21 @@ impl<'a, 't> Checker<'a, 't> {
                     if self.resolve(local_ty) == Ty::ArenaHandle {
                         self.diags.error(
                             "a region capability cannot be stored in an ordinary local; pass it as a function parameter or use the binding introduced by `arena name {}` directly".to_string(),
+                            name.span,
+                        );
+                        local_ty = Ty::Error;
+                    }
+                    if http_upgrade_carrier_class(
+                        self.resolve(local_ty),
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) == HttpUpgradeCarrierClass::Forbidden
+                    {
+                        self.diags.error(
+                            "http_upgrade may be stored only as a bare local or one unnested Result<http_upgrade, E> local"
+                                .to_string(),
                             name.span,
                         );
                         local_ty = Ty::Error;
@@ -45581,6 +46067,17 @@ impl<'a, 't> Checker<'a, 't> {
             .params
             .iter()
             .map(|t| {
+                if http_upgrade_carrier_class(
+                    *t,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) == HttpUpgradeCarrierClass::Carrier
+                    && *t != Ty::HttpUpgrade
+                {
+                    return None;
+                }
                 fn_sig_scalar_with_http_stream_carrier(
                     *t,
                     self.structs,
@@ -46770,6 +47267,22 @@ impl<'a, 't> Checker<'a, 't> {
         let mut pscalars = Vec::with_capacity(param_tys.len());
         for &parameter in &param_tys {
             let parameter = self.finalize(parameter);
+            if http_upgrade_carrier_class(
+                parameter,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) == HttpUpgradeCarrierClass::Carrier
+                && parameter != Ty::HttpUpgrade
+            {
+                self.diags.error(
+                    "a lambda value may take bare http_upgrade, but not a Result carrier parameter"
+                        .to_string(),
+                    span,
+                );
+                return err;
+            }
             let Some(scalar) = fn_sig_scalar_with_http_stream_carrier(
                 parameter,
                 self.structs,
@@ -48904,6 +49417,26 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "sort_by_key" {
             return self.check_array_sort_by_key(recv, args, span);
         }
+        // `http_headers.count(name)` shares its name with the array pipeline terminal. Dispatch both
+        // stored views and the mandated `ctx.headers().count(name)` temporary before the
+        // syntax-only pipeline lane claims every `.count(...)` call.
+        if method == "count"
+            && (self.resolve_place(recv).is_some_and(|(_, _, ty)| ty == Ty::HttpHeaders)
+                || matches!(
+                    &recv.kind,
+                    ast::ExprKind::Call { callee, .. }
+                        if matches!(
+                            &callee.kind,
+                            ast::ExprKind::FieldAccess { field, .. } if field.name == "headers"
+                        )
+                ))
+        {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty != Ty::HttpHeaders {
+                return err;
+            }
+            return self.check_http_headers_query(recv_expr, method, args, span);
+        }
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
@@ -49057,6 +49590,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             if recv_expr.ty == Ty::HttpReadStream && method == "read" {
                 return self.check_http_read_stream_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty == Ty::HttpUpgrade && method == "write" {
+                return self.check_http_upgrade_method(recv_expr, method, args, span);
             }
             if method == "bytes" {
                 if recv_expr.ty == Ty::Buffer {
@@ -49373,6 +49909,11 @@ impl<'a, 't> Checker<'a, 't> {
             // `http_headers` is Copy, owns nothing and is never dropped, so the mandated spelling
             // `ctx.headers().get(name)` needs no place-gate (unlike `ctx.headers()` itself).
             "get" if recv_ty == Ty::HttpHeaders => self.check_http_headers_get(recv_expr, args, span),
+            "count" | "tokens_valid" | "contains_token" | "contains_token_exact"
+                if recv_ty == Ty::HttpHeaders =>
+            {
+                self.check_http_headers_query(recv_expr, method, args, span)
+            }
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
             // http-client arm below; `check_box_get` otherwise swallows it with a box-only error).
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
@@ -49460,7 +50001,7 @@ impl<'a, 't> Checker<'a, 't> {
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
             // Request-context getters + `respond` on an `http_request_ctx`: `ctx.method()` / `ctx.path()`
             // / `ctx.headers()` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
-            "method" | "path" | "headers" | "body" | "respond" | "respond_stream" if recv_ty == Ty::HttpRequestCtx => {
+            "method" | "path" | "headers" | "body" | "upgrade_ready" | "respond" | "respond_stream" | "respond_upgrade" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
             }
             // The old spelling. `ctx.header(name)` was replaced by `ctx.headers().get(name)` (item 10
@@ -49487,6 +50028,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `s` AND `rb`). All yield `Result<(), Error>`. Type-guarded, same as above.
             "send" | "send_event" | "finish" | "reject" if recv_ty == Ty::HttpStream => {
                 self.check_http_stream_method(recv_expr, method, args, span)
+            }
+            "read_exact" | "write" | "deadline" | "shutdown" if recv_ty == Ty::HttpUpgrade => {
+                self.check_http_upgrade_method(recv_expr, method, args, span)
             }
             _ => {
                 // `place.field(args)` where `field` is a **function-value** field of a struct
@@ -52198,6 +52742,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::HttpRequestCtx
                 | Ty::ResponseBuilder
                 | Ty::HttpStream
+                | Ty::HttpUpgrade
                 | Ty::Command
                 | Ty::RunOutput
                 | Ty::RunBytes
@@ -59798,6 +60343,19 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "upgrade_ready" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.upgrade_ready()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpCtxUpgradeReady {
+                        ctx: Box::new(recv_expr),
+                    },
+                    ty: Ty::Bool,
+                    span,
+                }
+            }
             "respond" => {
                 if args.len() != 1 {
                     self.diags.error(format!("'.respond()' takes 1 argument (a response_builder), got {}", args.len()), span);
@@ -59842,8 +60400,30 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "respond_upgrade" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.respond_upgrade()' takes 1 argument (a header-only 101 response_builder), got {}", args.len()), span);
+                    return err;
+                }
+                let rb = self.check_expr(&args[0], None);
+                if rb.ty == Ty::Error {
+                    return err;
+                }
+                if self.resolve(rb.ty) != Ty::ResponseBuilder {
+                    self.diags.error(
+                        format!("'.respond_upgrade()' expects a response_builder (from `http.response(101)`), got {}", ty_name(rb.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpRespondUpgrade { ctx: Box::new(recv_expr), rb: Box::new(rb) },
+                    ty: Ty::Result(Scalar::HttpUpgrade, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / respond / respond_stream)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / upgrade_ready / respond / respond_stream / respond_upgrade)"), span);
                 err
             }
         }
@@ -59873,6 +60453,61 @@ impl<'a, 't> Checker<'a, 't> {
             kind: ExprKind::HttpCtxHeader { headers: Box::new(recv_expr), name: Box::new(name) },
             ty: Ty::Option(Scalar::Str),
             span,
+        }
+    }
+
+    fn check_http_headers_query(
+        &mut self,
+        recv_expr: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let expected = if matches!(method, "contains_token" | "contains_token_exact") {
+            2
+        } else {
+            1
+        };
+        if args.len() != expected {
+            self.diags.error(
+                format!("'.{method}()' takes {expected} string argument(s), got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        if name.ty == Ty::Error {
+            return err;
+        }
+        match method {
+            "count" => Expr {
+                kind: ExprKind::HttpHeadersCount { headers: Box::new(recv_expr), name: Box::new(name) },
+                ty: Ty::Int(IntTy { bits: 64, signed: true }),
+                span,
+            },
+            "tokens_valid" => Expr {
+                kind: ExprKind::HttpHeadersTokensValid { headers: Box::new(recv_expr), name: Box::new(name) },
+                ty: Ty::Bool,
+                span,
+            },
+            "contains_token" | "contains_token_exact" => {
+                let token = self.check_str_init(&args[1]);
+                if token.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpHeadersContainsToken {
+                        headers: Box::new(recv_expr),
+                        name: Box::new(name),
+                        token: Box::new(token),
+                        exact: method == "contains_token_exact",
+                    },
+                    ty: Ty::Bool,
+                    span,
+                }
+            }
+            _ => unreachable!("header query dispatch is closed"),
         }
     }
 
@@ -59942,6 +60577,107 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / send_event / finish / reject)"), span);
                 err
             }
+        }
+    }
+
+    fn check_http_upgrade_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http upgrade transport to a local first, then use it — a temporary owned handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
+        match method {
+            "read_exact" => {
+                if args.len() != 2 {
+                    self.diags.error(format!("'.read_exact()' takes 2 arguments (a mut buffer and count), got {}", args.len()), span);
+                    return err;
+                }
+                let out = self.check_expr(&args[0], Some(Ty::Buffer));
+                let count = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let mut operands_ok = out.ty != Ty::Error && count.ty != Ty::Error;
+                if out.ty != Ty::Error && out.ty != Ty::Buffer {
+                    self.diags.error(format!("'.read_exact()' fills a buffer, got {}", ty_name(out.ty)), args[0].span);
+                    operands_ok = false;
+                }
+                if out.ty == Ty::Buffer && !self.require_mut_buffer_local(&args[0], ".read_exact()") {
+                    operands_ok = false;
+                }
+                if count.ty != Ty::Error
+                    && !self.require_i64_arg(count.ty, args[1].span, "'.read_exact()' count")
+                {
+                    operands_ok = false;
+                }
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if !operands_ok || !receiver_ok {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpUpgradeReadExact {
+                        upgrade: Box::new(recv_expr),
+                        out: Box::new(out),
+                        count: Box::new(count),
+                    },
+                    ty: result_ty,
+                    span,
+                }
+            }
+            "write" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.write()' takes 1 byte-view argument, got {}", args.len()), span);
+                    return err;
+                }
+                let data = self.check_bytes_init(&args[0], "'.write()'");
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if data.ty == Ty::Error || !receiver_ok {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpUpgradeWrite { upgrade: Box::new(recv_expr), data: Box::new(data) },
+                    ty: result_ty,
+                    span,
+                }
+            }
+            "deadline" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.deadline()' takes 1 timeout_ns argument, got {}", args.len()), span);
+                    return err;
+                }
+                let timeout_ns = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let operand_ok = timeout_ns.ty != Ty::Error
+                    && self.require_i64_arg(timeout_ns.ty, args[0].span, "'.deadline()' timeout_ns");
+                let receiver_ok =
+                    self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate");
+                if !operand_ok || !receiver_ok {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpUpgradeDeadline {
+                        upgrade: Box::new(recv_expr),
+                        timeout_ns: Box::new(timeout_ns),
+                    },
+                    ty: result_ty,
+                    span,
+                }
+            }
+            "shutdown" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.shutdown()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                if !self.require_exclusive_handle_receiver(&recv_expr, "http_upgrade", method, "mutate") {
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpUpgradeShutdown { upgrade: Box::new(recv_expr) }, ty: result_ty, span }
+            }
+            _ => unreachable!("http_upgrade method dispatch is closed"),
         }
     }
 
@@ -62849,6 +63585,31 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ctx);
                 self.finalize_expr(rb);
             }
+            ExprKind::HttpRespondUpgrade { ctx, rb } => {
+                self.finalize_expr(ctx);
+                self.finalize_expr(rb);
+            }
+            ExprKind::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                self.finalize_expr(upgrade);
+                self.finalize_expr(out);
+                self.finalize_expr(count);
+            }
+            ExprKind::HttpUpgradeWrite { upgrade, data } => {
+                self.finalize_expr(upgrade);
+                self.finalize_expr(data);
+            }
+            ExprKind::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                self.finalize_expr(upgrade);
+                self.finalize_expr(timeout_ns);
+            }
+            ExprKind::HttpUpgradeShutdown { upgrade } => self.finalize_expr(upgrade),
             ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 self.finalize_expr(stream);
                 self.finalize_expr(chunk);
@@ -62871,10 +63632,23 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpCtxMethod { ctx }
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
-            | ExprKind::HttpCtxHeaders { ctx } => self.finalize_expr(ctx),
-            ExprKind::HttpCtxHeader { headers, name } => {
+            | ExprKind::HttpCtxHeaders { ctx }
+            | ExprKind::HttpCtxUpgradeReady { ctx } => self.finalize_expr(ctx),
+            ExprKind::HttpCtxHeader { headers, name }
+            | ExprKind::HttpHeadersCount { headers, name }
+            | ExprKind::HttpHeadersTokensValid { headers, name } => {
                 self.finalize_expr(headers);
                 self.finalize_expr(name);
+            }
+            ExprKind::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+                ..
+            } => {
+                self.finalize_expr(headers);
+                self.finalize_expr(name);
+                self.finalize_expr(token);
             }
             ExprKind::CryptoCtEqual { a, b } => {
                 self.finalize_expr(a);
@@ -64023,6 +64797,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::HttpHeaders => "http_headers".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::HttpUpgrade => "http_upgrade".to_string(),
         Ty::HttpReadStream => "http_read_stream".to_string(),
         Ty::HttpSseStream => "http_sse_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),
@@ -64454,6 +65229,7 @@ fn resolved_type_source_spelling(
             Ty::HttpHeaders => "http_headers".to_string(),
             Ty::ResponseBuilder => "response_builder".to_string(),
             Ty::HttpStream => "http_stream".to_string(),
+            Ty::HttpUpgrade => "http_upgrade".to_string(),
             Ty::HttpReadStream => "http_read_stream".to_string(),
             Ty::HttpSseStream => "http_sse_stream".to_string(),
             Ty::JsonDoc => "json.doc".to_string(),
@@ -65965,6 +66741,38 @@ fn resolve_type(
                     );
                     return Ty::Error;
                 }
+                match http_upgrade_carrier_class(
+                    pty,
+                    cx.structs,
+                    cx.tuples,
+                    cx.enums,
+                    cx.tagged_types,
+                ) {
+                    HttpUpgradeCarrierClass::Forbidden => {
+                        diags.error(
+                            "a function-value parameter may use http_upgrade only as a bare handle"
+                                .to_string(),
+                            p.ty.span(),
+                        );
+                        return Ty::Error;
+                    }
+                    HttpUpgradeCarrierClass::Carrier if pty != Ty::HttpUpgrade => {
+                        diags.error(
+                            "Result<http_upgrade, E> cannot be a function-value parameter"
+                                .to_string(),
+                            p.ty.span(),
+                        );
+                        return Ty::Error;
+                    }
+                    HttpUpgradeCarrierClass::Carrier if p.mode.is_out() => {
+                        diags.error(
+                            "http_upgrade cannot be an `out` function-value parameter".to_string(),
+                            p.ty.span(),
+                        );
+                        return Ty::Error;
+                    }
+                    _ => {}
+                }
                 if p.mode.is_out() && !matches!(pty, Ty::Slice(_)) {
                     diags.error(
                         format!(
@@ -66012,6 +66820,20 @@ fn resolve_type(
                 diags.error(
                     "a function-value return may contain an HTTP receive stream only through builtin Option/Result tags"
                         .to_string(),
+                    ret.span(),
+                );
+                return Ty::Error;
+            }
+            if http_upgrade_carrier_class(
+                rty,
+                cx.structs,
+                cx.tuples,
+                cx.enums,
+                cx.tagged_types,
+            ) != HttpUpgradeCarrierClass::None
+            {
+                diags.error(
+                    "a function-value cannot return http_upgrade".to_string(),
                     ret.span(),
                 );
                 return Ty::Error;
@@ -66455,6 +67277,13 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::HttpStream
+        }
+        "http_upgrade" => {
+            if !args.is_empty() {
+                diags.error("http_upgrade takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::HttpUpgrade
         }
         "http_read_stream" => {
             if !args.is_empty() {
@@ -66960,6 +67789,7 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::HttpRequestCtx,
     Ty::ResponseBuilder,
     Ty::HttpStream,
+    Ty::HttpUpgrade,
     Ty::HttpReadStream,
     Ty::HttpSseStream,
     // `command` / `run_output` / `run_bytes` — bare opaque-pointer Move handles freed by their
@@ -66989,6 +67819,11 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     // are available; this direct leaf guard closes concrete and generic field formation here.
     if http_stream_carrier_class(ty, &[], &[], &[], tagged_types)
         != HttpStreamCarrierClass::None
+    {
+        return false;
+    }
+    if http_upgrade_carrier_class(ty, &[], &[], &[], tagged_types)
+        != HttpUpgradeCarrierClass::None
     {
         return false;
     }
@@ -67783,6 +68618,92 @@ mod tests {
                 HttpStreamCarrierClass::None,
             );
         }
+    }
+
+    #[test]
+    fn http_upgrade_carrier_classifier_rejects_every_nesting_edge() {
+        let upgrade = Scalar::HttpUpgrade;
+        let structures = vec![StructDef {
+            name: "UpgradeHolder".to_string(),
+            source_name: "UpgradeHolder".to_string(),
+            fields: vec![FieldDef {
+                name: "upgrade".to_string(),
+                ty: Ty::HttpUpgrade,
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        let tuples = vec![hir::TupleDef {
+            elems: vec![upgrade],
+        }];
+        let enums = vec![hir::EnumDef {
+            name: "UpgradeChoice".to_string(),
+            source_name: "UpgradeChoice".to_string(),
+            variants: vec![hir::EnumVariant {
+                name: "Upgrade".to_string(),
+                payload: vec![upgrade],
+                field_base: 0,
+            }],
+        }];
+        let tagged = vec![
+            hir::TaggedType::Option(upgrade),
+            hir::TaggedType::Result(upgrade, Scalar::Unit),
+        ];
+        let class = |ty| {
+            http_upgrade_carrier_class(ty, &structures, &tuples, &enums, &tagged)
+        };
+
+        assert_eq!(class(Ty::HttpUpgrade), HttpUpgradeCarrierClass::Carrier);
+        assert_eq!(
+            class(Ty::Result(upgrade, Scalar::Unit)),
+            HttpUpgradeCarrierClass::Carrier,
+        );
+
+        for forbidden in [
+            Ty::Option(upgrade),
+            Ty::Result(Scalar::Unit, upgrade),
+            Ty::Result(upgrade, Scalar::Struct(0)),
+            Ty::Tagged(0),
+            Ty::Tagged(1),
+            Ty::Box(upgrade),
+            Ty::Array(upgrade, 1),
+            Ty::Vec(upgrade, 2),
+            Ty::Mask(upgrade, 2),
+            Ty::Slice(upgrade),
+            Ty::DynArray(upgrade),
+            Ty::ArrayBuilder(upgrade),
+            Ty::Task(upgrade),
+            Ty::Struct(0),
+            Ty::Tuple(0),
+            Ty::Enum(0),
+            Ty::StructArray(0, 1),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::DynFixedStructArray(0, 1),
+            Ty::FixedStructArrayBuilder(0, 1),
+            Ty::Soa(0),
+            Ty::JsonScanner(0),
+            Ty::DictEncoded(0, 0),
+            Ty::DynVecArray(upgrade, 2),
+            Ty::VecArrayBuilder(upgrade, 2),
+            Ty::DynMaskArray(upgrade, 2),
+            Ty::MaskArrayBuilder(upgrade, 2),
+            Ty::DynFixedArray(upgrade, 1),
+            Ty::FixedArrayBuilder(upgrade, 1),
+        ] {
+            assert_eq!(
+                class(forbidden),
+                HttpUpgradeCarrierClass::Forbidden,
+                "{forbidden:?}",
+            );
+        }
+
+        assert_eq!(
+            class(Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+            HttpUpgradeCarrierClass::None,
+        );
     }
 
     #[test]
@@ -68614,10 +69535,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.csv` adds one checked operation family. The wildcard-free policy above classifies
-        // it explicitly beside the existing package and core operations.
+        // `pkg.ws` adds nine checked operation variants. The wildcard-free policy above classifies
+        // them explicitly beside the existing package and core operations.
         assert_eq!(
-            variants, 302,
+            variants, 311,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -70929,6 +71850,9 @@ fn main() -> i32 = 0
     #[test]
     fn run_bytes_is_not_a_function_value_return() {
         assert!(!fn_value_ret_ok(Ty::RunBytes));
+        let bytes = Scalar::Int(IntTy { bits: 8, signed: false });
+        assert!(fn_sig_scalar(Ty::Slice(bytes)).is_some(), "slice parameters are admitted");
+        assert!(!fn_value_ret_ok(Ty::Slice(bytes)), "slice returns remain region-deferred");
         assert!(fn_value_ret_ok(Ty::Result(
             Scalar::RunBytes,
             Scalar::Enum(0),

@@ -170,10 +170,11 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 // 型
 web.Ctx    — view（method, path, query、マッチした pattern、body、切り離した header table）だけを
              持つ **Copy** struct。何も所有せず、`serve` が prepare と pump の間も request handle を保持する。
-             pending Upgrade capability は trailing Copy field `upgrade_ready: bool` を追加する。
-             HTTP/1.1 かつ parser residual なしの場合だけ true。view は handler/pump call 中有効である。
-Route      — Copy struct { method: str, pattern: str,
-                           handler: fn(Ctx) -> Result<response_builder, Error> }
+             trailing Copy field `upgrade_ready: bool` は HTTP/1.1 かつ parser residual なしの場合だけ
+             true。view は handler/pump call 中有効である。
+Handler    — Respond、Stream、Upgrade(UpgradeHandler) の Copy sum。
+Route      — Copy struct { method, prefix, pattern, middleware, stream_type, handler,
+                           upgrade_values }。exact type と callback shape は下記に固定する。
 ```
 
 **パターン構文（Fiber/httprouter 系譜 — 復元された参照により決定）:** `/` 区切り。リテラルは
@@ -329,9 +330,13 @@ s.send_event(data)       -> Result<(), Error>           // `data: {data}\n\n` 1 
 Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+  Upgrade(UpgradeHandler),
 }
-Route { method: str, pattern: str, stream_type: str, handler: Handler }
-//   stream_type: stream head の Content-Type; Respond ルートでは ""（読まれない）。
+Route {
+  method: str, prefix: str, pattern: str, middleware: Option<MiddlewareList>,
+  stream_type: str, handler: Handler, upgrade_values: slice<str>,
+}
+//   stream_type: stream head の Content-Type; Respond/Upgrade ルートでは ""（読まれない）。
 ```
 
 テーブルは 1 つ、dispatch も 1 つ: stream ルートは同じ radix tree・同じ method 解決を通り、他の行と
@@ -648,18 +653,19 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 ハンドラはこのファイルから**抽出**され、実物の `apps/web/pkg/**` に対してコンパイルされる。よって
 ドキュメントの例がコンパイルできなくなればスイートが落ちる。
 
-## `pkg.ws` 用 protocol-neutral Upgrade seam（設計済み、未実装）
+## `pkg.ws` 用 protocol-neutral Upgrade seam（出荷済み）
 
 `pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
 worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
 `UpgradeAccepted { response, selected }`、`UpgradeDecision { Accept, Reject, Failed }`、
-`UpgradeHandler { validate, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
+`UpgradeHandler { values_valid, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
 `Upgrade(UpgradeHandler)`、`Route` の末尾 field は `upgrade_values: slice<str>` である。
 
-exact constructor は `pkg.web.upgrade(method, pattern, values, validate, prepare, pump) -> Route`。
-Pure かつ protocol-blind で、values は Copy config。noncapturing `validate` は Pure でなければならない。
+exact constructor は `pkg.web.upgrade(method, pattern, values, values_valid, prepare, pump) -> Route`。
+Pure かつ protocol-blind で、values は Copy config、protocol package は call 前に values_valid を一回
+計算する。argument expression の effect は call site に明示され、callback として保持・再実行しない。
 既存 pre-bind route validation が common method/pattern/prefix と handler-storage checks 後、segment/pair
-checks 前に Upgrade row ごと一回呼ぶ。false は exact text
+checks 前に Upgrade row ごと boolean を一回読む。false は exact text
 `pkg.web: route N (METHOD PATTERN) has invalid upgrade values` で bind/tree construction 前に abort する。
 既存 routing/middleware 後に prepare を一回
 実行し、Reject は通常 respond、Failed は既存 log+fixed 500、Accept は
@@ -668,7 +674,7 @@ pump を呼び、spent ctx が Ctx view を保持する。Accept error は selec
 diagnostic を一回 log し同じ ctx で fixed 500 を試す。validation failure なら unspent なので回答でき、
 write failure 後は spent なので fallback は silently fail。pump Ok は log なし、Err は既存 Stream と同じ
 method/path/error diagnostic で、追加 HTTP response は送らない。HEAD fallback は `stream_type == ""` ではなく
-actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values と全 callback
+actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 405。group は values、values_valid、二 callback
 をそのまま copy。validation は Stream だけ nonempty stream_type、Respond/Upgrade は empty を要求。
 `Ctx` は trailing `upgrade_ready: bool` を持ち、middleware 前に
 `http_request_ctx.upgrade_ready()` から copy する。`pkg.ws` は false を通常の empty-body 400 にし、
@@ -676,7 +682,7 @@ actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 4
 
 Upgrade は Stream と同様 sequential worker 一つを占有する。第二 listener/router/pool/task/
 registry はなく、hot path は closed Handler tag match 一つだけ増える。この seam は `pkg.ws` と
-同時に activate し、design 文書だけでは出荷しない。exact ledger は `../ws.md`。
+同時に有効である。exact ledger は `../ws.md`。
 
 ## スライス（計画の F3）
 
@@ -693,8 +699,8 @@ registry はなく、hot path は closed Handler tag match 一つだけ増える
   — エラーポリシーの「起動時 abort、Err にしない」）: 既知の大文字メソッドまたは `""`、先頭 `/`
   のパターン、名前付き `:`/`*` セグメント、`*` は tail のみ、1 パターン内で同じパラメータ名を
   二度使わない、すべての Stream 行に空でない `stream_type`（空だと空欄の `Content-Type:` を
-  送出してしまう上、`stream_type == ""` は HEAD フォールバックが「Respond 行」と読む不変条件）、
-  そして後続の行が決して勝てない PATH CLAIM の重複なし — 同一メソッド二度
+  送出してしまう）、Respond/Upgrade 行に空の `stream_type`、そして後続の行が決して勝てない
+  PATH CLAIM の重複なし — 同一メソッド二度
   （405 `Allow` join を重複させていたのもこれ）や、その claim に対する any-method ルートより後の
   任意の行。パラメータ名は claim に影響しない（`/a/:x` ≡ `/a/:y`）。1 パターン上の
   specific-then-`any` は合法のまま（フォールバック方向）。**HEAD は RFC 準拠**（9110 §9.3.2）:

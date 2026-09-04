@@ -798,6 +798,12 @@ const SO_SNDTIMEO: i32 = 21; // Linux
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const SO_SNDTIMEO: i32 = 0x1005; // macOS/BSD
 
+const SHUT_RDWR: i32 = 2;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const ENOTCONN: i32 = 107; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ENOTCONN: i32 = 57; // macOS/BSD
+
 // `EINPROGRESS` — a non-blocking `connect` returns this errno to mean "handshake started, poll for
 // completion". Differs between Linux and macOS/BSD. Used by the checked TCP candidate state machine.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -10796,6 +10802,10 @@ pub struct Buffer {
     len: usize,
 }
 
+const _: () = assert!(
+    core::mem::size_of::<Buffer>() <= 64 && core::mem::align_of::<Buffer>() <= 16
+);
+
 impl Buffer {
     /// Prepare the caller-selected read window as raw spare capacity. No byte becomes part of the
     /// initialized Vec until the syscall reports how many it wrote.
@@ -10822,7 +10832,10 @@ pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
         Ok(()) => requested,
         Err(_) => 0,
     };
-    Box::into_raw(Box::new(Buffer { data, cap, len: 0 }))
+    let buffer = Box::into_raw(Box::new(Buffer { data, cap, len: 0 }));
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
+    buffer
 }
 
 /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents (`data[..len]`), written to
@@ -10876,6 +10889,8 @@ pub unsafe extern "C" fn align_rt_buffer_capacity(b: *mut Buffer) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
     if !b.is_null() {
+        #[cfg(feature = "alloc-count")]
+        requested_live_remove(1, b.cast());
         drop(unsafe { Box::from_raw(b) });
     }
 }
@@ -14507,6 +14522,28 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static HTTP_UPGRADE_FAILPOINT: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn http_upgrade_set_failpoint(phase: u8) {
+    HTTP_UPGRADE_FAILPOINT.with(|failpoint| failpoint.set(phase));
+}
+
+#[cfg(test)]
+fn http_upgrade_take_failpoint(phase: u8) -> bool {
+    HTTP_UPGRADE_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == phase {
+            failpoint.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
 fn capture_failpoint_take(expected: CaptureFailpoint) -> bool {
     CAPTURE_FAILPOINT.with(|slot| {
         if slot.get() == expected {
@@ -16146,6 +16183,8 @@ unsafe extern "C" {
     // `recv` — the connected-socket sibling used with `MSG_PEEK` at the exact close-delimited SSE
     // work boundary. The one-byte application payload stays queued; zero reports peer EOF.
     fn recv(sockfd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32) -> isize;
+    // Terminal full-duplex shutdown for a protocol-neutral HTTP Upgrade transport.
+    fn shutdown(sockfd: i32, how: i32) -> i32;
     // `bind`/`listen`/`accept` — the BSD server-side socket calls (identical prototypes on Linux and
     // macOS/BSD). `accept` with null `addr`/`addrlen` returns the connected fd without the peer
     // address. `bind` takes the `sockaddr` `getaddrinfo` filled. On Linux the CLOEXEC-atomic `accept4`
@@ -16617,6 +16656,121 @@ static ALLOC_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI6
 #[cfg(feature = "alloc-count")]
 static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
+/// Opt-in requested-live-byte probe used by the `pkg.ws` resource owner. It tracks only allocation
+/// families explicitly attributed to the measured operation; the map itself is probe machinery and
+/// therefore outside the measurement. Kind 0 is C-owned payload, 1 a `buffer` shell+payload, and 2
+/// an `array_builder` shell budget. The builder budget transfers to its frozen payload so the
+/// package's fixed 128-byte shell allowance remains charged through Text conversion.
+#[cfg(feature = "alloc-count")]
+#[derive(Default)]
+struct RequestedLiveProbe {
+    active: bool,
+    live: usize,
+    peak: usize,
+    allocations: std::collections::BTreeMap<(u8, usize), usize>,
+}
+
+#[cfg(feature = "alloc-count")]
+static REQUESTED_LIVE_PROBE: std::sync::LazyLock<std::sync::Mutex<RequestedLiveProbe>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(RequestedLiveProbe::default()));
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_insert(kind: u8, ptr: *mut u8, bytes: usize) {
+    if ptr.is_null() || bytes == 0 {
+        return;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    let old = probe.allocations.insert((kind, ptr.addr()), bytes).unwrap_or(0);
+    probe.live = probe.live.saturating_sub(old).saturating_add(bytes);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_remove(kind: u8, ptr: *mut u8) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return 0;
+    }
+    let removed = probe.allocations.remove(&(kind, ptr.addr())).unwrap_or(0);
+    probe.live = probe.live.saturating_sub(removed);
+    removed
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_realloc_begin(ptr: *mut u8, new_bytes: usize) -> usize {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return 0;
+    }
+    let old = probe.allocations.get(&(0, ptr.addr())).copied().unwrap_or(0);
+    probe.peak = probe.peak.max(probe.live.saturating_add(new_bytes));
+    old
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_realloc_commit(old_ptr: *mut u8, new_ptr: *mut u8, old_bytes: usize, new_bytes: usize) {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    if !old_ptr.is_null() {
+        probe.allocations.remove(&(0, old_ptr.addr()));
+    }
+    probe.allocations.insert((0, new_ptr.addr()), new_bytes);
+    probe.live = probe.live.saturating_sub(old_bytes).saturating_add(new_bytes);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_transfer_builder_shell(builder: *mut ArrayBuilder, data: *mut u8) {
+    let shell = requested_live_remove(2, builder.cast());
+    if shell == 0 || data.is_null() {
+        return;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    let key = (0, data.addr());
+    let bytes = probe.allocations.get(&key).copied().unwrap_or(0).saturating_add(shell);
+    probe.allocations.insert(key, bytes);
+    probe.live = probe.live.saturating_add(shell);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+/// Reset and enable requested-live-byte accounting for the calling measurement process.
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_reset() {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    probe.active = true;
+    probe.live = 0;
+    probe.peak = 0;
+    probe.allocations.clear();
+}
+
+/// Current requested live bytes since [`align_rt_requested_live_reset`].
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_bytes() -> i64 {
+    let probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    i64::try_from(probe.live).unwrap_or(i64::MAX)
+}
+
+/// Maximum requested live bytes since [`align_rt_requested_live_reset`].
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_peak() -> i64 {
+    let probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    i64::try_from(probe.peak).unwrap_or(i64::MAX)
+}
+
 /// Monotonic count of successful [`align_rt_alloc`] allocations since process start (feature
 /// `alloc-count` only). The delta across a sort equals the number of heap buffers it allocated.
 #[cfg(feature = "alloc-count")]
@@ -16650,6 +16804,8 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     }
     #[cfg(feature = "alloc-count")]
     ALLOC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(0, ptr, size);
     ptr
 }
 
@@ -16663,6 +16819,7 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
     #[cfg(feature = "alloc-count")]
     if !ptr.is_null() {
         FREE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        requested_live_remove(0, ptr);
     }
     unsafe { owned_raw_free(ptr) }
 }
@@ -16680,16 +16837,22 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u8 {
     if new_size <= 0 {
+        #[cfg(feature = "alloc-count")]
+        requested_live_remove(0, ptr);
         unsafe { owned_raw_free(ptr) };
         return core::ptr::null_mut();
     }
     let Ok(new_size) = safe_len(new_size) else {
         panic_abort("allocation too large");
     };
+    #[cfg(feature = "alloc-count")]
+    let old_size = requested_live_realloc_begin(ptr, new_size);
     let p = unsafe { owned_raw_realloc(ptr, new_size) };
     if p.is_null() {
         panic_abort("out of memory");
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_realloc_commit(ptr, p, old_size, new_size);
     p
 }
 
@@ -16747,6 +16910,7 @@ const _: () = assert!(
     core::mem::size_of::<ArrayBuilder>() <= 64
         && core::mem::align_of::<ArrayBuilder>() <= 16
 );
+const _: () = assert!(core::mem::size_of::<ArrayBuilder>() + core::mem::size_of::<Buffer>() <= 128);
 
 impl ArrayBuilder {
     /// Ensure room for `additional` more elements, growing by amortized doubling. Aborts on a
@@ -16867,7 +17031,10 @@ fn array_builder_value(elem_size: i64) -> ArrayBuilder {
 /// 16 for a `string` element). Growth is deferred to the first `push`/`append`.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
-    Box::into_raw(Box::new(array_builder_value(elem_size)))
+    let builder = Box::into_raw(Box::new(array_builder_value(elem_size)));
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(2, builder.cast(), 64);
+    builder
 }
 
 /// `array_builder<T>(out)` — allocate the builder header in `out`; growth chunks and the final
@@ -17060,6 +17227,8 @@ pub unsafe extern "C" fn align_rt_array_builder_build(b: *mut ArrayBuilder) -> A
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     if unsafe { (*b).arena.is_null() } {
+        #[cfg(feature = "alloc-count")]
+        requested_live_transfer_builder_shell(b, unsafe { (*b).data });
         // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
         let b = *unsafe { Box::from_raw(b) };
         return array_builder_build_value(b);
@@ -17112,6 +17281,8 @@ pub unsafe extern "C" fn align_rt_array_builder_build_stack(b: *mut ArrayBuilder
 }
 
 unsafe fn array_builder_free_value(b: ArrayBuilder) {
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(0, b.data);
     unsafe { owned_raw_free(b.data) };
 }
 
@@ -17129,6 +17300,8 @@ pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     if !unsafe { (*b).arena.is_null() } {
         return;
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(2, b.cast());
     let b = *unsafe { Box::from_raw(b) };
     unsafe { array_builder_free_value(b) };
 }
@@ -17173,6 +17346,8 @@ pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilde
     if !unsafe { (*b).arena.is_null() } {
         return;
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(2, b.cast());
     let b = *unsafe { Box::from_raw(b) };
     unsafe { array_builder_free_strings_value(b) };
 }
@@ -23928,6 +24103,10 @@ pub struct HttpRequestCtx {
     /// [`http_parse_request_head`]. Consumed by `respond_stream` to choose chunked (1.1) vs.
     /// close-delimited raw (1.0) framing; unused by the non-streaming `respond`.
     http11: bool,
+    /// True exactly when this request may enter a protocol-neutral HTTP Upgrade: HTTP/1.1 and no
+    /// bytes co-read past the framed request. Kept separately from `keep_alive`, whose
+    /// `Connection: close` policy is irrelevant to Upgrade readiness.
+    upgrade_ready: bool,
     /// **Keep-alive eligibility**, decided once at parse time (http.md item 9 ②): HTTP/1.1, no
     /// `Connection: close`, and no residual bytes past this request's own body (a pipelining client
     /// is answered then closed — residual carry-over is deliberately not built). `respond` parks the
@@ -24498,6 +24677,7 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 body_start: h.body_start,
                 body_len,
                 http11: h.http11,
+                upgrade_ready: h.http11 && !residual,
                 keep_alive,
                 park: None, // filled by `accept` from the server handle
             });
@@ -24602,6 +24782,22 @@ enum AcceptFail {
     Fatal(i32),
 }
 
+/// Complete the platform SIGPIPE prerequisite for one newly accepted socket. This helper owns the
+/// fd on entry: an install failure closes it exactly once and returns no publishable descriptor.
+fn http_prepare_accepted_fd<O: SocketWriteOps>(
+    fd: i32,
+    policy: SocketSigpipePolicy,
+    ops: &mut O,
+) -> Result<i32, AcceptFail> {
+    if policy == SocketSigpipePolicy::InstallSocketOption
+        && let Err(status) = socket_option_status(ops.install_nosigpipe(fd))
+    {
+        unsafe { close(fd) };
+        return Err(AcceptFail::Fatal(status));
+    }
+    Ok(fd)
+}
+
 /// How long to wait before retrying an `accept` that hit `EMFILE`/`ENFILE`. Short enough to recover
 /// promptly, long enough that a permanently exhausted table costs ~100 wakeups/s instead of a
 /// spinning core — and it paces [`http_yield_for_fds`]'s spending of warm connections.
@@ -24686,12 +24882,9 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
     unsafe {
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
     }
-    // macOS/BSD: suppress SIGPIPE per-socket for the response write (Linux uses MSG_NOSIGNAL on `send`).
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    unsafe {
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
-    }
-    Ok(fd)
+    // macOS/BSD: suppress SIGPIPE per-socket before the fd can enter a request context. Linux's
+    // MSG_NOSIGNAL policy needs no socket option. A failed install closes instead of publishing.
+    http_prepare_accepted_fd(fd, NATIVE_SOCKET_SIGPIPE_POLICY, &mut NativeSocketWriteOps)
 }
 
 /// `srv.accept()` — yield the next inbound request, read + parsed, as an owned `http_request_ctx`
@@ -24897,6 +25090,211 @@ pub unsafe extern "C" fn align_rt_http_ctx_header(
         }
     }
     0
+}
+
+#[inline]
+fn abi_ptr_is_aligned<T>(ptr: *const T) -> bool {
+    !ptr.is_null() && ptr.addr().is_multiple_of(core::mem::align_of::<T>())
+}
+
+/// Validate one header-query text argument before forming its slice. Query rows deliberately
+/// abort on malformed ABI input: returning zero/false would alias an ordinary absent result.
+unsafe fn http_query_token_arg<'a>(ptr: *const u8, len: i64, what: &str) -> &'a [u8] {
+    let Ok(n) = safe_len(len) else { panic_abort(what) };
+    if n > isize::MAX.unsigned_abs() || (n > 0 && ptr.is_null()) {
+        panic_abort(what);
+    }
+    let bytes = if n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(ptr, n) } };
+    if !http_is_token(bytes) {
+        panic_abort(what);
+    }
+    bytes
+}
+
+/// Validate the detached `http_headers` receiver before forming a reference.
+unsafe fn http_query_ctx<'a>(ctx: *mut HttpRequestCtx, what: &str) -> &'a HttpRequestCtx {
+    if !abi_ptr_is_aligned(ctx) {
+        panic_abort(what);
+    }
+    let ctx = unsafe { &*ctx };
+    let in_bounds = |start: usize, len: usize| {
+        start.checked_add(len).is_some_and(|end| end <= ctx.buf.len())
+    };
+    if !in_bounds(ctx.method_start, ctx.method_len)
+        || !in_bounds(ctx.target_start, ctx.target_len)
+        || !in_bounds(ctx.body_start, ctx.body_len)
+        || ctx.headers.iter().any(|header| {
+            !in_bounds(header.name_start, header.name_len)
+                || !in_bounds(header.value_start, header.value_len)
+        })
+    {
+        panic_abort(what);
+    }
+    ctx
+}
+
+#[inline]
+fn http_trim_token_ows(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn http_token_list_valid(value: &[u8]) -> bool {
+    let mut saw = false;
+    for member in value.split(|&b| b == b',') {
+        let member = http_trim_token_ows(member);
+        if !http_is_token(member) {
+            return false;
+        }
+        saw = true;
+    }
+    saw
+}
+
+/// Count physical request-header rows named `name`, case-insensitively.
+///
+/// # Safety
+/// `ctx` must be a live, aligned request context. `name_ptr/name_len` must describe one valid
+/// nonempty ASCII RFC token. Detectably malformed ABI input aborts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_headers_count(
+    ctx: *mut HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+) -> i64 {
+    let c = unsafe { http_query_ctx(ctx, "http_headers.count: invalid request context") };
+    let want = unsafe { http_query_token_arg(name_ptr, name_len, "http_headers.count: invalid header name") };
+    let count = c
+        .headers
+        .iter()
+        .filter(|h| c.buf[h.name_start..h.name_start + h.name_len].eq_ignore_ascii_case(want))
+        .count();
+    i64::try_from(count).unwrap_or_else(|_| panic_abort("http_headers.count: count exceeds i64"))
+}
+
+/// Return whether every physical row named `name` is a nonempty comma-separated RFC token list.
+/// Absence is valid.
+///
+/// # Safety
+/// Same receiver/name contract as [`align_rt_http_headers_count`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_headers_tokens_valid(
+    ctx: *mut HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+) -> i32 {
+    let c = unsafe { http_query_ctx(ctx, "http_headers.tokens_valid: invalid request context") };
+    let want = unsafe {
+        http_query_token_arg(name_ptr, name_len, "http_headers.tokens_valid: invalid header name")
+    };
+    i32::from(c.headers.iter().all(|h| {
+        let name = &c.buf[h.name_start..h.name_start + h.name_len];
+        if !name.eq_ignore_ascii_case(want) {
+            return true;
+        }
+        http_token_list_valid(&c.buf[h.value_start..h.value_start + h.value_len])
+    }))
+}
+
+/// Search every comma member of every named physical row for `token`, case-insensitively. This
+/// operation does not validate neighboring members; callers use `tokens_valid` first when needed.
+///
+/// # Safety
+/// `ctx` and both text arguments must satisfy the detectable ABI contract described above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_headers_contains_token(
+    ctx: *mut HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+    token_ptr: *const u8,
+    token_len: i64,
+) -> i32 {
+    let c = unsafe { http_query_ctx(ctx, "http_headers.contains_token: invalid request context") };
+    let want = unsafe {
+        http_query_token_arg(name_ptr, name_len, "http_headers.contains_token: invalid header name")
+    };
+    let token = unsafe {
+        http_query_token_arg(token_ptr, token_len, "http_headers.contains_token: invalid token")
+    };
+    http_headers_contains_token_inner(c, want, token, false)
+}
+
+/// Search every comma member of every named physical row for an exact byte match. Header names
+/// remain case-insensitive; only the member comparison differs from
+/// [`align_rt_http_headers_contains_token`].
+///
+/// # Safety
+/// `ctx` and both text arguments must satisfy the detectable ABI contract described above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_headers_contains_token_exact(
+    ctx: *mut HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+    token_ptr: *const u8,
+    token_len: i64,
+) -> i32 {
+    let c = unsafe {
+        http_query_ctx(ctx, "http_headers.contains_token_exact: invalid request context")
+    };
+    let want = unsafe {
+        http_query_token_arg(
+            name_ptr,
+            name_len,
+            "http_headers.contains_token_exact: invalid header name",
+        )
+    };
+    let token = unsafe {
+        http_query_token_arg(
+            token_ptr,
+            token_len,
+            "http_headers.contains_token_exact: invalid token",
+        )
+    };
+    http_headers_contains_token_inner(c, want, token, true)
+}
+
+fn http_headers_contains_token_inner(
+    c: &HttpRequestCtx,
+    want: &[u8],
+    token: &[u8],
+    exact: bool,
+) -> i32 {
+    for h in &c.headers {
+        let name = &c.buf[h.name_start..h.name_start + h.name_len];
+        if !name.eq_ignore_ascii_case(want) {
+            continue;
+        }
+        let value = &c.buf[h.value_start..h.value_start + h.value_len];
+        if value
+            .split(|&b| b == b',')
+            .map(http_trim_token_ows)
+            .any(|member| {
+                if exact {
+                    member == token
+                } else {
+                    member.eq_ignore_ascii_case(token)
+                }
+            })
+        {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Whether the parsed request is HTTP/1.1 with no co-read residual bytes.
+///
+/// # Safety
+/// `ctx` must be a live, aligned request context. Detectably malformed input aborts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_upgrade_ready(ctx: *mut HttpRequestCtx) -> i32 {
+    let c = unsafe { http_query_ctx(ctx, "http_request_ctx.upgrade_ready: invalid request context") };
+    i32::from(c.upgrade_ready)
 }
 
 /// `ctx.body()` — a `slice<u8>` **view** over the request body (zero copy; region-bound in sema).
@@ -25313,6 +25711,487 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
 }
 
 // ---------------------------------------------------------------------------------------------
+// std.http — protocol-neutral HTTP/1.1 Upgrade transport. `respond_upgrade` commits one checked
+// 101 response and transfers the accepted fd into a small Move handle. The protocol package owns
+// every byte above this exact read/write/deadline/shutdown seam.
+// ---------------------------------------------------------------------------------------------
+
+pub struct HttpUpgrade {
+    fd: i32,
+    /// Zero while live or cleanly spent; otherwise the first read/write transport failure.
+    sticky: i32,
+    deadline: Option<MonotonicTimeoutBudget>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HTTP_UPGRADE_REQUESTED_LIVE: core::cell::Cell<(bool, usize, usize)> =
+        const { core::cell::Cell::new((false, 0, 0)) };
+}
+
+#[cfg(test)]
+fn response_builder_requested_bytes(rb: &ResponseBuilder) -> usize {
+    core::mem::size_of::<ResponseBuilder>()
+        .saturating_add(
+            rb.headers
+                .capacity()
+                .saturating_mul(core::mem::size_of::<(String, String)>()),
+        )
+        .saturating_add(
+            rb.headers
+                .iter()
+                .map(|(name, value)| name.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(rb.body.as_ref().map_or(0, Vec::capacity))
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_enable() {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| probe.set((true, 0, 0)));
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_begin(rb: &ResponseBuilder) {
+    let bytes = response_builder_requested_bytes(rb);
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| {
+        if probe.get().0 {
+            probe.set((true, bytes, bytes));
+        }
+    });
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_add(bytes: usize) {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| {
+        let (active, live, peak) = probe.get();
+        if active {
+            let live = live.saturating_add(bytes);
+            probe.set((true, live, peak.max(live)));
+        }
+    });
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_peak() -> usize {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| probe.get().2)
+}
+
+const _: () = assert!(
+    core::mem::size_of::<HttpUpgrade>() <= 64
+        && core::mem::align_of::<HttpUpgrade>() <= 16
+);
+
+impl HttpUpgrade {
+    fn fail(&mut self, status: i32) -> i32 {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+            self.fd = -1;
+        }
+        self.sticky = status;
+        status
+    }
+
+    fn state_status(&self) -> Option<i32> {
+        if self.sticky != 0 {
+            Some(self.sticky)
+        } else if self.fd < 0 {
+            Some(AL_INVALID)
+        } else {
+            None
+        }
+    }
+
+    /// Arm one direction for the remaining cumulative budget. `Ok(false)` means the budget is
+    /// exhausted and no syscall may be issued.
+    fn arm_remaining(&self, optname: i32) -> Result<bool, i32> {
+        let Some(deadline) = self.deadline else { return Ok(true) };
+        let Some(remaining) = deadline.remaining() else { return Ok(false) };
+        let nanos = remaining.as_nanos().min(i64::MAX as u128) as i64;
+        let tv = timeval_from_ns(nanos.max(1));
+        let Ok(optlen) = libc::socklen_t::try_from(core::mem::size_of::<Timeval>()) else {
+            return Err(AL_INVALID);
+        };
+        let rc = unsafe {
+            setsockopt(
+                self.fd,
+                SOL_SOCKET,
+                optname,
+                (&tv as *const Timeval).cast(),
+                optlen,
+            )
+        };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        }
+    }
+}
+
+impl Drop for HttpUpgrade {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+    }
+}
+
+#[inline]
+fn http_upgrade_header_value_valid(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80)
+}
+
+fn http_upgrade_has_token(value: &[u8], token: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .map(http_trim_token_ows)
+        .any(|member| member.eq_ignore_ascii_case(token))
+}
+
+fn http_upgrade_head_len(rb: &ResponseBuilder) -> Option<usize> {
+    let mut len = b"HTTP/1.1 101 Switching Protocols\r\n".len();
+    for (name, value) in &rb.headers {
+        len = len
+            .checked_add(name.len())?
+            .checked_add(2)?
+            .checked_add(value.len())?
+            .checked_add(2)?;
+    }
+    len.checked_add(2)
+}
+
+fn http_validate_upgrade_response(rb: &ResponseBuilder) -> Result<usize, i32> {
+    if rb.status != 101 || rb.body.is_some() {
+        return Err(AL_INVALID);
+    }
+    for (name, value) in &rb.headers {
+        if !http_is_token(name.as_bytes()) || !http_upgrade_header_value_valid(value.as_bytes()) {
+            return Err(AL_INVALID);
+        }
+    }
+    let mut upgrade_value: Option<&[u8]> = None;
+    for (name, value) in &rb.headers {
+        if name.eq_ignore_ascii_case("upgrade") {
+            if upgrade_value.is_some() {
+                return Err(AL_INVALID);
+            }
+            upgrade_value = Some(value.as_bytes());
+        }
+    }
+    let Some(upgrade_value) = upgrade_value else {
+        return Err(AL_INVALID);
+    };
+    if !http_token_list_valid(upgrade_value) {
+        return Err(AL_INVALID);
+    }
+    let mut connection_value: Option<&[u8]> = None;
+    for (name, value) in &rb.headers {
+        if name.eq_ignore_ascii_case("connection") {
+            if connection_value.is_some() {
+                return Err(AL_INVALID);
+            }
+            connection_value = Some(value.as_bytes());
+        }
+    }
+    let Some(connection_value) = connection_value else {
+        return Err(AL_INVALID);
+    };
+    if !http_token_list_valid(connection_value)
+        || !http_upgrade_has_token(connection_value, b"upgrade")
+    {
+        return Err(AL_INVALID);
+    }
+    if rb.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-length")) {
+        return Err(AL_INVALID);
+    }
+    if rb.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")) {
+        return Err(AL_INVALID);
+    }
+    http_upgrade_head_len(rb).ok_or(AL_INVALID)
+}
+
+fn http_serialize_upgrade_response(rb: &ResponseBuilder, head_len: usize) -> Vec<u8> {
+    let mut head = Vec::with_capacity(head_len);
+    head.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+    for (name, value) in &rb.headers {
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    debug_assert_eq!(head.len(), head_len);
+    head
+}
+
+/// Commit a checked 101 response and publish an owned raw byte transport. The output slot is
+/// validated and zeroed before either input is inspected. The builder is then owned on every later
+/// return; the request fd moves only after validation and both allocations complete.
+///
+/// # Safety
+/// Pointers must satisfy the native ABI contract recorded in `pkg-design/ws.md`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_respond_upgrade(
+    ctx: *mut HttpRequestCtx,
+    rb: *mut ResponseBuilder,
+    out: *mut *mut HttpUpgrade,
+) -> i32 {
+    if !abi_ptr_is_aligned(out) {
+        return AL_INVALID;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    if !abi_ptr_is_aligned(rb) {
+        return AL_INVALID;
+    }
+    let r = unsafe { Box::from_raw(rb) };
+    #[cfg(test)]
+    http_upgrade_requested_live_begin(&r);
+    if !abi_ptr_is_aligned(ctx) {
+        return AL_INVALID;
+    }
+    let c = unsafe { &mut *ctx };
+    if c.fd < 0 || !c.http11 || !c.upgrade_ready {
+        return AL_INVALID;
+    }
+    let head_len = match http_validate_upgrade_response(&r) {
+        Ok(len) => len,
+        Err(status) => return status,
+    };
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(1) {
+        return AL_CODE;
+    }
+    let head = http_serialize_upgrade_response(&r, head_len);
+    #[cfg(test)]
+    http_upgrade_requested_live_add(head.capacity());
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(2) {
+        return AL_CODE;
+    }
+
+    // Allocate the handle shell while the builder and exact head are still live, before fd move.
+    let mut upgrade = Box::new(HttpUpgrade { fd: -1, sticky: 0, deadline: None });
+    #[cfg(test)]
+    http_upgrade_requested_live_add(core::mem::size_of::<HttpUpgrade>());
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(3) {
+        return AL_CODE;
+    }
+    upgrade.fd = c.fd;
+    c.fd = -1;
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(4) {
+        upgrade.fail(AL_CODE);
+        return AL_CODE;
+    }
+    let status = unsafe { http_send_all(upgrade.fd, &head) };
+    drop(head);
+    drop(r); // builder storage is gone before handle publication
+    if status != 0 {
+        upgrade.fail(status);
+        return status;
+    }
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(5) {
+        upgrade.fail(AL_CODE);
+        return AL_CODE;
+    }
+    unsafe { out.write(Box::into_raw(upgrade)) };
+    0
+}
+
+/// Fill `out` with exactly `count` bytes. A live failure closes and poisons the transport; partial
+/// bytes are never published.
+///
+/// # Safety
+/// `u` and `out` must be valid aligned handles for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_upgrade_read_exact(
+    u: *mut HttpUpgrade,
+    out: *mut Buffer,
+    count: i64,
+) -> i32 {
+    if !abi_ptr_is_aligned(out) {
+        return AL_INVALID;
+    }
+    let buffer = unsafe { &mut *out };
+    let Ok(count) = safe_len(count) else {
+        panic_abort("http_upgrade.read_exact: count must fit the buffer capacity")
+    };
+    if count > buffer.cap {
+        panic_abort("http_upgrade.read_exact: count must fit the buffer capacity");
+    }
+    if !abi_ptr_is_aligned(u) {
+        return AL_INVALID;
+    }
+    let upgrade = unsafe { &mut *u };
+    if let Some(status) = upgrade.state_status() {
+        return status;
+    }
+    buffer.len = 0;
+    buffer.data.clear();
+    if count == 0 {
+        return 0;
+    }
+    let Some(dst) = buffer.prepare_uninit_window() else {
+        panic_abort("http_upgrade.read_exact: buffer backing allocation failed")
+    };
+    let mut done = 0usize;
+    while done < count {
+        match upgrade.arm_remaining(SO_RCVTIMEO) {
+            Ok(true) => {}
+            Ok(false) => return upgrade.fail(AL_TIMEOUT),
+            Err(status) => return upgrade.fail(status),
+        }
+        let n = unsafe { read(upgrade.fd, dst.add(done).cast(), count - done) };
+        if n > 0 {
+            let Ok(read) = usize::try_from(n) else { return upgrade.fail(AL_CODE) };
+            let Some(next) = done.checked_add(read) else { return upgrade.fail(AL_CODE) };
+            done = next;
+            continue;
+        }
+        if n == 0 {
+            buffer.data.clear();
+            return upgrade.fail(AL_NOT_FOUND);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::WouldBlock && upgrade.deadline.is_some() {
+            if upgrade.deadline.is_some_and(|deadline| !deadline.is_exhausted()) {
+                continue;
+            }
+            return upgrade.fail(AL_TIMEOUT);
+        }
+        return upgrade.fail(io_read_write_status(&error));
+    }
+    unsafe { buffer.data.set_len(count) };
+    buffer.len = count;
+    0
+}
+
+/// Write all bytes without copying or retaining the source. A live failure closes and poisons.
+///
+/// # Safety
+/// `u` must be valid and `ptr/len` must describe a readable range when nonempty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_upgrade_write(
+    u: *mut HttpUpgrade,
+    ptr: *const u8,
+    len: i64,
+) -> i32 {
+    let Ok(len) = safe_len(len) else { return AL_INVALID };
+    if len > isize::MAX.unsigned_abs() || (len > 0 && ptr.is_null()) {
+        return AL_INVALID;
+    }
+    let mut bytes = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(ptr, len) } };
+    if !abi_ptr_is_aligned(u) {
+        return AL_INVALID;
+    }
+    let upgrade = unsafe { &mut *u };
+    if let Some(status) = upgrade.state_status() {
+        return status;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let flags = MSG_NOSIGNAL;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let flags = 0;
+    while !bytes.is_empty() {
+        match upgrade.arm_remaining(SO_SNDTIMEO) {
+            Ok(true) => {}
+            Ok(false) => return upgrade.fail(AL_TIMEOUT),
+            Err(status) => return upgrade.fail(status),
+        }
+        let n = unsafe { send(upgrade.fd, bytes.as_ptr().cast(), bytes.len(), flags) };
+        if n > 0 {
+            let Ok(written) = usize::try_from(n) else { return upgrade.fail(AL_CODE) };
+            let Some(remaining) = bytes.get(written..) else { return upgrade.fail(AL_CODE) };
+            bytes = remaining;
+            continue;
+        }
+        if n == 0 {
+            return upgrade.fail(AL_CODE);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::WouldBlock && upgrade.deadline.is_some() {
+            if upgrade.deadline.is_some_and(|deadline| !deadline.is_exhausted()) {
+                continue;
+            }
+            return upgrade.fail(AL_TIMEOUT);
+        }
+        return upgrade.fail(io_read_write_status(&error));
+    }
+    0
+}
+
+/// Replace the cumulative monotonic deadline used by every later read/write syscall.
+///
+/// # Safety
+/// `u` must be one aligned live handle. Invalid bounds are source-contract aborts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_upgrade_deadline(u: *mut HttpUpgrade, timeout_ns: i64) -> i32 {
+    if !(1..=86_400_000_000_000).contains(&timeout_ns) {
+        panic_abort("http_upgrade.deadline: timeout_ns must be in 1..=86400000000000");
+    }
+    if !abi_ptr_is_aligned(u) {
+        return AL_INVALID;
+    }
+    let upgrade = unsafe { &mut *u };
+    if let Some(status) = upgrade.state_status() {
+        return status;
+    }
+    upgrade.deadline = MonotonicTimeoutBudget::from_positive_ns(timeout_ns);
+    0
+}
+
+/// Terminal full-duplex shutdown followed by one cleanup close. A cleanly spent handle is
+/// idempotent; a poisoned handle replays its sticky error without another syscall.
+///
+/// # Safety
+/// `u` must be a valid aligned handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_upgrade_shutdown(u: *mut HttpUpgrade) -> i32 {
+    if !abi_ptr_is_aligned(u) {
+        return AL_INVALID;
+    }
+    let upgrade = unsafe { &mut *u };
+    if upgrade.sticky != 0 {
+        return upgrade.sticky;
+    }
+    if upgrade.fd < 0 {
+        return 0;
+    }
+    let rc = unsafe { shutdown(upgrade.fd, SHUT_RDWR) };
+    let status = if rc == 0 {
+        0
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ENOTCONN) { 0 } else { io_error_to_status(&error) }
+    };
+    unsafe { close(upgrade.fd) };
+    upgrade.fd = -1;
+    status
+}
+
+/// Null-safe close-only Drop for an Upgrade handle.
+///
+/// # Safety
+/// `u` must be null or a live handle returned by `align_rt_http_respond_upgrade`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_upgrade_free(u: *mut HttpUpgrade) {
+    if !u.is_null() {
+        drop(unsafe { Box::from_raw(u) });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // std.http — SSE / chunked streaming response (http.md items 7 + 8). `ctx.respond_stream(rb)`
 // validates + serializes the response head (with `Transfer-Encoding: chunked` for a 1.1 client, or
 // close-delimited raw framing for a 1.0 client), lifts the accepted fd out of the ctx — the ctx
@@ -25626,13 +26505,19 @@ pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
     }
 }
 
-// Compile-time pins for the eight feature-only verification exports. The compiled-symbol gate in
+// Compile-time pins for the eleven feature-only verification exports. The compiled-symbol gate in
 // `scripts/test-runtime-abi-exports.sh` owns their presence/absence; these assignments make every
 // promised parameter and return type part of the feature build itself.
 #[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_alloc_count;
 #[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_free_count;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() = align_rt_requested_live_reset;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_requested_live_bytes;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_requested_live_peak;
 #[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_str_finder_new_count;
 #[cfg(feature = "alloc-count")]
@@ -25681,9 +26566,13 @@ mod tests {
         let mut runtime = function_symbols(include_str!("lib.rs"));
         runtime.extend(function_symbols(include_str!("str_prims.rs")));
         runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
+        runtime.extend(function_symbols(include_str!("csv.rs")));
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
+            "align_rt_requested_live_bytes",
+            "align_rt_requested_live_peak",
+            "align_rt_requested_live_reset",
             "align_rt_str_finder_new_count",
             "align_rt_str_finder_free_count",
             "align_rt_test_par_map_force_caller",
@@ -25722,8 +26611,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 349);
-        assert_eq!(registry.len(), 349);
+        assert_eq!(runtime.len(), 360);
+        assert_eq!(registry.len(), 360);
         assert_eq!(runtime, registry);
     }
 
@@ -43917,6 +44806,411 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         port
     }
 
+    fn http_test_ctx(fd: i32, raw: &[u8], upgrade_ready: bool) -> HttpRequestCtx {
+        let parsed = http_parse_request_head(raw).expect("test request parses");
+        let body_start = parsed.body_start;
+        HttpRequestCtx {
+            fd,
+            buf: raw.to_vec(),
+            method_start: parsed.method_start,
+            method_len: parsed.method_len,
+            target_start: parsed.target_start,
+            target_len: parsed.target_len,
+            headers: parsed.headers,
+            body_start,
+            body_len: raw.len() - body_start,
+            http11: parsed.http11,
+            upgrade_ready,
+            keep_alive: false,
+            park: None,
+        }
+    }
+
+    fn upgrade_response(headers: Vec<(&str, &str)>) -> ResponseBuilder {
+        ResponseBuilder {
+            status: 101,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn http_header_query_rows_cover_repetition_tokens_absence_and_readiness() {
+        let raw = b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nX-Bad: good,,bad\r\n\r\n";
+        let mut ctx = http_test_ctx(-1, raw, true);
+        let count = |ctx: &mut HttpRequestCtx, name: &[u8]| unsafe {
+            align_rt_http_headers_count(ctx, name.as_ptr(), name.len() as i64)
+        };
+        let valid = |ctx: &mut HttpRequestCtx, name: &[u8]| unsafe {
+            align_rt_http_headers_tokens_valid(ctx, name.as_ptr(), name.len() as i64)
+        };
+        let contains = |ctx: &mut HttpRequestCtx, name: &[u8], token: &[u8]| unsafe {
+            align_rt_http_headers_contains_token(
+                ctx,
+                name.as_ptr(),
+                name.len() as i64,
+                token.as_ptr(),
+                token.len() as i64,
+            )
+        };
+        let contains_exact = |ctx: &mut HttpRequestCtx, name: &[u8], token: &[u8]| unsafe {
+            align_rt_http_headers_contains_token_exact(
+                ctx,
+                name.as_ptr(),
+                name.len() as i64,
+                token.as_ptr(),
+                token.len() as i64,
+            )
+        };
+
+        assert_eq!(count(&mut ctx, b"UPGRADE"), 2);
+        assert_eq!(count(&mut ctx, b"absent"), 0);
+        assert_eq!(valid(&mut ctx, b"Upgrade"), 1);
+        assert_eq!(valid(&mut ctx, b"Absent"), 1, "absence is valid");
+        assert_eq!(valid(&mut ctx, b"X-Bad"), 0);
+        assert_eq!(contains(&mut ctx, b"Connection", b"upgrade"), 1);
+        assert_eq!(contains(&mut ctx, b"Upgrade", b"websocket"), 1);
+        assert_eq!(contains_exact(&mut ctx, b"Upgrade", b"websocket"), 1);
+        assert_eq!(contains_exact(&mut ctx, b"Upgrade", b"WebSocket"), 0);
+        assert_eq!(contains(&mut ctx, b"Upgrade", b"missing"), 0);
+        assert_eq!(contains(&mut ctx, b"X-Bad", b"good"), 1, "neighbor validity is separate");
+        assert_eq!(unsafe { align_rt_http_ctx_upgrade_ready(&mut ctx) }, 1);
+        ctx.upgrade_ready = false;
+        assert_eq!(unsafe { align_rt_http_ctx_upgrade_ready(&mut ctx) }, 0);
+    }
+
+    #[test]
+    fn http_accept_sigpipe_prerequisite_closes_failed_fd_before_publication() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+
+        let (accepted, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let fd = accepted.into_raw_fd();
+        let mut ops = ScriptedSocketWriteOps::new(
+            [SocketCallOutcome::failed(libc::EAGAIN)],
+            [],
+        );
+        match http_prepare_accepted_fd(
+            fd,
+            SocketSigpipePolicy::InstallSocketOption,
+            &mut ops,
+        ) {
+            Err(AcceptFail::Fatal(status)) => {
+                assert_eq!(status, AL_CODE.saturating_add(libc::EAGAIN));
+            }
+            _ => panic!("failed SO_NOSIGPIPE install must be a fatal accept result"),
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "the failed candidate is already closed and cannot enter a request context",
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("read peer EOF"), 0);
+        assert_eq!(ops.calls, [ScriptedSocketWriteCall::Install { fd }]);
+
+        let (accepted, _peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let fd = accepted.into_raw_fd();
+        let mut ops = ScriptedSocketWriteOps::new([], []);
+        assert_eq!(
+            http_prepare_accepted_fd(
+                fd,
+                SocketSigpipePolicy::SendFlags(0x4000),
+                &mut ops,
+            )
+            .ok(),
+            Some(fd),
+            "the Linux send-flag policy needs no socket option",
+        );
+        assert!(ops.calls.is_empty());
+        unsafe { close(fd) };
+    }
+
+    #[test]
+    fn http_upgrade_response_validation_and_exact_serialization() {
+        let valid = upgrade_response(vec![
+            ("Upgrade", "websocket"),
+            ("Connection", "keep-alive, Upgrade"),
+            ("Sec-WebSocket-Accept", "accepted"),
+        ]);
+        let len = http_validate_upgrade_response(&valid).expect("valid Upgrade response");
+        let serialized = http_serialize_upgrade_response(&valid, len);
+        assert_eq!(serialized.len(), len);
+        assert_eq!(serialized.capacity(), len, "one exact head allocation, with no growth");
+        assert_eq!(
+            serialized,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: accepted\r\n\r\n",
+        );
+
+        let invalid = [
+            ResponseBuilder { status: 200, ..upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade")]) },
+            ResponseBuilder { body: Some(Vec::new()), ..upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade")]) },
+            upgrade_response(vec![("Connection", "Upgrade")]),
+            upgrade_response(vec![("Upgrade", "websocket")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Upgrade", "h2c"), ("Connection", "Upgrade")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Connection", "keep-alive")]),
+            upgrade_response(vec![("Upgrade", "websocket,,h2c"), ("Connection", "Upgrade")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "keep-alive")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Content-Length", "0")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Transfer-Encoding", "chunked")]),
+            upgrade_response(vec![("Upgrade", "websocket"), ("Connection", "Upgrade"), ("X-Test", "bad\r\nInjected: yes")]),
+        ];
+        for response in invalid {
+            assert_eq!(http_validate_upgrade_response(&response), Err(AL_INVALID));
+        }
+    }
+
+    #[test]
+    fn http_upgrade_failure_boundaries_retain_or_close_the_fd_before_publication() {
+        use std::os::unix::io::IntoRawFd;
+
+        for phase in 1..=5 {
+            let (local, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let fd = local.into_raw_fd();
+            let raw = b"GET /chat HTTP/1.1\r\nHost: h\r\n\r\n";
+            let mut ctx = http_test_ctx(fd, raw, true);
+            let response = Box::into_raw(Box::new(upgrade_response(vec![
+                ("Upgrade", "websocket"),
+                ("Connection", "Upgrade"),
+            ])));
+            let mut out = core::ptr::NonNull::<HttpUpgrade>::dangling().as_ptr();
+            http_upgrade_set_failpoint(phase);
+            assert_eq!(
+                unsafe { align_rt_http_respond_upgrade(&mut ctx, response, &mut out) },
+                AL_CODE,
+                "phase {phase}",
+            );
+            assert!(out.is_null(), "phase {phase}: no failed operation publishes a handle");
+            assert_eq!(
+                HTTP_UPGRADE_FAILPOINT.with(core::cell::Cell::get),
+                0,
+                "phase {phase}: the intended boundary was reached",
+            );
+            if phase <= 3 {
+                assert_eq!(ctx.fd, fd, "phase {phase}: pre-transfer failure retains ctx ownership");
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            } else {
+                assert_eq!(ctx.fd, -1, "phase {phase}: post-transfer failure spends the ctx");
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1, "owned fd closes once");
+            }
+            drop(peer);
+        }
+    }
+
+    #[test]
+    fn http_upgrade_transfers_fd_and_reads_writes_shuts_down_exactly_once() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::IntoRawFd;
+
+        let (local, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let fd = local.into_raw_fd();
+        let raw = b"GET /chat HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut ctx = http_test_ctx(fd, raw, true);
+        let response = upgrade_response(vec![
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+        ]);
+        let response_bytes = response_builder_requested_bytes(&response);
+        let response_head_bytes = http_validate_upgrade_response(&response).unwrap();
+        http_upgrade_requested_live_enable();
+        let response = Box::into_raw(Box::new(response));
+        let mut out = core::ptr::NonNull::<HttpUpgrade>::dangling().as_ptr();
+        assert_eq!(unsafe { align_rt_http_respond_upgrade(&mut ctx, response, &mut out) }, 0);
+        assert_eq!(
+            http_upgrade_requested_live_peak(),
+            response_bytes + response_head_bytes + core::mem::size_of::<HttpUpgrade>(),
+            "the builder, exact head, and handle shell coexist at the producer high-water",
+        );
+        assert_eq!(ctx.fd, -1, "the request context is spent only after success");
+        assert!(!out.is_null());
+
+        let expected = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let mut head = vec![0u8; expected.len()];
+        peer.read_exact(&mut head).expect("read Upgrade response");
+        assert_eq!(head, expected);
+
+        let buffer = align_rt_buffer_new(8);
+        peer.write_all(b"hello").unwrap();
+        assert_eq!(unsafe { align_rt_http_upgrade_read_exact(out, buffer, 5) }, 0);
+        assert_eq!(unsafe { (*buffer).data.as_slice() }, b"hello");
+        assert_eq!(unsafe { (*buffer).len }, 5);
+
+        assert_eq!(unsafe { align_rt_http_upgrade_write(out, b"bye".as_ptr(), 3) }, 0);
+        let mut written = [0u8; 3];
+        peer.read_exact(&mut written).unwrap();
+        assert_eq!(&written, b"bye");
+
+        assert_eq!(unsafe { align_rt_http_upgrade_shutdown(out) }, 0);
+        assert_eq!(unsafe { align_rt_http_upgrade_shutdown(out) }, 0, "clean shutdown is idempotent");
+        unsafe {
+            (*buffer).data = b"old".to_vec();
+            (*buffer).len = 3;
+        }
+        assert_eq!(unsafe { align_rt_http_upgrade_read_exact(out, buffer, 1) }, AL_INVALID);
+        assert_eq!(unsafe { (*buffer).data.as_slice() }, b"old", "spent failure leaves the output untouched");
+        unsafe {
+            align_rt_buffer_free(buffer);
+            align_rt_http_upgrade_free(out);
+        }
+    }
+
+    #[test]
+    fn http_upgrade_validation_failure_preserves_ctx_and_zeros_output() {
+        use std::os::unix::io::IntoRawFd;
+
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = local.into_raw_fd();
+        let mut ctx = http_test_ctx(fd, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", true);
+        let bad = Box::into_raw(Box::new(ResponseBuilder {
+            status: 200,
+            headers: Vec::new(),
+            body: None,
+        }));
+        let mut out = core::ptr::NonNull::<HttpUpgrade>::dangling().as_ptr();
+        assert_eq!(unsafe { align_rt_http_respond_upgrade(&mut ctx, bad, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        assert_eq!(ctx.fd, fd, "validation happens before fd transfer");
+    }
+
+    #[test]
+    fn http_upgrade_timeout_poison_is_sticky() {
+        use std::os::unix::io::IntoRawFd;
+
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let upgrade = Box::into_raw(Box::new(HttpUpgrade {
+            fd: local.into_raw_fd(),
+            sticky: 0,
+            deadline: None,
+        }));
+        let buffer = align_rt_buffer_new(1);
+        assert_eq!(unsafe { align_rt_http_upgrade_deadline(upgrade, 1) }, 0);
+        assert_eq!(unsafe { align_rt_http_upgrade_read_exact(upgrade, buffer, 1) }, AL_TIMEOUT);
+        assert_eq!(unsafe { align_rt_http_upgrade_write(upgrade, b"x".as_ptr(), 1) }, AL_TIMEOUT);
+        assert_eq!(unsafe { align_rt_http_upgrade_shutdown(upgrade) }, AL_TIMEOUT);
+        unsafe {
+            align_rt_buffer_free(buffer);
+            align_rt_http_upgrade_free(upgrade);
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess target for the detectable-invalid ABI matrix"]
+    fn http_upgrade_detectable_invalid_abi_probe() {
+        let mode = std::env::var("ALIGN_HTTP_UPGRADE_ABORT_MODE").expect("probe mode");
+        let mut ctx = http_test_ctx(-1, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", true);
+        match mode.as_str() {
+            "count-null-ctx" => unsafe {
+                align_rt_http_headers_count(core::ptr::null_mut(), b"Host".as_ptr(), 4);
+            },
+            "count-negative-len" => unsafe {
+                align_rt_http_headers_count(&mut ctx, b"Host".as_ptr(), -1);
+            },
+            "count-invalid-name" => unsafe {
+                align_rt_http_headers_count(&mut ctx, b"bad name".as_ptr(), 8);
+            },
+            "tokens-misaligned-ctx" => unsafe {
+                align_rt_http_headers_tokens_valid(1usize as *mut HttpRequestCtx, b"Host".as_ptr(), 4);
+            },
+            "contains-invalid-token" => unsafe {
+                align_rt_http_headers_contains_token(
+                    &mut ctx,
+                    b"Host".as_ptr(),
+                    4,
+                    b"bad token".as_ptr(),
+                    9,
+                );
+            },
+            "contains-exact-invalid-token" => unsafe {
+                align_rt_http_headers_contains_token_exact(
+                    &mut ctx,
+                    b"Host".as_ptr(),
+                    4,
+                    b"bad token".as_ptr(),
+                    9,
+                );
+            },
+            "read-negative-count" => {
+                let buffer = align_rt_buffer_new(0);
+                unsafe {
+                    align_rt_http_upgrade_read_exact(core::ptr::null_mut(), buffer, -1);
+                }
+            }
+            "read-over-capacity" => {
+                let buffer = align_rt_buffer_new(0);
+                unsafe {
+                    align_rt_http_upgrade_read_exact(core::ptr::null_mut(), buffer, 1);
+                }
+            }
+            "deadline-zero" => unsafe {
+                align_rt_http_upgrade_deadline(core::ptr::null_mut(), 0);
+            },
+            "malformed-header-span" => {
+                ctx.headers[0].name_start = usize::MAX;
+                unsafe {
+                    align_rt_http_headers_count(&mut ctx, b"Host".as_ptr(), 4);
+                }
+            }
+            "ready-malformed-body-span" => {
+                ctx.body_start = usize::MAX;
+                unsafe {
+                    align_rt_http_ctx_upgrade_ready(&mut ctx);
+                }
+            }
+            _ => panic!("unknown probe mode: {mode}"),
+        }
+        panic!("detectably malformed ABI input did not abort: {mode}");
+    }
+
+    #[test]
+    fn http_upgrade_detectable_invalid_abi_matrix_aborts() {
+        const NAME: &str = "tests::http_upgrade_detectable_invalid_abi_probe";
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for mode in [
+            "count-null-ctx",
+            "count-negative-len",
+            "count-invalid-name",
+            "tokens-misaligned-ctx",
+            "contains-invalid-token",
+            "contains-exact-invalid-token",
+            "read-negative-count",
+            "read-over-capacity",
+            "deadline-zero",
+            "malformed-header-span",
+            "ready-malformed-body-span",
+        ] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", NAME, "--test-threads=1"])
+                .env("ALIGN_HTTP_UPGRADE_ABORT_MODE", mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn malformed-ABI probe");
+            let mut child = ChildGuard(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().expect("poll malformed-ABI probe") {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{mode} malformed-ABI probe did not terminate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert!(!status.success(), "{mode} must hard-abort");
+        }
+    }
+
     /// The request-head parser accepts a well-formed request and lays out method / target / header /
     /// body spans over ONE buffer (zero-copy, R1).
     #[test]
@@ -44044,6 +45338,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 body_start: 18,
                 body_len: 0,
                 http11,
+                upgrade_ready: http11,
                 keep_alive: false,
                 park: None,
             };
@@ -44373,6 +45668,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             body_start: 18,
             body_len: 0,
             http11: true,
+            upgrade_ready: true,
             keep_alive: false,
             park: None,
         };

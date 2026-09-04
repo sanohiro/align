@@ -6050,6 +6050,95 @@ fn malformed_hir_global_type_metadata_fails_closed() {
 
 #[test]
 fn malformed_hir_type_placement_fails_closed() {
+    let mut upgrade_field = baseline_program();
+    upgrade_field.structs[0].fields[0].ty = Ty::HttpUpgrade;
+    assert_placement_rejected("HTTP upgrade struct field", &upgrade_field);
+
+    let mut upgrade_option = baseline_program();
+    upgrade_option.tagged_types[0] = TaggedType::Option(Scalar::HttpUpgrade);
+    assert_placement_rejected("HTTP upgrade Option payload", &upgrade_option);
+
+    let mut upgrade_enum = baseline_program();
+    upgrade_enum.enums[0].variants[1].payload = vec![Scalar::HttpUpgrade];
+    assert_placement_rejected("HTTP upgrade enum payload", &upgrade_enum);
+
+    let mut upgrade_tuple = baseline_program();
+    upgrade_tuple.tuples[0].elems = vec![Scalar::HttpUpgrade];
+    assert_placement_rejected("HTTP upgrade tuple element", &upgrade_tuple);
+
+    let mut upgrade_result_parameter = baseline_program();
+    upgrade_result_parameter.imported_fns.push(imported_fn(
+        "dep$upgrade_result_parameter",
+        vec![Ty::Result(Scalar::HttpUpgrade, Scalar::Enum(0))],
+        Ty::Unit,
+    ));
+    assert_placement_rejected(
+        "HTTP upgrade Result parameter",
+        &upgrade_result_parameter,
+    );
+
+    let mut upgrade_return = baseline_program();
+    upgrade_return.imported_fns.push(imported_fn(
+        "dep$upgrade_return",
+        vec![],
+        Ty::HttpUpgrade,
+    ));
+    assert_placement_rejected("HTTP upgrade return", &upgrade_return);
+
+    let mut upgrade_out = baseline_program();
+    let mut out = imported_fn("dep$upgrade_out", vec![Ty::HttpUpgrade], Ty::Unit);
+    out.param_modes[0] = align_ast::ParamMode::Out;
+    upgrade_out.imported_fns.push(out);
+    assert_placement_rejected("HTTP upgrade out parameter", &upgrade_out);
+
+    let mut upgrade_capture = baseline_program();
+    let mut lifted = body_test_parameter_function(
+        "upgrade_capture",
+        Ty::HttpUpgrade,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    );
+    lifted.origin = hir::FnOrigin::Lifted { capture_count: 1 };
+    lifted.locals[0].is_param = false;
+    upgrade_capture.fns.push(lifted);
+    assert_placement_rejected("HTTP upgrade closure capture", &upgrade_capture);
+
+    let mut upgrade_stored_local = baseline_program();
+    upgrade_stored_local.fns.push(body_test_named_function(
+        "upgrade_stored_local",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        vec![hir::Local {
+            id: 0,
+            name: "stored".to_string(),
+            ty: Ty::Option(Scalar::HttpUpgrade),
+            is_mut: false,
+            is_param: false,
+            align: None,
+        }],
+        Ty::Unit,
+    ));
+    assert_placement_rejected(
+        "HTTP upgrade forbidden ordinary local",
+        &upgrade_stored_local,
+    );
+
+    let mut upgrade_parameter = baseline_program();
+    upgrade_parameter.imported_fns.push(imported_fn(
+        "dep$upgrade_parameter",
+        vec![Ty::HttpUpgrade],
+        Ty::Unit,
+    ));
+    assert!(
+        validate_hir::type_placement_metadata_is_valid(&upgrade_parameter),
+        "one bare by-value HTTP upgrade parameter is the admitted carrier"
+    );
+
     let mut stream_field = baseline_program();
     stream_field.structs[0].fields[0].ty = Ty::HttpReadStream;
     assert_placement_rejected("HTTP read stream struct field", &stream_field);
@@ -11376,10 +11465,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // pkg.csv adds one checked operation family; keep this count synchronized with the
+        // pkg.ws adds nine checked operation variants; keep this count synchronized with the
         // exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        302,
+        311,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -11448,6 +11537,7 @@ fn hir_body_validator_native() {
     let result_buffer = native_result(Ty::Buffer, error);
     let result_response = native_result(Ty::HttpResponse, error);
     let result_read_stream = native_result(Ty::HttpReadStream, error);
+    let result_upgrade = native_result(Ty::HttpUpgrade, error);
     let result_sse_event = native_result(Ty::Tagged(http_sse_option), error);
     let result_u8_array = Ty::DynArray(u8_scalar);
 
@@ -13406,6 +13496,70 @@ fn hir_body_validator_native() {
         Ty::Option(Scalar::Str)
     );
     add!(
+        "native_http_headers_count",
+        body_test_expr(
+            hir::ExprKind::HttpHeadersCount {
+                headers: Box::new(body_test_expr(
+                    hir::ExprKind::HttpCtxHeaders {
+                        ctx: Box::new(ctx_field()),
+                    },
+                    Ty::HttpHeaders,
+                )),
+                name: Box::new(native_str()),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        i64_ty
+    );
+    add!(
+        "native_http_headers_tokens_valid",
+        body_test_expr(
+            hir::ExprKind::HttpHeadersTokensValid {
+                headers: Box::new(body_test_expr(
+                    hir::ExprKind::HttpCtxHeaders {
+                        ctx: Box::new(ctx_field()),
+                    },
+                    Ty::HttpHeaders,
+                )),
+                name: Box::new(native_str()),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_http_headers_contains_token",
+        body_test_expr(
+            hir::ExprKind::HttpHeadersContainsToken {
+                headers: Box::new(body_test_expr(
+                    hir::ExprKind::HttpCtxHeaders {
+                        ctx: Box::new(ctx_field()),
+                    },
+                    Ty::HttpHeaders,
+                )),
+                name: Box::new(native_str()),
+                token: Box::new(native_str()),
+                exact: false,
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Bool
+    );
+    add!(
+        "native_http_ctx_upgrade_ready",
+        body_test_expr(
+            hir::ExprKind::HttpCtxUpgradeReady {
+                ctx: Box::new(ctx_field()),
+            },
+            Ty::Bool,
+        ),
+        vec![body_test_local(0, "holder", Ty::Struct(ctx_struct), false, false)],
+        Ty::Bool
+    );
+    add!(
         "native_http_ctx_body",
         body_test_expr(
             hir::ExprKind::HttpCtxBody {
@@ -13445,6 +13599,106 @@ fn hir_body_validator_native() {
             body_test_local(1, "builder", Ty::ResponseBuilder, false, false),
         ],
         native_result(Ty::HttpStream, error)
+    );
+    let span = align_span::Span::new(0, 0, 0);
+    let upgrade_call = body_test_expr(
+        hir::ExprKind::HttpRespondUpgrade {
+            ctx: Box::new(native_local(0, Ty::HttpRequestCtx)),
+            rb: Box::new(native_local(1, Ty::ResponseBuilder)),
+        },
+        result_upgrade,
+    );
+    let mut upgrade_fixture = body_test_function_with_params(
+        "native_http_respond_upgrade",
+        vec![
+            body_test_local(0, "ctx", Ty::HttpRequestCtx, false, true),
+            body_test_local(1, "builder", Ty::ResponseBuilder, false, true),
+            body_test_local(2, "upgrade", Ty::HttpUpgrade, true, false),
+        ],
+        vec![0, 1],
+        hir::Block {
+            stmts: vec![
+                hir::Stmt::Let {
+                    local: 2,
+                    init: body_test_expr(
+                        hir::ExprKind::Try(Box::new(upgrade_call)),
+                        Ty::HttpUpgrade,
+                    ),
+                },
+                hir::Stmt::Expr(body_test_expr(
+                    hir::ExprKind::Try(Box::new(body_test_expr(
+                        hir::ExprKind::HttpUpgradeShutdown {
+                            upgrade: Box::new(native_local(2, Ty::HttpUpgrade)),
+                        },
+                        result_unit,
+                    ))),
+                    Ty::Unit,
+                )),
+            ],
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::ResultOk(Box::new(body_test_expr(
+                    hir::ExprKind::Unit,
+                    Ty::Unit,
+                ))),
+                result_unit,
+            ))),
+        },
+        result_unit,
+    );
+    upgrade_fixture.drop_locals = vec![0, 1, 2];
+    upgrade_fixture.drop_individual_locals = vec![0, 1, 2];
+    upgrade_fixture.drop_individual_exprs.insert(span, true);
+    program.fns.push(upgrade_fixture);
+    add!(
+        "native_http_upgrade_read_exact",
+        body_test_expr(
+            hir::ExprKind::HttpUpgradeReadExact {
+                upgrade: Box::new(native_local(0, Ty::HttpUpgrade)),
+                out: Box::new(native_local(1, Ty::Buffer)),
+                count: Box::new(native_i64()),
+            },
+            result_unit,
+        ),
+        vec![
+            body_test_local(0, "upgrade", Ty::HttpUpgrade, true, false),
+            body_test_local(1, "buffer", Ty::Buffer, true, false),
+        ],
+        result_unit
+    );
+    add!(
+        "native_http_upgrade_write",
+        body_test_expr(
+            hir::ExprKind::HttpUpgradeWrite {
+                upgrade: Box::new(native_local(0, Ty::HttpUpgrade)),
+                data: Box::new(native_str()),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "upgrade", Ty::HttpUpgrade, true, false)],
+        result_unit
+    );
+    add!(
+        "native_http_upgrade_deadline",
+        body_test_expr(
+            hir::ExprKind::HttpUpgradeDeadline {
+                upgrade: Box::new(native_local(0, Ty::HttpUpgrade)),
+                timeout_ns: Box::new(native_i64()),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "upgrade", Ty::HttpUpgrade, true, false)],
+        result_unit
+    );
+    add!(
+        "native_http_upgrade_shutdown",
+        body_test_expr(
+            hir::ExprKind::HttpUpgradeShutdown {
+                upgrade: Box::new(native_local(0, Ty::HttpUpgrade)),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "upgrade", Ty::HttpUpgrade, true, false)],
+        result_unit
     );
     add!(
         "native_http_stream_send",
@@ -15366,6 +15620,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpUpgrade
         | Scalar::HttpReadStream
         | Scalar::HttpSseStream
         | Scalar::RunOutput
@@ -15442,6 +15697,7 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::HttpRequestCtx,
         Scalar::ResponseBuilder,
         Scalar::HttpStream,
+        Scalar::HttpUpgrade,
         Scalar::HttpReadStream,
         Scalar::HttpSseStream,
         Scalar::RunOutput,

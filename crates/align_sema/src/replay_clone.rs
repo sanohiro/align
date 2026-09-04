@@ -1417,6 +1417,28 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             headers: boxed!(headers),
             name: boxed!(name),
         },
+        ExprKind::HttpHeadersCount { headers, name } => ExprKind::HttpHeadersCount {
+            headers: boxed!(headers),
+            name: boxed!(name),
+        },
+        ExprKind::HttpHeadersTokensValid { headers, name } => {
+            ExprKind::HttpHeadersTokensValid {
+                headers: boxed!(headers),
+                name: boxed!(name),
+            }
+        }
+        ExprKind::HttpHeadersContainsToken {
+            headers,
+            name,
+            token,
+            exact,
+        } => ExprKind::HttpHeadersContainsToken {
+            headers: boxed!(headers),
+            name: boxed!(name),
+            token: boxed!(token),
+            exact: *exact,
+        },
+        ExprKind::HttpCtxUpgradeReady { ctx } => ExprKind::HttpCtxUpgradeReady { ctx: boxed!(ctx) },
         ExprKind::HttpCtxBody { ctx } => ExprKind::HttpCtxBody { ctx: boxed!(ctx) },
         ExprKind::HttpResponseBuilder { status } => ExprKind::HttpResponseBuilder {
             status: boxed!(status),
@@ -1437,6 +1459,33 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::HttpRespondStream { ctx, rb } => ExprKind::HttpRespondStream {
             ctx: boxed!(ctx),
             rb: boxed!(rb),
+        },
+        ExprKind::HttpRespondUpgrade { ctx, rb } => ExprKind::HttpRespondUpgrade {
+            ctx: boxed!(ctx),
+            rb: boxed!(rb),
+        },
+        ExprKind::HttpUpgradeReadExact {
+            upgrade,
+            out,
+            count,
+        } => ExprKind::HttpUpgradeReadExact {
+            upgrade: boxed!(upgrade),
+            out: boxed!(out),
+            count: boxed!(count),
+        },
+        ExprKind::HttpUpgradeWrite { upgrade, data } => ExprKind::HttpUpgradeWrite {
+            upgrade: boxed!(upgrade),
+            data: boxed!(data),
+        },
+        ExprKind::HttpUpgradeDeadline {
+            upgrade,
+            timeout_ns,
+        } => ExprKind::HttpUpgradeDeadline {
+            upgrade: boxed!(upgrade),
+            timeout_ns: boxed!(timeout_ns),
+        },
+        ExprKind::HttpUpgradeShutdown { upgrade } => ExprKind::HttpUpgradeShutdown {
+            upgrade: boxed!(upgrade),
         },
         ExprKind::HttpStreamSend {
             stream,
@@ -2082,7 +2131,9 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BuilderToString(expr)
         | ExprKind::ArrayToSlice(expr)
         | ExprKind::Len(expr)
-        | ExprKind::ArrayBuilderBuild(expr) => one!(expr),
+        | ExprKind::ArrayBuilderBuild(expr)
+        | ExprKind::HttpCtxUpgradeReady { ctx: expr }
+        | ExprKind::HttpUpgradeShutdown { upgrade: expr } => one!(expr),
         ExprKind::CloneIn { value, region } => {
             one!(value);
             one!(region);
@@ -2329,9 +2380,26 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             headers: lhs,
             name: rhs,
         }
+        | ExprKind::HttpHeadersCount {
+            headers: lhs,
+            name: rhs,
+        }
+        | ExprKind::HttpHeadersTokensValid {
+            headers: lhs,
+            name: rhs,
+        }
         | ExprKind::HttpRbBody { rb: lhs, data: rhs }
         | ExprKind::HttpRespond { ctx: lhs, rb: rhs }
         | ExprKind::HttpRespondStream { ctx: lhs, rb: rhs }
+        | ExprKind::HttpRespondUpgrade { ctx: lhs, rb: rhs }
+        | ExprKind::HttpUpgradeWrite {
+            upgrade: lhs,
+            data: rhs,
+        }
+        | ExprKind::HttpUpgradeDeadline {
+            upgrade: lhs,
+            timeout_ns: rhs,
+        }
         | ExprKind::HttpStreamSend {
             stream: lhs,
             chunk: rhs,
@@ -2406,6 +2474,17 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             rb: ptr,
             name: offset,
             value,
+        }
+        | ExprKind::HttpHeadersContainsToken {
+            headers: ptr,
+            name: offset,
+            token: value,
+            ..
+        }
+        | ExprKind::HttpUpgradeReadExact {
+            upgrade: ptr,
+            out: offset,
+            count: value,
         } => {
             one!(ptr);
             one!(offset);

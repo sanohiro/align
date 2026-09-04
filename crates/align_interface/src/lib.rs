@@ -1373,6 +1373,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("http_request_ctx", 0, BuiltinCapability::Opaque),
     ("response_builder", 0, BuiltinCapability::Opaque),
     ("http_stream", 0, BuiltinCapability::Opaque),
+    ("http_upgrade", 0, BuiltinCapability::Opaque),
     ("json.kind", 0, BuiltinCapability::Opaque),
     ("log.level", 0, BuiltinCapability::Opaque),
     ("codec.kind", 0, BuiltinCapability::Opaque),

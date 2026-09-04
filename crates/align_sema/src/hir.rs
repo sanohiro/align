@@ -1776,6 +1776,20 @@ pub enum ExprKind {
     /// `fn header(c: Ctx, name: str) -> Option<str> = c.headers.get(name)` compile (http.md item 10 ④).
     /// `name` is borrowed. Pure. The read-dual of [`HttpRespHeader`].
     HttpCtxHeader { headers: Box<Expr>, name: Box<Expr> },
+    /// Pure repeated-header physical-row count.
+    HttpHeadersCount { headers: Box<Expr>, name: Box<Expr> },
+    /// Pure validation of every selected comma-separated header token list.
+    HttpHeadersTokensValid { headers: Box<Expr>, name: Box<Expr> },
+    /// Pure token membership across every selected physical row. Header names are always
+    /// case-insensitive; `exact` selects byte-exact rather than ASCII-case-insensitive members.
+    HttpHeadersContainsToken {
+        headers: Box<Expr>,
+        name: Box<Expr>,
+        token: Box<Expr>,
+        exact: bool,
+    },
+    /// Pure HTTP/1.1 plus parser-residual readiness query.
+    HttpCtxUpgradeReady { ctx: Box<Expr> },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** into `ctx`'s buffer (the `ty` is
     /// [`crate::Ty::Slice`] of `u8`), region-bound to `ctx`. `ctx` is a bound local. Pure. The read-dual
     /// of [`HttpRespBody`].
@@ -1812,6 +1826,16 @@ pub enum ExprKind {
     /// bad status is `Error.Invalid` and leaves the ctx unspent. A 1.0 request gets close-delimited
     /// raw framing (no chunked). **Impure** (network I/O).
     HttpRespondStream { ctx: Box<Expr>, rb: Box<Expr> },
+    /// Commit a checked 101 and publish one owned protocol-neutral upgraded byte stream.
+    HttpRespondUpgrade { ctx: Box<Expr>, rb: Box<Expr> },
+    /// Fill a mutable buffer with exactly `count` transport bytes.
+    HttpUpgradeReadExact { upgrade: Box<Expr>, out: Box<Expr>, count: Box<Expr> },
+    /// Write all borrowed bytes to an upgraded transport.
+    HttpUpgradeWrite { upgrade: Box<Expr>, data: Box<Expr> },
+    /// Replace the transport's retained cumulative monotonic deadline.
+    HttpUpgradeDeadline { upgrade: Box<Expr>, timeout_ns: Box<Expr> },
+    /// Terminal full-duplex shutdown, retaining one spent handle for ordinary Drop.
+    HttpUpgradeShutdown { upgrade: Box<Expr> },
     /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk (one chunk frame in
     /// framed/1.1 mode, or raw payload bytes in 1.0 mode) to the stream `s`
     /// ([`crate::Ty::HttpStream`]), yielding `Result<(), Error>` (the `ty`). With `event` set the

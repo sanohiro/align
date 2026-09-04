@@ -975,6 +975,7 @@ fn builtin_spelling_ownership_matches_the_producer_for_every_interface_spelling(
         "http_request_ctx",
         "response_builder",
         "http_stream",
+        "http_upgrade",
     ] {
         assert_eq!(
             align_sema::builtin_spelling_needs_return_cleanup(owned),

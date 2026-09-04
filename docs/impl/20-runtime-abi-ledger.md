@@ -11,9 +11,9 @@ surfaces are independently compared with the Rust runtime exports.
 
 With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, HTTP client
-raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, and
-`pkg.kv`, and `pkg.csv`, there
-are 331 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
+`pkg.csv`, and `pkg.ws`, there
+are 342 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -26,21 +26,23 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 349 records. Request 12
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 360 records. Request 12
 adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
-The explicit `alloc-count` runtime feature may expose four
-test/benchmark-only counter definitions. `par-map-probe` may expose four more:
+The explicit `alloc-count` runtime feature may expose seven
+test/benchmark-only definitions: the allocation/free and finder counters plus
+`align_rt_requested_live_reset`, `align_rt_requested_live_bytes`, and
+`align_rt_requested_live_peak`. `par-map-probe` may expose four more:
 `void @align_rt_test_par_map_force_caller(i32)`,
 `i64 @align_rt_test_par_map_min_chunk()`,
 `i64 @align_rt_test_par_map_min_chunk_for(i64, i64, i64)`, and
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 349 base records.
+The compiler-visible native registry is always exactly the 360 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
-inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 357.
+inspection, or other ambient input that changes it. The eleven optional probe
+records extend only the verification-time maximum runtime-export table to 371.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -56,10 +58,10 @@ inspection, stream construction/access/read, and Drop. The SSE capability added 
 the consuming transition, state getters, and event read. The asymmetric signature suite then added
 six keyed rows. The `core.test` child-control extension then added four unkeyed rows, and `std.log`
 added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg.kv` added one
-source-reachable unkeyed row, and `pkg.csv` added one keyed row. Their runtime
+source-reachable unkeyed row, `pkg.csv` added one keyed row, and `pkg.ws` added eleven keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 331 keyed records, 349 base records, and 357 records in the maximum optional-probe export table.
-No probe category changed. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
+are 342 keyed records, 360 base records, and 371 records in the maximum optional-probe export table.
+No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
@@ -485,9 +487,9 @@ cannot activate the row or select checked `CsvDecode`; exact compatible source-
 extern reuse follows the ordinary registry rule. No partial producer may land. Exact semantics,
 validation order, allocation contract, and closure matrix: `pkg-design/csv.md`.
 
-## `pkg.ws` reservation (designed; not active)
+## `pkg.ws` extension (implemented 2026-09-04)
 
-The accepted `pkg.ws` design reserves ten future keyed identities, all on existing ABI shapes:
+The implemented `pkg.ws` capability activates eleven keyed identities, all on existing ABI shapes:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
 |---|---|---|---|
@@ -500,12 +502,14 @@ The accepted `pkg.ws` design reserves ten future keyed identities, all on existi
 | `HttpHeadersCount` | `align_rt_http_headers_count` | A37: `i64 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i64` |
 | `HttpHeadersTokensValid` | `align_rt_http_headers_tokens_valid` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i32` |
 | `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
+| `HttpHeadersContainsTokenExact` | `align_rt_http_headers_contains_token_exact` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx) -> i32` |
 
-These rows remain absent from `RuntimeKey`, declarations, definitions, exports, collision identity,
-fingerprints, and count assertions until one atomic implementation activates the complete
-capability. The current inventory therefore remains 331 keyed records, 349 base records, 353 with
-either optional four-row probe, and 357 with both; A124 remains the next unreserved active shape.
+These rows activate together in `RuntimeKey`, declarations, definitions, exports, collision
+identity, fingerprints, and count assertions. The current inventory is therefore 342 keyed records,
+360 base records, 367 with the seven-row `alloc-count` probe, 364 with the four-row `par-map-probe`,
+and 371 with both; A124 remains the next
+unreserved active shape.
 
 The same capability hardens the existing HTTP accepted-socket setup without adding a key or shape.
 On macOS/iOS, after the existing best-effort `TCP_NODELAY` and `SO_KEEPALIVE`, `SO_NOSIGPIPE`
@@ -537,9 +541,20 @@ Each operation closes at most once. Caller-invalid precedes handle state; spent 
 return `AL_INVALID` without mutation/clock/I/O, shutdown is idempotent, and poisoned operations replay
 the stored status without I/O.
 
+The feature-gated requested-live probe resets one explicit measurement window and tracks only the
+allocation families attributed to it. `buffer` charges its fixed 64-byte shell budget plus reserved
+payload, `array_builder` charges its 64-byte shell budget and C-owned growth (including old+new
+overlap at realloc), and a frozen builder transfers that shell charge to its payload through Text
+conversion. Ordinary string clone allocation then records the simultaneous staging/result peak.
+The owner exercises Binary and Text at a bounded concrete size and separately pins the exact
+64-bit maximum equation `128 + 32768 + 2 * 536870912 = 1073774720`; production builds compile every
+probe hook and export out.
+
 Header query pointers borrow the live request context for the call and retain nothing. Count and
-token validation check context, then name; contains checks context, complete name view/token, then
-complete searched-token view/token. A null or misaligned context hard-aborts before Rust reference
+token validation check context, then name; both membership operations check context, complete name
+view/token, then complete searched-token view/token. Header names are case-insensitive;
+`HttpHeadersContainsToken` compares members ASCII-case-insensitively and
+`HttpHeadersContainsTokenExact` compares them byte-exactly. A null or misaligned context hard-aborts before Rust reference
 formation; negative or address-space-unrepresentable length and null positive-length range reject
 before slice formation; invalid token bytes hard-abort after safe view formation but before table
 scanning. `HttpCtxUpgradeReady` applies the same context rule.
@@ -547,7 +562,7 @@ Dangling nonnull pointers remain outside the detectable ABI contract. No malform
 an ordinary zero/false result. All other pointer/length/count/capacity/address products are rejected
 before Rust reference or slice formation as specified by their status-returning rows.
 
-All ten exports use the Rust C calling convention and must not unwind across it. Their generated
+All eleven exports use the Rust C calling convention and must not unwind across it. Their generated
 LLVM declarations preserve the reused A03/A04/A20/A24/A37/A62/A120 shapes' current empty curated
 function-attribute sets: this capability adds no `nounwind`, memory, return, or parameter attribute
 and does not mutate shared shape fingerprints. Exact public semantics, status mapping, validation
@@ -909,6 +924,9 @@ Unkeyed native records:
 | pkg.kv TCP configuration | `i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64)` | always linked; package-internal compatible extern; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_alloc_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_free_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
+| requested-live probe | `void @align_rt_requested_live_reset()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
+| requested-live probe | `i64 @align_rt_requested_live_bytes()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
+| requested-live probe | `i64 @align_rt_requested_live_peak()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | finder probe | `i64 @align_rt_str_finder_new_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | finder probe | `i64 @align_rt_str_finder_free_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | parallel probe | `void @align_rt_test_par_map_force_caller(i32)` | only with the explicit `align_runtime/par-map-probe` feature; no curated declaration attributes |
@@ -968,7 +986,7 @@ claimant keeps its current physical name/uniquification but loses accidental
 native attributes, while the actual possibly-suffixed native declaration gains
 the row attributes.
 
-The eight probe rows have
+The eleven probe rows have
 `verification_presence = AllocCount | ParMapProbe`: their exact signatures are
 checked against the corresponding runtime fixture, but their names do not
 participate in compiler collision validation and no compatible-extern reuse
@@ -977,24 +995,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 331 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 342 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 349 base native symbols against default-feature `align_runtime` exports,
+- the 360 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 353 `alloc-count` and 353 `par-map-probe` native symbols against
-  `align_runtime` built with each feature separately, including the four exact
+- the 367 `alloc-count` and 364 `par-map-probe` native symbols against
+  `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 357 maximum native symbols against `align_runtime` built with
+- the 371 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 349 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  349 exact registry function types through the production compatibility
+- all 360 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  360 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
@@ -1003,7 +1021,7 @@ Tests compare:
   classes (`#0`–`#4`), with the native row supplying its curated attributes;
 - one mutation of each registry attribute class, symbol, and key through the
   checked-in golden and uniqueness owners;
-- ordinary extern and program-definition positives for all eight probe
+- ordinary extern and program-definition positives for all eleven probe
   spellings while the normal runtime export set excludes them; and
 - trivial whole-program and per-unit-shaped emitted IR with identical
   alphabetical runtime declarations, whose exact rows are owned by the

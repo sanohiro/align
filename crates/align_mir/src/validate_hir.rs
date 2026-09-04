@@ -522,6 +522,12 @@ impl<'a> DeclarationValidator<'a> {
                 return false;
             }
             let is_signature_parameter = parameter_ids.contains(&local.id);
+            if !is_signature_parameter
+                && self.placement.upgrade_carrier_class(local.ty)
+                    == align_sema::HttpUpgradeCarrierClass::Forbidden
+            {
+                return false;
+            }
             if is_signature_parameter {
                 if !valid_member_name(&local.name)
                     || local.is_param == lifted
@@ -1079,6 +1085,16 @@ impl<'a> PlacementValidator<'a> {
         )
     }
 
+    fn upgrade_carrier_class(&self, ty: Ty) -> align_sema::HttpUpgradeCarrierClass {
+        align_sema::http_upgrade_carrier_class(
+            ty,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        )
+    }
+
     fn struct_fields_valid(&self) -> bool {
         for (id, definition) in self.program.structs.iter().enumerate() {
             if definition.name.starts_with("pkg.db$query$")
@@ -1098,6 +1114,8 @@ impl<'a> PlacementValidator<'a> {
             let abstract_node = self.is_abstract(Node::Struct(id as u32));
             for field in &definition.fields {
                 if self.stream_carrier_class(field.ty) != align_sema::HttpStreamCarrierClass::None
+                    || self.upgrade_carrier_class(field.ty)
+                        != align_sema::HttpUpgradeCarrierClass::None
                     || !self.field_type_ok(field.ty, abstract_node)
                     || (definition.c_repr && !matches!(field.ty, Ty::Int(_) | Ty::Float(_)))
                     || !self.inline_structs_unaligned(field.ty)
@@ -1117,6 +1135,8 @@ impl<'a> PlacementValidator<'a> {
                     if self.scalar_contains_run_bytes(payload)
                         || self.stream_carrier_class(align_sema::scalar_to_ty(payload))
                             != align_sema::HttpStreamCarrierClass::None
+                        || self.upgrade_carrier_class(align_sema::scalar_to_ty(payload))
+                            != align_sema::HttpUpgradeCarrierClass::None
                     {
                         return false;
                     }
@@ -1139,6 +1159,8 @@ impl<'a> PlacementValidator<'a> {
             for &element in &tuple.elems {
                 if self.stream_carrier_class(align_sema::scalar_to_ty(element))
                     != align_sema::HttpStreamCarrierClass::None
+                    || self.upgrade_carrier_class(align_sema::scalar_to_ty(element))
+                        != align_sema::HttpUpgradeCarrierClass::None
                     || !self.tuple_element_ok(element)
                     || (self.is_abstract(Node::Tuple(id as u32))
                         && matches!(element, Scalar::Param(_)))
@@ -1168,7 +1190,10 @@ impl<'a> PlacementValidator<'a> {
                         && self.scalar_ok(err, mode)
                 }
             };
-            if !valid {
+            if !valid
+                || self.upgrade_carrier_class(Ty::Tagged(id as u32))
+                    == align_sema::HttpUpgradeCarrierClass::Forbidden
+            {
                 return false;
             }
         }
@@ -1180,12 +1205,19 @@ impl<'a> PlacementValidator<'a> {
             let allow_param = self.is_abstract(Node::Fn(id as u32));
             if !function.params.iter().all(|(mode, parameter)| {
                 let class = self.stream_carrier_class(align_sema::scalar_to_ty(*parameter));
+                let upgrade =
+                    self.upgrade_carrier_class(align_sema::scalar_to_ty(*parameter));
                 class != align_sema::HttpStreamCarrierClass::Forbidden
                     && !(mode.is_out() && class == align_sema::HttpStreamCarrierClass::Carrier)
+                    && upgrade != align_sema::HttpUpgradeCarrierClass::Forbidden
+                    && !(upgrade == align_sema::HttpUpgradeCarrierClass::Carrier
+                        && (*parameter != Scalar::HttpUpgrade || mode.is_out()))
                     && self.scalar_ok(*parameter, ScalarPlacement::FnParameter { allow_param })
             }) || !self.resolve_type_ok(function.ret, allow_param)
                 || self.stream_carrier_class(function.ret)
                     == align_sema::HttpStreamCarrierClass::Forbidden
+                || self.upgrade_carrier_class(function.ret)
+                    != align_sema::HttpUpgradeCarrierClass::None
             {
                 return false;
             }
@@ -1195,19 +1227,33 @@ impl<'a> PlacementValidator<'a> {
 
     fn source_functions_valid(&self) -> bool {
         for function in &self.program.fns {
-            if !function.params.iter().enumerate().all(|(index, &local)| {
+            if function.locals.iter().any(|local| {
+                !function.params.contains(&local.id)
+                    && self.upgrade_carrier_class(local.ty)
+                        == align_sema::HttpUpgradeCarrierClass::Forbidden
+            }) || !function.params.iter().enumerate().all(|(index, &local)| {
                 function
                     .locals
                     .get(local as usize)
                     .is_some_and(|local| {
                         let class = self.stream_carrier_class(local.ty);
+                        let upgrade = self.upgrade_carrier_class(local.ty);
                         class != align_sema::HttpStreamCarrierClass::Forbidden
                             && !(function.param_modes.get(index).is_some_and(|mode| mode.is_out())
                                 && class == align_sema::HttpStreamCarrierClass::Carrier)
+                            && upgrade != align_sema::HttpUpgradeCarrierClass::Forbidden
+                            && !(upgrade == align_sema::HttpUpgradeCarrierClass::Carrier
+                                && (local.ty != Ty::HttpUpgrade
+                                    || function
+                                        .param_modes
+                                        .get(index)
+                                        .is_some_and(|mode| mode.is_out())))
                             && self.stored_function_parameter_ok(function, index, local.ty)
                     })
             }) || self.stream_carrier_class(function.ret)
                     == align_sema::HttpStreamCarrierClass::Forbidden
+                || self.upgrade_carrier_class(function.ret)
+                    != align_sema::HttpUpgradeCarrierClass::None
                 || !self.source_function_type_ok(function.ret, false, true)
             {
                 return false;
@@ -1224,13 +1270,23 @@ impl<'a> PlacementValidator<'a> {
                 .enumerate()
                 .all(|(index, &parameter)| {
                     let class = self.stream_carrier_class(parameter);
+                    let upgrade = self.upgrade_carrier_class(parameter);
                     class != align_sema::HttpStreamCarrierClass::Forbidden
                         && !(function.param_modes.get(index).is_some_and(|mode| mode.is_out())
                             && class == align_sema::HttpStreamCarrierClass::Carrier)
+                        && upgrade != align_sema::HttpUpgradeCarrierClass::Forbidden
+                        && !(upgrade == align_sema::HttpUpgradeCarrierClass::Carrier
+                            && (parameter != Ty::HttpUpgrade
+                                || function
+                                    .param_modes
+                                    .get(index)
+                                    .is_some_and(|mode| mode.is_out())))
                         && self.source_function_type_ok(parameter, true, false)
                 })
                 || self.stream_carrier_class(function.ret)
                     == align_sema::HttpStreamCarrierClass::Forbidden
+                || self.upgrade_carrier_class(function.ret)
+                    != align_sema::HttpUpgradeCarrierClass::None
                 || !self.source_function_type_ok(function.ret, false, true)
             {
                 return false;
@@ -1499,6 +1555,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::HttpReadStream
             | Scalar::HttpSseStream
             | Scalar::ResponseBuilder
@@ -1662,7 +1719,8 @@ impl<'a> PlacementValidator<'a> {
             | Ty::File
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
-            | Ty::HttpStream => true,
+            | Ty::HttpStream
+            | Ty::HttpUpgrade => true,
             Ty::HttpReadStream | Ty::HttpSseStream => true,
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
@@ -1764,6 +1822,9 @@ impl<'a> PlacementValidator<'a> {
             return self.source_function_type_ok(ty, true, false);
         }
         if self.stream_carrier_class(ty) != align_sema::HttpStreamCarrierClass::None {
+            return false;
+        }
+        if self.upgrade_carrier_class(ty) != align_sema::HttpUpgradeCarrierClass::None {
             return false;
         }
         match ty {
@@ -2165,6 +2226,7 @@ impl<'a> Validator<'a> {
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
             | Ty::HttpHeaders
@@ -2227,6 +2289,7 @@ impl<'a> Validator<'a> {
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::HttpReadStream
             | Scalar::HttpSseStream
             | Scalar::RunOutput => true,
@@ -3206,6 +3269,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
                 | Ty::HttpSseStream
             | Ty::JsonDoc => true,
@@ -3515,6 +3579,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::HttpReadStream
                 | Scalar::HttpSseStream
             | Scalar::RunOutput => true,
@@ -4334,12 +4399,21 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpCtxPath { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpHeadersCount { .. }
+            | hir::ExprKind::HttpHeadersTokensValid { .. }
+            | hir::ExprKind::HttpHeadersContainsToken { .. }
+            | hir::ExprKind::HttpCtxUpgradeReady { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
             | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpRespondUpgrade { .. }
+            | hir::ExprKind::HttpUpgradeReadExact { .. }
+            | hir::ExprKind::HttpUpgradeWrite { .. }
+            | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
             | hir::ExprKind::HttpStreamReject { .. }
@@ -4679,12 +4753,21 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpCtxPath { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpHeadersCount { .. }
+            | hir::ExprKind::HttpHeadersTokensValid { .. }
+            | hir::ExprKind::HttpHeadersContainsToken { .. }
+            | hir::ExprKind::HttpCtxUpgradeReady { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
             | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpRespondUpgrade { .. }
+            | hir::ExprKind::HttpUpgradeReadExact { .. }
+            | hir::ExprKind::HttpUpgradeWrite { .. }
+            | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::CryptoCtEqual { .. }
@@ -9023,20 +9106,39 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::HttpCtxMethod { ctx }
             | hir::ExprKind::HttpCtxPath { ctx }
             | hir::ExprKind::HttpCtxHeaders { ctx }
-            | hir::ExprKind::HttpCtxBody { ctx } => {
+            | hir::ExprKind::HttpCtxBody { ctx }
+            | hir::ExprKind::HttpCtxUpgradeReady { ctx } => {
                 if !self.http_request_ctx_place(ctx, context) || ctx.ty != Ty::HttpRequestCtx {
                     return None;
                 }
                 let ty = match kind {
                     hir::ExprKind::HttpCtxMethod { .. } | hir::ExprKind::HttpCtxPath { .. } => Ty::Str,
                     hir::ExprKind::HttpCtxHeaders { .. } => Ty::HttpHeaders,
-                    _ => Ty::Slice(u8_scalar),
+                    hir::ExprKind::HttpCtxBody { .. } => Ty::Slice(u8_scalar),
+                    _ => Ty::Bool,
                 };
                 strict(ty, &[ctx])
             }
             hir::ExprKind::HttpCtxHeader { headers, name } => {
                 (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str)
                     .then(|| strict(Ty::Option(Scalar::Str), &[headers, name]))?
+            }
+            hir::ExprKind::HttpHeadersCount { headers, name } => {
+                (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str)
+                    .then(|| strict(i64, &[headers, name]))?
+            }
+            hir::ExprKind::HttpHeadersTokensValid { headers, name } => {
+                (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Bool, &[headers, name]))?
+            }
+            hir::ExprKind::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+                ..
+            } => {
+                (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str && token.ty == Ty::Str)
+                    .then(|| strict(Ty::Bool, &[headers, name, token]))?
             }
             hir::ExprKind::HttpResponseBuilder { status } => {
                 (status.ty == i64).then(|| strict(Ty::ResponseBuilder, &[status]))?
@@ -9065,6 +9167,43 @@ impl<'a> BodyValidator<'a> {
                     && ctx.ty == Ty::HttpRequestCtx
                     && rb.ty == Ty::ResponseBuilder)
                     .then(|| result(Ty::HttpStream, &[ctx, rb]))?
+            }
+            hir::ExprKind::HttpRespondUpgrade { ctx, rb } => {
+                (self.http_request_ctx_place(ctx, context)
+                    && ctx.ty == Ty::HttpRequestCtx
+                    && rb.ty == Ty::ResponseBuilder)
+                    .then(|| result(Ty::HttpUpgrade, &[ctx, rb]))?
+            }
+            hir::ExprKind::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                (local(upgrade, Ty::HttpUpgrade)
+                    && upgrade.ty == Ty::HttpUpgrade
+                    && mutable_local(out, Ty::Buffer)
+                    && out.ty == Ty::Buffer
+                    && count.ty == i64)
+                    .then(|| result(Ty::Unit, &[upgrade, out, count]))?
+            }
+            hir::ExprKind::HttpUpgradeWrite { upgrade, data } => {
+                (local(upgrade, Ty::HttpUpgrade)
+                    && upgrade.ty == Ty::HttpUpgrade
+                    && byte_view(data.ty))
+                    .then(|| result(Ty::Unit, &[upgrade, data]))?
+            }
+            hir::ExprKind::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                (local(upgrade, Ty::HttpUpgrade)
+                    && upgrade.ty == Ty::HttpUpgrade
+                    && timeout_ns.ty == i64)
+                    .then(|| result(Ty::Unit, &[upgrade, timeout_ns]))?
+            }
+            hir::ExprKind::HttpUpgradeShutdown { upgrade } => {
+                (local(upgrade, Ty::HttpUpgrade) && upgrade.ty == Ty::HttpUpgrade)
+                    .then(|| result(Ty::Unit, &[upgrade]))?
             }
             hir::ExprKind::HttpStreamSend { stream, chunk, .. } => {
                 (local(stream, Ty::HttpStream) && stream.ty == Ty::HttpStream && byte_view(chunk.ty))
@@ -9257,6 +9396,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
                 | Ty::HttpSseStream
             | Ty::Param(_)

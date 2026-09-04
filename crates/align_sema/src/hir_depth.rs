@@ -392,6 +392,10 @@ fn walk_body_records<'a>(
                 | ExprKind::ArrayBuilderBuild(expr) => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }
+                ExprKind::HttpCtxUpgradeReady { ctx: expr }
+                | ExprKind::HttpUpgradeShutdown { upgrade: expr } => {
+                    work.push((BodyRecord::Expr(expr), child_depth));
+                }
                 ExprKind::CloneIn { value, region } => {
                     work.push((BodyRecord::Expr(value), child_depth));
                     work.push((BodyRecord::Expr(region), child_depth));
@@ -686,9 +690,26 @@ fn walk_body_records<'a>(
                     headers: lhs,
                     name: rhs,
                 }
+                | ExprKind::HttpHeadersCount {
+                    headers: lhs,
+                    name: rhs,
+                }
+                | ExprKind::HttpHeadersTokensValid {
+                    headers: lhs,
+                    name: rhs,
+                }
                 | ExprKind::HttpRbBody { rb: lhs, data: rhs }
                 | ExprKind::HttpRespond { ctx: lhs, rb: rhs }
                 | ExprKind::HttpRespondStream { ctx: lhs, rb: rhs }
+                | ExprKind::HttpRespondUpgrade { ctx: lhs, rb: rhs }
+                | ExprKind::HttpUpgradeWrite {
+                    upgrade: lhs,
+                    data: rhs,
+                }
+                | ExprKind::HttpUpgradeDeadline {
+                    upgrade: lhs,
+                    timeout_ns: rhs,
+                }
                 | ExprKind::HttpStreamSend {
                     stream: lhs,
                     chunk: rhs,
@@ -952,6 +973,17 @@ fn walk_body_records<'a>(
                     rb: ptr,
                     name: offset,
                     value,
+                }
+                | ExprKind::HttpHeadersContainsToken {
+                    headers: ptr,
+                    name: offset,
+                    token: value,
+                    ..
+                }
+                | ExprKind::HttpUpgradeReadExact {
+                    upgrade: ptr,
+                    out: offset,
+                    count: value,
                 } => {
                     work.push((BodyRecord::Expr(ptr), child_depth));
                     work.push((BodyRecord::Expr(offset), child_depth));

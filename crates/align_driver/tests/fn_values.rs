@@ -144,10 +144,11 @@ fn closure_multiple_captures() {
 
 #[test]
 fn non_scalar_signature_rejected_as_value() {
-    // slice ①: only scalar params/return may become a function value.
+    // Borrowed slices are now valid parameters for package callbacks, but returning one through a
+    // function value remains deferred until function values carry a return-region contract.
     assert!(check_errs(
         "fv-nonscalar",
-        "fn sum(xs: slice<i64>) -> i64 = 0\n\nfn main() -> i32 {\n  f := sum\n  return 0\n}\n"
+        "fn view(xs: slice<i64>) -> slice<i64> = xs\n\nfn main() -> i32 {\n  f := view\n  return 0\n}\n"
     ));
 }
 

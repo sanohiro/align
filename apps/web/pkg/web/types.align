@@ -35,9 +35,28 @@ module pkg.web.types
 // `web.header(c, name)` forwards to `c.headers.get(name)`; pkg.web ships NO lookup of its own (a
 // second RFC 9110 implementation here would be against One way). `http_headers` is a global surface
 // type name, so this module stays the dependency-free leaf it is designed to be.
-pub Ctx { method: str, path: str, query: str, prefix: str, pattern: str, body: slice<u8>, headers: http_headers }
+pub Ctx { method: str, path: str, query: str, prefix: str, pattern: str, body: slice<u8>, headers: http_headers, upgrade_ready: bool }
 
-// The two handler shapes, one route table (the Align-idiomatic or-kind — a sum type, NOT two fn
+// The protocol-neutral HTTP Upgrade decision. `pkg.web` owns only the routing and transfer;
+// protocol packages build the checked 101 response and interpret the resulting byte stream.
+pub UpgradeAccepted {
+  response: response_builder,
+  selected: string,
+}
+
+pub UpgradeDecision {
+  Accept(UpgradeAccepted),
+  Reject(response_builder),
+  Failed(Error),
+}
+
+pub UpgradeHandler {
+  values_valid: bool,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
+}
+
+// Three handler shapes, one route table (the Align-idiomatic or-kind — a sum type, NOT parallel fn
 // fields with filler sentinels, and NOT a second route table that would split priority/405 across
 // tables):
 //   - `Respond` — the unary form: BUILD one complete response and hand it back; `serve` writes it
@@ -47,11 +66,15 @@ pub Ctx { method: str, path: str, query: str, prefix: str, pattern: str, body: s
 //     the head is committed — exactly when the framework's ability to answer differently
 //     (404/405/500) has ended anyway. Pre-stream validation gets its 4xx window via `s.reject(rb)`;
 //     after the first send, an `Err` just ends the stream (drop closes the fd).
-// A fn-only sum type is **Copy** (each payload is a 16-byte `{fn_ptr, env_ptr}` value), so `Route`
-// stays a Copy struct.
+//   - `Upgrade` — validate opaque route values before bind, prepare one HTTP Upgrade decision after
+//     middleware, then transfer the byte stream and owned selected metadata to the protocol pump.
+// Every payload is Copy: Respond/Stream contain one 16-byte `{fn_ptr, env_ptr}` value and Upgrade
+// contains one bool plus two such function values in one Copy record. Therefore `Handler` and
+// `Route` stay Copy.
 pub Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+  Upgrade(UpgradeHandler),
 }
 
 // A pre-handler verdict. `Result<Option<response_builder>, Error>` cannot be represented by the
@@ -84,4 +107,5 @@ pub Route {
   middleware: Option<MiddlewareList>,
   stream_type: str,
   handler: Handler,
+  upgrade_values: slice<str>,
 }

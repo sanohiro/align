@@ -184,11 +184,12 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 // types
 web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
              pattern, the body view, and the detached header-table view). It owns nothing; `serve`
-             retains the request handle across prepare and pump. The pending Upgrade capability adds
-             one trailing Copy `upgrade_ready: bool`, true exactly for an HTTP/1.1 request with no
-             parser residual. Views remain valid for the handler/pump call.
-Route      — Copy struct { method: str, pattern: str,
-                           handler: fn(Ctx) -> Result<response_builder, Error> }
+             retains the request handle across prepare and pump. The trailing Copy
+             `upgrade_ready: bool` is true exactly for an HTTP/1.1 request with no parser residual.
+             Views remain valid for the handler/pump call.
+Handler    — Copy sum of Respond, Stream, and Upgrade(UpgradeHandler).
+Route      — Copy struct { method, prefix, pattern, middleware, stream_type, handler,
+                           upgrade_values }; the exact types and callback shapes are recorded below.
 ```
 
 **Pattern syntax (Fiber/httprouter lineage — settled by the restored reference):** `/`-separated;
@@ -355,9 +356,13 @@ method family on one handle. pkg.web ships NO wrapper (the `web.header` no-dupli
 Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+  Upgrade(UpgradeHandler),
 }
-Route { method: str, pattern: str, stream_type: str, handler: Handler }
-//   stream_type: the stream head's Content-Type; "" on Respond routes (never read).
+Route {
+  method: str, prefix: str, pattern: str, middleware: Option<MiddlewareList>,
+  stream_type: str, handler: Handler, upgrade_values: slice<str>,
+}
+//   stream_type: the stream head's Content-Type; "" on Respond/Upgrade routes (never read).
 ```
 
 One table, one dispatch: stream routes go through the same radix tree, the same method resolution,
@@ -697,7 +702,7 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 `from` guards. The `upload` handler above is EXTRACTED from this file and compiled against the real
 `apps/web/pkg/**`, so a documented example that stops compiling fails the suite.
 
-## Planned protocol-neutral Upgrade seam for `pkg.ws`
+## Protocol-neutral Upgrade seam for `pkg.ws` (shipped)
 
 `pkg.ws` is a separate package, but it must share this package's route table, middleware order,
 request views, and prefork worker ownership. Its design ledger adds one protocol-neutral extension
@@ -711,7 +716,7 @@ pub UpgradeDecision {
   Failed(Error)
 }
 pub UpgradeHandler {
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
   pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
 }
@@ -723,17 +728,20 @@ is:
 
 ```text
 pkg.web.upgrade(method: str, pattern: str, values: slice<str>,
-  validate: fn(slice<str>) -> bool,
+  values_valid: bool,
   prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
   pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>) -> Route
 ```
 
-The constructor is Pure and protocol-blind. `values` are retained Copy configuration. The supplied
-noncapturing `validate` function must be inferred Pure. Existing pre-bind route validation invokes
-it once per Upgrade row after common method/pattern/prefix and handler-storage checks but before
-segment and pair checks; false aborts with exact text
+The constructor is Pure and protocol-blind. `values` are retained Copy configuration, while the
+protocol package computes `values_valid` exactly once before the call. Any side effects in a direct
+caller's boolean expression are ordinary source-visible argument evaluation; no validation
+callback is retained or replayed. Existing pre-bind route validation reads the stored boolean once
+per Upgrade row after common method/pattern/prefix and handler-storage checks but before segment
+and pair checks; false aborts with exact text
 `pkg.web: route N (METHOD PATTERN) has invalid upgrade values`. Thus a protocol package can keep its
-constructor Pure while dynamic configuration is still rejected before bind/tree construction.
+constructor Pure while dynamic configuration is still rejected before bind/tree construction,
+without requiring an effect-qualified function-value type that the language does not expose.
 After the existing route and middleware decision, prepare runs once. Reject uses ordinary
 `ctx.respond`; Failed uses the existing error log plus fixed 500; Accept passes its builder to
 `ctx.respond_upgrade`. Only a successful fully written 101 invokes pump, which owns the transport
@@ -744,7 +752,7 @@ fails. Pump `Ok` emits no log; pump
 `Err` uses the existing Stream method/path/error diagnostic and cannot send another HTTP response.
 HEAD fallback now tests the
 actual `Respond` variant rather than the historical `stream_type == ""` proxy; Stream and Upgrade
-GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values` and all callbacks
+GET routes remain 405 for implicit HEAD. Grouping copies `upgrade_values`, `values_valid`, and both callbacks
 unchanged. Startup route validation requires empty `stream_type` for Respond/Upgrade and nonempty
 only for Stream. `Ctx` gains the exact trailing `upgrade_ready: bool`, copied from the new
 protocol-neutral `http_request_ctx.upgrade_ready()` query before middleware; `pkg.ws` uses false for
@@ -753,8 +761,7 @@ the ordinary empty-body 400 path, while `respond_upgrade` repeats its version/re
 An open Upgrade occupies one sequential worker exactly like Stream. No second listener, router,
 worker pool, hidden task, app registry, or WebSocket rule enters this package. Existing hot paths
 perform only the additional closed Handler tag match; the zero-allocation routing contract remains.
-This seam and `pkg.ws` activate together; it is not shipped by this design document alone. Exact
-cross-package ledger and closure matrix: `ws.md`.
+This seam is active with `pkg.ws`. Exact cross-package ledger and closure matrix: `ws.md`.
 
 ## Slices (F3 of the plan)
 
@@ -770,8 +777,8 @@ cross-package ledger and closure matrix: `ws.md`.
   (`router.validate`, pure diagnosis; `serve` prints to stderr + `process.abort()` before binding
   — the error policy's "startup abort, not Err"): known uppercase method or `""`, leading-`/`
   pattern, named `:`/`*` segments, `*` tail-only, no parameter name twice in a pattern, a
-  non-empty `stream_type` on every Stream row (an empty one would emit a blank `Content-Type:`,
-  and `stream_type == ""` is the invariant the HEAD fallback reads as "a Respond row"), and no
+  non-empty `stream_type` on every Stream row (an empty one would emit a blank `Content-Type:`),
+  empty `stream_type` on Respond/Upgrade rows, and no
   duplicate PATH CLAIM the later row can never win — same method twice (also what duplicated the
   405 `Allow` join) or any row after an any-method route on that claim; parameter names don't
   affect a claim (`/a/:x` ≡ `/a/:y`). Specific-then-`any` on one pattern stays legal (the fallback

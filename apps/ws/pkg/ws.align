@@ -1,0 +1,621 @@
+module pkg.ws
+
+import std.encoding
+import std.http
+import std.process
+import pkg.web
+import pkg.web.types
+
+MAX_MESSAGE_BYTES: i64 := 536870912
+SOURCE_WORK_BYTES: i64 := 1048576
+SCRATCH_BYTES: i64 := 32768
+MAX_TIMEOUT_NS: i64 := 86400000000000
+WEBSOCKET_GUID: str := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+pub Message {
+  Text(string)
+  Binary(array<u8>)
+  Close(Close)
+}
+
+pub Close {
+  code: Option<i64>,
+  reason: string,
+}
+
+FrameHeader {
+  fin: bool,
+  opcode: u8,
+  length: i64,
+  mask0: u8,
+  mask1: u8,
+  mask2: u8,
+  mask3: u8,
+  source_left: i64,
+}
+
+HeaderRead {
+  Ready(FrameHeader)
+  Protocol
+  Limit
+  Failed(Error)
+}
+
+CloseParse {
+  Valid(Close)
+  Protocol
+  TextError
+}
+
+fn token_byte(byte: u8) -> bool =
+  (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+    || (byte >= 97 && byte <= 122) || byte == 33 || byte == 35 || byte == 36
+    || byte == 37 || byte == 38 || byte == 39 || byte == 42 || byte == 43
+    || byte == 45 || byte == 46 || byte == 94 || byte == 95 || byte == 96
+    || byte == 124 || byte == 126
+
+fn token_valid(value: str) -> bool {
+  if value.len() == 0 { return false }
+  bytes := value.bytes()
+  mut index := 0
+  loop {
+    if index >= bytes.len() { break true }
+    if !token_byte(bytes[index]) { break false }
+    index = index + 1
+  }
+}
+
+fn protocols_valid(protocols: slice<str>) -> bool {
+  mut index := 0
+  loop {
+    if index >= protocols.len() { break true }
+    protocol := protocols[index]
+    if !token_valid(protocol) { break false }
+    mut earlier := 0
+    mut duplicate := false
+    loop {
+      if earlier >= index { break }
+      if protocols[earlier] == protocol {
+        duplicate = true
+        break
+      }
+      earlier = earlier + 1
+    }
+    if duplicate { break false }
+    index = index + 1
+  }
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+  if byte >= 65 && byte <= 90 { return Some(byte - 65) }
+  if byte >= 97 && byte <= 122 { return Some(byte - 97 + 26) }
+  if byte >= 48 && byte <= 57 { return Some(byte - 48 + 52) }
+  if byte == 43 { return Some(62) }
+  if byte == 47 { return Some(63) }
+  return None
+}
+
+fn canonical_websocket_key(key: str) -> bool {
+  if key.len() != 24 { return false }
+  bytes := key.bytes()
+  mut index := 0
+  loop {
+    if index >= 22 { break }
+    match base64_value(bytes[index]) {
+      Some(_) => {}
+      None => { return false }
+    }
+    index = index + 1
+  }
+  if bytes[22] != 61 || bytes[23] != 61 { return false }
+  final_value := base64_value(bytes[21]) else { return false }
+  return (final_value & 15) == 0
+}
+
+fn rol1(value: u32) -> u32 = (value << 1) | (value >> 31)
+fn rol5(value: u32) -> u32 = (value << 5) | (value >> 27)
+fn rol30(value: u32) -> u32 = (value << 30) | (value >> 2)
+
+fn accept_input_byte(key: slice<u8>, guid: slice<u8>, index: i64) -> u8 {
+  if index < 24 { return key[index] }
+  return guid[index - 24]
+}
+
+// SHA-1 is private and specialized to the fixed 60-byte WebSocket accept preimage.
+fn websocket_accept(key: str) -> string {
+  key_bytes := key.bytes()
+  guid_bytes := WEBSOCKET_GUID.bytes()
+  mut schedule_builder: array_builder<u32> := array_builder()
+  mut fill := 0
+  loop {
+    if fill >= 80 { break }
+    schedule_builder.push(0)
+    fill = fill + 1
+  }
+  mut schedule := schedule_builder.build()
+  mut h0: u32 := 0x67452301
+  mut h1: u32 := 0xEFCDAB89
+  mut h2: u32 := 0x98BADCFE
+  mut h3: u32 := 0x10325476
+  mut h4: u32 := 0xC3D2E1F0
+  mut block := 0
+  loop {
+    if block >= 2 { break }
+    mut word := 0
+    loop {
+      if word >= 16 { break }
+      mut value: u32 := 0
+      if block == 0 {
+        if word < 15 {
+          base := word * 4
+          value = ((accept_input_byte(key_bytes, guid_bytes, base) as u32) << 24)
+            | ((accept_input_byte(key_bytes, guid_bytes, base + 1) as u32) << 16)
+            | ((accept_input_byte(key_bytes, guid_bytes, base + 2) as u32) << 8)
+            | (accept_input_byte(key_bytes, guid_bytes, base + 3) as u32)
+        } else {
+          value = 0x80000000
+        }
+      } else if word == 15 {
+        value = 480
+      }
+      schedule[word] = value
+      word = word + 1
+    }
+    mut extend := 16
+    loop {
+      if extend >= 80 { break }
+      schedule[extend] = rol1(schedule[extend - 3] ^ schedule[extend - 8]
+        ^ schedule[extend - 14] ^ schedule[extend - 16])
+      extend = extend + 1
+    }
+    mut a := h0
+    mut b := h1
+    mut c := h2
+    mut d := h3
+    mut e := h4
+    mut round := 0
+    loop {
+      if round >= 80 { break }
+      mut f: u32 := 0
+      mut k: u32 := 0
+      if round < 20 {
+        f = (b & c) | ((~b) & d)
+        k = 0x5A827999
+      } else if round < 40 {
+        f = b ^ c ^ d
+        k = 0x6ED9EBA1
+      } else if round < 60 {
+        f = (b & c) | (b & d) | (c & d)
+        k = 0x8F1BBCDC
+      } else {
+        f = b ^ c ^ d
+        k = 0xCA62C1D6
+      }
+      temp := rol5(a) + f + e + k + schedule[round]
+      e = d
+      d = c
+      c = rol30(b)
+      b = a
+      a = temp
+      round = round + 1
+    }
+    h0 = h0 + a
+    h1 = h1 + b
+    h2 = h2 + c
+    h3 = h3 + d
+    h4 = h4 + e
+    block = block + 1
+  }
+  mut digest := buffer(20)
+  digest.put_u32_be(h0)
+  digest.put_u32_be(h1)
+  digest.put_u32_be(h2)
+  digest.put_u32_be(h3)
+  digest.put_u32_be(h4)
+  return encoding.base64_encode(digest.bytes())
+}
+
+fn reject(version: bool) -> pkg.web.types.UpgradeDecision {
+  response := http.response(400)
+  if version { response.header("Sec-WebSocket-Version", "13") }
+  return pkg.web.types.UpgradeDecision.Reject(response)
+}
+
+fn selected_protocol(c: pkg.web.types.Ctx, protocols: slice<str>) -> Option<string> {
+  if protocols.len() == 0 { return Some("".clone()) }
+  mut index := 0
+  loop {
+    if index >= protocols.len() { break }
+    protocol := protocols[index]
+    if c.headers.contains_token_exact("Sec-WebSocket-Protocol", protocol) {
+      return Some(protocol.clone())
+    }
+    index = index + 1
+  }
+  return None
+}
+
+fn prepare(c: pkg.web.types.Ctx, protocols: slice<str>) -> pkg.web.types.UpgradeDecision {
+  if c.method != "GET" || !c.upgrade_ready || c.body.len() != 0 { return reject(false) }
+  if c.headers.count("Host") != 1 { return reject(false) }
+  host := c.headers.get("Host") else { return reject(false) }
+  if host.len() == 0 { return reject(false) }
+  if !c.headers.tokens_valid("Upgrade")
+    || !c.headers.contains_token("Upgrade", "websocket") { return reject(false) }
+  if !c.headers.tokens_valid("Connection")
+    || !c.headers.contains_token("Connection", "Upgrade") { return reject(false) }
+  if c.headers.count("Sec-WebSocket-Version") != 1 { return reject(true) }
+  version := c.headers.get("Sec-WebSocket-Version") else { return reject(true) }
+  if version != "13" { return reject(true) }
+  if c.headers.count("Sec-WebSocket-Key") != 1 { return reject(false) }
+  key := c.headers.get("Sec-WebSocket-Key") else { return reject(false) }
+  if !canonical_websocket_key(key) { return reject(false) }
+  if !c.headers.tokens_valid("Sec-WebSocket-Protocol") { return reject(false) }
+  selected := selected_protocol(c, protocols) else { return reject(false) }
+  accept := websocket_accept(key)
+  response := http.response(101)
+  response.header("Upgrade", "websocket")
+  response.header("Connection", "Upgrade")
+  response.header("Sec-WebSocket-Accept", accept)
+  if selected.len() > 0 { response.header("Sec-WebSocket-Protocol", selected) }
+  return pkg.web.types.UpgradeDecision.Accept(pkg.web.types.UpgradeAccepted {
+    response: response,
+    selected: selected,
+  })
+}
+
+pub fn route(
+  pattern: str,
+  protocols: slice<str>,
+  pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>,
+) -> pkg.web.types.Route =
+  pkg.web.upgrade("GET", pattern, protocols, protocols_valid(protocols), prepare, pump)
+
+fn write_frame_head(borrow mut connection: http_upgrade, opcode: u8, length: i64) -> Result<(), Error> {
+  mut header := [0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+  header[0] = 128 | opcode
+  mut count := 2
+  if length <= 125 {
+    header[1] = length as u8
+  } else if length <= 65535 {
+    header[1] = 126
+    header[2] = (length >> 8) as u8
+    header[3] = length as u8
+    count = 4
+  } else {
+    header[1] = 127
+    header[2] = (length >> 56) as u8
+    header[3] = (length >> 48) as u8
+    header[4] = (length >> 40) as u8
+    header[5] = (length >> 32) as u8
+    header[6] = (length >> 24) as u8
+    header[7] = (length >> 16) as u8
+    header[8] = (length >> 8) as u8
+    header[9] = length as u8
+    count = 10
+  }
+  return connection.write(header[0..count])
+}
+
+fn write_frame(
+  borrow mut connection: http_upgrade,
+  opcode: u8,
+  payload: slice<u8>,
+) -> Result<(), Error> {
+  write_frame_head(connection, opcode, payload.len())?
+  return connection.write(payload)
+}
+
+fn send_close_frame(
+  borrow mut connection: http_upgrade,
+  code: i64,
+  reason: str,
+) -> Result<(), Error> {
+  write_frame_head(connection, 8, reason.len() + 2)?
+  code_bytes := [(code >> 8) as u8, code as u8]
+  connection.write(code_bytes[0..2])?
+  return connection.write(reason.bytes())
+}
+
+fn terminal_error(borrow mut connection: http_upgrade, code: i64) -> Error {
+  match send_close_frame(connection, code, "") {
+    Err(error) => {
+      connection.shutdown() else {}
+      return error
+    }
+    Ok(_) => {
+      match connection.shutdown() {
+        Err(error) => { return error }
+        Ok(_) => { return Error.Invalid }
+      }
+    }
+  }
+}
+
+fn shutdown_invalid(borrow mut connection: http_upgrade) -> Error {
+  match connection.shutdown() {
+    Err(error) => { return error }
+    Ok(_) => { return Error.Invalid }
+  }
+}
+
+fn read_header(
+  borrow mut connection: http_upgrade,
+  borrow mut scratch: buffer,
+  source_left: i64,
+) -> HeaderRead {
+  if source_left < 6 { return HeaderRead.Limit }
+  mut remaining := source_left - 6
+  match connection.read_exact(scratch, 2) {
+    Err(error) => { return HeaderRead.Failed(error) }
+    Ok(_) => {}
+  }
+  first := scratch.bytes()
+  byte0 := first[0]
+  byte1 := first[1]
+  fin := (byte0 & 128) != 0
+  if (byte0 & 112) != 0 || (byte1 & 128) == 0 { return HeaderRead.Protocol }
+  opcode := byte0 & 15
+  if opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10 {
+    return HeaderRead.Protocol
+  }
+  short_length := byte1 & 127
+  mut extension := 0
+  if short_length == 126 { extension = 2 }
+  if short_length == 127 { extension = 8 }
+  if remaining < extension { return HeaderRead.Limit }
+  remaining = remaining - extension
+  match connection.read_exact(scratch, extension + 4) {
+    Err(error) => { return HeaderRead.Failed(error) }
+    Ok(_) => {}
+  }
+  tail := scratch.bytes()
+  mut length := short_length as i64
+  if short_length == 126 {
+    length = tail.u16_be(0) as i64
+    if length < 126 { return HeaderRead.Protocol }
+  }
+  if short_length == 127 {
+    if (tail[0] & 128) != 0 { return HeaderRead.Protocol }
+    length = tail.u64_be(0) as i64
+    if length < 65536 { return HeaderRead.Protocol }
+  }
+  control := opcode >= 8
+  if control && (!fin || length > 125) { return HeaderRead.Protocol }
+  return HeaderRead.Ready(FrameHeader {
+    fin: fin,
+    opcode: opcode,
+    length: length,
+    mask0: tail[extension],
+    mask1: tail[extension + 1],
+    mask2: tail[extension + 2],
+    mask3: tail[extension + 3],
+    source_left: remaining,
+  })
+}
+
+fn mask_byte(header: FrameHeader, offset: i64) -> u8 {
+  slot := offset % 4
+  if slot == 0 { return header.mask0 }
+  if slot == 1 { return header.mask1 }
+  if slot == 2 { return header.mask2 }
+  return header.mask3
+}
+
+fn read_data_payload(
+  borrow mut connection: http_upgrade,
+  borrow mut scratch: buffer,
+  borrow mut output: array_builder<u8>,
+  header: FrameHeader,
+) -> Result<(), Error> {
+  mut offset := 0
+  loop {
+    if offset >= header.length { break }
+    left := header.length - offset
+    count := if left < SCRATCH_BYTES { left } else { SCRATCH_BYTES }
+    connection.read_exact(scratch, count)?
+    mut bytes := scratch.bytes()
+    mut index := 0
+    loop {
+      if index >= bytes.len() { break }
+      bytes[index] = bytes[index] ^ mask_byte(header, offset + index)
+      index = index + 1
+    }
+    output.append(bytes)
+    offset = offset + count
+  }
+  return Ok(())
+}
+
+fn read_control_payload(
+  borrow mut connection: http_upgrade,
+  borrow mut scratch: buffer,
+  header: FrameHeader,
+) -> Result<(), Error> {
+  connection.read_exact(scratch, header.length)?
+  mut bytes := scratch.bytes()
+  mut index := 0
+  loop {
+    if index >= bytes.len() { break }
+    bytes[index] = bytes[index] ^ mask_byte(header, index)
+    index = index + 1
+  }
+  return Ok(())
+}
+
+fn received_close_code(code: i64) -> bool =
+  code == 1000 || code == 1001 || code == 1002 || code == 1003 || code == 1007
+    || code == 1008 || code == 1009 || code == 1010 || code == 1011
+    || code == 1012 || code == 1013 || code == 1014 || code == 3000
+    || code == 3003 || code == 3008 || (code >= 4000 && code <= 4999)
+
+fn sent_close_code(code: i64) -> bool = received_close_code(code) && code != 1010
+
+fn parse_close(payload: slice<u8>) -> CloseParse {
+  if payload.len() == 0 {
+    return CloseParse.Valid(Close { code: None, reason: "".clone() })
+  }
+  if payload.len() == 1 { return CloseParse.Protocol }
+  code := payload.u16_be(0) as i64
+  if !received_close_code(code) { return CloseParse.Protocol }
+  reason_view := payload[2..payload.len()].as_str() else { return CloseParse.TextError }
+  return CloseParse.Valid(Close { code: Some(code), reason: reason_view.clone() })
+}
+
+pub fn receive(
+  borrow mut connection: http_upgrade,
+  max_message_bytes: i64,
+) -> Result<Message, Error> {
+  if max_message_bytes < 0 || max_message_bytes > MAX_MESSAGE_BYTES { process.abort() }
+  mut scratch := buffer(SCRATCH_BYTES)
+  mut output: array_builder<u8> := array_builder()
+  mut message_bytes := 0
+  mut source_left := SOURCE_WORK_BYTES
+  mut started := false
+  mut text := false
+  loop {
+    header := match read_header(connection, scratch, source_left) {
+      Ready(value) => value
+      Protocol => { return Err(terminal_error(connection, 1002)) }
+      Limit => { return Err(terminal_error(connection, 1009)) }
+      Failed(error) => { return Err(error) }
+    }
+    source_left = header.source_left
+    if header.opcode >= 8 {
+      if source_left < header.length { return Err(terminal_error(connection, 1009)) }
+      source_left = source_left - header.length
+      match read_control_payload(connection, scratch, header) {
+        Err(error) => { return Err(error) }
+        Ok(_) => {}
+      }
+      control := scratch.bytes()
+      if header.opcode == 9 {
+        match write_frame(connection, 10, control) {
+          Err(error) => { return Err(error) }
+          Ok(_) => {}
+        }
+      } else if header.opcode == 8 {
+        parsed := parse_close(control)
+        match parsed {
+          Protocol => { return Err(terminal_error(connection, 1002)) }
+          TextError => { return Err(terminal_error(connection, 1007)) }
+          Valid(close) => {
+            mut client_only := false
+            match close.code {
+              Some(value) => { client_only = value == 1010 }
+              None => {}
+            }
+            if client_only { write_frame(connection, 8, [])? } else {
+              write_frame(connection, 8, control)?
+            }
+            match connection.shutdown() {
+              Err(error) => { return Err(error) }
+              Ok(_) => { return Ok(Message.Close(close)) }
+            }
+          }
+        }
+      }
+    } else {
+      if header.opcode == 0 {
+        if !started { return Err(terminal_error(connection, 1002)) }
+      } else {
+        if started { return Err(terminal_error(connection, 1002)) }
+        started = true
+        text = header.opcode == 1
+      }
+      if header.length > max_message_bytes - message_bytes {
+        return Err(terminal_error(connection, 1009))
+      }
+      match read_data_payload(connection, scratch, output, header) {
+        Err(error) => { return Err(error) }
+        Ok(_) => {}
+      }
+      message_bytes = message_bytes + header.length
+      if header.fin {
+        bytes := output.build()
+        if text {
+          view := bytes[0..bytes.len()].as_str() else {
+            return Err(terminal_error(connection, 1007))
+          }
+          return Ok(Message.Text(view.clone()))
+        }
+        return Ok(Message.Binary(bytes))
+      }
+    }
+  }
+}
+
+pub fn send_text(borrow mut connection: http_upgrade, text: str) -> Result<(), Error> =
+  write_frame(connection, 1, text.bytes())
+
+pub fn send_binary(borrow mut connection: http_upgrade, data: slice<u8>) -> Result<(), Error> =
+  write_frame(connection, 2, data)
+
+fn discard_payload(
+  borrow mut connection: http_upgrade,
+  borrow mut scratch: buffer,
+  header: FrameHeader,
+) -> Result<(), Error> {
+  mut offset := 0
+  loop {
+    if offset >= header.length { break }
+    left := header.length - offset
+    count := if left < 125 { left } else { 125 }
+    connection.read_exact(scratch, count)?
+    offset = offset + count
+  }
+  return Ok(())
+}
+
+pub fn close(
+  connection: http_upgrade,
+  code: i64,
+  reason: str,
+  timeout_ns: i64,
+) -> Result<(), Error> {
+  if !sent_close_code(code) || reason.len() > 123
+    || timeout_ns < 1 || timeout_ns > MAX_TIMEOUT_NS { process.abort() }
+  mut transport := connection
+  transport.deadline(timeout_ns)?
+  send_close_frame(transport, code, reason)?
+  mut scratch := buffer(125)
+  mut started := false
+  loop {
+    header := match read_header(transport, scratch, SOURCE_WORK_BYTES) {
+      Ready(value) => value
+      Protocol => { return Err(shutdown_invalid(transport)) }
+      Limit => { return Err(shutdown_invalid(transport)) }
+      Failed(error) => { return Err(error) }
+    }
+    if header.opcode >= 8 {
+      read_control_payload(transport, scratch, header)?
+      control := scratch.bytes()
+      if header.opcode == 9 {
+        write_frame(transport, 10, control)?
+      } else if header.opcode == 8 {
+        match parse_close(control) {
+          Valid(_) => {
+            transport.shutdown()?
+            return Ok(())
+          }
+          Protocol => { return Err(shutdown_invalid(transport)) }
+          TextError => { return Err(shutdown_invalid(transport)) }
+        }
+      }
+    } else {
+      if header.opcode == 0 {
+        if !started {
+          return Err(shutdown_invalid(transport))
+        }
+      } else {
+        if started {
+          return Err(shutdown_invalid(transport))
+        }
+        started = !header.fin
+      }
+      discard_payload(transport, scratch, header)?
+      if header.opcode == 0 && header.fin { started = false }
+    }
+  }
+}

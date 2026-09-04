@@ -532,9 +532,9 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 
 ---
 
-## 12. `http_upgrade` type boundary (`pkg.ws` design; pending)
+## 12. `http_upgrade` type boundary (`pkg.ws`; shipped)
 
-The `pkg.ws` ledger introduces one protocol-neutral `Ty::HttpUpgrade` /
+The `pkg.ws` capability adds one protocol-neutral `Ty::HttpUpgrade` /
 `Scalar::HttpUpgrade`. It is Move, one pointer wide, non-Copy, non-comparable, non-printable, and
 Drop-bearing. Its positive carrier grammar is deliberately smaller than the general owned-handle
 rule: a raw same-frame local or by-value/shared-borrow/mutable-borrow parameter; plus one unnested
@@ -554,7 +554,7 @@ arguments precede state: spent read/write/deadline return Invalid without mutati
 poisoned calls replay their error, and shutdown alone is idempotent on spent. All four
 are Impure. Borrow overlap, move/drop/replacement, branch/loop joins, every value-carrying control
 form, whole/per-unit function-value pump signatures, and malformed checked HIR are cells in
-`pkg-design/ws.md`'s closure matrix. None is active in the current compiler.
+`pkg-design/ws.md`'s closure matrix. These records and restrictions are active in the compiler.
 
 ## 13. Required next refinements
 
