@@ -329,9 +329,13 @@ s.send_event(data)       -> Result<(), Error>           // `data: {data}\n\n` 1 
 Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+  Upgrade(UpgradeHandler),
 }
-Route { method: str, pattern: str, stream_type: str, handler: Handler }
-//   stream_type: stream head の Content-Type; Respond ルートでは ""（読まれない）。
+Route {
+  method: str, prefix: str, pattern: str, middleware: Option<MiddlewareList>,
+  stream_type: str, handler: Handler, upgrade_values: slice<str>,
+}
+//   stream_type: stream head の Content-Type; Respond/Upgrade ルートでは ""（読まれない）。
 ```
 
 テーブルは 1 つ、dispatch も 1 つ: stream ルートは同じ radix tree・同じ method 解決を通り、他の行と
@@ -648,7 +652,7 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 ハンドラはこのファイルから**抽出**され、実物の `apps/web/pkg/**` に対してコンパイルされる。よって
 ドキュメントの例がコンパイルできなくなればスイートが落ちる。
 
-## `pkg.ws` 用 protocol-neutral Upgrade seam（設計済み、未実装）
+## `pkg.ws` 用 protocol-neutral Upgrade seam（出荷済み）
 
 `pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
 worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
@@ -677,7 +681,7 @@ actual Respond variant を検査し、Stream/Upgrade GET は implicit HEAD で 4
 
 Upgrade は Stream と同様 sequential worker 一つを占有する。第二 listener/router/pool/task/
 registry はなく、hot path は closed Handler tag match 一つだけ増える。この seam は `pkg.ws` と
-同時に activate し、design 文書だけでは出荷しない。exact ledger は `../ws.md`。
+同時に有効である。exact ledger は `../ws.md`。
 
 ## スライス（計画の F3）
 
@@ -694,8 +698,8 @@ registry はなく、hot path は closed Handler tag match 一つだけ増える
   — エラーポリシーの「起動時 abort、Err にしない」）: 既知の大文字メソッドまたは `""`、先頭 `/`
   のパターン、名前付き `:`/`*` セグメント、`*` は tail のみ、1 パターン内で同じパラメータ名を
   二度使わない、すべての Stream 行に空でない `stream_type`（空だと空欄の `Content-Type:` を
-  送出してしまう上、`stream_type == ""` は HEAD フォールバックが「Respond 行」と読む不変条件）、
-  そして後続の行が決して勝てない PATH CLAIM の重複なし — 同一メソッド二度
+  送出してしまう）、Respond/Upgrade 行に空の `stream_type`、そして後続の行が決して勝てない
+  PATH CLAIM の重複なし — 同一メソッド二度
   （405 `Allow` join を重複させていたのもこれ）や、その claim に対する any-method ルートより後の
   任意の行。パラメータ名は claim に影響しない（`/a/:x` ≡ `/a/:y`）。1 パターン上の
   specific-then-`any` は合法のまま（フォールバック方向）。**HEAD は RFC 準拠**（9110 §9.3.2）:

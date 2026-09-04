@@ -25,7 +25,7 @@ fn sources_with_ws<'a>(main: &'a str, ws_root: &'a str) -> [(&'a str, &'a str); 
     ]
 }
 
-fn sources<'a>(main: &'a str) -> [(&'a str, &'a str); 6] {
+fn sources(main: &str) -> [(&str, &str); 6] {
     sources_with_ws(main, WS_ROOT)
 }
 
@@ -139,6 +139,10 @@ import pkg.ws
 import pkg.web
 import pkg.web.types
 
+RESOURCE_MAX: i64 := 1024
+RESOURCE_TEXT_PEAK: i64 := 34944
+RESOURCE_BINARY_PEAK: i64 := 33920
+
 extern "C" {
   fn align_rt_requested_live_reset()
   fn align_rt_requested_live_peak() -> i64
@@ -147,12 +151,12 @@ extern "C" {
 fn pump(c: pkg.web.types.Ctx, connection: http_upgrade, selected: string) -> Result<(), Error> {
   mut transport := connection
   unsafe { align_rt_requested_live_reset() }
-  message := pkg.ws.receive(transport, 1024)?
+  message := pkg.ws.receive(transport, RESOURCE_MAX)?
   peak := unsafe { align_rt_requested_live_peak() }
   mut expected := 0
   match message {
-    Text(_) => { expected = 34944 }
-    Binary(_) => { expected = 33920 }
+    Text(_) => { expected = RESOURCE_TEXT_PEAK }
+    Binary(_) => { expected = RESOURCE_BINARY_PEAK }
     Close(_) => { expected = -1 }
   }
   code := if peak == expected { 1000 } else { 1011 }
@@ -168,6 +172,16 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   return pkg.web.serve("127.0.0.1", parsed.get_i64("port"), routes, 1)
 }
 "#;
+
+fn source_i64_constant(source: &str, name: &str) -> i64 {
+    let prefix = format!("{name}: i64 := ");
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing shipped constant {name}"))
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid shipped constant {name}: {error}"))
+}
 
 fn free_loopback_port() -> u16 {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
@@ -329,7 +343,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     if !backend_available() {
         return;
     }
-    let mut server = start_server();
+    let server = start_server();
 
     // Upgrade GET rows do not participate in pkg.web's unary HEAD-to-GET fallback.
     let mut head_only = connect_retry(server.port);
@@ -490,6 +504,34 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
         .unwrap();
     assert_eq!(read_frame(&mut client_only_close), (true, 8, Vec::new()), "1010 gets an empty acknowledgment");
 
+    let mut empty_close = open_websocket(server.port);
+    empty_close.write_all(&masked_frame(true, 8, b"", [6, 6, 6, 6])).unwrap();
+    assert_eq!(read_frame(&mut empty_close), (true, 8, Vec::new()), "empty Close is acknowledged empty");
+
+    let mut one_byte_close = open_websocket(server.port);
+    one_byte_close.write_all(&masked_frame(true, 8, &[3], [7, 7, 7, 7])).unwrap();
+    assert_eq!(read_frame(&mut one_byte_close), (true, 8, vec![3, 234]), "one-byte Close is invalid");
+
+    let mut invalid_reason = open_websocket(server.port);
+    invalid_reason
+        .write_all(&masked_frame(true, 8, &[3, 232, 0xff], [8, 8, 8, 8]))
+        .unwrap();
+    assert_eq!(read_frame(&mut invalid_reason), (true, 8, vec![3, 239]), "invalid Close UTF-8 uses 1007");
+
+    let mut reason_123 = vec![3, 232];
+    reason_123.extend(std::iter::repeat_n(b'x', 123));
+    let mut max_reason = open_websocket(server.port);
+    max_reason.write_all(&masked_frame(true, 8, &reason_123, [9, 9, 9, 9])).unwrap();
+    assert_eq!(read_frame(&mut max_reason), (true, 8, reason_123), "123-byte Close reason is accepted");
+
+    let mut reason_124 = vec![3, 232];
+    reason_124.extend(std::iter::repeat_n(b'x', 124));
+    let mut oversized_reason = open_websocket(server.port);
+    oversized_reason
+        .write_all(&masked_frame(true, 8, &reason_124, [10, 10, 10, 10]))
+        .unwrap();
+    assert_eq!(read_frame(&mut oversized_reason), (true, 8, vec![3, 234]), "124-byte reason exceeds control framing");
+
     for code in [
         1000u16, 1001, 1002, 1003, 1007, 1008, 1009, 1011, 1012, 1013, 1014, 3000, 3003,
         3008, 4000, 4999,
@@ -506,31 +548,49 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
         assert_eq!(read_frame(&mut close), (true, 8, vec![3, 234]), "forbidden Close code {code}");
     }
 
-    // Force a transport failure while the protocol-error reply is pending. The pump log must carry
-    // the transport Code rather than the ordinary Invalid that a successful 1002 reply returns.
+}
+
+#[test]
+fn protocol_ping_and_peer_close_reply_transport_failures_win() {
+    if !backend_available() {
+        return;
+    }
     use std::os::fd::AsRawFd;
-    let mut reset = open_websocket(server.port);
-    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
-    assert_eq!(
-        unsafe {
-            libc::setsockopt(
-                reset.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                (&raw const linger).cast(),
-                std::mem::size_of::<libc::linger>() as libc::socklen_t,
-            )
-        },
-        0,
-    );
-    reset.write_all(&[0x81, 0]).unwrap();
-    drop(reset);
-    std::thread::sleep(Duration::from_millis(100));
+
+    let mut server = start_server_with(APP, "apps-ws-reply-failures");
+    for (label, frame) in [
+        ("protocol Close", vec![0x81, 0]),
+        ("Ping Pong", masked_frame(true, 9, b"ping", [1, 2, 3, 4])),
+        ("peer Close echo", masked_frame(true, 8, &[3, 232], [4, 3, 2, 1])),
+    ] {
+        let mut reset = open_websocket(server.port);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    reset.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&raw const linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            },
+            0,
+            "{label}",
+        );
+        reset.write_all(&frame).unwrap();
+        drop(reset);
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let _ = server.child.kill();
     let _ = server.child.wait();
     let mut stderr = String::new();
     server.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
-    assert!(stderr.contains("Code("), "reply transport failure must win over Invalid:\n{stderr}");
+    assert_eq!(
+        stderr.matches("Code(").count(),
+        3,
+        "every automatic reply failure must beat the ordinary protocol result:\n{stderr}",
+    );
 }
 
 fn finish_server_close(sock: &mut TcpStream, expected_code: u16) {
@@ -547,7 +607,9 @@ fn receive_resource_probe_pins_binary_text_and_maximum_live_byte_peaks() {
     if !backend_available() {
         return;
     }
-    assert_eq!(128 + 32_768 + 2 * 536_870_912, 1_073_774_720);
+    let max_message = source_i64_constant(WS_ROOT, "MAX_MESSAGE_BYTES");
+    let scratch = source_i64_constant(WS_ROOT, "SCRATCH_BYTES");
+    assert_eq!(128 + scratch + 2 * max_message, 1_073_774_720);
     let server = start_server_with(RESOURCE_APP, "apps-ws-resource");
 
     let mut text = open_websocket(server.port);
@@ -560,6 +622,17 @@ fn receive_resource_probe_pins_binary_text_and_maximum_live_byte_peaks() {
         .write_all(&masked_frame(true, 2, &vec![0x5a; 1024], [4, 3, 2, 1]))
         .unwrap();
     finish_server_close(&mut binary, 1000);
+
+    let growth_app = RESOURCE_APP
+        .replace("RESOURCE_MAX: i64 := 1024", "RESOURCE_MAX: i64 := 1025")
+        .replace("RESOURCE_BINARY_PEAK: i64 := 33920", "RESOURCE_BINARY_PEAK: i64 := 34948");
+    assert_ne!(growth_app, RESOURCE_APP, "the scaled owner must rewrite its exact peak");
+    let growth_server = start_server_with(&growth_app, "apps-ws-resource-growth");
+    let mut growth = open_websocket(growth_server.port);
+    let mut frames = masked_frame(false, 2, &[0x5a; 4], [1, 3, 5, 7]);
+    frames.extend(masked_frame(true, 0, &vec![0x5a; 1021], [2, 4, 6, 8]));
+    growth.write_all(&frames).unwrap();
+    finish_server_close(&mut growth, 1000);
 }
 
 #[test]
@@ -614,6 +687,47 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
             read_frame(&mut rejected),
             (true, 8, vec![3, 241]),
             "the rejected-next header after {label} work closes 1009",
+        );
+    }
+
+    let control_ws = WS_ROOT.replace(
+        "SOURCE_WORK_BYTES: i64 := 1048576",
+        "SOURCE_WORK_BYTES: i64 := 28",
+    );
+    assert_ne!(control_ws, WS_ROOT, "the nonempty-control owner must rewrite the bound");
+    let control_server = start_server_with_ws(APP, &control_ws, "apps-ws-control-work");
+    for (opcode, label) in [(9u8, "Ping"), (10, "Pong")] {
+        let mut exact = open_websocket(control_server.port);
+        let mut exact_frames = masked_frame(false, 1, b"", [1, 2, 3, 4]);
+        exact_frames.extend(masked_frame(true, opcode, b"ab", [2, 3, 4, 5]));
+        exact_frames.extend(masked_frame(true, opcode, b"cd", [3, 4, 5, 6]));
+        exact_frames.extend(masked_frame(true, 0, b"x", [4, 5, 6, 7]));
+        exact.write_all(&exact_frames).unwrap();
+        if opcode == 9 {
+            assert_eq!(read_frame(&mut exact), (true, 10, b"ab".to_vec()));
+            assert_eq!(read_frame(&mut exact), (true, 10, b"cd".to_vec()));
+        }
+        assert_eq!(
+            read_frame(&mut exact),
+            (true, 1, b"x".to_vec()),
+            "exact nonempty {label} payload charging is allowed",
+        );
+        finish_server_close(&mut exact, 1000);
+
+        let mut rejected = open_websocket(control_server.port);
+        let mut rejected_frames = masked_frame(false, 1, b"", [1, 1, 1, 1]);
+        rejected_frames.extend(masked_frame(true, opcode, b"ab", [2, 2, 2, 2]));
+        rejected_frames.extend(masked_frame(true, opcode, b"cd", [3, 3, 3, 3]));
+        rejected_frames.extend(masked_frame(true, opcode, b"ef", [4, 4, 4, 4]));
+        rejected.write_all(&rejected_frames).unwrap();
+        if opcode == 9 {
+            assert_eq!(read_frame(&mut rejected), (true, 10, b"ab".to_vec()));
+            assert_eq!(read_frame(&mut rejected), (true, 10, b"cd".to_vec()));
+        }
+        assert_eq!(
+            read_frame(&mut rejected),
+            (true, 8, vec![3, 241]),
+            "the rejected nonempty {label} payload closes 1009 before reading it",
         );
     }
 }

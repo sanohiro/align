@@ -355,9 +355,13 @@ method family on one handle. pkg.web ships NO wrapper (the `web.header` no-dupli
 Handler {
   Respond(fn(Ctx) -> Result<response_builder, Error>),
   Stream(fn(Ctx, http_stream) -> Result<(), Error>),
+  Upgrade(UpgradeHandler),
 }
-Route { method: str, pattern: str, stream_type: str, handler: Handler }
-//   stream_type: the stream head's Content-Type; "" on Respond routes (never read).
+Route {
+  method: str, prefix: str, pattern: str, middleware: Option<MiddlewareList>,
+  stream_type: str, handler: Handler, upgrade_values: slice<str>,
+}
+//   stream_type: the stream head's Content-Type; "" on Respond/Upgrade routes (never read).
 ```
 
 One table, one dispatch: stream routes go through the same radix tree, the same method resolution,
@@ -697,7 +701,7 @@ rather than `Done`, the boundary appearing inside a part's data, a verbatim bina
 `from` guards. The `upload` handler above is EXTRACTED from this file and compiled against the real
 `apps/web/pkg/**`, so a documented example that stops compiling fails the suite.
 
-## Planned protocol-neutral Upgrade seam for `pkg.ws`
+## Protocol-neutral Upgrade seam for `pkg.ws` (shipped)
 
 `pkg.ws` is a separate package, but it must share this package's route table, middleware order,
 request views, and prefork worker ownership. Its design ledger adds one protocol-neutral extension
@@ -756,8 +760,7 @@ the ordinary empty-body 400 path, while `respond_upgrade` repeats its version/re
 An open Upgrade occupies one sequential worker exactly like Stream. No second listener, router,
 worker pool, hidden task, app registry, or WebSocket rule enters this package. Existing hot paths
 perform only the additional closed Handler tag match; the zero-allocation routing contract remains.
-This seam and `pkg.ws` activate together; it is not shipped by this design document alone. Exact
-cross-package ledger and closure matrix: `ws.md`.
+This seam is active with `pkg.ws`. Exact cross-package ledger and closure matrix: `ws.md`.
 
 ## Slices (F3 of the plan)
 
@@ -773,8 +776,8 @@ cross-package ledger and closure matrix: `ws.md`.
   (`router.validate`, pure diagnosis; `serve` prints to stderr + `process.abort()` before binding
   — the error policy's "startup abort, not Err"): known uppercase method or `""`, leading-`/`
   pattern, named `:`/`*` segments, `*` tail-only, no parameter name twice in a pattern, a
-  non-empty `stream_type` on every Stream row (an empty one would emit a blank `Content-Type:`,
-  and `stream_type == ""` is the invariant the HEAD fallback reads as "a Respond row"), and no
+  non-empty `stream_type` on every Stream row (an empty one would emit a blank `Content-Type:`),
+  empty `stream_type` on Respond/Upgrade rows, and no
   duplicate PATH CLAIM the later row can never win — same method twice (also what duplicated the
   405 `Allow` join) or any row after an any-method route on that claim; parameter names don't
   affect a claim (`/a/:x` ≡ `/a/:y`). Specific-then-`any` on one pattern stays legal (the fallback

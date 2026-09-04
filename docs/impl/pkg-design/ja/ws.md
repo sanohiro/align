@@ -172,12 +172,12 @@ std transport、web Handler、ws consumer は互いに dormant な一連の capa
 | type formation | exact 71/47 codec leaf、raw same-frame local/parameter、unnested same-frame Result Ok from constructor/`map_err`、全他 placement negative、semantic-byte/malformed owner、variant tripwire。 |
 | ownership | rb validation、checked serialized-head size/allocation、fd move 前の handle-shell allocation、ctx spend、publication、replacement、Result/pump move、`?`/else/match/map_err/branch/loop/early exit/Drop、fd/allocation counter、exact head high-water/OOM-before-transfer failpoint。 |
 | headers/readiness | repeated row/token split/source-invalid abort、native null/alignment/length/range は safe view formation 前、token byte は table scan 前に hard-abort、HTTP version × residual、lifetime/no allocation differential + direct-ABI subprocess oracle。 |
-| web dispatch | Respond/Stream/Upgrade × route/method/HEAD/405/group/middleware、protocol-owned validation result の evaluate-once、stored true/false、validator callback 不在、prepare/write/pump result。 |
+| web dispatch | Respond/Stream/Upgrade × static/param/wildcard/method/HEAD/405/group/group_with/middleware 三結果、validation result evaluate-once/stored true/false/no callback、prepare 三結果、pre-write/committed-write failure、pump Ok/Err/log/fallback。専用 `apps_web_upgrade` raw-HTTP/socket owner。 |
 | handshake | seven validation phases、duplicate/case/token/key/version/protocol selection/extension/SHA-1 golden/browser interop。 |
 | frames | FIN/RSV/opcode/mask/length/fragment/control/TCP split/coalescing/mask position、exact header/control work charge の oracle + mutation corpus。 |
-| messages | Text/Binary UTF-8、Ping/Pong policy、1010 empty acknowledgment を含む Close、outgoing send/timed close、全 code。 |
-| bounds | message cap と固定 source-work allowance の exact/rejected-next（zero continuation/Ping/Pong flood）、length multi-invalid、caller-invalid × live/spent/poisoned、no-overread、reply/write/shutdown precedence。 |
-| allocation | builder storage と preallocated handle shell に共存する exact `H`-byte Upgrade response head、fixed scratch/shell budget/`array_builder` staging/Binary transfer/Text clone/no send copy/OOM/cleanup/fd close once。receive requested live heap exact 1073774720。checked-`H` high-water と receive resource probe。 |
+| messages | Text/Binary UTF-8、Ping/Pong policy、empty/one-byte/123/124/1010 を含む Close、outgoing send/timed close、全 code。protocol/Ping/peer-Close reply failure を別 socket twin で force。 |
+| bounds | message cap と固定 source-work allowance の exact/rejected-next（zero continuation と nonempty Ping/Pong flood）、payload charge を削ると失敗する別 reduced-bound owner、length multi-invalid、caller-invalid × live/spent/poisoned、no-overread、reply/write/shutdown precedence。 |
+| allocation | builder storage と preallocated handle shell に共存する exact `H`-byte Upgrade response head、fixed scratch/shell budget/`array_builder` staging/Binary transfer/Text clone/no send copy/OOM/cleanup/fd close once。shipped max/scratch constant から導く receive requested live heap exact 1073774720。checked-`H` high-water、steady probe、non-null old/new realloc overlap を測る scaled fragmented Binary probe。 |
 | ABI/cache | eleven keys と reused shape の exact empty curated function-attribute set、native query hard-abort、checked `SO_NOSIGPIPE` accept failure、HIR/MIR/LLVM、direct runtime/subprocess、rt-LTO、whole/per-unit、edit/revert、vendored inventory。 |
 
 ## 整合 pass と deferred
@@ -216,6 +216,9 @@ background heartbeat/async/broadcast registry/standalone listener は deferred�
 | P2 reused ABI attributes | reused shape の existing empty curated function-attribute set を保持。Rust C export は unwind しないが、generated declaration に LLVM `nounwind` promise を追加せず shared fingerprint を変えない。 |
 | P2 Upgrade head storage | checked exact wire length `H` を計算し、growth/second copy なしで exact `H`-byte head を allocate/fill、handle shell も fd transfer 前に allocate し、全 builder storage との coexist peak を instrument。 |
 | P2 stale readiness ABI prose | native inventory に残った null/misaligned-to-false 文を authoritative pre-reference hard-abort rule に置換し、英日とも malformed state と通常の HTTP/1.0/residual false を混同しない。 |
+| P1 owner operation matrix | shared framework dispatch を専用 `apps_web_upgrade` owner、WebSocket frame/resource を `apps_ws` に分け、group/middleware/prepare/fallback/pump、nonempty control charge、Close edge、protocol/Ping/peer-Close reply failure を mutation-discriminating raw socket で閉じる。 |
+| P2 maximum resource evidence | exact ceiling を shipped message/scratch constant から導き、non-null old/new builder buffer が同時 live になる scaled fragmented Binary path の peak を測る。 |
+| P2 activation prose drift | active type/HIR/MIR/backend status、eleven keys、exact web Handler/Route、英日 package prose、adjacent source comment を一 pass で同期。 |
 
 ## References
 

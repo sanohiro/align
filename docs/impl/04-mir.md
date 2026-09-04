@@ -447,12 +447,12 @@ explicit ownership/parallel operation in the emitted MIR.
 
 ---
 
-## 9. Planned HTTP Upgrade MIR (`pkg.ws` prerequisite)
+## 9. HTTP Upgrade MIR (`pkg.ws`)
 
-The `pkg.ws` implementation adds dedicated backend-agnostic MIR operations for
+The `pkg.ws` implementation uses dedicated backend-agnostic MIR operations for
 `HttpRespondUpgrade { ctx, rb, out }`, `HttpUpgradeReadExact { upgrade, buffer, count }`,
 `HttpUpgradeWrite { upgrade, data }`, `HttpUpgradeDeadline { upgrade, timeout_ns }`, and
-`HttpUpgradeShutdown { upgrade }`, plus `HttpCtxUpgradeReady` and the three header-table queries. MIR owns evaluation order,
+`HttpUpgradeShutdown { upgrade }`, plus `HttpCtxUpgradeReady` and the four header-table queries. MIR owns evaluation order,
 Result construction, source nulling, ctx-spent transition, mutable generations, sticky-error
 control, and Drop on every normal/error/early/control-flow path. Protocol handshake/frame semantics
 remain ordinary `pkg.web`/`pkg.ws` source and do not become MIR variants.
@@ -465,7 +465,7 @@ partial bytes on error. Spent read/write/deadline return Invalid without mutatio
 poisoned calls replay the stored status and shutdown alone is idempotent on spent. Deadline and shutdown keep
 one live/spent/poisoned owner and free exactly once. A no-wildcard operation sweep, print form,
 effect/work scan, Move/drop scan, whole/per-unit lowering, and optimized/unoptimized equality are
-required by `pkg-design/ws.md`. This section reserves no active variant today.
+owned by `pkg-design/ws.md`. These variants are active.
 The runtime behind `HttpRespondUpgrade` computes checked exact head length, allocates that head and
 the handle shell before fd transfer, and exposes no partially initialized handle to MIR. Detectable
 malformed native header/readiness inputs hard-abort below MIR and never synthesize zero/false.

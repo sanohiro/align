@@ -641,9 +641,9 @@ pub fn validate(routes: slice<pkg.web.types.Route>) -> string {
       b.write("\" must contain only literal segments")
       break b.to_string()
     }
-    // A stream route's head is built by `serve` from `stream_type`; an empty one would emit a
-    // blank `Content-Type:` header — and `stream_type == ""` is also the invariant `serve`'s
-    // HEAD→GET fallback uses to mean "a Respond row", so a Stream row must never carry it.
+    // A Stream route's head is built by `serve` from `stream_type`; an empty one would emit a
+    // blank `Content-Type:` header. Respond and Upgrade rows do not consume this field. HEAD→GET
+    // fallback separately examines the closed Handler tag and admits Respond only.
     stream_row := match ri.handler {
       Respond(_) => false
       Stream(_) => true
