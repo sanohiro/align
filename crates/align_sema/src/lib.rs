@@ -31479,6 +31479,22 @@ fn whole_moved(moved: &MovedSet, id: LocalId) -> bool {
         })
 }
 
+/// Element replacement needs the array shell but does not read a previously moved field. A whole
+/// local or outer field move still removes that shell; element-field moves do not.
+fn fixed_element_root_moved(moved: &MovedSet, id: LocalId) -> bool {
+    moved.contains(&MovedKey::Whole(id))
+        || moved
+            .iter()
+            .any(|key| matches!(key, MovedKey::Field(local, _) if *local == id))
+}
+
+/// Replacing one exact fixed-array element reinitializes every owned leaf below that element.
+fn clear_element_moved(moved: &mut MovedSet, id: LocalId, index: u32) {
+    moved.retain(|key| {
+        !matches!(key, MovedKey::ElemField(local, candidate, _) if *local == id && *candidate == index)
+    });
+}
+
 /// Field `n` of `id` is unusable if it (or the whole local) was moved.
 fn field_moved(moved: &MovedSet, id: LocalId, n: u32) -> bool {
     moved.contains(&MovedKey::Field(id, n)) || moved.contains(&MovedKey::Whole(id))
@@ -38730,12 +38746,18 @@ impl<'a> MoveCheck<'a> {
                 }
                 Stmt::AssignElem { base, index, value, .. } => {
                     self.check_borrow_use(*base, index.span);
-                    if whole_moved(moved, *base) {
+                    if fixed_element_root_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    if let ExprKind::Int(value) = index.kind
+                        && value >= 0
+                        && let Ok(index) = u32::try_from(value)
+                    {
+                        clear_element_moved(moved, *base, index);
+                    }
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
                     }

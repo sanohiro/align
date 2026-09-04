@@ -12721,6 +12721,13 @@ const TEMPLATE_HTML_VERSION: u32 = 1;
 const TEMPLATE_HTML_LIVE: u8 = 0;
 const TEMPLATE_HTML_SPENT: u8 = 1;
 
+#[cfg(feature = "alloc-count")]
+static TEMPLATE_HTML_SHELL_ALLOCS: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
+#[cfg(feature = "alloc-count")]
+static TEMPLATE_HTML_SHELL_FREES: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
+
 /// Exact v1 native shell for `pkg.template.html_builder`.
 #[repr(C)]
 pub struct TemplateHtmlBuilder {
@@ -12906,7 +12913,7 @@ fn template_html_reserve(builder: &mut TemplateHtmlBuilder, additional: usize) {
 /// Allocate one canonical empty HTML-builder shell.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_template_html_new_v1() -> *mut TemplateHtmlBuilder {
-    Box::into_raw(Box::new(TemplateHtmlBuilder {
+    let builder = Box::into_raw(Box::new(TemplateHtmlBuilder {
         version: TEMPLATE_HTML_VERSION,
         lifecycle: TEMPLATE_HTML_LIVE,
         reserved_u8: 0,
@@ -12914,7 +12921,10 @@ pub extern "C" fn align_rt_template_html_new_v1() -> *mut TemplateHtmlBuilder {
         ptr: core::ptr::null_mut(),
         len: 0,
         cap: 0,
-    }))
+    }));
+    #[cfg(feature = "alloc-count")]
+    TEMPLATE_HTML_SHELL_ALLOCS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    builder
 }
 
 /// Escape `& < > \" '` and append the complete UTF-8 input to `builder`.
@@ -12997,6 +13007,8 @@ pub unsafe extern "C" fn align_rt_template_html_into_string_v1(
     builder.len = 0;
     builder.cap = 0;
     drop(unsafe { Box::from_raw(builder_ptr) });
+    #[cfg(feature = "alloc-count")]
+    TEMPLATE_HTML_SHELL_FREES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     AlignStr { ptr, len }
 }
 
@@ -13018,6 +13030,8 @@ pub unsafe extern "C" fn align_rt_template_html_free_v1(builder_ptr: *mut Templa
     builder.cap = 0;
     unsafe { align_rt_free(payload) };
     drop(unsafe { Box::from_raw(builder_ptr) });
+    #[cfg(feature = "alloc-count")]
+    TEMPLATE_HTML_SHELL_FREES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Encoded length under `application/x-www-form-urlencoded`: identical to percent-encoding except a
@@ -48942,13 +48956,27 @@ mod regex_tests {
 
     #[cfg(feature = "alloc-count")]
     #[test]
-    fn template_html_payload_allocation_and_free_counts_are_exact() {
+    fn template_html_shell_and_payload_allocation_counts_are_exact() {
         let _serial = super::tests::ALLOC_COUNT_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         align_rt_requested_live_reset();
         let free_before = align_rt_free_count();
+        let shell_alloc_before =
+            TEMPLATE_HTML_SHELL_ALLOCS.load(core::sync::atomic::Ordering::Relaxed);
+        let shell_free_before =
+            TEMPLATE_HTML_SHELL_FREES.load(core::sync::atomic::Ordering::Relaxed);
         let builder = align_rt_template_html_new_v1();
+        assert_eq!(
+            TEMPLATE_HTML_SHELL_ALLOCS.load(core::sync::atomic::Ordering::Relaxed)
+                - shell_alloc_before,
+            1
+        );
+        assert_eq!(
+            TEMPLATE_HTML_SHELL_FREES.load(core::sync::atomic::Ordering::Relaxed)
+                - shell_free_before,
+            0
+        );
         assert_eq!(
             align_rt_requested_live_bytes(),
             0,
@@ -48965,6 +48993,11 @@ mod regex_tests {
         assert_eq!(unsafe { (*builder).cap }, capacity);
         assert_eq!(align_rt_requested_live_bytes(), capacity as i64);
         let finished = unsafe { align_rt_template_html_into_string_v1(builder) };
+        assert_eq!(
+            TEMPLATE_HTML_SHELL_FREES.load(core::sync::atomic::Ordering::Relaxed)
+                - shell_free_before,
+            1
+        );
         assert_eq!(align_rt_requested_live_bytes(), capacity as i64);
         assert_eq!(
             align_rt_free_count(),
@@ -48976,10 +49009,20 @@ mod regex_tests {
         assert_eq!(align_rt_requested_live_bytes(), 0);
 
         let unfinished = align_rt_template_html_new_v1();
+        assert_eq!(
+            TEMPLATE_HTML_SHELL_ALLOCS.load(core::sync::atomic::Ordering::Relaxed)
+                - shell_alloc_before,
+            2
+        );
         unsafe { align_rt_template_html_raw_v1(unfinished, b"payload".as_ptr(), 7) };
         assert!(align_rt_requested_live_bytes() > 0);
         let free_before_drop = align_rt_free_count();
         unsafe { align_rt_template_html_free_v1(unfinished) };
+        assert_eq!(
+            TEMPLATE_HTML_SHELL_FREES.load(core::sync::atomic::Ordering::Relaxed)
+                - shell_free_before,
+            2
+        );
         assert_eq!(align_rt_free_count() - free_before_drop, 1);
         assert_eq!(align_rt_requested_live_bytes(), 0);
     }

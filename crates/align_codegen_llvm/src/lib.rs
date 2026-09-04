@@ -4071,6 +4071,16 @@ fn template_html_mir_signature(
     })
 }
 
+fn template_html_mir_operation_name(rvalue: &Rvalue) -> Option<&'static str> {
+    match rvalue {
+        Rvalue::TemplateHtmlNew { .. } => Some("pkg.template$html"),
+        Rvalue::TemplateHtmlWrite { .. } => Some("pkg.template$write"),
+        Rvalue::TemplateHtmlRaw { .. } => Some("pkg.template$raw"),
+        Rvalue::TemplateHtmlToString { .. } => Some("pkg.template$to_string"),
+        _ => None,
+    }
+}
+
 fn validate_template_html_mir_signatures(program: &Program) -> Result<(), CodegenError> {
     let has_surface = program
         .fns
@@ -4116,6 +4126,21 @@ fn validate_template_html_mir_signatures(program: &Program) -> Result<(), Codege
         {
             return Err(CodegenError::Lowering(format!(
                 "pkg.template function '{}' has a malformed canonical signature",
+                function.name
+            )));
+        }
+        let operations = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|statement| match statement {
+                Stmt::Let(_, rvalue) => template_html_mir_operation_name(rvalue),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if operations.as_slice() != [function.name.as_str()] {
+            return Err(CodegenError::Lowering(format!(
+                "pkg.template function '{}' does not contain exactly one matching operation",
                 function.name
             )));
         }
@@ -25765,6 +25790,15 @@ fn main() -> i32 = 0
 
         let mut malformed = program.clone();
         malformed.fns[1].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[1].blocks[0].stmts.clear();
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        let duplicate = malformed.fns[2].blocks[0].stmts[0].clone();
+        malformed.fns[2].blocks[0].stmts.push(duplicate);
         assert!(validate_resource_rvalues(&malformed).is_err());
 
         let mut imported = program.clone();

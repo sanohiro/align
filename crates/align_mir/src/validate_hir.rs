@@ -260,6 +260,7 @@ pub(crate) enum TemplateHtmlValidationReason {
     Output,
     Value,
     Signature,
+    OperationCount,
 }
 
 fn template_html_signature(
@@ -403,6 +404,8 @@ pub(crate) fn template_html_validation_reason(
     }
 
     for function in &program.fns {
+        let canonical_wrapper = template_html_signature(&function.name, resource_id).is_some();
+        let mut operation_count = 0usize;
         let mut work = Vec::new();
         for statement in &function.body.stmts {
             push_statement_expressions(statement, &mut work);
@@ -481,8 +484,12 @@ pub(crate) fn template_html_validation_reason(
                 {
                     return Err(TemplateHtmlValidationReason::Origin);
                 }
+                operation_count += 1;
             }
             work.extend(align_sema::direct_expr_children(expression));
+        }
+        if canonical_wrapper && operation_count != 1 {
+            return Err(TemplateHtmlValidationReason::OperationCount);
         }
     }
     Ok(())

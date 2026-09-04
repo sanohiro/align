@@ -152,8 +152,12 @@ fn main() -> i32 {
   first := pkg.template.to_string(holders[0].nested.first)
   pkg.template.raw(holders[0].nested.second, "ok")
   second := pkg.template.to_string(holders[0].nested.second)
+  holders[0] = Holder { nested: Nested { first: pkg.template.html(), second: pkg.template.html() }, code: 30 }
+  pkg.template.raw(holders[0].nested.first, "fresh")
+  third := pkg.template.to_string(holders[0].nested.first)
   if first != "&lt;one&gt;" { return 1 }
   if second != "ok" { return 2 }
+  if third != "fresh" { return 3 }
   return holders[0].code + holders[1].code
 }
 "#;
@@ -181,7 +185,7 @@ fn main() -> i32 {
         ] {
             assert_eq!(
                 output.status.code(),
-                Some(30),
+                Some(50),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );

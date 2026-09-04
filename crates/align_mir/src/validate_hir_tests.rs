@@ -321,6 +321,24 @@ fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
         Err(Reason::Signature)
     );
 
+    let mut malformed = program.clone();
+    malformed.fns[1].body.value = Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit)));
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::OperationCount)
+    );
+
+    let mut malformed = program.clone();
+    let Some(operation) = malformed.fns[2].body.value.as_deref().cloned() else {
+        assert!(false, "template fixture must have a tail value");
+        return;
+    };
+    malformed.fns[2].body.stmts.push(hir::Stmt::Expr(operation));
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::OperationCount)
+    );
+
     let mut imported = baseline_program();
     imported.resources = program.resources.clone();
     imported.resources[0].drop_hook =
