@@ -10,7 +10,9 @@ It does not tour every syntax form or library module. The aim is to help you app
 
 ## How to use it
 
-Read a question and **answer it before reading the answer.** Saying it out loud may help. If you were right, move on. If you were wrong, go back a few questions and try again. You may run a program (`alignc run`), but predict its result first. Most questions can be answered from what you have learned so far.
+Work through the book with **`align-repl` open beside it**. Read a question and predict the answer, then enter the code in the REPL and compare the result with your prediction and the book's answer. If they differ, go back a few questions and work out why. Most questions build on what you have just learned.
+
+Keep the definitions you need for the next question. You can change a value, add an element, or try an empty input without making a new file each time. Predict what that change will do before running it, too.
 
 Some answers are one word. Some questions look identical to the one before — the difference is the lesson. Each chapter ends with a **Commandment** to help you remember its main idea.
 
@@ -18,11 +20,21 @@ After reading the book, choose a program you liked and read it again without run
 
 ## Trying the examples
 
-For installation and your first program, see [Getting started](../guide/01-getting-started.md). Most questions show expressions or short fragments. Use the declarations given with the question; when saving a complete program, put type and function declarations at file scope and the statements to run inside `main`. Questions that ask whether code compiles sometimes contain deliberate errors.
+For installation, see [Getting started](../guide/01-getting-started.md). Start a session from your terminal:
 
-Treat each question as a separate experiment unless it explicitly continues the previous one. In `align-repl`, `:clear` starts a fresh experiment, `:list` shows the current program, and `:save PATH` saves it. The REPL runs the whole accumulated program on each entry, so earlier file writes or other side effects happen again. See [The toolchain](../guide/16-toolchain.md) for the details.
+```text
+$ align-repl
+align> 1 + 2
+3
+```
+
+Most questions show expressions or short fragments that you can enter directly, along with any declarations the question uses. For a long pipeline, keep it on one line or enclose the whole expression in parentheses. Enter a block such as `arena { ... }` through its closing brace. Questions about whether code compiles sometimes contain deliberate errors; the diagnostic is the result to compare.
+
+`:list` shows the program so far; `:clear` clears it when you want to start a separate experiment. `:save PATH` saves the session's program. Each entry recompiles and runs the whole program, so earlier file writes or other side effects happen again even when repeated output is not displayed. See [The toolchain](../guide/16-toolchain.md) for the details.
 
 When an answer says an array is `[2, 4, 6]`, it describes the elements. The REPL displays an array's type, not its contents. To check your prediction, inspect elements such as `xs[0]`, or ask for a scalar result such as `xs.sum()`.
+
+For examples that show a complete program with `fn main`, save the code to a file and use `alignc run file.align`. When assembling a program from fragments, put type and function declarations at file scope and the statements to run inside `main`.
 
 ## The chapters
 
