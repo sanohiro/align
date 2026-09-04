@@ -9,6 +9,7 @@ One binary, `alignc`, carries the compiler, runner, formatter, cache controls, a
 ```text
 alignc check file.align         # whole-program parse + typecheck + lints
 alignc run   file.align [args…] # build + execute; trailing args → main(args)
+alignc test  file.align         # run tests in the explicit entry/import closure
 alignc build file.align         # executable named <stem> in the current directory
 alignc fmt   file.align --write # normalize formatting in place
 ```
@@ -125,7 +126,39 @@ wasteful default        a large literal array using a wider inferred element tha
 unused import           an imported capability unused by that file
 ```
 
-These are the performance model speaking at the source line, not style rules. Fix the data shape first; when you intentionally keep a warning, measure the artifact with `explain-opt`, `size`, and a representative benchmark.
+These warnings identify costs and conversions at specific source lines. Check whether a different data layout or operation would address them. If you keep a performance warning, use `explain-opt`, `size`, and a representative benchmark to measure the effect.
+
+## Tests with `core.test`
+
+Place a named `test` declaration at module scope and import `core.test` for assertions. Save this complete example as `arithmetic.align`; it needs no `main`:
+
+```align
+module arithmetic
+
+import core.test
+
+fn twice(value: i64) -> i64 = value * 2
+
+test "twice a positive number" {
+    test.expect_eq(twice(21), 42)
+}
+
+test "zero stays zero" {
+    test.expect(twice(0) == 0)
+}
+```
+
+```text
+alignc test arithmetic.align
+```
+
+The command runs tests in that file and every module it imports, including indirect imports. It does not discover files from a `tests/` directory or a filename suffix. Tests in dependencies run first, then tests in source order within each module. A successful run ends with `test result: ok. 2 passed; 0 failed` for this example.
+
+`test.expect` checks a `bool`; `test.expect_eq` uses ordinary scalar or string equality. Write assertions as statements in the test block, not inside helper functions or closures. A helper can return `Result`, and the test can use `?`. Completing the block succeeds; the first failed assertion or a returned `Err` fails that test and runs ordinary cleanup.
+
+The runner builds once, then runs tests sequentially in separate processes. Each test defaults to a 60-second timeout and a 1 MiB limit for each of stdout and stderr. `--timeout-ns` and `--max-output-bytes` adjust those limits; `-j` affects compilation, not test concurrency. Failing tests or finding no tests gives a nonzero exit status. Test code currently cannot call `process.command`, even through a helper; external-process integration belongs in a separate test script.
+
+`check` and `build` also type-check test declarations, but production artifacts omit them. `alignc test` never calls your `main` automatically, and tests cannot be entered in `align-repl`. The [test design](../impl/core-design/test.md) specifies the remaining runner options and output rules.
 
 ## align-repl
 
@@ -152,9 +185,9 @@ align> print(x * 2)
 10
 ```
 
-Rebinding a name **edits the earlier line in place** — Align forbids shadowing, so there is nothing
-else it could mean — and the later lines re-run against the new value. That changes earlier output,
-so the REPL prints the whole run behind a banner rather than hiding the difference:
+Rebinding a name **edits the earlier line in place**, then reruns the later lines with the new value.
+This preserves Align's no-shadowing rule. Because earlier output may change, the REPL prints the
+whole run with a banner:
 
 ```text
 align> x := 21
@@ -197,8 +230,8 @@ align> xs
 :save PATH         write a .align file      :save! PATH      … overwriting
 ```
 
-`:save` is the exit ramp: it writes the exact program that was compiled, so compiling that file
-with `alignc` produces a byte-identical object.
+`:save` writes the program that was compiled. Compiling that file with `alignc` produces a
+byte-identical object.
 
 `:const` exists because a `fn` you define cannot see `main`'s bindings — the session's `x := …`
 entries are locals inside `main`. A value a function must reach is a top-level constant:
@@ -252,4 +285,4 @@ align> 6 * 7
 
 ## What's deliberately missing
 
-There is no Align package registry/resolver, fetch command, project manifest, general test runner, or debugger integration yet. Source packages work today by vendoring their source under `pkg/`; imports and the filesystem remain the dependency graph, with no manifest or lockfile. Homebrew and apt distribute the compiler and runtime, not those source packages. Chapter [23](23-packages.md) covers the current package model. The toolchain contract remains deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.
+There is no Align package registry/resolver, fetch command, project manifest, or debugger integration yet. In-language tests use `alignc test` as described above. Source packages work today by vendoring their source under `pkg/`; imports and the filesystem remain the dependency graph, with no manifest or lockfile. Homebrew and apt distribute the compiler and runtime, not those source packages. Chapter [23](23-packages.md) covers the current package model. The toolchain contract remains deliberately small: one binary, import-discovered builds, content-identified artifacts, and inspectable optimization.

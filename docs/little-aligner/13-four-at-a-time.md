@@ -28,13 +28,13 @@ v1: vec4<i32> := [1, 2, 3, 4]
 v2: vec4<i32> := [10, 0, 30, 40]
 v3 := v1 + v2
 ```
-The annotation turns the literal into a vector — there is no separate constructor. `v3` now holds `[11, 2, 33, 44]`. One instruction, four results. (`v2` carries a zero on purpose — we will need it.)
+The annotation turns the literal into a vector — there is no separate constructor. `v3` now holds `[11, 2, 33, 44]`. One vector addition, four results. (`v2` carries a zero on purpose — we will need it.)
 
 ---
 
 **Q5.** What if we want to divide by `v2`, but only if the denominator is not zero?
 
-**A5.** In scalar code, we use `if`. But vectors don't branch—they compute everything at once. We use a **mask**.
+**A5.** In scalar code, we can test one denominator with `if`. Here we need a separate decision for each lane. We use a **mask**.
 
 ---
 
@@ -52,19 +52,19 @@ ones: vec4<i32> := [1, 1, 1, 1]
 safe_v2 := select(m, v2, ones)
 ans := v1 / safe_v2
 ```
-Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divided by the substituted `1` instead of trapping on `v2`'s `0`. The division never traps, and the CPU never branched.
+Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divides by the substituted `1`. Every denominator is now nonzero.
 
 ---
 
 **Q8.** Is it tedious to write this by hand for large arrays?
 
-**A8.** Yes. That is why Align auto-vectorizes pipelines. The compiler writes the `vec` and `mask` for you when you use `.map()`. 
+**A8.** Yes. For suitable pipeline operations, the compiler can generate vector instructions automatically. We can write the element transformation with `map` and leave the vector width and remaining elements to the compiler.
 
 ---
 
 **Q9.** Then why learn `vec` and `mask`?
 
-**A9.** Because auto-vectorization is a heuristic, not a guarantee. When you write a crypto algorithm, a custom hash, or a novel compression scheme, you must speak to the silicon directly. Align does not hide the machine.
+**A9.** Auto-vectorization is not guaranteed. Some algorithms call for specific lane operations, and some kernels benefit from explicit SIMD after measurement. Vectors and masks let us express those operations ourselves.
 
 ---
 
@@ -171,4 +171,4 @@ select(m, w, zero)
 
 > **The Thirteenth Commandment**
 >
-> *Trust the pipeline to vectorize the bulk. But when the silicon matters, speak its language: vectors and masks, never branches.*
+> *Start with a pipeline. Use explicit vectors when the algorithm needs lane operations, and check bounds and operands before using them.*

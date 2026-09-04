@@ -8,13 +8,13 @@
 
 ---
 
-**Q2.** If pipelines are so perfect, why give us a `loop` at all?
+**Q2.** When do we need a `loop` instead of a pipeline?
 
-**A2.** Pipelines are for when data flows in a straight line, from a known start to a known end. But some problems—like finding a path in a graph, or polling a socket until it answers—are shaped like circles. `loop` exists for when the algorithm itself is a circle. But notice: even a `loop` in Align is an expression that yields a value. It is just a pipeline stage that had to tie its own shoes.
+**A2.** Use a pipeline to transform or reduce elements from a source. Use `loop` when the next step depends on the current state: read until EOF, retry an operation, or improve an estimate until it converges. A `loop` is also an expression: `break` can give it a value.
 
 ---
 
-**Q3.** Show me this circle. Read a file in 4096-byte gulps until empty?
+**Q3.** Read a file in 4096-byte blocks until EOF?
 
 **A3.** The one loop the language has:
 
@@ -39,7 +39,7 @@ fn pump(r: reader, w: writer) -> Result<(), Error> {
 
 ---
 
-**Q5.** Sum everything a reader gives you, then?
+**Q5.** Then how do we total the number of bytes read?
 
 **A5.**
 
@@ -77,7 +77,7 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q9.** And recursion? The old books say functions calling themselves are the loops.
 
-**A9.** Not here. A recursive "loop" spends a stack frame per round — Align promises no tail-call magic, and scope-end drops and `?` would quietly break such magic anyway. A thousand gulps must not cost a thousand frames. That is what `loop` is for.
+**A9.** Align does not guarantee tail-call optimization, so each recursive call may need another stack frame. Scope-end cleanup and `?` also affect whether that optimization is possible. We do not need a thousand call frames just to repeat an operation a thousand times. Use `loop` for that.
 
 ---
 
@@ -87,7 +87,7 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 ---
 
-**Q11.** When do we pipeline, when do we `loop`, when do we recurse? The final sorting hat:
+**Q11.** When do we pipeline, when do we `loop`, when do we recurse?
 
 **A11.**
 
@@ -127,9 +127,9 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 ---
 
-**Q16.** The inner pipeline fails on one byte and uses `?`. Which boundary does it leave?
+**Q16.** The function applies `?` to a failing pipeline's `Result`. Which boundary does that `?` leave?
 
-**A16.** The function, not merely the pipeline or loop. `?` keeps its one meaning everywhere. If the caller should receive the failure, that is exactly the right door.
+**A16.** The enclosing function returns the error. Here `?` is applied to the pipeline's result in that function. A `?` inside a lambda would instead return from the lambda; it does not jump out of the function that called it.
 
 ---
 
@@ -147,4 +147,4 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q18.** Is that the end?
 
-**A18.** Of the control-path drills. Next we give independent work to many hands, then look down at four hardware lanes and ten gigabytes as one flat flow. After that, one last chapter will make us read the whole story at once.
+**A18.** Of the control-path drills. Next come parallel work, SIMD, and a large-file example. The final chapter brings together the ways we have learned to read a program.

@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/13-std-os.md)
 
-Everything OS-shaped lives in `std`, behind explicit imports: `std.io`, `std.fs`, `std.path`, `std.env`, `std.time` (this chapter), plus `std.encoding` and `std.rand` (next chapter). The imports are capability headers — a file whose header has no `std` imports provably touches no OS. Three rules hold across all of `std`:
+Import the `std` modules for the OS and service APIs you need: `std.io`, `std.fs`, `std.path`, `std.env`, and `std.time` in this chapter, then encoding, randomness, and other services in later chapters. Imports identify direct API use; `print` and calls into other modules can perform I/O without a local `std` import. Three rules hold across `std`:
 
 - Anything that can fail returns `Result<T, Error>`, mapped from errno by **one fixed table**: `ENOENT` → `NotFound`, `EACCES`/`EPERM` → `Denied`, `EINVAL` → `Invalid`, anything else → `Code(errno)`.
 - Resource handles are **Move types** that close themselves on drop (chapter [05](05-memory.md)) — no `close()` to forget, no leak on the error path.
@@ -49,10 +49,11 @@ is no cross-device copy fallback, crash-durability promise, pair transaction,
 or hidden cleanup. Paths are borrowed only for the call, must be non-empty
 valid UTF-8 without NUL bytes, and are passed as written. A checked path
 capacity overflow is `Error.Invalid`; actual allocation failure is terminal
-OOM. A two-file publisher must close both writers, recheck both final paths,
-rename result then evidence, and explicitly remove only paths it owns.
+OOM. For a result file accompanied by a separate evidence file, a publisher can close both writers,
+recheck both final paths, then rename the result first and its evidence second. Cleanup must remove
+only paths that publisher owns; the two renames are not an atomic transaction.
 
-## Retained-root regular files
+## Opening regular files without following symlinks
 
 When a caller must reject symlink traversal rather than use ordinary pathname resolution, `std.fs`
 provides two explicit constructors:
@@ -92,7 +93,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-`read_file_view` maps the file and hands you a `str` view of it. It **requires an enclosing `arena`** — the mapping's lifetime is the arena, the unmap is the arena's cleanup, and the view can't escape (`.clone()` if a piece must survive). The memory model from chapter [05](05-memory.md) didn't grow a special case for mmap; mmap fit the model.
+`read_file_view` maps the file and returns a `str` view. It **requires an enclosing `arena`**: the mapping remains valid until the arena ends, when cleanup unmaps it. The view cannot escape; use `.clone()` if text must survive the arena. This follows the memory model from chapter [05](05-memory.md).
 
 Because it returns a `str`, `read_file_view` validates the bytes as UTF-8 and rejects a binary file. For binary assets — a GGUF model, a packed index — use its sibling `read_bytes_view`, which does the same arena mmap without validation and hands you a `bytes` (`slice<u8>`) view:
 
@@ -110,7 +111,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-Same arena rule (the `bytes` view can't outlive the arena), same v1 limitations as `read_file_view`: a special or zero-length file falls back to an owned arena copy rather than a true zero-copy map, and concurrent truncation of a mapped file can raise `SIGBUS` (Align installs no signal handler — a process-global handler is exactly the hidden side effect the language forbids). There is no `bytes.clone()` yet, so to keep a piece past the arena, write it out (`fs.write_file` / a `buffer`) rather than copying the view.
+The same arena rule applies: the `bytes` view cannot outlive the arena. A special or zero-length file falls back to an owned arena copy rather than a zero-copy map. Concurrent truncation of a mapped file can raise `SIGBUS`; Align installs no process-global signal handler. There is no `bytes.clone()` yet, so to retain data beyond the arena, write it to a file or a `buffer` instead of retaining the view.
 
 ## Streams: `reader`, `writer`, `buffer`
 
@@ -149,7 +150,7 @@ pub fn main() -> Result<(), Error> {
 
 `io.stdin` / `io.stdout` / `io.stderr` are the borrowed standard streams. For chatty output, wrap: `w := io.stdout.buffered()` … `w.flush()?`.
 
-**The v1 rule you will trip on once:** an *owned* handle must be **bound to a local before method use**. `fs.create(p)?.write(d)?` is rejected, so name the handle first. The borrowed std streams are exempt (`io.stdout.write("ok\n")?` is fine); a `.buffered()` writer must still be named. General unnamed Move values have cleanup as of 2026-07-15, but lifting this receiver surface also requires a stable address for mutating/consuming handle methods and remains separate.
+**Bind an owned handle to a local before calling its methods.** `fs.create(p)?.write(d)?` is rejected, so name the handle first. The borrowed standard streams allow direct calls such as `io.stdout.write("ok\n")?`; a `.buffered()` writer must still be named. This is a current restriction on method receivers; cleanup of unnamed Move values is supported.
 
 ## `std.path`, `std.env`, `std.time`
 
@@ -180,9 +181,9 @@ pub fn main() -> Result<(), Error> {
 }
 ```
 
-Notes that carry design weight:
+A few details affect how you use these APIs:
 
 - `path.base`/`dir`/`ext` return **views into their input** — no allocation, and the region rules apply (a view of an arena-mapped path can't outlive the arena).
 - `env.get` returns `Option`, not `Result`: an unset variable is a normal answer, not a failure. The types tell you which kind of "no" you're getting.
 - Durations are plain `i64` nanoseconds — no `Duration` type, no unit enum, no conversion API. `instant()` for intervals, `now()` for timestamps, and passing an `i32` is a type error (no implicit widening, per chapter [02](02-language-basics.md)).
-- Program arguments are `main(args: array<str>)` — there is no `env.args`; argv flows through one visible door.
+- Program arguments arrive through `main(args: array<str>)`; there is no `env.args` API.

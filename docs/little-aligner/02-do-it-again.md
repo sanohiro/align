@@ -65,7 +65,7 @@ factor := 3
 
 **Q9.** What is `[1, 2, 3].map(fn x { x * 2 })` — with no `.sum()`?
 
-**A9.** It does not compile. A pipeline must end — in a reduction, or a materialization. A floating half-pipeline would be a hidden cost, and Align does not do hidden.
+**A9.** It does not compile. A pipeline must end in a reduction or a materialization. `map` describes the transformation; the ending says what to do with its results.
 
 ---
 
@@ -77,13 +77,13 @@ factor := 3
 
 **Q11.** What is `[1, 2, 3].map(fn x { x * 2 }).map(fn x { x + 1 }).sum()`?
 
-**A11.** `15`. Two maps in a row: `[3, 5, 7]`. And here is the secret: the compiler makes **one loop**, not two. The stages fuse.
+**A11.** `15`. Two maps in a row produce `3, 5, 7`, which `sum` adds. The compiler combines the stages into **one loop**. This is called fusion.
 
 ---
 
 **Q12.** How many arrays did Q11 build along the way?
 
-**A12.** Zero. `3`, `5`, `7` lived in a register for one instant each, already being summed. That is why we end pipelines instead of keeping middles.
+**A12.** Zero intermediate arrays. Each transformed value goes straight into the sum. We described the values `3, 5, 7` without asking the program to store them as an array.
 
 ---
 
@@ -102,13 +102,13 @@ factor := 3
 
 **Q14.** Then why is printing inside a pipeline usually a poor habit?
 
-**A14.** Because it mixes the answer with observation, restricts optimization, and stops the same function from being used by `par_map`. Keep a stage Pure when it naturally can be — but know the rule, not a myth: sequential `map` permits effects; explicit parallel work does not.
+**A14.** It mixes calculation with output, limits optimization, and prevents us from using the same function with `par_map`. Keep a stage Pure when its job allows it. Remember the distinction: sequential `map` permits side effects; explicit parallel work does not.
 
 ---
 
 **Q15.** What changes when `map` becomes `par_map`?
 
-**A15.** The order of workers is no longer a story you may observe, so its callable must be Pure. No printing, no changing outside state. Parallelism is written in the source, and so is the discipline that makes it safe.
+**A15.** Workers may run in any order, so the callable must be Pure: no printing and no changing outside state. Chapter 12 shows how to use it.
 
 ---
 
@@ -139,7 +139,7 @@ factor := 3
 scores.map(fn s { s + 10 }).to_array()
 ```
 
-The request asked for many scores back, so materialize many.
+`.to_array()`. We need to keep the transformed scores as an array.
 
 ---
 
@@ -151,7 +151,7 @@ The request asked for many scores back, so materialize many.
 scores.map(fn s { s + 10 }).sum()
 ```
 
-The request asked for one answer, so collapse directly. Do not build many on the way to one.
+`.sum()`. We need only the total, so there is no need to store the transformed scores in an array.
 
 ---
 
@@ -164,7 +164,7 @@ offset := 7
 moved := points.map(fn x { x + offset }).to_array()
 ```
 
-The lambda carries the one outside fact it needs.
+The lambda captures `offset` from the surrounding scope.
 
 ---
 
@@ -182,4 +182,4 @@ Then use `.map(move_right)`. Inline lambdas are for local thoughts; named functi
 
 > **The Second Commandment**
 >
-> *When you would visit each element, `map` it. When you would keep the result, say `to_array()` out loud.*
+> *Use `map` to transform each element. If you need an array of the results, write `to_array()`.*

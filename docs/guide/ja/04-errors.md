@@ -7,22 +7,24 @@ Align のエラーモデルは1つだけです。値が存在しないかもし�
 ## `Option<T>` —— ないかもしれない
 
 ```align
-fn find_even(xs: slice<i64>) -> Option<i64> {
-    if xs.any(fn x { x % 2 == 0 }) {
-        return Some(xs.where(fn x { x % 2 == 0 }).min())
+fn half_if_even(n: i64) -> Option<i64> {
+    if n % 2 == 0 {
+        return Some(n / 2)
     }
     return None
 }
 
 fn main() -> i32 {
-    a := find_even([3, 8, 5, 4][0..4]) else 0    // Some(4) → 4
-    b := find_even([3, 7, 5][0..3]) else 0       // None    → the default
-    print(a + b)                                  // 4
+    a := half_if_even(8) else 0    // Some(4) → 4
+    b := half_if_even(7) else 0    // None    → the default
+    print(a + b)                  // 4
     return 0
 }
 ```
 
 `Some(x)` と `None` で値を構築し、**`else` によるアンラップ**で値を取り出します。`expr else default` は、ペイロードが存在すればそれを、なければデフォルト値を返します。`else` の右辺には発散する処理（早期の `return` や、プログラムを abort する関数の呼び出し）を書くこともでき、これにより「値を取り出すか、さもなくば関数から脱出する」という一般的なパターンを簡潔に記述できます。より複雑な処理が必要な場合は `match` を使って `Some(v) =>` と `None =>` に分岐します。他のすべての `match` と同様に、網羅的に記述する必要があります。
+
+`half_if_even(0)` は `Some(0)`、`half_if_even(7)` は `None` を返します。どちらも `else 0` を付けると同じ数になるので、「値が0」と「値がない」を区別したい場合は `match` を使います。次に説明する `?` は `Result` 専用で、`Option` から値を取り出す用途には使えません。
 
 言語仕様に null が存在しないため、「チェックを忘れる」といったミスは起こり得ません。値が存在しない場合の処理をプログラマが明示するまで、型システムは安全な値 `T` を渡してくれないからです。
 
@@ -85,6 +87,7 @@ match fs.write_file("out.txt", "hi") {           // decide per case
 import std.fs
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() != 2 { return Err(Error.Invalid) }
     data := fs.read_file(args[1])?      // ENOENT becomes Err(NotFound)
     print(data.len())
     return Ok(())
@@ -93,11 +96,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `main` 関数から `Err` が返されると、プロセスは0以外の終了コード（非ゼロ）で終了します。各 `Error` カテゴリは小さな固定の終了コードに対応付けられています（`NotFound` → 1、`Invalid` → 2、`Denied` → 3、`Timeout` → 4 など）。また、`Error.Code(c)` の場合は `c` がそのまま終了コードになります。`error(c)` はこのエラーオブジェクトを生成するための短縮形です。例えば `return Err(error(7))` と書けば、プログラムは終了コード 7 で終了します。`main` の先頭にエラーを捕捉するための定型文（ボイラープレート）を書く必要はありません。このマッピングは言語の組み込み機能として提供されています。
 
-（この関数のシグネチャは、プログラムがコマンドライン引数をどのように受け取るかも示しています。`main(args: array<str>)` が唯一の引数受け取り口であり、`args[1]` がユーザーから渡された最初の引数となります。グローバル変数や `env.args` のような仕組みはありません。）
+コマンドライン引数は `main(args: array<str>)` で受け取ります。`args[1]` が最初のユーザー引数です。この例ではファイルのパスを一つ受け取り、引数の数が違えば `Error.Invalid` を返します。先に数を確かめるので、パスを渡し忘れても範囲外アクセスで停止しません。グローバルな引数リストや `env.args` はありません。
 
 ## 自作のエラー型
 
-任意の直和型をエラーとして扱うことができます。ただし、`?` 演算子はエラー型を暗黙的に変換しません。つまり、`Result<T, MyErr>` は、`Result<T, Error>` を返す関数内では `?` を使ってそのまま伝播させることはできません。型を合わせるためには、`map_err` を使用してエラー型の変換を明示的に行う必要があります。
+任意の直和型をエラーとして扱えます。呼び出す関数と呼び出し元でエラー型が同じなら、組み込みの `Error` でなくても `?` でそのまま伝播できます。エラー型が異なる場合だけ、`map_err` で明示的に変換します。次の例では、`Result<T, ParseErr>` を `Result<T, Error>` に合わせています。
 
 ```align
 ParseErr { Empty, BadChar }
@@ -132,4 +135,4 @@ fn main() -> i32 {
 
 ## 身につけたい習慣
 
-呼び出し元が使い方を誤らないような関数設計を心がけましょう。値がないことが通常の状態であれば `Option` を返し、失敗が「例外的だが実際に起こり得る」ものであれば `Result` を返し、絶対に失敗しないのであればそのままの型 `T` を返します。呼び出し側ではそれらを `?` や `else` で適切に処理し、プロセス終了コードのルーティングは `main` のシグネチャに任せるのが Align 流の書き方です。
+値がないこともある場合は `Option`、失敗する可能性がある場合は `Result`、失敗を報告する必要がない場合は通常の型 `T` を返します。呼び出し側では、`Result` のエラーを伝播させるなら `?`、代わりの値を使うなら `else`、内容を調べるなら `match` を使います。`main` が `Result<(), Error>` を返す場合、そこまで伝播したエラーは言語の規則に従ってプロセスの終了コードになります。

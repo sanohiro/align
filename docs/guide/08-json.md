@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/08-json.md)
 
-JSON is in `core` — not because Align wants a framework in the language, but because "typed records in, typed records out" is the boundary of nearly every data program, and a data-oriented language should make that boundary fast and typed. One import, two functions.
+`core.json` converts between JSON text and typed records. It provides two main functions: `json.encode` and `json.decode`.
 
 ## Encoding
 
@@ -22,7 +22,7 @@ fn main() -> i32 {
 
 ## Decoding — the type comes from the annotation
 
-`json.decode(s)` parses into whatever type the binding asks for, and returns `Result` because input is input:
+`json.decode(s)` uses the binding's type annotation to choose the result type. Parsing can fail, so it returns `Result`:
 
 ```align
 import core.json
@@ -62,7 +62,7 @@ xs: array<i64> := json.decode("[3, 1, 4, 1, 5]")?
 print(xs.sum())     // 14
 ```
 
-And here is the data-oriented payoff — decode **straight into structure-of-arrays**:
+You can also decode directly into **structure-of-arrays**:
 
 ```align
 import core.json
@@ -82,8 +82,8 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`soa<User>` (chapter [11](11-data-oriented.md)) stores each field as its own contiguous column. Decoding into it builds the columns **directly while parsing** — no array-of-structs intermediate, no transpose afterwards — and clean string columns are zero-copy views borrowing the input text. Selected escaped strings are decoded once into the enclosing arena. That is why the decode lives in an `arena`: the columns share the arena's lifetime, the whole batch dies together, and the compiler holds you to it. This one-liner outruns typical hand-tuned decoders (it benchmarks at parity with Rust's serde_json at a million rows) because the *layout decision* removed the work, not a clever inner loop.
+`soa<User>` (chapter [11](11-data-oriented.md)) stores each field in a contiguous column. The decoder fills these columns **while parsing**, with no intermediate array of structs or later transpose. Unescaped string fields borrow the input text; selected escaped strings are decoded once into the enclosing arena. The columns share the arena's lifetime.
 
 ## The shape of a JSON program
 
-Parse at the boundary into real types, process in the middle with pipelines over those types, encode at the far boundary. The middle of your program never sees JSON — it sees `soa<User>` and `array<i64>`, which is what the pipeline and SIMD machinery eat. If you find yourself wanting a dynamic "JSON value" type to pass around, that is the design asking you to declare the record type instead.
+Decode JSON into record types at input, process those records with pipelines, and encode them at output. This keeps JSON handling at the program's boundaries. The main computation works with types such as `soa<User>` and `array<i64>`. Declare a record type for the data you need to process.

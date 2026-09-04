@@ -2,21 +2,21 @@
 
 > 🌐 **English** · [Japanese](./ja/14-the-big-crunch.md)
 
-**Q1.** You are handed a 10-gigabyte log file. The goal: count how many requests each `user_id` made — and, while we are at it, how many of the whole 10 gigabytes came back `status == 200`.
+**Q1.** You are handed a 10-gigabyte log file containing a JSON array of request records. The goal: count requests per `user_id`, and count all requests with `status == 200`.
 
 **A1.** We need to read it, parse it, filter it, group it, and count it.
 
 ---
 
-**Q2.** Object-oriented instinct says: `file.read_to_string()`. 
+**Q2.** What if we read the whole file into an owned string?
 
-**A2.** And your machine begs for mercy. You just allocated 10 gigabytes on the heap, copying the data from the OS buffer into your program's memory.
+**A2.** We need a 10-gigabyte buffer for the input, before allocating any decoded records. We also copy the file's bytes into that buffer.
 
 ---
 
-**Q3.** So we stream it line by line, the way another language would? `for line in file.lines() { ... }`
+**Q3.** Could we decode one record at a time instead?
 
-**A3.** Better. But parsing strings into `LogLine` objects one by one still creates millions of small objects, thrashing the cache and breaking the pipeline.
+**A3.** Yes. That can avoid storing all the records. For this example, we want reusable columns for both a scan and a grouping. Later in the chapter we will try a scanner for a job that needs only one count.
 
 ---
 
@@ -42,9 +42,9 @@ For a regular, non-empty file, this is an OS-level memory map (`mmap`). It avoid
 
 ---
 
-**Q6.** Does `json.decode` allocate a string on the heap for every URL in the logs?
+**Q6.** If the records also include URLs, must each URL become an owned heap string?
 
-**A6.** No. A decoded string column is a column of `str` **views** — each one simply points into the `view` we already have. Zero copies.
+**A6.** A `str` field with no JSON escapes views the input bytes directly. An escaped string needs decoding and is stored in the arena. Neither case needs a separate owned `string` per URL, but only the unescaped case avoids copying its bytes.
 
 ---
 
@@ -59,7 +59,7 @@ For a regular, non-empty file, this is an OS-level memory map (`mmap`). It avoid
 
 **Q8.** Did that `where` build a new, smaller array?
 
-**A8.** No. `where` is a pipeline stage — it fuses with `count` into one pass over the column. No memory was moved.
+**A8.** No. `where` fuses with `count` into one pass over the column. The pass reads the status values and counts matches without building a filtered array.
 
 ---
 
@@ -111,15 +111,15 @@ fn main() -> Result<(), Error> {
 
 ---
 
-**Q13.** You have just processed 10 gigabytes with a handful of fused column passes and not one object.
+**Q13.** Which allocations did this arrangement avoid?
 
-**A13.** With no millions of per-row objects and no hidden intermediate arrays. That is The Big Crunch. The data stayed flat, the necessary batch and grouping memory stayed visible, and every pass had a reason.
+**A13.** An owned copy of the input, separate heap allocations for each record, and a filtered array of successful requests. The decoded columns and grouping state still need storage.
 
 ---
 
 **Q14.** So what does *zero-copy* mean — zero memory and zero work?
 
-**A14.** Neither. It means a particular boundary did not duplicate the bytes. Mapping avoids an owned input copy; decoded `str` fields view those mapped bytes. Parsing still works, numeric columns still need storage, and the OS still moves pages through the memory hierarchy. Always name which copy disappeared.
+**A14.** Neither. It means a particular boundary did not duplicate the bytes. Mapping avoids an owned input copy; unescaped `str` fields view those mapped bytes. Escaped strings need decoding into arena storage. Parsing still takes work, numeric columns still need storage, and the OS still moves pages through the memory hierarchy. Always name which copy disappeared.
 
 ---
 
@@ -138,7 +138,7 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 **Q16.** Why not use that scanner for the original per-user `group_by` too?
 
-**A16.** A scanner is deliberately for fused, non-materializing reductions; `group_by`, `sort`, and `to_array` are not scanner endings. If the job needs reusable columns or grouped materialization, build the batch and pay for it visibly. If one bounded answer can flow straight out, scan. “Zero-copy” is not one trick — it is refusing each unnecessary materialization in turn.
+**A16.** A scanner is deliberately for fused, non-materializing reductions; `group_by`, `sort`, and `to_array` are not scanner endings. If the job needs reusable columns or grouped materialization, build the batch and pay for it visibly. If one bounded answer can flow straight out, scan.
 
 ---
 
@@ -148,7 +148,7 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 ---
 
-**Q18.** Same file, but twenty reports repeatedly scan five hot fields.
+**Q18.** Now the records arrive as a JSON array, and twenty reports repeatedly scan the same five fields.
 
 **A18.** Decode those declared fields into `soa<T>` inside an arena, then reuse the columns. One batch allocation and parse can repay itself across many field-wise passes.
 
@@ -162,7 +162,7 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 **Q20.** A `str` field decoded from the mapped file must be returned after the arena ends. What is missing?
 
-**A20.** Ownership. The field is only a view into the mapping. Clone the specific survivor into owned storage at the boundary, or redesign the caller to finish using it inside the arena.
+**A20.** Ownership. The field is a borrowed view into the mapped text or the arena storage used to decode escapes. Clone the specific survivor into owned storage at the boundary, or redesign the caller to finish using it inside the arena.
 
 ---
 
@@ -174,4 +174,4 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 > **The Fourteenth Commandment**
 >
-> *Do not bring the data to the objects. Lay the data flat, map it from the earth, and let the pipeline flow over it.*
+> *Map the input, choose a scanner or reusable columns for the job, and account for the storage each step needs.*

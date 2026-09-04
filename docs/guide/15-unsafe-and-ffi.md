@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/15-unsafe-and-ffi.md)
 
-Every guarantee so far — no dangling views, no double-free, no data races in `par_map` — holds because the compiler can see everything. At the edge of the world (a C library, a hand-managed buffer) it can't. Align's answer is the standard one, kept small: an `unsafe {}` block marks exactly where the guarantees are yours to uphold, and nothing outside one can break them.
+The compiler checks view lifetimes, moves, and purity to prevent dangling views, double-free, and data races in `par_map`. It cannot inspect a C library or verify manual pointer operations. An `unsafe {}` block marks the code where you must uphold those guarantees yourself. A safe wrapper must do so for every input its callers can supply.
 
 ## `unsafe {}` and `raw.*`
 
@@ -49,7 +49,7 @@ fn main() -> i32 {
 }
 ```
 
-Declare the C signature; call it inside `unsafe` (the compiler can't check what C does — the block says *you* did). libc and libm resolve automatically; anything else names its library with `link`:
+Declare the C signature and call it inside `unsafe`. You must check that the signature is correct and the call satisfies the C API's requirements. libc and libm resolve automatically; name other libraries with `link`:
 
 ```align
 extern "C" link("m") {
@@ -75,14 +75,16 @@ fn main() -> i32 {
 }
 ```
 
-**The one FFI rule to tattoo somewhere:** Align strings are *not* NUL-terminated. Length-taking APIs (`write`, `memcmp`, `memcpy`) are safe; `strlen`/`printf("%s")` will read past the end. When C wants a struct, pin the layout with `layout(C)` — declaration order, C alignment rules, no field reordering (without it, Align reorders fields for density):
+**Align strings are not NUL-terminated.** Use C APIs that accept an explicit length, such as `write`, `memcmp`, or `memcpy`, and pass the correct length. `strlen` and `printf("%s")` expect NUL termination and may read past the view. When C expects a struct, use `layout(C)` to preserve declaration order and C alignment rules; without it, Align may reorder fields for density:
 
 ```align
 layout(C) Point { x: i32, y: i32 }      // matches `struct { int32_t x, y; }`
 ```
 
-`layout(C)` structs cross by pointer (through `raw`) or **by value** (SysV x86-64 ABI, ≤16-byte register-class structs — matching clang exactly; larger-by-value is implementation in progress). C-owned memory comes back as `raw` — C pointers carry no length, so nothing pretends to be a view — and you read its flat values with `raw.load` or wrap it in a length you got some honest way.
+`layout(C)` structs can cross through a `raw` pointer. **By-value structs are supported only on x86-64 Linux using the SysV ABI**, and only when the complete struct fits the available argument or return registers (at most 16 bytes). Larger structs and signatures that exhaust the argument registers are rejected. On Apple Silicon and other targets, pass the struct by pointer; `layout(C)` alone does not enable by-value calls there.
+
+C-owned memory returns as `raw` because a C pointer carries no length. Use `raw.load` to read values, or obtain and validate the length before constructing a view.
 
 ## The discipline
 
-Keep the edge thin and audited: one module owns the `extern` declarations and the `unsafe` blocks, converts at the boundary (views + lengths in, `raw` handled and freed, `Result` out), and exports a fully safe API. Callers of that module get the same guarantees as pure Align — because outside an `unsafe` block, nothing *can* be unsound. `grep unsafe` is the audit surface, and in a healthy program it is a page, not a codebase.
+Keep native integration in a small, reviewable module. It owns the `extern` declarations and `unsafe` blocks, passes views with their lengths, handles and frees `raw` pointers, and converts errors to `Result`. Its public API must uphold Align's safety guarantees for callers. Searching for `unsafe` helps locate code that needs manual review, including the assumptions made by its wrappers.

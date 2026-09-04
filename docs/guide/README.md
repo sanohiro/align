@@ -1,8 +1,16 @@
+# The Align Guide
+
 > 🌐 **English** · [Japanese](./ja/README.md)
 
-A hands-on introduction to writing Align — not the spec (that's draft.md), but how to think and write in Align. Chapters are ordered; start at 00. Every example compiles with today's `alignc` unless marked *implementation in progress*.
+A hands-on introduction to writing Align. Start at [00](00-why-align.md) and read the foundations in order; later chapters introduce tools and libraries as you need them. For the full language specification, see [draft.md](../../draft.md).
 
-Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** covers the same ground as question-and-answer drills, in the style of *The Little Schemer*.
+**[The Little Aligner](../little-aligner/README.md)** practices pipelines, data layout, and ownership through short questions and answers, in the tradition of *The Little Schemer*. You can start with either book and consult the other when you want a different explanation or more practice.
+
+## Reading and running the examples
+
+Some examples are complete programs; others are fragments that use declarations introduced nearby. Type and function declarations belong at file scope, and executable statements go inside `main`. Explicitly marked errors show what the compiler rejects; they are exercises in reading diagnostics. Features still awaiting implementation are marked separately.
+
+Use `alignc check file.align` to check a program and `alignc run file.align` to execute it. Test files use `alignc test file.align`; see [chapter 16](16-toolchain.md). For short expressions, use `align-repl`. Start independent examples with `:clear`: each entry reruns the accumulated program, including earlier side effects. Installation and the first session are covered in [chapter 01](01-getting-started.md).
 
 ## Part I — Foundations
 
@@ -28,7 +36,7 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 - [13 — std: files, I/O, and the OS boundary](13-std-os.md)
 - [14 — std: encoding, regex, rand, cli](14-std-encoding-rand-cli.md)
 - [15 — The edges: unsafe and C FFI](15-unsafe-and-ffi.md)
-- [16 — The toolchain: alignc, align-repl, the formatter, the lints](16-toolchain.md)
+- [16 — The toolchain: alignc, tests, align-repl, formatting, and lints](16-toolchain.md)
 - [17 — The Align way](17-the-align-way.md)
 - [18 — std services: network, HTTP, processes, compression, crypto](18-std-services.md)
 
@@ -41,6 +49,6 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 
 ## Part V — Packages
 
-- [23 — Packages: vendored source, pkg.web, pkg.frame, pkg.auth, pkg.kv, and pkg.db](23-packages.md)
+- [23 — Packages: vendored source and choosing a library](23-packages.md)
 - [24 — Databases: pkg.db in practice](24-database.md)
 - [25 — Vector search through pkg.db](25-vector-search.md)

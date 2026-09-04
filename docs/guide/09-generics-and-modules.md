@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/09-generics-and-modules.md)
 
-Two chapters' worth of machinery in most languages, kept deliberately small in Align: generics with three built-in bounds and full inference, and modules that are just files.
+This chapter covers generic functions and types, the built-in constraints on type parameters, and file-based modules.
 
 ## Generic functions
 
@@ -22,7 +22,7 @@ fn main() -> i32 {
 }
 ```
 
-Type parameters are **always inferred from the arguments** — there is no turbofish, no explicit instantiation syntax to learn or to read. Generics are monomorphized: each used instantiation compiles to its own specialized code, exactly as if you had written it by hand. Zero runtime dispatch.
+Type parameters are inferred from the arguments or the expected result type. If the arguments do not determine the type, add a binding annotation, as with `json.decode` in chapter [08](08-json.md). Calls do not take written type arguments such as `f<T>(x)`. Generics are monomorphized: each used instantiation compiles to specialized code without runtime dispatch.
 
 ## The bounds: `Num` ⊃ `Ord` ⊃ `Eq`
 
@@ -34,7 +34,7 @@ An unbounded `T` is opaque — you can move it, store it, return it, and nothing
 
 Use an operation the bound doesn't grant and the *definition* fails to compile — not the call site, later, in someone else's build.
 
-Those three, plus one closed structural bound `RegionPlain` (used only for region-backed plain construction — it grants no arithmetic or equality), are the entire built-in constraint system, on purpose. **There are no user-defined traits or interfaces** (a decision, not a gap): trait hierarchies are where languages grow a second, Turing-complete type-level dialect that humans skim and AIs hallucinate. Align's bet is that three bounds plus concrete types cover the real generic code a data-oriented program contains, and everything else is better said with a plain function.
+These three bounds describe the operations available on a type parameter. Structural bounds serve a separate purpose: for example, `RegionPlain` admits recursively plain data for region-backed construction, without granting arithmetic or equality operations. **User-defined traits and interfaces are not supported.** Other behavior is expressed with concrete types and functions.
 
 ## Generic types
 
@@ -62,7 +62,7 @@ fn main() -> i32 {
 }
 ```
 
-`Option<T>` and `Result<T, E>` are exactly this mechanism, shipped with the language. A generic *function* over a generic *struct* (`fn first<T>(p: Pair<T>) -> T`) works, and a type parameter may appear under `array`, `slice`, or an application of another top-level generic definition. One honest limit remains: constructing a payload-less variant alone (`Opt.Empty`) needs context to pin `T`.
+`Option<T>` and `Result<T, E>` use this same mechanism. A generic function can take a generic struct (`fn first<T>(p: Pair<T>) -> T`). Type parameters can also occur inside `array`, `slice`, or another top-level generic type. Constructing a payload-less variant such as `Opt.Empty` needs surrounding type information to determine `T`.
 
 ## Modules are files
 
@@ -92,9 +92,9 @@ fn main() -> i32 {
 }
 ```
 
-`alignc run main.align` finds `geom.align` next to the entry file; `import util.math` maps to `util/math.align`. The qualification rule is absolute — an imported type is `geom.Point`, never a bare `Point`; an imported sum-type variant is `geom.Color.Red`. Any name in any file tells you exactly where it came from, with no import-list archaeology. There is no aliasing (`import x as y`) and no glob — one way to refer to a thing.
+`alignc run main.align` finds `geom.align` next to the entry file; `import util.math` maps to `util/math.align`. Imported names must be qualified: write `geom.Point`, and `geom.Color.Red` for a sum-type variant. The qualifier identifies the module at the use site. Import aliases (`import x as y`) and glob imports are not supported.
 
-The same `import` keyword also switches on the built-in capability modules — `import std.fs`, `import core.json` — which is how a file declares, at the top, which parts of the outside world it touches. A file with no `std` imports provably does no I/O; chapter [13](13-std-os.md) builds on that.
+The same `import` keyword enables built-in modules such as `std.fs` and `core.json`. Imports show which APIs a file uses directly; they do not prove that it performs no I/O. For example, `print` needs no import, and an imported application or package function may perform I/O. The compiler infers effects through function calls when checking purity (chapter [10](10-closures-and-parallelism.md)).
 
 ## Program shape
 

@@ -1,8 +1,8 @@
-# Packages: vendored source, pkg.web, pkg.frame, pkg.auth, pkg.kv, and pkg.db
+# Packages: selecting and vendoring source libraries
 
 > 🌐 **English** · [Japanese](./ja/23-packages.md)
 
-`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.frame`, `pkg.auth`, `pkg.kv`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
+`core` provides language-level operations, `std` provides OS and service APIs, and `pkg` provides source libraries for applications. The packages below are implemented. Choose one by the work you need to do, then copy its source into your project. A registry and fetch tool are not yet available.
 
 ## A package is a source tree
 
@@ -32,7 +32,20 @@ pkg/
 
 `import pkg.web` resolves to `pkg/web.align`; `import pkg.web.cookie` resolves to `pkg/web/cookie.align`. Calls and types remain fully qualified, such as `pkg.web.get(...)` and `pkg.web.types.Ctx`.
 
-Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/frame/pkg](../../apps/frame/pkg), [apps/auth/pkg](../../apps/auth/pkg), [apps/kv/pkg](../../apps/kv/pkg), [apps/csv/pkg](../../apps/csv/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
+Vendoring means copying a package's source into the consuming project. Copy or merge the `pkg/` directory from the appropriate workspace into your application's root:
+
+| Work | Package | Source workspace |
+|---|---|---|
+| HTTP routes, middleware, and SSE | `pkg.web` | [apps/web/pkg](../../apps/web/pkg) |
+| WebSocket server routes | `pkg.ws` and its `pkg.web` dependency | [apps/ws/pkg](../../apps/ws/pkg) plus [apps/web/pkg](../../apps/web/pkg) |
+| HTML text with escaping | `pkg.template` | [apps/template/pkg](../../apps/template/pkg) |
+| CSV into typed columns | `pkg.csv` | [apps/csv/pkg](../../apps/csv/pkg) |
+| Joins over typed columns | `pkg.frame` | [apps/frame/pkg](../../apps/frame/pkg) |
+| Tokens, password hashes, and session tokens | `pkg.auth` | [apps/auth/pkg](../../apps/auth/pkg) |
+| RESP2 key-value access | `pkg.kv` | [apps/kv/pkg](../../apps/kv/pkg) |
+| SQLite and PostgreSQL | `pkg.db` | [apps/db/pkg](../../apps/db/pkg) |
+
+These sources are not embedded in the `alignc` archive, Debian package, or Homebrew formula. When trying a newly added package, use a compiler that includes its support; a packaged release may lag the current repository. Copy a package's internal modules as well as its root file.
 
 There is no package manifest, lockfile, registry, version solver, or download command. Imports plus the filesystem are the dependency graph, and one `pkg/<name>` exists per source tree. Updating or auditing a dependency means updating or auditing the vendored source.
 
@@ -77,6 +90,41 @@ Public companion modules provide focused, composable pieces:
 
 There is no application-state parameter in the handler shape yet. That is a current limitation, not a hidden framework facility. Database access is a separate package, `pkg.db`, below.
 
+## `pkg.ws`
+
+`pkg.ws` adds WebSocket server routes to `pkg.web`; it requires both source trees in the table above. Put `pkg.ws.route(pattern, protocols, pump)` in the same route array as your REST or SSE handlers. The pump receives the owned `http_upgrade` connection and selected protocol string. `pkg.ws.receive` takes an explicit message-size limit and returns a complete `Text`, `Binary`, or `Close` message; use `send_text`, `send_binary`, and `close` for replies.
+
+A live WebSocket occupies one server worker. Choose the worker count for simultaneous long-lived connections as well as ordinary HTTP requests; there is no hidden thread per connection. This is a server package, not a WebSocket client. The [WebSocket design](../impl/pkg-design/ws.md#public-use) provides a complete pump and the handshake requirements.
+
+## `pkg.template`
+
+For HTML output, use `pkg.template` rather than inserting untrusted text directly into a language `template` string. After vendoring the package, this is a complete program:
+
+```align
+import pkg.template
+
+fn greeting(name: str) -> string {
+    mut output := pkg.template.html()
+    pkg.template.raw(output, "<p>")
+    pkg.template.write(output, name)
+    pkg.template.raw(output, "</p>")
+    return pkg.template.to_string(output)
+}
+
+fn main() -> i32 {
+    print(greeting("<Align>"))
+    return 0
+}
+```
+
+It prints `<p>&lt;Align&gt;</p>`. `write` escapes text; `raw` inserts trusted markup unchanged. `to_string` consumes the Move builder and returns an owned string. Escaping is suitable for element text and already-quoted attribute values; it does not validate URLs, JavaScript, CSS, or attribute names. A plain language `template` formats text but does not HTML-escape it. See the [HTML builder design](../impl/pkg-design/template.md).
+
+## `pkg.csv`
+
+`pkg.csv.decode` reads an in-memory UTF-8 CSV document into `soa<R>`. Supply a named destination arena and a `pkg.csv.DecodeOptions` value with `header`, `line_ending`, and `max_rows`. There are no inferred defaults: choose `Header.Present` or `Header.Absent`, and `LineEnding.Lf` or `LineEnding.CrLf` explicitly. The binding annotation, such as `rows: soa<Trade>`, supplies the row type, following the same expected-type pattern as JSON decoding.
+
+With a header, fields are selected by name; without one, columns must match the record's declaration order and exact width. The result belongs to the destination arena. File reads are a separate `std.fs` operation, and errors use `pkg.csv.Error`, which you must handle or map before returning from a `main` that uses builtin `Error`. This first API decodes a complete document; it does not stream or encode CSV. See the [CSV design and example](../impl/pkg-design/csv.md#public-use).
+
 ## `pkg.frame`
 
 `pkg.frame` performs bounded stable inner joins over validated `core.codec` i64 or string columns. It returns owned `RowPair { left, right }` source ordinals in left-major, right-ascending order, so it does not materialize or retain either input batch. The required `max_pairs` makes duplicate-key fanout and output allocation visible. Nullable/composite keys, outer joins, adaptive build-side selection, parallelism, and spill are deliberately absent; the exact surface is in [`pkg.frame`'s design](../impl/pkg-design/frame.md).
@@ -103,6 +151,8 @@ fn main() -> Result<(), Error> {
     return Ok(())
 }
 ```
+
+The password portion of this example needs OpenSSL 3.2 or newer for Argon2id; see chapter [01](01-getting-started.md).
 
 Verification authenticates the compact bytes before parsing JSON, pins the algorithm to HS256, and compares signatures in constant time. The required `now_ns` checks optional integer-form `exp` and `nbf` claims without a hidden clock read. Password verification enforces the caller's three work ceilings before Argon2 runs. There is no default password policy, key lookup, issuer/audience policy, cookie, or session store; the exact bounds and errors are recorded in [`pkg.auth`'s design](../impl/pkg-design/auth.md).
 
@@ -137,13 +187,13 @@ fn create_session(
 
 `get` returns an owned optional string, `set` reports whether its `Always` / `IfAbsent` / `IfPresent` condition applied, and `delete` reports whether the key existed. Transport, oversized, or malformed replies retire the client; a later operation then returns `Closed`. There is no default endpoint, authentication, TLS, RESP3 negotiation, generic command API, pipeline, retry, redirect, pool, transaction, script, or pub/sub surface. Root `pkg.kv` and its private `pkg.kv.internal.resource` implementation ship together; the exact bounds and error rules are recorded in [`pkg.kv`'s design](../impl/pkg-design/kv.md).
 
-## `pkg.db` — complete committed roadmap
+## `pkg.db`
 
 `pkg.db` is the first-party database package, vendored the same way as the other four: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
 
-Complete: the first public release scope. Typed static queries and commands are checked against real schema metadata at compile time, execute on both SQLite and PostgreSQL, and regenerate that metadata offline. Prepared statements, transactions, typed row streams with deadlines and cancellation, compound one-to-many and many-to-one outputs, migration lifecycle tooling, and read-only catalog inspection with `EXPLAIN` are all in.
+`pkg.db` provides typed static queries and commands for SQLite and PostgreSQL. Queries can be checked at compile time using schema metadata produced by `alignc db prepare`. The package also supports prepared statements, transactions, typed row streams, one-to-many and many-to-one results, migrations, and read-only catalog inspection with `EXPLAIN`.
 
-The complete committed roadmap has also shipped: bounded batch and SoA delivery, PostgreSQL-native single-row and portal-batch delivery, the explicit fixed-capacity non-waiting `pkg.db.pool`, driver-explicit dynamic SQL, and proved SQLite scalar functions. The final cross-rail audit runs every owner suite in the required local and CI gate. Broader logical types, PostgreSQL COPY and callbacks, and SQLite collations remain explicitly consumer-gated future surfaces rather than incomplete D1–D14 work.
+For larger workloads, it offers bounded batches and SoA views, PostgreSQL single-row and portal-batch delivery, a fixed-capacity non-waiting pool, and explicit dynamic SQL. PostgreSQL execution supports deadlines and cancellation; SQLite scalar functions use callbacks checked by the compiler. Broader logical types, PostgreSQL COPY and callbacks, and SQLite collations remain future work, to be designed around concrete consumer needs.
 
 The compiler side is already in the binary you have: `alignc db prepare`, `db migrate`, `db status`, `db check`, and `db repair` (chapter [16](16-toolchain.md)) drive the checked metadata and the migration catalog. `docs/impl/pkg-design/db.md` is the contract of record.
 

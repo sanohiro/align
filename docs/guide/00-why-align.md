@@ -2,17 +2,17 @@
 
 > 🌐 **English** · [Japanese](./ja/00-why-align.md)
 
-Align is an AOT-compiled, data-oriented programming language. Before the syntax, the mindset — because Align asks you to write differently than a scalar, object-oriented language does.
+Align is an AOT-compiled, data-oriented programming language. Before introducing the syntax, this chapter explains its design priorities and how they shape the programs you write.
 
-> **Status.** Align is an early 0.x release. The compiler (`alignc`) builds real native executables, and everything in this book compiles and runs today unless a section is explicitly marked **implementation in progress** — those parts are designed (the design lives in the spec) but not built yet, and the book says so wherever it applies. There is no stability promise during 0.x: the language changes outright, with no deprecation cycles.
+> **Status.** This guide follows the implementation in the current repository. A packaged release may predate a feature described here; chapter [01](01-getting-started.md) explains how to build from source. Examples include complete programs, fragments to place in a function, and explicitly marked compile errors. Align is still in 0.x and does not promise backward compatibility.
 
 ## Four-way alignment
 
-Most languages optimize for one reader: the human. Align optimizes for four at once — the **Human**, the **AI** that reads and writes code, the **Compiler** that must infer memory and parallelism, and the **Hardware** that runs it. A design only ships when it serves all four. That is why Align has no macros, no visible lifetimes, no inheritance hierarchies: each would help one reader at the expense of another.
+Align is designed for four participants: the **Human** and **AI** that read and write code, the **Compiler** that analyzes memory use and parallelism, and the **Hardware** that runs it. Language features must serve all four. This guides decisions such as omitting macros, visible lifetime annotations, and inheritance hierarchies.
 
 ## Nothing hidden
 
-Allocation, errors, side effects, parallelism, and `unsafe` are always visible in the source. There are no hidden copies, no exceptions thrown from nowhere, no threads spawned behind your back. If a line allocates, you can see it. If it can fail, it returns `Result`. This is not ceremony — it is what lets both a human and a compiler reason about the code locally.
+Allocation, errors, side effects, parallelism, and `unsafe` are always visible in the source. There are no hidden copies, no exceptions thrown from nowhere, no threads spawned behind your back. If a line allocates, you can see it. Recoverable errors use `Result`. Bounds violations and invalid integer division terminate the program instead of returning `Err` (chapter [04](04-errors.md)). This is not ceremony — it is what lets both a human and a compiler reason about the code locally.
 
 ## One way to do things
 
@@ -31,8 +31,6 @@ The center of Align is not the object — it is the array. Real programs spend t
 
 ## How to read this book
 
-Chapters 01–05 get you writing programs: the toolchain, the expression-oriented core, data modeling, errors, and memory. Chapters 06–12 are the heart of the language: pipelines, strings, JSON, generics and modules, closures and parallelism, data-oriented layout, and explicit SIMD. Chapters 13–16 cover the standard library and the edges (unsafe, FFI, tooling). Chapter 17 closes with the idioms that make Align code fast and idiomatic.
+Chapters 01–05 cover the foundations: the toolchain, expressions, data modeling, errors, and memory. Chapters 06–12 cover pipelines and data processing. Chapters 13–18 cover the standard library, unsafe, FFI, tooling, and idioms. Chapters 19–22 apply these ideas to larger systems, and chapters 23–25 introduce packages, databases, and vector search.
 
-Prefer learning by drilling? [The Little Aligner](../little-aligner/README.md) teaches the same material as a question-and-answer workbook, in the style of *The Little Schemer*.
-
-Every code block in this book is real: it compiles with today's `alignc` unless marked otherwise.
+[The Little Aligner](../little-aligner/README.md) uses short questions and answers in the style of *The Little Schemer*, focusing on pipelines, data layout, and ownership. This guide adds practical coverage of tools, libraries, and packages. You can use the workbook to practice the language concepts and return here when building a program.

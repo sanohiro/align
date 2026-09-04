@@ -14,7 +14,7 @@ scores.map(fn s { s + 5 }).where(fn s { s >= 60 }).count()
 
 **Q2.** With `scores := [55, 40, 90]`, what does it answer?
 
-**A2.** `2`. The curve lifts `55` to `60` (in) and `40` to `45` (out); `90` was never in doubt.
+**A2.** `2`. Adding five gives `[60, 45, 95]`, and two of those scores are at least sixty.
 
 ---
 
@@ -25,7 +25,7 @@ xs.where(fn x { x > 0 }).map(fn x { x * 2 }).sum()
 xs.map(fn x { x * 2 }).where(fn x { x > 0 }).sum()
 ```
 
-**A3.** For doubling, the answers agree — doubling doesn't change sign. But the *work* differs: the first filters early and doubles fewer. Filter early when you can; the chain does exactly what you wrote, in the order you wrote it.
+**A3.** When doubling does not overflow, the answers agree. The *work* differs: the first filters early and doubles fewer values. Remember chapter 1: integer overflow wraps, so doubling can change a value's sign. Move a filter only when that preserves the answer for your inputs.
 
 ---
 
@@ -42,13 +42,13 @@ xs.where(fn x { x > 0 }).map(fn x { x - 10 }).count()
 
 **Q5.** Why don't we just write `for` loops like in C or Go?
 
-**A5.** A `for` loop is a set of instructions on *how* to move the CPU's feet. A pipeline is a statement of *what* the data becomes. When you declare *what* the data is doing, the compiler is free to optimize the *how*—vectorizing, fusing, and unrolling—far better than hand-written loops. 
+**A5.** A pipeline names the work on each element and the result we need. We do not have to manage an index or an accumulator ourselves. The compiler can fuse the stages and, where the operations allow it, vectorize the loop.
 
 ---
 
-**Q6.** In other languages, chaining `map` and `where` creates temporary intermediate arrays for every step, chewing up memory. Does Align?
+**Q6.** Does chaining `map` and `where` create a temporary array for each step?
 
-**A6.** No. Align pipelines are lazy until the final collapse. However many stages you chain—`map`, `where`, another `map`, a `scan`, a `sum`, ten more if you like—the compiler fuses all of them into exactly one loop, intermediates in registers. It is as if you wrote a painstakingly hand-optimized C loop, but you didn't have to. You may check any chain you write: `alignc emit-llvm yourfile.align`.
+**A6.** No. `map` and `where` fuse with the ending: each element passes through the stages without an intermediate array. A chain ending in `sum` uses one loop. Materializing operations such as `scan`, `sort`, and `to_array` build an array; a later reduction reads that array in another pass. You can inspect the generated code with `alignc emit-llvm yourfile.align`.
 
 ---
 
@@ -72,7 +72,7 @@ total := items
 halfway := items.where(.active).price
 ```
 
-**A8.** No — a chain must end in a collapse (`sum`, `count`, …) or a materialization (`to_array`, `sort`, `map_into`). A held middle would be a secret unfinished loop. End it, or don't start it.
+**A8.** No — a chain must end in a reduction (`sum`, `count`, …) or a materialization (`to_array`, `sort`, `map_into`). The ending determines whether we reduce the values, allocate an array, or write into existing storage.
 
 ---
 
@@ -96,7 +96,7 @@ One visible allocation, two cheap reductions. (One day you'll want *many* aggreg
 [1, 2, 3, 4, 5].chunks(2).map(fn c { c.sum() }).to_array()
 ```
 
-**A10.** `[3, 7, 5]` — sums of `[1,2]`, `[3,4]`, `[5]`. `chunks(n)` deals the array into hands of `n` (last hand short), each a slice, each pipelined like anything else.
+**A10.** `[3, 7, 5]`: the sums of `[1, 2]`, `[3, 4]`, and `[5]`. `chunks(n)` splits the array into slices of up to `n` elements. The last is shorter when the length is not a multiple of `n`.
 
 ---
 
@@ -112,7 +112,7 @@ fn double_into(src: slice<i64>, out dst: slice<i64>) {
 
 **A11.** The zero-allocation ending: results go into the slice `dst`, which must be the same length, and which the compiler proves doesn't overlap `src`. For the hot path that recycles buffers.
 
-The `out` says where the storage comes from: `dst` is the *caller's* slice, and this function writes through it. That is the only way to name a destination you did not allocate — so a `map_into` always lives inside a function with an `out` parameter.
+`out` says that the caller provides the destination. The function writes into `dst` instead of allocating an array of its own. The destination for `map_into` is received through an `out` parameter like this one.
 
 ---
 
@@ -135,11 +135,11 @@ xs.where(is_wanted).map(log).count()
 
 **Q14.** So “one loop” does not mean “the order no longer matters”?
 
-**A14.** Exactly. One physical loop carries one logical sentence. The compiler may change the machinery only while preserving the sentence.
+**A14.** Correct. Combining the work into one loop preserves the order of operations on each element.
 
 ---
 
-**Q15.** Write this request: “From the temperatures, keep positive ones, convert each from Celsius to doubled half-degrees, and find the maximum.”
+**Q15.** Write this request: “From the temperatures in degrees Celsius, keep positive ones, express each in units of half a degree, and find the maximum.”
 
 **A15.**
 
@@ -147,7 +147,7 @@ xs.where(is_wanted).map(log).count()
 temps.where(fn t { t > 0 }).map(fn t { t * 2 }).max()
 ```
 
-Nouns give the source and answer; verbs give the stages.
+`where` keeps positive values, `map` doubles them to change units, and `max` finds the largest.
 
 ---
 
@@ -165,7 +165,7 @@ The right answer depends on reuse. “No hidden allocation” does not mean “n
 
 ---
 
-**Q17.** Split `[1, 2, 3, 4, 5, 6, 7]` into hands of three and total each hand.
+**Q17.** Split `[1, 2, 3, 4, 5, 6, 7]` into chunks of three elements and sum each chunk.
 
 **A17.**
 
@@ -176,13 +176,13 @@ The right answer depends on reuse. “No hidden allocation” does not mean “n
     .to_array()
 ```
 
-`[6, 15, 7]`. A chunk is a view, so the last short hand costs no padding and no copy.
+`[6, 15, 7]`. Each chunk is a view into the original array. The last contains only one element; it needs no padding or copying.
 
 ---
 
 **Q18.** Why does Q17 end in `to_array` rather than `sum`?
 
-**A18.** Because the requested answer is one total *per hand*, not one total for the whole input. The shape of the answer chooses the ending.
+**A18.** Because the requested answer is one total *per chunk*, not one total for the whole input. The shape of the answer chooses the ending.
 
 ---
 
@@ -196,7 +196,7 @@ fn scale_into(src: slice<i64>, out dst: slice<i64>) {
 }
 ```
 
-`to_array` asks for new storage; `map_into` names existing storage — the caller's, arriving as `out dst` (A11). Same transformation, different ownership story.
+`to_array` creates a new array. `map_into` writes into storage supplied by the caller as `out dst` (A11). The transformation is the same; the destination differs.
 
 ---
 
@@ -212,10 +212,12 @@ answer := xs
     .sum()
 ```
 
-Break thoughts into named functions, not unfinished streams.
+Put the transformations in named functions while keeping the pipeline connected to its ending.
 
 ---
 
+For a diagram comparing a fused reduction with `to_array()` followed by another pass, see the guide's [pipeline chapter](../guide/06-pipelines.md).
+
 > **The Fifth Commandment**
 >
-> *A chain reads left to right, filters early, and ends. One sentence, one loop, one answer.*
+> *Read a chain left to right. Filter early when it preserves the answer, and choose the ending the result needs.*

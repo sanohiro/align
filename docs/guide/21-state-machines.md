@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/21-state-machines.md)
 
-In Chapter 19, we learned to unlearn objects. We stopped using instances with hidden `is_connected` booleans and internal mutable state. But how do we actually model a complex system—like a TCP connection, a game turn, or a UI component—without objects?
+Chapter 19 separated data from behavior. To represent a TCP connection, a game turn, or a UI component, we also need to describe its current state and the events that can change it.
 
 In Align, we model state using **sum types** and **state machines**.
 
@@ -20,7 +20,7 @@ class Connection {
 }
 ```
 
-This struct can represent impossible states. What does it mean if `isConnected` is true, but `socketId` is null? What if `isAuthenticating` and `errorMessage` are both set? The compiler cannot help you here. You have to write tests to ensure these impossible states never happen.
+This struct can represent inconsistent states. What should happen if `isConnected` is true but `socketId` is null, or if `isAuthenticating` and `errorMessage` are both set? Code that updates these fields must keep them consistent, and tests must check those combinations.
 
 ## Making Invalid States Unrepresentable
 
@@ -36,7 +36,9 @@ ConnectionState {
 }
 ```
 
-Now, it is physically impossible to have a `user_id` while you are `Disconnected`. It is impossible to be `Authenticating` without a socket. The shape of the data perfectly matches the reality of the domain. Payloads are positional; when several values deserve one domain name, give them a struct, for example `Connected(Session)`. Borrowed text and supported owned arrays may also be payloads, with the ordinary region and Move rules from chapter [05](05-memory.md).
+With this definition, `Disconnected` has no `user_id` field, and constructing `Authenticating` requires a socket. The type excludes those inconsistent combinations. Payloads are positional; when several values deserve one domain name, give them a struct, for example `Connected(Session)`. Borrowed text and supported owned arrays may also be payloads, with the ordinary region and Move rules from chapter [05](05-memory.md).
+
+The `i64` socket values here are identifiers for a model, not owned OS socket handles. This example can copy a state because all payloads are Copy. If a state owns a real resource, transitions must transfer or borrow that ownership and arrange its cleanup; copying an identifier does not duplicate the resource.
 
 ## Transitions as Pure Functions
 
@@ -79,12 +81,12 @@ fn next(state: ConnectionState, event: Event) -> ConnectionState {
 }
 ```
 
-## Why this is better
+## Checking and testing transitions
 
-This is a **Finite State Machine**. By pulling the state out of a hidden object and representing it as explicit data, we gain several superpowers:
+This is a **finite state machine**. Representing it as data and a transition function gives us:
 
-1. **Bug-proof:** `match` must cover every variant — the compiler rejects a missing arm. Every "ignore this event" is a wildcard *you wrote deliberately*, not a case you forgot.
+1. **Exhaustive cases:** `match` must cover every variant; the compiler rejects a missing arm. A wildcard explicitly handles any remaining cases.
 2. **Testable:** Testing this logic does not require spinning up sockets or mocking objects. You just call `next(state, event)` and assert the output.
 3. **Data-Oriented:** We can store an array of thousands of `ConnectionState` in memory and update them in bulk using a pipeline: `states.map(fn s { next(s, ev) }).to_array()`.
 
-When you stop hiding state inside objects, your system becomes a pipeline of predictable transitions.
+The transition logic can now be tested independently and applied to many states through the same pipeline.

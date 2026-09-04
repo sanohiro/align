@@ -2,11 +2,11 @@
 
 > 🌐 **English** · [Japanese](./ja/19-unlearning-objects.md)
 
-If you are coming to Align from Java, C#, or Python, your first instinct is to model the world as a graph of interacting objects. In Align, that instinct will fight the language at every turn. Align does not have objects, classes, or inheritance. 
+If you are coming to Align from Java, C#, or Python, you may be used to modeling a program as interacting objects. Align has no classes or inheritance. It separates data from the functions that process it.
 
-This chapter is a cookbook of paradigm shifts: how to solve common OOP problems the Align way.
+This chapter shows how to adapt common object-oriented patterns to Align.
 
-## 1. The "Stateful Entity" Anti-Pattern
+## 1. Updating fields across many entities
 
 **The OOP Way:** 
 You have a `Player` class that holds its own `health`, `x`, `y`, and an `update()` method that modifies its own state.
@@ -32,10 +32,10 @@ arena {
 }
 ```
 
-## 2. The "Polymorphic List" Anti-Pattern
+## 2. Processing several variants
 
 **The OOP Way:** 
-A list of `Shape` interfaces, containing `Circle`, `Rectangle`, and `Triangle` objects. You loop over them and call `shape.area()`. This causes virtual method dispatch (cache misses) on every iteration.
+A list of `Shape` interfaces contains `Circle`, `Rectangle`, and `Triangle` objects. Calling `shape.area()` on each element requires virtual dispatch; if the objects are scattered in memory, traversal can also incur cache misses.
 
 **The Align Way:**
 Use a sum type if the collection is small and mixed, or separate arrays if processing speed is paramount.
@@ -52,15 +52,15 @@ areas := shapes.map(fn s {
     }
 }).to_array()
 ```
-However, the true data-oriented approach is to store all Circles in one `soa<Circle>` and all Rects in a `soa<Rect>`, and process them in two separate, blazing-fast pipelines with no branching at all.
+When the variants can be processed separately, store Circles in `soa<Circle>` and Rects in `soa<Rect>`. Each pipeline then processes one shape without a branch to select its variant.
 
-## 3. The "Hidden Allocator" Anti-Pattern
+## 3. Allocating collections
 
 **The OOP Way:** 
 You append to a list inside a loop. The list resizes itself automatically, allocating heap memory unpredictably. 
 
 **The Align Way:**
-Align has `heap.new`, but its idiomatic use is rare. If you need dynamic memory, you use an `arena`. When the arena block ends, all memory is freed instantly. You never `new` or `delete` individual objects inside a hot loop, and in a hot loop you never grow a collection by side effect either — the pipeline itself accumulates, with exactly one visible allocation at the end:
+Use an `arena` when allocations share a lifetime. Its memory is released together when the block ends. For a bulk transformation, let the pipeline accumulate the result and make its allocation explicit at the end:
 
 ```align
 threshold := 100
@@ -71,9 +71,9 @@ arena {
 } // Boom. Gone.
 ```
 
-(When a pipeline genuinely can't express the shape — say, accumulating results while streaming input of unknown length — `array_builder<T>` is the sanctioned side-effecting `.push()` alternative; see chapter 18. It is the escape hatch for the rare case, not a substitute for the pipeline.)
+When results arrive through sequential I/O of unknown length, use `array_builder<T>` and `.push()` to accumulate them (chapter [18](18-std-services.md)). Use a pipeline when the transformation can be expressed as one.
 
-## 4. The "Getter/Setter" Anti-Pattern
+## 4. Accessing and transforming fields
 
 **The OOP Way:** 
 You hide fields behind `get_health()` and `set_health()` to encapsulate state and inject behavior.
@@ -83,4 +83,4 @@ Data is just data. Structs have public fields. If you need to transform the data
 
 ## Summary
 
-Unlearning objects means stopping the search for "the thing that *does* the action" and starting the search for "how the *data* flows". When you lay the data flat and push it through pipelines, the machine will run it faster than you ever thought possible.
+In Align, start by identifying the data a task needs and the transformations to apply. Grouping fields into contiguous columns lets each pipeline process the data it uses.

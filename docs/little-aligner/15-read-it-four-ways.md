@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/15-read-it-four-ways.md)
 
-**Q1.** We have learned many small spells. Can we see the whole language in one small program?
+**Q1.** Can one small program bring together what we have learned?
 
 **A1.** Enough of it to learn how to read:
 
@@ -65,7 +65,7 @@ This is the **lifetime reading**. Do not merely find values; find their homes an
 
 **Q8.** Why may the number leave the arena, while `rows` may not?
 
-**A8.** The number contains its own bits. It points at nothing in the arena. `rows` is backed by arena memory; returning it would leave a view of a demolished building. The type checker refuses that story before it can happen.
+**A8.** The number contains its own bits. It points at nothing in the arena. `rows` refers to arena memory; returning it would leave a view of storage that has been freed. The type checker rejects that return.
 
 ---
 
@@ -99,7 +99,7 @@ rows.where(.valid).score.to_array().sum()
 
 **Q13.** Could we replace `?` with `else`?
 
-**A13.** Only by choosing a fallback value of the right type. That changes the answer reading: malformed input is no longer passed upward as a failure; it is deliberately replaced. Syntax that looks small may carry a large policy. Read the policy, not just the punctuation.
+**A13.** Yes. An `else` branch can produce a fallback of the payload's type or exit the function, for example `else { return Err(Error.Invalid) }`. On a `Result`, `else` discards the original error. Use `?` to pass that error unchanged; use `match` to inspect it before deciding. Choose which failure or fallback the caller should receive.
 
 ---
 
@@ -122,7 +122,7 @@ rows.where(.valid).score.to_array().sum()
 1. **Answer** — What value or failure does this mean?
 2. **Flow** — How does data change, and where does control go?
 3. **Lifetime** — Who owns each value, and where does it die?
-4. **Work** — Which bytes, passes, allocations, copies, and exits does the machine perform?
+4. **Work** — Which data does the machine read, how many passes, allocations, and copies does it make, and where does execution exit?
 
 If one answer is foggy, you have found the part of the program you do not understand yet.
 
@@ -152,13 +152,27 @@ If you wrote that from the sentence without copying an earlier chain, the pipeli
 
 **Q19.** New requirement: “return every valid score over 100.” What changes?
 
-**A19.** The ending becomes `.to_array()`, and the function's return type and lifetime story must change with it. One word in the requirement — “number” versus “every” — changes scalar answer into owned collection.
+**A19.** The result type becomes `Result<array<i64>, Error>`. Merely writing `.to_array()` inside the original arena is not enough: that array would belong to the arena. Using the same `Record` declaration and `import core.json`, make the result in a helper without a local arena:
+
+```align
+fn collect_scores(rows: soa<Record>) -> array<i64> =
+    rows.where(.valid).score.where(fn score { score > 100 }).to_array()
+
+fn scores(data: str) -> Result<array<i64>, Error> {
+    arena {
+        rows: soa<Record> := json.decode(data)?
+        return Ok(collect_scores(rows))
+    }
+}
+```
+
+`rows` is a borrowed SoA view for the helper's call. The helper's `to_array()` allocates an independent result: a callee does not inherit its caller's arena implicitly. Its elements are `i64` values, so they borrow nothing from the input columns. The caller receives the array after the temporary columns are released. An array of borrowed `str` elements would still depend on their text; owning an array does not make all its elements independent.
 
 ---
 
-**Q20.** New requirement: “return the first malformed-row reason, otherwise the count.” Which old choice must not change?
+**Q20.** New requirement: “if decoding fails, return its error unchanged; otherwise return the count.” Which old choice must not change?
 
-**A20.** Keep `Result` and `?`. Failure still has a story the caller requested. An `else` fallback would erase the very answer now being asked for.
+**A20.** Keep `Result` and `?`. An `else` fallback would discard the requested error. This decoder returns `Error`; it does not provide a row number or a detailed parse message merely because we propagate it.
 
 ---
 
@@ -190,6 +204,6 @@ If you wrote that from the sentence without copying an earlier chain, the pipeli
 >
 > *Read once for the answer, once for the flow, once for the lifetime, and once for the work. When all four stories agree, you understand the program.*
 
-Now the drills are done. You know enough to begin solving your own problems in Align: shape the data, choose its flow, state its lifetime, and account for its work. [The guide](../guide/README.md) names the wider surface — strings, modules, the standard library, and building systems — when a real program asks for it. It is a shelf of further tools, not the place where becoming an aligner begins. That happened here.
+Now try a program of your own. Choose the data's shape, trace its flow, check its lifetime, and account for its work. [The guide](../guide/README.md) covers strings, modules, the standard library, and the toolchain as you need them.
 
-*Go cook something.*
+*What will you make?*

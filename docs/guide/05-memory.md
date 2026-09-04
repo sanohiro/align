@@ -33,9 +33,70 @@ fn main() -> i32 {
 }
 ```
 
-That compile error is the entire mechanism that replaces both the garbage collector and Rust's visible lifetimes: exactly one owner at any time, so the compiler knows exactly when to free — no double-free, no use-after-free, no annotation. When the owner goes out of scope, the buffer is dropped; when you reassign a `mut` owner, the old value is dropped first (no leak). When you genuinely want two, say so: `.clone()` is a visible deep copy.
+Moving a value leaves one owner, so the compiler can determine when to release its resources. When the owner goes out of scope, the buffer is dropped; when you reassign a `mut` owner, the old value is dropped first. For types that support cloning, such as `string`, `.clone()` makes a second independent copy. A Move resource is not necessarily cloneable.
 
 A struct with an owning field (`name: string`) becomes a Move type itself, dropped recursively — ownership composes through structure. Reading such a field (`u.name.len()`) borrows it as a `str` view without consuming anything.
+
+The two panels show the same buffer before and after `b := a`. The string's bytes stay in place; ownership changes hands.
+
+```mermaid
+flowchart LR
+    subgraph before["Before b := a"]
+        a["a: string"] -->|owns| first["buffer: hi"]
+    end
+    subgraph after["After b := a"]
+        dead["a: cannot be used"]
+        b["b: string"] -->|owns| same["the same buffer: hi"]
+    end
+    before -->|Move| after
+```
+
+`b` now determines when the buffer is released. For `b := a.clone()` instead, there would be two independent buffers and both bindings would remain usable.
+
+## Passing ownership, borrowing, and updating
+
+A parameter of type `Profile` takes a Move `Profile` from its caller. Use `borrow` when the function should inspect the existing record, and `borrow mut` when it should update that record:
+
+```align
+Profile { name: string, visits: i64 }
+
+fn name_size(borrow p: Profile) -> i64 = p.name.len()
+
+fn visit(borrow mut p: Profile) {
+    p.visits = p.visits + 1
+}
+
+fn main() -> i32 {
+    mut p := Profile { name: "Ada".clone(), visits: 0 }
+    print(name_size(p))    // 3
+    visit(p)
+    print(p.visits)        // 1
+    print(p.name.len())    // 3 — p is still owned here
+    return 0
+}
+```
+
+The mode is written in the function declaration; the call remains `visit(p)`. A shared borrow cannot move, replace, or drop `p`. A mutable borrow requires a writable place and gives the callee exclusive access for the call. It also invalidates older views into that value: obtain a new view after an update rather than using one saved before it.
+
+For a function that only needs text or array elements, prefer `str` or `slice<T>` to borrowing the whole record. Shared `borrow` is also useful for large Copy structs: ordinary value passing copies them, while a borrow reads the caller's existing value. `borrow mut` is needed when a Copy struct's field updates should reach the caller.
+
+Follow the two calls in the example. Neither transfers ownership of `p`:
+
+```mermaid
+sequenceDiagram
+    participant Caller as main: owns p
+    participant Read as name_size
+    participant Update as visit
+    Caller->>Read: name_size(p): shared borrow
+    Note over Read: Reads p.name without changing p
+    Read-->>Caller: 3
+    Caller->>Update: visit(p): mutable borrow
+    Note over Update: Exclusive access: visits becomes 1
+    Update-->>Caller: Returns without taking p
+    Note over Caller: Still owns p and may read or borrow it again
+```
+
+These calls return an integer and Unit. A function that returns a view can leave the caller with a reference into `p`; that view remains subject to `p`'s lifetime and mutation rules.
 
 ## Arenas — batch allocation by lifetime
 
@@ -46,7 +107,7 @@ fn join(a: str, b: str) -> string {
     arena {
         c := template "{a}{b}" // arena-backed temporary
         return c.clone()    // copy the result out — visible escape
-    }                       // everything else freed here, O(1)
+    }                       // all arena storage released here
 }
 
 fn main() -> i32 {
@@ -56,7 +117,20 @@ fn main() -> i32 {
 }
 ```
 
-An arena is a bump allocator: allocation is a pointer increment, and the free is one operation for the whole block regardless of how much you allocated. No per-object bookkeeping, no fragmentation. This is data-oriented memory management: group allocations by lifetime, not by object.
+Here `c` is a view of the template's arena storage. `c.clone()` allocates independent string storage and copies the bytes before `join` returns:
+
+```mermaid
+flowchart LR
+    subgraph local["join's arena: released on return"]
+        c["c: str"] -.->|views| temporary["template bytes: fusion"]
+    end
+    temporary -->|"c.clone(): allocate and copy"| owned["independent heap buffer: fusion"]
+    s["caller after return: s is a string"] -->|owns| owned
+```
+
+After the return, the arena storage is gone, but `s` owns the copied buffer. Dropping `s` releases that buffer. Returning `c` itself would leave the caller referring to the released arena storage, so the compiler rejects it. An independent scalar such as `c.len()` can leave without a copy of the text.
+
+An arena normally allocates by advancing a pointer within a block, obtaining another block when needed. Leaving the arena releases its blocks together. It avoids individually freeing each temporary; constructing the values and obtaining or releasing the backing blocks still take work.
 
 The compiler tracks the **region** of every value. A value allocated in an arena cannot leave it:
 
@@ -69,7 +143,9 @@ fn leak(a: str, b: str) -> str {
 }
 ```
 
-You never annotate a region. You only see them when you try to write a dangling reference — and the program doesn't compile. The escape hatch is always the same, and always visible: `.clone()` copies the data out into an owned value.
+Region annotations are not part of the source syntax. The compiler reports an error if a reference would outlive its data. In the string example, `str.clone()` makes an independent owned string. This does not mean every arena value has a cloning operation: choose an owned result type and its allocation path when returning a collection.
+
+In particular, `.to_array()` inside a local arena produces an arena-backed array, even though `array<T>` is a Move type. Move determines ownership transfer; the inferred region separately determines how long its storage may live. A helper with no local arena can allocate a free-standing result from borrowed inputs: the caller's arena is not implicitly inherited. [Little Aligner 15, Q19](../little-aligner/15-read-it-four-ways.md) shows the full pattern for an array of scores. Its `i64` elements are independent values; an owned array of `str` views would still depend on the storage those views borrow.
 
 ## The heap, explicitly
 
@@ -93,7 +169,7 @@ warning: unnecessary heap allocation: this box is only ever read back with
          suffices)
 ```
 
-`heap.new` exists for the case where a value must outlive the stack frame that computed it but live inside a chosen arena; it is deliberately not the everyday tool. In Align, "allocate every object on the heap" is not a style — the language steers you to values and arenas, and it says so when you stray.
+Use `heap.new` when a value must outlive the stack frame that computed it while remaining inside a chosen arena. For other cases, prefer values or arena-backed collections; the lint above identifies an unnecessary box.
 
 ## Views: `str` and `slice<T>`
 
@@ -115,6 +191,6 @@ That's all of it. When you create data, ask one question — *what is its lifeti
 - Dies in this expression or scope → **a value**. Do nothing.
 - A batch that dies together at the end of a phase → **arena**, and `.clone()` the survivors out.
 - One value that must outlive the frame → **`heap.new`** in the arena that matches its lifetime.
-- Just looking at someone else's data → **a view** (`str`, `slice`), free of charge.
+- Reading existing data → **a view** (`str`, `slice`), with no allocation or copy of the underlying data.
 
 Everything else — when to free, whether it escapes, who owns what — is the compiler's job, checked at compile time, invisible in the source except at a few visible points: `arena {}` (or a named `arena r {}`) where a lifetime begins and ends, `.clone()` where you pay for a copy, and a `borrow` / `borrow mut` parameter where a function reads or updates a value it does not own.

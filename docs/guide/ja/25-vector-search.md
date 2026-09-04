@@ -2,15 +2,13 @@
 
 # 25 — `pkg.db` を通じたベクトル検索
 
-データベースが SQL 境界でテキスト表現のベクトルを受け取り、結果を既存の対応済み
-フィールドへ整形できるなら、ベクトル検索はすでに `pkg.db` から利用できます。Align は
-データベース固有の契約を共通ベクトル API の背後へ隠しません。embedding の生成と
-`Params`/`Row` の形はアプリケーションが所有し、driver 固定の SQL、距離の意味、filter、
-index 利用、tuning は各 `Query` が所有します。
+データベースがベクトルをテキストとして受け取り、`pkg.db` が扱える型の列を返すなら、
+`pkg.db` からベクトル検索を使えます。アプリケーション側で埋め込みベクトルを生成し、
+`Params` と `Row` を定義します。距離の計算、絞り込み、インデックスの使用、調整は各クエリの
+SQL で指定します。データベース間で共通のベクトル API はありません。
 
-VC1 は PostgreSQL 16 と pgvector 0.8.6 でこの経路を実証します。test database は明示的に
-`CREATE EXTENSION vector` を実行し、`pkg.db` も `alignc` も extension を install または
-upgrade しません。
+この方法は PostgreSQL 16 と pgvector 0.8.6 で検証済みです。拡張は `CREATE EXTENSION vector`
+で有効にしてください。`pkg.db` や `alignc` が拡張をインストール・更新することはありません。
 
 ```align
 module app.search
@@ -35,38 +33,37 @@ pub fn nearest() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
 )
 ```
 
-ベクトルは text として可視に組み立てられ、server が parse します。これは互換経路であり、
-zero-copy や最適 transport の約束ではありません。直接の `pkg.db.rows`、`pkg.db.prepare` と
-`pkg.db.rows_stmt`、checked/offline metadata、`pkg.db.meta_query`、`pkg.db.explain` はすべて
-同じ descriptor を使います。checked PostgreSQL metadata は canonical な extension schema、
-name、version を含むため、pgvector のない database では preparation が失敗し、version が
-変われば fallback を選ばず schema identity が変わります。
+アプリケーションが渡したベクトルのテキストを、サーバーが解析します。既存の文字列のバインドを
+利用する方法であり、ベクトルをゼロコピーで送るものではありません。このクエリ定義は
+`pkg.db.rows`、`pkg.db.prepare` と `pkg.db.rows_stmt` によるプリペアドステートメント、
+検査用メタデータ、`pkg.db.meta_query`、`pkg.db.explain` で使えます。PostgreSQL の検査用
+メタデータには、拡張のスキーマ、名前、バージョンを記録します。pgvector がなければ prepare は
+失敗し、バージョンが変われば記録されるスキーマの識別情報も変わります。
 
-## Vendor ごとの境界
+## データベースごとの違い
 
-この表は product contract を記録するものであり、交換可能な Align capability を示すものでは
-ありません。本番 index の version や tuning を決めるときは、link 先の vendor 文書を確認して
-ください。
+次の表は、各データベースのベクトル機能を比較したものです。`pkg.db` がすべての製品に対応して
+いるという意味ではありません。本番のバージョンやインデックスの調整を決めるときは、リンク先の
+公式文書を確認してください。
 
-| Database | Storage と availability | Exact search と distance | Approximate index/search | Tuning boundary |
+| データベース | 格納形式と提供条件 | 厳密検索と距離 | 近似インデックス・検索 | 設定する場所 |
 |---|---|---|---|---|
-| PostgreSQL + [pgvector 0.8.6](https://github.com/pgvector/pgvector/tree/v0.8.6) | 別途 install する `vector(N)` extension type。VC1 は公式 `pgvector/pgvector:0.8.6-pg16-bookworm` image を pin する。 | index なしで `<->` (L2)、`<#>` (negative inner product)、`<=>` (cosine)、`<+>` (L1) により並べると exact scan。 | HNSW と IVFFlat の operator-class index。query operator は index と一致させる。 | HNSW の構築/検索と IVFFlat の lists/probes は extension SQL/settings のまま。 |
-| SQLite + [vec1 0.7](https://sqlite.org/vec1/doc/version-0.7/doc/vec1.md) | 別途 build する virtual-table extension。native vector は有限 IEEE-754 `f32` を machine byte order で詰めた BLOB。SQLite built-in type ではない。 | `none` と `flat` model は full vector を scan。`vec1_l2_distance` は squared L2、`vec1_cos_distance` は vec1 文書の cosine-distance 式を使う。JSON 変換は明示的 SQL。 | training 済み IVFADC model と PQ/OPQ/BQ 圧縮。nearest-neighbor query は virtual table を table-valued function として使う。 | model training、bucket、quantizer、code size、residual、`nprobe`、thread は vec1 configuration が所有する。 |
-| MySQL Community [9.7](https://dev.mysql.com/doc/refman/9.7/en/vector.html) と HeatWave | Community は `f32` element の built-in `VECTOR(N)` storage を持つが、`VECTOR` column はどの key にもできない。 | Community は `DISTANCE` を含まない。[function reference](https://dev.mysql.com/doc/refman/9.7/en/vector-functions.html) は cosine、dot、Euclidean の `DISTANCE` を HeatWave on OCI と MySQL AI に限定する。 | Community は vector index/search contract を提供しない。[HeatWave](https://dev.mysql.com/doc/heatwave/en/mys-hw-genai-vector-index-creation.html) は対象 workload に automatic HNSW index を別途提供する。 | HeatWave の distance execution、index creation、memory quota、build timeout、HNSW search control は service setting であり、Community-portable SQL option ではない。 |
-| [MariaDB 11.7.1+](https://mariadb.com/docs/server/reference/sql-structure/vectors/vector-overview) | text conversion function を伴う built-in `VECTOR(N)`。 | `VEC_DISTANCE` は Euclidean または cosine distance を表す。index-free evaluation は exact。 | `VECTOR INDEX` は modified HNSW を使い、対応する `ORDER BY ... LIMIT` query を高速化する。 | `M`、default metric、`mhnsw_ef_search`、cache limit は MariaDB の index/session/server control のまま。 |
-| [SQL Server 2025 (17.x)](https://learn.microsoft.com/en-us/sql/sql-server/ai/vectors?view=sql-server-ver17) | JSON array として公開される `f32` の binary built-in `VECTOR(N)`。Azure SQL product ごとにも availability が異なる。 | `VECTOR_DISTANCE` は常に exact で、cosine、Euclidean、negative dot product を支援する。 | `CREATE VECTOR INDEX` と `VECTOR_SEARCH` は DiskANN を使う。vendor 文書が示す product では index/search surface は preview。 | metric、index build parallelism、preview enablement、search option は T-SQL/service の関心事のまま。 |
-| [Oracle AI Database 26ai](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/vector_distance.html) | element format と dimension を Oracle SQL で宣言する built-in `VECTOR`。 | `VECTOR_DISTANCE` と shorthand function は、適用可能な cosine、dot、Euclidean、squared Euclidean、Manhattan、Hamming、Jaccard を支援する。`FETCH EXACT` は flat search を強制する。 | HNSW と IVF vector index。query metric が index metric と異なると exact search に fallback する。 | target accuracy、vector pool、neighbor partition、graph/index setting、metric choice は Oracle DDL/session の関心事のまま。 |
+| PostgreSQL + [pgvector 0.8.6](https://github.com/pgvector/pgvector/tree/v0.8.6) | 別途インストールする拡張型 `vector(N)`。結合テストでは公式の `pgvector/pgvector:0.8.6-pg16-bookworm` イメージを指定。 | インデックスなしで `<->`（L2）、`<#>`（負の内積）、`<=>`（コサイン）、`<+>`（L1）で並べると厳密検索になる。 | HNSW と IVFFlat の演算子クラス別インデックス。クエリの演算子とインデックスを一致させる。 | HNSW の構築・検索、IVFFlat の lists/probes は拡張の SQL・設定で指定する。 |
+| SQLite + [vec1 0.7](https://sqlite.org/vec1/doc/version-0.7/doc/vec1.md) | 別途ビルドする仮想テーブル拡張。ベクトルは有限の IEEE-754 `f32` をマシンのバイト順で詰めた BLOB。SQLite の組み込み型ではない。 | `none` と `flat` は完全なベクトルを走査する。`vec1_l2_distance` は二乗 L2、`vec1_cos_distance` は文書で定義されたコサイン距離を使う。JSON 変換は SQL で明示する。 | 学習済みの IVFADC モデルと PQ/OPQ/BQ 圧縮。最近傍検索では仮想テーブルをテーブル値関数として使う。 | 学習、バケット、量子化器、コードサイズ、残差、`nprobe`、スレッド数は vec1 の設定で指定する。 |
+| MySQL Community [9.7](https://dev.mysql.com/doc/refman/9.7/en/vector.html) と HeatWave | Community は `f32` 要素の組み込み `VECTOR(N)` 型を持つが、`VECTOR` 列はキーにできない。 | Community は `DISTANCE` を提供しない。[関数リファレンス](https://dev.mysql.com/doc/refman/9.7/en/vector-functions.html) では、コサイン・内積・ユークリッドの `DISTANCE` は HeatWave on OCI と MySQL AI に限定される。 | Community はベクトルインデックスや検索の機能を提供しない。[HeatWave](https://dev.mysql.com/doc/heatwave/en/mys-hw-genai-vector-index-creation.html) では、対象の処理に HNSW インデックスを自動生成する。 | 距離の計算、インデックス作成、メモリ上限、構築タイムアウト、HNSW 検索の制御は HeatWave のサービス設定で行い、Community と共通の SQL オプションではない。 |
+| [MariaDB 11.7.1+](https://mariadb.com/docs/server/reference/sql-structure/vectors/vector-overview) | テキスト変換関数を伴う組み込みの `VECTOR(N)` 型。 | `VEC_DISTANCE` はユークリッド距離かコサイン距離。インデックスなしの評価は厳密。 | `VECTOR INDEX` は HNSW の改変版を使い、対応する `ORDER BY ... LIMIT` を高速化する。 | `M`、既定の距離、`mhnsw_ef_search`、キャッシュ上限は MariaDB のインデックス・セッション・サーバーで設定する。 |
+| [SQL Server 2025 (17.x)](https://learn.microsoft.com/en-us/sql/sql-server/ai/vectors?view=sql-server-ver17) | `f32` のバイナリ表現を持ち、JSON 配列として公開する組み込み `VECTOR(N)` 型。Azure SQL の製品ごとに提供状況が異なる。 | `VECTOR_DISTANCE` は常に厳密で、コサイン、ユークリッド、負の内積に対応。 | `CREATE VECTOR INDEX` と `VECTOR_SEARCH` は DiskANN を使う。製品によっては、公式文書でインデックス・検索機能がプレビュー扱いとされている。 | 距離、インデックス構築の並列度、プレビューの有効化、検索オプションは T-SQL やサービスで設定する。 |
+| [Oracle AI Database 26ai](https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/vector_distance.html) | 要素形式と次元を Oracle SQL で宣言する、組み込みの `VECTOR` 型。 | `VECTOR_DISTANCE` と短縮形の関数は、適用可能なコサイン、内積、ユークリッド、二乗ユークリッド、マンハッタン、ハミング、ジャッカードに対応する。`FETCH EXACT` は全件走査を指定する。 | HNSW と IVF のベクトルインデックス。クエリとインデックスの距離の種類が異なると、厳密検索に切り替える。 | 目標精度、ベクトルプール、近傍パーティション、グラフ・インデックス、距離の選択は Oracle の DDL やセッションで設定する。 |
 
-portable な部分は意図的に小さく保ちます。embedding を含む `Params` と、identifier、payload、
-scalar distance を含む `Row` という考え方は再利用できます。それでも database ごとに別の
-driver-restricted `Query` を定義しなければなりません。`pkg.db` は embedding の生成、native
-extension の load、vector SQL の rewrite、index の選択、vendor 間の distance 値の正規化を
-行いません。
+共通して使えるのは、埋め込みベクトルを `Params` に、識別子・ペイロード・距離のスカラー値を
+`Row` に持たせるという構成です。クエリ自体はデータベースごとにドライバを限定して定義します。
+`pkg.db` は、埋め込みの生成、ネイティブ拡張の読み込み、ベクトル SQL の書き換え、インデックス
+の選択、製品間の距離値の正規化を行いません。
 
-## SQLite vec1 の disposition
+## SQLite vec1 を `pkg.db` から使えない理由
 
-VC1 は sqlite.org の `version-0.7` source から隔離した x86-64 Linux probe も実行しました。
-probe は `vec1.c` を loadable extension として build し、SQLite CLI に load して次を観測しました。
+x86-64 Linux の別環境で、sqlite.org の `version-0.7` ソースを使った検証も行いました。
+`vec1.c` を読み込み可能な拡張としてビルドし、SQLite CLI に読み込んだ結果は次のとおりです。
 
 ```text
 vec1_info()                                      version 0.7 (Scalar, multi-threaded)
@@ -75,13 +72,12 @@ vec1_l2_distance([1,2,3], [2,2,3])              1.0
 flat L2 top-2 with category = 'keep'             row 1: 0.0; row 2: 1.0
 ```
 
-この byte 列は probe host 上の little-endian `f32` です。vec1 は machine byte order を規定する
-ため、portable な永続 encoding ではありません。extension は `pkg.db` の外で load する必要が
-ありました。Align の SQLite connection は意図的に extension loading を無効のまま保つため、
-VC1 は SQLite vector support を ship しません。将来 vec1 を bundle または static link する提案は、
-dependency provenance、platform build、initialization、migration behavior、public contract を
-別途所有しなければなりません。
+この検証環境では、バイト列はリトルエンディアンの `f32` です。vec1 はマシンのバイト順を使う
+ため、このまま異なる環境に持ち運べる保存形式ではありません。拡張を読み込んだのは `pkg.db` の
+外です。Align の SQLite 接続は拡張の読み込みを無効にしているため、この検証だけで Align が
+SQLite のベクトル検索に対応したことにはなりません。vec1 の同梱や静的リンクには、依存元、
+各環境でのビルド、初期化、マイグレーション、公開 API を含む別の設計が必要です。
 
-直接の native-vector binding も将来の作業です。type identity、dimension、finite value、encoding、
-ownership、allocation、error precedence、Row lifetime について driver-qualified design が必要です。
-これらの database が似た用語を使うことは、1つの表現がすべてに安全だという根拠にはなりません。
+ネイティブのベクトル値を直接バインドする機能も今後の課題です。型の識別、次元、有限値、
+エンコーディング、所有権、メモリ確保、エラーの優先順位、行の有効期間をドライバごとに定める
+必要があります。SQL の名前が似ていても、ベクトルの表現が共通とは限りません。

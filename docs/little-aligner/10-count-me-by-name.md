@@ -42,7 +42,7 @@ Group by one field, fold another. That single line is the analytics workhorse.
 
 **Q5.** Besides `sum`, what may follow a `group_by`?
 
-**A5.** `min(.f)`, `max(.f)`, `count()` — biggest sale per region, sales count per region. (`count` takes no field; counting needs none.)
+**A5.** `min(.f)`, `max(.f)`, `count()` — smallest sale, biggest sale, and sales count per region. (`count` takes no field; counting needs none.)
 
 ---
 
@@ -68,7 +68,7 @@ Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>
 
 **Q8.** Why does one pass matter so much?
 
-**A8.** Because at a million rows, the trip through memory *is* the cost. Three passes read the table thrice. This is the same lesson as fusion in chapter 5, at the analytics scale.
+**A8.** Reading a large table repeatedly can be costly. A shared pass reads each row once and updates all the aggregates for its key. Hashing and the aggregate calculations still take work.
 
 ---
 
@@ -84,17 +84,17 @@ Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>
 
 ```align
 e := xs.dict_encode(.name)          // intern the names → small ids
-s := e.group_by(.name).sum(.score)  // these ride the ids —
+s := e.group_by(.name).sum(.a)      // these ride the ids —
 c := e.group_by(.name).count()      //   no re-hashing
 ```
 
-Dictionary encoding — the columnar database's oldest trick, as one visible call. Same source shape as `agg`: `xs` is an owned `array<Row>` and `.name` is its string key.
+Dictionary encoding replaces repeated names with reusable IDs. The source shape is the same as for `agg`: `xs` is an owned `array<Row>` and `.name` is its string key.
 
 ---
 
 **Q11.** Columnar databases keep appearing in our answers. Coincidence?
 
-**A11.** None at all. Sideways layout (9), grouped folds (10), dictionary encoding — analytics engines converged on these because the hardware insists. Align's move is making them *language*, so ordinary code lands where the engines did.
+**A11.** No. Column layouts, grouped reductions, and dictionary encoding are useful for the same kinds of workloads in a database or an Align program. Here we can request those operations directly in the source.
 
 ---
 
@@ -109,7 +109,7 @@ print(g.0.count())      // how many names
 print(g.1.max())        // the largest of the per-name maxima
 ```
 
-(Decode, group, fold — three lines from text to answer. The `count()` rode along free.)
+(The grouping computes each name's maximum and count in the same pass. The two prints show the number of distinct names and the largest of their maxima.)
 
 ---
 
@@ -172,7 +172,7 @@ g := orders.group_by(.customer).agg(
 )
 ```
 
-One key table, three accumulators per group — and the reason Q16's customers are *names* rather than numbers: `agg` wants a string key over row-shaped orders. Number them instead and you must ask three times, or one question at a time.
+One key table, three accumulators per group. This is why Q16 uses customer names: `agg` takes a string key over an array of records. For numeric keys, use the single-aggregate forms separately.
 
 ---
 

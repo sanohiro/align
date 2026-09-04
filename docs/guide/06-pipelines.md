@@ -10,7 +10,7 @@ This is the heart of Align. You don't write loops; you describe a transformation
 total := prices.map(with_tax).where(in_stock).sum()
 ```
 
-Read left to right: take `prices`, transform each, keep some, collapse to one value. Crucially, **no intermediate arrays exist** — `map`, `where`, and `sum` fuse into one counted loop; intermediates live in registers. This is stream fusion done by the compiler, not by you, and it is why the obvious code is also the fast code.
+Read left to right: transform each price, keep the values that pass the predicate, and add them. `map`, `where`, and `sum` fuse into one loop, passing each value straight to the next operation. **No intermediate arrays are created.**
 
 A pipeline must **end** — in a reduction (`sum`, `count`, `reduce`, …) or a materialization (`to_array`, `map_into`). A dangling `xs.map(f)` with no terminal is a compile error, because a lazy value you can pass around would be a hidden cost.
 
@@ -151,12 +151,24 @@ fn main() -> i32 {
 }
 ```
 
-One loop. The `where(.active)` is a branch that skips to the next iteration, `.price` is a field load, `with_tax` inlines, `sum` accumulates in a register. Check it yourself: `alignc emit-llvm` on this program shows a single fused loop — at `-O2`, a vectorized one.
+In the fused loop, `where(.active)` selects the rows, `.price` reads each selected price, `with_tax` transforms it, and `sum` accumulates the result. Use `alignc emit-llvm` to inspect the loop and check whether it vectorizes for your target and optimization profile.
 
-## Why this is fast (and why there's no escape hatch to beat it)
+The diagram compares two alternative endings for this example. The numbers at `.price` and `map` are values passed along inside the loop. Only the `to_array()` route stores them in a result array, here named `taxed`; `taxed.sum()` then scans that array separately.
 
-A hand-written version in a scalar language walks memory once per step and allocates temporaries in between. The fused pipeline walks once, allocates nothing, and hands LLVM a clean counted loop with no aliasing and cold error paths — exactly the shape auto-vectorizers were built for. You are not trading clarity for speed; the design's claim is that the clear version *is* the fast version, and `emit-llvm` lets you audit that claim any time.
+```mermaid
+flowchart TD
+    input["items: 3 rows"] --> keep["where(.active): keep the first and third rows"]
+    keep --> price[".price: 100.0, 200.0"]
+    price --> tax["map(with_tax): 108.0, 216.0"]
+    tax --> direct["sum(): 324.0<br/>One pass; no intermediate array"]
+    tax --> stored["to_array(): taxed = [108.0, 216.0]<br/>One pass to build the result array"]
+    stored --> later["taxed.sum(): 324.0<br/>A second pass over the 2 stored elements"]
+```
 
-## When the vocabulary genuinely can't say it
+## Why fusion helps
 
-Sequential control whose trip count is decided by the run itself — pumping a stream to EOF, retrying with backoff, driving a state machine — is the `loop` expression (chapter [02](02-language-basics.md)), and bulk grouped aggregation is `group_by` (chapter [11](11-data-oriented.md)). Those two cover nearly everything that tempts you toward a `for`. If you are about to walk an index inside a `loop`, stop and re-ask what the transformation is — the answer is usually a pipeline you haven't seen yet in this chapter.
+Processing a collection in separate stages can mean repeated memory scans and intermediate allocations. Fusion combines those stages into one loop and removes the intermediate collections. A loop with known bounds and no aliasing also gives LLVM useful information for vectorization. Use `emit-llvm` to inspect the generated code.
+
+## When to use `loop` or `group_by`
+
+Use `loop` when each iteration determines whether to continue, as in reading a stream to EOF, retrying with backoff, or driving a state machine (chapter [02](02-language-basics.md)). Use `group_by` for grouped aggregation (chapter [11](11-data-oriented.md)). Before writing an indexed traversal inside `loop`, check whether a pipeline expresses the transformation.
