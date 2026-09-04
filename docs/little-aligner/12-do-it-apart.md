@@ -142,7 +142,7 @@ task_group {
 
 **Q17.** One task returns `Err`. Does `wait()?` abandon the others?
 
-**A17.** No. It joins every task first, then propagates the first failure through the ordinary `?` door. Structured concurrency means cleanup and failure agree on the same boundary.
+**A17.** No. It joins every task first, then propagates an error through `?`. If several tasks fail, it chooses the failure from the earliest `spawn` in source order, regardless of which task finished first. Cleanup and error selection do not depend on completion order.
 
 ---
 

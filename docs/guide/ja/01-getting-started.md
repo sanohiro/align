@@ -39,7 +39,7 @@ Ubuntu 24.04 標準の OpenSSL 3.0 を使用すれば、TLS、ハッシュ、HMA
 
 ## まず REPL で試す
 
-`align-repl` は Align を動かしてみる最短の方法だ。引数なしで起動する:
+`align-repl` を使うと、短いコードを入力してすぐに試せます。引数なしで起動します。
 
 ```text
 $ align-repl
@@ -50,7 +50,7 @@ align> print(name)
 align
 ```
 
-インタプリタではありません。入力した各エントリは 1 つの育っていくプログラムに差し込まれ、プログラム全体が本物のコンパイラで再コンパイルされ、本物のネイティブバイナリが実行されます。つまり画面に見えているものは `alignc` が行うことそのものです。`:save file.align` でそのプログラムを書き出し、`:quit`（または Ctrl-D）で終了します。セッションモデルとコマンド一式は [16 章](16-toolchain.md)にあります。
+入力はセッションのプログラムに追加されます。そのたびに全体が `alignc` で再コンパイルされ、生成されたネイティブ実行ファイルが動きます。`:save file.align` でプログラムを保存し、`:quit`（または Ctrl-D）で終了します。セッションの仕組みとコマンド一覧は [16 章](16-toolchain.md)で説明します。
 
 ## Hello, Align
 
@@ -82,6 +82,7 @@ alignc check-per-unit file.align          各 import unit を interface 経由�
 alignc emit-interface file.align          public interface と hash を表示
 alignc build          file.align          ネイティブ実行ファイルを生成(./file)
 alignc run            file.align [args…]  build + run、末尾の引数は main(args) へ渡る
+alignc test           file.align          指定ファイルとインポート先のテストを実行
 alignc fmt            file.align [--write] 整形(表示、--write でその場で書き換え)
 alignc emit-mir       file.align          中間 IR をダンプ
 alignc emit-llvm      file.align          最適化前後の LLVM IR をダンプ
@@ -97,7 +98,7 @@ alignc db repair      --entry file.align  dirty な 1 件をチェックサム�
 alignc --version                          compiler version を表示
 ```
 
-`db` グループが関係するのは、`pkg.db` パッケージを使うプロジェクトだけです（第 [23](23-packages.md) 章）。日常的な開発サイクルでは、編集中は `check` を、テスト実行時は `run` を使用します。また、`emit-llvm` の存在を早めに知っておくことは有益です。Align は、素直なコードが効率的な機械語にコンパイルされるように設計されています。`emit-llvm` は、その設計通りにコンパイルされているかをご自身の目で確かめるためのコマンドです。
+`db` グループは `pkg.db` を使うプロジェクト向けです（[23 章](23-packages.md)）。日常の開発では、編集中の確認に `check`、実行に `run`、宣言したテストの実行に `test` を使います。テストの書き方は第 [16](16-toolchain.md#coretest-でテストを書く) 章で説明します。生成されるコードを調べたいときは `emit-llvm` で LLVM IR を確認できます。
 
 ## コンパイルエラーを読む
 

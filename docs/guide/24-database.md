@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/24-database.md)
 
-`pkg.db` keeps SQL as SQL. A query is a small module: a `.sql` file, a `Params` struct for its placeholders, and a `Row` struct for its result columns. That SQL can be checked against a real schema offline; at runtime the package binds parameters and decodes rows through generated code, with no reflection and no hidden statement cache.
+`pkg.db` keeps SQL as SQL. A query is a small module: a `.sql` file, a `Params` struct for its placeholders, and a `Row` struct for its result columns. The compiler can check it against saved schema metadata without connecting to a database. At runtime, generated code binds parameters and decodes rows, with no reflection or hidden statement cache.
 
 Vendor it like any package (chapter [23](23-packages.md)): copy [apps/db/pkg](../../apps/db/pkg) into your project root for `pkg.db` plus `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool`. Each section below is one thing you will actually need to do.
 
@@ -103,7 +103,7 @@ fn total_in_batches(target: pkg.db.exec) -> Result<i64, pkg.db.Error> {
 
 `next_batch` materializes at most `max_rows` rows into one independently owned columnar batch; `batch_len` and `batch_row` index it, and `batch_soa` projects it as the `soa<R>` of chapter [11](11-data-oriented.md). You pick the bound, so the memory cost stays visible.
 
-Deadlines are the common option `pkg.db.ExecuteOption.TimeoutNs(ns)`, and they are honest about driver support. PostgreSQL enforces one with a nonblocking wait plus native cancellation, mapping expiry to `pkg.db.Error.Timeout` and an engine-side cancellation to `Cancelled`. SQLite rejects the option before any SQL is sent — `Unsupported`, naming `db.execute.timeout_ns` — rather than accepting and ignoring it. Its native `pkg.db.sqlite.ExecuteOption.BusyTimeoutNs(ns)`, passed through `pkg.db.sqlite.rows_native`, bounds lock waits only and is deliberately not sold as a query deadline.
+Set an execution deadline with `pkg.db.ExecuteOption.TimeoutNs(ns)`. PostgreSQL enforces it with nonblocking waits and native cancellation: expiry returns `pkg.db.Error.Timeout`, and engine-side cancellation returns `Cancelled`. SQLite rejects this option before sending SQL, returning `Unsupported` with the name `db.execute.timeout_ns`. SQLite's `pkg.db.sqlite.ExecuteOption.BusyTimeoutNs(ns)`, passed through `pkg.db.sqlite.rows_native`, limits lock waits only; it does not bound the whole query.
 
 ## Writing safely
 
@@ -137,7 +137,7 @@ fn seed(connection: pkg.db.conn) -> Result<pkg.db.conn, pkg.db.Error> {
 }
 ```
 
-`begin` consumes the `conn` and produces a `tx`; `commit` and `rollback` consume the `tx` and give the `conn` back. That is why the failing arm matches instead of using `?`. A `?` inside the transaction body is *safe* — dropping `tx` performs a fail-safe rollback — but the early return drops the connection with it. Match when the caller must get the connection back; use `?` freely when it must not.
+`begin` consumes the `conn` and produces a `tx`; `commit` and `rollback` consume the `tx` and give the `conn` back. That is why the failing arm matches instead of using `?`. A `?` inside the transaction body is *safe* — dropping `tx` performs a fail-safe rollback — but the early return drops the connection with it. Match when the caller must get the connection back; use `?` when retaining it is unnecessary.
 
 `[]` transaction options mean `DEFERRED` on SQLite and `READ COMMITTED READ WRITE` on PostgreSQL. Stronger modes go through the driver's `begin_native`, which takes the common option slice plus a native one: `pkg.db.sqlite.TxOption.Immediate`, or `pkg.db.postgres.TxOption.Isolation(pkg.db.postgres.Isolation.Serializable)`. There is no transparent retry — match `Serialization` or `Deadlock` and retry visibly.
 
@@ -162,7 +162,7 @@ Each file gets one transaction policy. The default is all-or-nothing; `-- align:
 
 ## Getting the schema checked at compile time
 
-`alignc db prepare` is the one workflow that contacts a database. It asks the engine to describe every query reachable from the entry and writes deterministic metadata under `.align-db/`:
+For compile-time schema checks, run `alignc db prepare`. It connects to a database, asks the engine to describe every query reachable from the entry, and writes deterministic metadata under `.align-db/`:
 
 ```text
 alignc db prepare main.align --driver sqlite --database dev.sqlite --schema-id dev-v1
@@ -229,7 +229,7 @@ snapshot := pkg.db.pool.info(owner)?
 
 ## When the SQL really must be dynamic
 
-The escape hatch is explicit, weaker, and named:
+Use the dynamic API when the SQL text is only available at runtime. Results use `pkg.db.value` rather than a statically checked `Row` type:
 
 ```align
 fn counted(borrow connection: pkg.db.conn, out: region) -> Result<i64, pkg.db.Error> {
@@ -252,7 +252,7 @@ Identifiers still cannot be bound. Branching between two named static queries is
 
 ## Registering a SQLite scalar function
 
-SQLite scalar functions use a compiler-proved, noncapturing callback rather than a raw function pointer or retained closure environment:
+Register a SQLite scalar function with a noncapturing callback checked by the compiler:
 
 ```align
 fn twice(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
@@ -277,10 +277,10 @@ Registration is fixed-arity, connection-local, SQLite 3.30 or newer, and always 
 ## What is not there yet
 
 - No `maybe_one` and no `all` — use `one` or the stream.
-- Deadlines cover execution only, and only on PostgreSQL. Neither driver accepts `PrepareOption.TimeoutNs` or `TxOption.BeginTimeoutNs` in v1; both reject them as `Unsupported` instead of pretending.
+- Deadlines cover execution only, and only on PostgreSQL. Neither driver accepts `PrepareOption.TimeoutNs` or `TxOption.BeginTimeoutNs` in v1; both return `Unsupported`.
 - Prepared statements belong to one connection and never migrate between pooled ones. There is no statement cache, global or otherwise.
 - The pool never waits, reconnects, health-checks, or resets a session.
 - Dynamic SQL has no prepared or eager-materializing form.
-- Beyond the shipped SQLite scalar functions, there are no SQLite collations, busy handlers, extension loaders, or PostgreSQL callback surfaces. Each remains consumer-gated because it needs a distinct safety or persistence contract.
+- SQLite collations, busy handlers, extension loaders, and PostgreSQL callbacks are not yet supported. They require separate safety or persistence designs based on concrete consumer needs.
 
 The contract of record is `docs/impl/pkg-design/db.md`. [apps/db](../../apps/db) is the package-author workspace, and its `app/user_groups.align` is a worked one-to-many shaping example: one query, one ordered pass, one `array_builder` per child collection.

@@ -2,15 +2,15 @@
 
 > 🌐 **English** · [Japanese](./ja/22-building-a-system.md)
 
-You have unlearned objects (Chapter 19). You know how to manage long-lived memory with pools (Chapter 20). You know how to model state with sum types (Chapter 21).
+The previous chapters covered data and behavior (19), pools for long-lived data (20), and state machines (21).
 
-How do you put this all together to build an entire application? Let's build a miniature Entity-Component-System (ECS) architecture, the quintessential Data-Oriented Design pattern.
+We can combine these ideas in a small Entity-Component-System (ECS), a common data-oriented architecture.
 
 ## The Architecture
 
 In OOP, a game entity is a class with fields and methods. In ECS:
 - **Entities** are just IDs (e.g., `i64`). They contain no data.
-- **Components** are plain data, stored as flat, parallel columns — the same field-per-column shape [chapter 11](11-data-oriented.md) taught as `soa<T>`, though here they are plain arrays owned in `main` rather than an actual `soa<T>` value: `soa<T>` is arena-bound (chapter 20), while these components must outlive any single frame's arena. (A top-level `:=` is a compile-time constant, so the columns are declared inside `main` and threaded into systems by `borrow mut`; the fragments below show the shape.)
+- **Components** are plain data in parallel columns. Here the columns are arrays allocated once in `main`'s arena, which encloses the whole game loop. A `soa<T>` could also live in that arena; neither form belongs in an arena that ends after each frame. Systems below receive input slices and an `out` destination. The declaration fragments belong inside `main`, because top-level `:=` declares a compile-time constant.
 - **Systems** are functions that iterate over components using pipelines.
 
 Let's model a tiny 1D world where things have positions and velocities.
@@ -39,11 +39,13 @@ fn physics(xs: slice<f64>, vxs: slice<f64>, dt: f64, out next_xs: slice<f64>) {
 }
 ```
 
-Data in, data out. No hidden state, and — because the closure is pure — nothing stops the compiler from vectorizing the whole pass.
+The inputs and destination are explicit. The pure closure and contiguous columns let the compiler analyze the whole pass for vectorization.
+
+All three slices must have equal lengths, and `next_xs` must not overlap either input. Calling `physics(xs, vxs, dt, xs)` would violate the `out` contract. The two buffers below provide separate input and output storage while preserving each entity's index across columns.
 
 ## The Game Loop
 
-Now we wrap it all in a `loop` (Chapter 11 of [The Little Aligner](../little-aligner/11-do-it-until.md)). A real game loop runs for as long as the process is alive, so it cannot spend a fresh allocation every frame the way a one-shot pipeline can — that would grow the arena forever. Instead we allocate two column buffers once, outside the loop, and each frame writes into whichever buffer the previous frame did *not* just read from:
+Now put the update in a `loop` (Chapter 11 of [The Little Aligner](../little-aligner/11-do-it-until.md)). Repeatedly allocating in an arena that encloses the loop would retain every allocation until the loop ends. Instead, allocate two position buffers once and alternate their roles: the first frame reads A and writes B; the next reads B and writes A.
 
 ```align
 fn main() -> i32 {
@@ -69,12 +71,12 @@ fn main() -> i32 {
 }
 ```
 
-(A real game would ask the OS for the elapsed time and the window state — that is `std.time` and, for the window, an FFI binding (Chapter 15); here we run 600 fixed frames.) The world is not an object: it is the arena plus its columns, and every system is just a function you call on them, in an order you can read top to bottom — and because `physics` writes in place, running it for a million frames costs the same two buffers as running it for one.
+A real game would read elapsed time with `std.time` and window state through an FFI binding (Chapter 15); this example runs 600 fixed frames. The arena holds the columns for the whole run, and each system is a function called in the order shown. `physics` writes into the existing destination, so the position storage stays at two buffers regardless of the number of frames.
 
 ## Why this scales
 
 1. **Decoupling:** `physics` does not care about sprites. A render system does not care about velocities. You can add a `health` column tomorrow without touching the physics code.
 2. **Predictability:** Everything flows from top to bottom. There are no hidden `Update()` methods calling other methods implicitly.
-3. **Performance:** Because components are contiguous columns, the CPU prefetcher streams them perfectly. Run `alignc emit-llvm` and you will see `physics` compile to a tightly packed SIMD vector loop.
+3. **Performance:** Contiguous columns support sequential memory access and SIMD. Use `alignc explain-opt` or `alignc emit-llvm` to check whether `physics` vectorizes for your target.
 
-Data goes in. Data gets transformed. Data comes out. That is Align.
+The arrays hold the state; each system applies a transformation. Adding a system means adding another function and choosing where to call it in the loop.

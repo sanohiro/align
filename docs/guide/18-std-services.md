@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/18-std-services.md)
 
-The third wave of `std` reaches beyond files to services. The same boundary rules still hold: imports name capabilities, operating-system and engine failures return `Result`, and every socket, child, client, response, and stream that owns a resource is a Move value.
+This chapter covers networking, HTTP, processes, compression, and cryptography. The same boundary rules apply: imports name capabilities, operating-system and engine failures return `Result`, and sockets, children, clients, responses, and streams that own resources are Move values.
 
 ## `std.net`
 
@@ -76,9 +76,29 @@ pub fn main() -> Result<(), Error> {
 
 `std.crypto` provides OS random bytes, SHA-256/512, HMAC-SHA256, HKDF-SHA256, Argon2id, AES-256-GCM, ChaCha20-Poly1305, and constant-time equality. It wraps OpenSSL instead of inventing cryptography. Argon2id requires the provider added in OpenSSL 3.2; on an older engine that operation returns `Error.Code` without producing output. AEAD open is all-or-nothing: authentication failure releases no plaintext. `constant_time_equal` is constant-time over equal-length contents; input length is public. BLAKE3 is not exposed until a suitable audited system engine exists.
 
+## `std.log`
+
+A logger owns the writer you give it and uses an explicit minimum level. This program writes `[INFO] ready` to stderr and suppresses the debug record:
+
+```align
+import std.io
+import std.log
+
+fn main() -> Result<(), Error> {
+    logger := log.new(io.stderr.buffered(), log.level.Info)
+    logger.line(log.level.Info, "ready")
+    logger.line(log.level.Debug, "details")
+    return logger.flush()
+}
+```
+
+`log.new` consumes the writer; use the logger from then on. The levels are `Debug`, `Info`, `Warn`, `Error`, and `Off`. `line` accepts text or a builder and returns Unit. It records the first output failure internally and suppresses later writes; `flush()` reports that failure through `Result`. Call it explicitly when losing log output should affect your program's result.
+
+Arguments are evaluated even for a disabled level. Use `if logger.enabled(log.level.Debug) { ... }` around expensive message construction. The logger escapes line breaks so each record occupies one line. It does not add timestamps, structured fields, or a global logger; use ordinary templates or builders for message text. See the [logging design](../impl/std-design/log.md) for the exact format and ownership rules.
+
 ## High-throughput building blocks
 
-The same std wave added three useful shapes for larger programs:
+Three other tools support streaming and larger programs:
 
 - `fs.create_rw` / `fs.open_rw` with `pread`, `pwrite`, and `len` for offset-addressed files.
 - `array_builder<T>` with `push`, `append`, and consuming `build()` for a result whose final length is discovered while reading.

@@ -50,9 +50,9 @@ align> print(name)
 align
 ```
 
-It is not an interpreter. Every entry is spliced into one growing program, the whole program is
-recompiled with the real compiler, and the real native binary runs — so what you see is what
-`alignc` would do. `:save file.align` writes that program out, and `:quit` (or Ctrl-D) leaves.
+Each entry is added to the session program. The whole program is
+recompiled with `alignc`, and the resulting native executable runs.
+`:save file.align` writes that program out, and `:quit` (or Ctrl-D) leaves.
 Chapter [16](16-toolchain.md) covers the session model and the full command set.
 
 ## Hello, Align
@@ -85,6 +85,7 @@ alignc check-per-unit file.align          check each imported unit through its i
 alignc emit-interface file.align          print public interfaces and their hashes
 alignc build          file.align          produce a native executable (./file)
 alignc run            file.align [args…]  build + run; trailing args go to main(args)
+alignc test           file.align          run tests in the entry and its imported modules
 alignc fmt            file.align [--write] format (prints; --write rewrites in place)
 alignc emit-mir       file.align          dump the mid-level IR
 alignc emit-llvm      file.align          dump raw or optimized LLVM IR
@@ -100,7 +101,7 @@ alignc db repair      --entry file.align  checksum-bound repair of one dirty mig
 alignc --version                          print the compiler version
 ```
 
-The `db` group only concerns projects that use the `pkg.db` package (chapter [23](23-packages.md)). The everyday loop is `check` while editing, `run` to try it. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
+The `db` group only concerns projects that use the `pkg.db` package (chapter [23](23-packages.md)). The everyday loop is `check` while editing, `run` to try it, and `test` to run the tests you have declared. Chapter [16](16-toolchain.md#tests-with-coretest) shows how to write them. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
 
 ## Reading a compile error
 

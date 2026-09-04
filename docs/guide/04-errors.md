@@ -7,22 +7,24 @@ Align has one error model. A computation that might not produce a value returns 
 ## `Option<T>` — maybe absent
 
 ```align
-fn find_even(xs: slice<i64>) -> Option<i64> {
-    if xs.any(fn x { x % 2 == 0 }) {
-        return Some(xs.where(fn x { x % 2 == 0 }).min())
+fn half_if_even(n: i64) -> Option<i64> {
+    if n % 2 == 0 {
+        return Some(n / 2)
     }
     return None
 }
 
 fn main() -> i32 {
-    a := find_even([3, 8, 5, 4][0..4]) else 0    // Some(4) → 4
-    b := find_even([3, 7, 5][0..3]) else 0       // None    → the default
-    print(a + b)                                  // 4
+    a := half_if_even(8) else 0    // Some(4) → 4
+    b := half_if_even(7) else 0    // None    → the default
+    print(a + b)                  // 4
     return 0
 }
 ```
 
 `Some(x)` and `None` construct; the **`else`-unwrap** consumes: `expr else default` gives you the payload or the default. The `else` arm can also diverge (`return`, or a call that aborts), which is how "unwrap or bail" looks. For anything richer, `match` on it — `Some(v) =>` / `None =>`, exhaustive like every match.
+
+`half_if_even(0)` returns `Some(0)`, while `half_if_even(7)` returns `None`. After `else 0`, both give the same number. Use `match` if the caller must distinguish an absent value from a present zero. The `?` operator described below applies only to `Result`; it does not unwrap `Option`.
 
 There is no null in the language, so there is no "forgot to check" — the type system won't give you a `T` until you've said what happens when there isn't one.
 
@@ -85,6 +87,7 @@ A program that can fail gives `main` the type `Result<(), Error>`:
 import std.fs
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() != 2 { return Err(Error.Invalid) }
     data := fs.read_file(args[1])?      // ENOENT becomes Err(NotFound)
     print(data.len())
     return Ok(())
@@ -93,11 +96,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 If an `Err` propagates out of `main`, the process exits non-zero — each `Error` category maps to a small fixed code (`NotFound` → 1, `Invalid` → 2, `Denied` → 3, `Timeout` → 4), and `Error.Code(c)` exits with `c`. `error(c)` is shorthand for constructing that carrier: `return Err(error(7))` exits with 7. No handler boilerplate at the top of `main`; the mapping is part of the language.
 
-(That signature also shows how programs receive arguments: `main(args: array<str>)` is the only argv there is — `args[1]` is the first user argument. No global, no `env.args`.)
+Programs receive command-line arguments through `main(args: array<str>)`; `args[1]` is the first user argument. This example requires one path argument and returns `Error.Invalid` for any other count. Checking before indexing prevents an out-of-bounds abort when no path was supplied. There is no global argument list or `env.args`.
 
 ## Your own error types
 
-Any sum type can be an error. But `?` never converts error types implicitly — a `Result<T, MyErr>` doesn't propagate through a function returning `Result<T, Error>`. Convert visibly with `map_err`:
+Any sum type can be an error. When the called function and its caller use the same error type, `?` propagates it directly; that type need not be the built-in `Error`. If they use different error types, convert explicitly with `map_err`. A `Result<T, ParseErr>` cannot propagate unchanged through a function returning `Result<T, Error>`:
 
 ```align
 ParseErr { Empty, BadChar }
@@ -132,4 +135,4 @@ One rule keeps the model honest end to end: everything that can fail says so in 
 
 ## The habit
 
-Design functions so the caller can't misuse them: return `Option` when absence is normal, `Result` when failure is exceptional-but-real, and a plain `T` when it truly cannot fail. Then call everything with `?` and let `main`'s signature do the exit-code plumbing.
+Return `Option` when a value may be absent, `Result` when an operation can fail, and a plain `T` when no failure needs to be reported. At the call site, propagate a `Result` with `?`, supply a fallback with `else`, or inspect it with `match`. When `main` returns `Result<(), Error>`, an `Err` returned from `main` determines the process exit code.

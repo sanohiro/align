@@ -22,13 +22,13 @@
 
 **Q4.** What is `[2, 4, 6].all(fn x { x % 2 == 0 })`?
 
-**A4.** `true`. And `[2, 4, 7]`? — `false`. The `7` ruins it — but `all` keeps walking. Align's `any` and `all` do **not** short-circuit: they are branchless full scans, a steady pass the machine can vectorize rather than an early exit it must guess at (chapter 13). The answer is the same; the shape of the work is not.
+**A4.** `true`. And for `[2, 4, 7]`? `false`, because `7` fails the predicate. Align's `any` and `all` **do not short-circuit**: they scan the full input even after the answer is known. This approach suits vectorization (chapter 13).
 
 ---
 
 **Q5.** Suppose no reducer fits: we want the *product*. What now?
 
-**A5.** The general one: `reduce`.
+**A5.** Use `reduce` to multiply the elements.
 
 ```align
 [1, 2, 3, 4].reduce(1, fn acc, x { acc * x })
@@ -40,7 +40,7 @@
 
 **Q6.** Why the `1` in front?
 
-**A6.** The starting value — first the seed, then the folding function. `acc` begins at `1`; each element multiplies in. For a sum you would seed `0`. The seed is what an empty array answers.
+**A6.** It is the initial value of `acc`. Start at `1` and multiply by each element. For a sum, start at `0`. If there are no elements, the initial value is the answer.
 
 ---
 
@@ -52,25 +52,25 @@
 
 **Q8.** Write `sum` yourself, with `reduce`.
 
-**A8.** `xs.reduce(0, fn acc, x { acc + x })`. Now you know `sum`, `count`, `min`, `max` are courtesies — `reduce` is the general engine, and the named ones say the intent quicker.
+**A8.** `xs.reduce(0, fn acc, x { acc + x })`. With `reduce`, we specify how to combine the values. When we just want their sum, `sum` says that more directly.
 
 ---
 
 **Q9.** What is `[1, 2, 3, 4].scan(0, fn acc, x { acc + x })`?
 
-**A9.** The *running* sums: `1, 3, 6, 10`. `scan` is `reduce` that shows its work — and it is an **ending**, not a stage: like `sort`, it materializes, handing you a real array with the allocation in plain sight. Unlike a dangling `xs.map(f)`, it needs no consumer; but a reducer may still ask it a question.
+**A9.** The array of running sums: `[1, 3, 6, 10]`. Where `reduce` returns only the final value, `scan` stores each intermediate value in an array. It is a materializing **ending**, so it needs no `to_array()`. We may apply another reduction to the array it returns.
 
 ---
 
 **Q10.** Then what is `[1, 2, 3, 4].scan(0, fn acc, x { acc + x }).max()`?
 
-**A10.** `10` — the largest the running sum ever got. (With negatives in the array, that question becomes interesting: the high-water mark.)
+**A10.** `10`, the largest running sum. Try an array containing negative numbers too.
 
 ---
 
-**Q11.** What is `[3, 1, 2].map(fn x { x }).sort()` — may we ask for order?
+**Q11.** What does `[3, 1, 2].map(fn x { x }).sort()` return?
 
-**A11.** `[1, 2, 3]`, materialized. `sort` must build the array to sort it — so like `to_array`, it hands you a real array, allocation in plain sight.
+**A11.** The array `[1, 2, 3]`. `sort` is another ending that materializes an array.
 
 ---
 
@@ -82,19 +82,19 @@
 
 **Q13.** What is `[1, 2, 3, 4, 5].partition(fn x { x % 2 == 0 })`?
 
-**A13.** Two arrays at once: `([2, 4], [1, 3, 5])` — the blessed, then the rest. Catch them together: `(evens, odds) := ...`.
+**A13.** Two arrays at once: `([2, 4], [1, 3, 5])` — elements that pass the predicate, then those that fail it. Bind them together: `(evens, odds) := ...`.
 
 ---
 
 **Q14.** Over an empty slice, what do `any` and `all` answer?
 
-**A14.** `any` is `false`; `all` is `true`. There is no witness that passes, and no counterexample that fails.
+**A14.** `any` returns `false`; `all` returns `true`. There is no element that passes the predicate, and none that fails it.
 
 ---
 
 **Q15.** Why is `all` of nothing `true`? It sounds strange.
 
-**A15.** Ask the question it computes: “Did I find an element that breaks the rule?” In an empty input, no. This identity lets `all` compose without a special empty case, just as `sum` begins at `0` and a product begins at `1`.
+**A15.** Ask instead: “Is there an element that fails the predicate?” In an empty slice, there is none. Just as `sum` returns `0` for empty input, `all` returns `true`.
 
 ---
 
@@ -132,13 +132,13 @@ pair := [2, 4, 6].reduce((0, 0), fn acc, x {
 })
 ```
 
-`pair` is `(12, 3)`. An accumulator may be a tuple: the answer-so-far can have more than one pocket.
+`pair` is `(12, 3)`. A tuple accumulator can keep the sum and the count together.
 
 ---
 
 **Q19.** Then the integer average?
 
-**A19.** `pair.0 / pair.1`, which is `4`. The reduction collected the facts; the final expression interprets them. For possibly empty input, decide the empty case before dividing.
+**A19.** `pair.0 / pair.1`, or `4`: divide the sum by the count. If the input might be empty, decide how to handle that case before dividing.
 
 ---
 
@@ -162,10 +162,10 @@ No `to_array` in sight: `scan` already built the array (A9). Asking for one agai
 [3, -5, 4, 2].scan(0, fn acc, x { acc + x }).max()
 ```
 
-`4`. Materializing the intermediate answers is what lets a later reducer ask about their history.
+`4`. `max` finds the largest of the running sums stored by `scan`.
 
 ---
 
 > **The Fourth Commandment**
 >
-> *Seed first, then fold. And when a named reducer says it plainer — `sum`, `count`, `min`, `max`, `any`, `all` — say it plainly.*
+> *Give `reduce` an initial value and a way to combine elements. When `sum` or `count` says what you need, use that name.*

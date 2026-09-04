@@ -24,19 +24,19 @@ age:    30     25   41
 active: true   false true
 ```
 
-**A2.** Straight across one line, touching nothing else. Memory has the same preference as your eyes. Row-major is **AoS** (array of structs); sideways is **SoA** (struct of arrays).
+**A2.** Straight across one line, touching nothing else. The same two arrangements are possible in memory: **AoS** (array of structs) keeps each record together; **SoA** (struct of arrays) keeps each field's values together.
 
 ---
 
 **Q3.** Why does the machine care?
 
-**A3.** Cache lines. Memory arrives in 64-byte gulps: in AoS, each gulp of ages brings names and flags you didn't ask for; in SoA, a gulp of ages is *sixteen ages*. And SIMD (chapter 12 of the guide) eats only contiguous lanes — the column *is* the lane feed.
+**A3.** The CPU loads memory in cache lines. With 64-byte cache lines and `i64` ages, a line of an age column holds eight ages. An AoS layout also brings in names and flags, even when we only want ages. Contiguous columns also suit SIMD loads (chapter 12 of the guide).
 
 ---
 
-**Q4.** If sideways (SoA) is so much faster, why did the programming world invent Object-Oriented Programming (AoS)?
+**Q4.** If SoA helps with column scans, why keep AoS at all?
 
-**A4.** Because humans think in entities. We imagine a 'User' walking around with a name and an age. But the CPU does not see entities; it sees flat streams of bytes. Object-Oriented Programming prioritizes the human's imagination. Data-Oriented Design (SoA) prioritizes the physical reality of the silicon.
+**A4.** Because some work uses a whole record at a time. AoS keeps that record's fields together. SoA helps when we repeatedly scan selected fields across many records. Choose the layout for the work; neither layout requires a particular programming paradigm.
 
 ---
 
@@ -45,7 +45,7 @@ active: true   false true
 **A5.** One call, inside an arena:
 
 ```align
-User { active: bool, score: i64, age: i64 }
+User { name: str, age: i64, active: bool }
 
 arena {
     mut s := rows.to_soa()      // soa<User> — three columns now
@@ -71,7 +71,7 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 
 **Q8.** What is `s.where(.active).age.sum()`?
 
-**A8.** `71` — `30 + 41`; bob is inactive. Two columns touched (`active` to filter, `age` to sum); the names never left RAM. That is the entire trick, and it is a big one.
+**A8.** `71` — `30 + 41`; bob is inactive. This pass reads two columns: `active` to filter and `age` to sum. It does not read the names.
 
 ---
 
@@ -83,13 +83,13 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 
 **Q10.** And one cell? A write?
 
-**A10.** `s[0].age` reads one cell; with a `mut` soa, `s[1].score = 99` writes one — straight into the column.
+**A10.** `s[0].age` reads one cell; with a `mut` soa, `s[1].age = 26` writes one — straight into the column.
 
 ---
 
-**Q11.** A window? The middle of a column?
+**Q11.** After that update, how do we read a range from the middle of a column?
 
-**A11.** `s.age[1..3].sum()` — slice the column like any slice: `25 + 41 = 66`.
+**A11.** `s.age[1..3].sum()` — slice the column like any slice. After Q10's write, this is `26 + 41 = 67`.
 
 ---
 
@@ -107,13 +107,13 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 s: soa<User> := json.decode(data)?
 ```
 
-The parser fills columns as it reads; no row-shaped middleman, and string columns are views into the JSON text itself.
+The parser fills columns as it reads, without an intermediate array of rows. Unescaped `str` fields view the input text. Escaped strings are decoded into arena storage, so those fields need an allocation.
 
 ---
 
 **Q14.** Why did every soa live inside an `arena`?
 
-**A14.** Chapter 8's answer: columns are a *batch* with one lifetime — born from one decode, dead after one analysis. The arena states it; the compiler holds you to it.
+**A14.** These forms of `to_soa` and `json.decode` allocate their columns in the arena. The batch remains available for any analyses inside that scope; the columns are released when the scope ends.
 
 ---
 
@@ -186,6 +186,42 @@ The half-open range contains one hundred prices.
 
 ---
 
+**Q24.** Finish Q20 using columns. What does this complete program print?
+
+```align
+Order { price: i64, quantity: i64, active: bool }
+
+fn main() -> i32 {
+    arena {
+        rows := [
+            Order { price: 10, quantity: 2, active: true },
+            Order { price: 100, quantity: 3, active: false },
+            Order { price: 7, quantity: 4, active: true },
+        ]
+        s := rows.to_soa()
+        prices := s.price
+        quantities := s.quantity
+        active := s.active
+        total := zip(prices, quantities, active)
+            .where(fn row { row.2 })
+            .map(fn row { row.0 * row.1 })
+            .sum()
+        print(total)
+    }
+    return 0
+}
+```
+
+**A24.** `48`: `10 * 2 + 7 * 4`. `zip` pairs values at the same index: `.0` is price, `.1` is quantity, and `.2` is active. It supplies one tuple at a time, without building an array of tuples. The filter keeps or rejects that whole tuple.
+
+---
+
+**Q25.** May we filter or sort each column separately before `zip`?
+
+**A25.** Only if the columns still represent the same rows in the same order. Equal length is necessary but does not prove that relationship. For example, sorting prices alone pairs them with other orders' quantities. `zip` rejects unequal lengths rather than truncating to the shortest input, but preserving the row correspondence is our job. Zip the related columns first, then apply a shared filter as Q24 does.
+
+---
+
 > **The Ninth Commandment**
 >
-> *Scan columns, not rows. Turn data sideways once, at the door, and the machine will thank you all day.*
+> *Choose SoA for repeated column scans. Convert once, then reuse the columns.*

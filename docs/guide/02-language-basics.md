@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/02-language-basics.md)
 
-One sitting, the whole expression-oriented core: bindings, types, functions, control flow. After this chapter you can read any Align function.
+This chapter introduces bindings, types, functions, and control flow: the building blocks of an Align function.
 
 ## Bindings
 
@@ -49,7 +49,7 @@ fn main() -> i32 {
 }
 ```
 
-Two deliberate decisions live in that example:
+The example illustrates two rules:
 
 - **Integer overflow wraps.** It is defined two's-complement behavior — never undefined behavior, never a hidden trap. When you *want* a checked/saturating operation, the spec provides explicit `checked_*` / `saturating_*` / `wrapping_*` forms so the intent is visible in source.
 - **Narrowing is explicit and audited.** `as` truncation is defined behavior, and the compiler flags every lossy `as` with a warning so silent truncation can't hide.
@@ -95,7 +95,7 @@ Two body forms, nothing else: a block with `return`, or `= expr` for single-expr
 
 ## There is no `for`
 
-Align has no `for` and no `while`. This is not an omission — it is the language's center of gravity. Iteration over data is a **pipeline** (`xs.map(f).where(p).sum()`, chapter [06](06-pipelines.md)), which the compiler fuses into a single vectorizable loop. If you are about to walk a collection by hand, stop: name the transformation instead.
+Align has no `for` and no `while`. Use a **pipeline** for iteration over data (`xs.map(f).where(p).sum()`, chapter [06](06-pipelines.md)). The compiler fuses its stages into a single loop that can be vectorized. Start by identifying the transformation you need.
 
 What remains — iteration whose trip count is decided *by the iteration itself*, like reading until EOF or retrying until success — has exactly one construct: the **`loop` expression**. It repeats its block until a `break` runs; `break value` ends the loop with that value, so `loop`, like `if` and `match`, is an expression:
 
@@ -111,7 +111,7 @@ n_read := loop {
 
 There is no `continue` and no labeled break — skip-to-next is an `if` around the rest of the body, and a nested loop that wants a two-level exit is a function waiting to be extracted. Loop state lives in `mut` locals declared before the loop.
 
-The division of labor is strict: **the pipeline owns the data path; `loop` owns the control path.** When you feel the urge to write a loop, first ask what the *transformation* is — nine times out of ten it is a pipeline, and walking an array by index inside a `loop` draws a lint. (Recursion exists too, but it is for genuinely recursive problems — parsers, trees — not for iteration: Align guarantees no tail-call optimization, so a recursive "loop" costs stack.)
+**Pipelines handle data transformations; `loop` handles sequential control.** When you need to traverse a collection, look for a pipeline operation first. Recursion is available for recursive problems such as parsers and trees, but Align does not guarantee tail-call optimization: using recursion for iteration can keep growing the stack.
 
 ## Named constants
 

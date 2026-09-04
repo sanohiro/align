@@ -2,17 +2,19 @@
 
 > 🌐 **English** · [Japanese](./ja/20-beyond-arenas.md)
 
-Chapter 5 and Chapter 8 taught you that `arena` is the hammer for almost every memory nail. If data lives for a single "phase" (a web request, a frame of a game, a compilation pass), you allocate it in an arena and blow up the whole building when the phase ends.
+Chapters 5 and 8 introduced `arena` for data that shares a lifetime. If data lives for one phase, such as a web request, game frame, or compilation pass, allocate it in an arena and release it together when that phase ends.
 
 But what happens when data outlives a single phase, and its lifetime is unpredictable?
 
-Imagine a multiplayer game server. Players log in and out at random times. An `arena` per frame drops the player data too early. A single global `arena` never frees anything and eventually runs out of memory. 
+Imagine a multiplayer game server. Players log in and out at random times. An `arena` per frame drops the player data too early. A server-long arena that allocates a new record on every login retains those allocations after logout. A fixed pool avoids that growth by reusing the same slots.
 
-In an Object-Oriented language, you would `new Player()` and let the Garbage Collector eventually clean it up when it disconnects. In Align, we use **Data Pools** and **Generational Indices**.
+In a garbage-collected language, you might allocate a `Player` object and let the collector reclaim it after disconnection. Here we use **data pools** and **generational indices** to reuse storage explicitly.
 
 ## The Pool
 
-A Pool is just a pre-allocated block of parallel columns that reuses slots — the same column-per-field shape [chapter 11](11-data-oriented.md) taught as `soa<T>`. It cannot literally *be* a `soa<T>`, though: those columns are arena-resident (`to_soa` must be called inside an `arena`, and the columns die with it), while a Pool's whole point is data that outlives any single arena. So the columns instead live in `main`'s outermost scope — owned there for as long as the server runs, and threaded into each handler by a `borrow mut` parameter. Instead of asking the OS for memory every time a player joins, we hold contiguous columns — one row per slot — and manage the vacancy ourselves with a plain `bool` column. (The fragments below show the column *shape*; a top-level `:=` is a compile-time constant, so these `mut` columns are declared inside `main`, not at file scope.)
+A pool is a set of pre-allocated columns with reusable slots — the same column-per-field shape [chapter 11](11-data-oriented.md) taught as `soa<T>`. Here, the columns are arrays owned by `main` for as long as the server runs. A long-lived arena could also hold a pool, including a `soa<T>`, if the arena outlives every use of it. The distinction is between reusing fixed storage and repeatedly allocating, not between pools and arenas.
+
+We use one row per slot and a `bool` column for occupancy. Handlers can update the caller's columns through `borrow mut` parameters. The fragments below belong inside `main`; a top-level `:=` declares a compile-time constant.
 
 ```align
 mut alive := [false, false, false, false].to_array()
@@ -21,18 +23,18 @@ mut hp    := [0, 0, 0, 0].to_array()
 
 When a player joins, we find the first free slot — `alive[i] == false` — (or use a freelist to track empty slots in `O(1)`), write their data into row `i` of every column, and return the `i64` index. When they leave, we set `alive[i]` back to `false`.
 
-No OS calls. No garbage collector pauses. Just changing bytes in an array.
+After the pool is allocated, joining and leaving update its existing arrays without calling the OS allocator.
 
 ## The stale-index problem
 
-There is a fatal flaw with returning raw `i64` indices. 
+Returning an `i64` index alone cannot distinguish successive occupants of a slot.
 1. Alice joins and gets assigned `id = 2`.
 2. Bob (Alice's friend) saves `target = 2` to heal her later.
 3. Alice disconnects. Slot 2 is now free.
 4. Charlie joins and is assigned the newly vacant `id = 2`.
 5. Bob casts his heal on `target = 2`. Charlie gets healed instead of Alice!
 
-This is the classic stale-handle flavor of the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem): the slot you point at has been reused behind your back. If we were using pointers in C++, this would be a Use-After-Free security vulnerability.
+This is a stale-handle form of the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem): a saved index still points to the same slot, but the occupant has changed.
 
 ## Generational Indices
 
@@ -45,13 +47,19 @@ Entity { index: i64, generation: i64 }
 We upgrade our Pool with one more column that tracks the generation of each slot, and a check that a ticket is still current:
 
 ```align
-mut generation := [0, 0, 0, 0].to_array()
+mut generation := [1, 1, 1, 1].to_array()
 ```
 
 ```align
-fn is_live(alive: slice<bool>, generation: slice<i64>, e: Entity) -> bool =
-    alive[e.index] && generation[e.index] == e.generation
+fn is_live(alive: slice<bool>, generation: slice<i64>, e: Entity) -> bool {
+    if e.index < 0 { return false }
+    if e.index >= alive.len() { return false }
+    if e.index >= generation.len() { return false }
+    return alive[e.index] && generation[e.index] == e.generation
+}
 ```
+
+Check the index before reading either column. An out-of-range ticket is invalid input to the pool; it should return `false`, not trigger an array-bounds abort. All pool columns must still have the same capacity, and the ticket belongs to this pool only.
 
 Now, the timeline looks like this:
 1. Alice joins. Slot 2 is at generation 1. Alice is given `Entity { index: 2, generation: 1 }`.
@@ -60,11 +68,21 @@ Now, the timeline looks like this:
 4. Charlie joins. He is placed in slot 2, and is given `Entity { index: 2, generation: 2 }`.
 5. Bob tries to heal `Entity { index: 2, generation: 1 }`. `is_live(alive, generation, ticket)` checks slot 2, sees that its current generation is `2`, which does not match Bob's ticket (`1`), and returns `false` — the heal is safely rejected.
 
-## Why this is the Align way
+## Capacity and generation limits
 
-Notice what we have achieved:
-1. **Zero Allocations:** Players can join and leave millions of times without a single call to the OS allocator.
-2. **Cache Locality:** All players live contiguously in memory, making bulk updates (like applying poison damage to everyone) incredibly fast via pipelines — `hp` is already a column.
-3. **Absolute Safety:** No Use-After-Free bugs, no dangling pointers, and no garbage collection pauses.
+Keep these rules when implementing insertion and removal:
 
-When you need unpredictable lifetimes, do not look for a garbage collector. Build a Pool, and hand out tickets.
+- If no reusable slot remains, report absence with `Option` or a domain-specific `Result`; do not reuse an occupied slot.
+- Check the ticket before removal. A stale ticket must not clear a newer occupant's `alive` flag or advance its generation.
+- Never wrap a generation counter. Align integer addition wraps, so incrementing `i64` indefinitely would eventually make an old ticket match again. When a slot reaches the maximum generation, its final removal must retire it permanently instead of incrementing it. Track retirement separately from `alive`, and exclude retired slots from insertion.
+
+For example, in a pool with one live slot, removing generation `1` allows the slot to be issued as generation `2`. The generation-`1` ticket then fails validation. Removing a maximum-generation occupant leaves no reusable slot, so the next insertion reports that the pool is full. The counter is finite; retirement is the policy that preserves the stale-ticket guarantee.
+
+## What the pool provides
+
+The design has three useful properties:
+1. **Storage reuse:** Joining and leaving reuse the allocated slots.
+2. **Cache locality:** Each field occupies a contiguous column. Bulk updates, such as applying poison damage, can process `hp` directly through a pipeline.
+3. **Stale-handle checks:** Access checks both whether the slot is occupied and whether its generation matches the ticket.
+
+A fixed pool suits data with independent lifetimes when you can set a capacity in advance. Use generation-bearing tickets to identify the occupants of reusable slots.

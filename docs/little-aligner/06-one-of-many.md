@@ -40,7 +40,7 @@ fn go(l: Light) -> i64 = match l {
 
 **Q5.** Delete the `Green` arm. What happens?
 
-**A5.** A compile error: the match no longer covers every variant. **Exhaustiveness is the contract.** Add a variant next year, and every `match` in the program raises its hand.
+**A5.** A compile error: the match no longer covers every variant. Add a variant next year, and a `match` that lists the old variants without a wildcard will need another arm.
 
 ---
 
@@ -62,7 +62,7 @@ Shape { Circle(i64), Rect(i64, i64), Dot }
 
 **Q8.** In other languages, I would use class inheritance and a virtual `draw()` method to handle different shapes. Why does Align use sum types and `match`?
 
-**A8.** Inheritance scatters the logic across many files, and dynamic dispatch (virtual methods) hides the callee behind an indirect jump — hard to predict, impossible to inline or vectorize. A sum type and `match` gather the logic into one place and guarantee at compile-time that every case is handled. The CPU loves a clear path, and the reader loves the whole truth in one place.
+**A8.** A sum type lists the possible shapes. A `match` lists what this operation does for each shape, and the compiler checks that it covers them all. The variants and their payloads also give the compiler a known representation to work with.
 
 ---
 
@@ -78,7 +78,7 @@ fn area(s: Shape) -> i64 = match s {
 }
 ```
 
-`area(Shape.Rect(3, 4))` is `12`. The payload exists only where a pattern has caught it — there is no `.radius` to call on a maybe-Rect.
+`area(Shape.Rect(3, 4))` is `12`. The names bound to payload values are available within that arm. We cannot directly read a circle's radius from a value that might be a rectangle.
 
 ---
 
@@ -90,13 +90,13 @@ fn area(s: Shape) -> i64 = match s {
 
 **Q11.** May we match on a number? `match n { 0 => ..., _ => ... }`
 
-**A11.** No. `match` is for one-of-many types; numbers take `if`. Two tools, each whole; no half-overlap to memorize.
+**A11.** No. Align's `match` examines variants of a sum type. Use `if` for numeric conditions.
 
 ---
 
 **Q12.** What may a payload be?
 
-**A12.** Scalars and plain structs — `Wrap(Point)` is fine, and the arm `Wrap(p) => p.x + p.y` reaches inside. (An owning payload like `string` is accepted too — the whole sum simply becomes a Move value, and only the live arm is dropped.)
+**A12.** Scalars and structs: `Wrap(Point)` works, and `Wrap(p) => p.x + p.y` reads its payload. Owning payloads such as `string` work too. They make the sum type Move, and cleanup drops the payload of its active variant.
 
 ---
 
@@ -196,7 +196,7 @@ Same answer. Prefer `where(...).count()` when the thought is “which elements?�
 
 **Q19.** Add `Stale(i64)` to `Reading`. Which earlier code raises its hand?
 
-**A19.** Every exhaustive `match`: `value_or_zero`, the predicate in Q17, and the contribution in Q18. That is not breakage to fear; it is a list of decisions the new variant requires.
+**A19.** The matches that list the variants: `value_or_zero`, the predicate in Q17, and the function in Q18. Each needs a decision about the new case.
 
 ---
 
@@ -208,4 +208,4 @@ Same answer. Prefer `where(...).count()` when the thought is “which elements?�
 
 > **The Sixth Commandment**
 >
-> *When a thing is one of many, say the many. Then `match`, and let the compiler keep the list.*
+> *List mutually exclusive possibilities in a sum type. Handle them with `match`, and let the compiler check coverage.*

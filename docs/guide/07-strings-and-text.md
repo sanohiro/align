@@ -2,11 +2,11 @@
 
 > 🌐 **English** · [Japanese](./ja/07-strings-and-text.md)
 
-Text in Align follows the memory model of chapter [05](05-memory.md) exactly — there are two string types because there are two lifetimes, and every allocation is visible. Once you see the pattern here, you have seen it for every resource in the language.
+Text uses the memory model from chapter [05](05-memory.md). `str` borrows existing text; `string` owns its buffer. The distinction determines how long each value can be used and where allocation is needed.
 
 ## `str` and `string`
 
-- **`str`** — a borrowed, immutable **view**: a pointer and a byte length. String literals are `str`. Copying one is free; it carries the region of the data it points into.
+- **`str`** — a borrowed, immutable **view**: a pointer and a byte length. String literals are `str`. Copying the view does not copy the text; it carries the region of the data it points into.
 - **`string`** — an **owned** heap buffer. A Move type: assignment transfers ownership, the buffer is dropped when its owner dies.
 
 You get a `string` from `.clone()` (deep copy) or from a `builder` (below). And an owned `string` **auto-borrows** wherever a `str` is expected — passing it to a `str` parameter costs nothing and consumes nothing:
@@ -57,9 +57,9 @@ fn main() -> i32 {
 }
 ```
 
-(There is no `path[i]` single-byte access — a byte index is for slicing, not for walking.) A `split` does not exist yet (implementation in progress); today `find`/`rfind` + `[a..b]` compose the manual split, or you write a real parser.
+`path[i]` is not a string operation; use `path.bytes()[i]` when you need an individual UTF-8 byte. There is no `str.split` method. To separate a known delimiter, combine `find` or `rfind` with `[a..b]`; use a parser when the input has a more complex grammar.
 
-> **Cost:** Copying a `str`, slicing it, and `trim*` are O(1) views with no allocation or byte copy. `.clone()` is O(n), makes at most one result allocation, and copies n bytes into an owned `string`. Searches are O(n) in the worst case.
+> **Cost:** Copying a `str` or slicing it is O(1), with no allocation or byte copy. `trim`, `trim_start`, and `trim_end` also return views without allocation or byte copying, but they scan for whitespace and take O(n) time in the worst case. `.clone()` is O(n), makes at most one result allocation, and copies n bytes into an owned `string`. Searches are O(n) in the worst case.
 
 ## Concatenation: builder is the one way
 
@@ -105,7 +105,7 @@ fn main() -> i32 {
 }
 ```
 
-One growable buffer, amortized appends, one final `string`. `write` takes a `str` (or an owned `string`); `write_int` formats an integer straight into the buffer with no temporary. The compiler even fuses adjacent writes (`"lit"` + int + `"lit"` becomes a single runtime call), so the builder is not just the safe way — it is the fast way.
+The builder uses one growable buffer and produces a final `string`. Buffer growth is amortized across appends. `write` takes a `str` (or an owned `string`); `write_int` formats an integer directly into the buffer without a temporary string. The compiler can combine adjacent writes of literals and integers into one runtime call.
 
 ## Template strings
 
@@ -120,13 +120,13 @@ fn main() -> i32 {
 }
 ```
 
-Templates cover the `print`-a-composed-line case; the builder covers the build-a-document case; there is no printf-style format-string mini-language. (Inside pipeline lambdas, `template` is rejected for the same hidden-allocation reason as `+` — format the results after the pipeline, not per element inside it.)
+Use a template to format a line, and a builder to assemble a longer document. There is no printf-style format-string mini-language. A pipeline lambda may create a template outside an arena and consume its result locally. A dynamic template produces a view tied to that call's frame, so the lambda cannot return that view. To produce formatted text for later use, format the results after the pipeline.
 
 ## Choosing, at a glance
 
 | you want | reach for |
 |---|---|
-| pass text around, inspect it | `str` (views, free) |
+| pass text around, inspect it | `str` (a view, no copy of the text) |
 | keep text beyond its source's lifetime | `.clone()` → `string` |
 | glue a few pieces once | `builder` |
 | assemble text incrementally / in bulk | `builder` |

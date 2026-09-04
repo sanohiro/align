@@ -2,45 +2,45 @@
 
 > 🌐 **English** · [Japanese](./ja/17-the-align-way.md)
 
-The idioms, collected. Each of these was earned somewhere in the previous chapters; here they are as the checklist an experienced Align programmer runs on autopilot.
+Here are the idioms from the previous chapters, collected as a checklist for writing and reviewing Align code.
 
-## Describe transformations, don't iterate
+## Describe bulk transformations with pipelines
 
-Reach for `map`/`where`/`reduce` before you even think the word "loop" — there is no `for` or `while` to reach for anyway. The pipeline fuses to one vectorized pass. Genuinely sequential control — pump to EOF, retry, converge — is the one `loop` expression with a `break value`; bulk keyed aggregation is `group_by`; recursion is for recursive problems (parsers, trees), never for iteration. If you're walking an index inside a `loop`, you've missed a pipeline.
+Use `map`/`where`/`reduce` for bulk transformations. The compiler can fuse pipeline stages and vectorize the resulting pass. Use `loop` with a `break value` for sequential control such as reading to EOF, retrying, or convergence; use `group_by` for bulk keyed aggregation. Recursion suits recursive problems such as parsers and trees. If a loop advances an index, check whether a pipeline can express the operation directly.
 
 ```align
 total := xs.map(f).where(p).sum()
 ```
 
-## Handle errors with `?`, not branches
+## Propagate errors with `?`
 
 Failable functions return `Result`; call them with `?`; convert error types visibly with `map_err`; `match` at the point of final consumption when the reason matters. If the reason truly does not matter, `result else fallback` discards the error visibly and supplies a fallback. Let `main() -> Result<(), Error>` do the exit-code plumbing. Absence is still `Option`, a different thing from failure, and the signature says which one you mean.
 
-## Choose the lifetime, then stop thinking about memory
+## Choose a lifetime for each phase
 
 - Local value → nothing to do.
 - A phase's worth of allocations → `arena {}`, and `.clone()` the survivors out.
 - Text assembly → `builder`, never `+` in a loop.
-- Someone else's data → a view (`str`, `slice`), free.
+- Someone else's data → borrow a view (`str`, `slice`) without copying the data.
 
-One decision per phase of work. The compiler enforces the rest — moved values, escapes, drops — so once it compiles, the memory is right.
+Choose how long the data must live. The compiler then checks moves and region escapes and inserts the required cleanup.
 
 ## Lay bulk data out as SoA
 
 If a hot path touches one or two fields of many rows, transpose: `to_soa()` at the point data enters, or decode JSON straight into `soa<T>`. Repeated aggregation over a string key → `dict_encode` once. AoS is for data you touch whole and rarely.
 
-## Parallelism is two words
+## Choose between data parallelism and tasks
 
-`par_map` when the per-element function is expensive (measure — the sequential loop is vectorized and often wins); `task_group`/`spawn` with `wait()?` for heterogeneous jobs. Purity is inferred, so if it compiles, it's race-free; if it doesn't, the compiler just found your hidden side effect.
+Use `par_map` when the per-element function is expensive; measure first, because a vectorized sequential pipeline may be faster. Use `task_group`/`spawn` with `wait()?` for independent jobs with different operations. Parallel closures must be Pure. Purity is inferred, so a closure that changes state or performs I/O is rejected.
 
 ## Let the compiler see the shape
 
-Align's speed comes from what the compiler can *prove*: contiguous memory, no aliasing, non-null, cold error paths, arena lifetimes. Every restriction in the language — no null, one error model, Move types, inferred regions, terminated pipelines — exists to keep those proofs alive without annotations. Working with the grain (pipelines over index games, `Result` over sentinels, arenas over scattered ownership) is what keeps the inference fed. **Idiomatic Align is fast Align — the two are the same thing by design.**
+Align's restrictions give the compiler information it can use for optimization: contiguous memory, no aliasing, non-null values, cold error paths, and arena lifetimes. Pipelines, `Result`, and explicit allocation preserve that information without extra annotations. These idioms help the compiler optimize the code; measure the result on your workload.
 
 ## Trust, but verify with the tools
 
-`alignc check` in the edit loop. `alignc fmt --write` before committing. When the lints speak — huge copy, unnecessary heap, lossy cast — they are the performance model pointing at a line; the fix is usually an idiom from this list. And when you wonder whether a pipeline really vectorized: `alignc emit-llvm`. Never argue about performance you can dump.
+Use `alignc check` while editing and `alignc fmt --write` before committing. Investigate warnings about large copies, unnecessary heap allocation, and lossy casts. To check whether a pipeline vectorized, inspect its optimization remarks with `alignc explain-opt` or its IR with `alignc emit-llvm`. Use a benchmark to measure execution time.
 
 ## Nothing hidden — read code by its keywords
 
-Everything costly or dangerous in Align announces itself with a greppable word: allocation (`arena`, `heap.new`, `builder`, `.clone()`, `.to_array()`), failure (`Result`, `?`), mutation (`mut`, `out`, `borrow mut`), threads (`par_map`, `spawn`), native resources (`resource`), the unchecked world (`unsafe`, `raw`, `extern`). A reader — human or AI — audits a file by scanning for those words, and their absence is a guarantee, not a hope. Write code that keeps this property: the next reader of your program is the point of the language.
+Look for the words that mark allocation (`arena`, `heap.new`, `builder`, `.clone()`, `.to_array()`), failure (`Result`, `?`), mutation (`mut`, `out`, `borrow mut`), threads (`par_map`, `spawn`), native resources (`resource`), and unchecked operations (`unsafe`, `raw`, `extern`). They help a reader find the operations that deserve closer inspection. Keep these choices visible in your own APIs so the next reader can understand their costs and requirements.

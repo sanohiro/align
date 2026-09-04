@@ -16,7 +16,7 @@
 
 **Q3.** What is `fn x { x > 2 }` called, when it answers only `true` or `false`?
 
-**A3.** A predicate. `where` keeps the elements its predicate blesses.
+**A3.** A predicate. `where` keeps each element for which the predicate returns `true`.
 
 ---
 
@@ -56,7 +56,7 @@ Which prices are active?
 
 ---
 
-**Q8.** Two new spells in Q7. What is `.active` doing inside `where`?
+**Q8.** Two new pieces of syntax in Q7. What is `.active` doing inside `where`?
 
 **A8.** Field shorthand: `where(.active)` keeps the rows whose `active` field is `true`. Nothing more to write when the field already is the predicate.
 
@@ -70,13 +70,13 @@ Which prices are active?
 
 **Q10.** What is `items.price.where(fn p { p > 60 }).sum()`?
 
-**A10.** `300` again — `100 + 200`, this time by price, ignoring `active` entirely. Project first, filter after: also legal. Stages snap together in the order *you* mean.
+**A10.** Also `300` (`100 + 200`). This time we filter by price and do not check `active`. The two conditions happen to give the same answer for these items; they ask different questions.
 
 ---
 
-**Q11.** How many of those three structs did Q7 copy anywhere?
+**Q11.** Does Q7 copy any `Item` into intermediate storage?
 
-**A11.** None. `where` skips, `.price` is a field load from the row where it lies, `sum` accumulates. One pass, no temporaries — same fusion as chapter 2.
+**A11.** No. `where` skips unwanted rows, `.price` reads each remaining row's price, and `sum` adds it. One loop, no intermediate array: the fusion we saw in chapter 2.
 
 ---
 
@@ -106,13 +106,13 @@ readings := [
 
 What is `readings.where(.valid).value.to_array()`?
 
-**A13.** `[5, 12]`. Keep rows first; project the surviving field second.
+**A13.** `[5, 12]`. Keep the rows whose `valid` field is `true`, then take their `value` fields.
 
 ---
 
 **Q14.** What is `readings.value.where(fn x { x > 10 }).to_array()`?
 
-**A14.** `[40, 12]`. This question never looked at `valid`. A field projection forgets the other fields; after `.value`, only numbers flow.
+**A14.** `[40, 12]`. This expression does not check `valid`. After `.value`, the pipeline carries numbers, so the other fields are no longer available to later stages.
 
 ---
 
@@ -163,16 +163,16 @@ readings
 
 **Q18.** How many temporary arrays did Q17 make?
 
-**A18.** None. Three readings entered; one reached the multiply; one number reached the accumulator. Trace elements, not imaginary collections.
+**A18.** Zero. Of the three readings, only `12` passes both predicates. It is doubled and added to the sum.
 
 ---
 
 **Q19.** Say Q17 without syntax.
 
-**A19.** “Take the readings; keep valid ones; take their values; keep values over ten; double them; add them.” If the sentence and the chain disagree, one of them is wrong.
+**A19.** “Take the values from valid readings, keep those greater than ten, double them, and add.” Check which part of the expression performs each operation.
 
 ---
 
 > **The Third Commandment**
 >
-> *Filter with `where`, point with `.field`, and let the data flow to its answer.*
+> *Use `where` to keep elements that satisfy a condition, and `.field` to take a field from each element.*

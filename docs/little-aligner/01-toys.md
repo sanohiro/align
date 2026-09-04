@@ -32,9 +32,9 @@
 
 ---
 
-**Q6.** Why must mutability be announced at birth? Why can't I just change my mind later?
+**Q6.** Why must we say whether a binding can change when we declare it?
 
-**A6.** Because mutability is not a feature of a variable; it is a declaration of intent. When you read a block of code, you must instantly know what stands still and what dances. If anything could dance at any time, you could never trust the floor.
+**A6.** So the declaration tells you whether the binding may change. Without `mut`, you can read the rest of the scope knowing that the name will keep its value.
 
 ---
 
@@ -81,7 +81,7 @@ fn cube(x: i64) -> i64 {
 
 **Q11.** What is `square(square(2))`?
 
-**A11.** `16`. Functions compose. You knew that. We are warming up.
+**A11.** `16`: `square(2)` is `4`, then `square(4)` is `16`.
 
 ---
 
@@ -93,13 +93,13 @@ fn cube(x: i64) -> i64 {
 
 **Q13.** What does `print(7 / 0)` do?
 
-**A13.** It stops the program with an error — loudly, at that line. Never a quiet wrong number.
+**A13.** It stops the program with a division-by-zero error.
 
 ---
 
 **Q14.** `x: i8 := 127`. What is `x + 1`?
 
-**A14.** `-128`. Integer overflow wraps around, two's-complement. Defined, always, on purpose.
+**A14.** `-128`. Integer overflow wraps in two's complement. This is defined behavior, but you still need to decide whether it is appropriate for your calculation.
 
 ---
 
@@ -117,7 +117,7 @@ fn cube(x: i64) -> i64 {
 
 **Q17.** What is `[1, 2, 3][3]`?
 
-**A17.** A runtime abort. Out of bounds is an error, not an adventure.
+**A17.** An out-of-bounds error stops the program.
 
 ---
 
@@ -181,7 +181,7 @@ fn step(x: i64) -> i64 =
     if x % 2 == 0 { x / 2 } else { x * 3 + 1 }
 ```
 
-Then `step(4)` is `2`, and `step(5)` is `16`. A function is a named transformation, not a place to hide state.
+Then `step(4)` is `2`, and `step(5)` is `16`. The function gives this transformation a name.
 
 ---
 

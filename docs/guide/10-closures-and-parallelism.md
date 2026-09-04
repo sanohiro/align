@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/10-closures-and-parallelism.md)
 
-Parallelism is where hidden things kill you: hidden shared state, hidden side effects, hidden threads. Align's parallel story is therefore built on two visible pieces — closures with value capture, and **inferred purity** — and two constructs: `par_map` for data parallelism, `task_group` for task parallelism. Nothing else spawns a thread.
+Align uses closures with value capture and **inferred purity** to control shared state and side effects in parallel code. Use `par_map` to apply one function to many elements, and `task_group` to run separate tasks.
 
 ## Lambdas
 
@@ -13,7 +13,7 @@ A lambda is `fn` + parameters + a block; you have been using them in pipelines s
 [1, 2, 3, 4].reduce(0, fn acc, x { acc + x })
 ```
 
-Lambdas **capture by value**: an enclosing binding used inside is copied in at creation. No shared mutable environment exists, which is precisely what makes the parallel constructs below safe:
+Lambdas **capture by value**: an enclosing Copy binding used inside is copied in at creation. The closure retains that value even if the original `mut` binding changes later. It does not share a writable environment:
 
 ```align
 factor := 3
@@ -58,7 +58,7 @@ ys := [1, 2].par_map(fn x { show(x) })
 //        for an accumulation
 ```
 
-A data race needs shared mutable state or unordered side effects; a Pure function by-value-capturing its inputs has neither. So Align doesn't detect races — it makes them **unrepresentable** in the parallel constructs, at compile time, with no `Send`/`Sync` vocabulary to learn.
+Sequential `map` may call `show`: it prints in input order. Changing that call to `par_map` is not valid, because the observable order would depend on worker scheduling. Parallel callables must satisfy both purity and capture restrictions. Move captures are rejected, and a `region` allocation capability cannot be sent to a worker even though its type is Copy. These checks are inferred; no `Send` or `Sync` annotation is written.
 
 ## `par_map` — data parallelism
 
@@ -77,7 +77,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`par_map(f)` is `map` across a persistent worker-thread pool, materializing an owned `array<R>`. Semantically identical to `map` — purity guarantees it — so you can switch between them freely as data sizes change.
+`par_map(f)` runs across a persistent worker-thread pool and returns an owned `array<R>`. For an accepted Pure callable, its values and result order match `map(f).to_array()`. This is the complete sequential equivalent: a bare `map(f)` is an unfinished pipeline. Worker completion order does not change the array order, but scheduling overhead and result allocation remain part of the parallel operation.
 
 And you should: **`par_map` earns its keep only when `f` is expensive.** The range kernel still has setup and scheduling overhead, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. Direct-source `par_map` with Copy-capturing closures, and primitive-scalar length-preserving `map` stages before it, use the same range kernel with one immutable call-scoped context; filtered and unsupported forms remain sequential, and Move captures are rejected.
 
@@ -100,7 +100,7 @@ fn main() -> Result<(), Error> {
 
 `spawn(fn { ... })` starts a task and returns a handle; `wait()` joins all of them; `.get()` reads a result after the join. The block is the lifetime: tasks cannot outlive their `task_group`, structurally — no detached threads, no forgotten joins, because the scope won't let you write them.
 
-Tasks that can fail return `Result`, and the join point wears the `?`:
+Tasks that can fail return `Result`. Propagate a group failure with `wait()?`:
 
 ```align
 fn fetch(n: i64) -> Result<i64, Error> {
@@ -123,8 +123,8 @@ fn main() -> Result<(), Error> {
 
 ## Which one, when
 
-- Same function over many elements → `par_map`, if the function is expensive enough to beat the vectorized sequential loop.
+- Same function over many elements → `par_map`, when measurement shows that the work per element outweighs the scheduling overhead and improves on sequential execution.
 - A few different jobs at once → `task_group`.
-- Everything else → sequential pipelines, which are already using SIMD lanes in parallel (chapter [12](12-simd.md)).
+- Everything else → sequential pipelines, which may use SIMD without additional worker threads (chapter [12](12-simd.md)).
 
 All of it visible in source: `par_map` and `spawn` are the only two words in the language that mean "another thread runs this."

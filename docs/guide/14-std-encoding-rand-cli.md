@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/14-std-encoding-rand-cli.md)
 
-The second wave of `std`: converting bytes at the boundary, searching text, random numbers, and command-line parsing. Same three rules as chapter [13](13-std-os.md) — explicit imports, `Result` + the one errno table, Move where a resource is owned.
+This chapter covers byte encoding, text search, random numbers, and command-line parsing. The rules from chapter [13](13-std-os.md) still apply: explicit imports, `Result` with the fixed errno table, and Move types for owned resources.
 
 ## `std.encoding`
 
@@ -71,11 +71,11 @@ pub fn main() -> i32 {
 }
 ```
 
-The design bets:
+The random-number API follows these rules:
 
 - **An `rng` is a value**, not a hidden global. `rand.seed()` asks the OS for entropy; `rand.seed_with(s)` is deterministic and portable — tests and simulations reproduce exactly. Every method needs a `mut` receiver, because advancing the state *is* mutation and Align doesn't hide mutation.
-- Since drawing a number is visibly impure, an rng-using closure is **rejected by `par_map`** at compile time — the classic non-reproducible-parallel-simulation bug is unrepresentable. (Per-task generators via `task_group`, or pre-generate a column of randoms and pipeline over it.)
-- `range` is half-open `[lo, hi)` and bias-free; `range(1, 7)` is a die. Nonsense arguments (`lo >= hi`, `sample` with `k > len`) abort loudly rather than return something plausible.
+- Drawing a number changes the generator state, so an rng-using closure is **rejected by `par_map`** at compile time. For parallel simulations, use per-task generators with `task_group`, or generate a column of random numbers first and then process it through a pipeline.
+- `range` is half-open `[lo, hi)` and bias-free; `range(1, 7)` models a six-sided die. Invalid arguments (`lo >= hi`, or `sample` with `k > len`) abort as programming errors.
 
 ## `std.cli`
 
@@ -99,6 +99,6 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `flag_bool` defaults to `false`; `flag_str` and `flag_i64` take explicit defaults. The accepted spelling is `--name value` (and `--name` for a bool). Unknown, duplicate, or malformed flags return `Error.Invalid`. After a successful parse, getters are total; asking for an undeclared name or the wrong type aborts as a programming error. `p.get_str` is a view into `p`, so clone it if the text must outlive the parsed handle.
 
-Both the command and parsed result are Move handles. Bind them before calling methods; chained calls on unnamed owning receivers remain a separate v1 surface restriction even though general expression temporaries now clean up correctly. `c.usage()` returns generated usage text and remains available after either parse outcome. There are no derive macros or attribute DSLs: registration is ordinary code and visible at the call site.
+Both the command and parsed result are Move handles. Bind them before calling methods; unnamed owning receivers are not yet supported. `c.usage()` returns generated usage text and remains available after either parse outcome. Register flags with ordinary function calls; no derive macros or attribute DSLs are needed.
 
-The next wave — networking, HTTP/TLS, processes, compression, and cryptography — is also shipped. Chapter [18](18-std-services.md) introduces it.
+Chapter [18](18-std-services.md) covers networking, HTTP/TLS, processes, compression, and cryptography.

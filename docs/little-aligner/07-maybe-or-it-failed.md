@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/07-maybe-or-it-failed.md)
 
-**Q1.** The list of even numbers in `[1, 3, 5]` — what is its first element?
+**Q1.** What do we find when we look for the first even number in `[1, 3, 5]`?
 
 **A1.** There isn't one. And "there isn't one" needs a type: `Option<i64>` — either `Some(n)` or `None`.
 
@@ -10,19 +10,21 @@
 
 **Q2.** Is `None` the same as `null`?
 
-**A2.** No, and the difference is everything. A `null` hides inside any reference, waiting. A `None` lives only inside an `Option`, and the type system will not hand you the `i64` until you have said what happens when it isn't there.
+**A2.** `None` is a variant of `Option`, so the type tells you that a value may be absent. To get the `i64`, you must handle both possibilities: `Some` and `None`.
 
 ---
 
 **Q3.** So how do we get the number out of `Some(5)`?
 
-**A3.** Two doors. The quick one: `x := maybe else 0` — the payload, or your fallback. The thorough one: `match`, with `Some(n) =>` and `None =>`, exhaustive as ever.
+**A3.** To use a fallback, write `x := maybe else 0`: `x` gets the payload of `Some`, or `0` for `None`. To perform different work for each case, use `match` with `Some(n)` and `None` arms.
 
 ---
 
-**Q4.** What is `safe_head([1, 2, 3]) else -1`, if `safe_head` returns `Option<i64>`?
+**Q4.** Suppose `safe_head` returns the first element as `Some`, or `None` for an empty slice. What is `safe_head([1, 2, 3]) else -1`?
 
 **A4.** `1`. And over the empty slice, `-1`. The caller chose the meaning of absence — the function didn't have to guess.
+
+We will write `safe_head` ourselves in Q20.
 
 ---
 
@@ -49,7 +51,7 @@ fn load(path: str) -> Result<i64, Error> {
 
 What is the `?` doing?
 
-**A7.** The whole error model, in one character: if `read_file` came back `Ok(s)`, then `data` is `s` and we continue; if `Err(e)`, we **return** `Err(e)` right now, to our caller. Unwrap or bail.
+**A7.** If `read_file` returns `Ok(s)`, then `data` is `s` and we continue. If it returns `Err(e)`, we **return** `Err(e)` immediately to our caller.
 
 ---
 
@@ -65,7 +67,7 @@ What is the `?` doing?
 fs.write_file("log.txt", "hi")
 ```
 
-**A9.** The compiler says no — *unhandled Result*, a hard error. Handle it (`?`, `match`, `else`, or bind it and decide). In Align you may fail, but you may not fail *silently*.
+**A9.** The compiler says no — *unhandled Result*, a hard error. Use `?`, `match`, or `else`, or bind the result for later handling. Discarding the error with `else` is an explicit choice, as we will see in Q12.
 
 ---
 
@@ -75,9 +77,9 @@ fs.write_file("log.txt", "hi")
 
 ---
 
-**Q11.** My own error type, then — and `?` across the seam?
+**Q11.** How do we use our own error type with `?`?
 
-**A11.** Declare one (`ParseErr { Empty, BadChar }`) and convert **visibly** at the boundary:
+**A11.** Declare one, such as `ParseErr { Empty, BadChar }`. If `inner` returns `Result<i64, ParseErr>` and its caller also uses `ParseErr` as its error type, use `inner(n)?` directly. Convert only when the caller needs a different error type, such as the built-in `Error`:
 
 ```align
 v := inner(n).map_err(to_error)?
@@ -149,13 +151,63 @@ score := parse_score(text) else 0
 return Ok(score)
 ```
 
-Policy sits at the boundary it changes. File errors keep their story; parse errors are deliberately discarded.
+Only the parse result uses `else 0`. A file-reading error still returns to the caller.
 
 ---
 
 **Q19.** Why not write `fs.read_file(path) else ""` too?
 
 **A19.** You may only if “unreadable file means empty input” is truly the application's policy. `else` is not a shorter `?`; it answers a different question. Choose by meaning, never by punctuation count.
+
+---
+
+**Q20.** Now write `safe_head(xs: slice<i64>) -> Option<i64>`. What must we check before reading `xs[0]`?
+
+**A20.** Whether there is an element to read:
+
+```align
+fn safe_head(xs: slice<i64>) -> Option<i64> {
+    if xs.len() == 0 { return None }
+    return Some(xs[0])
+}
+```
+
+The empty case returns before indexing. A nonempty slice produces `Some` even when its first element is zero or negative.
+
+---
+
+**Q21.** Do these two `-1` results mean the same thing?
+
+```align
+found := safe_head([-1, 7])
+missing := safe_head([])
+print(found else -1)
+print(missing else -1)
+```
+
+**A21.** No. `found` is `Some(-1)`; `missing` is `None`. The fallback makes them look alike. To keep the distinction, inspect the variant:
+
+```align
+print(match found { Some(_) => true, None => false })     // true
+print(match missing { Some(_) => true, None => false })   // false
+```
+
+Use a fallback when this loss of information is acceptable to the caller.
+
+---
+
+**Q22.** We want to add one to the first element, or return `None` if the slice is empty. Can we unwrap `safe_head(xs)` with `?`?
+
+**A22.** No. `?` applies only to `Result`. For `Option`, the `else` arm can return from the function:
+
+```align
+fn head_plus_one(xs: slice<i64>) -> Option<i64> {
+    head := safe_head(xs) else { return None }
+    return Some(head + 1)
+}
+```
+
+`head_plus_one([4, 9])` returns `Some(5)`. An empty input returns `None` before the addition runs.
 
 ---
 

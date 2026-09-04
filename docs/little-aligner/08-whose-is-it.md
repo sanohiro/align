@@ -36,25 +36,25 @@ How many owned strings exist now?
 
 **Q4.** Why so strict?
 
-**A4.** Because one owner means the compiler knows exactly who frees, and when. No garbage collector to wait for, no double-free to fear, no lifetime annotations to write. The strictness *is* the memory management.
+**A4.** With one owner, the compiler can track responsibility for freeing the resource. We need neither a garbage collector nor lifetime annotations in the source.
 
 ---
 
 **Q5.** But I truly want two strings.
 
-**A5.** Then truly pay: `b := a.clone()`. A deep copy, spelled out where the cost is. In Align you may copy anything — you may just never copy *invisibly*.
+**A5.** Write `b := a.clone()`. This makes a deep copy of the string, so each binding owns its own buffer. The allocation and copy are explicit.
 
 ---
 
 **Q6.** Which types are Move?
 
-**A6.** The owners: `string`, `array<T>`, `buffer`, file handles. Everything plain — numbers, `bool`, views, small structs of them — is Copy. Own a resource: Move. Just data: Copy. And a struct that *contains* a `string` becomes Move too — ownership soaks upward.
+**A6.** Resource owners such as `string`, `array<T>`, `buffer`, and file handles. Numbers, `bool`, views, and structs of Copy fields are Copy. A struct that contains a `string` becomes Move too: it owns the string as part of its value.
 
 ---
 
 **Q7.** What is `"hello"` before any `.clone()` — who owns the literal?
 
-**A7.** Nobody; it is a `str` — a **view**: a pointer and a length, looking at bytes that outlive it. Views are Copy — copying a *look* at data is free.
+**A7.** The literal's bytes live for the whole program. Its type is `str`, a **view** consisting of a pointer and a length. Views are Copy: copying one copies the pointer and length, without duplicating the text.
 
 ---
 
@@ -83,30 +83,30 @@ print(shout("align"))
 
 **Q10.** When do I reach for an arena?
 
-**A10.** When a *phase* allocates many things that die together — parse this file, handle this request, decode this batch. One `arena {}` around the phase; temporaries cost a pointer bump each; cleanup is one line long and impossible to forget.
+**A10.** When a *phase* allocates many things that die together — parse this file, handle this request, decode this batch. Put one `arena {}` around the phase. It provides storage for the temporaries and releases that storage when the phase ends.
 
 ---
 
-**Q11.** In other languages, a garbage collector finds what I dropped and cleans it up. Why not use that instead of an `arena`?
+**Q11.** How does this differ from letting a garbage collector reclaim the memory?
 
-**A11.** A garbage collector is a janitor that follows your program around, inspecting and picking up individual pieces of trash. An `arena` is a building. When the work is done, you demolish the building. It is not about cleaning up mistakes; it is about planning lifetimes in bulk from the start.
+**A11.** An arena fits the case where we already know that many values have the same lifetime. We put them in one region and release it when the phase ends. The program states that boundary instead of asking a garbage collector to determine which individual values are still reachable.
 
 ---
 
 **Q12.** If I create 10,000 temporary strings in a loop and free them one by one, what is the cost?
 
-**A12.** In other languages, 10,000 round-trips through a general-purpose allocator, each with its locks and bookkeeping. In an `arena`, 10,000 strings cost one pointer bump each. The arena is not just about cleanup; it is about *blinding allocation speed*.
+**A12.** Separate allocations and frees each require allocator bookkeeping. An arena normally allocates by advancing a pointer within a block, obtaining another block when needed. It releases the storage together at the end. The strings still have to be built; the arena reduces allocation and cleanup overhead.
 
 ---
 
-**Q13.** So the whole decision, for any new data?
+**Q13.** How should we choose when creating new data?
 
 **A13.** One question — *how long does it live?*
 
 - this scope → a plain value, done
 - this phase → the arena, `.clone()` the survivors
 - longer, one owner → an owned type, moved along
-- I'm only looking → a view, free
+- I'm only looking → a view, with no copy of the underlying data
 
 ---
 
@@ -146,7 +146,7 @@ c := b.clone()
 
 Which names may still be used?
 
-**A17.** `b` and `c`. The move killed `a`; the clone made a second buffer without killing `b`.
+**A17.** `b` and `c`. Ownership moved from `a` to `b`, so `a` can no longer be used. `clone` made a separate buffer for `c` while leaving `b` intact.
 
 ---
 
@@ -158,7 +158,7 @@ Which names may still be used?
 
 **Q19.** A function takes `string` by value. What happens when we call it with `d`?
 
-**A19.** Ownership moves into the function. Unless the function returns the string, `d` is dead to the caller and the callee drops the buffer. Function boundaries do not suspend Move.
+**A19.** Ownership moves into the function, so the caller can no longer use `d`. The callee drops the string unless it moves ownership onward, for example by returning it. A returned string needs a new binding; it does not restore `d`.
 
 ---
 
@@ -170,7 +170,7 @@ Which names may still be used?
 fn count_bytes(s: str) -> i64 = s.len()
 ```
 
-Ownership parameters say “give this to me.” View parameters say “let me look.”
+Pass a view while retaining the owner. Passing a `string` by value transfers ownership; passing a `str` lets the function borrow the text.
 
 ---
 
@@ -191,10 +191,47 @@ Do not heap-own all ten in case one survives. Group the phase; copy the one valu
 
 **Q22.** Which is the useful first question: “stack or heap?” or “how long does it live?”
 
-**A22.** “How long does it live?” Storage follows lifetime: borrowed view, scope value, phase arena, or longer-lived owner. Starting with heap versus stack skips the ownership decision that matters.
+**A22.** “How long will we use it?” A borrowed view for reading, an arena for values released together, or an owning value for data needed longer. Choose the storage from the lifetime you need.
 
 ---
 
+**Q23.** A record owns a name. Can a function inspect the record without taking it?
+
+**A23.** Yes, with a shared `borrow` parameter:
+
+```align
+Profile { name: string, visits: i64 }
+
+fn name_size(borrow p: Profile) -> i64 = p.name.len()
+
+fn main() -> i32 {
+    p := Profile { name: "Ada".clone(), visits: 0 }
+    print(name_size(p))    // 3
+    print(p.name.len())    // 3 — the caller still owns p
+    return 0
+}
+```
+
+Without `borrow`, passing this Move record would transfer ownership. The call still says `name_size(p)`; the parameter declaration states how it is passed.
+
+---
+
+**Q24.** May `name_size` update `p.visits`?
+
+**A24.** No. A shared borrow is read-only. To update the caller's record, use a different parameter mode:
+
+```align
+fn visit(borrow mut p: Profile) {
+    p.visits = p.visits + 1
+}
+```
+
+Declare the caller's record as `mut p`, then call `visit(p)`. The caller still owns the record, and its `visits` becomes `1`. The callee has exclusive access for the call. If all it needs is the name's text, a `str` parameter remains enough; borrowing the record is useful when the operation needs the record itself.
+
+---
+
+To see the ownership changes as diagrams, read the guide's [memory chapter](../guide/05-memory.md). It follows Move, borrowing, and a string copied out of an arena.
+
 > **The Eighth Commandment**
 >
-> *One owner at a time. Group the short-lived under an arena. And when you must have two — `.clone()`, where all can see.*
+> *One owner at a time. Group values with the same lifetime in an arena. When you need another copy of a string, write `.clone()`.*

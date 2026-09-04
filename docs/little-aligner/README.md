@@ -4,19 +4,25 @@
 
 *In the tradition of "The Little Schemer."*
 
-This is not a reference and not a textbook — [the guide](../guide/README.md) is the textbook. This is a **drill book**: a long conversation of small questions and small answers, each one a half-step past the last. It teaches your hands the parts of Align that are unlike other languages — pipelines, `match`, Move, arenas, and turning data sideways into columns — until the idioms come out on their own.
+This is a **drill book**: a conversation of small questions and small answers, each building on the last. You will practice pipelines, `match`, Move, arenas, and arranging data in columns. For a systematic introduction and a broader account of the language, see [the guide](../guide/README.md).
 
-It does not tour every syntax form or library module. It has succeeded when a problem you have not seen before makes you ask the Align questions on your own: What is the shape of the data? Is this a flow, a choice, or a control circle? Who owns it, how long does it live, which columns will the machine touch, and where is the cost written? The aim is not to leave you acquainted with Align. It is to make you an **aligner**.
+It does not tour every syntax form or library module. The aim is to help you approach a new problem: What is the shape of the data? Does it call for a pipeline, a choice, or a loop? Who owns each value, how long does it live, and what work will the machine do?
 
 ## How to use it
 
-Read a question. **Answer it out loud before reading the answer.** If you were right, keep going; if you were wrong, back up a few questions — the answer was built there. When a program appears, you may run it (`alignc run`), but try to be the compiler first: most questions can be answered with nothing but the previous page.
+Read a question and **answer it before reading the answer.** Saying it out loud may help. If you were right, move on. If you were wrong, go back a few questions and try again. You may run a program (`alignc run`), but predict its result first. Most questions can be answered from what you have learned so far.
 
-Keeping `align-repl` open beside the book suits the drill rhythm: it starts empty, an answer is one line, and the program grows with you instead of becoming a new file per question. Predict the answer, type it, and compare. It compiles and runs natively rather than interpreting, so a wrong prediction is corrected by the real compiler; `:list` shows the program the chapter has built up so far, and `:save` turns it into a file when a drill grows into something you want to keep. See chapter [16](../guide/16-toolchain.md) of the guide.
+Some answers are one word. Some questions look identical to the one before — the difference is the lesson. Each chapter ends with a **Commandment** to help you remember its main idea.
 
-Some answers are one word. Some questions look identical to the one before — the difference is the lesson. And when a rule has earned it, it is carved into a **Commandment**.
+After reading the book, choose a program you liked and read it again without running it. Predict its answer. Trace the data and the lifetimes of its values. Count the passes, allocations, and copies. [The final chapter](15-read-it-four-ways.md) practices this way of reading.
 
-After the first trip through the book, take one program you liked and read it again without running it. Predict its answer. Trace the data. Point to where every value dies. Count the passes, allocations, and copies. [The final chapter](15-read-it-four-ways.md) teaches this second reading. Recognition makes a page feel familiar; recall makes the language yours.
+## Trying the examples
+
+For installation and your first program, see [Getting started](../guide/01-getting-started.md). Most questions show expressions or short fragments. Use the declarations given with the question; when saving a complete program, put type and function declarations at file scope and the statements to run inside `main`. Questions that ask whether code compiles sometimes contain deliberate errors.
+
+Treat each question as a separate experiment unless it explicitly continues the previous one. In `align-repl`, `:clear` starts a fresh experiment, `:list` shows the current program, and `:save PATH` saves it. The REPL runs the whole accumulated program on each entry, so earlier file writes or other side effects happen again. See [The toolchain](../guide/16-toolchain.md) for the details.
+
+When an answer says an array is `[2, 4, 6]`, it describes the elements. The REPL displays an array's type, not its contents. To check your prediction, inspect elements such as `xs[0]`, or ask for a scalar result such as `xs.sum()`.
 
 ## The chapters
 
@@ -24,7 +30,7 @@ After the first trip through the book, take one program you liked and read it ag
 2. [Do It Again](02-do-it-again.md) — `map`
 3. [Keep Some](03-keep-some.md) — `where` and field projections
 4. [Collapse It](04-collapse-it.md) — reductions: `sum`, `count`, `reduce`, and friends
-5. [Chains](05-chains.md) — whole pipelines, and why they cost one loop
+5. [Chains](05-chains.md) — composing pipelines and fusing loops
 6. [One of Many](06-one-of-many.md) — sum types and `match`
 7. [Maybe, or It Failed](07-maybe-or-it-failed.md) — `Option`, `Result`, `?`
 8. [Whose Is It?](08-whose-is-it.md) — Copy, Move, arenas, and `.clone()`
@@ -36,4 +42,4 @@ After the first trip through the book, take one program you liked and read it ag
 14. [The Big Crunch](14-the-big-crunch.md) — mmap, zero-copy pipelines, and putting it all together
 15. [Read It Four Ways](15-read-it-four-ways.md) — answer, flow, lifetime, and work
 
-Everything here runs with today's `alignc`. Bon appétit.
+The examples use today's `alignc`. Let's begin.

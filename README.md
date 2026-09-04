@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./README.ja.md)
 
-Align is an AOT-compiled, data-oriented programming language. It aligns four readers at once — the **human** who writes the code, the **AI** that generates it, the **compiler** that optimizes it, and the **hardware** that runs it. By combining a strict "nothing hidden" policy, a single unified model for errors and ownership, and a core built around data-oriented arrays and slices, Align guarantees predictable performance and cache-friendly, fused loops out of ordinary code.
+Align is an AOT-compiled, data-oriented programming language designed for the **human** who writes the code, the **AI** that generates it, the **compiler** that optimizes it, and the **hardware** that runs it. Errors, ownership transfers, allocation, and parallel work are explicit in the source. Array and slice pipelines let you express data transformations that the compiler can fuse into loops, while columnar layouts keep frequently used fields together in memory.
 
 ## Platforms
 
@@ -71,24 +71,27 @@ fn main() -> i32 {
 
 Run it with:
 ```sh
-./target/release/alignc run hello.align
+alignc run hello.align
 ```
 
-For an editor or agent loop, keep one foreground compiler resident and rebuild whenever a file the
-compiler actually consumed changes:
+If you built from source, use `./target/release/alignc` in place of `alignc`
+and `./target/release/align-repl` in place of `align-repl`, from the repository root.
+
+While editing, keep the compiler running and rebuild whenever one of the source files or other inputs
+it used changes:
 
 ```sh
-./target/release/alignc build hello.align --watch
+alignc build hello.align --watch
 ```
 
 The process keeps the last successful executable in place. Toolchain and library replacements are
 picked up by the next observed source/input change, or immediately after restarting the command.
 
-Or try Align without a file at all. `align-repl` is an AOT REPL: every entry recompiles one growing
-program with the real compiler and runs the real binary, so nothing is interpreted.
+You can also try expressions with `align-repl`. Each entry adds to the session's program, which
+`alignc` compiles and runs as a native executable.
 
 ```sh
-./target/release/align-repl
+align-repl
 ```
 
 ```text
@@ -98,16 +101,16 @@ align> 1 + 2
 
 ## Learn Align
 
-Start with the guide — a hands-on introduction to thinking and writing in Align:
+The guide explains syntax, tools, and libraries through worked examples:
 
 **[Tutorial (English)](docs/guide/README.md)** · **[Tutorial (Japanese)](docs/guide/ja/README.md)**
 
-Prefer drills? **[The Little Aligner](docs/little-aligner/README.md)** ([Japanese](docs/little-aligner/ja/README.md)) teaches the same idioms as a Q&A workbook, in the style of *The Little Schemer*.
+**[The Little Aligner](docs/little-aligner/README.md)** ([Japanese](docs/little-aligner/ja/README.md)) teaches through short questions and answers, in the tradition of *The Little Schemer*. Start here if you want to work out each step yourself: predict a result, follow the data, and reason about ownership and cost. The two books can be read independently or alongside each other.
 
 ## Layout
 
 - `draft.md` — authoritative language specification
-- `docs/guide/` — hands-on tutorial, 24 chapters (`00`–`23`, English + Japanese)
+- `docs/guide/` — hands-on tutorial (English + Japanese)
 - `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs

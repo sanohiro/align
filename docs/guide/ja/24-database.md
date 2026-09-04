@@ -2,7 +2,7 @@
 
 > 🌐 [English](../24-database.md) · **日本語**
 
-`pkg.db` は SQL を SQL のまま扱います。クエリは小さなモジュール1つです。`.sql` ファイル、プレースホルダに対応する `Params` 構造体、結果カラムに対応する `Row` 構造体。その SQL は実スキーマに対してオフラインで検査でき、実行時のパラメータバインドと行デコードは生成コードが行います。リフレクションも、隠れたステートメントキャッシュもありません。
+`pkg.db` は SQL を SQL のまま扱います。1つのクエリモジュールに、`.sql` ファイル、プレースホルダに対応する `Params` 構造体、結果の列に対応する `Row` 構造体を置きます。コンパイラは保存済みのスキーマメタデータを使い、データベースに接続せずに検査できます。実行時の引数のバインドと行のデコードは生成されたコードが行い、リフレクションや暗黙のステートメントキャッシュは使いません。
 
 vendoring の手順は他のパッケージと同じです（第 [23](23-packages.md) 章）。[apps/db/pkg](../../../apps/db/pkg) をプロジェクトルートへコピーすれば、`pkg.db` に加えて `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` が使えます。以降の各節は、実際に必要になる作業1つに対応します。
 
@@ -57,11 +57,11 @@ fn main() -> i32 {
 }
 ```
 
-呼び出し箇所には3つのものが見えたまま残ります。
+呼び出し箇所で次の3つを指定しています。
 
 - `pkg.db.exec_conn(connection)` は実行対象です。`pkg.db.exec_tx(transaction)` も同じ `pkg.db.exec` 型を返すので、トランザクションの内でも外でもクエリ側のコードは変わりません。
-- `out` は行の文字列ビューをクローンする先です。`one` はこの region に実体化し、行はそれより長くは生きられないので、外へ持ち出すものは `.clone()` します。`conn` も同様に、drop 時に自分で閉じる Move リソースです（第 [05](05-memory.md) 章）。忘れうる `close()` はありません。
-- `[]` は実行オプションのスライスです。空は「文書化された既定」であって、推論された既定ではありません。
+- `out` は行の文字列データをコピーする先のリージョンです。`one` が返す行はこの領域を参照するため、外に残す文字列は `.clone()` します。接続の `conn` は Move リソースで、drop 時に閉じられます（第 [05](05-memory.md) 章）。
+- `[]` は実行オプションのスライスです。空なら、文書化された既定値を使います。
 
 `one` はちょうど1行を要求します。0行でも2行でも `pkg.db.Error.Cardinality` が返り、どちらだったかは `observed_at_least` が示します。`maybe_one` も `all` も無いので、それ以外はすべてストリームで処理します。
 
@@ -83,7 +83,7 @@ fn total_ids(borrow connection: pkg.db.conn) -> Result<i64, pkg.db.Error> {
 }
 ```
 
-`rows` は暗黙の実体化を伴わない1パスです。ストリームは Move リソースで、尽きるか drop されるまで接続を握り続けます。`loop` と `else` アンラップの形は第 [02](02-language-basics.md) 章そのままで、これを隠すためのコールバック ABI をパッケージは持ち込みません。
+`rows` は結果全体を実体化せず、一度だけ走査するストリームを返します。ストリームは Move リソースで、最後まで読み終えるか drop するまで接続を保持します。第 [02](02-language-basics.md) 章の `loop` と `else` アンラップで読み進めます。
 
 列方向の処理には、1行ずつではなく上限付きのバッチを取ります。
 
@@ -101,9 +101,9 @@ fn total_in_batches(target: pkg.db.exec) -> Result<i64, pkg.db.Error> {
 }
 ```
 
-`next_batch` は最大 `max_rows` 行を、独立して所有される列指向のバッチ1つに実体化します。`batch_len` と `batch_row` で添字アクセスでき、`batch_soa` は第 [11](11-data-oriented.md) 章の `soa<R>` として射影します。上限を決めるのは呼び出し側なので、メモリコストが目に見えます。
+`next_batch` は最大 `max_rows` 行を、独立して所有する1つの列指向バッチに読み込みます。`batch_len` と `batch_row` で長さと各行を取得し、`batch_soa` で第 [11](11-data-oriented.md) 章の `soa<R>` として参照できます。呼び出し側が上限を決めるので、メモリ使用量を制限できます。
 
-デッドラインは共通オプション `pkg.db.ExecuteOption.TimeoutNs(ns)` で、ドライバの対応状況について正直です。PostgreSQL はノンブロッキング待機とネイティブなキャンセルで実際に強制し、期限切れは `pkg.db.Error.Timeout`、エンジン側都合のキャンセルは `Cancelled` に対応付けます。SQLite は受け取って無視するのではなく、SQL を送る前に `db.execute.timeout_ns` を名指しした `Unsupported` で拒否します。SQLite 側の `pkg.db.sqlite.ExecuteOption.BusyTimeoutNs(ns)`（`pkg.db.sqlite.rows_native` 経由）が制御するのはロック待ちだけで、クエリ全体のデッドラインだとは意図的に称しません。
+実行のデッドラインには `pkg.db.ExecuteOption.TimeoutNs(ns)` を使います。PostgreSQL はノンブロッキングの待機とキャンセルで期限を守り、期限切れは `pkg.db.Error.Timeout`、データベース側のキャンセルは `Cancelled` を返します。SQLite はこのオプションに対応せず、SQL を送る前に `db.execute.timeout_ns` を示す `Unsupported` を返します。SQLite 用の `pkg.db.sqlite.ExecuteOption.BusyTimeoutNs(ns)` は `pkg.db.sqlite.rows_native` で渡せますが、制限するのはロック待ちだけで、クエリ全体の実行時間ではありません。
 
 ## 書き込みを安全に
 
@@ -120,7 +120,7 @@ affected := outcome.rows_affected else { return Ok(-1) }
 
 件数を報告しない文もあるため、`rows_affected` は `Option<i64>` です。`RETURNING` を伴う DML は `command` ではなく `query` になります。
 
-トランザクションは、名前の付いた3ステップで接続を移動させます。
+トランザクションは次の3操作で接続の所有権を移します。
 
 ```align
 fn seed(connection: pkg.db.conn) -> Result<pkg.db.conn, pkg.db.Error> {
@@ -137,7 +137,7 @@ fn seed(connection: pkg.db.conn) -> Result<pkg.db.conn, pkg.db.Error> {
 }
 ```
 
-`begin` は `conn` を消費して `tx` を作り、`commit` と `rollback` は `tx` を消費して `conn` を返します。失敗側の腕が `?` ではなく `match` なのはそのためです。トランザクションの中で `?` を使うこと自体は*安全*で、`tx` が drop されればフェイルセーフなロールバックが走ります。ただし早期 return は接続ごと手放します。呼び出し元が接続を受け取り直す必要があるなら `match`、その必要がないなら `?` をそのまま使ってかまいません。
+`begin` は `conn` を消費して `tx` を作り、`commit` と `rollback` は `tx` を消費して `conn` を返します。この例のエラー分岐で `?` の代わりに `match` を使うのは、接続を受け取り直すためです。トランザクション内で `?` を使っても、`tx` の drop でロールバックするため安全です。ただし、早期 return すると接続も手放します。接続を取り戻す必要があれば `match`、なければ `?` を使えます。
 
 `[]` のトランザクションオプションは、SQLite では `DEFERRED`、PostgreSQL では `READ COMMITTED READ WRITE` を意味します。より強いモードはドライバの `begin_native` を通します。共通オプションのスライスにネイティブオプションのスライスを加えた形で、`pkg.db.sqlite.TxOption.Immediate` や `pkg.db.postgres.TxOption.Isolation(pkg.db.postgres.Isolation.Serializable)` を渡します。透過的なリトライはありません。`Serialization` や `Deadlock` を `match` して、見える形で再試行します。
 
@@ -162,7 +162,7 @@ PostgreSQL では対象を `--postgres-url-env NAME` に置き換えます。コ
 
 ## スキーマをコンパイル時に検査させる
 
-データベースに接続するワークフローは `alignc db prepare` だけです。エントリから到達できるすべてのクエリをエンジンに記述させ、決定的なメタデータを `.align-db/` 以下へ書き出します。
+コンパイル時のスキーマ検査に使うメタデータは、`alignc db prepare` で作成します。このコマンドがデータベースに接続し、エントリから到達する各クエリの情報を取得して、決定的な形式で `.align-db/` 以下に保存します。
 
 ```text
 alignc db prepare main.align --driver sqlite --database dev.sqlite --schema-id dev-v1
@@ -181,13 +181,13 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.query_file(
 )
 ```
 
-既定の `DeclaredOnly` は、SQL と構造体が well-formed であることだけを見ます。`CheckedOptional` はドライバごとに、現存する最新メタデータがあればそれを使います。`CheckedRequired` はメタデータの欠落や陳腐化をビルドエラーにします。しかもそのクエリが許すすべてのドライバ分を要求し、既定では両方なので、SQLite だけ prepare した状態では `checked metadata for PostgreSQL is stale: checked metadata is missing` で失敗します。片方のエンジンしか実在しないなら、`pkg.db.sqlite.query_file(options, native_options)` か PostgreSQL 版でクエリを固定します。
+既定の `DeclaredOnly` は、SQL と構造体の形式だけを検査します。`CheckedOptional` は、ドライバごとに有効なメタデータがあれば使います。`CheckedRequired` は、そのクエリが許可するすべてのドライバでメタデータを要求し、欠落や古い内容をビルドエラーにします。既定では両方を許可するため、SQLite だけ prepare すると `checked metadata for PostgreSQL is stale: checked metadata is missing` で失敗します。片方しか使わないなら `pkg.db.sqlite.query_file(options, native_options)`、または PostgreSQL 版でドライバを限定してください。
 
-同じ読み取り専用のカタログ面は実行時にも使えます。`pkg.db.meta_tables`、`meta_columns`、`meta_keys`、`meta_indexes`、そしてクエリプラン用の `pkg.db.explain` です。これらは調べるだけで、移行はしません。
+実行時にも `pkg.db.meta_tables`、`meta_columns`、`meta_keys`、`meta_indexes` でカタログを調べ、`pkg.db.explain` でクエリプランを確認できます。これらは読み取り専用で、マイグレーションは行いません。
 
 ## SQLite と PostgreSQL の両方に対応する
 
-共通面 —— `query`/`command`、`execute`、`one`、`rows`/`next`、`next_batch`、`prepare`/`rows_stmt`、`begin`/`commit`/`rollback`、`pkg.db.Error` —— は両エンジンで同一で、ポータブルな SQL は `:name` プレースホルダを使い、各ドライバがそれぞれのプロトコル形式へ落とします。エンジン固有のものはすべて修飾されるので、レビューで一目で分かります。
+`query` / `command`、`execute`、`one`、`rows` / `next`、`next_batch`、`prepare` / `rows_stmt`、`begin` / `commit` / `rollback`、`pkg.db.Error` は両エンジンで共通です。共通の SQL は `:name` プレースホルダを使い、各ドライバが自分のプロトコル形式へ変換します。エンジン固有の操作はモジュール名で区別します。
 
 ```align
 sqlite := pkg.db.sqlite.connect("app.db", [
@@ -225,11 +225,11 @@ connection := pkg.db.pool.try_acquire(owner)?
 snapshot := pkg.db.pool.info(owner)?
 ```
 
-`try_acquire` はブロックもスリープもしません。空きがなければ即座に `pkg.db.Error.PoolExhausted` を返し、バックプレッシャーの取り方は呼び出し側の判断のままです。取得できる値はごく普通の `pkg.db.conn` で、クエリもトランザクションもプリペアドステートメントもそのまま動きます。プールへ返すのはその drop です。容量は `1..=1024` で固定です。drop 時にトランザクションが idle だと証明できない接続は、黙って再利用されるのではなく閉じられ、そのスロットは廃棄されます。それは `info` の `capacity`／`idle`／`checked_out` で見えます。セッションは利用者間でリセットされません。適用した `PRAGMA` や `SET` は、その物理接続に残ります。
+`try_acquire` は待機せず、空きがなければ即座に `pkg.db.Error.PoolExhausted` を返します。再試行するか、要求を断るかは呼び出し側で決めます。取得する値は通常の `pkg.db.conn` なので、クエリ、トランザクション、プリペアドステートメントをそのまま使え、drop するとプールに戻ります。容量は `1..=1024` の範囲で固定です。drop 時に未完了のトランザクションがないと確認できない接続は閉じ、スロットも廃棄します。`info` の `capacity` / `idle` / `checked_out` で状態を確認できます。利用者が変わってもセッションはリセットされず、`PRAGMA` や `SET` はその物理接続に残ります。
 
 ## どうしても動的な SQL が要るとき
 
-脱出口は明示的で、弱く、名前が付いています。
+SQL が実行時に決まる場合は、動的 API を使います。結果は静的に検査された `Row` 型ではなく、`pkg.db.value` で受け取ります。
 
 ```align
 fn counted(borrow connection: pkg.db.conn, out: region) -> Result<i64, pkg.db.Error> {
@@ -246,13 +246,13 @@ fn counted(borrow connection: pkg.db.conn, out: region) -> Result<i64, pkg.db.Er
 }
 ```
 
-ドライバは推論ではなく引数です。実行ハンドルと突き合わされ、食い違えば SQL を送る前に `DriverMismatch` で失敗します。ここではプレースホルダの書き換えを行わないので、SQL はそのエンジンの方言そのものです。SQLite なら `?1`、PostgreSQL なら `$1` を書きます。値は `pkg.db.value` として渡し、サーバーのカラム順どおりに添字アクセスできる `array<pkg.db.value>` として、指定した region にコピーされて返ります。カラム名のテーブルも、構造体へのリフレクティブなデコードもありません。行を返さない形は `pkg.db.dynamic_execute` です。
+ドライバは引数で指定し、実行ハンドルと一致しなければ SQL を送る前に `DriverMismatch` を返します。プレースホルダは書き換えないので、SQLite なら `?1`、PostgreSQL なら `$1` を使います。引数は `pkg.db.value` で渡し、行はサーバーの列順に並んだ `array<pkg.db.value>` で受け取ります。結果は指定したリージョンにコピーされ、添字で参照できます。列名のテーブルや構造体へのリフレクションによるデコードはありません。行を返さない場合は `pkg.db.dynamic_execute` を使います。
 
 識別子は依然としてバインドできません。名前付きの静的クエリ2つを分岐で使い分けるのが正攻法で、識別子を SQL に文字列連結するのはサポート対象外です。
 
-## SQLite scalar function を登録する
+## SQLite のスカラー関数を登録する
 
-SQLite scalar function は raw function pointer や保持される closure environment ではなく、コンパイラが証明した noncapturing callback を使います。
+SQLite のスカラー関数には、キャプチャを持たず、コンパイラが検査したコールバックを登録します。
 
 ```align
 fn twice(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
@@ -272,15 +272,15 @@ fn install(borrow mut connection: pkg.db.conn) -> Result<(), pkg.db.Error> {
 }
 ```
 
-登録は固定 arity、接続ローカル、SQLite 3.30 以降で、常に `DIRECTONLY` です。`Deterministic` は callback が Pure だとコンパイラが証明した場合だけ受理されます。idle な direct SQLite connection が必要で、callback state が再利用される pool slot を追わないよう pooled connection は拒否されます。`remove_function` は同じ name/arity pair を削除します。callback の失敗は SQLite function error になり、言語の hard error は従来どおり process を終了します。
+登録する関数の引数の数は固定で、その接続内だけで有効です。SQLite 3.30 以降が必要で、常に `DIRECTONLY` が付きます。`Deterministic` を指定できるのは、コンパイラが Pure と判定したコールバックだけです。登録には、使用中の処理がない直接の SQLite 接続が必要です。コールバックの状態が再利用されるプールのスロットに残らないよう、プールから取得した接続は拒否します。`remove_function` は同じ名前と引数の数を持つ関数を削除します。コールバックの失敗は SQLite の関数エラーになり、言語のハードエラーはプロセスを終了します。
 
 ## まだ無いもの
 
 - `maybe_one` も `all` もありません。`one` かストリームを使います。
-- デッドラインは実行時のみ、しかも PostgreSQL のみです。`PrepareOption.TimeoutNs` と `TxOption.BeginTimeoutNs` は v1 ではどちらのドライバも受け付けず、できるふりをせず `Unsupported` で拒否します。
+- デッドラインは PostgreSQL の実行だけに対応します。`PrepareOption.TimeoutNs` と `TxOption.BeginTimeoutNs` は、v1 では両ドライバとも `Unsupported` を返します。
 - プリペアドステートメントは1つの接続に属し、プール内の別接続へ移ることはありません。ステートメントキャッシュはグローバルにもローカルにも存在しません。
 - プールは待機も再接続もヘルスチェックもセッションのリセットも行いません。
 - 動的 SQL に prepare 形式や一括実体化の形式はありません。
-- 出荷済みの SQLite scalar function 以外に、SQLite collation、busy handler、extension loader、PostgreSQL callback surface はありません。それぞれ固有の安全性または永続化契約が必要なため、consumer-gated のままです。
+- SQLite の照合順序、busy handler、拡張ローダー、PostgreSQL のコールバックはまだありません。具体的な利用者の要件に基づき、安全性や永続化を別途設計する必要があります。
 
-契約の正本は `docs/impl/pkg-design/db.md` です。[apps/db](../../../apps/db) はパッケージ作者用ワークスペースで、その `app/user_groups.align` は一対多シェイピングの実例です。クエリ1本、順序付きの1パス、子コレクション1つにつき `array_builder` 1つ、という形になっています。
+契約の正本は `docs/impl/pkg-design/db.md` です。[apps/db](../../../apps/db) はパッケージ作者用ワークスペースで、`app/user_groups.align` に一対多の結果を組み立てる例があります。1本のクエリを順番に1回走査し、子のコレクションごとに1つの `array_builder` で蓄積します。
