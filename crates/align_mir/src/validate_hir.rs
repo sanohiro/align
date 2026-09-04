@@ -9135,6 +9135,7 @@ impl<'a> BodyValidator<'a> {
                 headers,
                 name,
                 token,
+                ..
             } => {
                 (headers.ty == Ty::HttpHeaders && name.ty == Ty::Str && token.ty == Ty::Str)
                     .then(|| strict(Ty::Bool, &[headers, name, token]))?

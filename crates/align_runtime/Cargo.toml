@@ -14,10 +14,10 @@ license.workspace = true
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [features]
-# Off by default and zero-cost when off: gate atomic allocation counters into `align_rt_alloc` /
-# `align_rt_free` and expose the C-ABI getter `align_rt_alloc_count()`. Used by the manual
-# `bench/adaptive_sort` probe to prove the `len <= 32` sort short-size scratch matrix allocates only
-# the materialize buffer(s). Not a runtime capability — a measurement aid.
+# Off by default and zero-cost when off: gate allocation counters plus the requested-live-byte
+# measurement used by the `pkg.ws` resource owner. Also used by `bench/adaptive_sort` to prove the
+# short-size scratch matrix allocates only the materialize buffer(s). Not a runtime capability — a
+# measurement aid whose extra exports never enter the compiler registry.
 alloc-count = []
 # Measurement aid for `bench/par_map`: expose a caller-only switch so the threshold probe can
 # compare the pooled kernel with the same materializing `par_map` kernel without the scheduler.

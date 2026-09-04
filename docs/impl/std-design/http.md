@@ -1426,9 +1426,9 @@ name on a prose blacklist, and a new `Ty`/`Scalar` discriminator reopens the com
 The boundary above makes that carrier-provenance substrate a first-PR capability and makes SSE block
 state transactional in the second, rather than distributing either proof across later fixups.
 
-## Protocol-neutral server Upgrade prerequisite (`pkg.ws`; DESIGNED, not shipped)
+## Protocol-neutral server Upgrade prerequisite (`pkg.ws`; IMPLEMENTED 2026-09-04)
 
-The `pkg.ws` ledger requires one HTTP ownership seam and three general repeated-header queries. The
+The `pkg.ws` ledger requires one HTTP ownership seam and four general repeated-header queries. The
 protocol stays above this layer: std validates and transfers one HTTP/1.1 connection but never
 computes a WebSocket accept value, parses a frame, selects a subprotocol, or adds SHA-1.
 
@@ -1436,6 +1436,7 @@ computes a WebSocket accept value, parses a frame, selects a subprotocol, or add
 hs.count(name: str) -> i64
 hs.tokens_valid(name: str) -> bool
 hs.contains_token(name: str, token: str) -> bool
+hs.contains_token_exact(name: str, token: str) -> bool
 ctx.upgrade_ready() -> bool
 
 ctx.respond_upgrade(rb: response_builder) -> Result<http_upgrade, Error>
@@ -1448,7 +1449,9 @@ u.shutdown() -> Result<(), Error>
 Header names and the `contains_token` argument use the existing nonempty ASCII RFC token rule and
 abort before scanning when invalid. `count` is case-insensitive over physical rows. `tokens_valid`
 checks every comma member of every repeated row and returns true for absence; `contains_token`
-searches all rows/members ASCII-case-insensitively but does not certify its neighbors. All three are
+searches all rows/members ASCII-case-insensitively, while `contains_token_exact` preserves the
+case-insensitive header-name match but compares trimmed members byte-exactly. Neither membership
+operation certifies its neighbors. All four are
 Pure, allocation-free, cursor-free, and borrow only the existing request table. At the native
 boundary, each checks the context before complete name and token views. Null/misaligned context
 hard-aborts before reference formation; negative or address-space-unrepresentable length and null
@@ -1507,11 +1510,11 @@ SIGPIPE safety is established before a connection can reach this surface. Linux 
 request read/context publication; failure closes that fd once and makes `srv.accept` return the
 mapped OS error. It cannot leave an Upgrade-capable socket with suppression merely attempted.
 
-The ten keyed rows are `HttpCtxUpgradeReady` A03, `HttpHeadersCount` A37, `HttpHeadersTokensValid` A20,
-`HttpHeadersContainsToken` A120, `HttpRespondUpgrade` A24, `HttpUpgradeReadExact` A20,
+The eleven keyed rows are `HttpCtxUpgradeReady` A03, `HttpHeadersCount` A37, `HttpHeadersTokensValid` A20,
+`HttpHeadersContainsToken` A120, `HttpHeadersContainsTokenExact` A120, `HttpRespondUpgrade` A24, `HttpUpgradeReadExact` A20,
 `HttpUpgradeWrite` A20, `HttpUpgradeDeadline` A04, `HttpUpgradeShutdown` A03, and
-`HttpUpgradeFree` A62. No new ABI shape is reserved. This prerequisite activates only in the
-combined `pkg.ws` implementation capability; current shipped counts and A124 remain unchanged.
+`HttpUpgradeFree` A62. No new ABI shape is reserved. This prerequisite activates in the combined
+`pkg.ws` implementation capability; A124 remains unchanged.
 The generated declarations retain those reused shapes' empty curated function-attribute sets; the
 Rust C exports do not unwind across C, but no LLVM `nounwind` attribute or shared shape mutation is
 introduced.

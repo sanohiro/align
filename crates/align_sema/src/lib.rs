@@ -15982,6 +15982,7 @@ impl EffectScan<'_> {
                 headers,
                 name,
                 token,
+                ..
             } => {
                 walk!(headers);
                 walk!(name);
@@ -27461,6 +27462,7 @@ impl<'a> EscapeCheck<'a> {
                 headers,
                 name,
                 token,
+                ..
             } => {
                 self.walk(headers, depth);
                 self.walk(name, depth);
@@ -43312,6 +43314,7 @@ impl<'a> MoveCheck<'a> {
                 headers,
                 name,
                 token,
+                ..
             } => {
                 move_expr!(self, headers, moved, false, false);
                 move_expr!(self, name, moved, false, false);
@@ -49906,7 +49909,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `http_headers` is Copy, owns nothing and is never dropped, so the mandated spelling
             // `ctx.headers().get(name)` needs no place-gate (unlike `ctx.headers()` itself).
             "get" if recv_ty == Ty::HttpHeaders => self.check_http_headers_get(recv_expr, args, span),
-            "count" | "tokens_valid" | "contains_token" if recv_ty == Ty::HttpHeaders => {
+            "count" | "tokens_valid" | "contains_token" | "contains_token_exact"
+                if recv_ty == Ty::HttpHeaders =>
+            {
                 self.check_http_headers_query(recv_expr, method, args, span)
             }
             // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
@@ -60459,7 +60464,11 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
     ) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let expected = if method == "contains_token" { 2 } else { 1 };
+        let expected = if matches!(method, "contains_token" | "contains_token_exact") {
+            2
+        } else {
+            1
+        };
         if args.len() != expected {
             self.diags.error(
                 format!("'.{method}()' takes {expected} string argument(s), got {}", args.len()),
@@ -60482,7 +60491,7 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Bool,
                 span,
             },
-            "contains_token" => {
+            "contains_token" | "contains_token_exact" => {
                 let token = self.check_str_init(&args[1]);
                 if token.ty == Ty::Error {
                     return err;
@@ -60492,6 +60501,7 @@ impl<'a, 't> Checker<'a, 't> {
                         headers: Box::new(recv_expr),
                         name: Box::new(name),
                         token: Box::new(token),
+                        exact: method == "contains_token_exact",
                     },
                     ty: Ty::Bool,
                     span,
@@ -63625,6 +63635,7 @@ impl<'a, 't> Checker<'a, 't> {
                 headers,
                 name,
                 token,
+                ..
             } => {
                 self.finalize_expr(headers);
                 self.finalize_expr(name);

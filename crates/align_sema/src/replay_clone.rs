@@ -1431,10 +1431,12 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             headers,
             name,
             token,
+            exact,
         } => ExprKind::HttpHeadersContainsToken {
             headers: boxed!(headers),
             name: boxed!(name),
             token: boxed!(token),
+            exact: *exact,
         },
         ExprKind::HttpCtxUpgradeReady { ctx } => ExprKind::HttpCtxUpgradeReady { ctx: boxed!(ctx) },
         ExprKind::HttpCtxBody { ctx } => ExprKind::HttpCtxBody { ctx: boxed!(ctx) },
@@ -2477,6 +2479,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             headers: ptr,
             name: offset,
             token: value,
+            ..
         }
         | ExprKind::HttpUpgradeReadExact {
             upgrade: ptr,

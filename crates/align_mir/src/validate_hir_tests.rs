@@ -13541,6 +13541,7 @@ fn hir_body_validator_native() {
                 )),
                 name: Box::new(native_str()),
                 token: Box::new(native_str()),
+                exact: false,
             },
             Ty::Bool,
         ),

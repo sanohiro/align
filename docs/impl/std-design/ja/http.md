@@ -1383,9 +1383,9 @@ no-wildcard storage-graph classifier に変える。全 non-builtin-tag edge は
 carrier-provenance substrate を first-PR capability、SSE block state を second-PR transaction とし、どちらの proof も
 後続 fixup に分散させない。
 
-## protocol-neutral server Upgrade prerequisite (`pkg.ws`; DESIGNED, not shipped)
+## protocol-neutral server Upgrade prerequisite (`pkg.ws`; IMPLEMENTED 2026-09-04)
 
-`pkg.ws` ledger は一つの HTTP ownership seam と、汎用 repeated-header query 三つを要求する。protocol はこの層より
+`pkg.ws` ledger は一つの HTTP ownership seam と、汎用 repeated-header query 四つを要求する。protocol はこの層より
 上に留める。std は一つの HTTP/1.1 connection を検証して transfer するが、WebSocket accept value の計算、frame
 parse、subprotocol selection、SHA-1 の追加はしない。
 
@@ -1393,6 +1393,7 @@ parse、subprotocol selection、SHA-1 の追加はしない。
 hs.count(name: str) -> i64
 hs.tokens_valid(name: str) -> bool
 hs.contains_token(name: str, token: str) -> bool
+hs.contains_token_exact(name: str, token: str) -> bool
 ctx.upgrade_ready() -> bool
 
 ctx.respond_upgrade(rb: response_builder) -> Result<http_upgrade, Error>
@@ -1404,8 +1405,9 @@ u.shutdown() -> Result<(), Error>
 
 header name と `contains_token` argument は既存の nonempty ASCII RFC token rule を使い、不正なら scan 前に abort
 する。`count` は physical row を case-insensitive に数える。`tokens_valid` は全 repeated row の全 comma member を
-検査し、absent は true。`contains_token` は全 row/member を ASCII-case-insensitive に検索するが、隣接 member の
-妥当性は証明しない。三つとも Pure、allocation-free、cursor-free で、既存 request table を call 中だけ borrow
+検査し、absent は true。`contains_token` は全 row/member を ASCII-case-insensitive に検索し、
+`contains_token_exact` は header name の case-insensitive match を保ったまま trimmed member を byte-exact 比較する。
+どちらも隣接 member の妥当性は証明しない。四つとも Pure、allocation-free、cursor-free で、既存 request table を call 中だけ borrow
 する。native boundary では ctx、complete name/token view の順で検証する。null/misaligned ctx は reference formation 前、
 negative または address-space-unrepresentable length/positive-length null range は slice formation 前、invalid token byte は
 table scan 前に hard-abort し、dangling nonnull pointer は検出不能。zero/false と混同する malformed sentinel はない。
@@ -1451,11 +1453,11 @@ SIGPIPE safety はこの surface に connection が届く前に成立する。Li
 accepted socket の `SO_NOSIGPIPE` installation を request read/ctx publication 前に check し、failure は fd を一回
 close して `srv.accept` から mapped OS Error。suppression を試しただけの socket は Upgrade 可能にならない。
 
-十 keyed row は `HttpCtxUpgradeReady` A03、`HttpHeadersCount` A37、`HttpHeadersTokensValid` A20、
-`HttpHeadersContainsToken` A120、`HttpRespondUpgrade` A24、`HttpUpgradeReadExact` A20、
+十一 keyed row は `HttpCtxUpgradeReady` A03、`HttpHeadersCount` A37、`HttpHeadersTokensValid` A20、
+`HttpHeadersContainsToken` A120、`HttpHeadersContainsTokenExact` A120、`HttpRespondUpgrade` A24、`HttpUpgradeReadExact` A20、
 `HttpUpgradeWrite` A20、`HttpUpgradeDeadline` A04、`HttpUpgradeShutdown` A03、
 `HttpUpgradeFree` A62。新 ABI shape は予約しない。この prerequisite は combined `pkg.ws` implementation
-capability だけで activate し、current shipped count と A124 は不変。exact validation、pointer、ownership、cache、
+capability で activate し、A124 は不変。exact validation、pointer、ownership、cache、
 test contract は `../pkg-design/ws.md`。generated declaration は reused shape の empty curated function-attribute set
 を保持する。Rust C export は C 境界を unwind しないが、LLVM `nounwind` attribute や shared shape mutation は追加しない。
 

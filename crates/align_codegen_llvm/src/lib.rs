@@ -16947,13 +16947,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 headers,
                 name,
                 token,
+                exact,
             } => {
                 let headers = self.operand(headers)?.into_pointer_value();
                 let (name_ptr, name_len) = self.split_str(name)?;
                 let (token_ptr, token_len) = self.split_str(token)?;
                 self.builder
                     .build_call(
-                        self.runtime(RuntimeKey::HttpHeadersContainsToken),
+                        self.runtime(if *exact {
+                            RuntimeKey::HttpHeadersContainsTokenExact
+                        } else {
+                            RuntimeKey::HttpHeadersContainsToken
+                        }),
                         &[
                             headers.into(),
                             name_ptr.into(),
@@ -16961,7 +16966,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             token_ptr.into(),
                             token_len.into(),
                         ],
-                        "httpheaderscontainstoken",
+                        if *exact {
+                            "httpheaderscontainstokenexact"
+                        } else {
+                            "httpheaderscontainstoken"
+                        },
                     )
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
@@ -24550,6 +24559,9 @@ fn main() -> i32 = 0
         let symbols = [
             "align_rt_alloc_count",
             "align_rt_free_count",
+            "align_rt_requested_live_bytes",
+            "align_rt_requested_live_peak",
+            "align_rt_requested_live_reset",
             "align_rt_str_finder_new_count",
             "align_rt_str_finder_free_count",
             "align_rt_test_par_map_force_caller",
@@ -24560,6 +24572,9 @@ fn main() -> i32 = 0
         let extern_ir = ir(
             "extern \"C\" fn align_rt_alloc_count() -> i64\n\
              extern \"C\" fn align_rt_free_count() -> i64\n\
+             extern \"C\" fn align_rt_requested_live_bytes() -> i64\n\
+             extern \"C\" fn align_rt_requested_live_peak() -> i64\n\
+             extern \"C\" fn align_rt_requested_live_reset()\n\
              extern \"C\" fn align_rt_str_finder_new_count() -> i64\n\
              extern \"C\" fn align_rt_str_finder_free_count() -> i64\n\
              extern \"C\" fn align_rt_test_par_map_force_caller(force: i32)\n\
@@ -24581,6 +24596,9 @@ fn main() -> i32 = 0
         let program_ir = ir(
             "fn align_rt_alloc_count() -> i64 = 0\n\
              fn align_rt_free_count() -> i64 = 0\n\
+             fn align_rt_requested_live_bytes() -> i64 = 0\n\
+             fn align_rt_requested_live_peak() -> i64 = 0\n\
+             fn align_rt_requested_live_reset() { }\n\
              fn align_rt_str_finder_new_count() -> i64 = 0\n\
              fn align_rt_str_finder_free_count() -> i64 = 0\n\
              fn align_rt_test_par_map_force_caller(force: i32) { }\n\

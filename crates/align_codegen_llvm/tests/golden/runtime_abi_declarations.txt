@@ -163,6 +163,7 @@ key|HttpCtxUpgradeReady|http_ctx_upgrade_ready|declare i32 @align_rt_http_ctx_up
 key|HttpGetMany|http_get_many|declare i32 @align_rt_http_get_many(ptr, ptr, i64, i64, ptr)
 key|HttpHeader|http_header|declare void @align_rt_http_header(ptr, ptr, i64, ptr, i64)
 key|HttpHeadersContainsToken|http_headers_contains_token|declare i32 @align_rt_http_headers_contains_token(ptr, ptr, i64, ptr, i64)
+key|HttpHeadersContainsTokenExact|http_headers_contains_token_exact|declare i32 @align_rt_http_headers_contains_token_exact(ptr, ptr, i64, ptr, i64)
 key|HttpHeadersCount|http_headers_count|declare i64 @align_rt_http_headers_count(ptr, ptr, i64)
 key|HttpHeadersTokensValid|http_headers_tokens_valid|declare i32 @align_rt_http_headers_tokens_valid(ptr, ptr, i64)
 key|HttpMaxResponseBodyBytes|http_max_response_body_bytes|declare void @align_rt_http_max_response_body_bytes(ptr, i64)

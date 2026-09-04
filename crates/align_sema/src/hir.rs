@@ -1780,8 +1780,14 @@ pub enum ExprKind {
     HttpHeadersCount { headers: Box<Expr>, name: Box<Expr> },
     /// Pure validation of every selected comma-separated header token list.
     HttpHeadersTokensValid { headers: Box<Expr>, name: Box<Expr> },
-    /// Pure case-insensitive token membership across every selected physical row.
-    HttpHeadersContainsToken { headers: Box<Expr>, name: Box<Expr>, token: Box<Expr> },
+    /// Pure token membership across every selected physical row. Header names are always
+    /// case-insensitive; `exact` selects byte-exact rather than ASCII-case-insensitive members.
+    HttpHeadersContainsToken {
+        headers: Box<Expr>,
+        name: Box<Expr>,
+        token: Box<Expr>,
+        exact: bool,
+    },
     /// Pure HTTP/1.1 plus parser-residual readiness query.
     HttpCtxUpgradeReady { ctx: Box<Expr> },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** into `ctx`'s buffer (the `ty` is

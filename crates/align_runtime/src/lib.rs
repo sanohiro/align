@@ -10832,7 +10832,10 @@ pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
         Ok(()) => requested,
         Err(_) => 0,
     };
-    Box::into_raw(Box::new(Buffer { data, cap, len: 0 }))
+    let buffer = Box::into_raw(Box::new(Buffer { data, cap, len: 0 }));
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
+    buffer
 }
 
 /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents (`data[..len]`), written to
@@ -10886,6 +10889,8 @@ pub unsafe extern "C" fn align_rt_buffer_capacity(b: *mut Buffer) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
     if !b.is_null() {
+        #[cfg(feature = "alloc-count")]
+        requested_live_remove(1, b.cast());
         drop(unsafe { Box::from_raw(b) });
     }
 }
@@ -14517,6 +14522,28 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static HTTP_UPGRADE_FAILPOINT: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn http_upgrade_set_failpoint(phase: u8) {
+    HTTP_UPGRADE_FAILPOINT.with(|failpoint| failpoint.set(phase));
+}
+
+#[cfg(test)]
+fn http_upgrade_take_failpoint(phase: u8) -> bool {
+    HTTP_UPGRADE_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == phase {
+            failpoint.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
 fn capture_failpoint_take(expected: CaptureFailpoint) -> bool {
     CAPTURE_FAILPOINT.with(|slot| {
         if slot.get() == expected {
@@ -16629,6 +16656,121 @@ static ALLOC_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI6
 #[cfg(feature = "alloc-count")]
 static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
+/// Opt-in requested-live-byte probe used by the `pkg.ws` resource owner. It tracks only allocation
+/// families explicitly attributed to the measured operation; the map itself is probe machinery and
+/// therefore outside the measurement. Kind 0 is C-owned payload, 1 a `buffer` shell+payload, and 2
+/// an `array_builder` shell budget. The builder budget transfers to its frozen payload so the
+/// package's fixed 128-byte shell allowance remains charged through Text conversion.
+#[cfg(feature = "alloc-count")]
+#[derive(Default)]
+struct RequestedLiveProbe {
+    active: bool,
+    live: usize,
+    peak: usize,
+    allocations: std::collections::BTreeMap<(u8, usize), usize>,
+}
+
+#[cfg(feature = "alloc-count")]
+static REQUESTED_LIVE_PROBE: std::sync::LazyLock<std::sync::Mutex<RequestedLiveProbe>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(RequestedLiveProbe::default()));
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_insert(kind: u8, ptr: *mut u8, bytes: usize) {
+    if ptr.is_null() || bytes == 0 {
+        return;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    let old = probe.allocations.insert((kind, ptr as usize), bytes).unwrap_or(0);
+    probe.live = probe.live.saturating_sub(old).saturating_add(bytes);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_remove(kind: u8, ptr: *mut u8) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return 0;
+    }
+    let removed = probe.allocations.remove(&(kind, ptr as usize)).unwrap_or(0);
+    probe.live = probe.live.saturating_sub(removed);
+    removed
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_realloc_begin(ptr: *mut u8, new_bytes: usize) -> usize {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return 0;
+    }
+    let old = probe.allocations.get(&(0, ptr as usize)).copied().unwrap_or(0);
+    probe.peak = probe.peak.max(probe.live.saturating_add(new_bytes));
+    old
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_realloc_commit(old_ptr: *mut u8, new_ptr: *mut u8, old_bytes: usize, new_bytes: usize) {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    if !old_ptr.is_null() {
+        probe.allocations.remove(&(0, old_ptr as usize));
+    }
+    probe.allocations.insert((0, new_ptr as usize), new_bytes);
+    probe.live = probe.live.saturating_sub(old_bytes).saturating_add(new_bytes);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+#[cfg(feature = "alloc-count")]
+fn requested_live_transfer_builder_shell(builder: *mut ArrayBuilder, data: *mut u8) {
+    let shell = requested_live_remove(2, builder.cast());
+    if shell == 0 || data.is_null() {
+        return;
+    }
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    if !probe.active {
+        return;
+    }
+    let key = (0, data as usize);
+    let bytes = probe.allocations.get(&key).copied().unwrap_or(0).saturating_add(shell);
+    probe.allocations.insert(key, bytes);
+    probe.live = probe.live.saturating_add(shell);
+    probe.peak = probe.peak.max(probe.live);
+}
+
+/// Reset and enable requested-live-byte accounting for the calling measurement process.
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_reset() {
+    let mut probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    probe.active = true;
+    probe.live = 0;
+    probe.peak = 0;
+    probe.allocations.clear();
+}
+
+/// Current requested live bytes since [`align_rt_requested_live_reset`].
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_bytes() -> i64 {
+    let probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    i64::try_from(probe.live).unwrap_or(i64::MAX)
+}
+
+/// Maximum requested live bytes since [`align_rt_requested_live_reset`].
+#[cfg(feature = "alloc-count")]
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_requested_live_peak() -> i64 {
+    let probe = REQUESTED_LIVE_PROBE.lock().unwrap_or_else(|error| error.into_inner());
+    i64::try_from(probe.peak).unwrap_or(i64::MAX)
+}
+
 /// Monotonic count of successful [`align_rt_alloc`] allocations since process start (feature
 /// `alloc-count` only). The delta across a sort equals the number of heap buffers it allocated.
 #[cfg(feature = "alloc-count")]
@@ -16662,6 +16804,8 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     }
     #[cfg(feature = "alloc-count")]
     ALLOC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(0, ptr, size);
     ptr
 }
 
@@ -16675,6 +16819,7 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
     #[cfg(feature = "alloc-count")]
     if !ptr.is_null() {
         FREE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        requested_live_remove(0, ptr);
     }
     unsafe { owned_raw_free(ptr) }
 }
@@ -16692,16 +16837,22 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u8 {
     if new_size <= 0 {
+        #[cfg(feature = "alloc-count")]
+        requested_live_remove(0, ptr);
         unsafe { owned_raw_free(ptr) };
         return core::ptr::null_mut();
     }
     let Ok(new_size) = safe_len(new_size) else {
         panic_abort("allocation too large");
     };
+    #[cfg(feature = "alloc-count")]
+    let old_size = requested_live_realloc_begin(ptr, new_size);
     let p = unsafe { owned_raw_realloc(ptr, new_size) };
     if p.is_null() {
         panic_abort("out of memory");
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_realloc_commit(ptr, p, old_size, new_size);
     p
 }
 
@@ -16880,7 +17031,10 @@ fn array_builder_value(elem_size: i64) -> ArrayBuilder {
 /// 16 for a `string` element). Growth is deferred to the first `push`/`append`.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
-    Box::into_raw(Box::new(array_builder_value(elem_size)))
+    let builder = Box::into_raw(Box::new(array_builder_value(elem_size)));
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(2, builder.cast(), 64);
+    builder
 }
 
 /// `array_builder<T>(out)` — allocate the builder header in `out`; growth chunks and the final
@@ -17073,6 +17227,8 @@ pub unsafe extern "C" fn align_rt_array_builder_build(b: *mut ArrayBuilder) -> A
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     if unsafe { (*b).arena.is_null() } {
+        #[cfg(feature = "alloc-count")]
+        requested_live_transfer_builder_shell(b, unsafe { (*b).data });
         // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
         let b = *unsafe { Box::from_raw(b) };
         return array_builder_build_value(b);
@@ -17125,6 +17281,8 @@ pub unsafe extern "C" fn align_rt_array_builder_build_stack(b: *mut ArrayBuilder
 }
 
 unsafe fn array_builder_free_value(b: ArrayBuilder) {
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(0, b.data);
     unsafe { owned_raw_free(b.data) };
 }
 
@@ -17142,6 +17300,8 @@ pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     if !unsafe { (*b).arena.is_null() } {
         return;
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(2, b.cast());
     let b = *unsafe { Box::from_raw(b) };
     unsafe { array_builder_free_value(b) };
 }
@@ -17186,6 +17346,8 @@ pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilde
     if !unsafe { (*b).arena.is_null() } {
         return;
     }
+    #[cfg(feature = "alloc-count")]
+    requested_live_remove(2, b.cast());
     let b = *unsafe { Box::from_raw(b) };
     unsafe { array_builder_free_strings_value(b) };
 }
@@ -25059,6 +25221,49 @@ pub unsafe extern "C" fn align_rt_http_headers_contains_token(
     let token = unsafe {
         http_query_token_arg(token_ptr, token_len, "http_headers.contains_token: invalid token")
     };
+    http_headers_contains_token_inner(c, want, token, false)
+}
+
+/// Search every comma member of every named physical row for an exact byte match. Header names
+/// remain case-insensitive; only the member comparison differs from
+/// [`align_rt_http_headers_contains_token`].
+///
+/// # Safety
+/// `ctx` and both text arguments must satisfy the detectable ABI contract described above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_headers_contains_token_exact(
+    ctx: *mut HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+    token_ptr: *const u8,
+    token_len: i64,
+) -> i32 {
+    let c = unsafe {
+        http_query_ctx(ctx, "http_headers.contains_token_exact: invalid request context")
+    };
+    let want = unsafe {
+        http_query_token_arg(
+            name_ptr,
+            name_len,
+            "http_headers.contains_token_exact: invalid header name",
+        )
+    };
+    let token = unsafe {
+        http_query_token_arg(
+            token_ptr,
+            token_len,
+            "http_headers.contains_token_exact: invalid token",
+        )
+    };
+    http_headers_contains_token_inner(c, want, token, true)
+}
+
+fn http_headers_contains_token_inner(
+    c: &HttpRequestCtx,
+    want: &[u8],
+    token: &[u8],
+    exact: bool,
+) -> i32 {
     for h in &c.headers {
         let name = &c.buf[h.name_start..h.name_start + h.name_len];
         if !name.eq_ignore_ascii_case(want) {
@@ -25068,7 +25273,13 @@ pub unsafe extern "C" fn align_rt_http_headers_contains_token(
         if value
             .split(|&b| b == b',')
             .map(http_trim_token_ows)
-            .any(|member| member.eq_ignore_ascii_case(token))
+            .any(|member| {
+                if exact {
+                    member == token
+                } else {
+                    member.eq_ignore_ascii_case(token)
+                }
+            })
         {
             return 1;
         }
@@ -25512,6 +25723,60 @@ pub struct HttpUpgrade {
     deadline: Option<MonotonicTimeoutBudget>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static HTTP_UPGRADE_REQUESTED_LIVE: core::cell::Cell<(bool, usize, usize)> =
+        const { core::cell::Cell::new((false, 0, 0)) };
+}
+
+#[cfg(test)]
+fn response_builder_requested_bytes(rb: &ResponseBuilder) -> usize {
+    core::mem::size_of::<ResponseBuilder>()
+        .saturating_add(
+            rb.headers
+                .capacity()
+                .saturating_mul(core::mem::size_of::<(String, String)>()),
+        )
+        .saturating_add(
+            rb.headers
+                .iter()
+                .map(|(name, value)| name.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        )
+        .saturating_add(rb.body.as_ref().map_or(0, Vec::capacity))
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_enable() {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| probe.set((true, 0, 0)));
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_begin(rb: &ResponseBuilder) {
+    let bytes = response_builder_requested_bytes(rb);
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| {
+        if probe.get().0 {
+            probe.set((true, bytes, bytes));
+        }
+    });
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_add(bytes: usize) {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| {
+        let (active, live, peak) = probe.get();
+        if active {
+            let live = live.saturating_add(bytes);
+            probe.set((true, live, peak.max(live)));
+        }
+    });
+}
+
+#[cfg(test)]
+fn http_upgrade_requested_live_peak() -> usize {
+    HTTP_UPGRADE_REQUESTED_LIVE.with(|probe| probe.get().2)
+}
+
 const _: () = assert!(
     core::mem::size_of::<HttpUpgrade>() <= 64
         && core::mem::align_of::<HttpUpgrade>() <= 16
@@ -25679,6 +25944,8 @@ pub unsafe extern "C" fn align_rt_http_respond_upgrade(
         return AL_INVALID;
     }
     let r = unsafe { Box::from_raw(rb) };
+    #[cfg(test)]
+    http_upgrade_requested_live_begin(&r);
     if !abi_ptr_is_aligned(ctx) {
         return AL_INVALID;
     }
@@ -25690,18 +25957,44 @@ pub unsafe extern "C" fn align_rt_http_respond_upgrade(
         Ok(len) => len,
         Err(status) => return status,
     };
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(1) {
+        return AL_CODE;
+    }
     let head = http_serialize_upgrade_response(&r, head_len);
+    #[cfg(test)]
+    http_upgrade_requested_live_add(head.capacity());
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(2) {
+        return AL_CODE;
+    }
 
     // Allocate the handle shell while the builder and exact head are still live, before fd move.
     let mut upgrade = Box::new(HttpUpgrade { fd: -1, sticky: 0, deadline: None });
+    #[cfg(test)]
+    http_upgrade_requested_live_add(core::mem::size_of::<HttpUpgrade>());
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(3) {
+        return AL_CODE;
+    }
     upgrade.fd = c.fd;
     c.fd = -1;
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(4) {
+        upgrade.fail(AL_CODE);
+        return AL_CODE;
+    }
     let status = unsafe { http_send_all(upgrade.fd, &head) };
     drop(head);
     drop(r); // builder storage is gone before handle publication
     if status != 0 {
         upgrade.fail(status);
         return status;
+    }
+    #[cfg(test)]
+    if http_upgrade_take_failpoint(5) {
+        upgrade.fail(AL_CODE);
+        return AL_CODE;
     }
     unsafe { out.write(Box::into_raw(upgrade)) };
     0
@@ -26213,6 +26506,12 @@ const _: extern "C" fn() -> i64 = align_rt_alloc_count;
 #[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_free_count;
 #[cfg(feature = "alloc-count")]
+const _: extern "C" fn() = align_rt_requested_live_reset;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_requested_live_bytes;
+#[cfg(feature = "alloc-count")]
+const _: extern "C" fn() -> i64 = align_rt_requested_live_peak;
+#[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_str_finder_new_count;
 #[cfg(feature = "alloc-count")]
 const _: extern "C" fn() -> i64 = align_rt_str_finder_free_count;
@@ -26264,6 +26563,9 @@ mod tests {
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
+            "align_rt_requested_live_bytes",
+            "align_rt_requested_live_peak",
+            "align_rt_requested_live_reset",
             "align_rt_str_finder_new_count",
             "align_rt_str_finder_free_count",
             "align_rt_test_par_map_force_caller",
@@ -26302,8 +26604,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 359);
-        assert_eq!(registry.len(), 359);
+        assert_eq!(runtime.len(), 360);
+        assert_eq!(registry.len(), 360);
         assert_eq!(runtime, registry);
     }
 
@@ -44547,6 +44849,15 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 token.len() as i64,
             )
         };
+        let contains_exact = |ctx: &mut HttpRequestCtx, name: &[u8], token: &[u8]| unsafe {
+            align_rt_http_headers_contains_token_exact(
+                ctx,
+                name.as_ptr(),
+                name.len() as i64,
+                token.as_ptr(),
+                token.len() as i64,
+            )
+        };
 
         assert_eq!(count(&mut ctx, b"UPGRADE"), 2);
         assert_eq!(count(&mut ctx, b"absent"), 0);
@@ -44555,6 +44866,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert_eq!(valid(&mut ctx, b"X-Bad"), 0);
         assert_eq!(contains(&mut ctx, b"Connection", b"upgrade"), 1);
         assert_eq!(contains(&mut ctx, b"Upgrade", b"websocket"), 1);
+        assert_eq!(contains_exact(&mut ctx, b"Upgrade", b"websocket"), 1);
+        assert_eq!(contains_exact(&mut ctx, b"Upgrade", b"WebSocket"), 0);
         assert_eq!(contains(&mut ctx, b"Upgrade", b"missing"), 0);
         assert_eq!(contains(&mut ctx, b"X-Bad", b"good"), 1, "neighbor validity is separate");
         assert_eq!(unsafe { align_rt_http_ctx_upgrade_ready(&mut ctx) }, 1);
@@ -44644,6 +44957,43 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     }
 
     #[test]
+    fn http_upgrade_failure_boundaries_retain_or_close_the_fd_before_publication() {
+        use std::os::unix::io::IntoRawFd;
+
+        for phase in 1..=5 {
+            let (local, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let fd = local.into_raw_fd();
+            let raw = b"GET /chat HTTP/1.1\r\nHost: h\r\n\r\n";
+            let mut ctx = http_test_ctx(fd, raw, true);
+            let response = Box::into_raw(Box::new(upgrade_response(vec![
+                ("Upgrade", "websocket"),
+                ("Connection", "Upgrade"),
+            ])));
+            let mut out = core::ptr::NonNull::<HttpUpgrade>::dangling().as_ptr();
+            http_upgrade_set_failpoint(phase);
+            assert_eq!(
+                unsafe { align_rt_http_respond_upgrade(&mut ctx, response, &mut out) },
+                AL_CODE,
+                "phase {phase}",
+            );
+            assert!(out.is_null(), "phase {phase}: no failed operation publishes a handle");
+            assert_eq!(
+                HTTP_UPGRADE_FAILPOINT.with(core::cell::Cell::get),
+                0,
+                "phase {phase}: the intended boundary was reached",
+            );
+            if phase <= 3 {
+                assert_eq!(ctx.fd, fd, "phase {phase}: pre-transfer failure retains ctx ownership");
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            } else {
+                assert_eq!(ctx.fd, -1, "phase {phase}: post-transfer failure spends the ctx");
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1, "owned fd closes once");
+            }
+            drop(peer);
+        }
+    }
+
+    #[test]
     fn http_upgrade_transfers_fd_and_reads_writes_shuts_down_exactly_once() {
         use std::io::{Read, Write};
         use std::os::unix::io::IntoRawFd;
@@ -44653,12 +45003,21 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let fd = local.into_raw_fd();
         let raw = b"GET /chat HTTP/1.1\r\nHost: h\r\n\r\n";
         let mut ctx = http_test_ctx(fd, raw, true);
-        let response = Box::into_raw(Box::new(upgrade_response(vec![
+        let response = upgrade_response(vec![
             ("Upgrade", "websocket"),
             ("Connection", "Upgrade"),
-        ])));
+        ]);
+        let response_bytes = response_builder_requested_bytes(&response);
+        let response_head_bytes = http_validate_upgrade_response(&response).unwrap();
+        http_upgrade_requested_live_enable();
+        let response = Box::into_raw(Box::new(response));
         let mut out = core::ptr::NonNull::<HttpUpgrade>::dangling().as_ptr();
         assert_eq!(unsafe { align_rt_http_respond_upgrade(&mut ctx, response, &mut out) }, 0);
+        assert_eq!(
+            http_upgrade_requested_live_peak(),
+            response_bytes + response_head_bytes + core::mem::size_of::<HttpUpgrade>(),
+            "the builder, exact head, and handle shell coexist at the producer high-water",
+        );
         assert_eq!(ctx.fd, -1, "the request context is spent only after success");
         assert!(!out.is_null());
 
@@ -44758,6 +45117,15 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                     9,
                 );
             },
+            "contains-exact-invalid-token" => unsafe {
+                align_rt_http_headers_contains_token_exact(
+                    &mut ctx,
+                    b"Host".as_ptr(),
+                    4,
+                    b"bad token".as_ptr(),
+                    9,
+                );
+            },
             "read-negative-count" => {
                 let buffer = align_rt_buffer_new(0);
                 unsafe {
@@ -44806,6 +45174,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             "count-invalid-name",
             "tokens-misaligned-ctx",
             "contains-invalid-token",
+            "contains-exact-invalid-token",
             "read-negative-count",
             "read-over-capacity",
             "deadline-zero",

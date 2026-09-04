@@ -2376,6 +2376,7 @@ pub enum Rvalue {
         headers: Operand,
         name: Operand,
         token: Operand,
+        exact: bool,
     },
     HttpCtxUpgradeReady {
         ctx: Operand,
@@ -18465,6 +18466,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             headers,
             name,
             token,
+            exact,
         } => {
             let headers = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
             let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
@@ -18476,6 +18478,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                     headers,
                     name,
                     token,
+                    exact: *exact,
                 },
             ));
             let value = b.fresh_value(Ty::Bool);

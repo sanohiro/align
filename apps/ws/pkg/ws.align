@@ -227,7 +227,7 @@ fn selected_protocol(c: pkg.web.types.Ctx, protocols: slice<str>) -> Option<stri
   loop {
     if index >= protocols.len() { break }
     protocol := protocols[index]
-    if c.headers.contains_token("Sec-WebSocket-Protocol", protocol) {
+    if c.headers.contains_token_exact("Sec-WebSocket-Protocol", protocol) {
       return Some(protocol.clone())
     }
     index = index + 1

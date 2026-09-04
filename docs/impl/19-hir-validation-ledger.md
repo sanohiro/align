@@ -1993,7 +1993,8 @@ now that the cross-derivation comparisons delegate. Track separately.
 ## Planned `pkg.ws` checked-HIR records
 
 The `pkg.ws` capability adds exact validation rows for `Ty/Scalar::HttpUpgrade` and these
-expressions: `HttpCtxUpgradeReady`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`,
+expressions: `HttpCtxUpgradeReady`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`
+(whose `exact` discriminator selects the sibling exact-member runtime row),
 `HttpRespondUpgrade`, `HttpUpgradeReadExact`, `HttpUpgradeWrite`, `HttpUpgradeDeadline`, and
 `HttpUpgradeShutdown`. Each record fixes child count/order/type, bound-place class, result type,
 effect, region/borrow generation, consume/null behavior, and exact RuntimeKey. The type row admits

@@ -431,11 +431,12 @@ facts must live in this repository.
 - **Latest package capability:** `pkg.ws` is implemented against the accepted ledger at
   `docs/impl/pkg-design/ws.md`. It composes one RFC 6455 Upgrade route into `pkg.web`, owns the
   private handshake/SHA-1/frame state in package source, and uses a restricted protocol-neutral
-  `http_upgrade` Move handle. The implementation boundary also adds three allocation-free repeated
+  `http_upgrade` Move handle. The implementation boundary also adds four allocation-free repeated
   header/token queries, one HTTP-version/residual readiness query, one checked 101 transfer, exact
-  transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its ten active keys
-  reuse existing ABI shapes. The current inventory is 341 keyed plus 18 unkeyed records, 13 of
-  those source-reachable: 359 base exports, 363 with either four-row probe, and 367 with both.
+  transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its eleven active keys
+  reuse existing ABI shapes. The current inventory is 342 keyed plus 18 unkeyed records, 13 of
+  those source-reachable: 360 base exports, 367 with the seven-row allocation probe, 364 with the
+  four-row parallel probe, and 371 with both.
   A124 remains the next unused active shape.
 - **Next package design capability:** `pkg.template` remains an uncommitted outline in the roadmap;
   its public contract must be designed and reviewed before implementation.

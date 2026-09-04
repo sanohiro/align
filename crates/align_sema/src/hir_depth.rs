@@ -978,6 +978,7 @@ fn walk_body_records<'a>(
                     headers: ptr,
                     name: offset,
                     token: value,
+                    ..
                 }
                 | ExprKind::HttpUpgradeReadExact {
                     upgrade: ptr,
