@@ -1348,6 +1348,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("box", 1, BuiltinCapability::Opaque),
     ("array_builder", 1, BuiltinCapability::Opaque),
     ("buffer", 0, BuiltinCapability::Opaque),
+    ("xml.reader", 0, BuiltinCapability::Opaque),
     ("codec.encoder", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
@@ -2896,6 +2897,44 @@ mod builtin_spelling_tests {
             align_sema::builtin_spelling_needs_return_cleanup("i08"),
             align_sema::builtin_spelling_needs_return_cleanup("i8"),
             "the bridge must classify an integer spelling exactly as the type resolver does"
+        );
+    }
+
+    #[test]
+    fn xml_reader_return_cleanup_is_authenticated_from_the_independent_builtin_inventory() {
+        let mut summary = InterfaceSummary {
+            unit: "xml_provider".to_owned(),
+            fns: vec![IFnSig {
+                name: "reader".to_owned(),
+                type_params: Vec::new(),
+                params: Vec::new(),
+                ret: IType::Named {
+                    path: "xml.reader".to_owned(),
+                    args: Vec::new(),
+                },
+                return_borrow: ReturnBorrowSummary::None,
+                return_region: ReturnRegionSummary::None,
+                return_cleanup: align_sema::hir::ReturnCleanupAbi::DynamicBit,
+                effect: Effect::Pure,
+                parallel_transfer_params: Vec::new(),
+                resource_hook_body: false,
+                generic_body: None,
+            }],
+            structs: Vec::new(),
+            owned_json_graphs: Vec::new(),
+            enums: Vec::new(),
+            resources: Vec::new(),
+            consts: Vec::new(),
+            capabilities: Vec::new(),
+            interface_hash: Hash128 { lo: 0, hi: 0 },
+            impl_hash: Hash128 { lo: 0, hi: 0 },
+        };
+        assert!(validate_for_import(&summary).is_ok());
+
+        summary.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::None;
+        assert_eq!(
+            validate_for_import(&summary),
+            Err(ImportCompatibilityError::ReturnCleanupMismatch),
         );
     }
 }
