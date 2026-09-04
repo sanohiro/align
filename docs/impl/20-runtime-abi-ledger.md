@@ -606,13 +606,30 @@ The accepted XML capability plans eight keyed identities, all on existing ABI sh
 
 The Rust definitions use C calling convention and may not unwind across it. Generated declarations
 retain the reused A03/A08/A19/A20/A29/A62 shapes' empty curated function, return, memory, and
-parameter attribute sets. `XmlParse` consumes one allocator-compatible owned input: status zero
-publishes the sole shell, `-1` frees the input and means public `Error.Invalid`, and positive
-`AL_INVALID` is malformed private ABI. `XmlNext` returns only `0=None`, `1=Start`, `2=End`, or
-`3=Text`. Name/value/text entries first validate and initialize their writable `{ptr,i64}` outputs;
-name outputs are borrowed input views, while value/text outputs own runtime allocations. Count is
-only `0..=256`; every impossible getter result aborts. Free is null-safe and otherwise authenticates
-the shell before following and freeing the input.
+parameter attribute sets. These are `unsafe` boundaries: an exact-compatible caller supplies every
+nonnull pointer with provenance, lifetime, dereferenceability, accessibility, and the declared shared
+or exclusive access for every exact range against access not represented by the call; null is allowed
+only where the ABI explicitly says so. Parse input is one
+allocator-compatible owned range. Supplied argument ranges may overlap only as a mechanically
+rejected call: the runtime checks parse output/input and getter output/shell/input disjointness before
+typed access. Getters/count share the live shell allocation, while next and nonnull free hold it
+exclusively. When an operation follows the shell's stored input pointer, its live allocation and exact
+readable range are also caller preconditions unless the shell was published unchanged by this
+runtime. Violating the pointer/access caller preconditions is outside the ABI contract and is not
+promised a safe abort.
+
+Within those preconditions, the runtime checks representable raw ranges and every detectable
+input/output/shell alias before mutation, Rust reference creation, or slice creation. A mechanically
+rejected parse returns positive `AL_INVALID`, leaves output untouched, and leaves input ownership
+with the unsafe caller. After that preflight it stores null and accepts the input: status zero
+publishes the sole shell, while `-1` frees the input and means public `Error.Invalid`. An
+output-bearing getter likewise leaves output untouched on mechanical preflight failure, then zeros
+its `{ptr,i64}` output; any later wrong-state/index/private-state failure leaves canonical zero for
+borrowed and owned results alike. Success fills a borrowed name view or publishes one completed
+owned value/text allocation. `XmlNext` returns only `0=None`, `1=Start`, `2=End`, or `3=Text`.
+Count is only `0..=256`; every impossible getter result aborts. Free is null-safe; a nonnull argument
+must be a genuine exclusively held shell, and detectable malformed fields abort before following an
+invalid stored input pointer. The runtime does not authenticate an arbitrary dangling address.
 
 Design acceptance reserves no new shape: A124 remains the next unreserved shape and active
 keyed/base/probe totals do not change. Implementation must activate all eight keys, symbols,
