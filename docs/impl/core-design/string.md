@@ -79,8 +79,10 @@ Frame-regioned `str` (owned-structs work).
   defer"). Today: `find`/`rfind` + `s[a..b]` compose the manual split.
 - No direct `s[i]` byte access — use the explicit byte view `s.bytes()[i]` so dropping the UTF-8
   obligation is visible at the call site.
-- The §13/§18.1 template variants (`html`, `raw`, json-template) — only plain `template "…"`
-  exists. The escaping-variant design (context-aware autoescape) is unsettled.
+- The §13/§18.1 language template variants (`html`, `raw`, json-template) — only plain
+  `template "…"` exists. The designed `pkg.template` capability deliberately leaves that syntax
+  unchanged and instead provides an opaque HTML builder with default-escaped `write` plus explicit
+  `raw`; contextual language-template parsing remains deferred.
 
 ## Pitfalls
 

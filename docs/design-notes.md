@@ -1691,6 +1691,34 @@ Repository owner and CI commands preserve the same property with the existing qu
 success is phase/aggregate summaries, while failure or interruption replays the captured diagnostic
 log without changing selection or verdict.
 
+## Why an HTML builder is opaque
+
+An escape-by-default API cannot hand callers an ordinary `builder`. That would leave
+`builder.write` as an unlabelled unescaped path and make the safety rule a convention rather than a
+type boundary. `pkg.template` therefore owns one opaque Move builder. Its ordinary `write` applies
+the single five-entity table already owned by `encoding.html_escape`; `raw` is the only public
+unescaped append and makes trust visible in source. The consuming `to_string` keeps the existing
+builder ownership model and transfers the payload instead of inventing a second string assembly
+path.
+
+Opacity is also the native safety boundary. The resource owns a separately allocated shell and an
+optional disjoint allocator-compatible UTF-8 payload; exact-compatible calls hold exclusive shell
+access and reject detectable state, UTF-8, and input-alias defects before mutation. Canonical empty
+state has no retained capacity, so zero-copy finish has one unambiguous null/zero result. The
+existing recursive resource carrier is preserved, including source-formed fixed arrays of Move
+records and generic interface reconstruction, instead of creating a template-specific restriction.
+
+The package name also exposes why `template` is a contextual word rather than a globally forbidden
+identifier: it retains its syntax meaning at expression head only when followed by a string, while a
+noninitial dotted `pkg.template` path segment is unambiguous. This narrowly admits the planned
+package without allowing bare keyword declarations or loosening any other keyword.
+
+Five-entity escaping has a deliberately narrow promise: HTML element text and complete contents of
+an already-quoted attribute. It is not a parser or a policy for URL schemes, event handlers, CSS,
+JavaScript, comments, or constructed tag/attribute names. An API that inferred those contexts from
+append history would add a second template language and still fail on semantic sublanguages. Those
+domains stay explicit and consumer-driven.
+
 ---
 
 ## In one sentence

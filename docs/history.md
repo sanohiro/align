@@ -25,7 +25,7 @@ runtime operation or hidden sidecar.
 
 The prerequisite adds three general allocation-free header queries, one HTTP-version/residual
 readiness query, checked 101 ownership transfer, exact live/spent/poisoned transport behavior, and
-one web Upgrade dispatch path with Pure pre-bind protocol validation. Its ten runtime keys all
+one web Upgrade dispatch path with Pure pre-bind protocol validation. Its eleven runtime keys all
 reuse existing ABI shapes, leaving A124 unused. Exact surface, precedence,
 ownership, ABI, and one-PR implementation closure matrix: `docs/impl/pkg-design/ws.md`.
 Linux preserves `MSG_NOSIGNAL`; macOS/iOS requires checked `SO_NOSIGPIPE` before an accepted fd can

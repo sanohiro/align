@@ -438,8 +438,9 @@ facts must live in this repository.
   those source-reachable: 360 base exports, 367 with the seven-row allocation probe, 364 with the
   four-row parallel probe, and 371 with both.
   A124 remains the next unused active shape.
-- **Next package design capability:** `pkg.template` remains an uncommitted outline in the roadmap;
-  its public contract must be designed and reviewed before implementation.
+- **Next package implementation capability:** `pkg.template` has an accepted public ledger and
+  implementation closure matrix in `docs/impl/pkg-design/template.md`. It remains unimplemented;
+  the implementation must close that matrix in one consumer-complete capability.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.

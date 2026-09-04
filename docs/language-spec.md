@@ -729,10 +729,10 @@ implicit extension of the scanner surface.
 ### Templates
 
 ```text
-template
-html
-json
-raw
+template       // shipped plain scalar formatter
+html           // deferred language form; designed pkg.template is a separate opaque builder
+json template  // deferred; json.encode owns shipped JSON formatting
+raw            // no expression form; designed only as pkg.template's explicit append function
 ```
 
 ### Parallelism
@@ -1331,7 +1331,7 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The implemented first-party packages in this repository are exactly six vendorable subtrees:
+The implemented first-party packages in this repository are exactly seven vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1343,12 +1343,14 @@ pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 pkg.csv            // typed in-memory CSV direct-to-SoA decoder
+pkg.ws             // RFC 6455 server routes over pkg.web HTTP Upgrade
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
 `pkg.kv.internal.resource`.
 `pkg.csv` is one vendorable subtree with root `pkg.csv` and empty compiler-private descriptor
 module `pkg.csv.internal.descriptor`.
+`pkg.ws` is one vendorable subtree with root `pkg.ws`; it composes the public `pkg.web` boundary.
 
 `pkg/db` is one subtree with four public module boundaries, not four independently versioned
 packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
@@ -1543,7 +1545,7 @@ shipped inventory. Streaming,
 encoding, files, dialect inference, dynamic/owned rows, nullable columns, and recovery remain
 outside v1. Exact contract and closure matrix: `impl/pkg-design/csv.md`.
 
-The designed, not-yet-implemented `pkg.ws` v1 adds one RFC 6455 GET Upgrade route to the existing
+The implemented `pkg.ws` v1 adds one RFC 6455 GET Upgrade route to the existing
 `pkg.web` route table. Its public operations are `route(pattern, protocols, pump)`, bounded
 `receive(borrow mut http_upgrade, max_message_bytes)`, borrowed `send_text` / `send_binary`, and a
 consuming `close(http_upgrade, code, reason, timeout_ns)`. Receive returns
@@ -1581,8 +1583,37 @@ an empty acknowledgment while its original value is returned. The exact 64-bit p
 live-heap ceiling for scratch, shells, simultaneous growth, and Text staging/result is 1073774720
 bytes, excluding allocator metadata. Server sends borrow
 payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
-handshake without Ping/data resetting its budget before closing TCP. Ten planned runtime keys reuse
+handshake without Ping/data resetting its budget before closing TCP. Eleven active runtime keys reuse
 existing ABI shapes and their empty curated LLVM function-attribute sets, leaving A124 unused; no
-declaration-side `nounwind` or shared shape fingerprint change is added, and the design changes no
-shipped package/runtime inventory.
+declaration-side `nounwind` or shared shape fingerprint change is added.
 Exact contract: `impl/pkg-design/ws.md`.
+
+The designed `pkg.template` v1 is one opaque Move HTML text builder:
+
+```text
+pkg.template.html_builder
+pkg.template.html() -> html_builder
+pkg.template.write(borrow mut output: html_builder, value: str)
+pkg.template.raw(borrow mut output: html_builder, value: str)
+pkg.template.to_string(output: html_builder) -> string
+```
+
+Ordinary `write` escapes exactly `& < > " '` with the shared `encoding.html_escape` entity table
+and copies all other valid UTF-8 bytes. It is safe for element text and complete already-quoted
+attribute contents, not for unquoted attributes, URL/event/CSS/JavaScript semantics, comments, or
+constructed names. `raw` is the sole public unescaped append and marks the explicit trust boundary.
+The resource exposes neither its ordinary builder nor a partial view. Append operations retain no
+input and allocate no temporary string. `to_string` is the only finisher and transfers the payload
+without copying; unfinished recursive Drop frees it exactly once, including through source-formed
+fixed arrays of Move records. The exact-compatible native boundary requires a live exclusively
+accessed constructor-owned shell, a disjoint allocator-compatible payload, and valid UTF-8; it
+checks detectable state, input UTF-8, and aliasing before mutation. There is no recoverable error channel.
+Plain language `template "..."` remains the sole scalar formatter and is unchanged. The designed
+package requires only one syntax prerequisite: `template` is contextual as a noninitial segment
+after `.` in module/import/type/value paths, while expression-head `template` plus a string retains
+its existing meaning and bare/other keyword identifiers remain rejected. Generic interface and
+monomorphization paths retain the resource and operation identity. The design activates no
+package/runtime inventory; implementation adds five keyed rows using A47/A73/A83/A62, for
+347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and 376 maximum records while A124
+remains unused. Exact contract and closure matrix:
+`impl/pkg-design/template.md`.

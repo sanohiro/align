@@ -19,6 +19,37 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### `pkg.template` v1 is one escape-by-default HTML builder (SETTLED 2026-09-04)
+
+**Decision:** `pkg.template` exposes one opaque Move `html_builder`, constructed by `html()`,
+mutated by default-escaped `write(borrow mut output, value: str)` or explicit trusted
+`raw(borrow mut output, value: str)`, and consumed only by `to_string(output) -> string`. The
+underlying ordinary builder and every partial view stay private, so `raw` is the only public path
+that can append unescaped bytes. `write` shares the exact `encoding.html_escape` mapping for
+`& < > " '`, allocates no temporary string, and promises safety only for element text or the
+complete contents of an already-quoted attribute. It does not validate URL, event-handler,
+CSS/JavaScript, comment, tag-name, or attribute-name semantics.
+
+The resource owns one live, separately allocated runtime shell and one optional allocator-compatible
+payload. The empty product is canonical null/zero; a nonempty payload is disjoint from its shell and
+contains valid UTF-8. Exact-compatible native calls require exclusive shell access, validate
+detectable state, UTF-8, and input aliasing before mutation, and retain neither input. Unfinished
+recursive Drop frees both allocations once, including through source-formed fixed arrays of Move
+records; `to_string` nulls the source and transfers the payload without allocation or copy. There is
+no recoverable error channel. Length overflow and detectable malformed state abort before side
+effects; OOM aborts.
+
+Four checked HIR/MIR operations and the Drop row reuse A47/A73/A83/A62. Implementation activates
+five keyed/source-reachable rows and moves the current inventory to 347 keyed, 365 base, 372 with
+`alloc-count`, 369 with `par-map-probe`, and 376 with both; A124 remains unused. Generic templates,
+concrete monomorphization, interface reconstruction, whole/per-unit compilation, and edit/revert
+retain exact operation/resource/cache identity. Plain language `template "..."` remains the one
+scalar formatter and does not gain escaping. The token becomes contextual only as a noninitial
+dotted path segment so exact `pkg.template` module/import/type/value paths parse; bare and other
+keyword identifiers remain rejected.
+
+Record: `docs/impl/pkg-design/template.md`, `draft.md` §18.3, `docs/language-spec.md`
+
 ### WebSocket v1 is one typed RFC 6455 Upgrade route (SETTLED 2026-09-03)
 
 **Decision:** `pkg.ws` does not own another listener, router, concurrency model, or request context.
@@ -57,7 +88,7 @@ shutdown remains idempotent and caller-invalid arguments take precedence over st
 Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE` before request read/context publication,
 closing the accepted fd once and returning the mapped accept error if setup fails.
 
-Ten planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
+Eleven runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
 new ABI shape and A124 remains next. HTTP/2 extended CONNECT, client mode, TLS termination,
 extensions/permessage-deflate, raw frames, standalone serving, async/background heartbeat,
 connection registries, and broadcast are separate consumer-backed capabilities.
