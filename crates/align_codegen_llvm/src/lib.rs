@@ -4177,13 +4177,32 @@ enum XmlAccessProvenance {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XmlProducerState {
+    Present(XmlAccessProvenance),
+    MaybeAbsent(XmlAccessProvenance),
+    Absent,
+    Invalid,
+}
+
+impl XmlProducerState {
+    fn owned_if_present(self) -> bool {
+        matches!(
+            self,
+            Self::Present(XmlAccessProvenance::Owned)
+                | Self::MaybeAbsent(XmlAccessProvenance::Owned)
+                | Self::Absent
+        )
+    }
+}
+
 struct XmlSlotStores<'a> {
     roots: Vec<Vec<&'a Operand>>,
     fields: Vec<Vec<(&'a [u32], &'a Operand)>>,
     producers: Vec<Vec<(Ty, XmlAccessProvenance)>>,
 }
 
-struct XmlAccessGraph<'a> {
+struct ValidatedProducerGraph<'a> {
     function: &'a align_mir::Function,
     program: &'a Program,
     value_definitions: &'a [Option<&'a Rvalue>],
@@ -4203,6 +4222,42 @@ fn merge_xml_access(
         Some(current @ (XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed)) => current,
         Some(_) if matches!(next, XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed) => next,
         Some(_) => XmlAccessProvenance::Mixed,
+    })
+}
+
+fn merge_xml_state(
+    current: Option<XmlProducerState>,
+    next: XmlProducerState,
+) -> Option<XmlProducerState> {
+    use XmlProducerState::{Absent, Invalid, MaybeAbsent, Present};
+    Some(match (current, next) {
+        (None, next) => next,
+        (Some(Invalid), _) | (_, Invalid) => Invalid,
+        (Some(Absent), Absent) => Absent,
+        (Some(Absent), Present(access)) | (Some(Present(access)), Absent) => {
+            MaybeAbsent(access)
+        }
+        (Some(Absent), MaybeAbsent(access)) | (Some(MaybeAbsent(access)), Absent) => {
+            MaybeAbsent(access)
+        }
+        (Some(Present(current)), Present(next)) => {
+            Present(
+                merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
+            )
+        }
+        (Some(Present(current)), MaybeAbsent(next))
+        | (Some(MaybeAbsent(current)), Present(next))
+        | (Some(MaybeAbsent(current)), MaybeAbsent(next)) => MaybeAbsent(
+            merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
+        ),
+    })
+}
+
+fn require_xml_presence(state: Option<XmlProducerState>) -> Option<XmlProducerState> {
+    state.map(|state| match state {
+        XmlProducerState::MaybeAbsent(access) => XmlProducerState::Present(access),
+        XmlProducerState::Absent | XmlProducerState::Invalid => XmlProducerState::Invalid,
+        present @ XmlProducerState::Present(_) => present,
     })
 }
 
@@ -4239,16 +4294,17 @@ enum XmlAccessSource {
     Invalid,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct XmlAccessEquation {
     seed: Option<XmlAccessProvenance>,
     dependencies: Vec<XmlAccessNode>,
     checks: Vec<XmlAccessNode>,
     invalid: bool,
     absent: bool,
+    require_present: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct XmlCallFacts {
     params: Vec<Ty>,
     modes: Vec<align_ast::ParamMode>,
@@ -4256,6 +4312,32 @@ struct XmlCallFacts {
     borrow: hir::ReturnBorrowSummary,
     region: hir::ReturnRegionSummary,
     cleanup: hir::ReturnCleanupAbi,
+}
+
+fn xml_fn_type_facts(program: &Program, id: u32) -> Option<XmlCallFacts> {
+    let definition = program.fn_types.get(id as usize)?;
+    Some(XmlCallFacts {
+        params: definition
+            .params
+            .iter()
+            .map(|(_, scalar)| scalar_to_ty(*scalar))
+            .collect(),
+        modes: definition.params.iter().map(|(mode, _)| *mode).collect(),
+        ret: definition.ret,
+        borrow: definition.return_borrow.clone(),
+        region: definition.return_region.clone(),
+        cleanup: definition.return_cleanup,
+    })
+}
+
+fn xml_signature_matches_facts(
+    signature: &align_mir::FnSignatureFacts,
+    facts: &XmlCallFacts,
+) -> bool {
+    signature.param_modes == facts.modes
+        && signature.return_borrow == facts.borrow
+        && signature.return_region == facts.region
+        && signature.return_cleanup == facts.cleanup
 }
 
 struct XmlCallResult<'a> {
@@ -4482,15 +4564,381 @@ fn xml_direct_call_facts(program: &Program, target: &ProgramCall) -> Option<XmlC
     found
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XmlProducerVariantClass {
+    Graph,
+    Rejected,
+}
+
+fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
+    match rvalue {
+        Rvalue::Use(..)
+        | Rvalue::Load(..)
+        | Rvalue::Un(..)
+        | Rvalue::Cast { .. }
+        | Rvalue::Bin(..)
+        | Rvalue::IntArith { .. }
+        | Rvalue::MathOp { .. }
+        | Rvalue::Call(..)
+        | Rvalue::CallWithCleanup(..)
+        | Rvalue::FnAddr { .. }
+        | Rvalue::Closure { .. }
+        | Rvalue::CallIndirect { .. }
+        | Rvalue::CallIndirectWithCleanup(..)
+        | Rvalue::Field(..)
+        | Rvalue::Select { .. }
+        | Rvalue::OptionSome(..)
+        | Rvalue::OptionNone
+        | Rvalue::OptionIsSome(..)
+        | Rvalue::OptionUnwrap(..)
+        | Rvalue::ResultOk(..)
+        | Rvalue::ResultErr(..)
+        | Rvalue::ResultIsOk(..)
+        | Rvalue::ResultUnwrapOk(..)
+        | Rvalue::ResultUnwrapErr(..)
+        | Rvalue::MakeEnum { .. }
+        | Rvalue::MakeError { .. }
+        | Rvalue::EnumTagEq { .. }
+        | Rvalue::EnumPayload { .. }
+        | Rvalue::StaticDescriptorView { .. }
+        | Rvalue::MakeTuple { .. }
+        | Rvalue::TupleIndex { .. }
+        | Rvalue::SliceLen(..)
+        | Rvalue::SubSlice { .. }
+        | Rvalue::StrLit(..)
+        | Rvalue::StrClone(..)
+        | Rvalue::StrTrim { .. }
+        | Rvalue::BuilderNew { .. }
+        | Rvalue::BuilderToString(..)
+        | Rvalue::TemplateHtmlNew { .. }
+        | Rvalue::TemplateHtmlToString { .. }
+        | Rvalue::Template(..)
+        | Rvalue::FsReadFile { .. }
+        | Rvalue::XmlParse { .. }
+        | Rvalue::XmlNext { .. }
+        | Rvalue::XmlName { .. }
+        | Rvalue::XmlAttributeCount(..)
+        | Rvalue::XmlAttributeName { .. }
+        | Rvalue::XmlAttributeValue { .. }
+        | Rvalue::XmlText { .. }
+        | Rvalue::PathJoin { .. }
+        | Rvalue::PathComponent { .. }
+        | Rvalue::PathNormalize { .. }
+        | Rvalue::EncodingEncode { .. }
+        | Rvalue::RegexReplace { .. }
+        | Rvalue::CliGetStr { .. }
+        | Rvalue::CliUsage { .. }
+        | Rvalue::RunOutputView { .. }
+        | Rvalue::HttpSseStreamLastEventId { .. }
+        | Rvalue::HttpCtxMethod { .. }
+        | Rvalue::HttpCtxPath { .. } => XmlProducerVariantClass::Graph,
+        Rvalue::SqliteCallbackDescriptor(..)
+        | Rvalue::RawCall { .. }
+        | Rvalue::SoaColumn { .. }
+        | Rvalue::ArenaBegin
+        | Rvalue::TgBegin
+        | Rvalue::SpawnTask { .. }
+        | Rvalue::TgWaitResult { .. }
+        | Rvalue::HeapAlloc(..)
+        | Rvalue::RawAlloc(..)
+        | Rvalue::ColumnBatchCreate { .. }
+        | Rvalue::ColumnBatchAppend { .. }
+        | Rvalue::ColumnBatchRow { .. }
+        | Rvalue::ColumnBatchSoa { .. }
+        | Rvalue::RawNull
+        | Rvalue::RawLoad { .. }
+        | Rvalue::RawPointerLoad { .. }
+        | Rvalue::RawOffset { .. }
+        | Rvalue::RawIsNull(..)
+        | Rvalue::ResourceFromRaw { .. }
+        | Rvalue::ResourceBorrow { .. }
+        | Rvalue::ResourceRaw { .. }
+        | Rvalue::ResourceIntoRaw { .. }
+        | Rvalue::ResourceViewFromRaw { .. }
+        | Rvalue::BoxGet(..)
+        | Rvalue::BoxClone(..)
+        | Rvalue::Index(..)
+        | Rvalue::IndexField(..)
+        | Rvalue::MakeVec { .. }
+        | Rvalue::VecExtract { .. }
+        | Rvalue::VecInsert { .. }
+        | Rvalue::VecSumWhere { .. }
+        | Rvalue::VecDot { .. }
+        | Rvalue::VecMinMax { .. }
+        | Rvalue::VecSum { .. }
+        | Rvalue::MaskAny { .. }
+        | Rvalue::VecLoad { .. }
+        | Rvalue::IndexFieldPtr { .. }
+        | Rvalue::IndexColumn { .. }
+        | Rvalue::SoaGather { .. }
+        | Rvalue::IndexPtr { .. }
+        | Rvalue::MakeSlice(..)
+        | Rvalue::ArenaAlloc { .. }
+        | Rvalue::HeapAllocBuf { .. }
+        | Rvalue::SoaAlloc { .. }
+        | Rvalue::MakeDynArray { .. }
+        | Rvalue::GroupAgg { .. }
+        | Rvalue::GroupAggStrCols { .. }
+        | Rvalue::GroupAggStr { .. }
+        | Rvalue::GroupAggMultiStr { .. }
+        | Rvalue::DictEncode { .. }
+        | Rvalue::MakeDictEncoded { .. }
+        | Rvalue::DictField { .. }
+        | Rvalue::GatherColumnI64 { .. }
+        | Rvalue::DictLookup { .. }
+        | Rvalue::Chunks { .. }
+        | Rvalue::ParMapParallel { .. }
+        | Rvalue::ParMapReduce { .. }
+        | Rvalue::SlicePtr(..)
+        | Rvalue::SliceIndex(..)
+        | Rvalue::SliceIndexNoalias { .. }
+        | Rvalue::ConstArray { .. }
+        | Rvalue::StaticData(..)
+        | Rvalue::CloneIn { .. }
+        | Rvalue::StrPredicate { .. }
+        | Rvalue::StrFinderNew { .. }
+        | Rvalue::StrFinderFind { .. }
+        | Rvalue::BuilderWriteStr(..)
+        | Rvalue::BuilderWriteInt(..)
+        | Rvalue::BuilderWriteBool(..)
+        | Rvalue::BuilderWriteChar(..)
+        | Rvalue::BuilderWriteFloat(..)
+        | Rvalue::BuilderWriteStrIntStr(..)
+        | Rvalue::TemplateHtmlWrite { .. }
+        | Rvalue::TemplateHtmlRaw { .. }
+        | Rvalue::JsonEncodeBounded { .. }
+        | Rvalue::JsonDecode { .. }
+        | Rvalue::JsonOwnedDecode { .. }
+        | Rvalue::JsonDecodeArray { .. }
+        | Rvalue::JsonDecodeScalar { .. }
+        | Rvalue::JsonDecodeStructArray { .. }
+        | Rvalue::JsonDecodeSoa { .. }
+        | Rvalue::CsvDecode { .. }
+        | Rvalue::JsonDecodeUnion { .. }
+        | Rvalue::JsonDoc { .. }
+        | Rvalue::JsonDocKind { .. }
+        | Rvalue::JsonDocGet { .. }
+        | Rvalue::JsonDocAt { .. }
+        | Rvalue::JsonDocAsStr { .. }
+        | Rvalue::JsonDocAsScalar { .. }
+        | Rvalue::JsonDocLen { .. }
+        | Rvalue::JsonDocKey { .. }
+        | Rvalue::JsonDocElems { .. }
+        | Rvalue::JsonScanNew { .. }
+        | Rvalue::JsonScanNext { .. }
+        | Rvalue::ReaderOpen { .. }
+        | Rvalue::ReaderOpenBeneath { .. }
+        | Rvalue::WriterCreate { .. }
+        | Rvalue::WriterCreateExclusive { .. }
+        | Rvalue::WriterCreateExclusiveBeneath { .. }
+        | Rvalue::ReaderStdin
+        | Rvalue::WriterStd { .. }
+        | Rvalue::ReaderRead(..)
+        | Rvalue::ReaderBuffered(..)
+        | Rvalue::ReaderReadLine(..)
+        | Rvalue::BytesAsStr { .. }
+        | Rvalue::WriterWrite(..)
+        | Rvalue::WriterWriteBuilder(..)
+        | Rvalue::WriterFlush(..)
+        | Rvalue::LogNew(..)
+        | Rvalue::LogEnabled(..)
+        | Rvalue::LogLine(..)
+        | Rvalue::LogLineBuilder(..)
+        | Rvalue::LogFlush(..)
+        | Rvalue::CodecOpen(..)
+        | Rvalue::CodecBatchRows(..)
+        | Rvalue::CodecBatchColumns(..)
+        | Rvalue::CodecBatchName(..)
+        | Rvalue::CodecBatchKind(..)
+        | Rvalue::CodecBatchFind(..)
+        | Rvalue::CodecBatchColumn { .. }
+        | Rvalue::CodecColumnLen(..)
+        | Rvalue::CodecColumnAt { .. }
+        | Rvalue::CodecEncoderNew { .. }
+        | Rvalue::CodecEncoderPut { .. }
+        | Rvalue::CodecEncoderFinish(..)
+        | Rvalue::FrameInnerJoin { .. }
+        | Rvalue::IoCopy(..)
+        | Rvalue::FileCreateRw { .. }
+        | Rvalue::FileOpenRw { .. }
+        | Rvalue::FilePread { .. }
+        | Rvalue::FilePwrite { .. }
+        | Rvalue::FileLen { .. }
+        | Rvalue::BufferNew(..)
+        | Rvalue::BufferBytes(..)
+        | Rvalue::BufferLen(..)
+        | Rvalue::BufferCapacity(..)
+        | Rvalue::BytesRead { .. }
+        | Rvalue::BufferPut { .. }
+        | Rvalue::BufferAppend { .. }
+        | Rvalue::ArrayBuilderNew { .. }
+        | Rvalue::ArrayBuilderPush { .. }
+        | Rvalue::ArrayBuilderPushStr { .. }
+        | Rvalue::ArrayBuilderAppend { .. }
+        | Rvalue::ArrayBuilderBuild { .. }
+        | Rvalue::FsWriteFile { .. }
+        | Rvalue::FsWriteFileBuilder { .. }
+        | Rvalue::FsExists { .. }
+        | Rvalue::FsRemove { .. }
+        | Rvalue::RenameNoReplace { .. }
+        | Rvalue::FsReadDir { .. }
+        | Rvalue::DnsResolve { .. }
+        | Rvalue::TcpConnect { .. }
+        | Rvalue::ConnReader(..)
+        | Rvalue::ConnWriter(..)
+        | Rvalue::TcpReadTimeout { .. }
+        | Rvalue::TcpWriteTimeout { .. }
+        | Rvalue::TcpListen { .. }
+        | Rvalue::TcpAccept { .. }
+        | Rvalue::UdpBind { .. }
+        | Rvalue::UdpSendTo { .. }
+        | Rvalue::UdpRecvFrom { .. }
+        | Rvalue::ProcessSpawn { .. }
+        | Rvalue::ChildWait { .. }
+        | Rvalue::ChildKill { .. }
+        | Rvalue::ProcessExec { .. }
+        | Rvalue::FsReadFileView { .. }
+        | Rvalue::FsReadBytesView { .. }
+        | Rvalue::EnvGet { .. }
+        | Rvalue::EnvSet { .. }
+        | Rvalue::TimeNow
+        | Rvalue::ProcessCpuCount
+        | Rvalue::TimeInstant
+        | Rvalue::TimeSleep { .. }
+        | Rvalue::RegexCompile { .. }
+        | Rvalue::RegexIsMatch { .. }
+        | Rvalue::RegexFind { .. }
+        | Rvalue::RegexFindAll { .. }
+        | Rvalue::RegexSplit { .. }
+        | Rvalue::RegexCaptures { .. }
+        | Rvalue::RegexGroupCount { .. }
+        | Rvalue::RegexGroupIndex { .. }
+        | Rvalue::CapturesGroup { .. }
+        | Rvalue::EncodingDecode { .. }
+        | Rvalue::CompressCompress { .. }
+        | Rvalue::CompressDecompress { .. }
+        | Rvalue::Utf8Valid { .. }
+        | Rvalue::CryptoCtEqual { .. }
+        | Rvalue::CryptoRandom { .. }
+        | Rvalue::CryptoHash { .. }
+        | Rvalue::CryptoHmac { .. }
+        | Rvalue::CryptoHkdf { .. }
+        | Rvalue::CryptoAead { .. }
+        | Rvalue::CryptoArgon2(..)
+        | Rvalue::CryptoPrivateKeyFromPem { .. }
+        | Rvalue::CryptoPublicKeyFromPem { .. }
+        | Rvalue::CryptoPublicKeyFromJwk(..)
+        | Rvalue::CryptoSign { .. }
+        | Rvalue::CryptoVerify(..)
+        | Rvalue::RandSeed { .. }
+        | Rvalue::RandNext { .. }
+        | Rvalue::RandRange { .. }
+        | Rvalue::RandShuffle { .. }
+        | Rvalue::RandSample { .. }
+        | Rvalue::CliCommand { .. }
+        | Rvalue::CliFlag { .. }
+        | Rvalue::CliParse { .. }
+        | Rvalue::CliGetBool { .. }
+        | Rvalue::CliGetI64 { .. }
+        | Rvalue::HttpRequest { .. }
+        | Rvalue::HttpHeader { .. }
+        | Rvalue::HttpBody { .. }
+        | Rvalue::HttpRequestTimeout { .. }
+        | Rvalue::HttpRequestMaxResponseBodyBytes { .. }
+        | Rvalue::HttpClientTimeout { .. }
+        | Rvalue::HttpClientMaxResponseBodyBytes { .. }
+        | Rvalue::Command { .. }
+        | Rvalue::CommandCwd { .. }
+        | Rvalue::CommandTimeout { .. }
+        | Rvalue::CommandMaxCapture { .. }
+        | Rvalue::CommandEnv { .. }
+        | Rvalue::CommandEnvClear { .. }
+        | Rvalue::CommandRun { .. }
+        | Rvalue::CommandRunBytes { .. }
+        | Rvalue::RunOutputCode { .. }
+        | Rvalue::RunBytesCode { .. }
+        | Rvalue::RunBytesView { .. }
+        | Rvalue::HttpParse { .. }
+        | Rvalue::HttpRespStatus { .. }
+        | Rvalue::HttpRespHeader { .. }
+        | Rvalue::HttpRespBody { .. }
+        | Rvalue::HttpClient
+        | Rvalue::HttpClientGet { .. }
+        | Rvalue::HttpClientPost { .. }
+        | Rvalue::HttpClientRequest { .. }
+        | Rvalue::HttpClientRequestStream { .. }
+        | Rvalue::HttpReadStreamStatus { .. }
+        | Rvalue::HttpReadStreamHeader { .. }
+        | Rvalue::HttpReadStreamRead { .. }
+        | Rvalue::HttpReadStreamSse { .. }
+        | Rvalue::HttpSseStreamRetryMs { .. }
+        | Rvalue::HttpSseStreamNext { .. }
+        | Rvalue::HttpGetMany { .. }
+        | Rvalue::HttpServe { .. }
+        | Rvalue::HttpAccept { .. }
+        | Rvalue::HttpCtxHeader { .. }
+        | Rvalue::HttpHeadersCount { .. }
+        | Rvalue::HttpHeadersTokensValid { .. }
+        | Rvalue::HttpHeadersContainsToken { .. }
+        | Rvalue::HttpCtxUpgradeReady { .. }
+        | Rvalue::HttpCtxBody { .. }
+        | Rvalue::HttpResponseBuilder { .. }
+        | Rvalue::HttpRbHeader { .. }
+        | Rvalue::HttpRbBody { .. }
+        | Rvalue::HttpRespond { .. }
+        | Rvalue::HttpRespondStream { .. }
+        | Rvalue::HttpRespondUpgrade { .. }
+        | Rvalue::HttpUpgradeReadExact { .. }
+        | Rvalue::HttpUpgradeWrite { .. }
+        | Rvalue::HttpUpgradeDeadline { .. }
+        | Rvalue::HttpUpgradeShutdown { .. }
+        | Rvalue::HttpStreamSend { .. }
+        | Rvalue::HttpStreamFinish { .. }
+        | Rvalue::HttpStreamReject { .. } => XmlProducerVariantClass::Rejected,
+    }
+}
+
+fn assert_xml_stmt_variant_classified(statement: &Stmt) {
+    match statement {
+        Stmt::Let(..)
+        | Stmt::Store(..)
+        | Stmt::StoreField(..)
+        | Stmt::StoreIndex(..)
+        | Stmt::StoreConstArray { .. }
+        | Stmt::PtrStore(..)
+        | Stmt::PtrStoreNoalias { .. }
+        | Stmt::VecStore { .. }
+        | Stmt::StoreElemField(..)
+        | Stmt::StoreElemFieldPtr { .. }
+        | Stmt::StoreColumn { .. }
+        | Stmt::ArenaEnd(..)
+        | Stmt::RawFree(..)
+        | Stmt::ColumnBatchFinish { .. }
+        | Stmt::ColumnBatchDrop { .. }
+        | Stmt::RawStore { .. }
+        | Stmt::TgWait(..)
+        | Stmt::TgEnd(..)
+        | Stmt::DropFlagInit(..)
+        | Stmt::NullTupleField(..)
+        | Stmt::NullStructField(..)
+        | Stmt::NullElemField(..)
+        | Stmt::Drop(..)
+        | Stmt::DropElem(..)
+        | Stmt::DropElemField(..)
+        | Stmt::BorrowedElementReservation { .. }
+        | Stmt::DropValue(..) => {}
+    }
+}
+
 struct XmlAccessAnalyzer<'a> {
-    graph: &'a XmlAccessGraph<'a>,
+    graph: &'a ValidatedProducerGraph<'a>,
     equations: HashMap<XmlAccessNode, XmlAccessEquation>,
     scheduled: HashSet<XmlAccessNode>,
     pending: VecDeque<XmlAccessNode>,
 }
 
 impl<'a> XmlAccessAnalyzer<'a> {
-    fn new(graph: &'a XmlAccessGraph<'a>) -> Self {
+    fn new(graph: &'a ValidatedProducerGraph<'a>) -> Self {
         Self {
             graph,
             equations: HashMap::new(),
@@ -4564,9 +5012,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Operand::BorrowedPlace(_)
             | Operand::BorrowedElementPlace(_)
             | Operand::BorrowedFixedElementPlace(_)
-            | Operand::BorrowedCleanupArg(_) => {
-                XmlAccessSource::Seed(XmlAccessProvenance::Unknown)
-            }
+            | Operand::BorrowedCleanupArg(_) => XmlAccessSource::Invalid,
         }
     }
 
@@ -4658,6 +5104,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return;
         }
+        for ((argument, expected), mode) in args.iter().zip(&facts.params).zip(&facts.modes) {
+            let canonical_borrow = matches!(
+                argument,
+                Operand::BorrowedPlace(_)
+                    | Operand::BorrowedElementPlace(_)
+                    | Operand::BorrowedFixedElementPlace(_)
+            ) && matches!(
+                mode,
+                align_ast::ParamMode::Borrow
+                    | align_ast::ParamMode::BorrowMut
+                    | align_ast::ParamMode::Out
+            );
+            if !canonical_borrow {
+                self.check_operand(equation, argument, *expected);
+            }
+        }
         if matches!(selected_ty, Ty::String | Ty::XmlReader) {
             if facts.cleanup != hir::ReturnCleanupAbi::DynamicBit {
                 equation.invalid = true;
@@ -4719,6 +5181,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
+        if xml_producer_variant_class(&definition) == XmlProducerVariantClass::Rejected {
+            equation.invalid = true;
+            return equation;
+        }
         match definition {
             Rvalue::Use(operand) => {
                 if xml_operand_base_ty(self.graph.function, &operand) != Some(result_ty) {
@@ -4785,6 +5251,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                     return equation;
+                }
+                for (operand, expected) in elems.iter().zip(&tuple.elems) {
+                    self.check_operand(
+                        &mut equation,
+                        operand,
+                        scalar_to_ty(*expected),
+                    );
                 }
                 if path.is_empty() {
                     if elems.is_empty() {
@@ -4875,6 +5348,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 }
+                for (operand, expected) in payload.iter().zip(&definition.payload) {
+                    self.check_operand(
+                        &mut equation,
+                        operand,
+                        scalar_to_ty(*expected),
+                    );
+                }
                 if path.is_empty() {
                     if payload.is_empty() {
                         equation.seed = Some(XmlAccessProvenance::Owned);
@@ -4942,6 +5422,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    equation.require_present = true;
                     let mut selected_path = vec![XmlAccessPathSegment::EnumPayload {
                         enum_id,
                         variant,
@@ -4960,6 +5441,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 }
+                self.check_operand(&mut equation, &operand, payload_ty);
                 if path.is_empty() {
                     self.add_operand(&mut equation, &operand, payload_ty, Vec::new());
                     return equation;
@@ -4989,9 +5471,32 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if xml_option_payload(self.graph.program, option_ty) != Some(result_ty) {
                     equation.invalid = true;
                 } else {
+                    equation.require_present = true;
                     let mut selected_path = vec![XmlAccessPathSegment::OptionSome];
                     selected_path.extend(path);
                     self.add_operand(&mut equation, &operand, selected_ty, selected_path);
+                }
+            }
+            Rvalue::OptionIsSome(operand) => {
+                let wrapper_ty = xml_operand_base_ty(self.graph.function, &operand);
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !wrapper_ty.is_some_and(|ty| {
+                        xml_option_payload(self.graph.program, ty).is_some()
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(wrapper_ty) = wrapper_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &operand,
+                        wrapper_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
             Rvalue::ResultOk(ref operand) | Rvalue::ResultErr(ref operand) => {
@@ -5004,6 +5509,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 }
+                self.check_operand(&mut equation, operand, payload_ty);
                 let expected_segment = if ok {
                     XmlAccessPathSegment::ResultOk
                 } else {
@@ -5032,6 +5538,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if xml_result_payload(self.graph.program, wrapper_ty, ok) != Some(result_ty) {
                     equation.invalid = true;
                 } else {
+                    equation.require_present = true;
                     let mut selected_path = vec![if ok {
                         XmlAccessPathSegment::ResultOk
                     } else {
@@ -5039,6 +5546,154 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }];
                     selected_path.extend(path);
                     self.add_operand(&mut equation, operand, selected_ty, selected_path);
+                }
+            }
+            Rvalue::ResultIsOk(operand) => {
+                let wrapper_ty = xml_operand_base_ty(self.graph.function, &operand);
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !wrapper_ty.is_some_and(|ty| {
+                        xml_result_payload(self.graph.program, ty, true).is_some()
+                            && xml_result_payload(self.graph.program, ty, false).is_some()
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(wrapper_ty) = wrapper_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &operand,
+                        wrapper_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::EnumTagEq {
+                enum_id,
+                scrutinee,
+                variant,
+            } => {
+                let variant_valid = self
+                    .graph
+                    .program
+                    .enums
+                    .get(enum_id as usize)
+                    .is_some_and(|definition| (variant as usize) < definition.variants.len());
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !variant_valid
+                    || xml_operand_base_ty(self.graph.function, &scrutinee)
+                        != Some(Ty::Enum(enum_id))
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &scrutinee, Ty::Enum(enum_id));
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::MakeError { enum_id, tag, code } => {
+                let i32_ty = Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                });
+                if result_ty != Ty::Enum(enum_id)
+                    || !path.is_empty()
+                    || !builtin_error_enum_is_exact(self.graph.program, enum_id)
+                    || xml_operand_base_ty(self.graph.function, &tag) != Some(i32_ty)
+                    || xml_operand_base_ty(self.graph.function, &code) != Some(i32_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &tag, i32_ty);
+                    self.check_operand(&mut equation, &code, i32_ty);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::FnAddr { target, signature } => {
+                let Ty::Fn(id) = result_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(canonical) = xml_fn_type_facts(self.graph.program, id) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target_facts) = xml_direct_call_facts(self.graph.program, &target) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !path.is_empty()
+                    || canonical != target_facts
+                    || !xml_signature_matches_facts(&signature, &canonical)
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::Closure {
+                lifted,
+                captures,
+                capture_tys,
+                signature,
+            } => {
+                let Ty::Fn(id) = result_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(canonical) = xml_fn_type_facts(self.graph.program, id) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target) = self
+                    .graph
+                    .program
+                    .fns
+                    .iter()
+                    .find(|function| function.name == lifted)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(explicit) = target.params.len().checked_sub(capture_tys.len()) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let explicit_params = target.params[..explicit]
+                    .iter()
+                    .map(|slot| target.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>();
+                let target_capture_tys = target.params[explicit..]
+                    .iter()
+                    .map(|slot| target.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>();
+                let facts = explicit_params.map(|params| XmlCallFacts {
+                    params,
+                    modes: target.param_modes[..explicit].to_vec(),
+                    ret: target.ret,
+                    borrow: target.return_borrow.clone(),
+                    region: target.return_region.clone(),
+                    cleanup: target.return_cleanup,
+                });
+                let captures_match = captures.len() == capture_tys.len()
+                    && target_capture_tys.as_ref() == Some(&capture_tys)
+                    && captures.iter().zip(&capture_tys).all(|(operand, expected)| {
+                        xml_operand_base_ty(self.graph.function, operand) == Some(*expected)
+                    });
+                if !path.is_empty()
+                    || facts.as_ref() != Some(&canonical)
+                    || !xml_signature_matches_facts(&signature, &canonical)
+                    || !captures_match
+                {
+                    equation.invalid = true;
+                } else {
+                    for (capture, expected) in captures.iter().zip(&capture_tys) {
+                        self.check_operand(&mut equation, capture, *expected);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
             Rvalue::Call(DirectCall::Program(target), args) => {
@@ -5090,10 +5745,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 ret_ty,
                 signature,
             } => {
-                if !matches!(xml_operand_base_ty(self.graph.function, &callee), Some(Ty::Fn(_))) {
+                let Some(Ty::Fn(id)) = xml_operand_base_ty(self.graph.function, &callee) else {
                     equation.invalid = true;
                     return equation;
-                }
+                };
                 let facts = XmlCallFacts {
                     params: param_tys,
                     modes: signature.param_modes,
@@ -5102,6 +5757,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: signature.return_region,
                     cleanup: signature.return_cleanup,
                 };
+                let callable = xml_operand_access(self.graph, &callee, Ty::Fn(id));
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts)
+                    || !matches!(
+                        callable,
+                        XmlProducerState::Present(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                    )
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
                 self.add_call_result(&mut equation, XmlCallResult {
                     result: value,
                     result_ty,
@@ -5118,10 +5787,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 });
             }
             Rvalue::CallIndirectWithCleanup(call) => {
-                if !matches!(xml_operand_base_ty(self.graph.function, &call.callee), Some(Ty::Fn(_))) {
+                let Some(Ty::Fn(id)) = xml_operand_base_ty(self.graph.function, &call.callee) else {
                     equation.invalid = true;
                     return equation;
-                }
+                };
                 let facts = XmlCallFacts {
                     params: call.param_tys,
                     modes: call.signature.param_modes,
@@ -5130,6 +5799,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: call.signature.return_region,
                     cleanup: call.signature.return_cleanup,
                 };
+                let callable = xml_operand_access(self.graph, &call.callee, Ty::Fn(id));
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts)
+                    || !matches!(
+                        callable,
+                        XmlProducerState::Present(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                    )
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
                 self.add_call_result(&mut equation, XmlCallResult {
                     result: value,
                     result_ty,
@@ -5144,6 +5827,99 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         self.graph.program,
                     ),
                 });
+            }
+            Rvalue::SubSlice {
+                base,
+                start,
+                len,
+                elem,
+            } => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let base_ty = xml_operand_base_ty(self.graph.function, &base);
+                let relation_matches = match base_ty {
+                    Some(Ty::Str | Ty::String) => {
+                        result_ty == Ty::Str
+                            && elem
+                                == Ty::Int(IntTy {
+                                    bits: 8,
+                                    signed: false,
+                                })
+                    }
+                    Some(Ty::Slice(element) | Ty::DynArray(element)) => {
+                        result_ty == Ty::Slice(element) && elem == scalar_to_ty(element)
+                    }
+                    Some(Ty::Array(element, _)) => {
+                        result_ty == Ty::Slice(element) && elem == scalar_to_ty(element)
+                    }
+                    _ => false,
+                };
+                if !path.is_empty()
+                    || !relation_matches
+                    || xml_operand_base_ty(self.graph.function, &start) != Some(i64_ty)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &start, i64_ty);
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    let Some(base_ty) = base_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.add_operand(&mut equation, &base, base_ty, Vec::new());
+                }
+            }
+            Rvalue::SliceLen(input) => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let input_ty = xml_operand_base_ty(self.graph.function, &input);
+                let input_is_view = matches!(
+                    input_ty,
+                    Some(
+                        Ty::Str
+                            | Ty::String
+                            | Ty::Slice(_)
+                            | Ty::Array(_, _)
+                            | Ty::DynArray(_)
+                            | Ty::DynStructArray(_, _)
+                            | Ty::DynSliceArray(_)
+                    )
+                );
+                if result_ty != i64_ty || !path.is_empty() || !input_is_view {
+                    equation.invalid = true;
+                } else {
+                    let Some(input_ty) = input_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &input,
+                        input_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::FsReadFile { path: input, out } => {
+                let i32_ty = Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                });
+                if result_ty != i32_ty
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &input) != Some(Ty::Str)
+                    || self.graph.function.slots.get(out as usize) != Some(&Ty::String)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &input, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
             }
             Rvalue::StrLit(_) => {
                 if result_ty != Ty::Str || !path.is_empty() {
@@ -5193,6 +5969,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    self.check_operand(&mut equation, &a, Ty::Str);
+                    self.check_operand(&mut equation, &b, Ty::Str);
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
@@ -5203,15 +5981,59 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    self.check_operand(&mut equation, &source, Ty::Str);
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
-            Rvalue::EncodingEncode { .. }
-            | Rvalue::RegexReplace { .. }
-            | Rvalue::CliUsage { .. } => {
-                if result_ty != Ty::String || !path.is_empty() {
+            Rvalue::EncodingEncode { data, .. } => {
+                let data_ty = xml_operand_base_ty(self.graph.function, &data);
+                let byte_view = matches!(
+                    data_ty,
+                    Some(Ty::Str | Ty::String | Ty::Slice(Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    })))
+                );
+                if result_ty != Ty::String || !path.is_empty() || !byte_view {
                     equation.invalid = true;
                 } else {
+                    let Some(data_ty) = data_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &data,
+                        data_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::RegexReplace {
+                regex, text, repl, ..
+            } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &regex) != Some(Ty::Regex)
+                    || xml_operand_base_ty(self.graph.function, &text) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, &repl) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &regex, Ty::Regex);
+                    self.check_operand(&mut equation, &text, Ty::Str);
+                    self.check_operand(&mut equation, &repl, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::CliUsage { cmd } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &cmd) != Some(Ty::CliCommand)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &cmd, Ty::CliCommand);
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
@@ -5552,10 +6374,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
         equation
     }
 
-    fn build(mut self, root: XmlAccessSource) -> XmlAccessProvenance {
+    fn build(mut self, root: XmlAccessSource) -> XmlProducerState {
         let root_node = match root {
-            XmlAccessSource::Seed(access) => return access,
-            XmlAccessSource::Invalid => return XmlAccessProvenance::Unknown,
+            XmlAccessSource::Seed(access) => return XmlProducerState::Present(access),
+            XmlAccessSource::Invalid => return XmlProducerState::Invalid,
             XmlAccessSource::Node(node) => node,
         };
         while let Some(node) = self.pending.pop_front() {
@@ -5571,9 +6393,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             self.equations.insert(node, equation);
         }
 
-        let mut invalid = HashSet::<XmlAccessNode>::new();
         let mut validation_reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
-        let mut invalid_ready = VecDeque::new();
         for (node, equation) in &self.equations {
             for dependency in equation.dependencies.iter().chain(&equation.checks) {
                 validation_reverse
@@ -5581,22 +6401,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .or_default()
                     .push(node.clone());
             }
-            if equation.invalid && invalid.insert(node.clone()) {
-                invalid_ready.push_back(node.clone());
-            }
-        }
-        while let Some(changed) = invalid_ready.pop_front() {
-            let Some(parents) = validation_reverse.get(&changed) else {
-                continue;
-            };
-            for parent in parents {
-                if invalid.insert(parent.clone()) {
-                    invalid_ready.push_back(parent.clone());
-                }
-            }
         }
 
-        let mut values = HashMap::<XmlAccessNode, XmlAccessProvenance>::new();
+        let mut values = HashMap::<XmlAccessNode, XmlProducerState>::new();
         let mut reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
         let mut ready = VecDeque::new();
         for (node, equation) in &self.equations {
@@ -5606,10 +6413,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .or_default()
                     .push(node.clone());
             }
-            let initial = if invalid.contains(node) {
-                Some(XmlAccessProvenance::Unknown)
+            let initial = if equation.invalid {
+                Some(XmlProducerState::Invalid)
+            } else if equation.absent {
+                Some(XmlProducerState::Absent)
             } else {
-                equation.seed
+                equation.seed.map(XmlProducerState::Present)
             };
             if let Some(initial) = initial {
                 values.insert(node.clone(), initial);
@@ -5624,14 +6433,24 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let Some(equation) = self.equations.get(parent) else {
                     continue;
                 };
-                let next = equation.dependencies.iter().fold(equation.seed, |current, dependency| {
-                    values
-                        .get(dependency)
-                        .copied()
-                        .map_or(current, |access| merge_xml_access(current, access))
-                });
-                let next = if invalid.contains(parent) {
-                    Some(XmlAccessProvenance::Unknown)
+                let next = equation.dependencies.iter().fold(
+                    equation.seed.map(XmlProducerState::Present),
+                    |current, dependency| {
+                        values
+                            .get(dependency)
+                            .copied()
+                            .map_or(current, |state| merge_xml_state(current, state))
+                    },
+                );
+                let next = if equation.invalid {
+                    Some(XmlProducerState::Invalid)
+                } else if equation.absent {
+                    merge_xml_state(next, XmlProducerState::Absent)
+                } else {
+                    next
+                };
+                let next = if equation.require_present {
+                    require_xml_presence(next)
                 } else {
                     next
                 };
@@ -5644,67 +6463,54 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
         }
 
-        let unresolved = self
+        // Access propagation intentionally excludes validation-only dependencies. Once
+        // selected-path convergence is complete, however, every such dependency must have
+        // produced a total typed state. An unresolved check-only cycle is therefore invalid,
+        // and invalidity flows through both kinds of edge.
+        let mut invalid = self
             .equations
             .iter()
-            .filter(|(node, equation)| !equation.absent && !values.contains_key(*node))
+            .filter(|(node, equation)| equation.invalid || !values.contains_key(*node))
             .map(|(node, _)| node)
             .cloned()
-            .collect::<Vec<_>>();
-        for node in unresolved {
-            values.insert(node.clone(), XmlAccessProvenance::Unknown);
-            ready.push_back(node);
-        }
-        while let Some(changed) = ready.pop_front() {
-            let Some(parents) = reverse.get(&changed) else {
+            .collect::<HashSet<_>>();
+        let mut invalid_ready = invalid.iter().cloned().collect::<VecDeque<_>>();
+        while let Some(changed) = invalid_ready.pop_front() {
+            let Some(parents) = validation_reverse.get(&changed) else {
                 continue;
             };
             for parent in parents {
-                let Some(equation) = self.equations.get(parent) else {
-                    continue;
-                };
-                let next = equation.dependencies.iter().fold(equation.seed, |current, dependency| {
-                    values
-                        .get(dependency)
-                        .copied()
-                        .map_or(current, |access| merge_xml_access(current, access))
-                });
-                let next = if invalid.contains(parent) {
-                    Some(XmlAccessProvenance::Unknown)
-                } else {
-                    next
-                };
-                if let Some(next) = next
-                    && values.get(parent) != Some(&next)
-                {
-                    values.insert(parent.clone(), next);
-                    ready.push_back(parent.clone());
+                if invalid.insert(parent.clone()) {
+                    invalid_ready.push_back(parent.clone());
                 }
             }
+        }
+        if invalid.contains(&root_node) {
+            return XmlProducerState::Invalid;
         }
         values
             .get(&root_node)
             .copied()
-            .unwrap_or(XmlAccessProvenance::Unknown)
+            .unwrap_or(XmlProducerState::Invalid)
     }
 }
 
 fn xml_operand_access(
-    graph: &XmlAccessGraph<'_>,
+    graph: &ValidatedProducerGraph<'_>,
     operand: &Operand,
     expected: Ty,
-) -> XmlAccessProvenance {
+) -> XmlProducerState {
     let mut analysis = XmlAccessAnalyzer::new(graph);
     let root = analysis.source(operand, expected, Vec::new());
     analysis.build(root)
 }
 
 fn xml_operand_path_access(
-    graph: &XmlAccessGraph<'_>,
+    graph: &ValidatedProducerGraph<'_>,
     operand: &Operand,
     selected: Ty,
     path: Vec<XmlAccessPathSegment>,
-) -> XmlAccessProvenance {
+) -> XmlProducerState {
     let mut analysis = XmlAccessAnalyzer::new(graph);
     let root = analysis.source(operand, selected, path);
     analysis.build(root)
@@ -5820,6 +6626,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
         };
         for block in &function.blocks {
             for statement in &block.stmts {
+                assert_xml_stmt_variant_classified(statement);
                 match statement {
                     Stmt::Let(value, rvalue) => {
                         if let Some(count) = primary_definitions.get_mut(*value as usize) {
@@ -5881,7 +6688,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 }
             }
         }
-        let access_graph = XmlAccessGraph {
+        let access_graph = ValidatedProducerGraph {
             function,
             program,
             value_definitions: &value_definitions,
@@ -5893,6 +6700,33 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
         let xml_access = |operand: &Operand, expected: Ty| {
             xml_operand_access(&access_graph, operand, expected)
         };
+        let indirect_call_valid = |
+            callee: &Operand,
+            params: &[Ty],
+            ret: Ty,
+            signature: &align_mir::FnSignatureFacts,
+        | {
+            let Some(Ty::Fn(id)) = xml_operand_base_ty(function, callee) else {
+                return false;
+            };
+            let copied = XmlCallFacts {
+                params: params.to_vec(),
+                modes: signature.param_modes.clone(),
+                ret,
+                borrow: signature.return_borrow.clone(),
+                region: signature.return_region.clone(),
+                cleanup: signature.return_cleanup,
+            };
+            xml_fn_type_facts(program, id).as_ref() == Some(&copied)
+                && matches!(
+                    xml_access(callee, Ty::Fn(id)),
+                    XmlProducerState::Present(
+                        XmlAccessProvenance::Owned
+                            | XmlAccessProvenance::Shared
+                            | XmlAccessProvenance::Exclusive
+                    )
+                )
+        };
         let canonical_xml_value = |operand: &Operand| {
             matches!(operand, Operand::Value(_) | Operand::Arg(_))
         };
@@ -5902,9 +6736,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 Operand::Value(_) | Operand::Arg(_) | Operand::Const(Const::Int(_, _))
             ) && matches!(
                 xml_access(operand, i64_ty),
-                XmlAccessProvenance::Owned
-                    | XmlAccessProvenance::Shared
-                    | XmlAccessProvenance::Exclusive
+                XmlProducerState::Present(
+                    XmlAccessProvenance::Owned
+                        | XmlAccessProvenance::Shared
+                        | XmlAccessProvenance::Exclusive
+                )
             )
         };
         let xml_call_arguments_valid =
@@ -5937,7 +6773,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                                 operand,
                                                 *selected,
                                                 path.clone(),
-                                            ) == XmlAccessProvenance::Owned
+                                            ).owned_if_present()
                                         })
                                 }
                                 align_ast::ParamMode::Borrow => {
@@ -5950,9 +6786,17 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                                     *selected,
                                                     path.clone(),
                                                 ),
-                                                XmlAccessProvenance::Owned
-                                                    | XmlAccessProvenance::Shared
-                                                    | XmlAccessProvenance::Exclusive
+                                                XmlProducerState::Present(
+                                                    XmlAccessProvenance::Owned
+                                                        | XmlAccessProvenance::Shared
+                                                        | XmlAccessProvenance::Exclusive
+                                                )
+                                                    | XmlProducerState::MaybeAbsent(
+                                                        XmlAccessProvenance::Owned
+                                                            | XmlAccessProvenance::Shared
+                                                            | XmlAccessProvenance::Exclusive
+                                                    )
+                                                    | XmlProducerState::Absent
                                             )
                                         })
                                 }
@@ -5966,8 +6810,15 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                                     *selected,
                                                     path.clone(),
                                                 ),
-                                                XmlAccessProvenance::Owned
-                                                    | XmlAccessProvenance::Exclusive
+                                                XmlProducerState::Present(
+                                                    XmlAccessProvenance::Owned
+                                                        | XmlAccessProvenance::Exclusive
+                                                )
+                                                    | XmlProducerState::MaybeAbsent(
+                                                        XmlAccessProvenance::Owned
+                                                            | XmlAccessProvenance::Exclusive
+                                                    )
+                                                    | XmlProducerState::Absent
                                             )
                                         })
                                 }
@@ -6023,20 +6874,28 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         })
                     }
                     Rvalue::CallIndirect {
+                        callee,
                         args,
                         param_tys,
+                        ret_ty,
                         signature,
                         ..
                     } => {
-                        !operands_match_modes(args, &signature.param_modes, param_tys, program)
+                        indirect_call_valid(callee, param_tys, *ret_ty, signature)
+                            && (!operands_match_modes(args, &signature.param_modes, param_tys, program)
                             || xml_call_arguments_valid(
                                 args,
                                 param_tys,
                                 &signature.param_modes,
-                            )
+                            ))
                     }
                     Rvalue::CallIndirectWithCleanup(call) => {
-                        !operands_match_modes(
+                        indirect_call_valid(
+                            &call.callee,
+                            &call.param_tys,
+                            call.ret_ty,
+                            &call.signature,
+                        ) && (!operands_match_modes(
                             &call.args,
                             &call.signature.param_modes,
                             &call.param_tys,
@@ -6045,7 +6904,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             &call.args,
                             &call.param_tys,
                             &call.signature.param_modes,
-                        )
+                        ))
                     }
                     _ => true,
                 };
@@ -6110,9 +6969,10 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         error_enum,
                         cleanup,
                     } => {
+                        let input_state = xml_access(input, Ty::String);
                         canonical_xml_value(input)
                             && operand_ty(function, input) == Some(Ty::String)
-                            && xml_access(input, Ty::String) == XmlAccessProvenance::Owned
+                            && input_state == XmlProducerState::Present(XmlAccessProvenance::Owned)
                             && result
                                 == Ty::Result(Scalar::XmlReader, Scalar::Enum(*error_enum))
                             && builtin_error_enum_is_exact(program, *error_enum)
@@ -6126,7 +6986,10 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && result == Ty::Option(Scalar::Enum(*event_enum))
                             && xml_event_definition_valid(*event_enum)
@@ -6136,9 +6999,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned
-                                    | XmlAccessProvenance::Shared
-                                    | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && result == i64_ty
                     }
@@ -6147,9 +7012,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned
-                                    | XmlAccessProvenance::Shared
-                                    | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && result == Ty::Str
                     }
@@ -6158,9 +7025,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned
-                                    | XmlAccessProvenance::Shared
-                                    | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && operand_ty(function, index) == Some(i64_ty)
                             && readable_xml_index(index)
@@ -6171,9 +7040,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned
-                                    | XmlAccessProvenance::Shared
-                                    | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && operand_ty(function, index) == Some(i64_ty)
                             && readable_xml_index(index)
@@ -6184,9 +7055,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, reader) == Some(Ty::XmlReader)
                             && matches!(
                                 xml_access(reader, Ty::XmlReader),
-                                XmlAccessProvenance::Owned
-                                    | XmlAccessProvenance::Shared
-                                    | XmlAccessProvenance::Exclusive
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
                             )
                             && result == Ty::String
                     }
@@ -29181,6 +30054,115 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn xml_mir_gate_separates_inactive_presence_and_authenticates_indirect_calls() {
+        let base = mir(
+            r#"import std.xml
+Choice { Text(string), Empty }
+fn take_option(value: Option<string>) -> i64 = 1
+fn take_result(value: Result<string, Error>) -> i64 = 2
+fn take_choice(value: Choice) -> i64 = 3
+fn copy(source: string) -> string = source
+fn indirect(source: string) -> Result<xml.reader, Error> { call := copy; return xml.parse(call(source)) }
+fn valid() -> i64 {
+  a := take_option(None)
+  b := take_result(Err(Error.Invalid))
+  c := take_choice(Choice.Empty)
+  return a + b + c
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+
+        let function = xml_test_function(&base, "indirect");
+        let indirect_site = base.fns[function]
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block, body)| {
+                body.stmts.iter().position(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Let(_, Rvalue::CallIndirectWithCleanup(_))
+                    )
+                }).map(|statement| (block, statement))
+            })
+            .unwrap_or_else(|| panic!("missing indirect string call"));
+
+        let mutate_call = |program: &mut Program, mutation: usize| {
+            let Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) =
+                &mut program.fns[function].blocks[indirect_site.0].stmts[indirect_site.1]
+            else {
+                panic!("indirect string call changed shape")
+            };
+            match mutation {
+                0 => call.param_tys[0] = Ty::Raw,
+                1 => call.signature.param_modes[0] = align_ast::ParamMode::Borrow,
+                2 => call.ret_ty = Ty::XmlReader,
+                3 => call.signature.return_borrow = hir::ReturnBorrowSummary::Roots {
+                    params: vec![0],
+                    captures: Vec::new(),
+                },
+                4 => call.signature.return_region = hir::ReturnRegionSummary::Roots {
+                    params: vec![0],
+                    captures: Vec::new(),
+                },
+                5 => call.signature.return_cleanup = hir::ReturnCleanupAbi::None,
+                _ => panic!("unknown indirect-call mutation"),
+            }
+        };
+        for mutation in 0..6 {
+            let mut malformed = base.clone();
+            mutate_call(&mut malformed, mutation);
+            assert_xml_producer_rejected(
+                &malformed,
+                &format!("forged indirect-call fact {mutation}"),
+            );
+        }
+
+        let callee = match &base.fns[function].blocks[indirect_site.0].stmts[indirect_site.1] {
+            Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) => match call.callee {
+                Operand::Value(value) => value,
+                _ => panic!("indirect callee is not a value"),
+            },
+            _ => panic!("indirect string call changed shape"),
+        };
+        let mut wrong_type_id = base.clone();
+        wrong_type_id.fns[function].value_tys[callee as usize] = Ty::Fn(u32::MAX);
+        assert_xml_producer_rejected(&wrong_type_id, "forged indirect callee type id");
+
+        let mut forged_callee = base.clone();
+        let definition = forged_callee.fns[function]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find(|statement| matches!(statement, Stmt::Let(value, _) if *value == callee))
+            .unwrap_or_else(|| panic!("missing indirect callee producer"));
+        let Stmt::Let(_, rvalue) = definition else {
+            panic!("callee producer changed shape")
+        };
+        *rvalue = Rvalue::RawNull;
+        assert_xml_producer_rejected(&forged_callee, "raw indirect callee producer");
+
+        let mut forged_stored_callee = base;
+        let fn_address = forged_stored_callee.fns[function]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::FnAddr { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing stored function-address producer"));
+        *fn_address = Rvalue::RawNull;
+        assert_xml_producer_rejected(
+            &forged_stored_callee,
+            "raw function address through store/load",
+        );
+    }
+
+    #[test]
     fn xml_mir_gate_worklist_terminates_and_fails_closed() {
         let base = mir(
             r#"import std.xml
@@ -29237,6 +30219,55 @@ fn main() -> i32 = 0
             Operand::Value(loaded),
         );
         assert_xml_producer_rejected(&unseeded_cycle, "unseeded producer cycle");
+
+        let mut check_cycle = base.clone();
+        let bool_slot = u32::try_from(check_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        check_cycle.fns[function].slots.push(Ty::Bool);
+        check_cycle.fns[function].slot_align.push(None);
+        let condition = xml_test_value(&mut check_cycle.fns[function], Ty::Bool);
+        let selected = xml_test_value(&mut check_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut check_cycle.fns[function],
+            vec![
+                Stmt::Let(condition, Rvalue::Load(bool_slot)),
+                Stmt::Store(bool_slot, Operand::Value(condition)),
+                Stmt::Let(
+                    selected,
+                    Rvalue::Select {
+                        cond: Operand::Value(condition),
+                        a: Operand::Arg(0),
+                        b: Operand::Arg(0),
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut check_cycle.fns[function],
+            Operand::Value(selected),
+        );
+        assert_xml_producer_rejected(&check_cycle, "unseeded Select condition cycle");
+
+        let mut clone_cycle = base.clone();
+        let view_slot = u32::try_from(clone_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        clone_cycle.fns[function].slots.push(Ty::Str);
+        clone_cycle.fns[function].slot_align.push(None);
+        let view = xml_test_value(&mut clone_cycle.fns[function], Ty::Str);
+        let cloned = xml_test_value(&mut clone_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut clone_cycle.fns[function],
+            vec![
+                Stmt::Let(view, Rvalue::Load(view_slot)),
+                Stmt::Store(view_slot, Operand::Value(view)),
+                Stmt::Let(cloned, Rvalue::StrClone(Operand::Value(view))),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut clone_cycle.fns[function],
+            Operand::Value(cloned),
+        );
+        assert_xml_producer_rejected(&clone_cycle, "unseeded StrClone input cycle");
 
         let mut duplicate = base;
         let value = xml_test_value(&mut duplicate.fns[function], Ty::String);
