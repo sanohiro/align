@@ -619,16 +619,18 @@ readable range are also caller preconditions unless the shell was published unch
 runtime. Violating a post-shape-check pointer/access precondition is outside the ABI contract and is
 not promised a safe abort.
 
-Within those preconditions, the runtime checks representable raw ranges and every detectable
-input/output/shell alias before mutation, Rust reference creation, or slice creation. A mechanically
-rejected parse returns positive `AL_INVALID`, leaves output untouched, and accepts no input
+At parse, the runtime checks representable raw ranges and every detectable input/output alias before
+mutation, Rust reference creation, or slice creation. A mechanically rejected parse returns positive
+`AL_INVALID`, leaves output untouched, and accepts no input
 ownership. In particular, nonnull zero-length input is rejected and never freed. After that
 preflight it stores null and accepts no allocation for canonical empty or the positive-length owned
 input: status zero publishes the sole shell, while `-1` releases accepted input responsibility (a
 no-op for canonical empty) and means public `Error.Invalid`. An
-output-bearing getter likewise leaves output untouched on mechanical preflight failure, then zeros
-its `{ptr,i64}` output; any later wrong-state/index/private-state failure leaves canonical zero for
-borrowed and owned results alike. Success fills a borrowed name view or publishes one completed
+output-bearing getter leaves output untouched when any complete mechanical preflight step fails:
+address shape, output/fixed-shell disjointness, shell fields, stored shell/input internal disjointness,
+or output/input disjointness. It zeros `{ptr,i64}` only after that preflight; a later state/index
+failure leaves canonical zero for borrowed and owned results alike. Success fills a borrowed name
+view or publishes one completed
 owned value/text allocation. `XmlNext` returns only `0=None`, `1=Start`, `2=End`, or `3=Text`.
 Count is only `0..=256`; every impossible getter result aborts. Free is null-safe; a nonnull argument
 must be a genuine exclusively held shell, and detectable malformed fields abort before following an
