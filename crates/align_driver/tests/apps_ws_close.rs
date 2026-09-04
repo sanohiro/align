@@ -449,13 +449,16 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
 
     // Fault-inject between the code and reason writes: the 4-byte frame head/code prefix proves
     // those writes succeeded, then the reset makes the reason-payload write own the error.
-    let partial_write_ws = ws_root()
-        .replace("import std.http\n", "import std.http\nimport std.time\n")
-        .replace(
-            "  connection.write(code_bytes[0..2])?\n  return connection.write(reason.bytes())",
-            "  connection.write(code_bytes[0..2])?\n  mut sync := buffer(1)\n  match connection.read_exact(sync, 1) {\n    Ok(_) => {}\n    Err(_) => { return Err(Error.NotFound) }\n  }\n  time.sleep(200000000)\n  match connection.write(reason.bytes()) {\n    Ok(_) => { return Err(Error.Denied) }\n    Err(error) => { return Err(error) }\n  }",
-        );
-    assert_ne!(partial_write_ws, ws_root(), "close-frame write seam must remain recognizable");
+    let timed_ws = ws_root().replace("import std.http\n", "import std.http\nimport std.time\n");
+    assert_ne!(timed_ws, ws_root(), "std.http import seam must remain recognizable");
+    let partial_write_ws = timed_ws.replace(
+        "  connection.write(code_bytes[0..2])?\n  return connection.write(reason.bytes())",
+        "  connection.write(code_bytes[0..2])?\n  mut sync := buffer(1)\n  match connection.read_exact(sync, 1) {\n    Ok(_) => {}\n    Err(_) => { return Err(Error.NotFound) }\n  }\n  time.sleep(200000000)\n  match connection.write(reason.bytes()) {\n    Ok(_) => { return Err(Error.Denied) }\n    Err(error) => { return Err(error) }\n  }",
+    );
+    assert_ne!(
+        partial_write_ws, timed_ws,
+        "close-frame write seam must remain recognizable"
+    );
     let partial_built = build_app_with_ws("apps-ws-close-partial-write", &partial_write_ws);
     let mut partial_server = start_server(&partial_built.exe);
     let mut partial = open_websocket(&partial_server, "/reason123");
