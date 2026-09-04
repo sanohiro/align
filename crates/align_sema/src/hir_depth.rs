@@ -471,6 +471,14 @@ fn walk_body_records<'a>(
                     logger: lhs,
                     level: rhs,
                 }
+                | ExprKind::XmlAttributeName {
+                    reader: lhs,
+                    index: rhs,
+                }
+                | ExprKind::XmlAttributeValue {
+                    reader: lhs,
+                    index: rhs,
+                }
                 | ExprKind::CodecBatchName {
                     batch: lhs,
                     index: rhs,
@@ -881,6 +889,11 @@ fn walk_body_records<'a>(
                 | ExprKind::BytesAsStr { bytes: recv }
                 | ExprKind::WriterFlush { writer: recv }
                 | ExprKind::LogFlush { logger: recv }
+                | ExprKind::XmlParse { input: recv }
+                | ExprKind::XmlNext { reader: recv }
+                | ExprKind::XmlName { reader: recv }
+                | ExprKind::XmlAttributeCount { reader: recv }
+                | ExprKind::XmlText { reader: recv }
                 | ExprKind::CodecOpen { input: recv }
                 | ExprKind::CodecBatchRows { batch: recv }
                 | ExprKind::CodecBatchColumns { batch: recv }

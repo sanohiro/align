@@ -2,7 +2,7 @@
 
 > 🌐 [English](../xml.md) · **日本語**
 
-> **状態:** DESIGNED 2026-09-05。実装は未着手。
+> **状態:** IMPLEMENTED 2026-09-05。
 
 ## 権威ある公開契約 ledger
 
@@ -46,7 +46,7 @@ entry はない。
 import std.xml
 
 fn first_key(body: string) -> Result<string, Error> {
-  doc := xml.parse(body)?
+  mut doc := xml.parse(body)?
   loop {
     event := doc.next() else { break }
     match event {

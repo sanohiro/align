@@ -5079,6 +5079,7 @@ fn validate_tagged_program_inner(
                 | Scalar::Reader
                 | Scalar::Writer
                 | Scalar::Logger
+                | Scalar::XmlReader
                 | Scalar::Buffer
                 | Scalar::CodecBatch
                 | Scalar::CodecI64Column
@@ -5219,6 +5220,7 @@ fn validate_tagged_program_inner(
                         | Ty::Writer
                         | Ty::Reader
                         | Ty::Logger
+                        | Ty::XmlReader
                         | Ty::Buffer
                         | Ty::CodecBatch
                         | Ty::CodecI64Column
@@ -8429,6 +8431,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::Buffer
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
@@ -8647,6 +8650,7 @@ fn abi_type<'c>(
         | Ty::Writer
         | Ty::Reader
         | Ty::Logger
+        | Ty::XmlReader
         | Ty::Buffer
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
@@ -9011,8 +9015,8 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
-        Scalar::Reader | Scalar::Writer | Scalar::Logger => {
-            unreachable!("an I/O/logger handle is not a box/array payload")
+        Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
+            unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
         Scalar::Buffer | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
@@ -9122,6 +9126,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Writer => RuntimeKey::IoWriterFree,
         Ty::Reader => RuntimeKey::IoReaderFree,
         Ty::Logger => RuntimeKey::LogFree,
+        Ty::XmlReader => RuntimeKey::XmlFree,
         Ty::Buffer => RuntimeKey::BufferFree,
         Ty::CodecEncoder => RuntimeKey::CodecEncoderFreeV1,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
@@ -15841,6 +15846,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..) => return self.gen_log_rvalue(rv),
+            Rvalue::XmlParse { .. }
+            | Rvalue::XmlNext(_)
+            | Rvalue::XmlName { .. }
+            | Rvalue::XmlAttributeCount(_)
+            | Rvalue::XmlAttributeName { .. }
+            | Rvalue::XmlAttributeValue { .. }
+            | Rvalue::XmlText { .. } => return self.gen_xml_rvalue(rv),
             Rvalue::CodecOpen(_)
             | Rvalue::CodecBatchRows(_)
             | Rvalue::CodecBatchColumns(_)
@@ -18205,6 +18217,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::Buffer
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
@@ -20461,6 +20474,88 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| self.err("log_flush must return i32"))?
             }
             _ => return Err(self.err("gen_log_rvalue on a non-logger operation")),
+        };
+        Ok(Some(value))
+    }
+
+    #[inline(never)]
+    fn gen_xml_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let value = match rv {
+            Rvalue::XmlParse { input, out } => {
+                let (pointer, length) = self.split_str(input)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlParse),
+                        &[pointer.into(), length.into(), self.slots[out].into()],
+                        "xml_parse",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_parse must return i32"))?
+            }
+            Rvalue::XmlNext(reader) => self
+                .builder
+                .build_call(
+                    self.runtime(RuntimeKey::XmlNext),
+                    &[self.operand(reader)?.into()],
+                    "xml_next",
+                )
+                .map_err(|error| self.err(error))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("xml_next must return i32"))?,
+            Rvalue::XmlAttributeCount(reader) => self
+                .builder
+                .build_call(
+                    self.runtime(RuntimeKey::XmlAttributeCount),
+                    &[self.operand(reader)?.into()],
+                    "xml_attribute_count",
+                )
+                .map_err(|error| self.err(error))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("xml_attribute_count must return i64"))?,
+            Rvalue::XmlName { reader, out } | Rvalue::XmlText { reader, out } => {
+                let key = if matches!(rv, Rvalue::XmlName { .. }) {
+                    RuntimeKey::XmlName
+                } else {
+                    RuntimeKey::XmlText
+                };
+                self.builder
+                    .build_call(
+                        self.runtime(key),
+                        &[self.operand(reader)?.into(), self.slots[out].into()],
+                        key.logical_name(),
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("XML getter must return i32"))?
+            }
+            Rvalue::XmlAttributeName { reader, index, out }
+            | Rvalue::XmlAttributeValue { reader, index, out } => {
+                let key = if matches!(rv, Rvalue::XmlAttributeName { .. }) {
+                    RuntimeKey::XmlAttributeName
+                } else {
+                    RuntimeKey::XmlAttributeValue
+                };
+                self.builder
+                    .build_call(
+                        self.runtime(key),
+                        &[
+                            self.operand(reader)?.into(),
+                            self.slots[out].into(),
+                            self.operand(index)?.into(),
+                        ],
+                        key.logical_name(),
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("indexed XML getter must return i32"))?
+            }
+            _ => return Err(self.err("gen_xml_rvalue on a non-XML operation")),
         };
         Ok(Some(value))
     }

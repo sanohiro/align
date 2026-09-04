@@ -976,6 +976,29 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::LogFlush { logger } => ExprKind::LogFlush {
             logger: boxed!(logger),
         },
+        ExprKind::XmlParse { input } => ExprKind::XmlParse {
+            input: boxed!(input),
+        },
+        ExprKind::XmlNext { reader } => ExprKind::XmlNext {
+            reader: boxed!(reader),
+        },
+        ExprKind::XmlName { reader } => ExprKind::XmlName {
+            reader: boxed!(reader),
+        },
+        ExprKind::XmlAttributeCount { reader } => ExprKind::XmlAttributeCount {
+            reader: boxed!(reader),
+        },
+        ExprKind::XmlAttributeName { reader, index } => ExprKind::XmlAttributeName {
+            reader: boxed!(reader),
+            index: boxed!(index),
+        },
+        ExprKind::XmlAttributeValue { reader, index } => ExprKind::XmlAttributeValue {
+            reader: boxed!(reader),
+            index: boxed!(index),
+        },
+        ExprKind::XmlText { reader } => ExprKind::XmlText {
+            reader: boxed!(reader),
+        },
         ExprKind::CodecOpen { input } => ExprKind::CodecOpen { input: boxed!(input) },
         ExprKind::CodecBatchRows { batch } => ExprKind::CodecBatchRows { batch: boxed!(batch) },
         ExprKind::CodecBatchColumns { batch } => ExprKind::CodecBatchColumns { batch: boxed!(batch) },
@@ -2210,6 +2233,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             logger: lhs,
             level: rhs,
         }
+        | ExprKind::XmlAttributeName {
+            reader: lhs,
+            index: rhs,
+        }
+        | ExprKind::XmlAttributeValue {
+            reader: lhs,
+            index: rhs,
+        }
         | ExprKind::CodecBatchName { batch: lhs, index: rhs }
         | ExprKind::CodecBatchKind { batch: lhs, index: rhs }
         | ExprKind::CodecBatchFind { batch: lhs, name: rhs }
@@ -2623,6 +2654,11 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BytesAsStr { bytes: recv }
         | ExprKind::WriterFlush { writer: recv }
         | ExprKind::LogFlush { logger: recv }
+        | ExprKind::XmlParse { input: recv }
+        | ExprKind::XmlNext { reader: recv }
+        | ExprKind::XmlName { reader: recv }
+        | ExprKind::XmlAttributeCount { reader: recv }
+        | ExprKind::XmlText { reader: recv }
         | ExprKind::CodecOpen { input: recv }
         | ExprKind::CodecBatchRows { batch: recv }
         | ExprKind::CodecBatchColumns { batch: recv }

@@ -226,6 +226,9 @@ pub enum Scalar {
     /// A `log.logger` payload. The Move handle owns one writer and preserves that writer's region;
     /// aggregate storage therefore carries the same borrowed-descriptor provenance.
     Logger,
+    /// A validated `std.xml` forward-reader payload. The Move handle owns its source string and
+    /// fixed cursor shell; aggregate storage owns and drops that complete pair.
+    XmlReader,
     /// A validated `core.codec` batch view into one borrowed canonical envelope.
     CodecBatch,
     /// Alignment-independent typed column views borrowed from a validated codec batch.
@@ -347,7 +350,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -626,6 +629,9 @@ pub enum Ty {
     /// logger preserves the writer's descriptor provenance and region, latches its first sink
     /// failure, and is Drop-freed through the writer's ordinary flush/close path.
     Logger,
+    /// `xml.reader` (`std.xml`) — a Move forward cursor owning one consumed source string and one
+    /// fixed runtime shell. It borrows no outside storage and is Drop-freed exactly once.
+    XmlReader,
     /// Validated, Copy views over one canonical `core.codec` envelope. Every value retains the
     /// exact input storage region and generation; no variant owns or aligns the underlying bytes.
     CodecBatch,
@@ -927,6 +933,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Builder
         | Ty::Writer
         | Ty::Logger
+        | Ty::XmlReader
         | Ty::CodecBatch
         | Ty::CodecI64Column
         | Ty::CodecF64Column
@@ -999,6 +1006,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
@@ -1064,6 +1072,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
         Ty::Logger => Some(Scalar::Logger),
+        Ty::XmlReader => Some(Scalar::XmlReader),
         Ty::CodecBatch => Some(Scalar::CodecBatch),
         Ty::CodecI64Column => Some(Scalar::CodecI64Column),
         Ty::CodecF64Column => Some(Scalar::CodecF64Column),
@@ -1204,6 +1213,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Logger => Ty::Logger,
+        Scalar::XmlReader => Ty::XmlReader,
         Scalar::CodecBatch => Ty::CodecBatch,
         Scalar::CodecI64Column => Ty::CodecI64Column,
         Scalar::CodecF64Column => Ty::CodecF64Column,
@@ -2473,6 +2483,7 @@ pub fn drop_plan(
                         | Ty::StrFinder
                         | Ty::Writer
                         | Ty::Logger
+                        | Ty::XmlReader
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2935,6 +2946,7 @@ pub fn ty_contains_signature_key(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3207,6 +3219,7 @@ fn ty_contains_http_upgrade(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3320,6 +3333,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -3454,6 +3468,7 @@ fn ty_contains_http_receive_stream(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3536,6 +3551,7 @@ pub fn http_stream_carrier_class(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -3669,6 +3685,7 @@ pub fn http_stream_carrier_class(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -8596,6 +8613,25 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             name: "log.level".to_string(),
             source_name: "log.level".to_string(),
             variants: ["Debug", "Info", "Warn", "Error", "Off"]
+                .into_iter()
+                .map(|variant| hir::EnumVariant {
+                    name: variant.to_string(),
+                    payload: Vec::new(),
+                    field_base: 1,
+                })
+                .collect(),
+        });
+    }
+
+    // The builtin `xml.event` enum (`std.xml`). Its ordinals are source-visible and lower through
+    // the ordinary tag-only enum representation; the runtime uses one-based next statuses.
+    {
+        let xml_event_id = enums.len() as u32;
+        enum_ids.insert("xml.event".to_string(), xml_event_id);
+        enums.push(hir::EnumDef {
+            name: "xml.event".to_string(),
+            source_name: "xml.event".to_string(),
+            variants: ["Start", "End", "Text"]
                 .into_iter()
                 .map(|variant| hir::EnumVariant {
                     name: variant.to_string(),
@@ -15662,6 +15698,16 @@ impl EffectScan<'_> {
                 walk!(logger);
                 self.impure_direct = true;
             }
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => walk!(input),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                walk!(reader);
+                walk!(index);
+            }
             // `core.codec` is entirely in-memory and Pure; walk every operand in source order.
             ExprKind::CodecOpen { input }
             | ExprKind::CodecBatchRows { batch: input }
@@ -19582,6 +19628,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -21690,6 +21737,7 @@ impl<'a> EscapeCheck<'a> {
             Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::Fn(_)
             | Ty::ArenaHandle
             | Ty::ArrayBuilder(_)
@@ -23208,6 +23256,13 @@ impl<'a> EscapeCheck<'a> {
             // `log.new` transfers the writer and therefore inherits its exact region. An owned
             // writer is Static; a writer borrowed from a connection remains connection-bound.
             ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
+            ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeName { reader, .. } => work.push(Work::Eval(reader, depth)),
+            ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. } => values.push(Region::Static),
             ExprKind::CodecOpen { input } => work.push(Work::Eval(input, depth)),
             // The runtime returns one free-standing allocator-owned `array<RowPair>`. It does not
             // use the surrounding arena and retains neither input view, so the result is Static
@@ -24254,6 +24309,13 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoPublicKeyFromJwk { .. }
             | ExprKind::CryptoSign { .. }
             | ExprKind::CryptoVerify { .. }
+            | ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlName { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeName { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => {}
             }
@@ -27791,6 +27853,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(message, depth);
             }
             ExprKind::LogFlush { logger } => self.walk(logger, depth),
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => self.walk(input, depth),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                self.walk(reader, depth);
+                self.walk(index, depth);
+            }
             ExprKind::CodecOpen { input } => self.walk(input, depth),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch } => self.walk(batch, depth),
@@ -29632,6 +29704,9 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::RunBytesStderr { .. }
         | ExprKind::HttpRespBody { .. }
         | ExprKind::HttpCtxBody { .. } => StorageVariantPolicy::UnknownView,
+        ExprKind::XmlName { .. } | ExprKind::XmlAttributeName { .. } => {
+            StorageVariantPolicy::UnknownView
+        }
 
         ExprKind::CallFnValue { .. } | ExprKind::Call { .. } | ExprKind::RawCall { .. } => {
             StorageVariantPolicy::Call
@@ -29778,6 +29853,11 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::LogEnabled { .. }
         | ExprKind::LogLine { .. }
         | ExprKind::LogFlush { .. }
+        | ExprKind::XmlParse { .. }
+        | ExprKind::XmlNext { .. }
+        | ExprKind::XmlAttributeCount { .. }
+        | ExprKind::XmlAttributeValue { .. }
+        | ExprKind::XmlText { .. }
         | ExprKind::CodecBatchRows { .. }
         | ExprKind::CodecBatchColumns { .. }
         | ExprKind::CodecBatchKind { .. }
@@ -36769,6 +36849,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
             // Logger construction transfers the writer without widening or severing its region.
             ExprKind::LogNew { output, .. } => self.borrow_sources(output),
+            ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeName { reader, .. } => self.storage_roots(reader),
             ExprKind::CodecOpen { input } => self.storage_roots(input),
             ExprKind::CodecBatchName { batch, .. }
             | ExprKind::CodecBatchI64s { batch, .. }
@@ -37143,6 +37225,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CryptoPrivateKeyFromPem { .. } | ExprKind::CryptoPublicKeyFromPem { .. }
             | ExprKind::CryptoPublicKeyFromJwk { .. } | ExprKind::CryptoSign { .. }
             | ExprKind::CryptoVerify { .. }
+            | ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. }
             // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
             // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
             // whose `{start,end}` are Copy byte offsets, NOT a view into the text; `find_all`/`split`
@@ -40122,6 +40209,7 @@ impl<'a> MoveCheck<'a> {
     fn action_values(expression: &Expr) -> Vec<&Expr> {
         match &expression.kind {
             ExprKind::LogNew { output, .. } => vec![output],
+            ExprKind::XmlParse { input } => vec![input],
             ExprKind::StructLit { fields, .. } => fields.iter().collect(),
             ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
                 elems.iter().collect()
@@ -40482,6 +40570,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultErr(_)
             | ExprKind::EnumValue { .. }
             | ExprKind::LogNew { .. }
+            | ExprKind::XmlParse { .. }
             | ExprKind::Closure { .. }
                 if !deferred_action =>
             {
@@ -40617,6 +40706,10 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RandSample { rng, .. } => {
                 Some(SourceVisibleMutationAction::Source(rng))
             }
+            // Advancing the cursor invalidates every zero-copy name view of the current event.
+            // Treat the reader's owned input as mutable storage so both local and borrow-mut
+            // parameter roots end at this exact call boundary.
+            ExprKind::XmlNext { reader } => Some(SourceVisibleMutationAction::Storage(reader)),
             ExprKind::RandShuffle { rng, xs, .. } => {
                 Some(SourceVisibleMutationAction::Shuffle {
                     source: rng,
@@ -40651,6 +40744,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::ResultErr(_)
                 | ExprKind::EnumValue { .. }
                 | ExprKind::LogNew { .. }
+                | ExprKind::XmlParse { .. }
                 | ExprKind::Closure { .. }
         )
     }
@@ -42683,6 +42777,16 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, message, moved, false, false);
             }
             ExprKind::LogFlush { logger } => move_expr!(self, logger, moved, false, false),
+            ExprKind::XmlParse { input } => move_expr_deferred!(self, input, moved),
+            ExprKind::XmlNext { reader }
+            | ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeCount { reader }
+            | ExprKind::XmlText { reader } => move_expr!(self, reader, moved, false, false),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, index, moved, false, false);
+            }
             ExprKind::CodecOpen { input } => move_expr!(self, input, moved, false, false),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch }
@@ -43906,6 +44010,8 @@ struct Checker<'a, 't> {
     json_kind_enum_id: u32,
     /// The id of the builtin `log.level` enum. Runtime calls receive only its validated field 0.
     log_level_enum_id: u32,
+    /// The id of the builtin `xml.event` enum returned by `xml.reader.next()`.
+    xml_event_enum_id: u32,
     /// The id of the builtin `codec.kind` enum. Its ordinal is the canonical wire tag.
     codec_kind_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
@@ -44133,6 +44239,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `Error`), so its id is always present in `enum_ids`.
             json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
             log_level_enum_id: *enum_ids.get("log.level").expect("builtin log.level enum registered"),
+            xml_event_enum_id: *enum_ids
+                .get("xml.event")
+                .expect("builtin xml.event enum registered"),
             codec_kind_enum_id: *enum_ids.get("codec.kind").expect("builtin codec.kind enum registered"),
             structs,
             struct_templates,
@@ -46995,6 +47104,17 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return Ok(Some("codec.kind".to_string()));
         }
+        if flat == "xml.event" {
+            if !self.imports.contains("std.xml") {
+                self.diags.error(
+                    "`xml.event` requires `import std.xml` — the capability is not imported"
+                        .to_string(),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some("xml.event".to_string()));
+        }
         if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
             if let Some(required) = alias.required_import
                 && !self.imports.contains(required)
@@ -49498,6 +49618,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.log", "log.new", span);
                 return self.check_log_new(args, span);
             }
+            if module == "xml" && method == "parse" {
+                self.require_import("std.xml", "xml.parse", span);
+                return self.check_xml_parse(args, span);
+            }
             if module == "codec" && matches!(method, "open" | "encoder") {
                 self.require_import("core.codec", &format!("codec.{method}"), span);
                 return self.check_codec_constructor(method, args, span);
@@ -49940,6 +50064,30 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
+        }
+        if matches!(
+            method,
+            "next" | "name" | "attribute_count" | "attribute_name" | "attribute_value" | "text"
+        ) && self
+            .resolve_place(recv)
+            .is_some_and(|(_, _, ty)| ty == Ty::XmlReader)
+        {
+            let recv_expr = self.check_expr(recv, None);
+            return self.check_xml_reader_method(recv, recv_expr, method, args, span);
+        }
+        if matches!(
+            method,
+            "attribute_count" | "attribute_name" | "attribute_value" | "text"
+        ) {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Error {
+                return err;
+            }
+            self.diags.error(
+                format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                span,
+            );
+            return err;
         }
         if matches!(
             method,
@@ -61308,6 +61456,137 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::WriterStd { fd, buffered: true }, ty: Ty::Writer, span }
     }
 
+    fn check_xml_parse(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [input] = args else {
+            self.diags.error(
+                format!(
+                    "'xml.parse' expects 1 owned string argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err;
+        };
+        let input = self.check_expr(input, Some(Ty::String));
+        if input.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::XmlParse {
+                input: Box::new(input),
+            },
+            ty: Ty::Result(Scalar::XmlReader, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    fn check_xml_reader_method(
+        &mut self,
+        recv: &ast::Expr,
+        recv_expr: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        self.require_import("std.xml", &format!("xml.reader.{method}"), span);
+        let Some((reader_id, _)) = self.place_local(recv) else {
+            self.diags.error(
+                format!("'.{method}()' needs a bound xml.reader local"),
+                recv.span,
+            );
+            return err;
+        };
+        if method == "next" && !self.locals[reader_id as usize].is_mut {
+            let name = self.locals[reader_id as usize].name.clone();
+            self.diags.error(
+                format!("cannot advance immutable xml.reader '{name}' (declare with `mut`)"),
+                recv.span,
+            );
+            return err;
+        }
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        match method {
+            "next" | "name" | "attribute_count" | "text" => {
+                if !args.is_empty() {
+                    self.diags.error(
+                        format!("'.{method}()' takes no arguments, got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let kind = match method {
+                    "next" => ExprKind::XmlNext {
+                        reader: Box::new(recv_expr),
+                    },
+                    "name" => ExprKind::XmlName {
+                        reader: Box::new(recv_expr),
+                    },
+                    "attribute_count" => ExprKind::XmlAttributeCount {
+                        reader: Box::new(recv_expr),
+                    },
+                    "text" => ExprKind::XmlText {
+                        reader: Box::new(recv_expr),
+                    },
+                    _ => unreachable!(),
+                };
+                let ty = match method {
+                    "next" => Ty::Option(Scalar::Enum(self.xml_event_enum_id)),
+                    "name" => Ty::Str,
+                    "attribute_count" => i64_ty,
+                    "text" => Ty::String,
+                    _ => unreachable!(),
+                };
+                Expr { kind, ty, span }
+            }
+            "attribute_name" | "attribute_value" => {
+                let [index] = args else {
+                    self.diags.error(
+                        format!("'.{method}()' takes 1 index argument, got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                };
+                let index = self.check_expr(index, None);
+                if index.ty == Ty::Error
+                    || !self.require_i64_arg(index.ty, index.span, &format!("'.{method}()' index"))
+                {
+                    return err;
+                }
+                let ty = if method == "attribute_name" {
+                    Ty::Str
+                } else {
+                    Ty::String
+                };
+                let kind = if method == "attribute_name" {
+                    ExprKind::XmlAttributeName {
+                        reader: Box::new(recv_expr),
+                        index: Box::new(index),
+                    }
+                } else {
+                    ExprKind::XmlAttributeValue {
+                        reader: Box::new(recv_expr),
+                        index: Box::new(index),
+                    }
+                };
+                Expr { kind, ty, span }
+            }
+            _ => unreachable!("xml reader dispatch is closed"),
+        }
+    }
+
     /// `log.new(output, minimum)` transfers one writer into a region-identical logger. Both
     /// arguments are checked before move analysis consumes `output`.
     fn check_log_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -64290,6 +64569,16 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(message);
             }
             ExprKind::LogFlush { logger } => self.finalize_expr(logger),
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => self.finalize_expr(input),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(index);
+            }
             ExprKind::CodecOpen { input } => self.finalize_expr(input),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch }
@@ -65009,6 +65298,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
     "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
     "std.log",
+    "std.xml",
 ];
 
 /// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
@@ -65338,6 +65628,7 @@ fn ty_name(ty: Ty) -> String {
         // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::Writer => "writer".to_string(),
         Ty::Logger => "log.logger".to_string(),
+        Ty::XmlReader => "xml.reader".to_string(),
         Ty::CodecBatch => "codec.batch".to_string(),
         Ty::CodecI64Column => "codec.i64_column".to_string(),
         Ty::CodecF64Column => "codec.f64_column".to_string(),
@@ -65745,6 +66036,7 @@ fn resolved_type_source_spelling(
             Ty::Builder => "builder".to_string(),
             Ty::Writer => "writer".to_string(),
             Ty::Logger => "log.logger".to_string(),
+            Ty::XmlReader => "xml.reader".to_string(),
             Ty::CodecBatch => "codec.batch".to_string(),
             Ty::CodecI64Column => "codec.i64_column".to_string(),
             Ty::CodecF64Column => "codec.f64_column".to_string(),
@@ -66872,7 +67164,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -66962,6 +67254,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -67503,6 +67796,31 @@ fn resolve_type(
         } else {
             cx.enum_ids
                 .get("log.level")
+                .map(|&id| Ty::Enum(id))
+                .unwrap_or(Ty::Error)
+        };
+    }
+    // `std.xml` exposes one tag-only enum and one opaque Move reader, both qualified.
+    if path.segments.len() == 2
+        && path.segments[0].name == "xml"
+        && matches!(name, "event" | "reader")
+    {
+        if !cx.builtin_imports.contains("std.xml") {
+            diags.error(
+                format!("`xml.{name}` requires `import std.xml` — the capability is not imported"),
+                span,
+            );
+            return Ty::Error;
+        }
+        if !args.is_empty() {
+            diags.error(format!("`xml.{name}` takes no type arguments"), span);
+            return Ty::Error;
+        }
+        return if name == "reader" {
+            Ty::XmlReader
+        } else {
+            cx.enum_ids
+                .get("xml.event")
                 .map(|&id| Ty::Enum(id))
                 .unwrap_or(Ty::Error)
         };
@@ -68343,6 +68661,7 @@ pub fn is_move_handle(ty: Ty) -> bool {
 pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Writer,
     Ty::Logger,
+    Ty::XmlReader,
     Ty::CodecEncoder,
     Ty::Reader,
     Ty::Buffer,
@@ -68756,6 +69075,7 @@ fn enum_payload_ok(
         // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
         Scalar::ResponseBuilder
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
@@ -70118,7 +70438,7 @@ mod tests {
         // wildcard-free policy above classifies them explicitly beside the existing package and
         // core operations.
         assert_eq!(
-            variants, 315,
+            variants, 322,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
