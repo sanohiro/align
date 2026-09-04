@@ -160,6 +160,8 @@ pub struct ImportedFn {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: ReturnCleanupAbi,
+    /// The dependency interface was emitted only after producer validation of this body.
+    pub producer_certified: bool,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
     /// after declaration validation because imported callable ABI records are unchanged.
     pub effect: crate::FnEffect,

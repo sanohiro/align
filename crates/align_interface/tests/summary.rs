@@ -4,12 +4,10 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    DecodeError, Effect, Hash128, IParam, IType, ITypeParam,
-    ImportCompatibilityError,
-    InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
-    deserialize, deserialize_for_target, encode_interface_surface, serialize, summary_to_source,
-    validate_for_import,
-    OwnedJsonObjectFormat, OwnedJsonTarget,
+    DecodeError, Effect, Hash128, IParam, IType, ITypeParam, ImportCompatibilityError,
+    InterfaceSummary, OwnedJsonObjectFormat, OwnedJsonTarget, ParamMode, ProducerCertification,
+    ReturnBorrowSummary, ReturnRegionSummary, build_summaries, deserialize, deserialize_for_target,
+    encode_interface_surface, serialize, summary_to_source, validate_for_import,
 };
 
 /// One in-memory source module for a test program.
@@ -125,7 +123,10 @@ fn sync_generic_type_bodies(summary: &mut InterfaceSummary) {
 /// Parse + check + lower the given units and build their interface summaries. Asserts the program
 /// type-checks (a summary of an ill-typed program is meaningless). Fresh data structures every call,
 /// so building twice exercises determinism against any internal HashMap iteration order.
-fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
+fn try_summaries(
+    units: &[Unit],
+    certify_local_bodies: bool,
+) -> Result<Vec<InterfaceSummary>, String> {
     let mut diags = align_diag::Diagnostics::new();
     let asts: Vec<align_ast::File> = units
         .iter()
@@ -154,8 +155,26 @@ fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
         triple: "x86_64-pc-linux-gnu".to_string(),
         object_format: OwnedJsonObjectFormat::Elf,
     };
-    build_summaries(&modules, &hir, &mir, &sources, &target)
-        .expect("checked fixtures have encodable interface summaries")
+    let producer_certifications = if certify_local_bodies {
+        mir.fns
+            .iter()
+            .map(|function| function.name.as_str().to_owned())
+            .collect()
+    } else {
+        Default::default()
+    };
+    build_summaries(
+        &modules,
+        &hir,
+        &mir,
+        &sources,
+        &producer_certifications,
+        &target,
+    )
+}
+
+fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
+    try_summaries(units, true).expect("checked fixtures have encodable interface summaries")
 }
 
 /// A single-entry-module program.
@@ -787,6 +806,36 @@ fn deserialize_unknown_version_fails_closed() {
         Err(DecodeError::UnknownVersion(v)) => assert_eq!(v, 6),
         other => panic!("expected UnknownVersion, got {other:?}"),
     }
+    bytes[..4].copy_from_slice(&8u32.to_le_bytes());
+    assert_eq!(deserialize(&bytes), Err(DecodeError::UnknownVersion(8)));
+}
+
+#[test]
+fn interface_publication_requires_non_generic_producer_certification() {
+    let error = try_summaries(
+        &[unit(
+            "main",
+            true,
+            "pub fn value() -> string = \"x\".clone()\nfn main() -> i32 = 0\n",
+        )],
+        false,
+    )
+    .expect_err("an uncertified non-generic body must not be published");
+    assert_eq!(error, "function 'value' lacks MIR producer certification");
+
+    let generic = try_summaries(
+        &[unit(
+            "main",
+            true,
+            "pub fn identity<T>(value: T) -> T = value\nfn main() -> i32 = 0\n",
+        )],
+        false,
+    )
+    .expect("a generic body is revalidated by its consumer");
+    assert_eq!(
+        generic[0].fns[0].producer_certification,
+        ProducerCertification::RevalidateGenericBody
+    );
 }
 
 #[test]
@@ -2529,14 +2578,14 @@ fn parallel_transfer_roots_are_canonical_and_change_the_interface_hash() {
 }
 
 #[test]
-fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
+fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let summary =
         one("pub fn inspect(out value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
     let surface = encode_interface_surface(&summary);
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "08000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000000000000000000000000000000000000000000000000000000000"
+        "09000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000001000000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2553,28 +2602,46 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     );
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
-    // effect, empty parallel-transfer sequence, resource-hook-body bit, generic body option, then
-    // the empty top-level struct/owned-descriptor/enum/resource/const sequences.
+    // producer certificate, effect, empty parallel-transfer sequence, resource-hook-body bit,
+    // generic body option, then the empty top-level sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 30] = 0xff;
+    bad_borrow[surface.len() - 31] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 29] = 0xff;
+    bad_region[surface.len() - 30] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 28] = 0xff;
+    bad_cleanup[surface.len() - 29] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {
             what: "return cleanup ABI",
             tag: 0xff,
         })
+    );
+    let mut bad_certificate = serialize(&summary);
+    bad_certificate[surface.len() - 28] = 0xff;
+    assert_eq!(
+        deserialize(&bad_certificate),
+        Err(DecodeError::BadTag {
+            what: "producer certification",
+            tag: 0xff,
+        })
+    );
+
+    let mut mismatched = summary;
+    mismatched.fns[0].producer_certification = ProducerCertification::RevalidateGenericBody;
+    assert_eq!(
+        deserialize(&serialize(&mismatched)),
+        Err(DecodeError::InvalidSummary(
+            "producer certification disagrees with function body presence"
+        ))
     );
 }
 

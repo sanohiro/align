@@ -7214,6 +7214,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         hir::ReturnRegionSummary,
         hir::ReturnCleanupAbi,
         Vec<u32>,
+        bool,
     ),
 >;
 
@@ -9604,7 +9605,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _, _)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -9980,13 +9981,16 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     }
                     let return_provenance_known =
                         external_return_provenance.contains_key(&mangled);
+                    let producer_certified = external_return_provenance
+                        .get(&mangled)
+                        .is_some_and(|(_, _, _, _, certified)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots)| roots.clone())
+                        .map(|(_, _, _, roots, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10016,6 +10020,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
                         return_cleanup: sig.return_cleanup,
+                        producer_certified,
                         effect,
                         parallel_transfer_params,
                     });
