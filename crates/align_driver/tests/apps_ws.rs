@@ -8,33 +8,53 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
-const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
-const WEB_ROOT: &str = include_str!("../../../apps/web/pkg/web.align");
-const QUERY: &str = include_str!("../../../apps/web/pkg/web/internal/query.align");
-const WS_ROOT: &str = include_str!("../../../apps/ws/pkg/ws.align");
+fn router() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/internal/router.align"));
+    *SOURCE
+}
+fn types() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/types.align"));
+    *SOURCE
+}
+fn web_root() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web.align"));
+    *SOURCE
+}
+fn query() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/internal/query.align"));
+    *SOURCE
+}
+fn ws_root() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/ws/pkg/ws.align"));
+    *SOURCE
+}
 
 fn sources_with_ws<'a>(main: &'a str, ws_root: &'a str) -> [(&'a str, &'a str); 6] {
     [
-        ("pkg/web/internal/router.align", ROUTER),
-        ("pkg/web/internal/query.align", QUERY),
-        ("pkg/web/types.align", TYPES),
-        ("pkg/web.align", WEB_ROOT),
+        ("pkg/web/internal/router.align", router()),
+        ("pkg/web/internal/query.align", query()),
+        ("pkg/web/types.align", types()),
+        ("pkg/web.align", web_root()),
         ("pkg/ws.align", ws_root),
         ("main.align", main),
     ]
 }
 
 fn sources(main: &str) -> [(&str, &str); 6] {
-    sources_with_ws(main, WS_ROOT)
+    sources_with_ws(main, ws_root())
 }
 
 #[test]
 fn shipped_package_chain_checks_whole_and_per_unit() {
-    assert!(TYPES.contains("values_valid: bool"));
-    assert!(!TYPES.contains("validate: fn(slice<str>)"));
-    assert!(!ROUTER.contains("handler.validate("));
-    assert!(WS_ROOT.contains("protocols_valid(protocols)"));
+    assert!(types().contains("values_valid: bool"));
+    assert!(!types().contains("validate: fn(slice<str>)"));
+    assert!(!router().contains("handler.validate("));
+    assert!(ws_root().contains("protocols_valid(protocols)"));
     let main = r#"module main
 import pkg.ws
 import pkg.web
@@ -746,8 +766,8 @@ fn receive_resource_probe_pins_binary_text_and_maximum_live_byte_peaks() {
     if !backend_available() {
         return;
     }
-    let max_message = source_i64_constant(WS_ROOT, "MAX_MESSAGE_BYTES");
-    let scratch = source_i64_constant(WS_ROOT, "SCRATCH_BYTES");
+    let max_message = source_i64_constant(ws_root(), "MAX_MESSAGE_BYTES");
+    let scratch = source_i64_constant(ws_root(), "SCRATCH_BYTES");
     assert_eq!(128 + scratch + 2 * max_message, 1_073_774_720);
     let server = start_server_with(RESOURCE_APP, "apps-ws-resource");
 
@@ -779,11 +799,11 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
     if !backend_available() {
         return;
     }
-    let bounded_ws = WS_ROOT.replace(
+    let bounded_ws = ws_root().replace(
         "SOURCE_WORK_BYTES: i64 := 1048576",
         "SOURCE_WORK_BYTES: i64 := 24",
     );
-    assert_ne!(bounded_ws, WS_ROOT, "the owner must rewrite the one shipped work constant");
+    assert_ne!(bounded_ws, ws_root(), "the owner must rewrite the one shipped work constant");
     let server = start_server_with_ws(APP, &bounded_ws, "apps-ws-source-work");
 
     for (opcode, label) in [(0u8, "continuation"), (9, "Ping"), (10, "Pong")] {
@@ -829,11 +849,11 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
         );
     }
 
-    let control_ws = WS_ROOT.replace(
+    let control_ws = ws_root().replace(
         "SOURCE_WORK_BYTES: i64 := 1048576",
         "SOURCE_WORK_BYTES: i64 := 28",
     );
-    assert_ne!(control_ws, WS_ROOT, "the nonempty-control owner must rewrite the bound");
+    assert_ne!(control_ws, ws_root(), "the nonempty-control owner must rewrite the bound");
     let control_server = start_server_with_ws(APP, &control_ws, "apps-ws-control-work");
     for (opcode, label) in [(9u8, "Ping"), (10, "Pong")] {
         let mut exact = open_websocket(&control_server);

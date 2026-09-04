@@ -16683,7 +16683,7 @@ fn requested_live_insert(kind: u8, ptr: *mut u8, bytes: usize) {
     if !probe.active {
         return;
     }
-    let old = probe.allocations.insert((kind, ptr as usize), bytes).unwrap_or(0);
+    let old = probe.allocations.insert((kind, ptr.addr()), bytes).unwrap_or(0);
     probe.live = probe.live.saturating_sub(old).saturating_add(bytes);
     probe.peak = probe.peak.max(probe.live);
 }
@@ -16697,7 +16697,7 @@ fn requested_live_remove(kind: u8, ptr: *mut u8) -> usize {
     if !probe.active {
         return 0;
     }
-    let removed = probe.allocations.remove(&(kind, ptr as usize)).unwrap_or(0);
+    let removed = probe.allocations.remove(&(kind, ptr.addr())).unwrap_or(0);
     probe.live = probe.live.saturating_sub(removed);
     removed
 }
@@ -16708,7 +16708,7 @@ fn requested_live_realloc_begin(ptr: *mut u8, new_bytes: usize) -> usize {
     if !probe.active {
         return 0;
     }
-    let old = probe.allocations.get(&(0, ptr as usize)).copied().unwrap_or(0);
+    let old = probe.allocations.get(&(0, ptr.addr())).copied().unwrap_or(0);
     probe.peak = probe.peak.max(probe.live.saturating_add(new_bytes));
     old
 }
@@ -16720,9 +16720,9 @@ fn requested_live_realloc_commit(old_ptr: *mut u8, new_ptr: *mut u8, old_bytes: 
         return;
     }
     if !old_ptr.is_null() {
-        probe.allocations.remove(&(0, old_ptr as usize));
+        probe.allocations.remove(&(0, old_ptr.addr()));
     }
-    probe.allocations.insert((0, new_ptr as usize), new_bytes);
+    probe.allocations.insert((0, new_ptr.addr()), new_bytes);
     probe.live = probe.live.saturating_sub(old_bytes).saturating_add(new_bytes);
     probe.peak = probe.peak.max(probe.live);
 }
@@ -16737,7 +16737,7 @@ fn requested_live_transfer_builder_shell(builder: *mut ArrayBuilder, data: *mut 
     if !probe.active {
         return;
     }
-    let key = (0, data as usize);
+    let key = (0, data.addr());
     let bytes = probe.allocations.get(&key).copied().unwrap_or(0).saturating_add(shell);
     probe.allocations.insert(key, bytes);
     probe.live = probe.live.saturating_add(shell);
@@ -25094,14 +25094,14 @@ pub unsafe extern "C" fn align_rt_http_ctx_header(
 
 #[inline]
 fn abi_ptr_is_aligned<T>(ptr: *const T) -> bool {
-    !ptr.is_null() && (ptr as usize).is_multiple_of(core::mem::align_of::<T>())
+    !ptr.is_null() && ptr.addr().is_multiple_of(core::mem::align_of::<T>())
 }
 
 /// Validate one header-query text argument before forming its slice. Query rows deliberately
 /// abort on malformed ABI input: returning zero/false would alias an ordinary absent result.
 unsafe fn http_query_token_arg<'a>(ptr: *const u8, len: i64, what: &str) -> &'a [u8] {
     let Ok(n) = safe_len(len) else { panic_abort(what) };
-    if n > isize::MAX as usize || (n > 0 && ptr.is_null()) {
+    if n > isize::MAX.unsigned_abs() || (n > 0 && ptr.is_null()) {
         panic_abort(what);
     }
     let bytes = if n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(ptr, n) } };
@@ -25809,13 +25809,16 @@ impl HttpUpgrade {
         let Some(remaining) = deadline.remaining() else { return Ok(false) };
         let nanos = remaining.as_nanos().min(i64::MAX as u128) as i64;
         let tv = timeval_from_ns(nanos.max(1));
+        let Ok(optlen) = libc::socklen_t::try_from(core::mem::size_of::<Timeval>()) else {
+            return Err(AL_INVALID);
+        };
         let rc = unsafe {
             setsockopt(
                 self.fd,
                 SOL_SOCKET,
                 optname,
                 (&tv as *const Timeval).cast(),
-                core::mem::size_of::<Timeval>() as u32,
+                optlen,
             )
         };
         if rc == 0 {
@@ -26045,7 +26048,9 @@ pub unsafe extern "C" fn align_rt_http_upgrade_read_exact(
         }
         let n = unsafe { read(upgrade.fd, dst.add(done).cast(), count - done) };
         if n > 0 {
-            done += n as usize;
+            let Ok(read) = usize::try_from(n) else { return upgrade.fail(AL_CODE) };
+            let Some(next) = done.checked_add(read) else { return upgrade.fail(AL_CODE) };
+            done = next;
             continue;
         }
         if n == 0 {
@@ -26080,7 +26085,7 @@ pub unsafe extern "C" fn align_rt_http_upgrade_write(
     len: i64,
 ) -> i32 {
     let Ok(len) = safe_len(len) else { return AL_INVALID };
-    if len > isize::MAX as usize || (len > 0 && ptr.is_null()) {
+    if len > isize::MAX.unsigned_abs() || (len > 0 && ptr.is_null()) {
         return AL_INVALID;
     }
     let mut bytes = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(ptr, len) } };
@@ -26103,7 +26108,9 @@ pub unsafe extern "C" fn align_rt_http_upgrade_write(
         }
         let n = unsafe { send(upgrade.fd, bytes.as_ptr().cast(), bytes.len(), flags) };
         if n > 0 {
-            bytes = &bytes[n as usize..];
+            let Ok(written) = usize::try_from(n) else { return upgrade.fail(AL_CODE) };
+            let Some(remaining) = bytes.get(written..) else { return upgrade.fail(AL_CODE) };
+            bytes = remaining;
             continue;
         }
         if n == 0 {

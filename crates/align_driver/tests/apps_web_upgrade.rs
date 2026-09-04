@@ -12,10 +12,26 @@ use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-const ROUTER: &str = include_str!("../../../apps/web/pkg/web/internal/router.align");
-const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
-const WEB_ROOT: &str = include_str!("../../../apps/web/pkg/web.align");
-const QUERY: &str = include_str!("../../../apps/web/pkg/web/internal/query.align");
+fn router() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/internal/router.align"));
+    *SOURCE
+}
+fn types() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/types.align"));
+    *SOURCE
+}
+fn web_root() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web.align"));
+    *SOURCE
+}
+fn query() -> &'static str {
+    static SOURCE: std::sync::LazyLock<&str> =
+        std::sync::LazyLock::new(|| fixture("apps/web/pkg/web/internal/query.align"));
+    *SOURCE
+}
 
 const APP: &str = r#"module main
 import std.cli
@@ -167,10 +183,10 @@ fn start_server() -> Server {
     let built = build_exe_multi(
         "apps-web-upgrade",
         &[
-            ("pkg/web/internal/router.align", ROUTER),
-            ("pkg/web/internal/query.align", QUERY),
-            ("pkg/web/types.align", TYPES),
-            ("pkg/web.align", WEB_ROOT),
+            ("pkg/web/internal/router.align", router()),
+            ("pkg/web/internal/query.align", query()),
+            ("pkg/web/types.align", types()),
+            ("pkg/web.align", web_root()),
             ("main.align", APP),
         ],
         "main.align",
@@ -238,8 +254,8 @@ fn upgrade_dispatch_group_middleware_prepare_transfer_and_pump_matrix() {
     if !backend_available() {
         return;
     }
-    assert!(!TYPES.contains("validate: fn(slice<str>)"));
-    assert!(!ROUTER.contains("handler.validate("));
+    assert!(!types().contains("validate: fn(slice<str>)"));
+    assert!(!router().contains("handler.validate("));
     let mut server = start_server();
 
     for (path, pattern) in [

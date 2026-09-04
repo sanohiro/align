@@ -8715,7 +8715,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
         Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
-        Scalar::HttpUpgrade => unreachable!("an http_upgrade handle is not a box/array payload"),
+        // Keep sizing total for malformed MIR; valid programs never treat the opaque handle as a
+        // box/array payload, and its ABI representation is one pointer.
+        Scalar::HttpUpgrade => 8,
         // Not currently admitted as a box/array payload, but keep this size function total for
         // malformed MIR and consistent with the handle's one-pointer ABI.
         Scalar::HttpReadStream | Scalar::HttpSseStream => 8,
@@ -16927,7 +16929,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_headers_count returns i64")
+                    .ok_or_else(|| self.err("http_headers_count returned no value"))?
             }
             Rvalue::HttpHeadersTokensValid { headers, name } => {
                 let headers = self.operand(headers)?.into_pointer_value();
@@ -16941,7 +16943,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_headers_tokens_valid returns i32")
+                    .ok_or_else(|| self.err("http_headers_tokens_valid returned no value"))?
             }
             Rvalue::HttpHeadersContainsToken {
                 headers,
@@ -16975,7 +16977,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_headers_contains_token returns i32")
+                    .ok_or_else(|| self.err("http_headers_contains_token returned no value"))?
             }
             Rvalue::HttpCtxUpgradeReady { ctx } => {
                 let ctx = self.operand(ctx)?.into_pointer_value();
@@ -16988,7 +16990,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_ctx_upgrade_ready returns i32")
+                    .ok_or_else(|| self.err("http_ctx_upgrade_ready returned no value"))?
             }
             Rvalue::HttpCtxBody { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
@@ -17058,7 +17060,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_respond_upgrade returns i32 status")
+                    .ok_or_else(|| self.err("http_respond_upgrade returned no value"))?
             }
             Rvalue::HttpUpgradeReadExact {
                 upgrade,
@@ -17077,7 +17079,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_upgrade_read_exact returns i32 status")
+                    .ok_or_else(|| self.err("http_upgrade_read_exact returned no value"))?
             }
             Rvalue::HttpUpgradeWrite { upgrade, data } => {
                 let upgrade = self.operand(upgrade)?.into_pointer_value();
@@ -17091,7 +17093,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_upgrade_write returns i32 status")
+                    .ok_or_else(|| self.err("http_upgrade_write returned no value"))?
             }
             Rvalue::HttpUpgradeDeadline {
                 upgrade,
@@ -17108,7 +17110,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_upgrade_deadline returns i32 status")
+                    .ok_or_else(|| self.err("http_upgrade_deadline returned no value"))?
             }
             Rvalue::HttpUpgradeShutdown { upgrade } => {
                 let upgrade = self.operand(upgrade)?.into_pointer_value();
@@ -17121,7 +17123,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("http_upgrade_shutdown returns i32 status")
+                    .ok_or_else(|| self.err("http_upgrade_shutdown returned no value"))?
             }
             Rvalue::HttpStreamSend { stream, chunk, event } => {
                 let s = self.operand(stream)?.into_pointer_value();
