@@ -1804,18 +1804,11 @@ write_static(", score=")
 write_value(score)
 ```
 
-### Escaping Context
-
-```align
-html "<p>{name}</p>"
-json "{name}"
-```
-
-Raw output is explicit.
-
-```align
-raw(name)
-```
+Only the plain `template "…"` language form is shipped. The former `html "…"`, JSON-template,
+and expression-level `raw(...)` sketches are not accepted syntax. The proposed `pkg.template`
+capability leaves this formatter unchanged and instead supplies an opaque HTML builder: ordinary
+`write` escapes text with the shared five-entity table, while the package's `raw` function is the
+one explicit unescaped append. Contextual language-template parsing remains deferred.
 
 ---
 
@@ -2707,10 +2700,10 @@ total := rows.where(.active).pay.sum()?
 ### core.template
 
 ```text
-template
-html
-json template
-raw
+template          // shipped plain scalar formatter
+html              // deferred language form; proposed pkg.template is a separate opaque builder
+json template     // deferred; json.encode owns shipped JSON formatting
+raw               // no expression form; proposed only as pkg.template's explicit append function
 ```
 
 ### core.hash
@@ -3554,7 +3547,7 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The implemented first-party packages in this repository are exactly six vendorable subtrees:
+The implemented first-party packages in this repository are exactly seven vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3566,12 +3559,15 @@ pkg.frame          // bounded stable inner equi-join over typed codec columns
 pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 pkg.csv            // typed in-memory CSV direct-to-SoA decoder
+pkg.ws             // RFC 6455 server routes over pkg.web HTTP Upgrade
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
 `pkg.kv.internal.resource`.
 `pkg.csv` is one vendorable subtree with root `pkg.csv` and empty compiler-private descriptor
 module `pkg.csv.internal.descriptor`.
+`pkg.ws` is one vendorable subtree with root `pkg.ws`; it imports the public `pkg.web` boundary and
+does not add another listener or router.
 
 `pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
 versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
@@ -3855,7 +3851,7 @@ dialect inference, dynamic/owned rows, nullable columns, and recovery remain out
 grammar, conversions, precedence, lifetime, cache identity, ABI reservation, and closure matrix:
 `docs/impl/pkg-design/csv.md`.
 
-The designed `pkg.ws` v1 surface is one RFC 6455 server route over `pkg.web`:
+The implemented `pkg.ws` v1 surface is one RFC 6455 server route over `pkg.web`:
 
 ```text
 pkg.ws.Message { Text(string), Binary(array<u8>), Close(pkg.ws.Close) }
@@ -3927,13 +3923,49 @@ answering Ping without resetting that budget, then performs the server TCP close
 HTTP/2, extensions/compression, raw frames,
 standalone serving, async/background heartbeat, and connection registries are outside v1.
 
-Implementation activates the third web handler variant, three repeated-header/token queries, one
+Implementation activated the third web handler variant, three repeated-header/token queries, one
 version/residual readiness query, checked 101 transfer, upgraded transport operations, package
 source, and ten runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
 preserving its empty curated LLVM function-attribute set rather than adding `nounwind` to shared
-shape identity; the Rust C exports still do not unwind across C, and A124 remains unused. The design
-alone changes no shipped inventory. Exact surface, validation order, frame/close grammar,
+shape identity; the Rust C exports still do not unwind across C, and A124 remains unused. Exact
+surface, validation order, frame/close grammar,
 allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
+
+The proposed `pkg.template` v1 surface is one escape-by-default HTML text builder:
+
+```text
+pkg.template.html_builder  // opaque Move resource
+pkg.template.html() -> html_builder
+pkg.template.write(borrow mut output: html_builder, value: str)
+pkg.template.raw(borrow mut output: html_builder, value: str)
+pkg.template.to_string(output: html_builder) -> string
+```
+
+`write` maps exactly `& < > " '` to `&amp; &lt; &gt; &quot; &#39;`, reusing the one table
+owned by `encoding.html_escape`, and copies all other valid UTF-8 bytes unchanged. Its result is
+safe as element text or as the complete contents of an already-quoted attribute; it does not make
+unquoted attributes, URL schemes, event handlers, CSS, JavaScript, comments, or constructed names
+safe. `raw` is the sole public unescaped append and therefore the explicit trust boundary.
+
+The opaque resource never exposes its ordinary builder or a partial view. `html` creates one empty
+Move owner, both append operations borrow it mutably and allocate no temporary escaped string, and
+`to_string` is the sole finisher: it consumes the owner and transfers the allocator-compatible
+payload into an owned string without a copy. Unfinished Drop frees shell and payload once. There
+are no recoverable errors; detectable malformed compiler-private state and checked length overflow
+abort before mutation, while OOM aborts. Plain language `template "..."` remains the one scalar
+formatter and does not gain escaping.
+
+The proposed canonical package has root `pkg.template`, empty compiler-private descriptor module
+`pkg.template.internal.descriptor`, and private resource-hook module
+`pkg.template.internal.resource`. The otherwise-reserved `template` token is contextual only as a
+noninitial dotted path segment in module/import/type/value paths; expression-head `template` plus a
+string remains the existing template form, while bare and other keyword identifiers stay rejected.
+Four checked HIR/MIR operations plus one Drop call reuse existing
+ABI shapes and their empty curated LLVM attributes, so design acceptance alone activates no row and
+A124 remains unused. Contextual templates, components/includes, reflection, streaming/arena forms,
+HTML parsing/sanitizing, and URL/CSS/JavaScript encoders remain separate consumer-backed work.
+Exact proposed ledger and implementation closure matrix:
+`docs/impl/pkg-design/template.md`.
 
 **Implemented first-party packages** (developed in this repo and distributed with the system as
 vendorable subtrees) live at the same depth as any other `pkg` — `pkg.web` is the flagship.

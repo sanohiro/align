@@ -3386,6 +3386,29 @@ are active.
 
 ## Open (to be decided)
 
+### `pkg.template` v1 escape-by-default HTML builder (PROPOSED 2026-09-04)
+
+**Proposed decision:** `pkg.template` exposes one opaque Move `html_builder`, constructed by
+`html()`, mutated by default-escaped `write(borrow mut output, value: str)` or explicit trusted
+`raw(borrow mut output, value: str)`, and consumed only by `to_string(output) -> string`. The
+underlying ordinary builder and every partial view stay private, so `raw` is the only public path
+that can append unescaped bytes. `write` shares the exact `encoding.html_escape` mapping for
+`& < > " '`, allocates no temporary string, and promises safety only for element text or the
+complete contents of an already-quoted attribute. It does not validate URL, event-handler,
+CSS/JavaScript, comment, tag-name, or attribute-name semantics.
+
+The resource owns one runtime builder shell and allocator-compatible payload. Unfinished Drop frees
+both once; `to_string` nulls the source and transfers the payload without allocation or copy. There
+is no recoverable error channel. Detectable malformed private state and length overflow abort before
+mutation; OOM aborts. Four checked HIR/MIR operations and the Drop row reuse existing ABI shapes,
+activate only with implementation, and leave A124 unused at design acceptance. Plain language
+`template "..."` remains the one scalar formatter and does not gain escaping. The token becomes
+contextual only as a noninitial dotted path segment so exact `pkg.template` module/import/type/value
+paths parse; bare and other keyword identifiers remain rejected.
+
+Record under review: `docs/impl/pkg-design/template.md`, `draft.md` §18.3,
+`docs/language-spec.md`
+
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 
 SQLite can persist comparator results in indexes and schema objects, but its collation registration

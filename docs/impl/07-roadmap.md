@@ -3847,7 +3847,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`pkg.ws` is implemented after `pkg.csv`; `pkg.template` is the next package design capability.
+`pkg.ws` is implemented after `pkg.csv`; `pkg.template` is in design review as the next package
+capability. Its proposed contract is `pkg-design/template.md`; no implementation inventory is active.
 Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
@@ -4062,8 +4063,12 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
   heartbeat observation, and broadcast state are deferred. Exact ledger and implementation
   closure matrix: `pkg-design/ws.md`.
-- **pkg.template** — escape-by-default HTML builder; `raw` is the one unescaped path; shares the
-  shipped `encoding.html_escape` 5-entity table.
+- **pkg.template — PROPOSED** — opaque Move HTML text builder with `html`, default-escaped `write`,
+  explicit `raw`, and consuming zero-copy `to_string`; the underlying ordinary builder and partial
+  views are not exposed. `write` shares the shipped `encoding.html_escape` five-entity table and is
+  safe only for element text or complete already-quoted attribute contents. Contextual markup,
+  URL/CSS/JavaScript encoding, parsing/sanitizing, streaming, and components remain deferred. Exact
+  proposed ledger and implementation closure matrix: `pkg-design/template.md`.
 - **std.xml** — well-formed-only read-only reader; DOCTYPE / DTD / PI / external entity rejected
   (XXE / billion-laughs closed by construction); namespaces not expanded; consumers S3 + Azure Blob.
 - **std.time formatters** — rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped

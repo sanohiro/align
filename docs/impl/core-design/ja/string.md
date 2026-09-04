@@ -57,7 +57,10 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 
 - **`split`** および **`find_any`**（§18.1 カタログ） — 現状ディスパッチ用のアームはない。特に `split` は大きな課題（大物）である — その戻り値の型（ビューの `array<str>` — つまり region 付きビュー要素を持つ Move 配列）を実現するには、Move 要素コレクションに関する対応が必要になる。owned-copies による妥協的な形態でリリースしてはならない（「理想形で出すか、さもなくば defer（延期）する」）。現状では `find` / `rfind` と `s[a..b]` を組み合わせて手動で split 処理を構築する。
 - `s[i]` による直接のバイトアクセスはない — UTF-8 としての保証を外すことが呼び出し側で明確になるよう、`s.bytes()[i]` という明示的なバイトビューを使用する。
-- §13 / §18.1 の template のバリアント（`html`、`raw`、json-template など） — 現在はプレーンな `template "…"` のみ存在する。エスケープバリアントの設計（文脈依存の autoescape など）はまだ未確定である。
+- §13 / §18.1 の language template variant（`html`、`raw`、json-template など） — 現在は
+  plain な `template "…"` のみ。提案中の `pkg.template` はこの syntax を変えず、default-escaped
+  `write` と explicit `raw` を持つ opaque HTML builder を別に提供する。contextual language-template
+  parsing は deferred のまま。
 
 ## Pitfalls
 
