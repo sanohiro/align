@@ -4903,6 +4903,7 @@ fn validate_tagged_program_inner(
                 | Scalar::HttpRequestCtx
                 | Scalar::ResponseBuilder
                 | Scalar::HttpStream
+                | Scalar::HttpUpgrade
                 | Scalar::HttpReadStream
                 | Scalar::HttpSseStream
                 | Scalar::RunOutput
@@ -5050,6 +5051,7 @@ fn validate_tagged_program_inner(
                         | Ty::HttpRequestCtx
                         | Ty::ResponseBuilder
                         | Ty::HttpStream
+                        | Ty::HttpUpgrade
                         | Ty::HttpReadStream
                         | Ty::HttpSseStream
                         | Ty::HttpHeaders
@@ -8132,6 +8134,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpUpgrade
         | Scalar::HttpReadStream
         | Scalar::HttpSseStream
         | Scalar::RunOutput
@@ -8712,6 +8715,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
         Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
         Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
+        Scalar::HttpUpgrade => unreachable!("an http_upgrade handle is not a box/array payload"),
         // Not currently admitted as a box/array payload, but keep this size function total for
         // malformed MIR and consistent with the handle's one-pointer ABI.
         Scalar::HttpReadStream | Scalar::HttpSseStream => 8,
@@ -8822,6 +8826,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::HttpRequestCtx => RuntimeKey::HttpCtxFree,
         Ty::ResponseBuilder => RuntimeKey::HttpResponseFree,
         Ty::HttpStream => RuntimeKey::HttpStreamFree,
+        Ty::HttpUpgrade => RuntimeKey::HttpUpgradeFree,
         Ty::HttpReadStream | Ty::HttpSseStream => RuntimeKey::HttpReadStreamFree,
         // Unreachable while every `align_sema::MOVE_HANDLE_TYPES` entry has a row above, which is
         // what the sweep test asserts. Kept fail-closed rather than panicking in a compiler.
@@ -16910,6 +16915,72 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_ctx_header returns i32 present flag")
             }
+            Rvalue::HttpHeadersCount { headers, name } => {
+                let headers = self.operand(headers)?.into_pointer_value();
+                let (name_ptr, name_len) = self.split_str(name)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpHeadersCount),
+                        &[headers.into(), name_ptr.into(), name_len.into()],
+                        "httpheaderscount",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_headers_count returns i64")
+            }
+            Rvalue::HttpHeadersTokensValid { headers, name } => {
+                let headers = self.operand(headers)?.into_pointer_value();
+                let (name_ptr, name_len) = self.split_str(name)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpHeadersTokensValid),
+                        &[headers.into(), name_ptr.into(), name_len.into()],
+                        "httpheaderstokensvalid",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_headers_tokens_valid returns i32")
+            }
+            Rvalue::HttpHeadersContainsToken {
+                headers,
+                name,
+                token,
+            } => {
+                let headers = self.operand(headers)?.into_pointer_value();
+                let (name_ptr, name_len) = self.split_str(name)?;
+                let (token_ptr, token_len) = self.split_str(token)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpHeadersContainsToken),
+                        &[
+                            headers.into(),
+                            name_ptr.into(),
+                            name_len.into(),
+                            token_ptr.into(),
+                            token_len.into(),
+                        ],
+                        "httpheaderscontainstoken",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_headers_contains_token returns i32")
+            }
+            Rvalue::HttpCtxUpgradeReady { ctx } => {
+                let ctx = self.operand(ctx)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpCtxUpgradeReady),
+                        &[ctx.into()],
+                        "httpctxupgradeready",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_ctx_upgrade_ready returns i32")
+            }
             Rvalue::HttpCtxBody { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
                 self.builder
@@ -16958,6 +17029,90 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::HttpRespondStream), &[c.into(), r.into(), out_ptr.into()], "httprespondstream")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond_stream returns i32 status")
+            }
+            Rvalue::HttpRespondUpgrade { ctx, rb, out } => {
+                let ctx = self.operand(ctx)?.into_pointer_value();
+                let rb = self.operand(rb)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(
+                        out_ptr,
+                        self.ctx.ptr_type(AddressSpace::default()).const_null(),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpRespondUpgrade),
+                        &[ctx.into(), rb.into(), out_ptr.into()],
+                        "httprespondupgrade",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_respond_upgrade returns i32 status")
+            }
+            Rvalue::HttpUpgradeReadExact {
+                upgrade,
+                out,
+                count,
+            } => {
+                let upgrade = self.operand(upgrade)?.into_pointer_value();
+                let out = self.operand(out)?.into_pointer_value();
+                let count = self.operand(count)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpUpgradeReadExact),
+                        &[upgrade.into(), out.into(), count.into()],
+                        "httpupgradereadexact",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_upgrade_read_exact returns i32 status")
+            }
+            Rvalue::HttpUpgradeWrite { upgrade, data } => {
+                let upgrade = self.operand(upgrade)?.into_pointer_value();
+                let (data_ptr, data_len) = self.split_str(data)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpUpgradeWrite),
+                        &[upgrade.into(), data_ptr.into(), data_len.into()],
+                        "httpupgradewrite",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_upgrade_write returns i32 status")
+            }
+            Rvalue::HttpUpgradeDeadline {
+                upgrade,
+                timeout_ns,
+            } => {
+                let upgrade = self.operand(upgrade)?.into_pointer_value();
+                let timeout_ns = self.operand(timeout_ns)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpUpgradeDeadline),
+                        &[upgrade.into(), timeout_ns.into()],
+                        "httpupgradedeadline",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_upgrade_deadline returns i32 status")
+            }
+            Rvalue::HttpUpgradeShutdown { upgrade } => {
+                let upgrade = self.operand(upgrade)?.into_pointer_value();
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpUpgradeShutdown),
+                        &[upgrade.into()],
+                        "httpupgradeshutdown",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("http_upgrade_shutdown returns i32 status")
             }
             Rvalue::HttpStreamSend { stream, chunk, event } => {
                 let s = self.operand(stream)?.into_pointer_value();

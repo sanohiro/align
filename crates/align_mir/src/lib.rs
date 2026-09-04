@@ -2364,6 +2364,22 @@ pub enum Rvalue {
         name: Operand,
         out: Slot,
     },
+    HttpHeadersCount {
+        headers: Operand,
+        name: Operand,
+    },
+    HttpHeadersTokensValid {
+        headers: Operand,
+        name: Operand,
+    },
+    HttpHeadersContainsToken {
+        headers: Operand,
+        name: Operand,
+        token: Operand,
+    },
+    HttpCtxUpgradeReady {
+        ctx: Operand,
+    },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** `{ptr,len}` into `ctx`'s buffer
     /// (region-bound to `ctx`). Pure.
     HttpCtxBody {
@@ -2404,6 +2420,27 @@ pub enum Rvalue {
         ctx: Operand,
         rb: Operand,
         out: Slot,
+    },
+    HttpRespondUpgrade {
+        ctx: Operand,
+        rb: Operand,
+        out: Slot,
+    },
+    HttpUpgradeReadExact {
+        upgrade: Operand,
+        out: Operand,
+        count: Operand,
+    },
+    HttpUpgradeWrite {
+        upgrade: Operand,
+        data: Operand,
+    },
+    HttpUpgradeDeadline {
+        upgrade: Operand,
+        timeout_ns: Operand,
+    },
+    HttpUpgradeShutdown {
+        upgrade: Operand,
     },
     /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk to the stream `s` (opaque
     /// pointer, **borrowed** — mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`.
@@ -6492,12 +6529,21 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpCtxPath { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpHeadersCount { .. }
+            | hir::ExprKind::HttpHeadersTokensValid { .. }
+            | hir::ExprKind::HttpHeadersContainsToken { .. }
+            | hir::ExprKind::HttpCtxUpgradeReady { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
             | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpRespondUpgrade { .. }
+            | hir::ExprKind::HttpUpgradeReadExact { .. }
+            | hir::ExprKind::HttpUpgradeWrite { .. }
+            | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
@@ -6674,12 +6720,21 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpCtxPath { .. }
         | hir::ExprKind::HttpCtxHeaders { .. }
         | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpHeadersCount { .. }
+        | hir::ExprKind::HttpHeadersTokensValid { .. }
+        | hir::ExprKind::HttpHeadersContainsToken { .. }
+        | hir::ExprKind::HttpCtxUpgradeReady { .. }
         | hir::ExprKind::HttpCtxBody { .. }
         | hir::ExprKind::HttpResponseBuilder { .. }
         | hir::ExprKind::HttpRbHeader { .. }
         | hir::ExprKind::HttpRbBody { .. }
         | hir::ExprKind::HttpRespond { .. }
         | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpRespondUpgrade { .. }
+        | hir::ExprKind::HttpUpgradeReadExact { .. }
+        | hir::ExprKind::HttpUpgradeWrite { .. }
+        | hir::ExprKind::HttpUpgradeDeadline { .. }
+        | hir::ExprKind::HttpUpgradeShutdown { .. }
         | hir::ExprKind::HttpStreamReject { .. }
         | hir::ExprKind::HttpStreamSend { .. }
         | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
@@ -7796,12 +7851,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpCtxPath { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
+            | hir::ExprKind::HttpHeadersCount { .. }
+            | hir::ExprKind::HttpHeadersTokensValid { .. }
+            | hir::ExprKind::HttpHeadersContainsToken { .. }
+            | hir::ExprKind::HttpCtxUpgradeReady { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
             | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
+            | hir::ExprKind::HttpRespondUpgrade { .. }
+            | hir::ExprKind::HttpUpgradeReadExact { .. }
+            | hir::ExprKind::HttpUpgradeWrite { .. }
+            | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
@@ -14771,6 +14835,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::HttpRequestCtx
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
+        | Scalar::HttpUpgrade
         | Scalar::HttpReadStream
         | Scalar::HttpSseStream
         | Scalar::RunOutput
@@ -18370,6 +18435,75 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::HttpCtxHeader { headers, name } => {
             lower_http_ctx_header(b, headers, name, e.ty)
         }
+        hir::ExprKind::HttpHeadersCount { headers, name } => {
+            let headers = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
+            let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::HttpHeadersCount { headers, name }));
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpHeadersTokensValid { headers, name } => {
+            let headers = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
+            let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpHeadersTokensValid { headers, name },
+            ));
+            let value = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::Bin(
+                    BinOp::Ne,
+                    Operand::Value(code),
+                    Operand::Const(Const::Int(0, status_ty())),
+                ),
+            ));
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpHeadersContainsToken {
+            headers,
+            name,
+            token,
+        } => {
+            let headers = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
+            let name = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
+            let token = lower_required!(b, lower_expr(b, token), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpHeadersContainsToken {
+                    headers,
+                    name,
+                    token,
+                },
+            ));
+            let value = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::Bin(
+                    BinOp::Ne,
+                    Operand::Value(code),
+                    Operand::Const(Const::Int(0, status_ty())),
+                ),
+            ));
+            Operand::Value(value)
+        }
+        hir::ExprKind::HttpCtxUpgradeReady { ctx } => {
+            let ctx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpCtxUpgradeReady { ctx }));
+            let value = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::Bin(
+                    BinOp::Ne,
+                    Operand::Value(code),
+                    Operand::Const(Const::Int(0, status_ty())),
+                ),
+            ));
+            Operand::Value(value)
+        }
         // `ctx.body()` → a `slice<u8>` view `{ptr,len}` into the ctx buffer (region-bound to `ctx`).
         hir::ExprKind::HttpCtxBody { ctx } => {
             let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
@@ -18442,6 +18576,73 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                 e.ty,
                 false,
             )
+        }
+        hir::ExprKind::HttpRespondUpgrade { ctx, rb } => {
+            let out = b.new_slot(Ty::HttpUpgrade);
+            let ctx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
+            let rb_value = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
+            null_moved_source(b, rb);
+            lower_http_response_result(
+                b,
+                Rvalue::HttpRespondUpgrade {
+                    ctx,
+                    rb: rb_value,
+                    out,
+                },
+                out,
+                Ty::HttpUpgrade,
+                e.ty,
+                false,
+            )
+        }
+        hir::ExprKind::HttpUpgradeReadExact {
+            upgrade,
+            out,
+            count,
+        } => {
+            let upgrade = lower_required!(b, lower_expr(b, upgrade), Operand::Const(Const::Unit));
+            let out = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
+            let count = lower_required!(b, lower_expr(b, count), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpUpgradeReadExact {
+                    upgrade,
+                    out,
+                    count,
+                },
+            ));
+            lower_status_result(b, code, e.ty)
+        }
+        hir::ExprKind::HttpUpgradeWrite { upgrade, data } => {
+            let upgrade = lower_required!(b, lower_expr(b, upgrade), Operand::Const(Const::Unit));
+            let data = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpUpgradeWrite { upgrade, data }));
+            lower_status_result(b, code, e.ty)
+        }
+        hir::ExprKind::HttpUpgradeDeadline {
+            upgrade,
+            timeout_ns,
+        } => {
+            let upgrade = lower_required!(b, lower_expr(b, upgrade), Operand::Const(Const::Unit));
+            let timeout_ns =
+                lower_required!(b, lower_expr(b, timeout_ns), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpUpgradeDeadline {
+                    upgrade,
+                    timeout_ns,
+                },
+            ));
+            lower_status_result(b, code, e.ty)
+        }
+        hir::ExprKind::HttpUpgradeShutdown { upgrade } => {
+            let upgrade = lower_required!(b, lower_expr(b, upgrade), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpUpgradeShutdown { upgrade }));
+            lower_status_result(b, code, e.ty)
         }
         // `s.send(chunk)` / `s.send_event(data)` → `Result<(), Error>`. `s` is **borrowed** (mutated
         // in place — not consumed); the payload is a byte view.
@@ -20677,6 +20878,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Captures => "captures".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::HttpStream => "http_stream".to_string(),
+        Ty::HttpUpgrade => "http_upgrade".to_string(),
         Ty::HttpReadStream => "http_read_stream".to_string(),
         Ty::HttpSseStream => "http_sse_stream".to_string(),
         Ty::JsonDoc => "json.doc".to_string(),

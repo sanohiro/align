@@ -3847,7 +3847,7 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`pkg.csv` is implemented after `pkg.kv`; `pkg.ws` is the next package design capability.
+`pkg.ws` is implemented after `pkg.csv`; `pkg.template` is the next package design capability.
 Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
@@ -4041,7 +4041,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   Streaming, encoding, file/mmap input, dialect inference, dynamic/owned rows, nullability,
   and recovery are deferred. Exact ledger and implementation closure matrix:
   `pkg-design/csv.md`.
-- **pkg.ws — DESIGNED 2026-09-03; implementation pending** — RFC 6455 HTTP/1.1 server integrated
+- **pkg.ws — IMPLEMENTED 2026-09-04** — RFC 6455 HTTP/1.1 server integrated
   into the existing `pkg.web` route table, middleware order, request views, and explicit
   `SO_REUSEPORT` worker model through one protocol-neutral Upgrade handler. The new
   `http_upgrade` Move handle owns the fd after a checked 101 and exposes exact read/write, one
@@ -4057,7 +4057,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   their overlap with builder storage. Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE`
   before request-context publication and closes once with a mapped accept error on failure.
   Sends are unmasked and do not copy payload; server close has an explicit cumulative deadline and
-  completes the closing handshake without resetting its budget. Ten planned runtime keys reuse
+  completes the closing handshake without resetting its budget. Ten active runtime keys reuse
   existing shapes and their empty curated LLVM function-attribute sets, so A124 remains unused.
   WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
   heartbeat observation, and broadcast state are deferred. Exact ledger and implementation

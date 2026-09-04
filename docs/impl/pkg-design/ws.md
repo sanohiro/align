@@ -2,8 +2,8 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/ws.md`.
 >
-> **Status:** designed; implementation pending. No surface in this document is shipped until the implementation
-> capability activates it together with its owner tests and runtime rows.
+> **Status:** IMPLEMENTED 2026-09-04. The implementation activates this surface together with its
+> owner tests and runtime rows without widening the accepted contract.
 
 ## Authoritative public-contract ledger
 
@@ -215,7 +215,7 @@ The capability adds these keyed runtime rows, all reusing existing shapes:
 | `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120 | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03 | `unsafe extern "C" fn(*mut HttpRequestCtx) -> i32` |
 
-No A124 shape is consumed. The keyed inventory grows by ten only when implementation activates the
+No A124 shape is consumed. The implementation activation grows the keyed inventory by ten as one
 complete capability. Header rows and the readiness row borrow the request context and retain
 nothing. A null/misaligned readiness receiver hard-aborts before reference formation; source HIR
 cannot form that case, and malformed native state never aliases a legitimate false result. All
@@ -262,8 +262,8 @@ mirror, `docs/impl/std-design/http.md`, `draft.md`, `docs/language-spec.md`, `do
 `docs/history.md`, `docs/open-questions.md`, `docs/impl/03-types.md`, `docs/impl/04-mir.md`,
 `docs/impl/05-backend-llvm.md`, `docs/impl/07-roadmap.md`,
 `docs/impl/17-library-boundary-prerequisites.md`, `docs/impl/19-hir-validation-ledger.md`,
-`docs/impl/20-runtime-abi-ledger.md`, and `HANDOFF.md` must agree before implementation. Shipped
-package inventories remain unchanged until source activation.
+`docs/impl/20-runtime-abi-ledger.md`, and `HANDOFF.md` agree at implementation. Shipped package
+inventories now include `apps/ws/pkg/ws.align` together with the extended `pkg.web` sources.
 
 The author-side pass must prove:
 

@@ -102,12 +102,12 @@ fn malformed_tables_abort_at_startup_with_a_diagnosis() {
     // Group prefixes are stored separately from patterns, but must still form a literal path.
     assert_aborts(
         "web-val-prefix-shape",
-        "    pkg.web.types.Route { method: \"GET\", prefix: \"api\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h) },",
+        "    pkg.web.types.Route { method: \"GET\", prefix: \"api\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h), upgrade_values: [] },",
         "group prefix",
     );
     assert_aborts(
         "web-val-prefix-dynamic",
-        "    pkg.web.types.Route { method: \"GET\", prefix: \"/:tenant\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h) },",
+        "    pkg.web.types.Route { method: \"GET\", prefix: \"/:tenant\", pattern: \"/x\", middleware: None, stream_type: \"\", handler: pkg.web.types.Handler.Respond(h), upgrade_values: [] },",
         "only literal segments",
     );
     // A nameless parameter segment cannot be read back by `web.param`.

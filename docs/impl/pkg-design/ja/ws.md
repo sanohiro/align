@@ -2,8 +2,8 @@
 
 > 英語版 `../ws.md` が権威であり、このファイルは同期された日本語 mirror である。
 >
-> **状態:** designed、implementation pending。この文書の surface は、implementation capability が owner test
-> と runtime row を一緒に有効化するまで未実装である。
+> **状態:** IMPLEMENTED 2026-09-04。implementation capability は accepted contract を拡張せず、
+> owner test と runtime row と共にこの surface を有効化した。
 
 ## 権威 public-contract ledger
 
@@ -133,7 +133,7 @@ close は一つの cumulative deadline 内で peer Close を待ち、Closing 中
 
 ## Native ABI
 
-実装時だけ次の十 keyed row を同時に追加し、すべて既存 shape を再利用する。
+実装は次の十 keyed row を同時に追加し、すべて既存 shape を再利用する。
 
 | Key | Symbol | Shape |
 |---|---|---|
@@ -148,7 +148,7 @@ close は一つの cumulative deadline 内で peer Close を待ち、Closing 中
 | `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120 |
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03 |
 
-A124 は消費しない。implementation activation 時だけ keyed inventory は十増える。readiness は ctx を
+A124 は消費しない。implementation activation で keyed inventory は十増えた。readiness は ctx を
 borrow して何も retain せず、null/misaligned receiver は reference formation 前に hard-abort。source HIR は
 その状態を作れず、malformed native state は通常の false と混同しない。exact native signatures は
 英語 ledger が権威。pointer/length/null/capacity/output

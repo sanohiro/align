@@ -391,6 +391,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
+            | Scalar::HttpUpgrade
             | Scalar::HttpReadStream
             | Scalar::HttpSseStream
             | Scalar::RunOutput
@@ -545,6 +546,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
+            | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
             | Ty::HttpHeaders

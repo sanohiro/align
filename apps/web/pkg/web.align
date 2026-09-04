@@ -22,7 +22,7 @@ import pkg.web.internal.query
 // The general unary form. Every per-method constructor below is this with the method spelled out;
 // an EMPTY method matches any method, which is how a catch-all is written.
 pub fn route(method: str, pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
-  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: "", handler: pkg.web.types.Handler.Respond(handler) }
+  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: "", handler: pkg.web.types.Handler.Respond(handler), upgrade_values: [] }
 
 pub fn get(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_builder, Error>) -> pkg.web.types.Route =
   route("GET", pattern, handler)
@@ -55,7 +55,31 @@ pub fn any(pattern: str, handler: fn(pkg.web.types.Ctx) -> Result<response_build
 // `Content-Type`. Stream routes live in the same table as unary routes: same radix dispatch, same
 // method resolution, same 405 `Allow` contribution.
 pub fn stream(method: str, pattern: str, content_type: str, pump: fn(pkg.web.types.Ctx, http_stream) -> Result<(), Error>) -> pkg.web.types.Route =
-  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump) }
+  pkg.web.types.Route { method: method, prefix: "", pattern: pattern, middleware: None, stream_type: content_type, handler: pkg.web.types.Handler.Stream(pump), upgrade_values: [] }
+
+// The protocol-neutral Upgrade route. A protocol package owns `values`, their Pure startup
+// validator, handshake preparation, and the upgraded-stream pump.
+pub fn upgrade(
+  method: str,
+  pattern: str,
+  values: slice<str>,
+  validate: fn(slice<str>) -> bool,
+  prepare: fn(pkg.web.types.Ctx, slice<str>) -> pkg.web.types.UpgradeDecision,
+  pump: fn(pkg.web.types.Ctx, http_upgrade, string) -> Result<(), Error>,
+) -> pkg.web.types.Route =
+  pkg.web.types.Route {
+    method: method,
+    prefix: "",
+    pattern: pattern,
+    middleware: None,
+    stream_type: "",
+    handler: pkg.web.types.Handler.Upgrade(pkg.web.types.UpgradeHandler {
+      validate: validate,
+      prepare: prepare,
+      pump: pump,
+    }),
+    upgrade_values: values,
+  }
 
 // A Server-Sent Events route: method GET (EventSource always GETs), `Content-Type:
 // text/event-stream`. The pump writes WHATWG event frames with `s.send_event(data)` — SSE event
@@ -76,6 +100,7 @@ pub fn group(prefix: str, routes: slice<pkg.web.types.Route>) -> array<pkg.web.t
       middleware: r.middleware,
       stream_type: r.stream_type,
       handler: r.handler,
+      upgrade_values: r.upgrade_values,
     }
   }).to_array()
 
@@ -93,6 +118,7 @@ pub fn group_with(
       middleware: Some(pkg.web.types.MiddlewareList { handlers: middleware }),
       stream_type: r.stream_type,
       handler: r.handler,
+      upgrade_values: r.upgrade_values,
     }
   }).to_array()
 
@@ -224,6 +250,12 @@ fn log_middleware_error(c: pkg.web.types.Ctx, err: Error) -> () {
   log_request_error("middleware Failed", c, err)
 }
 
+// Consuming `selected` in this helper guarantees its owned storage is dropped before the caller
+// constructs the fallback response after a failed Upgrade transfer.
+fn log_upgrade_error(c: pkg.web.types.Ctx, err: Error, selected: string) -> () {
+  log_handler_error(c, err)
+}
+
 fn log_request_error(kind: str, c: pkg.web.types.Ctx, err: Error) -> () {
   mut line := builder()
   line.write("pkg.web: ")
@@ -306,7 +338,12 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
       gidx := pkg.web.internal.router.dispatch_routes(routes, tree[..], "GET", path)
       if gidx >= 0 {
         rg := routes[gidx]
-        if rg.stream_type == "" {
+        respond_row := match rg.handler {
+          Respond(_) => true
+          Stream(_) => false
+          Upgrade(_) => false
+        }
+        if respond_row {
           idx = gidx
         }
       }
@@ -321,6 +358,7 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
         pattern: r.pattern,
         body: ctx.body(),
         headers: ctx.headers(),
+        upgrade_ready: ctx.upgrade_ready(),
       }
       match before(r, c) {
         Failed(pre_error) => {
@@ -348,6 +386,33 @@ fn worker(host: str, port: i64, routes: slice<pkg.web.types.Route>, shared: bool
                   }
                 }
                 Err(e) => {}
+              }
+            }
+            Upgrade(h) => {
+              match h.prepare(c, r.upgrade_values) {
+                Accept(accepted) => {
+                  response := accepted.response
+                  selected := accepted.selected
+                  match ctx.respond_upgrade(response) {
+                    Ok(connection) => {
+                      match h.pump(c, connection, selected) {
+                        Ok(_) => {}
+                        Err(e) => log_handler_error(c, e)
+                      }
+                    }
+                    Err(e) => {
+                      log_upgrade_error(c, e, selected)
+                      fallback := auto_response(500, "{\"error\":\"internal error\"}")
+                      ctx.respond(fallback) else {}
+                    }
+                  }
+                }
+                Reject(response) => ctx.respond(response) else {}
+                Failed(e) => {
+                  log_handler_error(c, e)
+                  fallback := auto_response(500, "{\"error\":\"internal error\"}")
+                  ctx.respond(fallback) else {}
+                }
               }
             }
           }

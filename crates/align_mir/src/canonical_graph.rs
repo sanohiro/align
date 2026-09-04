@@ -1574,6 +1574,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         44 => Ok(Scalar::CodecBoolColumn),
         45 => Ok(Scalar::CodecStrColumn),
         46 => Ok(Scalar::CodecEncoder),
+        47 => Ok(Scalar::HttpUpgrade),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1725,6 +1726,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         68 => Ok(Ty::CodecBoolColumn),
         69 => Ok(Ty::CodecStrColumn),
         70 => Ok(Ty::CodecEncoder),
+        71 => Ok(Ty::HttpUpgrade),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2534,6 +2536,7 @@ fn scalar(
             Scalar::CodecBoolColumn => leaf!(44),
             Scalar::CodecStrColumn => leaf!(45),
             Scalar::CodecEncoder => leaf!(46),
+            Scalar::HttpUpgrade => leaf!(47),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2769,6 +2772,7 @@ fn ty(
             Ty::CodecBoolColumn => leaf!(68),
             Ty::CodecStrColumn => leaf!(69),
             Ty::CodecEncoder => leaf!(70),
+            Ty::HttpUpgrade => leaf!(71),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -3532,6 +3536,7 @@ mod tests {
             (Ty::RunBytes, vec![3, 0, 0, 0, 0, 60]),
             (Ty::HttpReadStream, vec![3, 0, 0, 0, 0, 61]),
             (Ty::HttpSseStream, vec![3, 0, 0, 0, 0, 62]),
+            (Ty::HttpUpgrade, vec![3, 0, 0, 0, 0, 71]),
         ] {
             let encoded = CanonicalTy::from_program(root, &program).unwrap();
             assert_eq!(encoded.as_bytes(), expected);
@@ -3795,9 +3800,13 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 71], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 47], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 72], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 48], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
+        error(
+            &[3, 0, 0, 0, 0, 71, 0],
+            CanonicalCodecError::TrailingBytes,
+        );
         error(&[3, 0, 0, 0, 0, 26, 2], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 26, 1, 4], CanonicalCodecError::UnknownTag);
         error(
@@ -4146,6 +4155,10 @@ mod tests {
             Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [39, 4],
             Scalar::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [39, 5],
             Scalar::Logger => [40],
+            Scalar::CodecBatch => [41], Scalar::CodecI64Column => [42],
+            Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
+            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46],
+            Scalar::HttpUpgrade => [47],
         );
     }
 
@@ -4199,6 +4212,10 @@ mod tests {
             Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Private) => [63, 4],
             Ty::SignatureKey(align_sema::SignatureKeyKind::Ed25519Public) => [63, 5],
             Ty::Logger => [64],
+            Ty::CodecBatch => [65], Ty::CodecI64Column => [66],
+            Ty::CodecF64Column => [67], Ty::CodecBoolColumn => [68],
+            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70],
+            Ty::HttpUpgrade => [71],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );
@@ -4218,6 +4235,10 @@ mod tests {
         bytes!(
             encoded_ty(Ty::Result(Scalar::Bool, Scalar::Fn(3))),
             [5, 2, 33, 3, 0x50, 0, 0]
+        );
+        bytes!(
+            encoded_ty(Ty::Result(Scalar::HttpUpgrade, Scalar::Bool)),
+            [5, 47, 2]
         );
         bytes!(
             encoded_ty(Ty::Array(Scalar::Char, 0x0102_0304)),

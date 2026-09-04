@@ -205,6 +205,7 @@ align_suite_priority_score() {
     align_driver::test::pkg_db_callbacks) echo 75 ;;
     align_driver::test::pkg_db_pool) echo 72 ;;
     align_driver::test::apps_web_validate) echo 70 ;;
+    align_driver::test::apps_ws) echo 70 ;;
     align_driver::test::pkg_db_a2) echo 60 ;;
     align_driver::test::pkg_db_q6) echo 59 ;;
     align_driver::test::pkg_db_q5b1) echo 55 ;;

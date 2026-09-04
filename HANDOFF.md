@@ -28,6 +28,9 @@ are implemented and active at their joint capability boundary in PR #933. `pkg.c
 against the accepted public contract and implementation closure matrix in
 `docs/impl/pkg-design/csv.md`: the canonical package, checked HIR/MIR operation, transitive
 parallel-worker region gate, direct-to-SoA runtime, and A123 activate as one capability.
+`pkg.ws` is implemented against `docs/impl/pkg-design/ws.md`: the protocol-neutral HTTP Upgrade
+transport, third `pkg.web` Handler variant, package-owned RFC 6455 handshake/frame state, and ten
+reused-shape runtime rows activate as one capability.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.
@@ -408,16 +411,16 @@ facts must live in this repository.
   runtime repeats the key kind before every EVP operation. The implementation closure matrix owns
   carrier/Drop paths, decoder/error-queue/failpoint behavior, provider provenance, ABI identity,
   optimized/unoptimized lowering, and the explicit resource probe.
-- **Latest language capability:** `pkg.kv` is implemented against
+- **Recent package capability:** `pkg.kv` is implemented against
   `docs/impl/pkg-design/kv.md` as one synchronous plaintext RESP2 client with an opaque Move owner,
   explicit connect/I/O timeouts and response cap, owned-string GET, conditional/expiring SET, and
   one-key DEL. The vendorable subtree contains root `pkg.kv` and
   `pkg.kv.internal.resource`; TLS and the wider Redis surface remain deferred.
-- **Latest runtime capability:** `pkg.csv` activates keyed `CsvDecodeSoaV1` at A123. The exact
-  current inventory is 331 keyed plus 18 unkeyed records, 13 of those unkeyed records
+- **Previous runtime capability:** `pkg.csv` activates keyed `CsvDecodeSoaV1` at A123. At that
+  boundary the inventory was 331 keyed plus 18 unkeyed records, 13 of those unkeyed records
   source-reachable: 349 base exports, 353 with either four-row probe feature alone, and 357 at the
-  maximum combined probe surface. A124 is the next unused active ABI shape.
-- **Latest language capability:** `pkg.csv` implements one explicit typed in-memory direct-to-SoA
+  maximum combined probe surface.
+- **Previous package capability:** `pkg.csv` implements one explicit typed in-memory direct-to-SoA
   decode. Its canonical generic wrapper is abstract-checked and only concrete `SoaPlain`
   monomorphs emit checked `CsvDecode`; A123 UTF-8-prevalidates and parses allocation-free before one
   exact nonempty arena allocation. Present headers use a fixed 1024-entry bound and authenticated
@@ -425,32 +428,17 @@ facts must live in this repository.
   doubled-quote strings occupy the output tail, and errors leave the arena unchanged. The required
   `region` remains Pure for sequential use but non-Send through direct and transitively captured
   callable environments at both `spawn` and `par_map` boundaries.
-- **Next language capability:** `pkg.ws` now has an implementation-pending design ledger at
+- **Latest package capability:** `pkg.ws` is implemented against the accepted ledger at
   `docs/impl/pkg-design/ws.md`. It composes one RFC 6455 Upgrade route into `pkg.web`, owns the
   private handshake/SHA-1/frame state in package source, and uses a restricted protocol-neutral
   `http_upgrade` Move handle. The implementation boundary also adds three allocation-free repeated
   header/token queries, one HTTP-version/residual readiness query, one checked 101 transfer, exact
-  transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its ten planned keys reuse existing ABI shapes; current counts
-  stay 331 keyed/349 base and A124 remains the next unused active shape until implementation.
-  The first independent review of candidate `3657a179` found six contract gaps: canonical type
-  tags, parser-residual rejection, spent-handle behavior, pre-handshake HTTP-version validation,
-  complete response-header syntax, and Pure route configuration validation. The coherent repair
-  uses post-`pkg.csv` tags 71/47, a version-plus-residual readiness query, spent Invalid/no-I/O
-  rules, strict header validation, and a Pure pre-bind Upgrade validator. Those decisions are
-  propagated through every source named by `ws.md`, including both Japanese mirrors. That fresh
-  review then found four remaining gaps: an
-  accidental `Ctx` Move restatement, client-only close code 1010 echo, unbounded zero-length/control
-  frame work, and an incomplete transient allocation ceiling. The next repair preserved Copy
-  `Ctx`, acknowledges 1010 with an empty Close, charges a fixed 1 MiB source-work allowance, and
-  fixes the exact 64-bit producer-requested live-heap ceiling at 1073774720 bytes. Its required full
-  review exposed four final cross-boundary gaps: unchecked macOS/iOS `SO_NOSIGPIPE`, ambiguous
-  malformed header-query ABI results, an impossible LLVM `nounwind` promise on reused shapes, and
-  omitted Upgrade response-head storage. The reopened platform/ABI/publication matrix now requires
-  checked accepted-socket suppression with close-once failure, hard-abort query guards, unchanged
-  empty curated shape attributes, and exact pre-transfer head/handle allocation with measured
-  builder overlap. The authority set and both Japanese mirrors carry that contract. One fresh full
-  design review must accept this strategy-changing repair before the ledger becomes the
-  implementation contract.
+  transport I/O/deadline/shutdown, and the third `pkg.web` Handler variant. Its ten active keys
+  reuse existing ABI shapes. The current inventory is 341 keyed plus 18 unkeyed records, 13 of
+  those source-reachable: 359 base exports, 363 with either four-row probe, and 367 with both.
+  A124 remains the next unused active shape.
+- **Next package design capability:** `pkg.template` remains an uncommitted outline in the roadmap;
+  its public contract must be designed and reviewed before implementation.
 - **Other queued language work:** The completed align-llm Request 22 implementation follows
   `docs/impl/30-borrowed-string-array-index-plan.md`; `std.id` remains blocked on the settled scalar
   equality rule and friction-ledger evidence.
