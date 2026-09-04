@@ -47,6 +47,7 @@ import pkg.auth
 import pkg.kv
 import pkg.csv
 import pkg.ws
+import pkg.template
 
 fn main() -> i32 = 0
 ALIGN

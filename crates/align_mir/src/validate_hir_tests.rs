@@ -238,6 +238,26 @@ fn template_hir_program() -> hir::Program {
             Ty::String,
         ),
     ];
+    let parameter = |id, name: &str, ty, is_mut| hir::Local {
+        id,
+        name: name.into(),
+        ty,
+        is_mut,
+        is_param: true,
+        align: None,
+    };
+    for function in &mut functions[1..3] {
+        function.params = vec![0, 1];
+        function.param_modes = vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue];
+        function.locals = vec![
+            parameter(0, "output", Ty::Resource(resource), true),
+            parameter(1, "value", Ty::Str, false),
+        ];
+    }
+    functions[3].params = vec![0];
+    functions[3].param_modes = vec![align_ast::ParamMode::ByValue];
+    functions[3].locals = vec![parameter(0, "output", Ty::Resource(resource), false)];
+    functions[0].return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
     for function in &mut functions {
         function.origin = hir::FnOrigin::Source {
             is_entry: false,
@@ -292,6 +312,39 @@ fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
     assert_eq!(
         validate_hir::template_html_validation_reason(&malformed),
         Err(Reason::Origin)
+    );
+
+    let mut malformed = program.clone();
+    malformed.fns[1].param_modes[0] = align_ast::ParamMode::ByValue;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&malformed),
+        Err(Reason::Signature)
+    );
+
+    let mut imported = baseline_program();
+    imported.resources = program.resources.clone();
+    imported.resources[0].drop_hook =
+        "pkg.template.internal.resource.__align_interface_drop_html_builder".into();
+    imported.imported_fns.push(hir::ImportedFn {
+        name: "pkg.template$write".into(),
+        params: vec![Ty::Resource(0), Ty::Str],
+        param_modes: vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue],
+        ret: Ty::Unit,
+        return_provenance_known: true,
+        return_borrow: ReturnBorrowSummary::None,
+        return_region: ReturnRegionSummary::None,
+        return_cleanup: hir::ReturnCleanupAbi::None,
+        effect: align_sema::FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
+    });
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&imported),
+        Ok(())
+    );
+    imported.imported_fns[0].param_modes[0] = align_ast::ParamMode::ByValue;
+    assert_eq!(
+        validate_hir::template_html_validation_reason(&imported),
+        Err(Reason::Signature)
     );
 
     let mut malformed = program.clone();

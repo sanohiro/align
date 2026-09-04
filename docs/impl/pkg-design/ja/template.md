@@ -116,12 +116,14 @@ runtime operation は次の順である。
 
 1. exact-compatible caller は `align_rt_template_html_new_v1` が allocate した live/dereferenceable/
    8-aligned shell と、operation または Drop 全体の exclusive access を供給する。null/misaligned shell は
-   reference formation 前 abort。caller precondition により access 可能となった後、version/live state/
-   reserved bytes/complete payload product を validate。
+   reference formation 前 abort。caller precondition により access 可能となった後、raw scalar fields
+   から version/live state/reserved bytes/length/payload nullness/range/shell-payload disjointness を
+   payload slice formation 前に validate し、その後 initialized payload prefix を UTF-8 validate。
 2. write/raw は input slice formation 前に signed length、target-address representability、nullness を
-   validate。zero は null 可、positive は不可。complete input の UTF-8 を検証し、input address range が
-   32-byte shell または complete payload allocation と overlap すれば measurement/reallocation/mutation 前
-   abort。dangling nonnull と forged allocator provenance は detectable ABI 外。
+   validate。zero は null 可、positive は不可。input address range が 32-byte shell または complete
+   payload allocation と overlap すれば先に abort し、その後 slice を形成して complete input を UTF-8
+   validate。すべて measurement/reallocation/mutation 前。dangling nonnull と forged allocator
+   provenance は detectable ABI 外。
 3. mutation 前に exact added/final length を checked compute。write は UTF-8 検証後 shared table で
    measurement、raw は validated input length。
 4. payload storage を reserve。allocation failure は recoverable partial result なしで hard abort。

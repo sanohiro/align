@@ -12759,15 +12759,20 @@ fn template_html_ranges_overlap(left: (usize, usize), right: (usize, usize)) -> 
     left.0 < right.1 && right.0 < left.1
 }
 
+#[derive(Clone, Copy)]
+struct TemplateHtmlState {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
 /// Validate scalar shell state before any payload access.
 ///
 /// # Safety
 /// `builder` must be a live, uniquely borrowed pointer returned by
 /// [`align_rt_template_html_new_v1`]. Its payload pointer, when non-null, must retain the allocation
 /// provenance recorded by the shell.
-unsafe fn template_html_state<'a>(
-    builder: *mut TemplateHtmlBuilder,
-) -> &'a mut TemplateHtmlBuilder {
+unsafe fn template_html_state(builder: *mut TemplateHtmlBuilder) -> TemplateHtmlState {
     if builder.is_null()
         || !builder
             .addr()
@@ -12775,49 +12780,69 @@ unsafe fn template_html_state<'a>(
     {
         template_html_abort("template html builder shell invalid");
     }
-    let builder = unsafe { &mut *builder };
-    if builder.version != TEMPLATE_HTML_VERSION
-        || builder.lifecycle != TEMPLATE_HTML_LIVE
-        || builder.reserved_u8 != 0
-        || builder.reserved_u16 != 0
-        || builder.len > builder.cap
+    // Read only Copy scalar fields until every detectable shell/payload alias product has been
+    // rejected. Constructing `&mut TemplateHtmlBuilder` here would already promise disjointness
+    // from a forged payload pointer into the shell.
+    let version = unsafe { core::ptr::addr_of!((*builder).version).read() };
+    let lifecycle = unsafe { core::ptr::addr_of!((*builder).lifecycle).read() };
+    let reserved_u8 = unsafe { core::ptr::addr_of!((*builder).reserved_u8).read() };
+    let reserved_u16 = unsafe { core::ptr::addr_of!((*builder).reserved_u16).read() };
+    let ptr = unsafe { core::ptr::addr_of!((*builder).ptr).read() };
+    let raw_len = unsafe { core::ptr::addr_of!((*builder).len).read() };
+    let raw_cap = unsafe { core::ptr::addr_of!((*builder).cap).read() };
+    if version != TEMPLATE_HTML_VERSION
+        || lifecycle != TEMPLATE_HTML_LIVE
+        || reserved_u8 != 0
+        || reserved_u16 != 0
+        || raw_len > raw_cap
     {
         template_html_abort("template html builder state invalid");
     }
-    let Ok(len) = usize::try_from(builder.len) else {
+    let Ok(len) = usize::try_from(raw_len) else {
         template_html_abort("template html builder length invalid");
     };
-    let Ok(cap) = usize::try_from(builder.cap) else {
+    let Ok(cap) = usize::try_from(raw_cap) else {
         template_html_abort("template html builder capacity invalid");
     };
     if cap == 0 {
-        if len != 0 || !builder.ptr.is_null() {
+        if len != 0 || !ptr.is_null() {
             template_html_abort("template html builder empty state invalid");
         }
     } else {
-        if builder.ptr.is_null() {
+        if len == 0 {
+            template_html_abort("template html builder retained capacity invalid");
+        }
+        if ptr.is_null() {
             template_html_abort("template html builder payload missing");
         }
-        template_html_range(
-            builder.ptr.addr(),
+        let payload_range = template_html_range(
+            ptr.addr(),
             cap,
             "template html builder payload range invalid",
         );
-        let payload = unsafe { core::slice::from_raw_parts(builder.ptr, len) };
+        let shell_range = template_html_range(
+            builder.addr(),
+            core::mem::size_of::<TemplateHtmlBuilder>(),
+            "template html builder shell range invalid",
+        );
+        if template_html_ranges_overlap(payload_range, shell_range) {
+            template_html_abort("template html builder payload aliases shell");
+        }
+        let payload = unsafe { core::slice::from_raw_parts(ptr, len) };
         if core::str::from_utf8(payload).is_err() {
             template_html_abort("template html builder payload is not utf-8");
         }
     }
-    builder
+    TemplateHtmlState { ptr, len, cap }
 }
 
-/// Validate a complete UTF-8 input view, then reject aliases of the shell or payload allocation.
+/// Reject aliases of the shell or payload allocation, then validate the complete UTF-8 input.
 ///
 /// # Safety
 /// A non-empty `(ptr, len)` must describe one live initialized byte range for the call.
 unsafe fn template_html_input<'a>(
     builder_ptr: *mut TemplateHtmlBuilder,
-    builder: &TemplateHtmlBuilder,
+    builder: TemplateHtmlState,
     ptr: *const u8,
     len: i64,
 ) -> &'a [u8] {
@@ -12831,10 +12856,6 @@ unsafe fn template_html_input<'a>(
         template_html_abort("template html input pointer invalid");
     }
     let input_range = template_html_range(ptr.addr(), len, "template html input range invalid");
-    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
-    if core::str::from_utf8(input).is_err() {
-        template_html_abort("template html input is not utf-8");
-    }
     let shell_range = template_html_range(
         builder_ptr.addr(),
         core::mem::size_of::<TemplateHtmlBuilder>(),
@@ -12846,13 +12867,16 @@ unsafe fn template_html_input<'a>(
     if builder.cap != 0 {
         let payload_range = template_html_range(
             builder.ptr.addr(),
-            usize::try_from(builder.cap)
-                .unwrap_or_else(|_| template_html_abort("template html builder capacity invalid")),
+            builder.cap,
             "template html builder payload range invalid",
         );
         if template_html_ranges_overlap(input_range, payload_range) {
             template_html_abort("template html input aliases builder payload");
         }
+    }
+    let input = unsafe { core::slice::from_raw_parts(ptr, len) };
+    if core::str::from_utf8(input).is_err() {
+        template_html_abort("template html input is not utf-8");
     }
     input
 }
@@ -12904,8 +12928,9 @@ pub unsafe extern "C" fn align_rt_template_html_write_v1(
     ptr: *const u8,
     len: i64,
 ) {
-    let builder = unsafe { template_html_state(builder_ptr) };
-    let input = unsafe { template_html_input(builder_ptr, builder, ptr, len) };
+    let state = unsafe { template_html_state(builder_ptr) };
+    let input = unsafe { template_html_input(builder_ptr, state, ptr, len) };
+    let builder = unsafe { &mut *builder_ptr };
     let additional = html_escaped_len(input)
         .unwrap_or_else(|| template_html_abort("template html escaped length overflow"));
     template_html_reserve(builder, additional);
@@ -12938,8 +12963,9 @@ pub unsafe extern "C" fn align_rt_template_html_raw_v1(
     ptr: *const u8,
     len: i64,
 ) {
-    let builder = unsafe { template_html_state(builder_ptr) };
-    let input = unsafe { template_html_input(builder_ptr, builder, ptr, len) };
+    let state = unsafe { template_html_state(builder_ptr) };
+    let input = unsafe { template_html_input(builder_ptr, state, ptr, len) };
+    let builder = unsafe { &mut *builder_ptr };
     template_html_reserve(builder, input.len());
     if input.is_empty() {
         return;
@@ -12961,9 +12987,10 @@ pub unsafe extern "C" fn align_rt_template_html_raw_v1(
 pub unsafe extern "C" fn align_rt_template_html_into_string_v1(
     builder_ptr: *mut TemplateHtmlBuilder,
 ) -> AlignStr {
-    let builder = unsafe { template_html_state(builder_ptr) };
-    let ptr = builder.ptr;
-    let len = i64::try_from(builder.len)
+    let state = unsafe { template_html_state(builder_ptr) };
+    let builder = unsafe { &mut *builder_ptr };
+    let ptr = state.ptr;
+    let len = i64::try_from(state.len)
         .unwrap_or_else(|_| template_html_abort("template html builder length invalid"));
     builder.lifecycle = TEMPLATE_HTML_SPENT;
     builder.ptr = core::ptr::null_mut();
@@ -12982,8 +13009,9 @@ pub unsafe extern "C" fn align_rt_template_html_free_v1(builder_ptr: *mut Templa
     if builder_ptr.is_null() {
         return;
     }
-    let builder = unsafe { template_html_state(builder_ptr) };
-    let payload = builder.ptr;
+    let state = unsafe { template_html_state(builder_ptr) };
+    let builder = unsafe { &mut *builder_ptr };
+    let payload = state.ptr;
     builder.lifecycle = TEMPLATE_HTML_SPENT;
     builder.ptr = core::ptr::null_mut();
     builder.len = 0;
@@ -48845,6 +48873,23 @@ mod regex_tests {
                         align_rt_template_html_free_v1(builder);
                     }
                 }
+                "retained-empty-capacity" => {
+                    let builder = align_rt_template_html_new_v1();
+                    unsafe {
+                        (*builder).ptr = core::ptr::NonNull::<u8>::dangling().as_ptr();
+                        (*builder).cap = 1;
+                        align_rt_template_html_free_v1(builder);
+                    }
+                }
+                "payload-shell-alias" => {
+                    let builder = align_rt_template_html_new_v1();
+                    unsafe {
+                        (*builder).ptr = builder.cast();
+                        (*builder).len = 1;
+                        (*builder).cap = 1;
+                        align_rt_template_html_free_v1(builder);
+                    }
+                }
                 "negative-length" => {
                     let builder = align_rt_template_html_new_v1();
                     unsafe { align_rt_template_html_raw_v1(builder, core::ptr::null(), -1) }
@@ -48874,6 +48919,8 @@ mod regex_tests {
             "null-shell",
             "version",
             "reserved",
+            "retained-empty-capacity",
+            "payload-shell-alias",
             "negative-length",
             "invalid-utf8",
             "shell-alias",

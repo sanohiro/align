@@ -28306,11 +28306,11 @@ struct MoveCheck<'a> {
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
 /// partial tuple-field move (`a := t.0`, moving one owned element) coexist: each owned tuple field
 /// can be moved out independently, after which the tuple may no longer be used as a whole.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum MovedKey {
     Whole(LocalId),
     Field(LocalId, u32),
-    ElemField(LocalId, u32, u32),
+    ElemField(LocalId, u32, Box<[u32]>),
 }
 
 type MovedSet = std::collections::HashSet<MovedKey>;
@@ -31484,6 +31484,27 @@ fn field_moved(moved: &MovedSet, id: LocalId, n: u32) -> bool {
     moved.contains(&MovedKey::Field(id, n)) || moved.contains(&MovedKey::Whole(id))
 }
 
+/// A fixed-element projection is unavailable when the same path, one of its parents, or one of
+/// its children was already moved. Sibling leaves remain independent owners.
+fn element_field_moved(
+    moved: &MovedSet,
+    local: LocalId,
+    index: u32,
+    path: &[u32],
+) -> bool {
+    moved.contains(&MovedKey::Whole(local))
+        || moved.iter().any(|key| {
+            matches!(
+                key,
+                MovedKey::ElemField(candidate, candidate_index, candidate_path)
+                    if *candidate == local
+                        && *candidate_index == index
+                        && (candidate_path.starts_with(path)
+                            || path.starts_with(candidate_path))
+            )
+        })
+}
+
 /// Whether a match scrutinee's result is assembled through a control-flow join. When an outer arm
 /// moves a payload out, MIR must lower this shape consuming so the join owns its selected source.
 /// Transparent scopes expose the same result shape without adding a join.
@@ -31504,7 +31525,15 @@ fn match_scrutinee_materializes_result(e: &Expr) -> bool {
 
 /// Re-binding a local (`x := …`) clears every move record for it (whole and per-field).
 fn clear_moved(moved: &mut MovedSet, id: LocalId) {
-    moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
+    moved.retain(|key| {
+        !matches!(
+            key,
+            MovedKey::Whole(local)
+                | MovedKey::Field(local, _)
+                | MovedKey::ElemField(local, _, _)
+                if *local == id
+        )
+    });
 }
 
 fn borrowed_projection_locals(body: &hir::Block) -> std::collections::HashSet<LocalId> {
@@ -38439,7 +38468,7 @@ impl<'a> MoveCheck<'a> {
         // iteration. `probe`'s end state includes it (statements are walked linearly), so zero the
         // back-edge in that case.
         let back_edge: MovedSet = if probe_falls_through {
-            probe.difference(&entry).copied().collect()
+            probe.difference(&entry).cloned().collect()
         } else {
             MovedSet::new()
         };
@@ -38947,6 +38976,41 @@ impl<'a> MoveCheck<'a> {
                             expression.span,
                         );
                     }
+                    return;
+                }
+                ExprKind::ElemField {
+                    recv, index, path, ..
+                } if !path.is_empty() => {
+                    let ExprKind::Local(base) = recv.kind else {
+                        return;
+                    };
+                    let Some(index) = (match index.kind {
+                        ExprKind::Int(value) if value >= 0 => u32::try_from(value).ok(),
+                        _ => None,
+                    }) else {
+                        self.diags.error(
+                            "moving an owned field out of a fixed array requires a constant index"
+                                .to_string(),
+                            expression.span,
+                        );
+                        return;
+                    };
+                    if self.borrowed_param_mode(base).is_some() {
+                        let name = &self.f.locals[base as usize].name;
+                        self.diags.error(
+                            format!("cannot move an element field out of borrowed parameter '{name}'"),
+                            expression.span,
+                        );
+                        return;
+                    }
+                    self.reject_live_resource_dependents(base, moved, expression.span);
+                    self.invalidate_mutable_place(base, &[]);
+                    self.invalidate_owner(base);
+                    moved.insert(MovedKey::ElemField(
+                        base,
+                        index,
+                        path.clone().into_boxed_slice(),
+                    ));
                     return;
                 }
                 ExprKind::Block(block)
@@ -42781,7 +42845,7 @@ impl<'a> MoveCheck<'a> {
                 recv, index, path, ..
             } => {
                 if let ExprKind::Local(base) = recv.kind
-                    && let [field] = path.as_slice()
+                    && !path.is_empty()
                 {
                     self.check_borrow_use(base, e.span);
                     let exact_index = match index.kind {
@@ -42790,7 +42854,7 @@ impl<'a> MoveCheck<'a> {
                     };
                     let already_moved = moved.contains(&MovedKey::Whole(base))
                         || exact_index.is_some_and(|index| {
-                            moved.contains(&MovedKey::ElemField(base, index, *field))
+                            element_field_moved(moved, base, index, path)
                         })
                         || exact_index.is_none()
                             && moved.iter().any(|key| {
@@ -42825,7 +42889,11 @@ impl<'a> MoveCheck<'a> {
                         // element resource is transferred.
                         self.invalidate_mutable_place(base, &[]);
                         self.invalidate_owner(base);
-                        moved.insert(MovedKey::ElemField(base, index, *field));
+                        moved.insert(MovedKey::ElemField(
+                            base,
+                            index,
+                            path.clone().into_boxed_slice(),
+                        ));
                     }
                 } else {
                     move_expr!(self, recv, moved, false, false);

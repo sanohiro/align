@@ -259,6 +259,35 @@ pub(crate) enum TemplateHtmlValidationReason {
     StoredType,
     Output,
     Value,
+    Signature,
+}
+
+fn template_html_signature(
+    name: &str,
+    resource: u32,
+) -> Option<(Vec<Ty>, Vec<align_ast::ParamMode>, Ty, hir::ReturnCleanupAbi)> {
+    use align_ast::ParamMode::{BorrowMut, ByValue};
+    Some(match name {
+        "pkg.template$html" => (
+            Vec::new(),
+            Vec::new(),
+            Ty::Resource(resource),
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        "pkg.template$write" | "pkg.template$raw" => (
+            vec![Ty::Resource(resource), Ty::Str],
+            vec![BorrowMut, ByValue],
+            Ty::Unit,
+            hir::ReturnCleanupAbi::None,
+        ),
+        "pkg.template$to_string" => (
+            vec![Ty::Resource(resource)],
+            vec![ByValue],
+            Ty::String,
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        _ => return None,
+    })
 }
 
 /// Validate the package identity, resource identity, placement, and operand/result types of every
@@ -288,7 +317,15 @@ pub(crate) fn template_html_validation_reason(
         }
         false
     });
-    if !contains_operation {
+    let contains_declaration = program
+        .fns
+        .iter()
+        .any(|function| template_html_signature(&function.name, 0).is_some())
+        || program
+            .imported_fns
+            .iter()
+            .any(|function| template_html_signature(&function.name, 0).is_some());
+    if !contains_operation && !contains_declaration {
         return Ok(());
     }
     let Some((resource_id, resource)) = program
@@ -299,9 +336,14 @@ pub(crate) fn template_html_validation_reason(
     else {
         return Err(TemplateHtmlValidationReason::Resource);
     };
+    let drop_hook_matches = resource.drop_hook
+        == "pkg.template.internal.resource$drop_html_builder"
+        || (!contains_operation
+            && resource.drop_hook
+                == "pkg.template.internal.resource.__align_interface_drop_html_builder");
     if resource.declaring_module != "pkg.template"
         || resource.generic_arity != 0
-        || resource.drop_hook != "pkg.template.internal.resource$drop_html_builder"
+        || !drop_hook_matches
         || resource.drop_thunk != "__align_resource_drop$pkg.template$html_builder"
         || resource.representation_version != 1
         || resource.drop_abi_fingerprint != *b"align-res-drop-1"
@@ -309,6 +351,56 @@ pub(crate) fn template_html_validation_reason(
         return Err(TemplateHtmlValidationReason::Resource);
     }
     let resource_id = resource_id as u32;
+
+    for function in &program.fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_signature(&function.name, resource_id)
+        else {
+            continue;
+        };
+        let actual_params = function
+            .params
+            .iter()
+            .map(|local| function.locals.get(*local as usize).map(|local| local.ty))
+            .collect::<Option<Vec<_>>>();
+        if function.origin
+            != (hir::FnOrigin::Source {
+                is_entry: false,
+                is_public: true,
+            })
+        {
+            return Err(TemplateHtmlValidationReason::Origin);
+        }
+        if actual_params.as_deref() != Some(params.as_slice())
+            || function.param_modes != modes
+            || function.ret != ret
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+            || function.parallel_transfer != hir::ReturnBorrowSummary::None
+        {
+            return Err(TemplateHtmlValidationReason::Signature);
+        }
+    }
+    for function in &program.imported_fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_signature(&function.name, resource_id)
+        else {
+            continue;
+        };
+        if function.params != params
+            || function.param_modes != modes
+            || function.ret != ret
+            || !function.return_provenance_known
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+            || function.effect != align_sema::FnEffect::Pure
+            || !function.parallel_transfer_params.is_empty()
+        {
+            return Err(TemplateHtmlValidationReason::Signature);
+        }
+    }
 
     for function in &program.fns {
         let mut work = Vec::new();

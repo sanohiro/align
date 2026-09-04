@@ -24,6 +24,19 @@ fn fixed_template_place_mut(
     })
 }
 
+fn null_element_field_mut(
+    program: &mut align_mir::Program,
+) -> Option<(&mut u32, &mut Operand, &mut Vec<u32>)> {
+    program.fns.iter_mut().find_map(|function| {
+        function.blocks.iter_mut().find_map(|block| {
+            block.stmts.iter_mut().find_map(|statement| match statement {
+                Stmt::NullElemField(slot, index, path) => Some((slot, index, path)),
+                _ => None,
+            })
+        })
+    })
+}
+
 fn template_source() -> &'static str {
     fixture("apps/template/pkg/template.align")
 }
@@ -127,24 +140,25 @@ fn resource_fields_in_fixed_move_record_arrays_borrow_finish_and_drop_once() {
     let main = r#"module main
 import pkg.template
 
-Holder { output: pkg.template.html_builder, code: i32 }
+Nested { first: pkg.template.html_builder, second: pkg.template.html_builder }
+Holder { nested: Nested, code: i32 }
 
 fn main() -> i32 {
   mut holders := [
-    Holder { output: pkg.template.html(), code: 10 },
-    Holder { output: pkg.template.html(), code: 20 },
+    Holder { nested: Nested { first: pkg.template.html(), second: pkg.template.html() }, code: 10 },
+    Holder { nested: Nested { first: pkg.template.html(), second: pkg.template.html() }, code: 20 },
   ]
-  pkg.template.write(holders[0].output, "<one>")
-  first := pkg.template.to_string(holders[0].output)
-  pkg.template.raw(holders[1].output, "ok")
-  second := pkg.template.to_string(holders[1].output)
+  pkg.template.write(holders[0].nested.first, "<one>")
+  first := pkg.template.to_string(holders[0].nested.first)
+  pkg.template.raw(holders[0].nested.second, "ok")
+  second := pkg.template.to_string(holders[0].nested.second)
   if first != "&lt;one&gt;" { return 1 }
   if second != "ok" { return 2 }
   return holders[0].code + holders[1].code
 }
 "#;
-    let files = files(main);
-    let checked = diff_check_multi("pkg-template-fixed-record-array", &files, "main.align");
+    let project_files = files(main);
+    let checked = diff_check_multi("pkg-template-fixed-record-array", &project_files, "main.align");
     assert!(
         !checked.whole_errors && !checked.per_unit_errors,
         "whole:\n{}\nper-unit:\n{}",
@@ -155,12 +169,12 @@ fn main() -> i32 {
         for output in [
             build_and_run_multi(
                 "pkg-template-fixed-record-array-whole",
-                &files,
+                &project_files,
                 "main.align",
             ),
             build_per_unit_multi(
                 "pkg-template-fixed-record-array-units",
-                &files,
+                &project_files,
                 "main.align",
             )
             .link_and_run(),
@@ -175,7 +189,7 @@ fn main() -> i32 {
 
         let built = build_per_unit_multi(
             "pkg-template-fixed-record-array-mir",
-            &files,
+            &project_files,
             "main.align",
         );
         let valid = built.unit("main").mir.clone();
@@ -205,7 +219,68 @@ fn main() -> i32 {
                 "malformed fixed element {name} must fail before LLVM pointer construction"
             );
         }
+
+        for (name, mutate) in [
+            (
+                "slot",
+                (|slot: &mut u32, _: &mut Operand, _: &mut Vec<u32>| *slot = u32::MAX)
+                    as fn(&mut u32, &mut Operand, &mut Vec<u32>),
+            ),
+            ("index-type", |_, index, _| {
+                *index = Operand::Const(align_mir::Const::Bool(false));
+            }),
+            ("index-range", |_, index, _| {
+                let Operand::Const(align_mir::Const::Int(_, ty)) = index else {
+                    return;
+                };
+                *index = Operand::Const(align_mir::Const::Int(i128::MAX, *ty));
+            }),
+            ("empty-path", |_, _, path| path.clear()),
+            ("missing-field", |_, _, path| *path = vec![u32::MAX]),
+            ("non-record-intermediate", |_, _, path| *path = vec![1, 0]),
+            ("non-resource-leaf", |_, _, path| *path = vec![1]),
+        ] {
+            let mut malformed = valid.clone();
+            let Some((slot, index, path)) = null_element_field_mut(&mut malformed) else {
+                assert!(false, "fixture must contain a fixed element nulling statement");
+                return;
+            };
+            mutate(slot, index, path);
+            assert!(
+                emit_llvm_ir(&malformed, BuildTarget::Baseline, false, &[], false).is_err(),
+                "malformed fixed element nulling {name} must fail before LLVM construction"
+            );
+        }
     }
+
+    let duplicate = r#"module main
+import pkg.template
+
+Nested { output: pkg.template.html_builder }
+Holder { nested: Nested }
+
+fn main() -> i32 {
+  mut holders := [Holder { nested: Nested { output: pkg.template.html() } }]
+  first := pkg.template.to_string(holders[0].nested.output)
+  second := pkg.template.to_string(holders[0].nested.output)
+  return 0
+}
+"#;
+    let duplicate_files = files(duplicate);
+    let rejected = diff_check_multi(
+        "pkg-template-nested-fixed-record-double-move",
+        &duplicate_files,
+        "main.align",
+    );
+    assert!(
+        rejected.whole_errors
+            && rejected.per_unit_errors
+            && rejected.whole_diags.contains("use of moved element field")
+            && rejected.per_unit_diags.contains("use of moved element field"),
+        "whole:\n{}\nper-unit:\n{}",
+        rejected.whole_diags,
+        rejected.per_unit_diags,
+    );
 }
 
 #[test]

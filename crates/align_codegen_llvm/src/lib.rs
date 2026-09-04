@@ -976,6 +976,7 @@ pub fn validate_thin_partition_program(
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
     Ok(())
@@ -3045,6 +3046,7 @@ fn build_module<'c>(
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -4041,7 +4043,107 @@ fn template_html_callable_resource_matches(program: &Program, resource: u32) -> 
         })
 }
 
+fn template_html_mir_signature(
+    name: &str,
+    resource: u32,
+) -> Option<(Vec<Ty>, Vec<align_ast::ParamMode>, Ty, hir::ReturnCleanupAbi)> {
+    use align_ast::ParamMode::{BorrowMut, ByValue};
+    Some(match name {
+        "pkg.template$html" => (
+            Vec::new(),
+            Vec::new(),
+            Ty::Resource(resource),
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        "pkg.template$write" | "pkg.template$raw" => (
+            vec![Ty::Resource(resource), Ty::Str],
+            vec![BorrowMut, ByValue],
+            Ty::Unit,
+            hir::ReturnCleanupAbi::None,
+        ),
+        "pkg.template$to_string" => (
+            vec![Ty::Resource(resource)],
+            vec![ByValue],
+            Ty::String,
+            hir::ReturnCleanupAbi::DynamicBit,
+        ),
+        _ => return None,
+    })
+}
+
+fn validate_template_html_mir_signatures(program: &Program) -> Result<(), CodegenError> {
+    let has_surface = program
+        .fns
+        .iter()
+        .any(|function| template_html_mir_signature(function.name.as_str(), 0).is_some())
+        || program
+            .imported_fns
+            .iter()
+            .any(|function| template_html_mir_signature(function.name.as_str(), 0).is_some());
+    if !has_surface {
+        return Ok(());
+    }
+    let Some(resource) = program
+        .resources
+        .iter()
+        .enumerate()
+        .find_map(|(resource, _)| {
+            let resource = u32::try_from(resource).ok()?;
+            template_html_callable_resource_matches(program, resource).then_some(resource)
+        })
+    else {
+        return Err(CodegenError::Lowering(
+            "pkg.template callable surface has no canonical resource".into(),
+        ));
+    };
+    for function in &program.fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_mir_signature(function.name.as_str(), resource)
+        else {
+            continue;
+        };
+        let actual = function
+            .params
+            .iter()
+            .map(|slot| function.slots.get(*slot as usize).copied())
+            .collect::<Option<Vec<_>>>();
+        if actual.as_deref() != Some(params.as_slice())
+            || function.param_modes != modes
+            || function.ret != ret
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+        {
+            return Err(CodegenError::Lowering(format!(
+                "pkg.template function '{}' has a malformed canonical signature",
+                function.name
+            )));
+        }
+    }
+    for function in &program.imported_fns {
+        let Some((params, modes, ret, cleanup)) =
+            template_html_mir_signature(function.name.as_str(), resource)
+        else {
+            continue;
+        };
+        if function.params != params
+            || function.param_modes != modes
+            || function.ret != ret
+            || function.return_borrow != hir::ReturnBorrowSummary::None
+            || function.return_region != hir::ReturnRegionSummary::None
+            || function.return_cleanup != cleanup
+        {
+            return Err(CodegenError::Lowering(format!(
+                "imported pkg.template function '{}' has a malformed canonical signature",
+                function.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
+    validate_template_html_mir_signatures(program)?;
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
             align_mir::Operand::Const(align_mir::Const::Int(_, ty))
@@ -6444,6 +6546,77 @@ fn validate_slice_index_rvalues(program: &Program) -> Result<(), CodegenError> {
                 {
                     return Err(CodegenError::Lowering(format!(
                         "slice-index MIR in function '{}' has a physical source/result contract mismatch",
+                        function.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a malformed fixed-record resource nulling statement before LLVM indexes a slot, record,
+/// or field table. This statement is emitted only after moving a canonical `pkg.template`
+/// resource leaf out of a source-formed fixed record array.
+fn validate_fixed_element_nulling(program: &Program) -> Result<(), CodegenError> {
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let Stmt::NullElemField(slot, index, path) = statement else {
+                    continue;
+                };
+                let Some(Ty::StructArray(mut struct_id, len)) =
+                    function.slots.get(*slot as usize).copied()
+                else {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has an invalid root slot",
+                        function.name
+                    )));
+                };
+                let Operand::Const(Const::Int(index, index_ty)) = index else {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has a non-constant index",
+                        function.name
+                    )));
+                };
+                if !matches!(index_ty, Ty::Int(_))
+                    || *index < 0
+                    || u32::try_from(*index).ok().is_none_or(|index| index >= len)
+                    || path.is_empty()
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' has an invalid index or path",
+                        function.name
+                    )));
+                }
+                let mut leaf = None;
+                for (depth, field) in path.iter().copied().enumerate() {
+                    let Some(ty) = program
+                        .structs
+                        .get(struct_id as usize)
+                        .and_then(|record| record.fields.get(field as usize))
+                        .map(|field| field.ty)
+                    else {
+                        return Err(CodegenError::Lowering(format!(
+                            "fixed element nulling in function '{}' has an invalid field path",
+                            function.name
+                        )));
+                    };
+                    if depth + 1 == path.len() {
+                        leaf = Some(ty);
+                    } else if let Ty::Struct(next) = ty {
+                        struct_id = next;
+                    } else {
+                        return Err(CodegenError::Lowering(format!(
+                            "fixed element nulling in function '{}' crosses a non-record field",
+                            function.name
+                        )));
+                    }
+                }
+                if !matches!(leaf, Some(Ty::Resource(resource)) if template_html_callable_resource_matches(program, resource))
+                {
+                    return Err(CodegenError::Lowering(format!(
+                        "fixed element nulling in function '{}' does not select the canonical template resource",
                         function.name
                     )));
                 }
@@ -25508,6 +25681,11 @@ fn main() -> i32 = 0
             vec![Ty::Unit, Ty::Resource(resource), Ty::Str],
         );
         write.ret = Ty::Unit;
+        write.params = vec![0, 1];
+        write.param_modes = vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue];
+        write.borrow_mut_cleanup_slots = vec![Some(2), None];
+        write.slots = vec![Ty::Resource(resource), Ty::Str, Ty::Bool];
+        write.slot_align = vec![None; 3];
         let mut raw = write.clone();
         raw.name = program_call("pkg.template$raw");
         assert!(matches!(raw.blocks[0].stmts[0], Stmt::Let(..)));
@@ -25527,17 +25705,21 @@ fn main() -> i32 = 0
             vec![Ty::String, Ty::Resource(resource)],
         );
         finish.ret = Ty::String;
+        finish.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+        finish.params = vec![0];
+        finish.param_modes = vec![align_ast::ParamMode::ByValue];
+        finish.borrow_mut_cleanup_slots = vec![None];
+        finish.slots = vec![Ty::Resource(resource)];
+        finish.slot_align = vec![None];
+        let mut html = template_mir_function(
+            "pkg.template$html",
+            Rvalue::TemplateHtmlNew { resource },
+            vec![Ty::Resource(resource)],
+        );
+        html.ret = Ty::Resource(resource);
+        html.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
         Program {
-            fns: vec![
-                template_mir_function(
-                    "pkg.template$html",
-                    Rvalue::TemplateHtmlNew { resource },
-                    vec![Ty::Resource(resource)],
-                ),
-                write,
-                raw,
-                finish,
-            ],
+            fns: vec![html, write, raw, finish],
             sqlite_callback_effects: Default::default(),
             externs: vec![],
             imported_fns: vec![],
@@ -25580,6 +25762,25 @@ fn main() -> i32 = 0
         let mut malformed = program.clone();
         malformed.fns[2].name = program_call("main");
         assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut malformed = program.clone();
+        malformed.fns[1].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&malformed).is_err());
+
+        let mut imported = program.clone();
+        imported.fns.clear();
+        imported.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("pkg.template$raw"),
+            params: vec![Ty::Resource(0), Ty::Str],
+            param_modes: vec![align_ast::ParamMode::BorrowMut, align_ast::ParamMode::ByValue],
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+        });
+        assert!(validate_resource_rvalues(&imported).is_ok());
+        imported.imported_fns[0].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&imported).is_err());
 
         let mut malformed = program;
         assert!(matches!(
