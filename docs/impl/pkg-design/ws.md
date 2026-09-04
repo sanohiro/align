@@ -332,6 +332,9 @@ The author-side pass must prove:
 | P2 bounded owner lifecycle | Install child RAII immediately after spawn and apply one deadline to startup, exchange, kill/wait, and stderr completion; no fallible pre-owner window or unbounded drain. |
 | P2 Upgrade method check order | Check arity and every method operand before the exclusive shared-receiver gate, with a twin that requires both independent diagnostics. |
 | P2 top-level web type drift | Replace pending Upgrade prose and the obsolete unary Route summary in the authoritative English/Japanese type overview. |
+| P1 outbound-close evidence strength | Make the close owner reject negative and above-u16 codes, distinguish one cumulative 600 ms budget from a per-frame reset with a shorter client read bound, and fault-inject after the frame head/code write so a reset owns the reason-payload write failure specifically. |
+| P2 empty protocol products | Offer a client protocol against an empty server list and reject a server list containing the empty string, separating selection-none behavior from request/config omissions. |
+| P2 fail-safe owner reaping | Give every affected test socket a deadline for writes as well as reads, and transfer every spawned child to a kill-and-wait reaper before a bounded owner returns or unwinds; a polling error or expired caller deadline cannot leave an unreaped process. |
 
 ## References
 

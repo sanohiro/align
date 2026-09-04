@@ -458,7 +458,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     let empty_protocol_server = start_server_with(&empty_protocol_app, "apps-ws-empty-protocols");
     let empty_selected = request_head(
         empty_protocol_server.port,
-        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: offered\r\n\r\n",
     );
     assert!(empty_selected.starts_with("HTTP/1.1 101 "), "empty server protocol list: {empty_selected:?}");
     assert!(!empty_selected.contains("Sec-WebSocket-Protocol:"));
@@ -804,6 +804,7 @@ fn invalid_server_protocol_aborts_before_bind_with_exact_route_diagnosis() {
         return;
     }
     for (name, protocols) in [
+        ("apps-ws-empty-protocol", "protocols := [\"\"]"),
         ("apps-ws-invalid-protocol", "protocols := [\"bad protocol\"]"),
         (
             "apps-ws-duplicate-protocol",

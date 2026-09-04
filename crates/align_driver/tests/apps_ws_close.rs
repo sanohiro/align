@@ -53,6 +53,7 @@ fn pump(c: pkg.web.types.Ctx, connection: http_upgrade, selected: string) -> Res
   if c.path == "/c3008" { code = 3008 }
   if c.path == "/c4000" { code = 4000 }
   if c.path == "/c4999" { code = 4999 }
+  if c.path == "/cnegative" { code = -1 }
   if c.path == "/c999" { code = 999 }
   if c.path == "/c1004" { code = 1004 }
   if c.path == "/c1005" { code = 1005 }
@@ -64,13 +65,14 @@ fn pump(c: pkg.web.types.Ctx, connection: http_upgrade, selected: string) -> Res
   if c.path == "/c3001" { code = 3001 }
   if c.path == "/c3999" { code = 3999 }
   if c.path == "/c5000" { code = 5000 }
+  if c.path == "/c65536" { code = 65536 }
   if c.path == "/reason123" { reason = repeated_x(123) }
   if c.path == "/reason124" { reason = repeated_x(124) }
   if c.path == "/timeout0" { timeout_ns = 0 }
   if c.path == "/timeout-min" { timeout_ns = 1 }
   if c.path == "/timeout-max" { timeout_ns = 86400000000000 }
   if c.path == "/timeout-over" { timeout_ns = 86400000000001 }
-  if c.path == "/timeout-short" { timeout_ns = 250000000 }
+  if c.path == "/timeout-short" { timeout_ns = 600000000 }
   if c.path == "/write-fail" {
     mut sync := buffer(1)
     transport.read_exact(sync, 1)?
@@ -88,20 +90,29 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 "#;
 
 struct Server {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     port: u16,
     deadline: Instant,
 }
 
-fn terminate_child_by(child: &mut std::process::Child, deadline: Instant) {
-    let _ = child.kill();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break,
+fn terminate_child_by(
+    mut child: std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::Child> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
-    }
+        let _ = sender.send(child);
+    });
+    receiver.recv_timeout(remaining).ok()
 }
 
 struct PendingChild {
@@ -121,60 +132,78 @@ impl PendingChild {
 
 impl Drop for PendingChild {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            terminate_child_by(child, self.deadline);
+        if let Some(child) = self.child.take() {
+            let _ = terminate_child_by(child, self.deadline);
         }
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        terminate_child_by(&mut self.child, self.deadline);
+        if let Some(child) = self.child.take() {
+            let _ = terminate_child_by(child, self.deadline);
+        }
     }
 }
 
 impl Server {
     fn stop_and_stderr(&mut self) -> String {
-        let _ = self.child.kill();
-        loop {
-            if self.child.try_wait().expect("poll stopped close owner").is_some() {
-                break;
-            }
-            assert!(Instant::now() < self.deadline, "close owner did not stop before its deadline");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let child = self.child.take().expect("close owner child exists");
+        let mut child = terminate_child_by(child, self.deadline)
+            .expect("close owner did not stop before its deadline");
+        let _ = child.wait();
         let mut stderr = String::new();
-        self.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         stderr
     }
 
     fn wait_for_abort(&mut self) -> (std::process::ExitStatus, String) {
         let status = loop {
-            if let Some(status) = self.child.try_wait().expect("poll invalid close server") {
-                break status;
+            match self
+                .child
+                .as_mut()
+                .expect("close owner child exists")
+                .try_wait()
+            {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < self.deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => panic!("invalid close input did not abort"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll invalid close server: {error}"),
             }
-            assert!(Instant::now() < self.deadline, "invalid close input did not abort");
-            std::thread::sleep(Duration::from_millis(10));
         };
         let mut stderr = String::new();
-        self.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        self.child
+            .as_mut()
+            .expect("close owner child exists")
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
         (status, stderr)
     }
 }
 
-fn build_app() -> BuiltExeMulti {
+fn build_app_with_ws(name: &str, ws_root: &str) -> BuiltExeMulti {
     build_exe_multi(
-        "apps-ws-close",
+        name,
         &[
             ("pkg/web/internal/router.align", ROUTER),
             ("pkg/web/internal/query.align", QUERY),
             ("pkg/web/types.align", TYPES),
             ("pkg/web.align", WEB_ROOT),
-            ("pkg/ws.align", WS_ROOT),
+            ("pkg/ws.align", ws_root),
             ("main.align", APP),
         ],
         "main.align",
     )
+}
+
+fn build_app() -> BuiltExeMulti {
+    build_app_with_ws("apps-ws-close", WS_ROOT)
 }
 
 fn free_loopback_port() -> u16 {
@@ -209,7 +238,7 @@ fn start_server(exe: &Path) -> Server {
             }
             panic!("close owner exited at startup: {status:?}; stderr: {stderr}");
         }
-        return Server { child: child.take(), port, deadline };
+        return Server { child: Some(child.take()), port, deadline };
     }
     unreachable!("startup retry loop returns or panics")
 }
@@ -337,12 +366,15 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
     let mut bounded = open_websocket(&server, "/timeout-short");
     assert_eq!(read_frame(&mut bounded), (true, 8, 1000u16.to_be_bytes().to_vec()));
     for mask in [[1, 1, 1, 1], [2, 2, 2, 2]] {
-        std::thread::sleep(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(120));
         bounded.write_all(&masked_frame(true, 9, b"p", mask)).unwrap();
         assert_eq!(read_frame(&mut bounded), (true, 10, b"p".to_vec()));
     }
+    // The real cumulative budget has about 360ms left here. A buggy per-frame reset would leave
+    // the full 600ms, so this client-side bound makes that implementation time out the test.
+    bounded.set_read_timeout(Some(Duration::from_millis(480))).unwrap();
     expect_connection_end(&mut bounded);
-    assert!(started.elapsed() < Duration::from_secs(2), "deadline must not reset per frame");
+    assert!(started.elapsed() < Duration::from_millis(750), "deadline must not reset per frame");
 
     let mut protocol = open_websocket(&server, "/protocol");
     assert_eq!(read_frame(&mut protocol).1, 8);
@@ -395,7 +427,43 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
     assert!(stderr.contains("Timeout"), "deadline exhaustion must surface Timeout:\n{stderr}");
     assert!(stderr.contains("Code("), "outbound reset must surface transport Code:\n{stderr}");
 
+    // Fault-inject between the code and reason writes: the 4-byte frame head/code prefix proves
+    // those writes succeeded, then the reset makes the reason-payload write own the error.
+    let partial_write_ws = WS_ROOT.replace(
+        "  connection.write(code_bytes[0..2])?\n  return connection.write(reason.bytes())",
+        "  connection.write(code_bytes[0..2])?\n  mut sync := buffer(1)\n  connection.read_exact(sync, 1)?\n  return connection.write(reason.bytes())",
+    );
+    assert_ne!(partial_write_ws, WS_ROOT, "close-frame write seam must remain recognizable");
+    let partial_built = build_app_with_ws("apps-ws-close-partial-write", &partial_write_ws);
+    let mut partial_server = start_server(&partial_built.exe);
+    let mut partial = open_websocket(&partial_server, "/reason123");
+    let mut prefix = [0u8; 4];
+    partial.read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, [0x88, 125, 3, 232], "frame head and code were written first");
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                partial.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        },
+        0,
+    );
+    partial.write_all(&[0]).unwrap();
+    drop(partial);
+    std::thread::sleep(Duration::from_millis(100));
+    let partial_stderr = partial_server.stop_and_stderr();
+    assert!(
+        partial_stderr.contains("Code("),
+        "reason-payload reset must surface transport Code:\n{partial_stderr}"
+    );
+
     for path in [
+        "/cnegative",
         "/c999",
         "/c1004",
         "/c1005",
@@ -407,6 +475,7 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
         "/c3001",
         "/c3999",
         "/c5000",
+        "/c65536",
         "/reason124",
         "/timeout0",
         "/timeout-over",

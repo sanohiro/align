@@ -87,41 +87,48 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 "#;
 
 struct Server {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     port: u16,
     deadline: Instant,
     _built: BuiltExeMulti,
 }
 
-fn terminate_child_by(child: &mut std::process::Child, deadline: Instant) {
-    let _ = child.kill();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break,
+fn terminate_child_by(
+    mut child: std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::Child> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
-    }
+        let _ = sender.send(child);
+    });
+    receiver.recv_timeout(remaining).ok()
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        terminate_child_by(&mut self.child, self.deadline);
+        if let Some(child) = self.child.take() {
+            let _ = terminate_child_by(child, self.deadline);
+        }
     }
 }
 
 impl Server {
     fn stop_and_stderr(&mut self) -> String {
-        let _ = self.child.kill();
-        loop {
-            if self.child.try_wait().expect("poll stopped Upgrade owner").is_some() {
-                break;
-            }
-            assert!(Instant::now() < self.deadline, "Upgrade owner did not stop before its deadline");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let child = self.child.take().expect("Upgrade owner child exists");
+        let mut child = terminate_child_by(child, self.deadline)
+            .expect("Upgrade owner did not stop before its deadline");
+        let _ = child.wait();
         let mut stderr = String::new();
-        self.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         stderr
     }
 }
@@ -143,8 +150,8 @@ impl PendingChild {
 
 impl Drop for PendingChild {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            terminate_child_by(child, self.deadline);
+        if let Some(child) = self.child.take() {
+            let _ = terminate_child_by(child, self.deadline);
         }
     }
 }
@@ -193,7 +200,7 @@ fn start_server() -> Server {
             }
             panic!("Upgrade owner exited at startup: {status:?}; stderr: {stderr}");
         }
-        return Server { child: child.take(), port, deadline, _built: built };
+        return Server { child: Some(child.take()), port, deadline, _built: built };
     }
     unreachable!("startup retry loop returns or panics")
 }
@@ -215,6 +222,7 @@ fn exchange(server: &Server, request: &[u8]) -> String {
         .checked_duration_since(Instant::now())
         .expect("Upgrade owner deadline exhausted before exchange");
     sock.set_read_timeout(Some(remaining)).unwrap();
+    sock.set_write_timeout(Some(remaining)).unwrap();
     sock.write_all(&one_shot(request)).unwrap();
     let mut response = Vec::new();
     sock.read_to_end(&mut response).unwrap();
@@ -281,6 +289,11 @@ fn upgrade_dispatch_group_middleware_prepare_transfer_and_pump_matrix() {
         },
         0,
     );
+    let remaining = server
+        .deadline
+        .checked_duration_since(Instant::now())
+        .expect("Upgrade owner deadline exhausted before reset request");
+    reset.set_write_timeout(Some(remaining)).unwrap();
     reset.write_all(&get("/write-fail")).unwrap();
     drop(reset);
     std::thread::sleep(Duration::from_millis(100));

@@ -21,6 +21,43 @@ const TYPES: &str = include_str!("../../../apps/web/pkg/web/types.align");
 const WEB_ROOT: &str = include_str!("../../../apps/web/pkg/web.align");
 const QUERY: &str = include_str!("../../../apps/web/pkg/web/internal/query.align");
 
+struct ChildOwner {
+    child: Option<std::process::Child>,
+    deadline: Instant,
+}
+
+impl ChildOwner {
+    fn new(child: std::process::Child, timeout: Duration) -> Self {
+        Self { child: Some(child), deadline: Instant::now() + timeout }
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("child owner holds its process")
+    }
+}
+
+impl Drop for ChildOwner {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = child.kill();
+            loop {
+                match child.wait() {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = sender.send(());
+        });
+        let _ = receiver.recv_timeout(remaining);
+    }
+}
+
 /// A `main` serving `routes_src` on a port that is never reached for the reject cases.
 fn app(routes_src: &str) -> String {
     format!(
@@ -63,24 +100,31 @@ fn run_expect_exit(name: &str, routes_src: &str) -> (std::process::ExitStatus, S
         ],
         "main.align",
     );
-    let mut child = std::process::Command::new(&built.exe)
+    let child = std::process::Command::new(&built.exe)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn server");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child = ChildOwner::new(child, Duration::from_secs(10));
+    let deadline = child.deadline;
     let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(st) => break st,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("server should have aborted at startup but is still running");
+        match child.child().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
             }
+            Ok(None) => panic!("server should have aborted at startup but is still running"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll startup abort: {error}"),
         }
     };
     let mut err = String::new();
-    child.stderr.take().expect("stderr piped").read_to_string(&mut err).expect("read stderr");
+    child
+        .child()
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut err)
+        .expect("read stderr");
     (status, err)
 }
 
@@ -215,11 +259,12 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
     let port = probe.local_addr().unwrap().port();
     drop(probe);
-    let mut child = std::process::Command::new(&built.exe)
+    let child = std::process::Command::new(&built.exe)
         .args(["--port", &port.to_string()])
         .spawn()
         .expect("spawn server");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let child = ChildOwner::new(child, Duration::from_secs(30));
+    let deadline = child.deadline;
     let resp = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut sock) => {
@@ -230,15 +275,9 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
                 break String::from_utf8_lossy(&out).into_owned();
             }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("server never came up: {e}");
-            }
+            Err(e) => panic!("server never came up: {e}"),
         }
     };
-    let _ = child.kill();
-    let _ = child.wait();
     // DELETE bypasses the GET row and lands on the any fallback — both rows are live.
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "fallback served: {resp:?}");
     assert!(resp.ends_with("\r\n\r\nany"), "the any row answered: {resp:?}");
@@ -278,24 +317,31 @@ pub fn main() -> Result<(), Error> {\n\
         ],
         "main.align",
     );
-    let mut child = std::process::Command::new(&built.exe)
+    let child = std::process::Command::new(&built.exe)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn server");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child = ChildOwner::new(child, Duration::from_secs(10));
+    let deadline = child.deadline;
     let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(st) => break st,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("an empty-typed stream route must abort at startup");
+        match child.child().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
             }
+            Ok(None) => panic!("an empty-typed stream route must abort at startup"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll empty-typed stream abort: {error}"),
         }
     };
     let mut err = String::new();
-    child.stderr.take().expect("stderr piped").read_to_string(&mut err).expect("read stderr");
+    child
+        .child()
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut err)
+        .expect("read stderr");
     assert!(!status.success(), "must abort, got {status:?}");
     assert!(err.contains("stream route with an empty content type"), "diagnosis: {err:?}");
 }
