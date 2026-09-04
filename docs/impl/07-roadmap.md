@@ -4052,9 +4052,13 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   frame-work caps, counts scratch/transient-growth/Text-conversion memory in one exact ceiling,
   answers Ping, ignores Pong, validates masked frames and UTF-8, and echoes a valid peer Close except
   that client-only 1010 receives an empty acknowledgment.
+  Header/readiness ABIs hard-abort detectable malformed inputs instead of aliasing zero/false. The
+  101 path allocates one checked exact head and its handle shell before fd transfer and instruments
+  their overlap with builder storage. Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE`
+  before request-context publication and closes once with a mapped accept error on failure.
   Sends are unmasked and do not copy payload; server close has an explicit cumulative deadline and
   completes the closing handshake without resetting its budget. Ten planned runtime keys reuse
-  existing shapes, so A124 remains unused.
+  existing shapes and their empty curated LLVM function-attribute sets, so A124 remains unused.
   WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
   heartbeat observation, and broadcast state are deferred. Exact ledger and implementation
   closure matrix: `pkg-design/ws.md`.

@@ -1406,19 +1406,27 @@ header name と `contains_token` argument は既存の nonempty ASCII RFC token 
 する。`count` は physical row を case-insensitive に数える。`tokens_valid` は全 repeated row の全 comma member を
 検査し、absent は true。`contains_token` は全 row/member を ASCII-case-insensitive に検索するが、隣接 member の
 妥当性は証明しない。三つとも Pure、allocation-free、cursor-free で、既存 request table を call 中だけ borrow
-する。
+する。native boundary では ctx、complete name/token view の順で検証する。null/misaligned ctx は reference formation 前、
+negative または address-space-unrepresentable length/positive-length null range は slice formation 前、invalid token byte は
+table scan 前に hard-abort し、dangling nonnull pointer は検出不能。zero/false と混同する malformed sentinel はない。
 
 `upgrade_ready` は Pure/zero-allocation で、parsed request が HTTP/1.1 かつ complete request 後の parser
 residual がない時だけ true。`pkg.web.Ctx` はこの値を trailing field に middleware/dispatch 前に copy する。
 HTTP/1.0 と co-read byte は accept 計算前に通常 400 となり、lower transfer も両 fact を再検証する。
+native getter も null/misaligned ctx を false にせず hard-abort する。
 
 `respond_upgrade` は builder だけを consume する。byte write/fd ownership move 前の順序は HTTP/1.1、parser
 residual absent、exact status 101、body absent、各 header name を nonempty ASCII RFC token、value を
 HTAB/SP/visible-ASCII/obs-text として insertion order で検証、nonempty token-list Upgrade row exactly one、
 Upgrade token を持つ valid Connection row exactly one、Content-Length absent、Transfer-Encoding absent。
-validation failure は ctx unspent。validation 後に head を serialize、fd を lift、ctx を
-spent にして complete head を書く。success だけ Move handle を publish する。write failure は fd を close して ctx
-spent のまま。ctx は pump view の request buffer を保持し、upgraded fd を park しない。
+validation failure は ctx unspent。その後 checked addition で
+`H = len("HTTP/1.1 101 Switching Protocols\r\n") + sum(len(name)+len(": ")+len(value)+len("\r\n")) + len("\r\n")`
+を計算し、overflow は ctx unspent の Invalid。一つの exact `H`-byte buffer を growth/second serialized copy なしで
+allocate/fill し、fixed handle shell も fd transfer 前に allocate する。entry builder heap `B` と
+`U = size_of::<HttpUpgrade>()` に対し、allocator-private metadata を除く exact producer-requested operation
+high-water は `B + H + U`。compile-time layout assertion と allocation probe が所有する。OOM は
+wire byte/ownership transfer 前に hard-abort。success だけ Move handle を publish し、head/builder は publication 前に
+free。write failure は fd close、ctx spent。ctx は pump view の request buffer を保持し upgraded fd を park しない。
 
 `http_upgrade` はその fd と sticky terminal error state を所有する。raw same-frame local と
 by-value/borrow/borrow-mut parameter は可。tagged carrier は unnested same-frame
@@ -1439,12 +1447,17 @@ successful shutdown 後の read/write/deadline は buffer/state/clock/I/O mutati
 shutdown repeat だけ Ok。caller argument invalidity は live/spent/poisoned state より先。
 Drop は protocol write 無しの close-only。
 
+SIGPIPE safety はこの surface に connection が届く前に成立する。Linux write は `send(MSG_NOSIGNAL)`。macOS/iOS は
+accepted socket の `SO_NOSIGPIPE` installation を request read/ctx publication 前に check し、failure は fd を一回
+close して `srv.accept` から mapped OS Error。suppression を試しただけの socket は Upgrade 可能にならない。
+
 十 keyed row は `HttpCtxUpgradeReady` A03、`HttpHeadersCount` A37、`HttpHeadersTokensValid` A20、
 `HttpHeadersContainsToken` A120、`HttpRespondUpgrade` A24、`HttpUpgradeReadExact` A20、
 `HttpUpgradeWrite` A20、`HttpUpgradeDeadline` A04、`HttpUpgradeShutdown` A03、
 `HttpUpgradeFree` A62。新 ABI shape は予約しない。この prerequisite は combined `pkg.ws` implementation
 capability だけで activate し、current shipped count と A124 は不変。exact validation、pointer、ownership、cache、
-test contract は `../pkg-design/ws.md`。
+test contract は `../pkg-design/ws.md`。generated declaration は reused shape の empty curated function-attribute set
+を保持する。Rust C export は C 境界を unwind しないが、LLVM `nounwind` attribute や shared shape mutation は追加しない。
 
 ## Pitfalls
 

@@ -2010,3 +2010,7 @@ source. Every scalar/id/key/result/effect/region/ownership field gets a mutation
 discriminator must extend the existing variant sweep. Any invalid record returns the canonical
 empty MIR program (or `LoweringRejected` through the checked entry) before MIR/runtime identity,
 allocation, fd transfer, or I/O. These rows are reserved by `pkg-design/ws.md` and not active yet.
+Source-invalid header tokens abort before a query call is emitted. Runtime-only malformed native
+context/view inputs remain the direct ABI owner's hard-abort responsibility and cannot be
+represented as ordinary HIR zero/false results. The checked response-head size and allocation are
+runtime publication prerequisites after semantic validation, not a second HIR result state.

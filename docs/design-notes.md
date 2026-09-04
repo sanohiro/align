@@ -1582,13 +1582,18 @@ The shared layer stops at protocol-neutral ownership transfer. `http_upgrade` me
 validated residual-free HTTP/1.1 101 with syntactically complete response headers moved the
 accepted fd out of the request context. A readiness bit lets protocol prepare reject HTTP/1.0 or
 co-read residual bytes through the ordinary 400 path before accept work, while the transfer repeats
-both checks. It exposes exact buffered
+both checks. The lower seam computes a checked exact response-head length, allocates that one head
+and the handle shell before fd transfer, and makes their overlap with builder-owned strings visible.
+Its query ABIs hard-abort detectable malformed context/view shapes before safe formation and token
+bytes before scanning rather than aliasing zero/false, and
+its reused LLVM shapes retain their existing empty curated attribute sets. It exposes exact buffered
 reads, write-all, one cumulative monotonic deadline, shutdown, and close-only Drop, but no raw fd, socket
 conversion, parser, or address. Its carrier is narrower than an ordinary resource: the pump owns it
 locally and may call borrowed helpers, but cannot hide it in data, a closure, a task, parallel work,
 an extern, or a return. The spent context remains alive beside it so request views stay valid for
 the pump exactly as they do for HTTP streaming. A spent handle rejects read/write/deadline without
-I/O and keeps shutdown idempotent.
+I/O and keeps shutdown idempotent. Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE`
+before request read/context publication and closes once with a mapped accept error on failure.
 
 `pkg.ws` owns everything that gives the bytes WebSocket meaning: a Pure pre-bind protocol-list
 validator, header token validation, canonical

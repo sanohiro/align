@@ -507,12 +507,27 @@ fingerprints, and count assertions until one atomic implementation activates the
 capability. The current inventory therefore remains 331 keyed records, 349 base records, 353 with
 either optional four-row probe, and 357 with both; A124 remains the next unreserved active shape.
 
+The same capability hardens the existing HTTP accepted-socket setup without adding a key or shape.
+On macOS/iOS, after the existing best-effort `TCP_NODELAY` and `SO_KEEPALIVE`, `SO_NOSIGPIPE`
+installation is checked before reading a request or publishing a request context. Failure captures
+that errno, closes the accepted fd once without retry while ignoring the close result, and makes
+`srv.accept` return the original mapped OS error; no context or writable connection escapes. Linux
+retains `send(MSG_NOSIGNAL)`. A socket-option failpoint owns the failure ordering and close count.
+
 `HttpRespondUpgrade` first validates and zeroes its writable aligned output. Invalid output returns
 `AL_INVALID` without inspecting or consuming inputs. It then requires and takes a nonnull aligned
-builder before ctx validation, so every later result consumes it. It publishes the handle only after
-the validated HTTP/1.1, residual-free 101 head with complete RFC header syntax writes completely and the fd moves
-from the request context. The readiness getter returns true only for HTTP/1.1 with no parser
-residual. Read validates arguments/state before clearing a live buffer and publishes length only after exact success;
+builder before ctx validation, so every later result consumes it. After the exact semantic checks,
+checked addition computes `H = len("HTTP/1.1 101 Switching Protocols\r\n") +
+sum(len(name) + len(": ") + len(value) + len("\r\n")) + len("\r\n")`; an unrepresentable total
+returns `AL_INVALID` with ctx unspent. The runtime allocates and fills exactly one `H`-byte head
+without growth or a second serialized copy, then allocates the fixed handle shell, all before fd
+transfer or wire I/O. With entry builder heap `B` and `U = size_of::<HttpUpgrade>()`, the exact
+producer-requested operation high-water excluding allocator-private metadata is `B + H + U`;
+compile-time layout assertions and an allocation probe own it. OOM hard-aborts
+before transfer. It publishes the handle only after the validated HTTP/1.1, residual-free 101 head
+with complete RFC header syntax writes completely and the fd moves from the request context. The
+readiness getter returns true only for HTTP/1.1 with no parser residual. Read validates
+arguments/state before clearing a live buffer and publishes length only after exact success;
 write borrows bytes and is SIGPIPE-safe write-all. Deadline retains one monotonic start-plus-budget
 in the opaque handle; every later read/write recomputes the same remaining budget before each
 syscall, rounds positive waits up, rechecks an early native timeout wakeup, and makes no call after
@@ -522,11 +537,21 @@ Each operation closes at most once. Caller-invalid precedes handle state; spent 
 return `AL_INVALID` without mutation/clock/I/O, shutdown is idempotent, and poisoned operations replay
 the stored status without I/O.
 
-Header query pointers borrow the live request context for the call and retain nothing. All
-pointer/length/count/capacity/address products are rejected before Rust reference or slice
-formation. All rows are C calling convention and `nounwind`, with no additional curated function,
-return, or parameter attributes. Exact public semantics, status mapping, validation order,
-ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
+Header query pointers borrow the live request context for the call and retain nothing. Count and
+token validation check context, then name; contains checks context, complete name view/token, then
+complete searched-token view/token. A null or misaligned context hard-aborts before Rust reference
+formation; negative or address-space-unrepresentable length and null positive-length range reject
+before slice formation; invalid token bytes hard-abort after safe view formation but before table
+scanning. `HttpCtxUpgradeReady` applies the same context rule.
+Dangling nonnull pointers remain outside the detectable ABI contract. No malformed query maps to
+an ordinary zero/false result. All other pointer/length/count/capacity/address products are rejected
+before Rust reference or slice formation as specified by their status-returning rows.
+
+All ten exports use the Rust C calling convention and must not unwind across it. Their generated
+LLVM declarations preserve the reused A03/A04/A20/A24/A37/A62/A120 shapes' current empty curated
+function-attribute sets: this capability adds no `nounwind`, memory, return, or parameter attribute
+and does not mutate shared shape fingerprints. Exact public semantics, status mapping, validation
+order, ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 

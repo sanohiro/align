@@ -1556,6 +1556,10 @@ validation. The package validates the RFC token/key/version handshake, chooses t
 server-order offered subprotocol, and keeps its fixed accept SHA-1 helper private. HTTP/1.0 or a
 request with parser residual bytes takes the ordinary 400 path before accept calculation, and the
 checked transfer repeats those facts plus complete response-header syntax before any write. The
+transfer computes checked exact wire-head length and allocates one exact head plus its handle shell
+before fd move, counting their overlap with the still-live builder. Detectable malformed native
+header/readiness context/view shapes hard-abort before reference/slice formation and invalid token
+bytes before scanning; neither maps to ordinary zero/false. The
 protocol-neutral `http_upgrade` Move handle is published only after a checked, fully written
 HTTP/1.1 101 while the spent request context stays alive for pump views. It admits local and
 by-value/borrow/borrow-mut parameter use plus one unnested same-frame Result Ok local from the
@@ -1565,6 +1569,8 @@ write-all, one strict positive cumulative monotonic deadline, shutdown, and Drop
 sticky builtin error. The deadline
 does not reset per call, partial transfer, or frame. Spent read/write/deadline return Invalid with no
 mutation, clock, or I/O, while repeated shutdown is idempotent; caller-invalid arguments win first.
+Linux writes use `MSG_NOSIGNAL`; macOS/iOS accepts a socket into an HTTP request context only after
+checked `SO_NOSIGPIPE`, closing once and returning the mapped accept error on failure.
 
 Client frames must be masked, extension-free, minimally length-encoded, and structurally valid.
 Receive assembles fragments under an explicit inclusive 512 MiB ceiling and fixed 1 MiB per-call
@@ -1576,5 +1582,7 @@ live-heap ceiling for scratch, shells, simultaneous growth, and Text staging/res
 bytes, excluding allocator metadata. Server sends borrow
 payload without copying. A server Close uses one explicit cumulative deadline to complete the peer
 handshake without Ping/data resetting its budget before closing TCP. Ten planned runtime keys reuse
-existing ABI shapes, leaving A124 unused; the design changes no shipped package/runtime inventory.
+existing ABI shapes and their empty curated LLVM function-attribute sets, leaving A124 unused; no
+declaration-side `nounwind` or shared shape fingerprint change is added, and the design changes no
+shipped package/runtime inventory.
 Exact contract: `impl/pkg-design/ws.md`.

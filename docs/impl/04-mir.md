@@ -466,6 +466,9 @@ poisoned calls replay the stored status and shutdown alone is idempotent on spen
 one live/spent/poisoned owner and free exactly once. A no-wildcard operation sweep, print form,
 effect/work scan, Move/drop scan, whole/per-unit lowering, and optimized/unoptimized equality are
 required by `pkg-design/ws.md`. This section reserves no active variant today.
+The runtime behind `HttpRespondUpgrade` computes checked exact head length, allocates that head and
+the handle shell before fd transfer, and exposes no partially initialized handle to MIR. Detectable
+malformed native header/readiness inputs hard-abort below MIR and never synthesize zero/false.
 
 ## 10. Remaining design refinements
 

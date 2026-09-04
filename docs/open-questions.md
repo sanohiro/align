@@ -30,6 +30,11 @@ context retains request views for the pump. The raw handle admits same-frame loc
 by-value/borrow/borrow-mut parameter use. Its only tagged carrier is an unnested same-frame Result
 Ok local from construction or `map_err`; no other aggregate, tag, collection, capture, task,
 parallel, extern, out, global, or user-return carrier is admitted. Canonical type tags are 71/47.
+The transfer checks exact serialized-head length, allocates one exact head and the handle shell
+before fd ownership moves, and counts their overlap with builder storage. Detectable malformed
+native header/readiness context/view shapes hard-abort before reference/slice formation and invalid
+token bytes before scanning; neither can become ordinary zero/false. Reused ABI shapes retain their
+empty curated LLVM attribute sets.
 
 The package supplies a Pure total protocol-list validator which existing pre-bind route validation
 runs before bind/tree construction. It validates the canonical RFC 6455 header/token/key/version
@@ -49,6 +54,8 @@ Close while continuing required Ping replies. The generic transport exposes exac
 reads, write-all, one cumulative monotonic deadline that never resets per I/O/frame, shutdown, and
 close-only Drop. Spent read/write/deadline return Invalid without mutation, clock access, or I/O;
 shutdown remains idempotent and caller-invalid arguments take precedence over state.
+Linux uses `MSG_NOSIGNAL`; macOS/iOS checks `SO_NOSIGPIPE` before request read/context publication,
+closing the accepted fd once and returning the mapped accept error if setup fails.
 
 Ten planned runtime keys reuse A24/A20/A120/A37/A04/A03/A62, so the implementation consumes no
 new ABI shape and A124 remains next. HTTP/2 extended CONNECT, client mode, TLS termination,

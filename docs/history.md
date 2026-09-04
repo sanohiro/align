@@ -9,6 +9,9 @@ takes the accepted fd only after a checked and fully written residual-free HTTP/
 response-header syntax; the spent request context
 continues to own every request view during the pump. The carrier is deliberately narrow and cannot
 escape through aggregates, captures, tasks, parallel work, externs, or user returns.
+The transfer preallocates its exact checked response head and handle shell before fd ownership
+moves. Native header/readiness queries hard-abort detectable malformed inputs instead of returning
+zero/false, and the reused ABI shapes keep their existing empty curated LLVM attribute sets.
 
 `pkg.ws` owns canonical RFC 6455 token/key/version validation, first-server-order subprotocol
 selection, private fixed-purpose SHA-1, client masking, minimal frame lengths, fragmentation,
@@ -25,6 +28,8 @@ readiness query, checked 101 ownership transfer, exact live/spent/poisoned trans
 one web Upgrade dispatch path with Pure pre-bind protocol validation. Its ten runtime keys all
 reuse existing ABI shapes, leaving A124 unused. Exact surface, precedence,
 ownership, ABI, and one-PR implementation closure matrix: `docs/impl/pkg-design/ws.md`.
+Linux preserves `MSG_NOSIGNAL`; macOS/iOS requires checked `SO_NOSIGPIPE` before an accepted fd can
+publish a request context, with close-once and mapped accept failure if setup fails.
 
 ## 2026-09-03: pkg.csv settles on one typed direct-to-SoA materializer
 

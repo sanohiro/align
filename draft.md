@@ -3883,8 +3883,13 @@ other methods retain ordinary 404/405 behavior. After middleware Proceed, the HT
 defensively rechecks GET, requires HTTP/1.1 with no parser residual, then validates empty body, one
 Host/key/version, all repeated token rows, canonical 16-byte base64 key, and version 13 before
 producing the header-only 101. The lower transfer boundary repeats the version/residual checks and
-validates complete response-header syntax before producing bytes. The SHA-1 accept proof is private
-package source and adds no public crypto operation.
+validates complete response-header syntax before producing bytes. It computes the exact wire-head
+length with checked addition, allocates one exact head plus the handle shell before fd transfer, and
+counts their peak coexistence with builder-owned header storage; OOM therefore occurs before any
+wire byte. The three header queries and readiness getter hard-abort detectable malformed native
+context/view shapes before reference or slice formation and invalid token bytes before scanning,
+rather than returning ordinary zero/false. The
+SHA-1 accept proof is private package source and adds no public crypto operation.
 
 `http_upgrade` is a protocol-neutral `std.http` Move handle published only after a validated and
 fully written HTTP/1.1 101. The request context stays spent but alive, retaining its views for the
@@ -3898,7 +3903,9 @@ Exact read into a caller buffer, write-all, one strict positive cumulative monot
 shutdown, and close-only Drop are Impure; read/write failure closes and stores one sticky builtin
 `Error`. After shutdown, read/write/deadline return `Error.Invalid` without mutation, clock access,
 or I/O; repeated shutdown is idempotent. Caller argument invalidity precedes handle state. The
-deadline budget is never reset by another call, partial transfer, or frame.
+deadline budget is never reset by another call, partial transfer, or frame. Linux writes use
+`MSG_NOSIGNAL`; macOS/iOS admits an accepted socket only after checked `SO_NOSIGPIPE`, closing it
+once and returning the mapped accept error before request publication if installation fails.
 
 Receive requires an explicit inclusive `0..=536870912` message bound and returns one complete owned
 Text/Binary message or peer Close. Each call also has a fixed 1048576-byte source-work allowance:
@@ -3923,7 +3930,8 @@ standalone serving, async/background heartbeat, and connection registries are ou
 Implementation activates the third web handler variant, three repeated-header/token queries, one
 version/residual readiness query, checked 101 transfer, upgraded transport operations, package
 source, and ten runtime keys in one closure-matrix boundary. Every key reuses an existing ABI shape,
-so A124 remains unused. The design
+preserving its empty curated LLVM function-attribute set rather than adding `nounwind` to shared
+shape identity; the Rust C exports still do not unwind across C, and A124 remains unused. The design
 alone changes no shipped inventory. Exact surface, validation order, frame/close grammar,
 allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
 

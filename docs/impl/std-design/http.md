@@ -1449,22 +1449,36 @@ Header names and the `contains_token` argument use the existing nonempty ASCII R
 abort before scanning when invalid. `count` is case-insensitive over physical rows. `tokens_valid`
 checks every comma member of every repeated row and returns true for absence; `contains_token`
 searches all rows/members ASCII-case-insensitively but does not certify its neighbors. All three are
-Pure, allocation-free, cursor-free, and borrow only the existing request table.
+Pure, allocation-free, cursor-free, and borrow only the existing request table. At the native
+boundary, each checks the context before complete name and token views. Null/misaligned context
+hard-aborts before reference formation; negative or address-space-unrepresentable length and null
+positive-length range reject before slice formation; invalid token bytes hard-abort before table
+scanning. A dangling nonnull pointer is not
+detectable. There is no malformed-input sentinel that can be confused with zero or false.
 
 `upgrade_ready` is Pure, allocation-free, and true exactly when the parsed request is HTTP/1.1 and
 the parser retained no residual bytes after the complete request. `pkg.web.Ctx` copies that value
 into its trailing `upgrade_ready: bool` before middleware/dispatch. HTTP/1.0 and co-read post-request
 bytes therefore take the protocol package's normal 400 path before accept calculation, and the
-lower transfer boundary checks the same two facts again.
+lower transfer boundary checks the same two facts again. Its native getter likewise hard-aborts on
+a null/misaligned context rather than returning false.
 
 `respond_upgrade` consumes only the builder. Before bytes or fd ownership move it checks in order:
 HTTP/1.1, no parser residual, exact status 101, absent body, every header in insertion order with a
 nonempty ASCII RFC-token name and a value restricted to HTAB/SP/visible-ASCII/obs-text bytes,
 exactly one nonempty token-list Upgrade row, exactly one valid Connection row containing the
 Upgrade token, absent Content-Length, then absent Transfer-Encoding. Validation failure
-leaves ctx unspent. After validation it serializes the head, lifts the fd, marks ctx spent, and
-writes the complete head; success alone publishes the Move handle. Write failure closes the fd and
-leaves ctx spent. The ctx retains the request buffer for pump views and never parks the upgraded fd.
+leaves ctx unspent. Checked addition then computes exact wire-head length `H`; overflow is Invalid
+with ctx still unspent. Here `H = len("HTTP/1.1 101 Switching Protocols\r\n") +
+sum(len(name) + len(": ") + len(value) + len("\r\n")) + len("\r\n")`. One exact `H`-byte buffer is
+allocated and filled without growth or a second serialized copy, and the fixed handle shell is
+allocated, before fd transfer. With entry builder heap `B` and `U = size_of::<HttpUpgrade>()`, the
+exact producer-requested operation high-water excluding allocator-private metadata is `B + H + U`;
+compile-time layout assertions and an allocation probe own it. OOM hard-aborts before a
+wire byte or ownership transfer. The runtime then lifts the fd, marks ctx spent, and writes the
+complete head; success alone publishes the Move handle. The head and builder are freed before
+publication. Write failure closes the fd and leaves ctx spent. The ctx retains the request buffer
+for pump views and never parks the upgraded fd.
 
 `http_upgrade` owns that fd plus sticky terminal error state. It is a local/pump-only Move carrier:
 raw same-frame locals and by-value/borrow/borrow-mut parameters are admitted; one unnested
@@ -1488,11 +1502,19 @@ After successful shutdown, read/write/deadline return `Error.Invalid` without bu
 mutation; repeated shutdown alone is idempotent Ok. Caller argument invalidity is selected before
 live/spent/poisoned state. Drop is close-only with no protocol write.
 
+SIGPIPE safety is established before a connection can reach this surface. Linux writes use
+`send(MSG_NOSIGNAL)`. On macOS/iOS, accepted-socket `SO_NOSIGPIPE` installation is checked before
+request read/context publication; failure closes that fd once and makes `srv.accept` return the
+mapped OS error. It cannot leave an Upgrade-capable socket with suppression merely attempted.
+
 The ten keyed rows are `HttpCtxUpgradeReady` A03, `HttpHeadersCount` A37, `HttpHeadersTokensValid` A20,
 `HttpHeadersContainsToken` A120, `HttpRespondUpgrade` A24, `HttpUpgradeReadExact` A20,
 `HttpUpgradeWrite` A20, `HttpUpgradeDeadline` A04, `HttpUpgradeShutdown` A03, and
 `HttpUpgradeFree` A62. No new ABI shape is reserved. This prerequisite activates only in the
 combined `pkg.ws` implementation capability; current shipped counts and A124 remain unchanged.
+The generated declarations retain those reused shapes' empty curated function-attribute sets; the
+Rust C exports do not unwind across C, but no LLVM `nounwind` attribute or shared shape mutation is
+introduced.
 Exact validation, pointer, ownership, cache, and test contracts: `../pkg-design/ws.md`.
 
 ## Pitfalls
