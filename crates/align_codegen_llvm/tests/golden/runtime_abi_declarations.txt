@@ -345,6 +345,14 @@ key|UdpSendTo|udp_send_to|declare i64 @align_rt_udp_send_to(ptr, ptr, i64, ptr, 
 key|UdpSocketFree|udp_socket_free|declare void @align_rt_udp_socket_free(ptr)
 key|Utf8BoundaryFail|utf8_boundary_fail|declare void @align_rt_utf8_boundary_fail(i64, i64) #1
 key|Utf8Valid|utf8_valid|declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64) #4
+key|XmlAttributeCount|xml_attribute_count|declare i64 @align_rt_xml_attribute_count(ptr)
+key|XmlAttributeName|xml_attribute_name|declare i32 @align_rt_xml_attribute_name(ptr, ptr, i64)
+key|XmlAttributeValue|xml_attribute_value|declare i32 @align_rt_xml_attribute_value(ptr, ptr, i64)
+key|XmlFree|xml_free|declare void @align_rt_xml_free(ptr)
+key|XmlName|xml_name|declare i32 @align_rt_xml_name(ptr, ptr)
+key|XmlNext|xml_next|declare i32 @align_rt_xml_next(ptr)
+key|XmlParse|xml_parse|declare i32 @align_rt_xml_parse(ptr, i64, ptr)
+key|XmlText|xml_text|declare i32 @align_rt_xml_text(ptr, ptr)
 unkeyed|ReportError|declare i32 @align_rt_report_error(i32)
 unkeyed|ArgsBuild|declare { ptr, i64 } @align_rt_args_build(i32, ptr)
 unkeyed|ArenaReset|declare void @align_rt_arena_reset(ptr)

@@ -1791,6 +1791,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -1853,6 +1854,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Scalar::ResponseBuilder
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -1955,6 +1957,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -2451,6 +2454,7 @@ impl<'a> Validator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -2521,6 +2525,7 @@ impl<'a> Validator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -3493,6 +3498,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Writer
             | Ty::Reader
             | Ty::Logger
+                | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3811,6 +3817,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+                | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -4527,6 +4534,13 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. }
+            | hir::ExprKind::XmlParse { .. }
+            | hir::ExprKind::XmlNext { .. }
+            | hir::ExprKind::XmlName { .. }
+            | hir::ExprKind::XmlAttributeCount { .. }
+            | hir::ExprKind::XmlAttributeName { .. }
+            | hir::ExprKind::XmlAttributeValue { .. }
+            | hir::ExprKind::XmlText { .. }
             | hir::ExprKind::CodecOpen { .. }
             | hir::ExprKind::CodecBatchRows { .. }
             | hir::ExprKind::CodecBatchColumns { .. }
@@ -4897,6 +4911,13 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. }
+                | hir::ExprKind::XmlParse { .. }
+                | hir::ExprKind::XmlNext { .. }
+                | hir::ExprKind::XmlName { .. }
+                | hir::ExprKind::XmlAttributeCount { .. }
+                | hir::ExprKind::XmlAttributeName { .. }
+                | hir::ExprKind::XmlAttributeValue { .. }
+                | hir::ExprKind::XmlText { .. }
             | hir::ExprKind::CodecOpen { .. }
             | hir::ExprKind::CodecBatchRows { .. }
             | hir::ExprKind::CodecBatchColumns { .. }
@@ -5466,6 +5487,26 @@ impl<'a> BodyValidator<'a> {
                 variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
             })
     }
+
+        fn xml_event_ty(&self, ty: Ty) -> bool {
+            let Ty::Enum(id) = ty else {
+                return false;
+            };
+            let Some(definition) = self.program.enums.get(id as usize) else {
+                return false;
+            };
+            const NAMES: [&str; 3] = ["Start", "End", "Text"];
+            definition.name == "xml.event"
+                && definition.source_name == "xml.event"
+                && definition.variants.len() == NAMES.len()
+                && definition
+                    .variants
+                    .iter()
+                    .zip(NAMES)
+                    .all(|(variant, expected)| {
+                        variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
+                    })
+        }
 
     fn codec_kind_ty(&self, ty: Ty) -> bool {
         let Ty::Enum(id) = ty else {
@@ -8670,6 +8711,35 @@ impl<'a> BodyValidator<'a> {
                 (self.logger_place(logger, context) && logger.ty == Ty::Logger)
                     .then(|| result(Ty::Unit, &[logger]))?
             }
+            hir::ExprKind::XmlParse { input } => {
+                (input.ty == Ty::String).then(|| result(Ty::XmlReader, &[input]))?
+            }
+            hir::ExprKind::XmlNext { reader } => {
+                let Ty::Option(event) = expression.ty else {
+                    return None;
+                };
+                (mutable_local(reader, Ty::XmlReader)
+                    && reader.ty == Ty::XmlReader
+                    && self.xml_event_ty(align_sema::scalar_to_ty(event)))
+                .then(|| strict(expression.ty, &[reader]))?
+            }
+            hir::ExprKind::XmlName { reader } => {
+                local(reader, Ty::XmlReader).then(|| strict(Ty::Str, &[reader]))?
+            }
+            hir::ExprKind::XmlAttributeCount { reader } => {
+                local(reader, Ty::XmlReader).then(|| strict(i64, &[reader]))?
+            }
+            hir::ExprKind::XmlAttributeName { reader, index } => {
+                (local(reader, Ty::XmlReader) && index.ty == i64)
+                    .then(|| strict(Ty::Str, &[reader, index]))?
+            }
+            hir::ExprKind::XmlAttributeValue { reader, index } => {
+                (local(reader, Ty::XmlReader) && index.ty == i64)
+                    .then(|| strict(Ty::String, &[reader, index]))?
+            }
+            hir::ExprKind::XmlText { reader } => {
+                local(reader, Ty::XmlReader).then(|| strict(Ty::String, &[reader]))?
+            }
             hir::ExprKind::CodecOpen { input } => {
                 (input.ty == Ty::Slice(u8_scalar)).then(|| result(Ty::CodecBatch, &[input]))?
             }
@@ -9674,6 +9744,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+                | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column

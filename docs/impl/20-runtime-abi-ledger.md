@@ -589,9 +589,9 @@ sets. No probe category or ABI shape is added, and A124 remains the next unreser
 The exact 32-byte shell, validation order, escaping table reuse, zero-copy finish, ownership,
 allocation, cache identity, and closure matrix are owned by `pkg-design/template.md`.
 
-## Planned `std.xml` extension (designed 2026-09-05; inactive until implementation)
+## `std.xml` extension (implemented 2026-09-05)
 
-The accepted XML capability plans eight keyed identities, all on existing ABI shapes:
+The XML capability adds eight keyed identities, all on existing ABI shapes:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration | Exact Rust ABI |
 |---|---|---|---|
@@ -636,11 +636,12 @@ Count is only `0..=256`; every impossible getter result aborts. Free is null-saf
 must be a genuine exclusively held shell, and detectable malformed fields abort before following an
 invalid stored input pointer. The runtime does not authenticate an arbitrary dangling address.
 
-Design acceptance reserves no new shape: A124 remains the next unreserved shape and active
-keyed/base/probe totals do not change. Implementation must activate all eight keys, symbols,
+No new shape is used: A124 remains the next unreserved shape. All eight keys, symbols,
 declarations, definitions, exports, collision identities, fingerprint rows, count assertions, and
-their type/Drop consumers atomically. The grammar, status mapping, ownership, validation order,
-allocation contract, and closure matrix are authoritative in `std-design/xml.md`.
+their type/Drop consumers activate atomically. The exact active totals are 355 keyed, 373 base, 380
+with `alloc-count`, 377 with `par-map-probe`, 373 with `task-probe`, and 384 with every probe. The
+grammar, status mapping, ownership, validation order, allocation contract, and closure matrix are
+authoritative in `std-design/xml.md`.
 
 ## HTTP client raw receive-stream substrate (implemented)
 

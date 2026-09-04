@@ -766,6 +766,29 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::LogLine(logger, level, message) => format!("log_line({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogLineBuilder(logger, level, message) => format!("log_line_builder({}, {}, {})", operand_str(logger), operand_str(level), operand_str(message)),
         Rvalue::LogFlush(logger) => format!("log_flush({})", operand_str(logger)),
+        Rvalue::XmlParse { input, out } => {
+            format!("xml_parse({}, -> _{out})", operand_str(input))
+        }
+        Rvalue::XmlNext(reader) => format!("xml_next({})", operand_str(reader)),
+        Rvalue::XmlName { reader, out } => {
+            format!("xml_name({}, -> _{out})", operand_str(reader))
+        }
+        Rvalue::XmlAttributeCount(reader) => {
+            format!("xml_attribute_count({})", operand_str(reader))
+        }
+        Rvalue::XmlAttributeName { reader, index, out } => format!(
+            "xml_attribute_name({}, {}, -> _{out})",
+            operand_str(reader),
+            operand_str(index)
+        ),
+        Rvalue::XmlAttributeValue { reader, index, out } => format!(
+            "xml_attribute_value({}, {}, -> _{out})",
+            operand_str(reader),
+            operand_str(index)
+        ),
+        Rvalue::XmlText { reader, out } => {
+            format!("xml_text({}, -> _{out})", operand_str(reader))
+        }
         Rvalue::CodecOpen(input) => format!("codec_open({})", operand_str(input)),
         Rvalue::CodecBatchRows(batch) => format!("codec_batch_rows({})", operand_str(batch)),
         Rvalue::CodecBatchColumns(batch) => {

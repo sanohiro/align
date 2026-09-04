@@ -1506,6 +1506,34 @@ pub enum Rvalue {
     LogLineBuilder(Operand, Operand, Operand),
     /// `l.flush()` — expose the first latched or current writer flush status as i32.
     LogFlush(Operand),
+    /// Consume an owned string into a validated XML reader. The runtime writes the opaque reader
+    /// pointer into `out` and returns 0, public Invalid (-1), or a positive private rejection.
+    XmlParse {
+        input: Operand,
+        out: Slot,
+    },
+    /// Advance an XML reader: 0=None, 1=Start, 2=End, 3=Text.
+    XmlNext(Operand),
+    /// Fill a borrowed `{ptr,len}` name view and return a private status.
+    XmlName {
+        reader: Operand,
+        out: Slot,
+    },
+    XmlAttributeCount(Operand),
+    XmlAttributeName {
+        reader: Operand,
+        index: Operand,
+        out: Slot,
+    },
+    XmlAttributeValue {
+        reader: Operand,
+        index: Operand,
+        out: Slot,
+    },
+    XmlText {
+        reader: Operand,
+        out: Slot,
+    },
     /// Validate a canonical `core.codec` envelope. The successful batch value is the unchanged
     /// input `{ptr,len}` and is wrapped by MIR only after this status is zero.
     CodecOpen(Operand),
@@ -7197,6 +7225,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. } => lower_log_expr(b, e),
+            hir::ExprKind::XmlParse { .. }
+            | hir::ExprKind::XmlNext { .. }
+            | hir::ExprKind::XmlName { .. }
+            | hir::ExprKind::XmlAttributeCount { .. }
+            | hir::ExprKind::XmlAttributeName { .. }
+            | hir::ExprKind::XmlAttributeValue { .. }
+            | hir::ExprKind::XmlText { .. } => lower_xml_expr(b, e),
             hir::ExprKind::CodecOpen { .. }
             | hir::ExprKind::CodecBatchRows { .. }
             | hir::ExprKind::CodecBatchColumns { .. }
@@ -14994,6 +15029,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::Buffer
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
@@ -17384,6 +17420,304 @@ fn lower_log_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             debug_assert!(false, "lower_log_expr dispatcher admitted a non-logger operation");
             Operand::Const(Const::Unit)
         }
+    }
+}
+
+fn continue_or_abort(b: &mut Builder, condition: Operand) {
+    let proceed = b.new_block();
+    let abort = b.new_block();
+    b.terminate(Term::Branch(condition, proceed, abort));
+    b.cur = abort;
+    let value = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), Vec::new()),
+    ));
+    b.terminate(Term::Unreachable);
+    b.cur = proceed;
+}
+
+fn lower_xml_parse(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::XmlReader);
+    let input_operand = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        status,
+        Rvalue::XmlParse {
+            input: input_operand,
+            out,
+        },
+    ));
+    // Every compiler-produced call passes mechanical preflight, so success and public parse
+    // failure both transfer the source allocation to the runtime before this source is nulled.
+    null_moved_source(b, input);
+
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok = b.new_block();
+    let classify = b.new_block();
+    let invalid = b.new_block();
+    let abort = b.new_block();
+    let join = b.new_block();
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok, classify));
+
+    b.cur = ok;
+    let reader = b.fresh_value(Ty::XmlReader);
+    b.push(Stmt::Let(reader, Rvalue::Load(out)));
+    let wrapped = b.fresh_value(result_ty);
+    b.push(Stmt::Let(wrapped, Rvalue::ResultOk(Operand::Value(reader))));
+    b.push(Stmt::Store(result, Operand::Value(wrapped)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = classify;
+    let is_invalid = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_invalid,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(-1, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(Operand::Value(is_invalid), invalid, abort));
+
+    let Ty::Result(_, Scalar::Enum(error_enum)) = result_ty else {
+        b.cur = abort;
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    b.cur = invalid;
+    let error = b.fresh_value(Ty::Enum(error_enum));
+    b.push(Stmt::Let(
+        error,
+        Rvalue::MakeEnum {
+            enum_id: error_enum,
+            variant: align_sema::ERROR_VARIANT_INVALID,
+            payload: Vec::new(),
+        },
+    ));
+    let wrapped = b.fresh_value(result_ty);
+    b.push(Stmt::Let(wrapped, Rvalue::ResultErr(Operand::Value(error))));
+    b.push(Stmt::Store(result, Operand::Value(wrapped)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = abort;
+    let value = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), Vec::new()),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+fn lower_xml_next(b: &mut Builder, reader: &hir::Expr, result_ty: Ty) -> Operand {
+    let reader_operand = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(status, Rvalue::XmlNext(reader_operand)));
+    let Ty::Option(Scalar::Enum(event_enum)) = result_ty else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let result = b.new_slot(result_ty);
+    let none = b.new_block();
+    let checks = [b.new_block(), b.new_block(), b.new_block()];
+    let variants = [b.new_block(), b.new_block(), b.new_block()];
+    let abort = b.new_block();
+    let join = b.new_block();
+    let is_none = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_none,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    b.terminate(Term::Branch(Operand::Value(is_none), none, checks[0]));
+
+    b.cur = none;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::OptionNone));
+    b.push(Stmt::Store(result, Operand::Value(value)));
+    b.terminate(Term::Goto(join));
+
+    for index in 0..3 {
+        b.cur = checks[index];
+        let matches = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            matches,
+            Rvalue::Bin(
+                BinOp::Eq,
+                Operand::Value(status),
+                Operand::Const(Const::Int((index + 1) as i128, status_ty())),
+            ),
+        ));
+        let no = if index == 2 { abort } else { checks[index + 1] };
+        b.terminate(Term::Branch(Operand::Value(matches), variants[index], no));
+
+        b.cur = variants[index];
+        let event = b.fresh_value(Ty::Enum(event_enum));
+        b.push(Stmt::Let(
+            event,
+            Rvalue::MakeEnum {
+                enum_id: event_enum,
+                variant: index as u32,
+                payload: Vec::new(),
+            },
+        ));
+        let some = b.fresh_value(result_ty);
+        b.push(Stmt::Let(some, Rvalue::OptionSome(Operand::Value(event))));
+        b.push(Stmt::Store(result, Operand::Value(some)));
+        b.terminate(Term::Goto(join));
+    }
+
+    b.cur = abort;
+    let value = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), Vec::new()),
+    ));
+    b.terminate(Term::Unreachable);
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+fn lower_xml_output(
+    b: &mut Builder,
+    reader: &hir::Expr,
+    index: Option<&hir::Expr>,
+    result_ty: Ty,
+    make: impl FnOnce(Operand, Option<Operand>, Slot) -> Rvalue,
+    borrowed: bool,
+) -> Operand {
+    let reader_operand = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+    let index_operand = match index {
+        Some(index) => Some(lower_required!(
+            b,
+            lower_expr(b, index),
+            Operand::Const(Const::Unit)
+        )),
+        None => None,
+    };
+    let out = b.new_slot(result_ty);
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        status,
+        make(reader_operand.clone(), index_operand, out),
+    ));
+    let ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        ok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    continue_or_abort(b, Operand::Value(ok));
+    let value = b.fresh_value(result_ty);
+    if borrowed {
+        inherit_borrow_owners(b, value, [&reader_operand]);
+    }
+    b.push(Stmt::Let(value, Rvalue::Load(out)));
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn lower_xml_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::XmlParse { input } => lower_xml_parse(b, input, e.ty),
+        hir::ExprKind::XmlNext { reader } => lower_xml_next(b, reader, e.ty),
+        hir::ExprKind::XmlName { reader } => lower_xml_output(
+            b,
+            reader,
+            None,
+            e.ty,
+            |reader, _, out| Rvalue::XmlName { reader, out },
+            true,
+        ),
+        hir::ExprKind::XmlAttributeName { reader, index } => lower_xml_output(
+            b,
+            reader,
+            Some(index),
+            e.ty,
+            |reader, index, out| Rvalue::XmlAttributeName {
+                reader,
+                index: index.expect("checked indexed XML operation"),
+                out,
+            },
+            true,
+        ),
+        hir::ExprKind::XmlAttributeValue { reader, index } => lower_xml_output(
+            b,
+            reader,
+            Some(index),
+            e.ty,
+            |reader, index, out| Rvalue::XmlAttributeValue {
+                reader,
+                index: index.expect("checked indexed XML operation"),
+                out,
+            },
+            false,
+        ),
+        hir::ExprKind::XmlText { reader } => lower_xml_output(
+            b,
+            reader,
+            None,
+            e.ty,
+            |reader, _, out| Rvalue::XmlText { reader, out },
+            false,
+        ),
+        hir::ExprKind::XmlAttributeCount { reader } => {
+            let reader = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+            let count = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(count, Rvalue::XmlAttributeCount(reader)));
+            let nonnegative = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                nonnegative,
+                Rvalue::Bin(
+                    BinOp::Ge,
+                    Operand::Value(count),
+                    Operand::Const(Const::Int(0, i64_ty())),
+                ),
+            ));
+            let bounded = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                bounded,
+                Rvalue::Bin(
+                    BinOp::Le,
+                    Operand::Value(count),
+                    Operand::Const(Const::Int(256, i64_ty())),
+                ),
+            ));
+            let valid = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                valid,
+                Rvalue::Bin(
+                    BinOp::And,
+                    Operand::Value(nonnegative),
+                    Operand::Value(bounded),
+                ),
+            ));
+            continue_or_abort(b, Operand::Value(valid));
+            Operand::Value(count)
+        }
+        _ => unreachable!("lower_xml_expr on a non-XML operation"),
     }
 }
 
@@ -21014,6 +21348,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Logger => "log.logger".to_string(),
+        Ty::XmlReader => "xml.reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::CodecBatch => "codec.batch".to_string(),
         Ty::CodecI64Column => "codec.i64_column".to_string(),

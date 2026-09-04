@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/xml.md)
 
-> **Status:** DESIGNED 2026-09-05. Implementation is pending.
+> **Status:** IMPLEMENTED 2026-09-05.
 
 ## Authoritative public-contract ledger
 
@@ -48,7 +48,7 @@ Declarations and calls remain separate:
 import std.xml
 
 fn first_key(body: string) -> Result<string, Error> {
-  doc := xml.parse(body)?
+  mut doc := xml.parse(body)?
   loop {
     event := doc.next() else { break }
     match event {

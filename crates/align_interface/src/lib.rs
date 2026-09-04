@@ -2641,6 +2641,9 @@ pub fn summary_to_source(
                         "log.level" | "log.logger" => {
                             builtin_type_imports.insert("std.log".to_string());
                         }
+                        "xml.event" | "xml.reader" => {
+                            builtin_type_imports.insert("std.xml".to_string());
+                        }
                         "codec.kind"
                         | "codec.batch"
                         | "codec.i64_column"

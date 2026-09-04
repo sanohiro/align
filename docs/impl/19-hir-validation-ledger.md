@@ -2016,7 +2016,7 @@ context/view inputs remain the direct ABI owner's hard-abort responsibility and 
 represented as ordinary HIR zero/false results. The checked response-head size and allocation are
 runtime publication prerequisites after semantic validation, not a second HIR result state.
 
-### Planned `std.xml` records (designed 2026-09-05; inactive until implementation)
+### `std.xml` records (implemented 2026-09-05)
 
 The accepted XML capability adds `Ty::XmlReader` and `Scalar::XmlReader` as one nominal Move-handle
 family. `xml.event` remains an ordinary source-nameable `Ty::Enum`/`Scalar::Enum` aggregate with the
@@ -2025,9 +2025,9 @@ shortcut. `XmlNext` produces `Option<Scalar::Enum(xml.event)>`. `XmlName` and `X
 return a `str` region rooted in both the reader and its current cursor generation; `XmlText` and
 `XmlAttributeValue` return owned `string` with no reader region.
 
-Canonical type record version 3 already uses the implemented codec leaves `Ty=65..=70` /
+Canonical type record version 3 uses the implemented codec leaves `Ty=65..=70` /
 `Scalar=41..=46` and the implemented HTTP Upgrade leaves `Ty::HttpUpgrade=71` /
-`Scalar::HttpUpgrade=47`. XML reserves the next append-only leaves `Ty::XmlReader=72` and
+`Scalar::HttpUpgrade=47`. XML uses the next append-only leaves `Ty::XmlReader=72` and
 `Scalar::XmlReader=48`; 73 and 49 remain the next unknown tags. `Ty::XmlReader` encodes exactly as
 `[3, 0, 0, 0, 0, 72]`; `Ty::Option(Scalar::XmlReader)` encodes exactly as
 `[3, 0, 0, 0, 0, 4, 48]`. Both directions return the identical semantic root. Unknown 73/49,
@@ -2035,10 +2035,10 @@ missing root/payload, truncated, and trailing bytes reject before cache publicat
 format 8 remains unchanged because `xml.reader` and `xml.event` use the existing nominal named-type
 and enum grammar.
 
-Implementation activates both type leaves and all seven checked expression families (`XmlParse`,
+Both type leaves and all seven checked expression families (`XmlParse`,
 `XmlNext`, `XmlName`, `XmlAttributeCount`, `XmlAttributeName`, `XmlAttributeValue`, `XmlText`)
 atomically with their clone/replay, depth, effect, ownership, current-cursor region, traversal,
-finalization, source-shape, semantic projection, and malformed validation arms. The parameterized
-owners in `std-design/xml.md` must fail on a missing form, wrong reader/event/result, lost mutable
+finalization, source-shape, semantic projection, and malformed validation arms activate atomically.
+The parameterized owners in `std-design/xml.md` fail on a missing form, wrong reader/event/result, lost mutable
 receiver or cursor generation, owned/view result confusion, unknown canonical tag, or status/event
 decode after unchecked HIR/MIR.

@@ -370,6 +370,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -517,6 +518,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
