@@ -134,9 +134,13 @@ fn xml_parse_authenticates_owned_field_tagged_and_control_producers() {
     if !backend_available() {
         return;
     }
-    let source = r#"import std.xml
+    let source = r#"import core.json
+import std.fs
+import std.xml
 Holder { value: string }
 Choice { Text(string), Empty }
+Pair { Both(xml.reader, i64), Empty }
+JsonRow { value: i64 }
 fn keep_error(error: Error) -> Error = error
 fn name(reader: xml.reader) -> Result<string, Error> {
   mut current := reader
@@ -161,6 +165,16 @@ fn selected(value: Choice) -> Result<xml.reader, Error> {
   return xml.parse(source)
 }
 fn looped() -> Result<xml.reader, Error> = xml.parse(loop { break "<loop/>".clone() })
+fn built() -> Result<xml.reader, Error> {
+  output := builder()
+  output.write("<builder/>")
+  return xml.parse(output.to_string())
+}
+fn json_generated(row: JsonRow) -> Result<xml.reader, Error> {
+  encoded := json.encode(row)
+  return xml.parse(encoded.clone())
+}
+fn file_generated(path: str) -> Result<xml.reader, Error> = xml.parse(fs.read_file(path)?)
 pub fn main() -> Result<(), Error> {
   print(name(field(Holder { value: "<field/>".clone() })?)?)
   print(name(optional(Some("<option/>".clone()))?)?)
@@ -168,6 +182,14 @@ pub fn main() -> Result<(), Error> {
   print(name(branch(true)?)?)
   print(name(selected(Choice.Text("<match/>".clone()))?)?)
   print(name(looped()?)?)
+  print(name(built()?)?)
+  sibling := "ignored".clone()
+  pair := Pair.Both(xml.parse("<sibling/>".clone())?, sibling.len())
+  match pair {
+    Both(reader, _) => print(name(reader)?)
+    Empty => print("empty")
+  }
+  print(name(xml.parse("  <trim/>  ".trim().clone())?)?)
   return Ok(())
 }
 "#;
@@ -180,7 +202,7 @@ pub fn main() -> Result<(), Error> {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "field\noption\nresult\nif\nmatch\nloop\n",
+        "field\noption\nresult\nif\nmatch\nloop\nbuilder\nsibling\ntrim\n",
     );
 }
 
@@ -317,11 +339,11 @@ fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
     let files = &[
         (
             "xml_support.align",
-            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub Concrete { Value(xml.reader), Empty }\npub fn source() -> string = \"<branch/>\".clone()\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn carry_concrete(reader: xml.reader) -> Concrete = Concrete.Value(reader)\npub fn current_name(borrow reader: xml.reader) -> str = reader.name()\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
+            "module xml_support\nimport std.xml\npub Carrier<T> { Value(T), Empty }\npub Concrete { Value(xml.reader), Empty }\npub Paired { Both(xml.reader, str), Empty }\npub fn source() -> string = \"<branch/>\".clone()\npub fn parse(source: string) -> Result<xml.reader, Error> = xml.parse(source)\npub fn keep<T>(value: T) -> T = value\npub fn carry(reader: xml.reader) -> Carrier<xml.reader> = Carrier.Value(reader)\npub fn carry_concrete(reader: xml.reader) -> Concrete = Concrete.Value(reader)\npub fn paired(reader: xml.reader, borrow peer: xml.reader) -> Paired = Paired.Both(reader, peer.name())\npub fn current_name(borrow reader: xml.reader) -> str = reader.name()\npub fn root_name(reader: xml.reader) -> Result<string, Error> {\n  mut current := reader\n  event := current.next() else { return Err(Error.Invalid) }\n  match event {\n    Start => { return Ok(current.name().clone()) }\n    End => { return Err(Error.Invalid) }\n    Text => { return Err(Error.Invalid) }\n  }\n}\n",
         ),
         (
             "main.align",
-            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  concrete := xml_support.parse(\"<leaf/>\".clone())?\n  match xml_support.carry_concrete(concrete) {\n    Value(reader4) => print(xml_support.root_name(reader4)?)\n    Empty => print(\"empty\")\n  }\n  imported_source := xml.parse(xml_support.source())?\n  print(xml_support.root_name(imported_source)?)\n  return Ok(())\n}\n",
+            "import std.xml\nimport xml_support\npub fn main() -> Result<(), Error> {\n  reader := xml_support.parse(\"<root/>\".clone())?\n  reader2 := xml_support.keep(reader)\n  match xml_support.carry(reader2) {\n    Value(reader3) => print(xml_support.root_name(reader3)?)\n    Empty => print(\"empty\")\n  }\n  concrete := xml_support.parse(\"<leaf/>\".clone())?\n  match xml_support.carry_concrete(concrete) {\n    Value(reader4) => print(xml_support.root_name(reader4)?)\n    Empty => print(\"empty\")\n  }\n  imported_source := xml.parse(xml_support.source())?\n  print(xml_support.root_name(imported_source)?)\n  mut peer := xml.parse(\"<peer/>\".clone())?\n  peer_event := peer.next() else { return Err(Error.Invalid) }\n  match xml_support.paired(xml.parse(\"<sum/>\".clone())?, peer) {\n    Both(reader5, _) => {\n      mut sum_reader := reader5\n      sum_event := sum_reader.next() else { return Err(Error.Invalid) }\n      print(sum_reader.name())\n    }\n    Empty => print(\"empty\")\n  }\n  return Ok(())\n}\n",
         ),
     ];
     let differential = diff_check_multi("std-xml-interface", files, "main.align");
@@ -384,7 +406,7 @@ fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "root\nleaf\nbranch\n"
+            "root\nleaf\nbranch\nsum\n"
         );
     }
 }
