@@ -70114,10 +70114,11 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.ws` adds nine checked operation variants. The wildcard-free policy above classifies
-        // them explicitly beside the existing package and core operations.
+        // `pkg.ws` adds nine checked operation variants and `pkg.template` adds four. The
+        // wildcard-free policy above classifies them explicitly beside the existing package and
+        // core operations.
         assert_eq!(
-            variants, 311,
+            variants, 315,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

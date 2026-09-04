@@ -11692,10 +11692,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // pkg.ws adds nine checked operation variants; keep this count synchronized with the
-        // exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
+        // pkg.ws adds nine checked operation variants and pkg.template adds four; keep this count
+        // synchronized with the exhaustive validation, source-shape, replay-clone, and
+        // canonical-graph matches.
         variants,
-        311,
+        315,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

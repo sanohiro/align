@@ -291,6 +291,14 @@ fn template_html_signature(
     })
 }
 
+fn template_html_return_matches(actual: Ty, expected: Ty) -> bool {
+    match (actual, expected) {
+        (Ty::Unit, Ty::Unit) | (Ty::String, Ty::String) => true,
+        (Ty::Resource(actual), Ty::Resource(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
 /// Validate the package identity, resource identity, placement, and operand/result types of every
 /// compiler-emitted HTML-builder operation before general body validation and MIR construction.
 pub(crate) fn template_html_validation_reason(
@@ -374,7 +382,7 @@ pub(crate) fn template_html_validation_reason(
         }
         if actual_params.as_deref() != Some(params.as_slice())
             || function.param_modes != modes
-            || function.ret != ret
+            || !template_html_return_matches(function.ret, ret)
             || function.return_borrow != hir::ReturnBorrowSummary::None
             || function.return_region != hir::ReturnRegionSummary::None
             || function.return_cleanup != cleanup
@@ -391,7 +399,7 @@ pub(crate) fn template_html_validation_reason(
         };
         if function.params != params
             || function.param_modes != modes
-            || function.ret != ret
+            || !template_html_return_matches(function.ret, ret)
             || !function.return_provenance_known
             || function.return_borrow != hir::ReturnBorrowSummary::None
             || function.return_region != hir::ReturnRegionSummary::None
