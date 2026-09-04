@@ -107,7 +107,7 @@ fn terminate_child_by(
             match child.wait() {
                 Ok(_) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
         let _ = sender.send(child);
@@ -431,7 +431,7 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
     // those writes succeeded, then the reset makes the reason-payload write own the error.
     let partial_write_ws = WS_ROOT.replace(
         "  connection.write(code_bytes[0..2])?\n  return connection.write(reason.bytes())",
-        "  connection.write(code_bytes[0..2])?\n  mut sync := buffer(1)\n  connection.read_exact(sync, 1)?\n  return connection.write(reason.bytes())",
+        "  connection.write(code_bytes[0..2])?\n  mut sync := buffer(1)\n  connection.read_exact(sync, 1)?\n  match connection.write(reason.bytes()) {\n    Ok(_) => { return Err(Error.Denied) }\n    Err(error) => { return Err(error) }\n  }",
     );
     assert_ne!(partial_write_ws, WS_ROOT, "close-frame write seam must remain recognizable");
     let partial_built = build_app_with_ws("apps-ws-close-partial-write", &partial_write_ws);
@@ -460,6 +460,10 @@ fn outbound_close_validation_wire_state_deadline_and_failures() {
     assert!(
         partial_stderr.contains("Code("),
         "reason-payload reset must surface transport Code:\n{partial_stderr}"
+    );
+    assert!(
+        !partial_stderr.contains("Denied"),
+        "a successful reason write must take the distinct sentinel path:\n{partial_stderr}"
     );
 
     for path in [

@@ -49,7 +49,7 @@ impl Drop for ChildOwner {
                 match child.wait() {
                     Ok(_) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
             let _ = sender.send(());
@@ -269,6 +269,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {\n\
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut sock) => {
                 // One request per connection: keep-alive would park the socket and block the read.
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("route-validation deadline exhausted before request");
+                sock.set_read_timeout(Some(remaining)).expect("bound validation read");
+                sock.set_write_timeout(Some(remaining)).expect("bound validation write");
                 sock.write_all(&one_shot(b"DELETE /x HTTP/1.1\r\nHost: h\r\n\r\n")).expect("write");
                 let mut out = Vec::new();
                 let _ = sock.read_to_end(&mut out);

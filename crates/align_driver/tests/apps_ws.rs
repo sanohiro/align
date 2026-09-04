@@ -193,12 +193,21 @@ fn free_loopback_port() -> u16 {
     port
 }
 
-fn connect_retry(port: u16) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn connect_retry(server: &Server) -> TcpStream {
     loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(sock) => return sock,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+        match TcpStream::connect(("127.0.0.1", server.port)) {
+            Ok(sock) => {
+                let remaining = server
+                    .deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("WebSocket server deadline exhausted after connect");
+                sock.set_read_timeout(Some(remaining)).unwrap();
+                sock.set_write_timeout(Some(remaining)).unwrap();
+                return sock;
+            }
+            Err(_) if Instant::now() < server.deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
             Err(error) => panic!("server never came up: {error}"),
         }
     }
@@ -252,10 +261,14 @@ fn read_frame(sock: &mut TcpStream) -> (bool, u8, Vec<u8>) {
     ((first[0] & 0x80) != 0, first[0] & 0x0f, payload)
 }
 
-fn open_websocket(port: u16) -> TcpStream {
-    let mut sock = connect_retry(port);
-    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+fn open_websocket(server: &Server) -> TcpStream {
+    let mut sock = connect_retry(server);
+    let remaining = server
+        .deadline
+        .checked_duration_since(Instant::now())
+        .expect("WebSocket server deadline exhausted before handshake");
+    sock.set_read_timeout(Some(remaining)).unwrap();
+    sock.set_write_timeout(Some(remaining)).unwrap();
     sock.write_all(
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
     )
@@ -265,30 +278,73 @@ fn open_websocket(port: u16) -> TcpStream {
     sock
 }
 
-fn request_head(port: u16, request: &[u8]) -> String {
-    let mut sock = connect_retry(port);
-    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+fn request_head(server: &Server, request: &[u8]) -> String {
+    let mut sock = connect_retry(server);
+    let remaining = server
+        .deadline
+        .checked_duration_since(Instant::now())
+        .expect("WebSocket server deadline exhausted before request");
+    sock.set_read_timeout(Some(remaining)).unwrap();
+    sock.set_write_timeout(Some(remaining)).unwrap();
     sock.write_all(request).unwrap();
     String::from_utf8(read_http_head(&mut sock)).unwrap()
 }
 
-fn assert_protocol_close(port: u16, bytes: &[u8], label: &str) {
-    let mut sock = open_websocket(port);
+fn assert_protocol_close(server: &Server, bytes: &[u8], label: &str) {
+    let mut sock = open_websocket(server);
     sock.write_all(bytes).unwrap();
     assert_eq!(read_frame(&mut sock), (true, 8, vec![3, 234]), "{label}");
 }
 
 struct Server {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     port: u16,
+    deadline: Instant,
     _built: BuiltExeMulti,
+}
+
+fn terminate_child_by(
+    child: std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::Child> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let _ = sender.send(child);
+    });
+    receiver.recv_timeout(remaining).ok()
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.take() {
+            let _ = terminate_child_by(child, self.deadline);
+        }
+    }
+}
+
+impl Server {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("WebSocket server child exists")
+    }
+
+    fn stop_and_stderr(&mut self) -> String {
+        let child = self.child.take().expect("WebSocket server child exists");
+        let mut child = terminate_child_by(child, self.deadline)
+            .expect("WebSocket server did not stop before its deadline");
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        stderr
     }
 }
 
@@ -302,12 +358,24 @@ fn start_server_with(source: &str, build_name: &str) -> Server {
         .spawn()
         .expect("spawn WebSocket server");
     // Install the kill-and-reap guard before any later setup can fail.
-    let mut server = Server { child, port, _built: built };
+    let mut server = Server {
+        child: Some(child),
+        port,
+        deadline: Instant::now() + Duration::from_secs(300),
+        _built: built,
+    };
     std::thread::sleep(Duration::from_millis(300));
-    if let Some(status) = server.child.try_wait().expect("poll WebSocket server") {
+    let status = loop {
+        match server.child().try_wait() {
+            Ok(status) => break status,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll WebSocket server: {error}"),
+        }
+    };
+    if let Some(status) = status {
         let mut stderr = String::new();
         server
-            .child
+            .child()
             .stderr
             .take()
             .unwrap()
@@ -327,11 +395,23 @@ fn start_server_with_ws(source: &str, ws_root: &str, build_name: &str) -> Server
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bounded WebSocket server");
-    let mut server = Server { child, port, _built: built };
+    let mut server = Server {
+        child: Some(child),
+        port,
+        deadline: Instant::now() + Duration::from_secs(300),
+        _built: built,
+    };
     std::thread::sleep(Duration::from_millis(300));
-    if let Some(status) = server.child.try_wait().expect("poll bounded WebSocket server") {
+    let status = loop {
+        match server.child().try_wait() {
+            Ok(status) => break status,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll bounded WebSocket server: {error}"),
+        }
+    };
+    if let Some(status) = status {
         let mut stderr = String::new();
-        server.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        server.child().stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         panic!("bounded server exited at startup: {status:?}; stderr: {stderr}");
     }
     server
@@ -349,8 +429,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     let server = start_server();
 
     // Upgrade GET rows do not participate in pkg.web's unary HEAD-to-GET fallback.
-    let mut head_only = connect_retry(server.port);
-    head_only.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut head_only = connect_retry(&server);
     head_only
         .write_all(b"HEAD /chat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -359,8 +438,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     assert!(head_only_response.contains("Allow: GET\r\n"), "{head_only_response:?}");
 
     // A version mismatch is a normal HTTP rejection and advertises the one accepted version.
-    let mut rejected = connect_retry(server.port);
-    rejected.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut rejected = connect_retry(&server);
     rejected
         .write_all(
             b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nConnection: close\r\n\r\n",
@@ -388,26 +466,26 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
             b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZ===\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n".as_slice(),
         ),
     ] {
-        let response = request_head(server.port, request);
+        let response = request_head(&server, request);
         assert!(response.starts_with("HTTP/1.1 400 "), "{label}: {response:?}");
         assert!(!response.contains("Sec-WebSocket-Version:"), "{label}: non-version rejection");
     }
 
     let earlier_host_wins = request_head(
-        server.port,
+        &server,
         b"GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 12\r\nSec-WebSocket-Key: bad\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
     );
     assert!(earlier_host_wins.starts_with("HTTP/1.1 400 "), "{earlier_host_wins:?}");
     assert!(!earlier_host_wins.contains("Sec-WebSocket-Version:"), "Host validation precedes version");
 
     let version_wins = request_head(
-        server.port,
+        &server,
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 12\r\nSec-WebSocket-Key: bad\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
     );
     assert!(version_wins.contains("Sec-WebSocket-Version: 13\r\n"), "version validation precedes key");
 
     let case_mismatch = request_head(
-        server.port,
+        &server,
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: CHAT.V1\r\n\r\n",
     );
     assert!(case_mismatch.starts_with("HTTP/1.1 400 "), "subprotocol matching is byte-exact");
@@ -439,13 +517,13 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
             false,
         ),
     ] {
-        let response = request_head(server.port, request);
+        let response = request_head(&server, request);
         assert!(response.starts_with("HTTP/1.1 400 "), "{label}: {response:?}");
         assert_eq!(response.contains("Sec-WebSocket-Version: 13\r\n"), version_header, "{label}");
     }
 
     let repeated_protocol = request_head(
-        server.port,
+        &server,
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: other\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
     );
     assert!(repeated_protocol.starts_with("HTTP/1.1 101 "), "repeated protocol rows combine: {repeated_protocol:?}");
@@ -457,7 +535,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     );
     let empty_protocol_server = start_server_with(&empty_protocol_app, "apps-ws-empty-protocols");
     let empty_selected = request_head(
-        empty_protocol_server.port,
+        &empty_protocol_server,
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: offered\r\n\r\n",
     );
     assert!(empty_selected.starts_with("HTTP/1.1 101 "), "empty server protocol list: {empty_selected:?}");
@@ -469,15 +547,13 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     );
     let ordered_protocol_server = start_server_with(&ordered_protocol_app, "apps-ws-ordered-protocols");
     let ordered = request_head(
-        ordered_protocol_server.port,
+        &ordered_protocol_server,
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat.v1, chat.v2\r\n\r\n",
     );
     assert!(ordered.starts_with("HTTP/1.1 101 "), "multiple server protocols: {ordered:?}");
     assert!(ordered.contains("Sec-WebSocket-Protocol: chat.v2\r\n"), "first server match wins: {ordered:?}");
 
-    let mut sock = connect_retry(server.port);
-    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut sock = connect_retry(&server);
     sock.write_all(
         b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: h2c\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: other\r\nSec-WebSocket-Protocol: chat.v1\r\n\r\n",
     )
@@ -501,7 +577,7 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
     sock.write_all(&masked_frame(true, 8, &[3, 232], [13, 14, 15, 16])).unwrap();
 
     for (length, opcode) in [(126usize, 1u8), (65_536usize, 2u8), (131_072usize, 2u8)] {
-        let mut boundary = open_websocket(server.port);
+        let mut boundary = open_websocket(&server);
         let payload = vec![if opcode == 1 { b'a' } else { 0xa5 }; length];
         let frame = masked_frame(true, opcode, &payload, [2, 4, 6, 8]);
         if length == 126 {
@@ -515,70 +591,70 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
         finish_server_close(&mut boundary, 1000);
     }
 
-    let mut unmasked = open_websocket(server.port);
+    let mut unmasked = open_websocket(&server);
     unmasked.write_all(&[0x81, 0]).unwrap();
     assert_eq!(read_frame(&mut unmasked), (true, 8, vec![3, 234]), "unmasked input closes 1002");
 
-    let mut bad_text = open_websocket(server.port);
+    let mut bad_text = open_websocket(&server);
     bad_text.write_all(&masked_frame(true, 1, &[0xff], [1, 1, 1, 1])).unwrap();
     assert_eq!(read_frame(&mut bad_text), (true, 8, vec![3, 239]), "invalid UTF-8 closes 1007");
 
-    let mut nonminimal16 = open_websocket(server.port);
+    let mut nonminimal16 = open_websocket(&server);
     nonminimal16.write_all(&[0x82, 0xfe, 0, 125, 1, 2, 3, 4]).unwrap();
     assert_eq!(read_frame(&mut nonminimal16), (true, 8, vec![3, 234]), "nonminimal 16-bit length closes 1002");
 
-    let mut nonminimal64 = open_websocket(server.port);
+    let mut nonminimal64 = open_websocket(&server);
     let mut nonminimal64_head = vec![0x82, 0xff];
     nonminimal64_head.extend_from_slice(&65_535u64.to_be_bytes());
     nonminimal64_head.extend_from_slice(&[1, 2, 3, 4]);
     nonminimal64.write_all(&nonminimal64_head).unwrap();
     assert_eq!(read_frame(&mut nonminimal64), (true, 8, vec![3, 234]), "nonminimal 64-bit length closes 1002");
 
-    let mut oversized = open_websocket(server.port);
+    let mut oversized = open_websocket(&server);
     let mut oversized_head = vec![0x82, 0xff];
     oversized_head.extend_from_slice(&131_073u64.to_be_bytes());
     oversized_head.extend_from_slice(&[1, 2, 3, 4]);
     oversized.write_all(&oversized_head).unwrap();
     assert_eq!(read_frame(&mut oversized), (true, 8, vec![3, 241]), "rejected-next message byte closes 1009 without reading payload");
 
-    let mut continuation = open_websocket(server.port);
+    let mut continuation = open_websocket(&server);
     continuation.write_all(&masked_frame(true, 0, b"x", [2, 3, 4, 5])).unwrap();
     assert_eq!(read_frame(&mut continuation), (true, 8, vec![3, 234]), "orphan continuation closes 1002");
 
-    assert_protocol_close(server.port, &[0xc1, 0x80, 1, 2, 3, 4], "RSV is forbidden");
-    assert_protocol_close(server.port, &[0x83, 0x80, 1, 2, 3, 4], "reserved opcode is forbidden");
-    assert_protocol_close(server.port, &[0x09, 0x80, 1, 2, 3, 4], "control frames must be final");
+    assert_protocol_close(&server, &[0xc1, 0x80, 1, 2, 3, 4], "RSV is forbidden");
+    assert_protocol_close(&server, &[0x83, 0x80, 1, 2, 3, 4], "reserved opcode is forbidden");
+    assert_protocol_close(&server, &[0x09, 0x80, 1, 2, 3, 4], "control frames must be final");
     assert_protocol_close(
-        server.port,
+        &server,
         &[0x89, 0xfe, 0, 126, 1, 2, 3, 4],
         "control payloads cannot use 126 bytes",
     );
     let mut overlapping_messages = masked_frame(false, 1, b"", [1, 2, 3, 4]);
     overlapping_messages.extend(masked_frame(true, 2, b"", [4, 3, 2, 1]));
-    assert_protocol_close(server.port, &overlapping_messages, "a second data opcode cannot interrupt fragments");
+    assert_protocol_close(&server, &overlapping_messages, "a second data opcode cannot interrupt fragments");
 
-    let mut split_utf8 = open_websocket(server.port);
+    let mut split_utf8 = open_websocket(&server);
     let mut split_utf8_frames = masked_frame(false, 1, &[0xc3], [1, 4, 1, 4]);
     split_utf8_frames.extend(masked_frame(true, 0, &[0xa9], [2, 7, 1, 8]));
     split_utf8.write_all(&split_utf8_frames).unwrap();
     assert_eq!(read_frame(&mut split_utf8), (true, 1, vec![0xc3, 0xa9]));
     finish_server_close(&mut split_utf8, 1000);
 
-    let mut client_only_close = open_websocket(server.port);
+    let mut client_only_close = open_websocket(&server);
     client_only_close
         .write_all(&masked_frame(true, 8, &[3, 242], [6, 7, 8, 9]))
         .unwrap();
     assert_eq!(read_frame(&mut client_only_close), (true, 8, Vec::new()), "1010 gets an empty acknowledgment");
 
-    let mut empty_close = open_websocket(server.port);
+    let mut empty_close = open_websocket(&server);
     empty_close.write_all(&masked_frame(true, 8, b"", [6, 6, 6, 6])).unwrap();
     assert_eq!(read_frame(&mut empty_close), (true, 8, Vec::new()), "empty Close is acknowledged empty");
 
-    let mut one_byte_close = open_websocket(server.port);
+    let mut one_byte_close = open_websocket(&server);
     one_byte_close.write_all(&masked_frame(true, 8, &[3], [7, 7, 7, 7])).unwrap();
     assert_eq!(read_frame(&mut one_byte_close), (true, 8, vec![3, 234]), "one-byte Close is invalid");
 
-    let mut invalid_reason = open_websocket(server.port);
+    let mut invalid_reason = open_websocket(&server);
     invalid_reason
         .write_all(&masked_frame(true, 8, &[3, 232, 0xff], [8, 8, 8, 8]))
         .unwrap();
@@ -586,13 +662,13 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
 
     let mut reason_123 = vec![3, 232];
     reason_123.extend(std::iter::repeat_n(b'x', 123));
-    let mut max_reason = open_websocket(server.port);
+    let mut max_reason = open_websocket(&server);
     max_reason.write_all(&masked_frame(true, 8, &reason_123, [9, 9, 9, 9])).unwrap();
     assert_eq!(read_frame(&mut max_reason), (true, 8, reason_123), "123-byte Close reason is accepted");
 
     let mut reason_124 = vec![3, 232];
     reason_124.extend(std::iter::repeat_n(b'x', 124));
-    let mut oversized_reason = open_websocket(server.port);
+    let mut oversized_reason = open_websocket(&server);
     oversized_reason
         .write_all(&masked_frame(true, 8, &reason_124, [10, 10, 10, 10]))
         .unwrap();
@@ -602,13 +678,13 @@ fn handshake_fragment_ping_echo_and_close_run_end_to_end() {
         1000u16, 1001, 1002, 1003, 1007, 1008, 1009, 1011, 1012, 1013, 1014, 3000, 3003,
         3008, 4000, 4999,
     ] {
-        let mut close = open_websocket(server.port);
+        let mut close = open_websocket(&server);
         close.write_all(&masked_frame(true, 8, &code.to_be_bytes(), [1, 3, 5, 7]))
             .unwrap();
         assert_eq!(read_frame(&mut close), (true, 8, code.to_be_bytes().to_vec()), "allowed Close code {code}");
     }
     for code in [999u16, 1004, 1005, 1006, 1015, 1016, 2999, 3001, 3999, 5000] {
-        let mut close = open_websocket(server.port);
+        let mut close = open_websocket(&server);
         close.write_all(&masked_frame(true, 8, &code.to_be_bytes(), [2, 4, 6, 8]))
             .unwrap();
         assert_eq!(read_frame(&mut close), (true, 8, vec![3, 234]), "forbidden Close code {code}");
@@ -629,7 +705,7 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
         ("Ping Pong", masked_frame(true, 9, b"ping", [1, 2, 3, 4])),
         ("peer Close echo", masked_frame(true, 8, &[3, 232], [4, 3, 2, 1])),
     ] {
-        let mut reset = open_websocket(server.port);
+        let mut reset = open_websocket(&server);
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         assert_eq!(
             unsafe {
@@ -648,10 +724,7 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
         drop(reset);
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = server.child.kill();
-    let _ = server.child.wait();
-    let mut stderr = String::new();
-    server.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    let stderr = server.stop_and_stderr();
     assert_eq!(
         stderr.matches("Code(").count(),
         3,
@@ -678,12 +751,12 @@ fn receive_resource_probe_pins_binary_text_and_maximum_live_byte_peaks() {
     assert_eq!(128 + scratch + 2 * max_message, 1_073_774_720);
     let server = start_server_with(RESOURCE_APP, "apps-ws-resource");
 
-    let mut text = open_websocket(server.port);
+    let mut text = open_websocket(&server);
     text.write_all(&masked_frame(true, 1, &vec![b'x'; 1024], [1, 2, 3, 4]))
         .unwrap();
     finish_server_close(&mut text, 1000);
 
-    let mut binary = open_websocket(server.port);
+    let mut binary = open_websocket(&server);
     binary
         .write_all(&masked_frame(true, 2, &vec![0x5a; 1024], [4, 3, 2, 1]))
         .unwrap();
@@ -694,7 +767,7 @@ fn receive_resource_probe_pins_binary_text_and_maximum_live_byte_peaks() {
         .replace("RESOURCE_BINARY_PEAK: i64 := 33920", "RESOURCE_BINARY_PEAK: i64 := 34948");
     assert_ne!(growth_app, RESOURCE_APP, "the scaled owner must rewrite its exact peak");
     let growth_server = start_server_with(&growth_app, "apps-ws-resource-growth");
-    let mut growth = open_websocket(growth_server.port);
+    let mut growth = open_websocket(&growth_server);
     let mut frames = masked_frame(false, 2, &[0x5a; 4], [1, 3, 5, 7]);
     frames.extend(masked_frame(true, 0, &vec![0x5a; 1021], [2, 4, 6, 8]));
     growth.write_all(&frames).unwrap();
@@ -714,7 +787,7 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
     let server = start_server_with_ws(APP, &bounded_ws, "apps-ws-source-work");
 
     for (opcode, label) in [(0u8, "continuation"), (9, "Ping"), (10, "Pong")] {
-        let mut exact = open_websocket(server.port);
+        let mut exact = open_websocket(&server);
         let mut exact_frames = masked_frame(false, 1, b"", [1, 2, 3, 4]);
         for mask in [[2, 3, 4, 5], [3, 4, 5, 6]] {
             exact_frames.extend(masked_frame(opcode != 0, opcode, b"", mask));
@@ -737,7 +810,7 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
         );
         finish_server_close(&mut exact, 1000);
 
-        let mut rejected = open_websocket(server.port);
+        let mut rejected = open_websocket(&server);
         let mut rejected_frames = masked_frame(false, 1, b"", [1, 1, 1, 1]);
         for mask in [[2, 2, 2, 2], [3, 3, 3, 3], [4, 4, 4, 4]] {
             rejected_frames.extend(masked_frame(opcode != 0, opcode, b"", mask));
@@ -763,7 +836,7 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
     assert_ne!(control_ws, WS_ROOT, "the nonempty-control owner must rewrite the bound");
     let control_server = start_server_with_ws(APP, &control_ws, "apps-ws-control-work");
     for (opcode, label) in [(9u8, "Ping"), (10, "Pong")] {
-        let mut exact = open_websocket(control_server.port);
+        let mut exact = open_websocket(&control_server);
         let mut exact_frames = masked_frame(false, 1, b"", [1, 2, 3, 4]);
         exact_frames.extend(masked_frame(true, opcode, b"ab", [2, 3, 4, 5]));
         exact_frames.extend(masked_frame(true, opcode, b"cd", [3, 4, 5, 6]));
@@ -780,7 +853,7 @@ fn exact_and_rejected_next_source_work_boundaries_are_discriminated() {
         );
         finish_server_close(&mut exact, 1000);
 
-        let mut rejected = open_websocket(control_server.port);
+        let mut rejected = open_websocket(&control_server);
         let mut rejected_frames = masked_frame(false, 1, b"", [1, 1, 1, 1]);
         rejected_frames.extend(masked_frame(true, opcode, b"ab", [2, 2, 2, 2]));
         rejected_frames.extend(masked_frame(true, opcode, b"cd", [3, 3, 3, 3]));
@@ -822,18 +895,27 @@ fn invalid_server_protocol_aborts_before_bind_with_exact_route_diagnosis() {
             .expect("run invalid WebSocket server");
         // The executable must fail synchronously during route validation. Keep an RAII owner
         // around it so a regression that reaches the accept loop cannot leak a server process.
-        let mut child = Server { child, port, _built: built };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut child = Server {
+            child: Some(child),
+            port,
+            deadline: Instant::now() + Duration::from_secs(30),
+            _built: built,
+        };
+        let deadline = child.deadline;
         let status = loop {
-            if let Some(status) = child.child.try_wait().expect("poll invalid WebSocket server") {
-                break status;
+            match child.child().try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => panic!("invalid startup did not terminate before the deadline"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll invalid WebSocket server: {error}"),
             }
-            assert!(Instant::now() < deadline, "invalid startup did not terminate before the deadline");
-            std::thread::sleep(Duration::from_millis(10));
         };
         let mut stderr = String::new();
         child
-            .child
+            .child()
             .stderr
             .take()
             .unwrap()
