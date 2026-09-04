@@ -217,9 +217,10 @@ The capability adds these keyed runtime rows, all reusing existing shapes:
 
 No A124 shape is consumed. The keyed inventory grows by ten only when implementation activates the
 complete capability. Header rows and the readiness row borrow the request context and retain
-nothing. A null/misaligned readiness receiver returns false without dereference; source HIR cannot
-form that case. All pointer/length pairs validate negative/overflow/null products before slice
-formation. `HttpRespondUpgrade` first requires a writable aligned output slot and zeroes it; an
+nothing. A null/misaligned readiness receiver hard-aborts before reference formation; source HIR
+cannot form that case, and malformed native state never aliases a legitimate false result. All
+pointer/length pairs validate negative/overflow/null products before slice formation.
+`HttpRespondUpgrade` first requires a writable aligned output slot and zeroes it; an
 invalid slot returns `AL_INVALID` without inspecting or consuming either input. It then requires and
 takes a nonnull aligned builder before validating ctx, so every later status consumes that builder;
 a null/misaligned builder or ctx returns `AL_INVALID`, and semantic validation returns the ordinary
@@ -319,6 +320,7 @@ The author-side pass must prove:
 | P2 malformed query ABI | In ctx/name/token order, hard-abort detectable null/alignment/length/range defects before safe view formation and invalid token bytes before table scan, so native defects cannot alias ordinary zero/false results; cover each row in subprocess owners. |
 | P2 reused ABI attributes | Preserve each reused shape's existing empty curated function-attribute set; Rust C exports must not unwind, but the generated declaration does not gain an LLVM `nounwind` promise or mutate shared shape fingerprints. |
 | P2 Upgrade head storage | Compute checked exact wire length `H`, allocate/fill one exact `H`-byte head with no growth or second copy, allocate the handle shell before fd transfer, and instrument the peak where both coexist with all builder storage. |
+| P2 stale readiness ABI prose | Replace the leftover null/misaligned-to-false sentence in the native inventory with the authoritative pre-reference hard-abort rule, including the Japanese mirror, so malformed state cannot alias ordinary HTTP/1.0/residual false. |
 
 ## References
 

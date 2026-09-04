@@ -149,7 +149,8 @@ close は一つの cumulative deadline 内で peer Close を待ち、Closing 中
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03 |
 
 A124 は消費しない。implementation activation 時だけ keyed inventory は十増える。readiness は ctx を
-borrow して何も retain せず、null/misaligned receiver は dereference せず false。exact native signatures は
+borrow して何も retain せず、null/misaligned receiver は reference formation 前に hard-abort。source HIR は
+その状態を作れず、malformed native state は通常の false と混同しない。exact native signatures は
 英語 ledger が権威。pointer/length/null/capacity/output
 を slice/deref/I/O/ownership より先に検証する。RespondUpgrade は writable aligned output を最初に
 要求して zero 化し、不正 output では入力を inspect/consume しない。次に nonnull aligned builder を
@@ -212,6 +213,7 @@ background heartbeat/async/broadcast registry/standalone listener は deferred�
 | P2 malformed query ABI | ctx/name/token 順で detectable null/alignment/length/range defect を safe view formation 前、invalid token byte を table scan 前に hard-abort し、zero/false と混同しない。各 row を subprocess owner で覆う。 |
 | P2 reused ABI attributes | reused shape の existing empty curated function-attribute set を保持。Rust C export は unwind しないが、generated declaration に LLVM `nounwind` promise を追加せず shared fingerprint を変えない。 |
 | P2 Upgrade head storage | checked exact wire length `H` を計算し、growth/second copy なしで exact `H`-byte head を allocate/fill、handle shell も fd transfer 前に allocate し、全 builder storage との coexist peak を instrument。 |
+| P2 stale readiness ABI prose | native inventory に残った null/misaligned-to-false 文を authoritative pre-reference hard-abort rule に置換し、英日とも malformed state と通常の HTTP/1.0/residual false を混同しない。 |
 
 ## References
 
