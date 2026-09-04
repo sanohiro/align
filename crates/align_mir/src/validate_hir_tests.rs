@@ -110,6 +110,7 @@ fn declaration_header_program() -> hir::Program {
             captures: Vec::new(),
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -352,6 +353,7 @@ fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: align_sema::FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -1498,6 +1500,7 @@ fn checked_interface_program(
                 provenance.1,
                 hir::ReturnCleanupAbi::None,
                 Vec::new(),
+                true,
             ),
         );
     }
@@ -3739,6 +3742,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
             captures: Vec::new(),
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Unknown,
         parallel_transfer_params: Vec::new(),
     });
@@ -3755,6 +3759,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Impure,
         parallel_transfer_params: Vec::new(),
     });
@@ -3974,6 +3979,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     }
@@ -4042,6 +4048,7 @@ fn with_return(ty: Ty) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -6711,6 +6718,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
         });
@@ -6748,6 +6756,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
         });
@@ -6766,6 +6775,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });

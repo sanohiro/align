@@ -88,6 +88,16 @@ pub enum Effect {
     Unknown,
 }
 
+/// Producer-side proof state carried by each exported function record.
+///
+/// Generic bodies are re-lowered and validated in the consumer. A non-generic body is absent from
+/// the interface and may be trusted only when the producer validated its exact MIR first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProducerCertification {
+    RevalidateGenericBody,
+    ValidatedBody,
+}
+
 impl From<align_sema::FnEffect> for Effect {
     fn from(e: align_sema::FnEffect) -> Effect {
         match e {
@@ -145,6 +155,7 @@ pub struct IFnSig {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
+    pub producer_certification: ProducerCertification,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
@@ -450,6 +461,7 @@ pub fn build_summaries(
     program: &align_sema::hir::Program,
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
+    producer_certifications: &HashSet<String>,
     target: &OwnedJsonTarget,
 ) -> Result<Vec<InterfaceSummary>, String> {
     build_summaries_with_effects(
@@ -458,6 +470,7 @@ pub fn build_summaries(
         mir,
         sources,
         &HashMap::new(),
+        producer_certifications,
         target,
     )
 }
@@ -484,6 +497,7 @@ pub fn build_summaries_with_effects(
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
     external_effects: &HashMap<String, align_sema::FnEffect>,
+    producer_certifications: &HashSet<String>,
     target: &OwnedJsonTarget,
 ) -> Result<Vec<InterfaceSummary>, String> {
     let effects: HashMap<String, Effect> = align_sema::fn_effects(program, external_effects)
@@ -614,6 +628,11 @@ pub fn build_summaries_with_effects(
                             }
                             apply_function_cleanup_metadata(&mut ret, function.ret, program);
                         }
+                        if !is_generic && !producer_certifications.contains(&canonical) {
+                            return Err(format!(
+                                "function '{canonical}' lacks MIR producer certification"
+                            ));
+                        }
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -622,6 +641,11 @@ pub fn build_summaries_with_effects(
                             return_borrow,
                             return_region,
                             return_cleanup,
+                            producer_certification: if is_generic {
+                                ProducerCertification::RevalidateGenericBody
+                            } else {
+                                ProducerCertification::ValidatedBody
+                            },
                             effect,
                             parallel_transfer_params,
                             resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
@@ -2780,6 +2804,7 @@ pub fn summary_return_provenance(
                 function.return_region.clone(),
                 function.return_cleanup,
                 function.parallel_transfer_params.clone(),
+                function.producer_certification == ProducerCertification::ValidatedBody,
             ),
         );
     }
@@ -2923,6 +2948,7 @@ mod builtin_spelling_tests {
                 return_borrow: ReturnBorrowSummary::None,
                 return_region: ReturnRegionSummary::None,
                 return_cleanup: align_sema::hir::ReturnCleanupAbi::DynamicBit,
+                producer_certification: ProducerCertification::ValidatedBody,
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),
                 resource_hook_body: false,

@@ -102,6 +102,8 @@ pub struct ImportedFn {
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
     pub return_cleanup: hir::ReturnCleanupAbi,
+    /// The format-9 dependency record was emitted only after producer validation.
+    pub producer_certified: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3342,6 +3344,7 @@ fn lower_program_unchecked(
                     return_borrow: import.return_borrow.clone(),
                     return_region: import.return_region.clone(),
                     return_cleanup: import.return_cleanup,
+                    producer_certified: import.producer_certified,
                 })
                 .collect()
         } else {

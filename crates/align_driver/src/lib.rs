@@ -403,6 +403,7 @@ fn install_static_descriptor_data(
             return_borrow: none_borrow.clone(),
             return_region: none_region.clone(),
             return_cleanup: no_cleanup,
+            producer_certified: true,
         });
     };
     for (kind, callback) in [
@@ -2887,8 +2888,23 @@ pub fn build_interface_summaries(
             return (Vec::new(), diags);
         }
     };
+    let producer_certifications = match align_codegen_llvm::validate_mir_producers(&mir) {
+        Ok(certifications) => certifications,
+        Err(reason) => {
+            diags.error(
+                format!("cannot certify MIR producers: {reason}"),
+                align_span::Span::new(0, 0, 0),
+            );
+            return (Vec::new(), diags);
+        }
+    };
     let mut summaries = match align_interface::build_summaries(
-        &modules, &hir, &mir, &sources, &target,
+        &modules,
+        &hir,
+        &mir,
+        &sources,
+        &producer_certifications,
+        &target,
     ) {
         Ok(summaries) => summaries,
         Err(reason) => {
@@ -3517,12 +3533,24 @@ fn walk_inner(
                     continue;
                 }
             };
+            let producer_certifications =
+                match align_codegen_llvm::validate_mir_producers(&mir) {
+                    Ok(certifications) => certifications,
+                    Err(reason) => {
+                        diags.error(
+                            format!("cannot certify MIR producers: {reason}"),
+                            align_span::Span::new(0, 0, 0),
+                        );
+                        continue;
+                    }
+                };
             let mut built = match align_interface::build_summaries_with_effects(
                 &unit_module,
                 &program,
                 &mir,
                 &sources,
                 &external_effects,
+                &producer_certifications,
                 &target,
             ) {
                 Ok(built) => built,
@@ -4681,12 +4709,15 @@ impl RehydrateCtx {
         let sources: HashMap<String, String> =
             HashMap::from([(unit.path.clone(), unit.src.clone())]);
         let target = current_owned_json_target().map_err(|_| RehydrateFailure::Summary)?;
+        let producer_certifications = align_codegen_llvm::validate_mir_producers(&mir)
+            .map_err(|_| RehydrateFailure::Summary)?;
         let mut built = align_interface::build_summaries_with_effects(
             &unit_module,
             &program,
             &mir,
             &sources,
             &external_effects,
+            &producer_certifications,
             &target,
         )
         .map_err(|_| RehydrateFailure::Summary)?;
