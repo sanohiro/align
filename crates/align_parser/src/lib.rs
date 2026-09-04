@@ -1465,10 +1465,13 @@ impl<'a> Parser<'a> {
             } else if self.at(&TokKind::Question) {
                 self.bump();
                 let span = e.span.merge(self.prev_span());
-                e = Expr { kind: ExprKind::Try(Box::new(e)), span };
-            } else if self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Ident(_)) {
+                e = Expr {
+                    kind: ExprKind::Try(Box::new(e)),
+                    span,
+                };
+            } else if self.at(&TokKind::Dot) && self.noninitial_path_segment_at(1) {
                 self.bump(); // '.'
-                let field = self.parse_ident("field or method name")?;
+                let field = self.parse_noninitial_path_segment("field or method name")?;
                 let span = e.span.merge(field.span);
                 e = Expr { kind: ExprKind::FieldAccess { recv: Box::new(e), field }, span };
             } else if self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Int(_)) {
@@ -1734,7 +1737,7 @@ impl<'a> Parser<'a> {
         // Path: ident (`.` ident)* — count segments, find the index just past the last one.
         let mut segs = 1usize;
         let mut i = 1; // index of the token after the leading ident
-        while matches!(self.peek_at(i), TokKind::Dot) && matches!(self.peek_at(i + 1), TokKind::Ident(_)) {
+        while matches!(self.peek_at(i), TokKind::Dot) && self.noninitial_path_segment_at(i + 1) {
             segs += 1;
             i += 2;
         }
@@ -1757,7 +1760,7 @@ impl<'a> Parser<'a> {
         segments.push(self.parse_ident("type name")?);
         for _ in 1..segs {
             self.expect(&TokKind::Dot, "'.'");
-            segments.push(self.parse_ident("type name")?);
+            segments.push(self.parse_noninitial_path_segment("type name")?);
         }
         let name = Path { span: start.merge(self.prev_span()), segments };
         self.expect(&TokKind::LBrace, "'{'");
@@ -1905,9 +1908,9 @@ impl<'a> Parser<'a> {
         if let Some(id) = self.parse_ident("identifier") {
             segments.push(id);
         }
-        while self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Ident(_)) {
+        while self.at(&TokKind::Dot) && self.noninitial_path_segment_at(1) {
             self.bump();
-            if let Some(id) = self.parse_ident("identifier") {
+            if let Some(id) = self.parse_noninitial_path_segment("identifier") {
                 segments.push(id);
             }
         }
@@ -2015,6 +2018,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `template` remains a keyword at expression head but is the one contextual keyword admitted
+    /// after `.` so the canonical `pkg.template` package can be named without widening any bare
+    /// identifier position or another keyword.
+    fn noninitial_path_segment_at(&self, offset: usize) -> bool {
+        matches!(self.peek_at(offset), TokKind::Ident(_) | TokKind::Template)
+    }
+
+    fn parse_noninitial_path_segment(&mut self, what: &str) -> Option<Ident> {
+        let span = self.span();
+        match self.peek() {
+            TokKind::Ident(_) => self.parse_ident(what),
+            TokKind::Template => {
+                self.bump();
+                Some(Ident {
+                    name: "template".to_owned(),
+                    span,
+                })
+            }
+            _ => {
+                self.diags.error(format!("expected {what}"), span);
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2280,6 +2307,49 @@ mod tests {
             matches!(parts.as_slice(), [TemplatePart::Hole(e)] if matches!(e.kind, ExprKind::Binary { .. })),
             "hole should be a binary expression, got {parts:?}"
         );
+    }
+
+    #[test]
+    fn template_is_contextual_only_after_a_dot() {
+        let (file, errors) = parse(
+            "module pkg.template\n\
+             import pkg.template.internal.resource\n\
+             fn build(value: pkg.template.Value) -> i32 {\n\
+               pkg.template.write(value)\n\
+               return 0\n\
+             }\n",
+        );
+        assert!(!errors, "qualified template segments should parse");
+        assert_eq!(
+            file.module
+                .as_ref()
+                .expect("module")
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pkg", "template"]
+        );
+        assert_eq!(
+            file.imports[0]
+                .segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pkg", "template", "internal", "resource"]
+        );
+
+        for source in [
+            "fn template() -> i32 = 0\n",
+            "fn f() -> i32 = template.value\n",
+            "module pkg.if\n",
+        ] {
+            let (_file, errors) = parse(source);
+            assert!(
+                errors,
+                "non-contextual keyword spelling must reject: {source:?}"
+            );
+        }
     }
 
     #[test]

@@ -3847,8 +3847,8 @@ movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
 This track consumes no language milestone and does not replace the live queue.
-`pkg.ws` is implemented after `pkg.csv`; `pkg.template` is the next package implementation
-capability. Its accepted contract is `pkg-design/template.md`; no implementation inventory is active.
+`pkg.ws` and `pkg.template` are implemented after `pkg.csv`. The next library capability is selected
+from the remaining independently gated queue below; no unmarked outline is implementation work.
 Promotion of an optimization slice is a separate explicit
 scheduling decision.
 
@@ -4063,7 +4063,7 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   WebSocket client, HTTP/2, extensions/compression, raw frames, standalone serving, async,
   heartbeat observation, and broadcast state are deferred. Exact ledger and implementation
   closure matrix: `pkg-design/ws.md`.
-- **pkg.template — DESIGNED (2026-09-04)** — opaque Move HTML text builder with `html`, default-escaped `write`,
+- **pkg.template — IMPLEMENTED 2026-09-04** — opaque Move HTML text builder with `html`, default-escaped `write`,
   explicit `raw`, and consuming zero-copy `to_string`; the underlying ordinary builder and partial
   views are not exposed. `write` shares the shipped `encoding.html_escape` five-entity table and is
   safe only for element text or complete already-quoted attribute contents. Contextual markup,

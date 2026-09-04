@@ -4,8 +4,8 @@
 >
 > **注意:** 英語版 (`../template.md`) が正本。本書は同期ミラーである。
 >
-> **ステータス:** DESIGNED (2026-09-04)。design acceptance だけでは package source、compiler
-> operation、runtime row、ABI shape を activate しない。
+> **ステータス:** IMPLEMENTED (2026-09-04)。package source、checked operation、既存 shape を
+> 再利用する runtime row 5 個は同時に activate する。
 
 ## 公開契約台帳
 

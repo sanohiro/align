@@ -302,6 +302,7 @@ impl Function {
             Operand::Arg(i) => self.slots[self.params[*i as usize] as usize],
             Operand::BorrowedPlace(place) => place.ty,
             Operand::BorrowedElementPlace(place) => place.element_ty,
+            Operand::BorrowedFixedElementPlace(place) => place.ty,
             Operand::BorrowedCleanupArg(_) => Ty::Bool,
         }
     }
@@ -434,6 +435,9 @@ pub enum Stmt {
     /// buffer now owned by the new binding. Depth-1 (a direct field of the slot's struct); the other
     /// fields are untouched.
     NullStructField(Slot, u32),
+    /// Null one resource-pointer leaf of a fixed Move-struct array after an exact element-field
+    /// move. The enclosing array remains the owner of every other element and field.
+    NullElemField(Slot, Operand, Vec<u32>),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
     /// Drop element `index` of a fixed Move-struct array slot: free that element's owned fields
@@ -1230,6 +1234,27 @@ pub enum Rvalue {
     /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
     /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
     BuilderToString(Operand),
+    /// `pkg.template.html()` — allocate the canonical HTML builder resource.
+    TemplateHtmlNew {
+        resource: u32,
+    },
+    /// Escape and append a UTF-8 `str` to the canonical HTML builder.
+    TemplateHtmlWrite {
+        resource: u32,
+        output: Operand,
+        value: Operand,
+    },
+    /// Append a UTF-8 `str` without escaping.
+    TemplateHtmlRaw {
+        resource: u32,
+        output: Operand,
+        value: Operand,
+    },
+    /// Consume the canonical HTML builder and transfer its payload into an owned `string`.
+    TemplateHtmlToString {
+        resource: u32,
+        output: Operand,
+    },
     /// `template "..."` — build a `str` from pieces. The optional operand is the enclosing arena
     /// handle; absent means individually owned storage held by a synthetic `string` owner.
     Template(Vec<TemplatePiece>, Option<Operand>),
@@ -2543,6 +2568,9 @@ pub enum Operand {
     /// A bounds-guarded dynamic-array element place. This is not a pointer: codegen derives the
     /// element address only while lowering the enclosing shared-borrow call action.
     BorrowedElementPlace(Box<BorrowedElementPlace>),
+    /// A statically bounded field within one element of a source-formed fixed record array.
+    /// The constant ordinal and field path keep the place pointer-free until codegen.
+    BorrowedFixedElementPlace(Box<BorrowedFixedElementPlace>),
     /// Cleanup bit carried beside an incoming whole-Move `BorrowMut` parameter.
     BorrowedCleanupArg(u32),
 }
@@ -2569,6 +2597,17 @@ pub struct BorrowedElementPlace {
     /// successful bounds edge after MIR rewrites and prove it dominates the call action before
     /// forming a pointer; the descriptor itself remains pointer-free.
     pub guard: BorrowedElementGuard,
+}
+
+#[derive(Clone, Debug)]
+pub struct BorrowedFixedElementPlace {
+    pub base: Slot,
+    pub index: u32,
+    pub path: Vec<u32>,
+    pub ty: Ty,
+    /// Call-scoped cleanup proxy required by the Move `BorrowMut` ABI. The only admitted
+    /// callees are the non-consuming `pkg.template.write` and `pkg.template.raw` wrappers.
+    pub cleanup: Option<Slot>,
 }
 
 #[derive(Clone, Debug)]
@@ -2884,6 +2923,8 @@ pub enum ValidationPass {
     JsonScan,
     /// `validate_hir::csv_decode_validation_reason`.
     CsvDecode,
+    /// `validate_hir::template_html_validation_reason`.
+    TemplateHtml,
     /// `align_sema::checked_hir_test_catalog_is_valid` at the test-only lowering boundary.
     TestCatalog,
     /// `validate_hir::body_only_metadata_is_valid`; carries the rejected function name.
@@ -2905,6 +2946,7 @@ impl ValidationPass {
             Self::DeclarationHeaders => "declaration_header_metadata_is_valid",
             Self::JsonScan => "json_scan_validation_reason",
             Self::CsvDecode => "csv_decode_validation_reason",
+            Self::TemplateHtml => "template_html_validation_reason",
             Self::TestCatalog => "checked_hir_test_catalog_is_valid",
             Self::Bodies => "body_only_metadata_is_valid",
             Self::BodyFacts => "checked_hir_body_facts_are_valid",
@@ -3045,7 +3087,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
     hir_program_validation_reason(program).is_ok()
 }
 
-/// Run the nine gates in their fixed order, naming the first one that refuses.
+/// Run the validation gates in their fixed order, naming the first one that refuses.
 ///
 /// The order is load-bearing: each gate assumes the bounds and ids the previous ones established.
 fn hir_program_validation_reason(
@@ -3053,7 +3095,7 @@ fn hir_program_validation_reason(
 ) -> Result<(), (ValidationPass, Option<String>)> {
     /// One gate: its identity and its predicate.
     type Gate = (ValidationPass, fn(&hir::Program) -> bool);
-    let gates: [Gate; 8] = [
+    let gates: [Gate; 9] = [
         (
             ValidationPass::BodyDepth,
             align_sema::checked_hir_body_depth_is_valid,
@@ -3079,6 +3121,9 @@ fn hir_program_validation_reason(
         }),
         (ValidationPass::CsvDecode, |program| {
             validate_hir::csv_decode_validation_reason(program).is_ok()
+        }),
+        (ValidationPass::TemplateHtml, |program| {
+            validate_hir::template_html_validation_reason(program).is_ok()
         }),
         // `Bodies` is checked between JsonScan and BodyFacts, below, so it can name its function.
         (
@@ -4044,6 +4089,7 @@ fn builder_key(
         Operand::Const(_)
         | Operand::BorrowedPlace(_)
         | Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedFixedElementPlace(_)
         | Operand::BorrowedCleanupArg(_) => None,
     }
 }
@@ -4285,6 +4331,9 @@ struct BuilderCtx {
     eager_expr_results: std::collections::HashMap<usize, Operand>,
     /// Whether an outer `lower_expr` invocation currently owns `eager_expr_results`.
     eager_expr_active: bool,
+    /// Fixed-array element places captured while lowering `ElemField`, so a consuming parent can
+    /// null the selected resource slot without evaluating its index expression twice.
+    element_field_places: std::collections::HashMap<usize, (Slot, Operand, Vec<u32>)>,
     /// Monotonic identity for indexed shared-borrow reservation markers. Kept behind the existing
     /// context box so the recursively passed [`Builder`] retains its established stack footprint.
     next_borrow_reservation: u32,
@@ -4330,6 +4379,14 @@ impl Builder {
 }
 
 impl Builder {
+    fn fresh_scratch_slot(&mut self, ty: Ty) -> Slot {
+        let slot = self.slots.len() as Slot;
+        self.slots.push(ty);
+        self.slot_align.push(None);
+        self.drop_flags.push(None);
+        slot
+    }
+
     fn new_block(&mut self) -> BlockId {
         let id = self.blocks.len() as BlockId;
         self.blocks.push(BBuild {
@@ -4693,6 +4750,7 @@ fn lower_fn(
             return_cleanup: f.return_cleanup,
             eager_expr_results: std::collections::HashMap::new(),
             eager_expr_active: false,
+            element_field_places: std::collections::HashMap::new(),
             next_borrow_reservation: 0,
         }),
     };
@@ -4895,12 +4953,23 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Field { root, path }
             if path.len() == 1
                 && (e.ty == Ty::String
+                    || matches!(e.ty, Ty::Resource(_))
                     || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
                         && align_sema::drop_plan(e.ty, &b.structs, &b.enums, &b.tagged_types)
                             .needs_drop())
                     || align_sema::is_move_handle(e.ty)) =>
         {
             b.push(Stmt::NullStructField(*root, path[0]));
+        }
+        hir::ExprKind::ElemField { .. } if matches!(e.ty, Ty::Resource(_)) => {
+            if let Some((slot, index, path)) = b
+                .ctx
+                .element_field_places
+                .get(&(e as *const hir::Expr as usize))
+                .cloned()
+            {
+                b.push(Stmt::NullElemField(slot, index, path));
+            }
         }
         // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
         // moves the live variant's owned buffer out into `ps`; null that depth-1 enum field of the
@@ -8612,6 +8681,70 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::BuilderToString(bop)));
                 Operand::Value(v)
             }
+            hir::ExprKind::TemplateHtmlNew { resource } => {
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::TemplateHtmlNew {
+                        resource: *resource,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::TemplateHtmlWrite {
+                resource,
+                output,
+                value,
+            }
+            | hir::ExprKind::TemplateHtmlRaw {
+                resource,
+                output,
+                value,
+            } => {
+                lower_required_binding!(
+                    b,
+                    output = lower_expr(b, output),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(
+                    b,
+                    value = lower_expr(b, value),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(Ty::Unit);
+                let rvalue = if matches!(&e.kind, hir::ExprKind::TemplateHtmlWrite { .. }) {
+                    Rvalue::TemplateHtmlWrite {
+                        resource: *resource,
+                        output,
+                        value,
+                    }
+                } else {
+                    Rvalue::TemplateHtmlRaw {
+                        resource: *resource,
+                        output,
+                        value,
+                    }
+                };
+                b.push(Stmt::Let(v, rvalue));
+                Operand::Const(Const::Unit)
+            }
+            hir::ExprKind::TemplateHtmlToString { resource, output } => {
+                lower_required_binding!(
+                    b,
+                    output_operand = lower_expr(b, output),
+                    Operand::Const(Const::Unit)
+                );
+                null_moved_source(b, output);
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::TemplateHtmlToString {
+                        resource: *resource,
+                        output: output_operand,
+                    },
+                ));
+                Operand::Value(v)
+            }
             hir::ExprKind::ArraySum { source, stages } => {
                 // An explicitly parallel, directly-consumed integer map can fold its result in the
                 // range kernel. This removes the full transformed array and the serial reread while
@@ -9129,7 +9262,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 index,
                 path,
                 struct_id,
-            } => lower_index_field(b, recv, index, path, *struct_id, e.ty),
+            } => lower_index_field(b, e, recv, index, path, *struct_id, e.ty),
             hir::ExprKind::ArrayLit { .. } => {
                 unreachable!("array literal only appears as a let initializer or pipeline source")
             }
@@ -9494,6 +9627,7 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
     let is_projection = match &e.kind {
         hir::ExprKind::Local(local) => b.borrowed_bindings.contains_key(local),
         hir::ExprKind::Field { root, .. } => b.borrowed_bindings.contains_key(root),
+        hir::ExprKind::ElemField { .. } => true,
         _ => false,
     };
     let mut place = match &e.kind {
@@ -9527,16 +9661,53 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
             place.ty = e.ty;
             place
         }
+        hir::ExprKind::ElemField {
+            recv, index, path, ..
+        } => {
+            let (hir::ExprKind::Local(base), hir::ExprKind::Int(index)) =
+                (&recv.kind, &index.kind)
+            else {
+                // Preserve the checked-HIR boundary as an error-producing gate: malformed input
+                // becomes an untyped MIR operand and is rejected before LLVM construction.
+                return Operand::Const(Const::Unit);
+            };
+            let Ok(index) = u32::try_from(*index) else {
+                return Operand::Const(Const::Unit);
+            };
+            let cleanup = (mode == align_ast::ParamMode::BorrowMut
+                && needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types))
+            .then(|| {
+                let slot = b.fresh_scratch_slot(Ty::Bool);
+                b.push(Stmt::Store(slot, Operand::Const(Const::Bool(true))));
+                slot
+            });
+            return Operand::BorrowedFixedElementPlace(Box::new(BorrowedFixedElementPlace {
+                base: *base,
+                index,
+                path: path.clone(),
+                ty: e.ty,
+                cleanup,
+            }));
+        }
         _ => unreachable!("sema admitted a non-place borrowed argument"),
     };
     let needs_cleanup = mode == align_ast::ParamMode::BorrowMut
         && !is_projection
-        && place.path.is_empty()
         && needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
-    let cleanup = needs_cleanup.then(|| {
-        b.drop_flags[place.slot as usize]
-            .expect("whole-Move BorrowMut place has a caller-visible cleanup slot")
-    });
+    let cleanup = if needs_cleanup {
+        if place.path.is_empty() {
+            let Some(Some(cleanup)) = b.drop_flags.get(place.slot as usize) else {
+                return Operand::Const(Const::Unit);
+            };
+            Some(*cleanup)
+        } else {
+            let slot = b.fresh_scratch_slot(Ty::Bool);
+            b.push(Stmt::Store(slot, Operand::Const(Const::Bool(true))));
+            Some(slot)
+        }
+    } else {
+        None
+    };
     place.ty = e.ty;
     place.cleanup = cleanup;
     Operand::BorrowedPlace(Box::new(place))
@@ -11144,6 +11315,7 @@ fn lower_slice_range(
 /// projection). Only the one field (a scalar or a `str` view) is loaded — no whole-struct copy.
 fn lower_index_field(
     b: &mut Builder,
+    expression: &hir::Expr,
     recv: &hir::Expr,
     index: &hir::Expr,
     path: &[u32],
@@ -11187,6 +11359,7 @@ fn lower_index_field(
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
     };
+    let fixed = fixed_len.is_some();
     let len = match (&slice_val, fixed_len) {
         (Some(source), _) => {
             let len = b.fresh_value(i64_ty());
@@ -11200,6 +11373,12 @@ fn lower_index_field(
         }
     };
     emit_bounds_check(b, &idx, len);
+    if fixed {
+        b.ctx.element_field_places.insert(
+            expression as *const hir::Expr as usize,
+            (slot, idx.clone(), path.to_vec()),
+        );
+    }
     // Load the element's first field via the shared seam. For a depth-1 path that *is* the leaf; for
     // a nested path (`arr[i].a.x`) it is the intermediate sub-struct, which we materialize to a temp
     // slot and then project the remaining field path out of (reusing the slot-field GEP) — so the
@@ -21791,6 +21970,7 @@ fn main() -> i32 {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 eager_expr_results: std::collections::HashMap::new(),
                 eager_expr_active: false,
+                element_field_places: std::collections::HashMap::new(),
                 next_borrow_reservation: 0,
             }),
         };

@@ -2,9 +2,9 @@
 
 > English is authoritative. A synchronized Japanese mirror lives at `ja/template.md`.
 >
-> **Status:** DESIGNED (2026-09-04). This document is the authority for the first `pkg.template`
-> capability. Design acceptance activates no package source, compiler operation, runtime row, or
-> ABI shape.
+> **Status:** IMPLEMENTED (2026-09-04). This document is the authority for the first
+> `pkg.template` capability. Package source, checked operations, and five reused-shape runtime rows
+> activate together.
 
 ## Authoritative public-contract ledger
 

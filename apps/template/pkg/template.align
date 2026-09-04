@@ -1,0 +1,17 @@
+module pkg.template
+
+import pkg.template.internal.descriptor
+import pkg.template.internal.resource
+
+pub resource html_builder = pkg.template.internal.resource.drop_html_builder
+
+pub fn html() -> html_builder = pkg.template.internal.descriptor.html()
+
+pub fn write(borrow mut output: html_builder, value: str) =
+  pkg.template.internal.descriptor.write(output, value)
+
+pub fn raw(borrow mut output: html_builder, value: str) =
+  pkg.template.internal.descriptor.raw(output, value)
+
+pub fn to_string(output: html_builder) -> string =
+  pkg.template.internal.descriptor.to_string(output)

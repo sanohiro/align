@@ -1023,6 +1023,28 @@ pub enum ExprKind {
         arena: Box<Expr>,
         options: Box<Expr>,
     },
+    /// Canonical `pkg.template.html()` compiler/package bridge. The nominal resource id is retained
+    /// so checked-HIR validation can reject a forged package operation before MIR construction.
+    TemplateHtmlNew {
+        resource: u32,
+    },
+    /// Default-escaped append into the canonical `pkg.template.html_builder` resource.
+    TemplateHtmlWrite {
+        resource: u32,
+        output: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Explicit byte-exact trusted append into the canonical HTML builder.
+    TemplateHtmlRaw {
+        resource: u32,
+        output: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Consume the canonical HTML builder and transfer its payload into one owned string.
+    TemplateHtmlToString {
+        resource: u32,
+        output: Box<Expr>,
+    },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value and select the variant by its shape class (Str/Number/Bool/Object). The `str`
     /// payloads are zero-copy views into the input, so the result is region-tied to it (see

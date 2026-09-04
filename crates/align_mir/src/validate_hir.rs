@@ -250,6 +250,152 @@ pub(crate) fn csv_decode_validation_reason(
     Ok(())
 }
 
+/// The first checked-HIR contract failure for a compiler-emitted `pkg.template` operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TemplateHtmlValidationReason {
+    InvalidSpan,
+    Origin,
+    Resource,
+    StoredType,
+    Output,
+    Value,
+}
+
+/// Validate the package identity, resource identity, placement, and operand/result types of every
+/// compiler-emitted HTML-builder operation before general body validation and MIR construction.
+pub(crate) fn template_html_validation_reason(
+    program: &hir::Program,
+) -> Result<(), TemplateHtmlValidationReason> {
+    let contains_operation = program.fns.iter().any(|function| {
+        let mut work = Vec::new();
+        for statement in &function.body.stmts {
+            push_statement_expressions(statement, &mut work);
+        }
+        if let Some(value) = function.body.value.as_deref() {
+            work.push(value);
+        }
+        while let Some(expression) = work.pop() {
+            if matches!(
+                expression.kind,
+                hir::ExprKind::TemplateHtmlNew { .. }
+                    | hir::ExprKind::TemplateHtmlWrite { .. }
+                    | hir::ExprKind::TemplateHtmlRaw { .. }
+                    | hir::ExprKind::TemplateHtmlToString { .. }
+            ) {
+                return true;
+            }
+            work.extend(align_sema::direct_expr_children(expression));
+        }
+        false
+    });
+    if !contains_operation {
+        return Ok(());
+    }
+    let Some((resource_id, resource)) = program
+        .resources
+        .iter()
+        .enumerate()
+        .find(|(_, resource)| resource.source_name == "pkg.template$html_builder")
+    else {
+        return Err(TemplateHtmlValidationReason::Resource);
+    };
+    if resource.declaring_module != "pkg.template"
+        || resource.generic_arity != 0
+        || resource.drop_hook != "pkg.template.internal.resource$drop_html_builder"
+        || resource.drop_thunk != "__align_resource_drop$pkg.template$html_builder"
+        || resource.representation_version != 1
+        || resource.drop_abi_fingerprint != *b"align-res-drop-1"
+    {
+        return Err(TemplateHtmlValidationReason::Resource);
+    }
+    let resource_id = resource_id as u32;
+
+    for function in &program.fns {
+        let mut work = Vec::new();
+        for statement in &function.body.stmts {
+            push_statement_expressions(statement, &mut work);
+        }
+        if let Some(value) = function.body.value.as_deref() {
+            work.push(value);
+        }
+        while let Some(expression) = work.pop() {
+            let expected_function = match &expression.kind {
+                hir::ExprKind::TemplateHtmlNew { resource }
+                    if *resource == resource_id && expression.ty == Ty::Resource(resource_id) =>
+                {
+                    Some("pkg.template$html")
+                }
+                hir::ExprKind::TemplateHtmlWrite {
+                    resource,
+                    output,
+                    value,
+                } if *resource == resource_id => {
+                    if expression.ty != Ty::Unit {
+                        return Err(TemplateHtmlValidationReason::StoredType);
+                    }
+                    if output.ty != Ty::Resource(resource_id) {
+                        return Err(TemplateHtmlValidationReason::Output);
+                    }
+                    if value.ty != Ty::Str {
+                        return Err(TemplateHtmlValidationReason::Value);
+                    }
+                    Some("pkg.template$write")
+                }
+                hir::ExprKind::TemplateHtmlRaw {
+                    resource,
+                    output,
+                    value,
+                } if *resource == resource_id => {
+                    if expression.ty != Ty::Unit {
+                        return Err(TemplateHtmlValidationReason::StoredType);
+                    }
+                    if output.ty != Ty::Resource(resource_id) {
+                        return Err(TemplateHtmlValidationReason::Output);
+                    }
+                    if value.ty != Ty::Str {
+                        return Err(TemplateHtmlValidationReason::Value);
+                    }
+                    Some("pkg.template$raw")
+                }
+                hir::ExprKind::TemplateHtmlToString { resource, output }
+                    if *resource == resource_id =>
+                {
+                    if expression.ty != Ty::String {
+                        return Err(TemplateHtmlValidationReason::StoredType);
+                    }
+                    if output.ty != Ty::Resource(resource_id) {
+                        return Err(TemplateHtmlValidationReason::Output);
+                    }
+                    Some("pkg.template$to_string")
+                }
+                hir::ExprKind::TemplateHtmlNew { .. }
+                | hir::ExprKind::TemplateHtmlWrite { .. }
+                | hir::ExprKind::TemplateHtmlRaw { .. }
+                | hir::ExprKind::TemplateHtmlToString { .. } => {
+                    return Err(TemplateHtmlValidationReason::Resource);
+                }
+                _ => None,
+            };
+            if let Some(expected_function) = expected_function {
+                if !valid_span(expression.span) {
+                    return Err(TemplateHtmlValidationReason::InvalidSpan);
+                }
+                if function.name != expected_function
+                    || function.origin
+                        != (hir::FnOrigin::Source {
+                            is_entry: false,
+                            is_public: true,
+                        })
+                {
+                    return Err(TemplateHtmlValidationReason::Origin);
+                }
+            }
+            work.extend(align_sema::direct_expr_children(expression));
+        }
+    }
+    Ok(())
+}
+
 fn push_statement_expressions<'a>(statement: &'a hir::Stmt, work: &mut Vec<&'a hir::Expr>) {
     match statement {
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => work.push(init),
@@ -3621,7 +3767,14 @@ impl<'a> BodyValidator<'a> {
             &self.program.tuples,
             &self.program.enums,
             &self.program.tagged_types,
-        ) {
+        ) && !matches!(ty, Ty::Struct(id)
+            if align_sema::struct_is_move(
+                id,
+                &self.program.structs,
+                &self.program.enums,
+                &self.program.tagged_types,
+            ))
+        {
             return false;
         }
         match ty {
@@ -4013,7 +4166,12 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrBorrow(_)
             | hir::ExprKind::BuilderNew { .. }
             | hir::ExprKind::BuilderWrite { .. }
-            | hir::ExprKind::BuilderToString(_) => true,
+            | hir::ExprKind::BuilderToString(_)
+            // Exact package/resource/operand contracts are owned by the earlier dedicated gate.
+            | hir::ExprKind::TemplateHtmlNew { .. }
+            | hir::ExprKind::TemplateHtmlWrite { .. }
+            | hir::ExprKind::TemplateHtmlRaw { .. }
+            | hir::ExprKind::TemplateHtmlToString { .. } => true,
             hir::ExprKind::SqliteCallbackDescriptor { target, effect } => {
                 self.sqlite_callback_descriptor_ok(expression.ty, target, effect.get())
             }
@@ -6166,6 +6324,15 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderToString(expr) => {
                 push_expr!(expr, context.clone());
             }
+            hir::ExprKind::TemplateHtmlNew { .. } => {}
+            hir::ExprKind::TemplateHtmlWrite { output, value, .. }
+            | hir::ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                push_expr!(value, context.clone());
+                push_expr!(output, context.clone());
+            }
+            hir::ExprKind::TemplateHtmlToString { output, .. } => {
+                push_expr!(output, context.clone());
+            }
             hir::ExprKind::CloneIn { value, region } => {
                 push_expr!(region, context.clone());
                 push_expr!(value, context.clone());
@@ -6822,7 +6989,7 @@ impl<'a> BodyValidator<'a> {
                         return None;
                     }
                     if matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-                        && !self.borrow_arg_is_valid(context, &args[index], *mode)
+                        && !self.borrow_arg_is_valid(context, &args[index], *mode, false)
                     {
                         return None;
                     }
@@ -7071,7 +7238,18 @@ impl<'a> BodyValidator<'a> {
                         return None;
                     }
                     if matches!(mode, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-                        && !self.borrow_arg_is_valid(context, &args[index], *mode)
+                        && !self.borrow_arg_is_valid(
+                            context,
+                            &args[index],
+                            *mode,
+                            matches!(
+                                func.as_str(),
+                                "pkg.template.write"
+                                    | "pkg.template.raw"
+                                    | "pkg.template$write"
+                                    | "pkg.template$raw"
+                            ),
+                        )
                     {
                         return None;
                     }
@@ -7607,6 +7785,7 @@ impl<'a> BodyValidator<'a> {
                             context,
                             argument,
                             param_modes[index],
+                            false,
                         )
                     })
                 {
@@ -8079,6 +8258,27 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::BuilderToString(builder) => {
                 let flow = self.expr_flow(builder)?;
                 (flow.ty == Ty::Builder).then_some((Ty::String, flow.falls, flow.breaks))
+            }
+            hir::ExprKind::TemplateHtmlNew { resource } => {
+                Some((Ty::Resource(*resource), true, Vec::new()))
+            }
+            hir::ExprKind::TemplateHtmlWrite { output, value, .. }
+            | hir::ExprKind::TemplateHtmlRaw { output, value, .. } => {
+                let output = self.expr_flow(output)?;
+                let value = self.expr_flow(value)?;
+                if !matches!(output.ty, Ty::Resource(_)) || value.ty != Ty::Str {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[output, value]);
+                Some((Ty::Unit, falls, breaks))
+            }
+            hir::ExprKind::TemplateHtmlToString { output, .. } => {
+                let output = self.expr_flow(output)?;
+                matches!(output.ty, Ty::Resource(_)).then_some((
+                    Ty::String,
+                    output.falls,
+                    output.breaks,
+                ))
             }
             _ => self
                 .derive_pipeline_expression(expression, context)
@@ -10221,7 +10421,10 @@ impl<'a> BodyValidator<'a> {
                 if leaf == Ty::String {
                     leaf = Ty::Str;
                 }
-                if !self.ty_copy_ok(leaf, context) {
+                if !(self.ty_copy_ok(leaf, context)
+                    || matches!(leaf, Ty::Resource(_))
+                        && matches!(receiver.ty, Ty::StructArray(..)))
+                {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
@@ -11977,14 +12180,23 @@ impl<'a> BodyValidator<'a> {
         context: &BodyContext,
         argument: &hir::Expr,
         mode: align_ast::ParamMode,
+        allow_projected_move: bool,
     ) -> bool {
-        let (root, field) = match &argument.kind {
-            hir::ExprKind::Local(local) => (*local, false),
-            hir::ExprKind::Field { root, .. } => (*root, true),
+        let (root, field, fixed_element_field) = match &argument.kind {
+            hir::ExprKind::Local(local) => (*local, false, false),
+            hir::ExprKind::Field { root, .. } => (*root, true, false),
+            hir::ExprKind::ElemField { recv, .. }
+                if matches!(recv.ty, Ty::StructArray(..)) =>
+            {
+                let hir::ExprKind::Local(root) = recv.kind else {
+                    return false;
+                };
+                (root, true, true)
+            }
             hir::ExprKind::BorrowedIndex { base, .. }
                 if mode == align_ast::ParamMode::Borrow =>
             {
-                (base.root_local, false)
+                (base.root_local, false, false)
             }
             _ => return false,
         };
@@ -12005,8 +12217,13 @@ impl<'a> BodyValidator<'a> {
             &self.program.tagged_types,
         );
         match mode {
-            align_ast::ParamMode::Borrow => argument.ty != Ty::ArenaHandle,
-            align_ast::ParamMode::BorrowMut => local.is_mut && !(field && move_pointee),
+            align_ast::ParamMode::Borrow => {
+                argument.ty != Ty::ArenaHandle
+                    && (!fixed_element_field || allow_projected_move || !move_pointee)
+            }
+            align_ast::ParamMode::BorrowMut => {
+                local.is_mut && (allow_projected_move || !(field && move_pointee))
+            }
             _ => false,
         }
     }

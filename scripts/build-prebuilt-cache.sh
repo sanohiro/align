@@ -35,7 +35,7 @@ PROJECT="$WORK_ROOT/project"
 WARM_ROOT="$WORK_ROOT/writable"
 mkdir -p "$PROJECT/pkg"
 
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg; do
+for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg apps/template/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
 done
 

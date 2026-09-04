@@ -730,9 +730,9 @@ implicit extension of the scanner surface.
 
 ```text
 template       // shipped plain scalar formatter
-html           // deferred language form; designed pkg.template is a separate opaque builder
+html           // deferred language form; implemented pkg.template is a separate opaque builder
 json template  // deferred; json.encode owns shipped JSON formatting
-raw            // no expression form; designed only as pkg.template's explicit append function
+raw            // no expression form; implemented only as pkg.template's explicit append function
 ```
 
 ### Parallelism
@@ -1588,7 +1588,7 @@ existing ABI shapes and their empty curated LLVM function-attribute sets, leavin
 declaration-side `nounwind` or shared shape fingerprint change is added.
 Exact contract: `impl/pkg-design/ws.md`.
 
-The designed `pkg.template` v1 is one opaque Move HTML text builder:
+The implemented `pkg.template` v1 is one opaque Move HTML text builder:
 
 ```text
 pkg.template.html_builder
@@ -1608,12 +1608,12 @@ without copying; unfinished recursive Drop frees it exactly once, including thro
 fixed arrays of Move records. The exact-compatible native boundary requires a live exclusively
 accessed constructor-owned shell, a disjoint allocator-compatible payload, and valid UTF-8; it
 checks detectable state, input UTF-8, and aliasing before mutation. There is no recoverable error channel.
-Plain language `template "..."` remains the sole scalar formatter and is unchanged. The designed
+Plain language `template "..."` remains the sole scalar formatter and is unchanged. The implemented
 package requires only one syntax prerequisite: `template` is contextual as a noninitial segment
 after `.` in module/import/type/value paths, while expression-head `template` plus a string retains
 its existing meaning and bare/other keyword identifiers remain rejected. Generic interface and
-monomorphization paths retain the resource and operation identity. The design activates no
-package/runtime inventory; implementation adds five keyed rows using A47/A73/A83/A62, for
+monomorphization paths retain the resource and operation identity. The implementation activates
+five keyed rows using A47/A73/A83/A62, for
 347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and 376 maximum records while A124
 remains unused. Exact contract and closure matrix:
 `impl/pkg-design/template.md`.

@@ -326,6 +326,11 @@ key|TcpListen|tcp_listen|declare i32 @align_rt_tcp_listen(ptr, i64, i64, ptr)
 key|TcpListenerFree|tcp_listener_free|declare void @align_rt_tcp_listener_free(ptr)
 key|TcpReadTimeout|tcp_read_timeout|declare void @align_rt_tcp_read_timeout(ptr, i64)
 key|TcpWriteTimeout|tcp_write_timeout|declare void @align_rt_tcp_write_timeout(ptr, i64)
+key|TemplateHtmlFree|template_html_free|declare void @align_rt_template_html_free_v1(ptr)
+key|TemplateHtmlNew|template_html_new|declare ptr @align_rt_template_html_new_v1()
+key|TemplateHtmlRaw|template_html_raw|declare void @align_rt_template_html_raw_v1(ptr, ptr, i64)
+key|TemplateHtmlToString|template_html_to_string|declare { ptr, i64 } @align_rt_template_html_into_string_v1(ptr)
+key|TemplateHtmlWrite|template_html_write|declare void @align_rt_template_html_write_v1(ptr, ptr, i64)
 key|TgAlloc|tg_alloc|declare noalias ptr @align_rt_tg_alloc(ptr, i64, i64) #2
 key|TgBegin|tg_begin|declare noalias ptr @align_rt_tg_begin() #0
 key|TgEnd|tg_end|declare void @align_rt_tg_end(ptr)

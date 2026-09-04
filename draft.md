@@ -1805,7 +1805,7 @@ write_value(score)
 ```
 
 Only the plain `template "…"` language form is shipped. The former `html "…"`, JSON-template,
-and expression-level `raw(...)` sketches are not accepted syntax. The designed `pkg.template`
+and expression-level `raw(...)` sketches are not accepted syntax. The implemented `pkg.template`
 capability leaves this formatter unchanged and instead supplies an opaque HTML builder: ordinary
 `write` escapes text with the shared five-entity table, while the package's `raw` function is the
 one explicit unescaped append. Contextual language-template parsing remains deferred.
@@ -2701,9 +2701,9 @@ total := rows.where(.active).pay.sum()?
 
 ```text
 template          // shipped plain scalar formatter
-html              // deferred language form; designed pkg.template is a separate opaque builder
+html              // deferred language form; implemented pkg.template is a separate opaque builder
 json template     // deferred; json.encode owns shipped JSON formatting
-raw               // no expression form; designed only as pkg.template's explicit append function
+raw               // no expression form; implemented only as pkg.template's explicit append function
 ```
 
 ### core.hash
@@ -3931,7 +3931,7 @@ shape identity; the Rust C exports still do not unwind across C, and A124 remain
 surface, validation order, frame/close grammar,
 allocation, ABI, and closure matrix: `docs/impl/pkg-design/ws.md`.
 
-The designed `pkg.template` v1 surface is one escape-by-default HTML text builder:
+The implemented `pkg.template` v1 surface is one escape-by-default HTML text builder:
 
 ```text
 pkg.template.html_builder  // opaque Move resource
@@ -3958,13 +3958,13 @@ checked length overflow and OOM abort. Recursive ownership includes the shipped 
 arrays of Move records, and generic interface/monomorphization paths preserve the same identity and
 Drop. Plain language `template "..."` remains the one scalar formatter and does not gain escaping.
 
-The designed canonical package has root `pkg.template`, empty compiler-private descriptor module
+The implemented canonical package has root `pkg.template`, empty compiler-private descriptor module
 `pkg.template.internal.descriptor`, and private resource-hook module
 `pkg.template.internal.resource`. The otherwise-reserved `template` token is contextual only as a
 noninitial dotted path segment in module/import/type/value paths; expression-head `template` plus a
 string remains the existing template form, while bare and other keyword identifiers stay rejected.
 Four checked HIR/MIR operations plus one Drop call reuse A47/A73/A83/A62 and their empty curated
-LLVM attributes. Design acceptance alone activates no row; implementation adds five keyed and
+LLVM attributes. The implementation activates five keyed and
 source-reachable rows, producing 347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and
 376 maximum records while A124 remains unused. Contextual templates, components/includes, reflection, streaming/arena forms,
 HTML parsing/sanitizing, and URL/CSS/JavaScript encoders remain separate consumer-backed work.

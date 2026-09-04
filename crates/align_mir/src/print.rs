@@ -135,6 +135,14 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::NullStructField(slot, idx) => {
                 let _ = writeln!(out, "    null _{slot}.{idx}");
             }
+            Stmt::NullElemField(slot, index, path) => {
+                let _ = writeln!(
+                    out,
+                    "    null_elem _{slot}[{}]{}",
+                    operand_str(index),
+                    path_str(path)
+                );
+            }
             Stmt::Drop(slot) => {
                 let _ = writeln!(out, "    drop _{slot}");
             }
@@ -594,6 +602,29 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(s2)
         ),
         Rvalue::BuilderToString(op) => format!("builder_to_string({})", operand_str(op)),
+        Rvalue::TemplateHtmlNew { resource } => format!("template_html_new(resource={resource})"),
+        Rvalue::TemplateHtmlWrite {
+            resource,
+            output,
+            value,
+        } => format!(
+            "template_html_write(resource={resource}, {}, {})",
+            operand_str(output),
+            operand_str(value)
+        ),
+        Rvalue::TemplateHtmlRaw {
+            resource,
+            output,
+            value,
+        } => format!(
+            "template_html_raw(resource={resource}, {}, {})",
+            operand_str(output),
+            operand_str(value)
+        ),
+        Rvalue::TemplateHtmlToString { resource, output } => format!(
+            "template_html_to_string(resource={resource}, {})",
+            operand_str(output)
+        ),
         Rvalue::Template(pieces, _arena) => {
             let ps: Vec<String> = pieces
                 .iter()
@@ -1212,6 +1243,17 @@ fn operand_str(op: &Operand) -> String {
             operand_str(&Operand::BorrowedPlace(Box::new(place.base.clone()))),
             operand_str(&place.index),
             place.guard.reservation,
+        ),
+        Operand::BorrowedFixedElementPlace(place) => format!(
+            "borrow-fixed-element ${}[{}].{}",
+            place.base,
+            place.index,
+            place
+                .path
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("."),
         ),
         Operand::BorrowedCleanupArg(index) => format!("arg{index}.cleanup"),
     }
