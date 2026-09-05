@@ -7,6 +7,13 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**XML investigation closure:** the owner requested one consolidated
+investigate-then-repair record instead of further piecemeal fix rounds. Read
+[`docs/impl/xml-producer-investigation.md`](docs/impl/xml-producer-investigation.md)
+for the complete classification, coherent repair, explicit non-findings, and
+owner evidence. The remaining workflow is PR verification, merge, and versioned
+release; stop after that release.
+
 **Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
 library work. If its owner proceeds with the intended release, complete that
 release before binding the consolidation baseline; this preparation does not

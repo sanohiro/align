@@ -14,6 +14,15 @@ import core.json
 import core.codec
 pub fn codec_name(batch: codec.batch) -> Option<str> = batch.name(0)
 pub fn codec_text(column: codec.str_column) -> Option<str> = column.at(0)
+pub fn captured(value: str) -> str {
+  callback := fn { value }
+  return callback()
+}
+fn describe_vector(value: vec4<i32>) -> str = if value.sum() == 12 { "twelve" } else { "wrong" }
+pub fn vector_producer() -> string {
+  value: vec4<i32> := [1, 2, 3, 4]
+  return describe_vector(select(value > 2, value + 2, value - 1)).clone()
+}
 pub Choice { A(string), B(string) }
 pub fn absent() -> string { value: Option<string> := None; return value else "fallback".clone() }
 pub fn alternate() -> string {
@@ -50,6 +59,22 @@ pub fn string_groups(data: str) -> Result<string, Error> {
     return Ok(groups.0[0].clone())
   }
 }
+pub fn aos_groups(data: str) -> Result<string, Error> {
+  rows: array<Row> := json.decode(data)?
+  groups := rows.group_by(.name).sum(.age)
+  return Ok(groups.0[0].clone())
+}
+pub fn aos_multi(data: str) -> Result<string, Error> {
+  rows: array<Row> := json.decode(data)?
+  groups := rows.group_by(.name).agg(sum(.age), max(.age), count())
+  return Ok(groups.0[0].clone())
+}
+pub fn aos_encoded(data: str) -> Result<string, Error> {
+  rows: array<Row> := json.decode(data)?
+  encoded := rows.dict_encode(.name)
+  groups := encoded.group_by(.name).sum(.age)
+  return Ok(groups.0[0].clone())
+}
 pub fn transposed_strings() -> string {
   arena {
     rows := [Row { name: "text", age: 1 }].to_soa()
@@ -83,6 +108,11 @@ fn main() -> Result<(), Error> {
   print(container_support.absent())
   print(container_support.alternate())
   print(container_support.selected())
+  print(container_support.captured(view))
+  print(container_support.vector_producer())
+  print(container_support.aos_groups("[{\"name\":\"abc\",\"age\":1}]")?)
+  print(container_support.aos_multi("[{\"name\":\"abc\",\"age\":1}]")?)
+  print(container_support.aos_encoded("[{\"name\":\"abc\",\"age\":1}]")?)
   return Ok(())
 }
 "#;
@@ -91,14 +121,14 @@ fn main() -> Result<(), Error> {
     assert_eq!(whole.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&whole.stdout),
-        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\n"
+        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\nview\ntwelve\nabc\nabc\nabc\n"
     );
     let output =
         build_per_unit_multi("producer-container-interface", files, "main.align").link_and_run();
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\n"
+        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\nview\ntwelve\nabc\nabc\nabc\n"
     );
 }
 
@@ -114,6 +144,43 @@ fn documented_first_key(path: &str) -> String {
         .map(|offset| marker + offset)
         .expect("closing Align fence");
     document[start..end].to_string()
+}
+
+#[test]
+fn producer_certification_preserves_generated_streaming_decoder_observations() {
+    if !backend_available() { return; }
+    let resource = r#"module pkg.db.internal.resource
+pub fn drop_rows(state: raw) { unsafe { if !state.is_null() { raw.free(state) } } }
+"#;
+    let db = r#"module pkg.db
+import pkg.db.internal.resource
+pub BorrowedRow { value: str }
+pub resource rows<R> = pkg.db.internal.resource.drop_rows
+"#;
+    let sqlite = r#"module pkg.db.internal.sqlite
+import pkg.db
+import pkg.db.internal.descriptor
+pub fn decode_current(borrow mut stream: pkg.db.rows<pkg.db.BorrowedRow>, context: raw) -> pkg.db.BorrowedRow {
+  unsafe {
+    reference := resource.borrow(stream)
+    return pkg.db.internal.descriptor.decode_current_row(reference, context)
+  }
+}
+"#;
+    let files = &[
+        ("pkg/db/internal/resource.align", resource),
+        ("pkg/db/internal/descriptor.align", "module pkg.db.internal.descriptor\n"),
+        ("pkg/db/internal/sqlite.align", sqlite),
+        ("pkg/db.align", db),
+        ("pkg/db/api.align", "module pkg.db.api\nimport pkg.db\nimport pkg.db.internal.sqlite\npub fn exercise(run: bool) { if run { unsafe { state := raw.alloc(1); mut stream: pkg.db.rows<pkg.db.BorrowedRow> := resource.from_raw(state); row := pkg.db.internal.sqlite.decode_current(stream, state); print(row.value) } } }\n"),
+        ("main.align", "import pkg.db.api\nfn main() -> i32 { pkg.db.api.exercise(false); return 0 }\n"),
+    ];
+    let llvm = emit_llvm_multi("streaming-decoder-producer", files, "main.align");
+    assert!(llvm.contains("call %\"pkg.db$BorrowedRow\" %rawptrval("),
+        "the generated indirect row decoder must be emitted");
+    let output = build_per_unit_multi("streaming-decoder-interface", files, "main.align")
+        .link_and_run();
+    assert_eq!(output.status.code(), Some(0));
 }
 
 fn documented_http_integration(path: &str) -> String {
@@ -237,27 +304,33 @@ fn xml_parse_rejects_invalid_documents_without_partial_reader_publication() {
         return;
     }
     let source = r#"import std.xml
-fn invalid(source: string) {
-  match xml.parse(source) {
-    Ok(_) => print("unexpected")
-    Err(_) => print("invalid")
+fn describe(error: Error) -> str = match error { Invalid => "invalid", _ => "unexpected" }
+fn invalid(source: string) -> string {
+  return match xml.parse(source) {
+    Ok(_) => "unexpected".clone()
+    Err(error) => describe(error).clone()
   }
 }
 pub fn main() {
-  invalid("".clone())
-  invalid("<a>".clone())
-  invalid("<a x='1' x='2'/>".clone())
-  invalid("<!DOCTYPE a><a/>".clone())
-  invalid("<a>&custom;</a>".clone())
-  invalid("<a/><b/>".clone())
+  print(invalid("".clone()))
+  print(invalid("<a>".clone()))
+  print(invalid("<a x='1' x='2'/>".clone()))
+  print(invalid("<!DOCTYPE a><a/>".clone()))
+  print(invalid("<a>&custom;</a>".clone()))
+  print(invalid("<a/><b/>".clone()))
 }
 "#;
-    let output = build_and_run("std-xml-invalid", source);
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "invalid\ninvalid\ninvalid\ninvalid\ninvalid\ninvalid\n",
-    );
+    for output in [
+        build_and_run("std-xml-invalid", source),
+        build_per_unit_multi("std-xml-invalid-interface", &[("main.align", source)], "main.align")
+            .link_and_run(),
+    ] {
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "invalid\ninvalid\ninvalid\ninvalid\ninvalid\ninvalid\n",
+        );
+    }
 }
 
 #[test]
