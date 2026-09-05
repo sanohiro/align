@@ -4606,6 +4606,16 @@ fn xml_selected_ty(
     Some(ty)
 }
 
+fn xml_inline_array_element(program: &Program, ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Array(element, _) => Some(scalar_to_ty(element)),
+        Ty::StructArray(id, _) if program.structs.get(id as usize).is_some() => {
+            Some(Ty::Struct(id))
+        }
+        _ => None,
+    }
+}
+
 fn xml_owned_leaf_paths(
     program: &Program,
     root: Ty,
@@ -5974,11 +5984,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let Some(element_ty) = xml_selected_ty(
-                    self.graph.program,
-                    slot_ty,
-                    &[XmlAccessPathSegment::Element],
-                ) else {
+                let Some(element_ty) = xml_inline_array_element(self.graph.program, slot_ty) else {
                     equation.invalid = true;
                     return equation;
                 };
@@ -6007,6 +6013,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
+                if !matches!(slot_ty, Ty::StructArray(..)) {
+                    equation.invalid = true;
+                    return equation;
+                }
                 let mut result_path = vec![XmlAccessPathSegment::Element];
                 result_path.extend(
                     fields
@@ -6055,24 +6065,36 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }
                     _ => false,
                 };
-                let Some(remaining) =
+                if !view_matches {
+                    equation.invalid = true;
+                } else if path.is_empty() {
+                    let source = self.queue(XmlAccessNode::Slot(
+                        slot,
+                        vec![XmlAccessPathSegment::Element],
+                    ));
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if let Some(remaining) =
                     path.strip_prefix(&[XmlAccessPathSegment::Element])
-                else {
-                    equation.invalid = true;
-                    return equation;
-                };
-                let mut source_path = vec![XmlAccessPathSegment::Element];
-                source_path.extend_from_slice(remaining);
-                if !view_matches
-                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
-                        != Some(selected_ty)
                 {
-                    equation.invalid = true;
-                } else {
+                    let mut source_path = vec![XmlAccessPathSegment::Element];
+                    source_path.extend_from_slice(remaining);
+                    if xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
                     Self::add_source(
                         &mut equation,
                         self.queue(XmlAccessNode::Slot(slot, source_path)),
                     );
+                } else {
+                    equation.invalid = true;
                 }
             }
             Rvalue::ConstArray { elems, elem } => {
@@ -8183,6 +8205,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 ((*index).clone(), (*fields).to_vec(), (*operand).clone())
             })
             .collect::<Vec<_>>();
+        let whole_element_from_fields = if path.as_slice() == [XmlAccessPathSegment::Element] {
+            match slot_ty {
+                Ty::StructArray(id, _) => self
+                    .graph
+                    .program
+                    .structs
+                    .get(id as usize)
+                    .is_some_and(|definition| {
+                        !definition.fields.is_empty()
+                            && definition.fields.iter().enumerate().all(|(field, _)| {
+                                element_field_stores.iter().any(|(_, path, _)| {
+                                    path.first().copied() == u32::try_from(field).ok()
+                                })
+                            })
+                    }),
+                _ => false,
+            }
+        } else {
+            false
+        };
         let Some(constant_stores) = self.graph.slot_stores.constant_elements.get(slot as usize)
         else {
             equation.invalid = true;
@@ -8251,11 +8293,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 bits: 64,
                 signed: true,
             });
-            let Some(element_ty) = xml_selected_ty(
-                self.graph.program,
-                slot_ty,
-                &[XmlAccessPathSegment::Element],
-            ) else {
+            let Some(element_ty) = xml_inline_array_element(self.graph.program, slot_ty) else {
                 equation.invalid = true;
                 continue;
             };
@@ -8300,6 +8338,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 continue;
             };
             if fields.is_empty()
+                || !matches!(slot_ty, Ty::StructArray(..))
                 || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
             {
@@ -8316,6 +8355,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     path[stored_path.len()..].to_vec(),
                 );
             }
+        }
+        if whole_element_from_fields {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
         }
         for (elements, element_ty) in constant_stores {
             let valid_shape = match slot_ty {
@@ -8662,6 +8704,75 @@ fn xml_borrowed_access(
         XmlProducerState::Present(xml_argument_access(graph.function, index as u32))
     } else {
         xml_slot_path_access(graph, slot, expected, path)
+    }
+}
+
+fn xml_borrowed_storage_access(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+) -> XmlProducerState {
+    let slot = match operand {
+        Operand::BorrowedPlace(place) => place.slot,
+        Operand::BorrowedElementPlace(place) => place.base.slot,
+        Operand::BorrowedFixedElementPlace(place) => place.base,
+        _ => return XmlProducerState::Invalid,
+    };
+    if graph.function.slots.get(slot as usize).is_none() {
+        return XmlProducerState::Invalid;
+    }
+    let access = graph
+        .function
+        .params
+        .iter()
+        .position(|candidate| *candidate == slot)
+        .map_or(XmlAccessProvenance::Owned, |index| {
+            xml_argument_access(graph.function, index as u32)
+        });
+    XmlProducerState::Present(access)
+}
+
+fn xml_borrowed_mode_satisfied(
+    program: &Program,
+    parameter: Ty,
+    selected: Ty,
+    mode: align_ast::ParamMode,
+    payload: XmlProducerState,
+    storage: XmlProducerState,
+) -> bool {
+    let mut readable_payload = OperandRequirement::READ;
+    readable_payload.callable = matches!(selected, Ty::Fn(_));
+    match mode {
+        // A canonical borrowed descriptor is also the physical representation of a Copy view
+        // passed by value. The call-shape check above already rejects a borrowed carrier for a
+        // Move parameter; the remaining Copy case needs only readable payload provenance.
+        align_ast::ParamMode::ByValue => readable_payload.is_satisfied_by(payload),
+        align_ast::ParamMode::Borrow => readable_payload.is_satisfied_by(payload),
+        align_ast::ParamMode::BorrowMut => {
+            if align_sema::ty_is_move(
+                parameter,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                xml_mode_requirement(program, parameter, selected, mode)
+                    .is_satisfied_by(payload)
+            } else {
+                readable_payload.is_satisfied_by(payload)
+                    && OperandRequirement {
+                        write: true,
+                        exclusive: true,
+                        ..OperandRequirement::default()
+                    }
+                    .is_satisfied_by(storage)
+            }
+        }
+        align_ast::ParamMode::Out => OperandRequirement {
+            write: true,
+            exclusive: true,
+            ..OperandRequirement::default()
+        }
+        .is_satisfied_by(storage),
     }
 }
 
@@ -9287,19 +9398,8 @@ fn validate_resource_rvalues_component(
                                     | Operand::BorrowedElementPlace(_)
                                     | Operand::BorrowedFixedElementPlace(_)
                             );
-                            let borrowed_state = canonical_borrow
-                                .then(|| xml_borrowed_access(&access_graph, operand));
                             let canonical_borrow_path = canonical_borrow
                                 && xml_borrowed_descriptor_path_valid(&access_graph, operand);
-                            let canonical_borrow_state = || {
-                                borrowed_state.map(|state| {
-                                    if canonical_borrow_path {
-                                        state
-                                    } else {
-                                        XmlProducerState::Invalid
-                                    }
-                                })
-                            };
                             let canonical_shape = !matches!(mode, align_ast::ParamMode::Out)
                                 || canonical_borrow;
                             let parameter_moves = align_sema::ty_is_move(
@@ -9312,6 +9412,38 @@ fn validate_resource_rvalues_component(
                             let by_value_shape = !matches!(mode, align_ast::ParamMode::ByValue)
                                 || !parameter_moves
                                 || matches!(operand, Operand::Value(_) | Operand::Arg(_));
+                            if canonical_borrow {
+                                if !canonical_borrow_path {
+                                    return false;
+                                }
+                                let payload = xml_borrowed_access(&access_graph, operand);
+                                let storage =
+                                    xml_borrowed_storage_access(&access_graph, operand);
+                                if leaves.is_empty() {
+                                    return canonical_shape
+                                        && by_value_shape
+                                        && xml_borrowed_mode_satisfied(
+                                            program,
+                                            *expected,
+                                            *expected,
+                                            *mode,
+                                            payload,
+                                            storage,
+                                        );
+                                }
+                                return canonical_shape
+                                    && by_value_shape
+                                    && leaves.iter().all(|(selected, _)| {
+                                        xml_borrowed_mode_satisfied(
+                                            program,
+                                            *expected,
+                                            *selected,
+                                            *mode,
+                                            payload,
+                                            storage,
+                                        )
+                                    });
+                            }
                             if leaves.is_empty() {
                                 if !parameter_moves {
                                     // Copy-only carriers have no producer capability for this
@@ -9319,13 +9451,11 @@ fn validate_resource_rvalues_component(
                                     // exact Out/Borrow/BorrowMut destination and mode shape.
                                     return true;
                                 }
-                                let state = canonical_borrow_state().unwrap_or_else(|| {
-                                    xml_operand_access(
-                                        &access_graph,
-                                        operand,
-                                        *expected,
-                                    )
-                                });
+                                let state = xml_operand_access(
+                                    &access_graph,
+                                    operand,
+                                    *expected,
+                                );
                                 return canonical_shape
                                     && by_value_shape
                                     && xml_mode_requirement(
@@ -9339,14 +9469,12 @@ fn validate_resource_rvalues_component(
                             canonical_shape
                                 && by_value_shape
                                 && leaves.iter().all(|(selected, path)| {
-                                    let state = canonical_borrow_state().unwrap_or_else(|| {
-                                        xml_operand_path_access(
-                                            &access_graph,
-                                            operand,
-                                            *selected,
-                                            path.clone(),
-                                        )
-                                    });
+                                    let state = xml_operand_path_access(
+                                        &access_graph,
+                                        operand,
+                                        *selected,
+                                        path.clone(),
+                                    );
                                     xml_mode_requirement(program, *expected, *selected, *mode)
                                         .is_satisfied_by(state)
                                 })
@@ -32100,6 +32228,21 @@ fn fixed(first: str, second: str) -> i64 {
   return take(values[0]) + take(records[1].value) + take_many(values)
 }
 fn folded() -> i64 { values := ["a", "b"]; return take(values[0]) }
+fn label(values: slice<i64>) -> str = "ok"
+fn numeric(value: i64) -> str { values := [value, 2]; return label(values) }
+Numbers { first: i64, second: i64 }
+fn label_record(value: Numbers) -> str = "ok"
+fn numeric_record(value: i64) -> str {
+  values := [Numbers { first: value, second: 2 }]
+  return label_record(values[0])
+}
+View { text: str }
+fn replace(borrow mut value: View) { value.text = "new" }
+fn replace_copy(borrow source: View) -> str {
+  mut copy := source
+  replace(copy)
+  return copy.text
+}
 fn capture_cycle() -> i64 {
   mut n: i64 := 0
   f := fn x: i64 { n + x }
@@ -32130,6 +32273,42 @@ fn main() -> i32 = 0
             .unwrap_or_else(|| panic!("missing fixed-array Index producer"));
         bad_index.fns[fixed].value_tys[indexed as usize] = Ty::Bool;
         assert_xml_producer_rejected(&bad_index, "fixed-array Index result type");
+
+        let mut non_inline_slot = ordinary.clone();
+        let slot = non_inline_slot.fns[fixed]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Index(slot, _)) => Some(*slot),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array Index slot"));
+        non_inline_slot.fns[fixed].slots[slot as usize] = Ty::Slice(Scalar::Str);
+        assert_xml_producer_rejected(&non_inline_slot, "slice slot used by fixed Index");
+
+        let replace_copy = xml_test_function(&ordinary, "replace_copy");
+        let mut shared_storage = ordinary.clone();
+        let source = shared_storage.fns[replace_copy].params[0];
+        let place = shared_storage.fns[replace_copy]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), arguments))
+                    if target.as_str() == "replace" => arguments.first_mut(),
+                _ => None,
+            })
+            .and_then(|operand| match operand {
+                Operand::BorrowedPlace(place) => Some(place),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing Copy-local BorrowMut descriptor"));
+        place.slot = source;
+        assert_xml_producer_rejected(
+            &shared_storage,
+            "shared Copy parameter used as BorrowMut storage",
+        );
 
         let mut bad_index_field = ordinary.clone();
         let fields = bad_index_field.fns[fixed]
