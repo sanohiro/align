@@ -4205,6 +4205,7 @@ struct XmlSlotStores<'a> {
 struct ValidatedProducerGraph<'a> {
     function: &'a align_mir::Function,
     program: &'a Program,
+    local_contracts: &'a HashSet<ProgramCall>,
     value_definitions: &'a [Option<&'a Rvalue>],
     auxiliary_value_definitions: &'a [Option<&'a Rvalue>],
     duplicate_values: &'a [bool],
@@ -4222,7 +4223,27 @@ fn merge_xml_access(
         Some(current) if current == next => current,
         Some(current @ (XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed)) => current,
         Some(_) if matches!(next, XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed) => next,
-        Some(_) => XmlAccessProvenance::Mixed,
+        Some(XmlAccessProvenance::Owned) => next,
+        Some(XmlAccessProvenance::Shared) => match next {
+            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
+                XmlAccessProvenance::Shared
+            }
+            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Mixed,
+            current => current,
+        },
+        Some(XmlAccessProvenance::Exclusive) => match next {
+            XmlAccessProvenance::Owned => XmlAccessProvenance::Exclusive,
+            XmlAccessProvenance::Shared => XmlAccessProvenance::Shared,
+            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Unreadable,
+            current => current,
+        },
+        Some(XmlAccessProvenance::Unreadable) => match next {
+            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
+                XmlAccessProvenance::Unreadable
+            }
+            XmlAccessProvenance::Shared => XmlAccessProvenance::Mixed,
+            current => current,
+        },
     })
 }
 
@@ -4276,6 +4297,7 @@ fn xml_argument_access(function: &align_mir::Function, index: u32) -> XmlAccessP
 enum XmlAccessPathSegment {
     StructField(u32),
     TupleElement(u32),
+    Element,
     EnumPayload { enum_id: u32, variant: u32, slot: u32 },
     OptionSome,
     ResultOk,
@@ -4478,6 +4500,39 @@ fn xml_result_payload(program: &Program, ty: Ty, ok: bool) -> Option<Ty> {
     Some(scalar_to_ty(if ok { success } else { failure }))
 }
 
+fn xml_ty_matches_tagged_body(program: &Program, actual: Ty, expected: Ty) -> bool {
+    fn tagged_matches(program: &Program, id: u32, body: Ty) -> bool {
+        match (program.tagged_types.get(id as usize), body) {
+            (Some(hir::TaggedType::Option(payload)), Ty::Option(actual)) => *payload == actual,
+            (Some(hir::TaggedType::Result(ok, error)), Ty::Result(actual_ok, actual_error)) => {
+                *ok == actual_ok && *error == actual_error
+            }
+            _ => false,
+        }
+    }
+
+    actual == expected
+        || matches!(expected, Ty::Tagged(id) if tagged_matches(program, id, actual))
+        || matches!(actual, Ty::Tagged(id) if tagged_matches(program, id, expected))
+}
+
+fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
+    let bytes = Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    match (actual, expected) {
+        (Ty::String, Ty::Str) => true,
+        (Ty::String | Ty::Str, Ty::Slice(element)) => element == bytes,
+        (Ty::DynArray(actual), Ty::Slice(expected)) => actual == expected,
+        (
+            Ty::DynStructArray(actual, Layout::Aos),
+            Ty::Slice(Scalar::Struct(expected)),
+        ) => actual == expected,
+        _ => false,
+    }
+}
+
 fn xml_selected_ty(
     program: &Program,
     mut ty: Ty,
@@ -4486,7 +4541,10 @@ fn xml_selected_ty(
     for segment in path {
         ty = match *segment {
             XmlAccessPathSegment::StructField(field) => {
-                let Ty::Struct(id) = ty else { return None };
+                let id = match ty {
+                    Ty::Struct(id) | Ty::Soa(id) => id,
+                    _ => return None,
+                };
                 program
                     .structs
                     .get(id as usize)?
@@ -4498,6 +4556,28 @@ fn xml_selected_ty(
                 let Ty::Tuple(id) = ty else { return None };
                 scalar_to_ty(*program.tuples.get(id as usize)?.elems.get(index as usize)?)
             }
+            XmlAccessPathSegment::Element => match ty {
+                Ty::Box(payload)
+                | Ty::Array(payload, _)
+                | Ty::Slice(payload)
+                | Ty::DynArray(payload)
+                | Ty::Task(payload)
+                | Ty::DynVecArray(payload, _)
+                | Ty::DynMaskArray(payload, _)
+                | Ty::DynFixedArray(payload, _) => scalar_to_ty(payload),
+                Ty::DynSliceArray(payload) => {
+                    scalar_to_ty(align_sema::prim_to_scalar(payload))
+                }
+                Ty::ArrayBuilder(payload) => scalar_to_ty(payload),
+                Ty::VecArrayBuilder(payload, lanes) => Ty::Vec(payload, lanes),
+                Ty::MaskArrayBuilder(payload, lanes) => Ty::Mask(payload, lanes),
+                Ty::FixedArrayBuilder(payload, length) => Ty::Array(payload, length),
+                Ty::FixedStructArrayBuilder(id, length) => Ty::StructArray(id, length),
+                Ty::StructArray(id, _)
+                | Ty::DynStructArray(id, _)
+                | Ty::DynFixedStructArray(id, _) => Ty::Struct(id),
+                _ => return None,
+            },
             XmlAccessPathSegment::EnumPayload {
                 enum_id,
                 variant,
@@ -4536,7 +4616,30 @@ fn xml_owned_leaf_paths(
         }
         let aggregate = matches!(
             ty,
-            Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
+            Ty::Struct(_)
+                | Ty::Tuple(_)
+                | Ty::Enum(_)
+                | Ty::Option(_)
+                | Ty::Result(..)
+                | Ty::Tagged(_)
+                | Ty::Box(_)
+                | Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(_)
+                | Ty::DynSliceArray(_)
+                | Ty::DynArray(_)
+                | Ty::DynVecArray(..)
+                | Ty::DynMaskArray(..)
+                | Ty::DynFixedArray(..)
+                | Ty::DynFixedStructArray(..)
+                | Ty::Soa(_)
+                | Ty::Task(_)
+                | Ty::ArrayBuilder(_)
+                | Ty::VecArrayBuilder(..)
+                | Ty::MaskArrayBuilder(..)
+                | Ty::FixedArrayBuilder(..)
+                | Ty::FixedStructArrayBuilder(..)
         );
         if aggregate {
             if ancestors.contains(&ty) {
@@ -4603,17 +4706,87 @@ fn xml_owned_leaf_paths(
                     pending.push((scalar_to_ty(*failure), error, ancestors));
                 }
             },
+            Ty::Box(payload)
+            | Ty::Array(payload, _)
+            | Ty::Slice(payload)
+            | Ty::DynArray(payload)
+            | Ty::Task(payload)
+            | Ty::DynVecArray(payload, _)
+            | Ty::DynMaskArray(payload, _)
+            | Ty::DynFixedArray(payload, _) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((scalar_to_ty(payload), selected, ancestors));
+            }
+            Ty::DynSliceArray(payload) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((
+                    scalar_to_ty(align_sema::prim_to_scalar(payload)),
+                    selected,
+                    ancestors,
+                ));
+            }
+            Ty::ArrayBuilder(payload) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((scalar_to_ty(payload), selected, ancestors));
+            }
+            Ty::VecArrayBuilder(payload, lanes) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Vec(payload, lanes), selected, ancestors));
+            }
+            Ty::MaskArrayBuilder(payload, lanes) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Mask(payload, lanes), selected, ancestors));
+            }
+            Ty::FixedArrayBuilder(payload, length) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Array(payload, length), selected, ancestors));
+            }
+            Ty::FixedStructArrayBuilder(id, length) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::StructArray(id, length), selected, ancestors));
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Struct(id), selected, ancestors));
+            }
+            Ty::Soa(id) => {
+                let definition = program.structs.get(id as usize)?;
+                for (field, definition) in definition.fields.iter().enumerate() {
+                    let mut selected = path.clone();
+                    selected.push(XmlAccessPathSegment::StructField(
+                        u32::try_from(field).ok()?,
+                    ));
+                    pending.push((definition.ty, selected, ancestors.clone()));
+                }
+            }
             _ => {}
         }
     }
     Some(leaves)
 }
 
-fn xml_direct_call_facts(program: &Program, target: &ProgramCall) -> Option<XmlCallFacts> {
+fn xml_direct_call_facts(
+    program: &Program,
+    target: &ProgramCall,
+    local_contracts: &HashSet<ProgramCall>,
+) -> Option<XmlCallFacts> {
     let mut found = None;
     for function in &program.fns {
         if &function.name != target {
             continue;
+        }
+        if !local_contracts.contains(target) {
+            return None;
         }
         let params = function
             .params
@@ -4718,12 +4891,17 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::PathNormalize { .. }
         | Rvalue::EncodingEncode { .. }
         | Rvalue::RegexReplace { .. }
+        | Rvalue::ArrayBuilderNew { .. }
+        | Rvalue::ArrayBuilderBuild { .. }
         | Rvalue::CliGetStr { .. }
         | Rvalue::CliUsage { .. }
         | Rvalue::RunOutputView { .. }
         | Rvalue::HttpSseStreamLastEventId { .. }
         | Rvalue::HttpCtxMethod { .. }
-        | Rvalue::HttpCtxPath { .. } => XmlProducerVariantClass::Graph,
+        | Rvalue::HttpCtxPath { .. }
+        | Rvalue::ResourceViewFromRaw { .. }
+        | Rvalue::SliceIndex(..)
+        | Rvalue::SliceIndexNoalias { .. } => XmlProducerVariantClass::Graph,
         Rvalue::SqliteCallbackDescriptor(..)
         | Rvalue::RawCall { .. }
         | Rvalue::SoaColumn { .. }
@@ -4746,7 +4924,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::ResourceBorrow { .. }
         | Rvalue::ResourceRaw { .. }
         | Rvalue::ResourceIntoRaw { .. }
-        | Rvalue::ResourceViewFromRaw { .. }
         | Rvalue::BoxGet(..)
         | Rvalue::BoxClone(..)
         | Rvalue::Index(..)
@@ -4782,8 +4959,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::ParMapParallel { .. }
         | Rvalue::ParMapReduce { .. }
         | Rvalue::SlicePtr(..)
-        | Rvalue::SliceIndex(..)
-        | Rvalue::SliceIndexNoalias { .. }
         | Rvalue::ConstArray { .. }
         | Rvalue::StrPredicate { .. }
         | Rvalue::StrFinderNew { .. }
@@ -4861,11 +5036,9 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::BytesRead { .. }
         | Rvalue::BufferPut { .. }
         | Rvalue::BufferAppend { .. }
-        | Rvalue::ArrayBuilderNew { .. }
         | Rvalue::ArrayBuilderPush { .. }
         | Rvalue::ArrayBuilderPushStr { .. }
         | Rvalue::ArrayBuilderAppend { .. }
-        | Rvalue::ArrayBuilderBuild { .. }
         | Rvalue::FsWriteFile { .. }
         | Rvalue::FsWriteFileBuilder { .. }
         | Rvalue::FsExists { .. }
@@ -4986,6 +5159,279 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::HttpStreamFinish { .. }
         | Rvalue::HttpStreamReject { .. } => XmlProducerVariantClass::Irrelevant,
     }
+}
+
+fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
+    use XmlAccessProvenance::{Owned, Shared};
+
+    let owned = |slot| vec![(slot, Owned)];
+    match rvalue {
+        Rvalue::JsonDecode { out, arena, .. }
+        | Rvalue::JsonDecodeStructArray { out, arena, .. }
+        | Rvalue::JsonDecodeUnion { out, arena, .. } => {
+            vec![(*out, if arena.is_some() { Shared } else { Owned })]
+        }
+        Rvalue::JsonDecodeSoa { out, .. } | Rvalue::CsvDecode { out, .. } => {
+            vec![(*out, Shared)]
+        }
+        Rvalue::JsonDoc { out, .. }
+        | Rvalue::JsonDocGet { out, .. }
+        | Rvalue::JsonDocAt { out, .. }
+        | Rvalue::JsonDocAsStr { out, .. }
+        | Rvalue::JsonDocKey { out, .. }
+        | Rvalue::JsonDocElems { out, .. }
+        | Rvalue::BytesAsStr { out, .. }
+        | Rvalue::FsReadFileView { out, .. }
+        | Rvalue::FsReadBytesView { out, .. }
+        | Rvalue::HttpRespHeader { out, .. }
+        | Rvalue::HttpReadStreamHeader { out, .. }
+        | Rvalue::HttpCtxHeader { out, .. } => vec![(*out, Shared)],
+        Rvalue::JsonScanNext { cursor, row, .. } => {
+            vec![(*cursor, Owned), (*row, Shared)]
+        }
+        Rvalue::HttpSseStreamNext {
+            present,
+            retry_present,
+            retry_ms,
+            event,
+            data,
+            last_event_id,
+            ..
+        } => vec![
+            (*present, Owned),
+            (*retry_present, Owned),
+            (*retry_ms, Owned),
+            (*event, Shared),
+            (*data, Shared),
+            (*last_event_id, Shared),
+        ],
+        Rvalue::CryptoArgon2(args) => owned(args.out),
+        Rvalue::CryptoPublicKeyFromJwk(args) => owned(args.out),
+        Rvalue::CryptoVerify(args) => owned(args.out),
+        Rvalue::JsonEncodeBounded { out, .. }
+        | Rvalue::JsonOwnedDecode { out, .. }
+        | Rvalue::JsonDecodeArray { out, .. }
+        | Rvalue::JsonDecodeScalar { out, .. }
+        | Rvalue::JsonDocAsScalar { out, .. }
+        | Rvalue::FsReadFile { out, .. }
+        | Rvalue::ReaderOpen { out, .. }
+        | Rvalue::ReaderOpenBeneath { out, .. }
+        | Rvalue::WriterCreate { out, .. }
+        | Rvalue::WriterCreateExclusive { out, .. }
+        | Rvalue::WriterCreateExclusiveBeneath { out, .. }
+        | Rvalue::CodecEncoderNew { out, .. }
+        | Rvalue::FrameInnerJoin { out, .. }
+        | Rvalue::FileCreateRw { out, .. }
+        | Rvalue::FileOpenRw { out, .. }
+        | Rvalue::FsReadDir { out, .. }
+        | Rvalue::DnsResolve { out, .. }
+        | Rvalue::TcpConnect { out, .. }
+        | Rvalue::TcpListen { out, .. }
+        | Rvalue::TcpAccept { out, .. }
+        | Rvalue::UdpBind { out, .. }
+        | Rvalue::ProcessSpawn { out, .. }
+        | Rvalue::EnvGet { out, .. }
+        | Rvalue::RegexCompile { out, .. }
+        | Rvalue::RegexFind { out, .. }
+        | Rvalue::RegexFindAll { out, .. }
+        | Rvalue::RegexSplit { out, .. }
+        | Rvalue::RegexCaptures { out, .. }
+        | Rvalue::CapturesGroup { out, .. }
+        | Rvalue::EncodingDecode { out, .. }
+        | Rvalue::CompressCompress { out, .. }
+        | Rvalue::CompressDecompress { out, .. }
+        | Rvalue::CryptoHkdf { out, .. }
+        | Rvalue::CryptoAead { out, .. }
+        | Rvalue::CryptoPrivateKeyFromPem { out, .. }
+        | Rvalue::CryptoPublicKeyFromPem { out, .. }
+        | Rvalue::CryptoSign { out, .. }
+        | Rvalue::RandSeed { out, .. }
+        | Rvalue::CliParse { out, .. }
+        | Rvalue::CommandRun { out, .. }
+        | Rvalue::CommandRunBytes { out, .. }
+        | Rvalue::HttpParse { out, .. }
+        | Rvalue::HttpClientGet { out, .. }
+        | Rvalue::HttpClientPost { out, .. }
+        | Rvalue::HttpClientRequest { out, .. }
+        | Rvalue::HttpClientRequestStream { out, .. }
+        | Rvalue::HttpReadStreamRead { out, .. }
+        | Rvalue::HttpGetMany { out, .. }
+        | Rvalue::HttpServe { out, .. }
+        | Rvalue::HttpAccept { out, .. }
+        | Rvalue::HttpRespondStream { out, .. }
+        | Rvalue::HttpRespondUpgrade { out, .. } => owned(*out),
+        _ => Vec::new(),
+    }
+}
+
+fn xml_out_producer_result_ty(rvalue: &Rvalue) -> Option<Ty> {
+    if xml_written_slots(rvalue).is_empty() {
+        return None;
+    }
+    Some(match rvalue {
+        Rvalue::JsonDocGet { .. }
+        | Rvalue::JsonDocAt { .. }
+        | Rvalue::JsonDocElems { .. }
+        | Rvalue::RandSeed { .. } => Ty::Unit,
+        _ => Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        }),
+    })
+}
+
+fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::JsonEncodeBounded { max_bytes, .. } => vec![max_bytes],
+        Rvalue::JsonDecode { input, arena, .. }
+        | Rvalue::JsonDecodeStructArray { input, arena, .. }
+        | Rvalue::JsonDecodeUnion { input, arena, .. } => {
+            let mut operands = vec![input];
+            operands.extend(arena.iter());
+            operands
+        }
+        Rvalue::JsonOwnedDecode { input, .. }
+        | Rvalue::JsonDecodeArray { input, .. }
+        | Rvalue::JsonDecodeScalar { input, .. }
+        | Rvalue::FsReadFile { path: input, .. }
+        | Rvalue::ReaderOpen { path: input, .. }
+        | Rvalue::WriterCreate { path: input, .. }
+        | Rvalue::WriterCreateExclusive { path: input, .. }
+        | Rvalue::FileCreateRw { path: input, .. }
+        | Rvalue::FileOpenRw { path: input, .. }
+        | Rvalue::FsReadDir { path: input, .. }
+        | Rvalue::DnsResolve { host: input, .. }
+        | Rvalue::BytesAsStr { bytes: input, .. }
+        | Rvalue::EnvGet { name: input, .. }
+        | Rvalue::RegexCompile { pattern: input, .. }
+        | Rvalue::EncodingDecode { input, .. }
+        | Rvalue::CompressDecompress { data: input, .. }
+        | Rvalue::CryptoPrivateKeyFromPem { pem: input, .. }
+        | Rvalue::CryptoPublicKeyFromPem { pem: input, .. }
+        | Rvalue::CommandRun { command: input, .. }
+        | Rvalue::CommandRunBytes { command: input, .. }
+        | Rvalue::HttpParse { data: input, .. }
+        | Rvalue::HttpAccept { server: input, .. } => vec![input],
+        Rvalue::JsonDecodeSoa { input, arena, .. }
+        | Rvalue::JsonDoc { input, arena, .. }
+        | Rvalue::FsReadFileView {
+            path: input, arena, ..
+        }
+        | Rvalue::FsReadBytesView {
+            path: input, arena, ..
+        } => vec![input, arena],
+        Rvalue::CsvDecode {
+            input,
+            arena,
+            options,
+            ..
+        } => vec![input, arena, options],
+        Rvalue::JsonDocGet { doc, key, .. } => vec![doc, key],
+        Rvalue::JsonDocAt { doc, index, .. } | Rvalue::JsonDocKey { doc, index, .. } => {
+            vec![doc, index]
+        }
+        Rvalue::JsonDocAsStr { doc, .. } | Rvalue::JsonDocAsScalar { doc, .. } => vec![doc],
+        Rvalue::JsonDocElems { doc, arena, .. } => vec![doc, arena],
+        Rvalue::JsonScanNext { scanner, .. } => vec![scanner],
+        Rvalue::ReaderOpenBeneath { root, relative, .. }
+        | Rvalue::WriterCreateExclusiveBeneath { root, relative, .. } => vec![root, relative],
+        Rvalue::CodecEncoderNew { rows, .. } => vec![rows],
+        Rvalue::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            ..
+        } => vec![left, right, max_pairs],
+        Rvalue::TcpConnect {
+            host,
+            port,
+            timeout_ns,
+            ..
+        } => vec![host, port, timeout_ns],
+        Rvalue::TcpListen { host, port, .. }
+        | Rvalue::UdpBind { host, port, .. } => vec![host, port],
+        Rvalue::TcpAccept { listener, .. } => vec![listener],
+        Rvalue::ProcessSpawn { cmd, args, .. } | Rvalue::CliParse { cmd, args, .. } => {
+            vec![cmd, args]
+        }
+        Rvalue::RegexFind {
+            regex,
+            text,
+            start,
+            ..
+        } => vec![regex, text, start],
+        Rvalue::RegexFindAll { regex, text, .. }
+        | Rvalue::RegexSplit { regex, text, .. }
+        | Rvalue::RegexCaptures { regex, text, .. } => vec![regex, text],
+        Rvalue::CapturesGroup { caps, index, .. } => vec![caps, index],
+        Rvalue::CompressCompress { data, level, .. } => vec![data, level],
+        Rvalue::CryptoHkdf {
+            salt,
+            ikm,
+            info,
+            len,
+            ..
+        } => vec![salt, ikm, info, len],
+        Rvalue::CryptoAead {
+            key,
+            nonce,
+            input,
+            aad,
+            ..
+        } => vec![key, nonce, input, aad],
+        Rvalue::CryptoArgon2(args) => vec![
+            &args.password,
+            &args.salt,
+            &args.m_cost,
+            &args.t_cost,
+            &args.parallelism,
+            &args.len,
+        ],
+        Rvalue::CryptoPublicKeyFromJwk(args) => {
+            let mut operands = vec![&args.first];
+            operands.extend(args.second.iter());
+            operands
+        }
+        Rvalue::CryptoVerify(args) => vec![&args.key, &args.message, &args.signature],
+        Rvalue::CryptoSign { key, message, .. } => vec![key, message],
+        Rvalue::RandSeed { seed, .. } => seed.iter().collect(),
+        Rvalue::HttpRespHeader { resp, name, .. } => vec![resp, name],
+        Rvalue::HttpClientGet { client, url, .. } => vec![client, url],
+        Rvalue::HttpClientPost {
+            client,
+            url,
+            body,
+            ..
+        } => vec![client, url, body],
+        Rvalue::HttpClientRequest { client, req, .. }
+        | Rvalue::HttpClientRequestStream { client, req, .. } => vec![client, req],
+        Rvalue::HttpReadStreamHeader { stream, name, .. } => vec![stream, name],
+        Rvalue::HttpReadStreamRead { stream, buffer, .. }
+        | Rvalue::HttpSseStreamNext { stream, buffer, .. } => vec![stream, buffer],
+        Rvalue::HttpGetMany {
+            client,
+            urls,
+            max_concurrency,
+            ..
+        } => vec![client, urls, max_concurrency],
+        Rvalue::HttpServe { host, port, .. } => vec![host, port],
+        Rvalue::HttpCtxHeader { ctx, name, .. } => vec![ctx, name],
+        Rvalue::HttpRespondStream { ctx, rb, .. }
+        | Rvalue::HttpRespondUpgrade { ctx, rb, .. } => vec![ctx, rb],
+        _ => Vec::new(),
+    }
+}
+
+fn xml_array_builder_output(builder: Ty) -> Option<Ty> {
+    Some(match builder {
+        Ty::ArrayBuilder(Scalar::Struct(id)) => Ty::DynStructArray(id, Layout::Aos),
+        Ty::ArrayBuilder(element) => Ty::DynArray(element),
+        Ty::VecArrayBuilder(element, lanes) => Ty::DynVecArray(element, lanes),
+        Ty::MaskArrayBuilder(element, lanes) => Ty::DynMaskArray(element, lanes),
+        Ty::FixedArrayBuilder(element, length) => Ty::DynFixedArray(element, length),
+        Ty::FixedStructArrayBuilder(id, length) => Ty::DynFixedStructArray(id, length),
+        _ => return None,
+    })
 }
 
 fn assert_xml_stmt_variant_classified(statement: &Stmt) {
@@ -5155,6 +5601,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
     ) {
         let source = self.check_source(operand, expected);
         Self::add_required_source(equation, source, OperandRequirement::READ);
+    }
+
+    fn check_whole_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        let Some(leaves) = xml_owned_leaf_paths(self.graph.program, expected) else {
+            equation.invalid = true;
+            return;
+        };
+        if leaves.is_empty() {
+            self.check_operand(equation, operand, expected);
+            return;
+        }
+        for (selected, path) in leaves {
+            let source = self.source(operand, selected, path);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
     }
 
     fn check_template_piece(
@@ -5354,10 +5820,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
+        let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
         if xml_producer_variant_class(&definition) == XmlProducerVariantClass::Irrelevant {
-            if path.is_empty()
-                && xml_owned_leaf_paths(self.graph.program, result_ty)
-                    .is_some_and(|leaves| leaves.is_empty())
+            if xml_owned_leaf_paths(self.graph.program, result_ty)
+                .is_some_and(|leaves| leaves.is_empty())
             {
                 // The complete rvalue validator owns this variant's operand and option equation.
                 // This graph may treat it as a readable leaf only after the actual result type is
@@ -5370,10 +5836,113 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         match definition {
             Rvalue::Use(operand) => {
-                if xml_operand_base_ty(self.graph.function, &operand) != Some(result_ty) {
+                let Some(source_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(self.graph.program, source_ty, result_ty)
+                    && !xml_ty_is_view_retype(source_ty, result_ty)
+                {
+                    equation.invalid = true;
+                } else if path.is_empty() {
+                    self.add_operand(&mut equation, &operand, source_ty, Vec::new());
+                } else {
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, source_ty, &path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(&mut equation, &operand, source_selected, path);
+                    }
+                }
+            }
+            Rvalue::ResourceViewFromRaw {
+                owner,
+                ptr,
+                len,
+                resource,
+                view,
+                allow_null_if_empty,
+                check_nonnegative_len,
+                check_alignment,
+                check_utf8,
+            } => {
+                let expected = match view {
+                    hir::ResourceViewKind::StrUtf8 => Some((
+                        Ty::Option(Scalar::Str),
+                        Ty::Str,
+                        1,
+                        true,
+                    )),
+                    hir::ResourceViewKind::Slice(scalar) => {
+                        let bits = match scalar {
+                            Scalar::Int(integer) => integer.bits,
+                            Scalar::Float(float) => float.bits,
+                            _ => {
+                                equation.invalid = true;
+                                return equation;
+                            }
+                        };
+                        align_sema::scalar_to_prim(scalar).map(|primitive| {
+                            let payload = Ty::Slice(align_sema::prim_to_scalar(primitive));
+                            (
+                                Ty::Option(Scalar::Slice(primitive)),
+                                payload,
+                                u32::from(bits) / 8,
+                                false,
+                            )
+                        })
+                    }
+                };
+                let Some((expected_result, payload_ty, alignment, utf8)) = expected else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let path_valid = path.is_empty()
+                    || path.as_slice() == [XmlAccessPathSegment::OptionSome]
+                        && selected_ty == payload_ty;
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    result_ty,
+                    expected_result,
+                ) || !path_valid
+                    || self
+                        .graph
+                        .program
+                        .resources
+                        .get(resource as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, &owner)
+                        != Some(Ty::ResourceRef(resource))
+                    || xml_operand_base_ty(self.graph.function, &ptr) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                    || !allow_null_if_empty
+                    || !check_nonnegative_len
+                    || check_alignment != alignment
+                    || check_utf8 != utf8
+                {
                     equation.invalid = true;
                 } else {
-                    self.add_operand(&mut equation, &operand, selected_ty, path);
+                    self.check_operand(
+                        &mut equation,
+                        &owner,
+                        Ty::ResourceRef(resource),
+                    );
+                    self.check_operand(&mut equation, &ptr, Ty::Raw);
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
             Rvalue::Load(slot) => {
@@ -5385,6 +5954,52 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         self.queue(XmlAccessNode::Slot(slot, path)),
                     );
                 }
+            }
+            Rvalue::SliceIndex(source, index)
+            | Rvalue::SliceIndexNoalias {
+                slice: source,
+                index,
+                ..
+            } => {
+                let Some(source_ty) = xml_operand_base_ty(self.graph.function, &source) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(path);
+                let Some(source_selected) =
+                    xml_selected_ty(self.graph.program, source_ty, &source_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let selection_matches = {
+                    source_selected == selected_ty
+                        || (source_selected == Ty::String && selected_ty == Ty::Str)
+                };
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if !slice_index_result_matches(
+                    self.graph.program,
+                    source_ty,
+                    result_ty,
+                    slice_index_noalias,
+                ) || !selection_matches
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_whole_operand(&mut equation, &source, source_ty);
+                self.check_operand(&mut equation, &index, i64_ty);
+                self.add_operand(
+                    &mut equation,
+                    &source,
+                    source_selected,
+                    source_path,
+                );
             }
             Rvalue::Field(slot, fields) => {
                 let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
@@ -5425,32 +6040,41 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
+                let operand_tys = elems
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>();
                 if result_ty != Ty::Tuple(tuple_id)
                     || elems.len() != tuple.elems.len()
-                    || elems.iter().zip(&tuple.elems).any(|(operand, expected)| {
-                        xml_operand_base_ty(self.graph.function, operand)
-                            != Some(scalar_to_ty(*expected))
+                    || operand_tys.as_ref().is_none_or(|actual| {
+                        actual.iter().zip(&tuple.elems).any(|(actual, expected)| {
+                            !xml_ty_matches_tagged_body(
+                                self.graph.program,
+                                *actual,
+                                scalar_to_ty(*expected),
+                            )
+                        })
                     })
                 {
                     equation.invalid = true;
                     return equation;
                 }
-                for (operand, expected) in elems.iter().zip(&tuple.elems) {
-                    self.check_operand(
-                        &mut equation,
-                        operand,
-                        scalar_to_ty(*expected),
-                    );
+                let Some(operand_tys) = operand_tys else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                for (operand, actual) in elems.iter().zip(&operand_tys) {
+                    self.check_operand(&mut equation, operand, *actual);
                 }
                 if path.is_empty() {
                     if elems.is_empty() {
                         equation.seed = Some(XmlAccessProvenance::Owned);
                     } else {
-                        for (operand, expected) in elems.iter().zip(&tuple.elems) {
+                        for (operand, actual) in elems.iter().zip(&operand_tys) {
                             self.add_operand(
                                 &mut equation,
                                 operand,
-                                scalar_to_ty(*expected),
+                                *actual,
                                 Vec::new(),
                             );
                         }
@@ -5466,16 +6090,30 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let Some(payload_ty) = tuple
-                    .elems
-                    .get(*index as usize)
-                    .copied()
-                    .map(scalar_to_ty)
+                let Some(actual) = operand_tys.get(*index as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual, rest)
                 else {
                     equation.invalid = true;
                     return equation;
                 };
-                self.add_operand(&mut equation, operand, payload_ty, rest.to_vec());
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
             }
             Rvalue::TupleIndex { tuple, index } => {
                 let Some(tuple_ty) = xml_operand_base_ty(self.graph.function, &tuple) else {
@@ -5498,12 +6136,31 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if result_ty != payload_ty {
+                if !xml_ty_matches_tagged_body(self.graph.program, result_ty, payload_ty) {
                     equation.invalid = true;
                 } else {
                     let mut selected_path = vec![XmlAccessPathSegment::TupleElement(index)];
                     selected_path.extend(path);
-                    self.add_operand(&mut equation, &tuple, selected_ty, selected_path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, tuple_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &tuple,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
                 }
             }
             Rvalue::MakeEnum {
@@ -5521,32 +6178,54 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
+                let operand_tys = payload
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>();
                 if result_ty != Ty::Enum(enum_id)
                     || payload.len() != definition.payload.len()
-                    || payload.iter().zip(&definition.payload).any(|(operand, expected)| {
-                        xml_operand_base_ty(self.graph.function, operand)
-                            != Some(scalar_to_ty(*expected))
+                    || operand_tys.as_ref().is_none_or(|actual| {
+                        actual
+                            .iter()
+                            .zip(&definition.payload)
+                            .any(|(actual, expected)| {
+                                !xml_ty_matches_tagged_body(
+                                    self.graph.program,
+                                    *actual,
+                                    scalar_to_ty(*expected),
+                                )
+                            })
                     })
                 {
                     equation.invalid = true;
                     return equation;
                 }
-                for (operand, expected) in payload.iter().zip(&definition.payload) {
-                    self.check_operand(
-                        &mut equation,
-                        operand,
-                        scalar_to_ty(*expected),
-                    );
+                let Some(operand_tys) = operand_tys else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if let Some(XmlAccessPathSegment::EnumPayload {
+                    enum_id: path_enum,
+                    variant: path_variant,
+                    ..
+                }) = path.first()
+                    && (*path_enum != enum_id || *path_variant != variant)
+                {
+                    equation.absent = true;
+                    return equation;
+                }
+                for (operand, actual) in payload.iter().zip(&operand_tys) {
+                    self.check_operand(&mut equation, operand, *actual);
                 }
                 if path.is_empty() {
                     if payload.is_empty() {
                         equation.seed = Some(XmlAccessProvenance::Owned);
                     } else {
-                        for (operand, expected) in payload.iter().zip(&definition.payload) {
+                        for (operand, actual) in payload.iter().zip(&operand_tys) {
                             self.add_operand(
                                 &mut equation,
                                 operand,
-                                scalar_to_ty(*expected),
+                                *actual,
                                 Vec::new(),
                             );
                         }
@@ -5563,23 +6242,37 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 if *path_enum != enum_id || *path_variant != variant {
-                    equation.absent = true;
+                    equation.invalid = true;
                     return equation;
                 }
                 let Some(operand) = payload.get(*slot as usize) else {
                     equation.invalid = true;
                     return equation;
                 };
-                let Some(payload_ty) = definition
-                    .payload
-                    .get(*slot as usize)
-                    .copied()
-                    .map(scalar_to_ty)
+                let Some(actual) = operand_tys.get(*slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual, rest)
                 else {
                     equation.invalid = true;
                     return equation;
                 };
-                self.add_operand(&mut equation, operand, payload_ty, rest.to_vec());
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
             }
             Rvalue::EnumPayload {
                 enum_id,
@@ -5601,7 +6294,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 if xml_operand_base_ty(self.graph.function, &operand) != Some(Ty::Enum(enum_id))
-                    || result_ty != payload_ty
+                    || !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        result_ty,
+                        payload_ty,
+                    )
                 {
                     equation.invalid = true;
                 } else {
@@ -5612,7 +6309,28 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         slot,
                     }];
                     selected_path.extend(path);
-                    self.add_operand(&mut equation, &operand, selected_ty, selected_path);
+                    let Some(source_selected) = xml_selected_ty(
+                        self.graph.program,
+                        Ty::Enum(enum_id),
+                        &selected_path,
+                    ) else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
                 }
             }
             Rvalue::OptionSome(operand) => {
@@ -5620,20 +6338,54 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if xml_operand_base_ty(self.graph.function, &operand) != Some(payload_ty) {
+                let Some(actual_payload_ty) =
+                    xml_operand_base_ty(self.graph.function, &operand)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_payload_ty,
+                    payload_ty,
+                ) {
                     equation.invalid = true;
                     return equation;
                 }
-                self.check_operand(&mut equation, &operand, payload_ty);
+                self.check_operand(&mut equation, &operand, actual_payload_ty);
                 if path.is_empty() {
-                    self.add_operand(&mut equation, &operand, payload_ty, Vec::new());
+                    self.add_operand(
+                        &mut equation,
+                        &operand,
+                        actual_payload_ty,
+                        Vec::new(),
+                    );
                     return equation;
                 }
                 let Some((XmlAccessPathSegment::OptionSome, rest)) = path.split_first() else {
                     equation.invalid = true;
                     return equation;
                 };
-                self.add_operand(&mut equation, &operand, payload_ty, rest.to_vec());
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual_payload_ty, rest)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        &operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
             }
             Rvalue::OptionNone => {
                 if xml_option_payload(self.graph.program, result_ty).is_none() {
@@ -5651,13 +6403,36 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if xml_option_payload(self.graph.program, option_ty) != Some(result_ty) {
+                let payload_matches = xml_option_payload(self.graph.program, option_ty)
+                    .is_some_and(|payload| {
+                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                    });
+                if !payload_matches {
                     equation.invalid = true;
                 } else {
                     equation.require_present = true;
                     let mut selected_path = vec![XmlAccessPathSegment::OptionSome];
                     selected_path.extend(path);
-                    self.add_operand(&mut equation, &operand, selected_ty, selected_path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, option_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        selected_ty,
+                        source_selected,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
                 }
             }
             Rvalue::OptionIsSome(operand) => {
@@ -5688,18 +6463,40 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if xml_operand_base_ty(self.graph.function, operand) != Some(payload_ty) {
+                let Some(actual_payload_ty) =
+                    xml_operand_base_ty(self.graph.function, operand)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_payload_ty,
+                    payload_ty,
+                ) {
                     equation.invalid = true;
                     return equation;
                 }
-                self.check_operand(&mut equation, operand, payload_ty);
                 let expected_segment = if ok {
                     XmlAccessPathSegment::ResultOk
                 } else {
                     XmlAccessPathSegment::ResultErr
                 };
+                if let Some(segment) = path.first()
+                    && matches!(segment, XmlAccessPathSegment::ResultOk | XmlAccessPathSegment::ResultErr)
+                    && segment != &expected_segment
+                {
+                    equation.absent = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, operand, actual_payload_ty);
                 if path.is_empty() {
-                    self.add_operand(&mut equation, operand, payload_ty, Vec::new());
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_payload_ty,
+                        Vec::new(),
+                    );
                     return equation;
                 }
                 let Some((segment, rest)) = path.split_first() else {
@@ -5707,9 +6504,28 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 if segment != &expected_segment {
-                    equation.absent = true;
+                    equation.invalid = true;
                 } else {
-                    self.add_operand(&mut equation, operand, payload_ty, rest.to_vec());
+                    let Some(actual_selected) =
+                        xml_selected_ty(self.graph.program, actual_payload_ty, rest)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        actual_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            operand,
+                            actual_selected,
+                            rest.to_vec(),
+                        );
+                    }
                 }
             }
             Rvalue::ResultUnwrapOk(ref operand) | Rvalue::ResultUnwrapErr(ref operand) => {
@@ -5718,7 +6534,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if xml_result_payload(self.graph.program, wrapper_ty, ok) != Some(result_ty) {
+                let payload_matches = xml_result_payload(self.graph.program, wrapper_ty, ok)
+                    .is_some_and(|payload| {
+                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                    });
+                if !payload_matches {
                     equation.invalid = true;
                 } else {
                     equation.require_present = true;
@@ -5728,7 +6548,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         XmlAccessPathSegment::ResultErr
                     }];
                     selected_path.extend(path);
-                    self.add_operand(&mut equation, operand, selected_ty, selected_path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, wrapper_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        selected_ty,
+                        source_selected,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
                 }
             }
             Rvalue::ResultIsOk(operand) => {
@@ -5804,7 +6643,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let Some(target_facts) = xml_direct_call_facts(self.graph.program, &target) else {
+                let Some(target_facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &target,
+                    self.graph.local_contracts,
+                ) else {
                     equation.invalid = true;
                     return equation;
                 };
@@ -5845,17 +6688,29 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let explicit_params = target.params[..explicit]
+                let Some(explicit_param_slots) = target.params.get(..explicit) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target_capture_slots) = target.params.get(explicit..) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(explicit_modes) = target.param_modes.get(..explicit) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let explicit_params = explicit_param_slots
                     .iter()
                     .map(|slot| target.slots.get(*slot as usize).copied())
                     .collect::<Option<Vec<_>>>();
-                let target_capture_tys = target.params[explicit..]
+                let target_capture_tys = target_capture_slots
                     .iter()
                     .map(|slot| target.slots.get(*slot as usize).copied())
                     .collect::<Option<Vec<_>>>();
                 let facts = explicit_params.map(|params| XmlCallFacts {
                     params,
-                    modes: target.param_modes[..explicit].to_vec(),
+                    modes: explicit_modes.to_vec(),
                     ret: target.ret,
                     borrow: target.return_borrow.clone(),
                     region: target.return_region.clone(),
@@ -5879,29 +6734,112 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
-            Rvalue::Call(DirectCall::Program(target), args) => {
-                let Some(facts) = xml_direct_call_facts(self.graph.program, &target) else {
+            Rvalue::Call(DirectCall::Runtime(key), args) => {
+                let Some(argument_types) = args
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>()
+                else {
                     equation.invalid = true;
                     return equation;
                 };
-                self.add_call_result(&mut equation, XmlCallResult {
-                    result: value,
-                    result_ty,
-                    selected_ty,
-                    args: &args,
-                    facts: &facts,
-                    cleanup: None,
-                    modes_match: direct_operands_match_modes(
+                let result_is_unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if !path.is_empty()
+                    || !result_is_unprotected
+                    || !direct_runtime_key_is_valid(
+                        key,
+                        &argument_types,
+                        result_ty,
+                        self.graph.program,
+                    )
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                for (argument, expected) in args.iter().zip(argument_types) {
+                    self.check_whole_operand(&mut equation, argument, expected);
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::Call(DirectCall::Program(target), args) => {
+                if let Some(facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &target,
+                    self.graph.local_contracts,
+                ) {
+                    self.add_call_result(&mut equation, XmlCallResult {
+                        result: value,
+                        result_ty,
+                        selected_ty,
+                        args: &args,
+                        facts: &facts,
+                        cleanup: None,
+                        modes_match: direct_operands_match_modes(
+                            &target,
+                            &args,
+                            &facts.modes,
+                            &facts.params,
+                            self.graph.program,
+                        ),
+                    });
+                    return equation;
+                }
+                let has_align_declaration = self
+                    .graph
+                    .program
+                    .fns
+                    .iter()
+                    .any(|function| function.name == target)
+                    || self
+                        .graph
+                        .program
+                        .imported_fns
+                        .iter()
+                        .any(|function| function.name == target);
+                let mut externs = self
+                    .graph
+                    .program
+                    .externs
+                    .iter()
+                    .filter(|declaration| declaration.name == target);
+                let Some(extern_) = externs.next() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let result_is_unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if has_align_declaration
+                    || externs.next().is_some()
+                    || !path.is_empty()
+                    || !result_is_unprotected
+                    || extern_.ret != result_ty
+                    || !direct_operands_match_modes(
                         &target,
                         &args,
-                        &facts.modes,
-                        &facts.params,
+                        &extern_.param_modes,
+                        &extern_.params,
                         self.graph.program,
-                    ),
-                });
+                    )
+                    || args.len() != extern_.params.len()
+                    || args.iter().zip(&extern_.params).any(|(argument, expected)| {
+                        xml_operand_base_ty(self.graph.function, argument) != Some(*expected)
+                    })
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                for (argument, expected) in args.iter().zip(&extern_.params) {
+                    self.check_whole_operand(&mut equation, argument, *expected);
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
             }
             Rvalue::CallWithCleanup(call) => {
-                let Some(facts) = xml_direct_call_facts(self.graph.program, &call.target) else {
+                let Some(facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &call.target,
+                    self.graph.local_contracts,
+                ) else {
                     equation.invalid = true;
                     return equation;
                 };
@@ -6178,6 +7116,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    self.check_whole_operand(&mut equation, &value, result_ty);
                     let source = self.source(&value, selected_ty, path);
                     Self::add_required_source(
                         &mut equation,
@@ -6186,6 +7125,45 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     );
                     self.check_operand(&mut equation, &handle, Ty::ArenaHandle);
                     equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ArrayBuilderNew { elem, region } => {
+                let element = xml_selected_ty(
+                    self.graph.program,
+                    result_ty,
+                    &[XmlAccessPathSegment::Element],
+                );
+                let builder_shape = xml_array_builder_output(result_ty).is_some();
+                let region_valid = region.as_ref().is_none_or(|region| {
+                    xml_operand_base_ty(self.graph.function, region) == Some(Ty::ArenaHandle)
+                });
+                if !builder_shape || element != Some(elem) || !region_valid {
+                    equation.invalid = true;
+                } else {
+                    if let Some(region) = &region {
+                        self.check_operand(&mut equation, region, Ty::ArenaHandle);
+                    }
+                    equation.seed = Some(if path.is_empty() || region.is_none() {
+                        XmlAccessProvenance::Owned
+                    } else {
+                        XmlAccessProvenance::Shared
+                    });
+                }
+            }
+            Rvalue::ArrayBuilderBuild { builder } => {
+                let Some(builder_ty) = xml_operand_base_ty(self.graph.function, &builder) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if xml_array_builder_output(builder_ty) != Some(result_ty) {
+                    equation.invalid = true;
+                } else {
+                    self.check_whole_operand(&mut equation, &builder, builder_ty);
+                    if path.is_empty() {
+                        self.add_operand(&mut equation, &builder, builder_ty, Vec::new());
+                    } else {
+                        self.add_operand(&mut equation, &builder, selected_ty, path);
+                    }
                 }
             }
             Rvalue::PathJoin { a, b } => {
@@ -6607,13 +7585,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
         slot_ty: Ty,
         selected_ty: Ty,
         path: &[XmlAccessPathSegment],
-        value: ValueId,
-        rvalue: &Rvalue,
+        producer: (ValueId, &Rvalue),
     ) {
-        let i32_ty = Ty::Int(IntTy {
-            bits: 32,
-            signed: true,
-        });
+        let (value, rvalue) = producer;
         let i64_ty = Ty::Int(IntTy {
             bits: 64,
             signed: true,
@@ -6622,7 +7596,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             bits: 8,
             signed: false,
         }));
-        let result_is_status = self.graph.function.value_tys.get(value as usize) == Some(&i32_ty)
+        let expected_result = xml_out_producer_result_ty(rvalue);
+        let result_is_unique = expected_result.is_some()
+            && self.graph.function.value_tys.get(value as usize) == expected_result.as_ref()
             && self.graph.primary_definitions.get(value as usize) == Some(&1)
             && self.graph.auxiliary_definitions.get(value as usize) == Some(&0)
             && !self
@@ -6638,7 +7614,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .is_some_and(|definition| {
                     definition.is_some_and(|candidate| std::ptr::eq(candidate, rvalue))
                 });
-        if !result_is_status || !path.is_empty() || selected_ty != slot_ty {
+        let Some(recorded_access) = xml_written_slots(rvalue)
+            .into_iter()
+            .find_map(|(written, access)| (written == slot).then_some(access))
+        else {
+            equation.invalid = true;
+            return;
+        };
+        if !result_is_unique
+            || xml_selected_ty(self.graph.program, slot_ty, path) != Some(selected_ty)
+        {
             equation.invalid = true;
             return;
         }
@@ -6663,6 +7648,227 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 (*out, XmlAccessProvenance::Owned)
             }
+            Rvalue::JsonDecode {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Struct(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonOwnedDecode { plan, input, out } => {
+                let canonical = align_sema::owned_json_graph_plan_v2(
+                        &self.graph.program.structs,
+                        plan.root,
+                    )
+                    .is_ok_and(|canonical| canonical == *plan);
+                if slot_ty != Ty::Struct(plan.root)
+                    || !canonical
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeArray { elem, input, out } => {
+                let Some(scalar) = align_sema::ty_to_scalar(*elem)
+                    .filter(|_| matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool))
+                else {
+                    equation.invalid = true;
+                    return;
+                };
+                if slot_ty != Ty::DynArray(scalar)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeScalar { scalar, input, out } => {
+                if slot_ty != *scalar
+                    || !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeStructArray {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::DynStructArray(*struct_id, align_sema::Layout::Aos)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonDecodeSoa {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Soa(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                self.check_operand(equation, arena, Ty::ArenaHandle);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::CsvDecode {
+                struct_id,
+                options_struct_id,
+                input,
+                arena,
+                options,
+                out,
+            } => {
+                if slot_ty != Ty::Soa(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*options_struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    || xml_operand_base_ty(self.graph.function, options)
+                        != Some(Ty::Struct(*options_struct_id))
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                self.check_operand(equation, arena, Ty::ArenaHandle);
+                self.check_whole_operand(equation, options, Ty::Struct(*options_struct_id));
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::JsonDecodeUnion {
+                enum_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Enum(*enum_id)
+                    || self.graph.program.enums.get(*enum_id as usize).is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonScanNext {
+                scanner,
+                struct_id,
+                cursor,
+                row,
+            } => {
+                if slot != *row
+                    || slot_ty != Ty::Struct(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, scanner)
+                        != Some(Ty::JsonScanner(*struct_id))
+                    || self.graph.function.slots.get(*cursor as usize) != Some(&i64_ty)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, scanner, Ty::JsonScanner(*struct_id));
+                (*row, XmlAccessProvenance::Shared)
+            }
             Rvalue::FsReadFile { path: input, out } => {
                 if slot_ty != Ty::String
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
@@ -6681,6 +7887,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return;
                 }
                 self.check_operand(equation, name, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::FsReadDir { path: input, out } | Rvalue::DnsResolve { host: input, out } => {
+                if slot_ty != Ty::DynArray(Scalar::String)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonDocAsStr { doc, out } => {
@@ -6769,11 +7985,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 (*out, XmlAccessProvenance::Shared)
             }
             _ => {
-                equation.invalid = true;
-                return;
+                for operand in xml_out_producer_operands(rvalue) {
+                    let Some(expected) = xml_operand_base_ty(self.graph.function, operand) else {
+                        equation.invalid = true;
+                        continue;
+                    };
+                    self.check_whole_operand(equation, operand, expected);
+                }
+                (slot, recorded_access)
             }
         };
-        if expected_out != slot {
+        if expected_out != slot || access != recorded_access {
             equation.invalid = true;
         } else {
             equation.seed = merge_xml_access(equation.seed, access);
@@ -6818,14 +8040,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 slot_ty,
                 selected_ty,
                 &path,
-                value,
-                producer,
+                (value, producer),
             );
         }
         for operand in root_stores {
             if xml_operand_base_ty(self.graph.function, &operand) != Some(slot_ty) {
                 equation.invalid = true;
             } else {
+                self.check_whole_operand(&mut equation, &operand, slot_ty);
                 self.add_operand(&mut equation, &operand, selected_ty, path.clone());
             }
         }
@@ -6845,6 +8067,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
+            self.check_whole_operand(&mut equation, &operand, stored_ty);
             if path.is_empty() {
                 self.add_operand(&mut equation, &operand, stored_ty, Vec::new());
             } else if path.starts_with(&stored_path) {
@@ -6967,6 +8190,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             .filter(|(node, equation)| {
                 equation.invalid
                     || !values.contains_key(*node)
+                    || values.get(*node) == Some(&XmlProducerState::Invalid)
                     || equation.checks.iter().any(|(dependency, requirement)| {
                         values
                             .get(dependency)
@@ -7108,10 +8332,16 @@ fn xml_borrowed_access(
             let Some((selected, path)) = xml_borrowed_path(graph.program, root, &place.path) else {
                 return XmlProducerState::Invalid;
             };
-            if selected != place.ty {
+            let view_retype = matches!(
+                (selected, place.ty),
+                (Ty::Array(element, _), Ty::Slice(view))
+                    | (Ty::DynArray(element), Ty::Slice(view))
+                    if element == view
+            );
+            if selected != place.ty && !view_retype {
                 return XmlProducerState::Invalid;
             }
-            (place.slot, path, place.ty)
+            (place.slot, path, selected)
         }
         Operand::BorrowedElementPlace(place) => {
             return xml_borrowed_access(
@@ -7177,10 +8407,205 @@ fn xml_borrowed_access(
     }
 }
 
+fn xml_borrowed_descriptor_path_valid(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+) -> bool {
+    let (place, element_base) = match operand {
+        Operand::BorrowedPlace(place) => (place.as_ref(), false),
+        Operand::BorrowedElementPlace(place) => (&place.base, true),
+        Operand::BorrowedFixedElementPlace(place) => {
+            return graph.function.slots.get(place.base as usize).is_some();
+        }
+        _ => return false,
+    };
+    let path = if element_base
+        && matches!(place.path.first(), Some(hir::BorrowedPathSegment::RootSlot))
+    {
+        let Some(path) = place.path.get(1..) else {
+            return false;
+        };
+        path
+    } else {
+        &place.path
+    };
+    let Some((selected, _)) = graph
+        .function
+        .slots
+        .get(place.slot as usize)
+        .copied()
+        .and_then(|root| xml_borrowed_path(graph.program, root, path))
+    else {
+        return false;
+    };
+    // A traversable projection is canonical enough to defer its final retype check to callable
+    // preflight, which owns the precise borrowed-place diagnostic. Root descriptors still need an
+    // exact type here so a relabeled whole value cannot bypass producer authentication.
+    !path.is_empty()
+        || selected == place.ty
+        || (!element_base
+            && matches!(
+                (selected, place.ty),
+                (Ty::Array(element, _), Ty::Slice(view))
+                    | (Ty::DynArray(element), Ty::Slice(view))
+                    if element == view
+            ))
+}
+
+fn xml_return_cleanup_companion(
+    graph: &ValidatedProducerGraph<'_>,
+    returned: &Operand,
+) -> Option<Option<ValueId>> {
+    let Operand::Value(initial) = returned else {
+        return Some(None);
+    };
+    let mut value = *initial;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(value) || graph.duplicate_values.get(value as usize) != Some(&false) {
+            return None;
+        }
+        let definition = graph.value_definitions.get(value as usize)?.as_ref()?;
+        match definition {
+            Rvalue::CallWithCleanup(call) => return Some(Some(call.cleanup)),
+            Rvalue::CallIndirectWithCleanup(call) => return Some(Some(call.cleanup)),
+            Rvalue::XmlParse { cleanup, .. } => return Some(Some(*cleanup)),
+            Rvalue::Use(Operand::Value(next)) => value = *next,
+            _ => return Some(None),
+        }
+    }
+}
+
+fn xml_local_call_components(program: &Program) -> Result<Vec<Vec<usize>>, CodegenError> {
+    let mut indices = HashMap::new();
+    for (index, function) in program.fns.iter().enumerate() {
+        if indices.insert(function.name.clone(), index).is_some() {
+            return Err(CodegenError::Lowering(
+                "MIR producer certification contains duplicate local function names".to_owned(),
+            ));
+        }
+    }
+
+    let mut edges = vec![Vec::<usize>::new(); program.fns.len()];
+    for (source, function) in program.fns.iter().enumerate() {
+        for rvalue in function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|statement| match statement {
+                Stmt::Let(_, rvalue) => Some(rvalue),
+                _ => None,
+            })
+        {
+            let target = match rvalue {
+                Rvalue::Call(DirectCall::Program(target), _) | Rvalue::FnAddr { target, .. } => {
+                    Some(target)
+                }
+                Rvalue::CallWithCleanup(call) => Some(&call.target),
+                Rvalue::Closure { lifted, .. } => Some(lifted),
+                _ => None,
+            };
+            if let Some(target) = target.and_then(|target| indices.get(target).copied()) {
+                edges[source].push(target);
+            }
+        }
+        edges[source].sort_unstable();
+        edges[source].dedup();
+    }
+
+    // Iterative Kosaraju keeps a malformed enormous call graph from consuming the native stack.
+    let mut visited = vec![false; edges.len()];
+    let mut finish = Vec::with_capacity(edges.len());
+    for start in 0..edges.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut pending = vec![(start, 0usize)];
+        while let Some((node, next)) = pending.last_mut() {
+            if let Some(target) = edges[*node].get(*next).copied() {
+                *next += 1;
+                if !visited[target] {
+                    visited[target] = true;
+                    pending.push((target, 0));
+                }
+            } else {
+                finish.push(*node);
+                pending.pop();
+            }
+        }
+    }
+    let mut reverse = vec![Vec::<usize>::new(); edges.len()];
+    for (source, targets) in edges.iter().enumerate() {
+        for target in targets {
+            reverse[*target].push(source);
+        }
+    }
+    visited.fill(false);
+    let mut components = Vec::new();
+    for start in finish.into_iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut component = Vec::new();
+        let mut pending = vec![start];
+        while let Some(node) = pending.pop() {
+            component.push(node);
+            for source in &reverse[node] {
+                if !visited[*source] {
+                    visited[*source] = true;
+                    pending.push(*source);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+
+    let mut owner = vec![usize::MAX; edges.len()];
+    for (component, members) in components.iter().enumerate() {
+        for member in members {
+            owner[*member] = component;
+        }
+    }
+    let mut dependencies = vec![HashSet::<usize>::new(); components.len()];
+    for (source, targets) in edges.iter().enumerate() {
+        for target in targets {
+            if owner[source] != owner[*target] {
+                dependencies[owner[source]].insert(owner[*target]);
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(components.len());
+    let mut complete = HashSet::new();
+    while ordered.len() != components.len() {
+        let Some(next) = (0..components.len()).find(|candidate| {
+            !complete.contains(candidate)
+                && dependencies[*candidate]
+                    .iter()
+                    .all(|dependency| complete.contains(dependency))
+        }) else {
+            return Err(CodegenError::Lowering(
+                "MIR producer call-graph condensation is cyclic".to_owned(),
+            ));
+        };
+        complete.insert(next);
+        ordered.push(components[next].clone());
+    }
+    Ok(ordered)
+}
+
 /// Validate the complete MIR producer graph and return the exact local bodies whose declared
 /// contracts were certified together. Interface publication consumes this set; it must never infer
 /// certification from a declaration alone.
 pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, CodegenError> {
+    validate_tagged_program(program)?;
+    validate_resource_program(program)?;
+    validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
+    let declarations = callable_declarations(program)?;
+    callable_preflight(program, &[], declarations, ModuleScope::Whole)?;
     validate_resource_rvalues(program)?;
     let certified = program
         .fns
@@ -7197,6 +8622,26 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Code
 
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     validate_template_html_mir_signatures(program)?;
+    let components = xml_local_call_components(program)?;
+    let mut certified = HashSet::<ProgramCall>::new();
+    for component in components {
+        let mut provisional = certified.clone();
+        provisional.extend(
+            component
+                .iter()
+                .map(|member| program.fns[*member].name.clone()),
+        );
+        validate_resource_rvalues_component(program, &component, &provisional)?;
+        certified = provisional;
+    }
+    Ok(())
+}
+
+fn validate_resource_rvalues_component(
+    program: &Program,
+    component: &[usize],
+    local_contracts: &HashSet<ProgramCall>,
+) -> Result<(), CodegenError> {
     let xml_event_definition_valid = |event_enum: u32| {
         let Some(definition) = program.enums.get(event_enum as usize) else {
             return false;
@@ -7293,7 +8738,10 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 .collect::<Option<Vec<_>>>()
         })
     };
-    for function in &program.fns {
+    for (function_index, function) in program.fns.iter().enumerate() {
+        if component.binary_search(&function_index).is_err() {
+            continue;
+        }
         let mut primary_definitions = vec![0u32; function.value_tys.len()];
         let mut auxiliary_definitions = vec![0u32; function.value_tys.len()];
         let mut value_definitions = vec![None; function.value_tys.len()];
@@ -7314,7 +8762,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         }
                         if let Some(definition) = value_definitions.get_mut(*value as usize) {
                             if definition.is_some() {
-                                duplicate_values[*value as usize] = true;
+                                if let Some(duplicate) =
+                                    duplicate_values.get_mut(*value as usize)
+                                {
+                                    *duplicate = true;
+                                }
                             } else {
                                 *definition = Some(rvalue);
                             }
@@ -7336,24 +8788,10 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                 *definition = Some(rvalue);
                             }
                         }
-                        let producer = match rvalue {
-                            Rvalue::JsonEncodeBounded { out, .. }
-                            | Rvalue::FsReadFile { out, .. }
-                            | Rvalue::EnvGet { out, .. }
-                            | Rvalue::JsonDocAsStr { out, .. }
-                            | Rvalue::JsonDocKey { out, .. }
-                            | Rvalue::BytesAsStr { out, .. }
-                            | Rvalue::FsReadFileView { out, .. }
-                            | Rvalue::HttpRespHeader { out, .. }
-                            | Rvalue::HttpReadStreamHeader { out, .. }
-                            | Rvalue::HttpCtxHeader { out, .. } => Some(*out),
-                            _ => None,
-                        };
-                        if let Some(out) = producer
-                            && let Some(producers) =
-                                slot_stores.producers.get_mut(out as usize)
-                        {
-                            producers.push((*value, rvalue));
+                        for (out, _) in xml_written_slots(rvalue) {
+                            if let Some(producers) = slot_stores.producers.get_mut(out as usize) {
+                                producers.push((*value, rvalue));
+                            }
                         }
                     }
                     Stmt::Store(slot, operand) => {
@@ -7373,6 +8811,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
         let access_graph = ValidatedProducerGraph {
             function,
             program,
+            local_contracts,
             value_definitions: &value_definitions,
             auxiliary_value_definitions: &auxiliary_value_definitions,
             duplicate_values: &duplicate_values,
@@ -7421,12 +8860,27 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 Term::ReturnWithCleanup(returned) => {
                     (Some(&returned.0), Some(&returned.1))
                 }
-                Term::Return(None) | Term::Goto(_) | Term::Branch(..) | Term::Unreachable => {
+                Term::Return(None) => {
+                    if function.ret != Ty::Unit
+                        || function.return_cleanup != hir::ReturnCleanupAbi::None
+                    {
+                        return Err(fail(
+                            function,
+                            "producer return omitted its declared value or cleanup bit",
+                        ));
+                    }
                     (None, None)
                 }
+                Term::Goto(_) | Term::Branch(..) | Term::Unreachable => (None, None),
             };
             if let Some(returned) = returned
             {
+                if xml_operand_base_ty(function, returned) != Some(function.ret) {
+                    return Err(fail(
+                        function,
+                        "producer return operand disagrees with its declared result type",
+                    ));
+                }
                 if let Some((selected, path)) = return_leaves
                     .iter()
                     .find(|(selected, path)| !return_leaf_valid(returned, *selected, path))
@@ -7446,6 +8900,16 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         "producer return cleanup mode is not certified by its body",
                     ));
                 }
+                let companion = xml_return_cleanup_companion(&access_graph, returned)
+                    .ok_or_else(|| fail(function, "producer return cleanup source is malformed"))?;
+                if let Some(expected) = companion
+                    && !matches!(cleanup, Some(Operand::Value(actual)) if *actual == expected)
+                {
+                    return Err(fail(
+                        function,
+                        "producer return cleanup is detached from its value producer",
+                    ));
+                }
                 if cleanup.is_some_and(|cleanup| {
                     !matches!(
                         xml_access(cleanup, Ty::Bool),
@@ -7459,6 +8923,27 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     return Err(fail(
                         function,
                         "producer return cleanup operand is not certified by its body",
+                    ));
+                }
+                if return_leaves.is_empty()
+                    && align_sema::ty_is_move(
+                        function.ret,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    )
+                    && !xml_mode_requirement(
+                        program,
+                        function.ret,
+                        function.ret,
+                        align_ast::ParamMode::ByValue,
+                    )
+                    .is_satisfied_by(xml_access(returned, function.ret))
+                {
+                    return Err(fail(
+                        function,
+                        "producer return does not transfer its declared Move value",
                     ));
                 }
             }
@@ -7518,9 +9003,6 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             let Some(leaves) = xml_owned_leaf_paths(program, *expected) else {
                                 return false;
                             };
-                            if leaves.is_empty() {
-                                return true;
-                            }
                             let canonical_borrow = matches!(
                                 operand,
                                 Operand::BorrowedPlace(_)
@@ -7529,13 +9011,68 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             );
                             let borrowed_state = canonical_borrow
                                 .then(|| xml_borrowed_access(&access_graph, operand));
+                            let canonical_borrow_path = canonical_borrow
+                                && xml_borrowed_descriptor_path_valid(&access_graph, operand);
+                            let canonical_borrow_state = || {
+                                borrowed_state.map(|state| {
+                                    if canonical_borrow_path {
+                                        XmlProducerState::Present(match mode {
+                                            align_ast::ParamMode::ByValue
+                                            | align_ast::ParamMode::Borrow => {
+                                                XmlAccessProvenance::Shared
+                                            }
+                                            align_ast::ParamMode::BorrowMut => {
+                                                XmlAccessProvenance::Exclusive
+                                            }
+                                            align_ast::ParamMode::Out => {
+                                                XmlAccessProvenance::Unreadable
+                                            }
+                                        })
+                                    } else {
+                                        state
+                                    }
+                                })
+                            };
                             let canonical_shape = !matches!(mode, align_ast::ParamMode::Out)
                                 || canonical_borrow;
+                            let parameter_moves = align_sema::ty_is_move(
+                                *expected,
+                                &program.structs,
+                                &program.tuples,
+                                &program.enums,
+                                &program.tagged_types,
+                            );
+                            let by_value_shape = !matches!(mode, align_ast::ParamMode::ByValue)
+                                || !parameter_moves
+                                || matches!(operand, Operand::Value(_) | Operand::Arg(_));
+                            if leaves.is_empty() {
+                                if !parameter_moves {
+                                    // Copy-only carriers have no producer capability for this
+                                    // validator to authenticate. Callable preflight owns their
+                                    // exact Out/Borrow/BorrowMut destination and mode shape.
+                                    return true;
+                                }
+                                let state = canonical_borrow_state().unwrap_or_else(|| {
+                                    xml_operand_access(
+                                        &access_graph,
+                                        operand,
+                                        *expected,
+                                    )
+                                });
+                                return canonical_shape
+                                    && by_value_shape
+                                    && xml_mode_requirement(
+                                        program,
+                                        *expected,
+                                        *expected,
+                                        *mode,
+                                    )
+                                    .is_satisfied_by(state);
+                            }
                             canonical_shape
-                                && (!matches!(mode, align_ast::ParamMode::ByValue)
-                                    || matches!(operand, Operand::Value(_) | Operand::Arg(_)))
+                                && by_value_shape
                                 && leaves.iter().all(|(selected, path)| {
-                                    let state = borrowed_state.unwrap_or_else(|| {
+                                    let state = canonical_borrow_state().unwrap_or_else(|| {
                                         xml_operand_path_access(
                                             &access_graph,
                                             operand,
@@ -7568,32 +9105,88 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                let protected_call_boundary = |args: &[Operand]| {
+                    xml_owned_leaf_paths(program, result)
+                        .is_none_or(|leaves| !leaves.is_empty())
+                        || args.iter().any(|operand| {
+                            xml_operand_base_ty(function, operand)
+                                .and_then(|ty| xml_owned_leaf_paths(program, ty))
+                                .is_none_or(|leaves| !leaves.is_empty())
+                        })
+                };
                 let call_arguments_valid = match rvalue {
                     Rvalue::Call(DirectCall::Program(target), args) => {
-                        xml_direct_call_facts(program, target).is_none_or(|facts| {
-                            !direct_operands_match_modes(
-                                target,
-                                args,
-                                &facts.modes,
-                                &facts.params,
-                                program,
-                            ) || xml_call_arguments_valid(args, &facts.params, &facts.modes)
-                        })
+                        xml_direct_call_facts(program, target, local_contracts).map_or_else(
+                            || {
+                                let has_align_declaration = program
+                                    .fns
+                                    .iter()
+                                    .any(|function| &function.name == target)
+                                    || program
+                                        .imported_fns
+                                        .iter()
+                                        .any(|function| &function.name == target);
+                                let matching = program
+                                    .externs
+                                    .iter()
+                                    .filter(|declaration| &declaration.name == target)
+                                    .collect::<Vec<_>>();
+                                if !protected_call_boundary(args) {
+                                    true
+                                } else if !has_align_declaration
+                                    && let [declaration] = matching.as_slice()
+                                {
+                                    direct_operands_match_modes(
+                                        target,
+                                        args,
+                                        &declaration.param_modes,
+                                        &declaration.params,
+                                        program,
+                                    ) && xml_call_arguments_valid(
+                                        args,
+                                        &declaration.params,
+                                        &declaration.param_modes,
+                                    )
+                                } else {
+                                    false
+                                }
+                            },
+                            |facts| {
+                                let deferred_borrowed = args.iter().any(|operand| {
+                                    xml_borrowed_descriptor_path_valid(&access_graph, operand)
+                                });
+                                let mode_valid = deferred_borrowed || direct_operands_match_modes(
+                                    target,
+                                    args,
+                                    &facts.modes,
+                                    &facts.params,
+                                    program,
+                                );
+                                let producer_valid =
+                                    xml_call_arguments_valid(args, &facts.params, &facts.modes);
+                                mode_valid && producer_valid
+                            },
+                        )
                     }
                     Rvalue::CallWithCleanup(call) => {
-                        xml_direct_call_facts(program, &call.target).is_none_or(|facts| {
-                            !direct_operands_match_modes(
-                                &call.target,
-                                &call.args,
-                                &facts.modes,
-                                &facts.params,
-                                program,
-                            ) || xml_call_arguments_valid(
-                                &call.args,
-                                &facts.params,
-                                &facts.modes,
-                            )
-                        })
+                        xml_direct_call_facts(program, &call.target, local_contracts).map_or_else(
+                            || !protected_call_boundary(&call.args),
+                            |facts| {
+                                (call.args.iter().any(|operand| {
+                                    xml_borrowed_descriptor_path_valid(&access_graph, operand)
+                                }) || direct_operands_match_modes(
+                                    &call.target,
+                                    &call.args,
+                                    &facts.modes,
+                                    &facts.params,
+                                    program,
+                                )) && xml_call_arguments_valid(
+                                    &call.args,
+                                    &facts.params,
+                                    &facts.modes,
+                                )
+                            },
+                        )
                     }
                     Rvalue::CallIndirect {
                         callee,
@@ -7604,12 +9197,17 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         ..
                     } => {
                         indirect_call_valid(callee, param_tys, *ret_ty, signature)
-                            && (!operands_match_modes(args, &signature.param_modes, param_tys, program)
-                            || xml_call_arguments_valid(
+                            && operands_match_modes(
+                                args,
+                                &signature.param_modes,
+                                param_tys,
+                                program,
+                            )
+                            && xml_call_arguments_valid(
                                 args,
                                 param_tys,
                                 &signature.param_modes,
-                            ))
+                            )
                     }
                     Rvalue::CallIndirectWithCleanup(call) => {
                         indirect_call_valid(
@@ -7617,16 +9215,16 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             &call.param_tys,
                             call.ret_ty,
                             &call.signature,
-                        ) && (!operands_match_modes(
+                        ) && operands_match_modes(
                             &call.args,
                             &call.signature.param_modes,
                             &call.param_tys,
                             program,
-                        ) || xml_call_arguments_valid(
+                        ) && xml_call_arguments_valid(
                             &call.args,
                             &call.param_tys,
                             &call.signature.param_modes,
-                        ))
+                        )
                     }
                     _ => true,
                 };
@@ -10277,7 +11875,7 @@ fn direct_operands_match_modes(
     {
         return false;
     }
-    let Ty::Resource(resource) = types[0] else {
+    let Some(Ty::Resource(resource)) = types.first().copied() else {
         return false;
     };
     let projected = match &args[0] {
@@ -28183,7 +29781,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a same-action by-value peer must not consume the indexed root"),
-            "borrowed element array root changes between its bounds guard and call action",
+            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
     }
 
@@ -30316,6 +31914,28 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn xml_access_join_is_the_capability_intersection() {
+        use XmlAccessProvenance::{
+            Exclusive, Mixed, Owned, Shared, Unknown, Unreadable,
+        };
+
+        let cases = [
+            (Owned, Shared, Shared),
+            (Owned, Exclusive, Exclusive),
+            (Owned, Unreadable, Unreadable),
+            (Shared, Exclusive, Shared),
+            (Shared, Unreadable, Mixed),
+            (Exclusive, Unreadable, Unreadable),
+            (Owned, Unknown, Unknown),
+            (Shared, Mixed, Mixed),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(merge_xml_access(Some(left), right), Some(expected));
+            assert_eq!(merge_xml_access(Some(right), left), Some(expected));
+        }
+    }
+
+    #[test]
     fn xml_mir_gate_authenticates_types_on_every_producer_edge() {
         let base = mir(
             r#"import std.xml
@@ -31030,14 +32650,16 @@ fn main() -> i32 = 0
         params: Vec<Ty>,
         out_ty: Ty,
     ) -> Program {
-        let out = u32::try_from(params.len()).expect("test parameter inventory fits u32");
+        let out = u32::try_from(params.len())
+            .unwrap_or_else(|_| panic!("test parameter inventory exceeds u32"));
         let mut slots = params.clone();
         slots.push(out_ty);
         let i32_ty = Ty::Int(IntTy {
             bits: 32,
             signed: true,
         });
-        let term = if out_ty == Ty::String {
+        let owns_dynamic_payload = matches!(out_ty, Ty::String | Ty::DynArray(Scalar::String));
+        let term = if owns_dynamic_payload {
             Term::ReturnWithCleanup(Box::new((
                 Operand::Value(1),
                 Operand::Const(Const::Bool(true)),
@@ -31054,7 +32676,7 @@ fn main() -> i32 = 0
                 ret: out_ty,
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
-                return_cleanup: if out_ty == Ty::String {
+                return_cleanup: if owns_dynamic_payload {
                     hir::ReturnCleanupAbi::DynamicBit
                 } else {
                     hir::ReturnCleanupAbi::None
@@ -31113,6 +32735,15 @@ fn main() -> i32 = 0
                 },
                 vec![Ty::Str],
                 Ty::String,
+            ),
+            (
+                "fs.read_dir",
+                Rvalue::FsReadDir {
+                    path: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::Str],
+                Ty::DynArray(Scalar::String),
             ),
             (
                 "json.doc.as_str",
@@ -31202,6 +32833,7 @@ fn main() -> i32 = 0
             match producer {
                 Rvalue::JsonEncodeBounded { out, .. }
                 | Rvalue::FsReadFile { out, .. }
+                | Rvalue::FsReadDir { out, .. }
                 | Rvalue::EnvGet { out, .. }
                 | Rvalue::JsonDocAsStr { out, .. }
                 | Rvalue::JsonDocKey { out, .. }
@@ -31305,6 +32937,36 @@ fn main() -> i32 = 0
             "certification must not collapse duplicate local function names"
         );
 
+        let mut missing_return = base.clone();
+        missing_return.fns[make].blocks[0].term = Term::Return(None);
+        assert_xml_producer_rejected(
+            &missing_return,
+            "protected non-unit function omitted its return value",
+        );
+
+        let mut detached_cleanup = base.clone();
+        let returned = detached_cleanup.fns[wrap]
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                Term::ReturnWithCleanup(returned) => Some(returned),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing cleanup-carrying wrapper return"));
+        returned.1 = Operand::Const(Const::Bool(true));
+        assert_xml_producer_rejected(
+            &detached_cleanup,
+            "return cleanup detached from its call result",
+        );
+
+        let invoke = xml_test_function(&base, "invoke");
+        let mut wrong_direct_mode = base.clone();
+        wrong_direct_mode.fns[invoke].param_modes[0] = align_ast::ParamMode::Borrow;
+        assert_xml_producer_rejected(
+            &wrong_direct_mode,
+            "direct edge disagrees with its callable mode product",
+        );
+
         let recursive = xml_test_function(&base, "recursive");
         let mut contradictory = base;
         let producer = contradictory.fns[recursive]
@@ -31318,6 +32980,97 @@ fn main() -> i32 = 0
             .unwrap_or_else(|| panic!("missing recursive producer"));
         *producer = Rvalue::RawNull;
         assert_xml_producer_rejected(&contradictory, "contradictory recursive return");
+    }
+
+    #[test]
+    fn xml_whole_carrier_operations_validate_unselected_siblings() {
+        let base = mir(
+            r#"Pair { first: str, second: str }
+fn clone_first(first: str, second: str, out: region) -> string {
+  pair := Pair { first: first, second: second }
+  copied := pair.clone_in(out)
+  return copied.first.clone()
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(validate_mir_producers(&base).is_ok());
+
+        let function = xml_test_function(&base, "clone_first");
+        let mut malformed = base;
+        let second = malformed.fns[function].params[1];
+        malformed.fns[function].slots[second as usize] = Ty::Raw;
+        assert_xml_producer_rejected(
+            &malformed,
+            "CloneIn/StoreField ignored an invalid unselected sibling",
+        );
+    }
+
+    #[test]
+    fn producer_publication_preflight_returns_errors_instead_of_panicking() {
+        let base = mir(
+            r#"fn apply(f: fn(i64) -> i64, value: i64) -> i64 = f(value)
+fn capture(base: i64) -> i64 = apply(fn value: i64 { value + base }, 1)
+fn main() -> i32 = 0
+"#,
+        );
+
+        let mut malformed_closure = base.clone();
+        let lifted = malformed_closure
+            .fns
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Closure { lifted, .. }) => Some(lifted.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing capturing closure producer"));
+        let target = xml_test_function(&malformed_closure, lifted.as_str());
+        malformed_closure.fns[target].param_modes.clear();
+
+        let mut malformed_import = base.clone();
+        malformed_import.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("malformed$import"),
+            params: vec![Ty::Str],
+            param_modes: Vec::new(),
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
+        });
+
+        let mut malformed_local = base;
+        malformed_local.fns[0].param_modes.clear();
+
+        for (label, malformed) in [
+            ("lifted closure", malformed_closure),
+            ("imported declaration", malformed_import),
+            ("local declaration", malformed_local),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_mir_producers(&malformed)
+            }));
+            assert!(
+                matches!(outcome, Ok(Err(_))),
+                "malformed {label} must return CodegenError without panicking"
+            );
+        }
+
+        assert!(
+            !direct_operands_match_modes(
+                &program_call("pkg.template$write"),
+                &[Operand::Const(Const::Unit), Operand::Const(Const::Unit)],
+                &[
+                    align_ast::ParamMode::BorrowMut,
+                    align_ast::ParamMode::ByValue,
+                ],
+                &[],
+                &Program::default(),
+            ),
+            "an empty template type vector must fail closed"
+        );
     }
 
     #[test]
