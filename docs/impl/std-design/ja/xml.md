@@ -378,6 +378,11 @@ full post-redesign review は existing-producer closure を one axis として�
 | Existing-producer repair review P2: `MakeDynArray` が scalar/AoS layout だけを想定し column-major allocation/store を省略。 | SoA result は exact `SoaAlloc` nominal identity と length に bindし、selected field は対応する typed `StoreColumn` write を辿る。allocation authority と stored string provenance は分離したまま。 | 数値・文字列を含む `to_soa` consumer は whole/per-unit build で pass。allocation/store nominal mutation は reject。 |
 | Existing-producer repair review P2: runtime column aggregation が生成した buffer element に pointer-store equation がない。 | 数値・文字列 key の column aggregator は `PtrStore` と同じ producer set に typed buffer write を追加。key view は source key column だけを辿り、数値 aggregate output は borrowed payload を持たない。 | 数値 grouped result を string-producing helper に渡す経路と grouped string-key clone は pass。forged runtime output identity/type は reject。 |
 
+| DB owner sweep: empty fixed-array view が unseeded element graph として扱われた。 | exact zero-length `MakeSlice` は payload producer を持たず、physical slot type と exact zero length を確認した場合だけ readable empty-view seed を持つ。nonempty view は element producer を必要とする。 | empty string-bearing argument は certifyし、view length を zero から one に変える mutation は reject。dynamic DB execution が source-reachable empty enum-slice case を所有。 |
+| DB owner sweep: generated column-batch row/SoA view が string-bearing result にもかかわらず irrelevant に分類された。 | `ColumnBatchRow` と `ColumnBatchSoa` は exact result、batch resource/row identity、payload、owner、index operand を validateして shared reader-owned field を公開。既存 static callback validation は producer-owned callback の完全な contract を維持。 | `pkg_db_q1::generated_runtime_data_is_producer_owned`、既存 column-batch mutation owner、provisioned fourteen-suite DB gate。 |
+
+| DB owner sweep: returned dependent Move resource が retained parent region から shared access を継承した。 | certified Move return は自身の shell を所有する。region dependency は lifetime を制約するが transfer/exclusive-borrow authority は失わせない。selected Copy view leaf は input root を辿り、String/XML cleanup-bit check は不変。 | `resource_ownership::returned_dependent_resource_retains_its_own_mutable_authority` が whole/per-unit の return 後 BorrowMut をカバー。既存 parent move/mutable-borrow negative は lifetime exclusion を維持。 |
+
 ## Deferred surface
 
 `io.reader` streaming、incremental/fallible `next`、caller-buffer text decode、raw span/source location、

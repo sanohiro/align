@@ -4912,6 +4912,8 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::HttpCtxMethod { .. }
         | Rvalue::HttpCtxPath { .. }
         | Rvalue::ResourceViewFromRaw { .. }
+        | Rvalue::ColumnBatchRow { .. }
+        | Rvalue::ColumnBatchSoa { .. }
         | Rvalue::SoaColumn { .. }
         | Rvalue::Index(..)
         | Rvalue::IndexField(..)
@@ -4937,8 +4939,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::RawAlloc(..)
         | Rvalue::ColumnBatchCreate { .. }
         | Rvalue::ColumnBatchAppend { .. }
-        | Rvalue::ColumnBatchRow { .. }
-        | Rvalue::ColumnBatchSoa { .. }
         | Rvalue::RawNull
         | Rvalue::RawLoad { .. }
         | Rvalue::RawPointerLoad { .. }
@@ -5770,7 +5770,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
             return;
         }
-        if roots.is_empty() {
+        // A returned Move carrier owns its shell even when that shell retains a region
+        // dependency on an argument (for example, a DB cursor borrowing its connection).
+        // Selected Copy views still follow their input roots below; lifetime dependence
+        // must not downgrade the new owner's transfer or exclusive-borrow authority.
+        if roots.is_empty() || align_sema::ty_is_move(
+            selected_ty,
+            &self.graph.program.structs,
+            &self.graph.program.tuples,
+            &self.graph.program.enums,
+            &self.graph.program.tagged_types,
+        ) {
             equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
             return;
         }
@@ -5885,6 +5895,35 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     } else {
                         self.add_operand(&mut equation, &operand, source_selected, path);
                     }
+                }
+            }
+            Rvalue::ColumnBatchRow { payload, owner, index, struct_id, resource } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != Ty::Struct(struct_id)
+                    || !db_resource_matches_row(self.graph.program, resource, struct_id, "batch")
+                    || xml_operand_base_ty(self.graph.function, &payload) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &owner) != Some(Ty::ResourceRef(resource))
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &payload, Ty::Raw);
+                    self.check_operand(&mut equation, &owner, Ty::ResourceRef(resource));
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ColumnBatchSoa { payload, owner, struct_id, resource } => {
+                if result_ty != Ty::Soa(struct_id)
+                    || !db_resource_matches_row(self.graph.program, resource, struct_id, "batch")
+                    || xml_operand_base_ty(self.graph.function, &payload) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &owner) != Some(Ty::ResourceRef(resource))
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &payload, Ty::Raw);
+                    self.check_operand(&mut equation, &owner, Ty::ResourceRef(resource));
+                    equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
             Rvalue::ResourceViewFromRaw {
@@ -6066,6 +6105,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 if !view_matches {
                     equation.invalid = true;
+                } else if length == 0 {
+                    // Exact zero-length inline storage has no element producer to follow.
+                    // Bounds validation keeps every element read unreachable; this is a
+                    // readable empty view, not an uninitialized nonempty payload.
+                    equation.seed = Some(XmlAccessProvenance::Shared);
                 } else if path.is_empty() {
                     let source = self.queue(XmlAccessNode::Slot(
                         slot,
@@ -32735,6 +32779,7 @@ fn mixed_inputs(owned: string, source: str) -> i64 =
   inspect_carrier(Carrier { owned: owned, view: source })
 fn tail_first(values: slice<str>) -> str { tail := values[1..]; return tail[0] }
 fn tail_forward(values: slice<str>) -> i64 { tail := values[1..]; return take_many(tail) }
+fn empty_view() -> i64 = take_many([])
 fn capture_cycle() -> i64 {
   mut n: i64 := 0
   f := fn x: i64 { n + x }
@@ -32875,6 +32920,16 @@ fn main() -> i32 = 0
         }
 
         let tail_first = xml_test_function(&ordinary, "tail_first");
+        let empty_view = xml_test_function(&ordinary, "empty_view");
+        let mut forged_empty_length = ordinary.clone();
+        let empty_length = forged_empty_length.fns[empty_view].blocks.iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::MakeSlice(_, length)) => Some(length),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing empty view fixture"));
+        *empty_length = 1;
+        assert_xml_producer_rejected(&forged_empty_length, "empty view forged nonempty length");
         let mut bad_subslice = ordinary.clone();
         let elem = bad_subslice.fns[tail_first]
             .blocks
