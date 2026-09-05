@@ -4,6 +4,47 @@
 mod common;
 use common::*;
 
+#[test]
+fn producer_certification_preserves_non_xml_container_interfaces() {
+    if !backend_available() {
+        return;
+    }
+    let support = r#"module container_support
+import core.json
+pub Row { name: str, age: i64 }
+pub Carrier { owned: string, view: str }
+pub fn consume(value: Carrier) -> i64 = value.owned.len() + value.view.len()
+pub fn tail(values: slice<str>) -> str { rest := values[1..]; return rest[0] }
+fn length(row: Row) -> i64 = row.name.len()
+pub fn summarize(data: str) -> Result<i64, Error> {
+  rows: array<Row> := json.decode(data)?
+  mapped := rows.map(length).sum()
+  arena {
+    columns: soa<Row> := json.decode(data)?
+    names := columns.name
+    copied := columns.to_array()
+    return Ok(mapped + names[0].len() + copied[0].name.len())
+  }
+}
+"#;
+    let main = r#"import container_support
+fn main() -> Result<(), Error> {
+  owner := "view".clone()
+  view: str := owner
+  print(container_support.consume(container_support.Carrier { owned: "owned".clone(), view: view }))
+  values := ["first", "second"]
+  print(container_support.tail(values))
+  print(container_support.summarize("[{\"name\":\"abc\",\"age\":1}]")?)
+  return Ok(())
+}
+"#;
+    let files = &[("container_support.align", support), ("main.align", main)];
+    let output = build_per_unit_multi("producer-container-interface", files, "main.align")
+        .link_and_run();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "9\nsecond\n9\n");
+}
+
 fn documented_first_key(path: &str) -> String {
     let document = std::fs::read_to_string(path).expect("std.xml design document");
     let marker = document.find("fn first_key").expect("first_key example");
