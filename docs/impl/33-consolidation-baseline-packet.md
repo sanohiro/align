@@ -172,15 +172,22 @@ another broad architecture survey in place of filling these bounded ledgers.
 The pilot reuses existing semantic oracles; it does not start a benchmark
 platform. Freeze a pilot bundle before asking a model to solve it: exact task
 texts, input/output oracles and test IDs, allowed specification excerpts and
-package sources, compiler artifact, model/provider revision or returned model
+package sources, model/provider revision or returned model
 identity, all exposed sampling settings, and the fixed repair budget. An
 unpinnable model is labeled non-comparable across runs.
 
 Start with six tasks below, one initial answer plus at most two repair answers
 per task. Each repair receives only that task's compile/test diagnostics; no
-reference solution or compiler patch is supplied. V1 repeats the identical
-bundle and model settings in a fresh context. Keep initial and repaired success
-separate. This small pilot is diagnostic evidence, not a language-wide score.
+reference solution or compiler patch is supplied. The compiler and matching
+runtime are bound execution-arm inputs, not part of the frozen task bundle.
+V0 records the baseline arm. At V1, replay saved V0 source against both baseline
+and candidate arms with the same oracles; separately repeat the authoring loop
+in fresh contexts for both arms with the same task bundle and model settings.
+Record each arm's compiler/runtime identities and resulting diagnostics; do not
+change compilers inside an attempt or repair sequence. Keep initial and repaired
+success separate, and distinguish fixed-source compiler changes from variation
+in freshly generated solutions. This small pilot is diagnostic evidence, not a
+language-wide score.
 
 | ID | Task to freeze using the named existing fixture's exact inputs and oracle | Oracle owner |
 |---|---|---|

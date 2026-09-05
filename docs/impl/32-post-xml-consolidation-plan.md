@@ -202,6 +202,9 @@ Ordinary CI owns structural/correctness invariants; timing remains local evidenc
 ## 8. AI authorability and public surface
 
 Packet 33 defines a small fixed pilot at V0 and a same-task repeat at V1.
+Task/oracle/model inputs stay fixed; baseline and candidate compiler/runtime
+identities are recorded as separate execution arms. Replay saved source on
+both arms to distinguish compiler changes from fresh model variation.
 Correctness rate and performance among correct solutions are separate. An
 unavailable model/provider is an explicit missing lane, not a reason to block
 compiler qualification or to buy/connect an unrequested service.
