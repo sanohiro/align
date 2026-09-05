@@ -4199,6 +4199,9 @@ impl XmlProducerState {
 struct XmlSlotStores<'a> {
     roots: Vec<Vec<&'a Operand>>,
     fields: Vec<Vec<(&'a [u32], &'a Operand)>>,
+    elements: Vec<Vec<(&'a Operand, &'a Operand)>>,
+    element_fields: Vec<Vec<(&'a Operand, &'a [u32], &'a Operand)>>,
+    constant_elements: Vec<Vec<(&'a [ConstElem], Ty)>>,
     producers: Vec<Vec<(ValueId, &'a Rvalue)>>,
 }
 
@@ -4900,6 +4903,10 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::HttpCtxMethod { .. }
         | Rvalue::HttpCtxPath { .. }
         | Rvalue::ResourceViewFromRaw { .. }
+        | Rvalue::Index(..)
+        | Rvalue::IndexField(..)
+        | Rvalue::MakeSlice(..)
+        | Rvalue::ConstArray { .. }
         | Rvalue::SliceIndex(..)
         | Rvalue::SliceIndexNoalias { .. } => XmlProducerVariantClass::Graph,
         Rvalue::SqliteCallbackDescriptor(..)
@@ -4926,8 +4933,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::ResourceIntoRaw { .. }
         | Rvalue::BoxGet(..)
         | Rvalue::BoxClone(..)
-        | Rvalue::Index(..)
-        | Rvalue::IndexField(..)
         | Rvalue::MakeVec { .. }
         | Rvalue::VecExtract { .. }
         | Rvalue::VecInsert { .. }
@@ -4941,7 +4946,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::IndexColumn { .. }
         | Rvalue::SoaGather { .. }
         | Rvalue::IndexPtr { .. }
-        | Rvalue::MakeSlice(..)
         | Rvalue::ArenaAlloc { .. }
         | Rvalue::HeapAllocBuf { .. }
         | Rvalue::SoaAlloc { .. }
@@ -4959,7 +4963,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::ParMapParallel { .. }
         | Rvalue::ParMapReduce { .. }
         | Rvalue::SlicePtr(..)
-        | Rvalue::ConstArray { .. }
         | Rvalue::StrPredicate { .. }
         | Rvalue::StrFinderNew { .. }
         | Rvalue::StrFinderFind { .. }
@@ -5159,6 +5162,17 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::HttpStreamFinish { .. }
         | Rvalue::HttpStreamReject { .. } => XmlProducerVariantClass::Irrelevant,
     }
+}
+
+fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
+    matches!(
+        (element, ty),
+        (ConstElem::Int(_), Ty::Int(_))
+            | (ConstElem::Float(_), Ty::Float(_))
+            | (ConstElem::Char(_), Ty::Char)
+            | (ConstElem::Bool(_), Ty::Bool)
+            | (ConstElem::Str(_), Ty::Str)
+    )
 }
 
 fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
@@ -5736,7 +5750,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     | align_ast::ParamMode::Out
             );
             if !canonical_borrow {
-                self.check_operand(equation, argument, *expected);
+                self.check_whole_operand(equation, argument, *expected);
             }
         }
         if matches!(selected_ty, Ty::String | Ty::XmlReader) {
@@ -5953,6 +5967,129 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         &mut equation,
                         self.queue(XmlAccessNode::Slot(slot, path)),
                     );
+                }
+            }
+            Rvalue::Index(slot, index) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(element_ty) = xml_selected_ty(
+                    self.graph.program,
+                    slot_ty,
+                    &[XmlAccessPathSegment::Element],
+                ) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if result_ty != element_ty
+                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                }
+            }
+            Rvalue::IndexField(slot, index, fields) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut result_path = vec![XmlAccessPathSegment::Element];
+                result_path.extend(
+                    fields
+                        .iter()
+                        .copied()
+                        .map(XmlAccessPathSegment::StructField),
+                );
+                let Some(expected_result) =
+                    xml_selected_ty(self.graph.program, slot_ty, &result_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = result_path;
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if fields.is_empty()
+                    || result_ty != expected_result
+                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                }
+            }
+            Rvalue::MakeSlice(slot, length) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let view_matches = match (slot_ty, result_ty) {
+                    (Ty::Array(element, actual), Ty::Slice(view)) => {
+                        element == view && u32::try_from(length) == Ok(actual)
+                    }
+                    (Ty::StructArray(id, actual), Ty::Slice(Scalar::Struct(view))) => {
+                        id == view && u32::try_from(length) == Ok(actual)
+                    }
+                    _ => false,
+                };
+                let Some(remaining) =
+                    path.strip_prefix(&[XmlAccessPathSegment::Element])
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend_from_slice(remaining);
+                if !view_matches
+                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                }
+            }
+            Rvalue::ConstArray { elems, elem } => {
+                let result_matches = align_sema::ty_to_scalar(elem)
+                    .is_some_and(|element| result_ty == Ty::Slice(element));
+                let path_matches = path.is_empty()
+                    || path.as_slice() == [XmlAccessPathSegment::Element]
+                        && selected_ty == elem;
+                if !result_matches
+                    || !path_matches
+                    || elems
+                        .iter()
+                        .any(|element| !xml_const_element_matches_ty(element, elem))
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
             Rvalue::SliceIndex(source, index)
@@ -6878,20 +7015,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: signature.return_region,
                     cleanup: signature.return_cleanup,
                 };
-                let callable = xml_operand_access(self.graph, &callee, Ty::Fn(id));
-                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts)
-                    || !matches!(
-                        callable,
-                        XmlProducerState::Present(
-                            XmlAccessProvenance::Owned
-                                | XmlAccessProvenance::Shared
-                                | XmlAccessProvenance::Exclusive
-                        )
-                    )
-                {
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
                     equation.invalid = true;
                     return equation;
                 }
+                let callee = self.check_source(&callee, Ty::Fn(id));
+                Self::add_required_source(
+                    &mut equation,
+                    callee,
+                    OperandRequirement {
+                        read: true,
+                        callable: true,
+                        ..OperandRequirement::default()
+                    },
+                );
                 self.add_call_result(&mut equation, XmlCallResult {
                     result: value,
                     result_ty,
@@ -6920,20 +7057,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: call.signature.return_region,
                     cleanup: call.signature.return_cleanup,
                 };
-                let callable = xml_operand_access(self.graph, &call.callee, Ty::Fn(id));
-                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts)
-                    || !matches!(
-                        callable,
-                        XmlProducerState::Present(
-                            XmlAccessProvenance::Owned
-                                | XmlAccessProvenance::Shared
-                                | XmlAccessProvenance::Exclusive
-                        )
-                    )
-                {
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
                     equation.invalid = true;
                     return equation;
                 }
+                let callee = self.check_source(&call.callee, Ty::Fn(id));
+                Self::add_required_source(
+                    &mut equation,
+                    callee,
+                    OperandRequirement {
+                        read: true,
+                        callable: true,
+                        ..OperandRequirement::default()
+                    },
+                );
                 self.add_call_result(&mut equation, XmlCallResult {
                     result: value,
                     result_ty,
@@ -7383,21 +7520,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 }
-                let Some((XmlAccessPathSegment::ResultOk, rest)) = path.split_first() else {
-                    equation.invalid = true;
-                    return equation;
-                };
-                if rest.is_empty() && selected_ty == Ty::XmlReader {
-                    let input = self.check_source(&input, Ty::String);
-                    Self::add_required_source(
-                        &mut equation,
-                        input,
-                        OperandRequirement {
-                            read: true,
-                            move_value: true,
-                            ..OperandRequirement::default()
-                        },
-                    );
+                let input = self.check_source(&input, Ty::String);
+                Self::add_required_source(
+                    &mut equation,
+                    input,
+                    OperandRequirement {
+                        read: true,
+                        move_value: true,
+                        ..OperandRequirement::default()
+                    },
+                );
+                let whole_result = path.is_empty() && selected_ty == result_ty;
+                let reader_payload = path.as_slice() == [XmlAccessPathSegment::ResultOk]
+                    && selected_ty == Ty::XmlReader;
+                if whole_result || reader_payload {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 } else {
                     equation.invalid = true;
@@ -8028,6 +8164,34 @@ impl<'a> XmlAccessAnalyzer<'a> {
             .iter()
             .map(|(fields, operand)| ((*fields).to_vec(), (*operand).clone()))
             .collect::<Vec<_>>();
+        let Some(element_stores) = self.graph.slot_stores.elements.get(slot as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        let element_stores = element_stores
+            .iter()
+            .map(|(index, operand)| ((*index).clone(), (*operand).clone()))
+            .collect::<Vec<_>>();
+        let Some(element_field_stores) = self.graph.slot_stores.element_fields.get(slot as usize)
+        else {
+            equation.invalid = true;
+            return equation;
+        };
+        let element_field_stores = element_field_stores
+            .iter()
+            .map(|(index, fields, operand)| {
+                ((*index).clone(), (*fields).to_vec(), (*operand).clone())
+            })
+            .collect::<Vec<_>>();
+        let Some(constant_stores) = self.graph.slot_stores.constant_elements.get(slot as usize)
+        else {
+            equation.invalid = true;
+            return equation;
+        };
+        let constant_stores = constant_stores
+            .iter()
+            .map(|(elements, element)| ((*elements).to_vec(), *element))
+            .collect::<Vec<_>>();
         let Some(producers) = self.graph.slot_stores.producers.get(slot as usize) else {
             equation.invalid = true;
             return equation;
@@ -8078,6 +8242,100 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     path[stored_path.len()..].to_vec(),
                 );
             }
+        }
+        let element_path = path
+            .strip_prefix(&[XmlAccessPathSegment::Element])
+            .map(<[_]>::to_vec);
+        for (index, operand) in element_stores {
+            let i64_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            let Some(element_ty) = xml_selected_ty(
+                self.graph.program,
+                slot_ty,
+                &[XmlAccessPathSegment::Element],
+            ) else {
+                equation.invalid = true;
+                continue;
+            };
+            if xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                || xml_operand_base_ty(self.graph.function, &operand) != Some(element_ty)
+            {
+                equation.invalid = true;
+                continue;
+            }
+            self.check_operand(&mut equation, &index, i64_ty);
+            self.check_whole_operand(&mut equation, &operand, element_ty);
+            let Some(remaining) = element_path.as_ref() else {
+                equation.invalid = true;
+                continue;
+            };
+            if xml_selected_ty(self.graph.program, element_ty, remaining) != Some(selected_ty) {
+                equation.invalid = true;
+                continue;
+            }
+            self.add_operand(
+                &mut equation,
+                &operand,
+                selected_ty,
+                remaining.clone(),
+            );
+        }
+        for (index, fields, operand) in element_field_stores {
+            let i64_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            let mut stored_path = vec![XmlAccessPathSegment::Element];
+            stored_path.extend(
+                fields
+                    .iter()
+                    .copied()
+                    .map(XmlAccessPathSegment::StructField),
+            );
+            let Some(stored_ty) = xml_selected_ty(self.graph.program, slot_ty, &stored_path)
+            else {
+                equation.invalid = true;
+                continue;
+            };
+            if fields.is_empty()
+                || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
+            {
+                equation.invalid = true;
+                continue;
+            }
+            self.check_operand(&mut equation, &index, i64_ty);
+            self.check_whole_operand(&mut equation, &operand, stored_ty);
+            if path.starts_with(&stored_path) {
+                self.add_operand(
+                    &mut equation,
+                    &operand,
+                    selected_ty,
+                    path[stored_path.len()..].to_vec(),
+                );
+            }
+        }
+        for (elements, element_ty) in constant_stores {
+            let valid_shape = match slot_ty {
+                Ty::Array(element, length) => {
+                    scalar_to_ty(element) == element_ty
+                        && usize::try_from(length) == Ok(elements.len())
+                }
+                _ => false,
+            };
+            if !valid_shape
+                || elements
+                    .iter()
+                    .any(|element| !xml_const_element_matches_ty(element, element_ty))
+                || element_path.as_deref() != Some(&[])
+                || selected_ty != element_ty
+            {
+                equation.invalid = true;
+                continue;
+            }
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Shared);
         }
         if equation.seed.is_none() && equation.dependencies.is_empty() && !equation.invalid {
             equation.invalid = true;
@@ -8750,6 +9008,9 @@ fn validate_resource_rvalues_component(
         let mut slot_stores = XmlSlotStores {
             roots: vec![Vec::new(); function.slots.len()],
             fields: vec![Vec::new(); function.slots.len()],
+            elements: vec![Vec::new(); function.slots.len()],
+            element_fields: vec![Vec::new(); function.slots.len()],
+            constant_elements: vec![Vec::new(); function.slots.len()],
             producers: vec![Vec::new(); function.slots.len()],
         };
         for block in &function.blocks {
@@ -8802,6 +9063,23 @@ fn validate_resource_rvalues_component(
                     Stmt::StoreField(slot, path, operand) => {
                         if let Some(stores) = slot_stores.fields.get_mut(*slot as usize) {
                             stores.push((path.as_slice(), operand));
+                        }
+                    }
+                    Stmt::StoreIndex(slot, index, operand) => {
+                        if let Some(stores) = slot_stores.elements.get_mut(*slot as usize) {
+                            stores.push((index, operand));
+                        }
+                    }
+                    Stmt::StoreElemField(slot, index, path, operand) => {
+                        if let Some(stores) = slot_stores.element_fields.get_mut(*slot as usize) {
+                            stores.push((index, path.as_slice(), operand));
+                        }
+                    }
+                    Stmt::StoreConstArray { slot, elems, elem } => {
+                        if let Some(stores) =
+                            slot_stores.constant_elements.get_mut(*slot as usize)
+                        {
+                            stores.push((elems.as_slice(), *elem));
                         }
                     }
                     _ => {}
@@ -9016,20 +9294,9 @@ fn validate_resource_rvalues_component(
                             let canonical_borrow_state = || {
                                 borrowed_state.map(|state| {
                                     if canonical_borrow_path {
-                                        XmlProducerState::Present(match mode {
-                                            align_ast::ParamMode::ByValue
-                                            | align_ast::ParamMode::Borrow => {
-                                                XmlAccessProvenance::Shared
-                                            }
-                                            align_ast::ParamMode::BorrowMut => {
-                                                XmlAccessProvenance::Exclusive
-                                            }
-                                            align_ast::ParamMode::Out => {
-                                                XmlAccessProvenance::Unreadable
-                                            }
-                                        })
-                                    } else {
                                         state
+                                    } else {
+                                        XmlProducerState::Invalid
                                     }
                                 })
                             };
@@ -29733,7 +30000,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
-            "borrowed element array root changes between its bounds guard and call action",
+            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
 
         let by_value_source = r#"Record { value: string }
@@ -30313,7 +30580,10 @@ fn main() -> i32 = 0
             "a slice view forged from an array with another element must fail closed"
         );
         if let Err(error) = malformed {
-            assert_lowering(error, "borrowed place type disagrees with its field path");
+            assert_lowering(
+                error,
+                "resource MIR in function 'inspect' is malformed: XML-capable call argument provenance mismatch",
+            );
         }
     }
 
@@ -31814,6 +32084,228 @@ fn main() -> i32 = 0
             assert!(
                 validate_resource_rvalues(&direct_arg).is_ok(),
                 "a raw argument with the operation's canonical mode must remain valid"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_closure_keeps_calls_arrays_reborrows_and_whole_results_total() {
+        let ordinary = mir(
+            r#"Record { value: str }
+fn take(value: str) -> i64 = value.len()
+fn take_many(values: slice<str>) -> i64 = take(values[0])
+fn fixed(first: str, second: str) -> i64 {
+  values := [first, second]
+  records := [Record { value: first }, Record { value: second }]
+  return take(values[0]) + take(records[1].value) + take_many(values)
+}
+fn folded() -> i64 { values := ["a", "b"]; return take(values[0]) }
+fn capture_cycle() -> i64 {
+  mut n: i64 := 0
+  f := fn x: i64 { n + x }
+  n = f(1)
+  return n
+}
+fn main() -> i32 = 0
+"#,
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_mir_producers(&ordinary)
+        }));
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "ordinary fixed/static string arrays and a callable cycle must certify: {outcome:?}"
+        );
+
+        let fixed = xml_test_function(&ordinary, "fixed");
+        let mut bad_index = ordinary.clone();
+        let indexed = bad_index.fns[fixed]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(value, Rvalue::Index(..)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array Index producer"));
+        bad_index.fns[fixed].value_tys[indexed as usize] = Ty::Bool;
+        assert_xml_producer_rejected(&bad_index, "fixed-array Index result type");
+
+        let mut bad_index_field = ordinary.clone();
+        let fields = bad_index_field.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::IndexField(_, _, fields)) => Some(fields),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array IndexField producer"));
+        fields[0] = u32::MAX;
+        assert_xml_producer_rejected(&bad_index_field, "fixed-array IndexField path");
+
+        let mut bad_slice = ordinary.clone();
+        let length = bad_slice.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::MakeSlice(_, length)) => Some(length),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array MakeSlice producer"));
+        *length += 1;
+        assert_xml_producer_rejected(&bad_slice, "fixed-array MakeSlice length");
+
+        let mut bad_store = ordinary.clone();
+        let stored = bad_store.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreIndex(_, _, stored) => Some(stored),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array StoreIndex producer"));
+        *stored = Operand::Const(Const::Bool(false));
+        assert_xml_producer_rejected(&bad_store, "fixed-array StoreIndex operand");
+
+        let mut bad_field_store = ordinary.clone();
+        let stored = bad_field_store.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreElemField(_, _, _, stored) => Some(stored),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array StoreElemField producer"));
+        *stored = Operand::Const(Const::Bool(false));
+        assert_xml_producer_rejected(&bad_field_store, "fixed-array StoreElemField operand");
+
+        let folded = xml_test_function(&ordinary, "folded");
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let strings = vec![ConstElem::Str("a".to_owned()), ConstElem::Str("b".to_owned())];
+        let mut static_array = ordinary.clone();
+        static_array.fns[folded] = Function {
+            name: program_call("folded"),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: Vec::new(),
+            slot_align: Vec::new(),
+            value_tys: vec![Ty::Slice(Scalar::Str), Ty::Str, i64_ty],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let(
+                        0,
+                        Rvalue::ConstArray {
+                            elems: strings.clone(),
+                            elem: Ty::Str,
+                        },
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::SliceIndex(
+                            Operand::Value(0),
+                            Operand::Const(Const::Int(0, i64_ty)),
+                        ),
+                    ),
+                    Stmt::Let(
+                        2,
+                        Rvalue::Call(direct_program("take"), vec![Operand::Value(1)]),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(2))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        assert!(validate_mir_producers(&static_array).is_ok());
+        let mut bad_constant = static_array;
+        let Stmt::Let(_, Rvalue::ConstArray { elem, .. }) =
+            &mut bad_constant.fns[folded].blocks[0].stmts[0]
+        else {
+            panic!("static ConstArray fixture changed shape")
+        };
+        *elem = Ty::Bool;
+        assert_xml_producer_rejected(&bad_constant, "static ConstArray element type");
+
+        let mut pooled_array = ordinary.clone();
+        pooled_array.fns[folded] = Function {
+            name: program_call("folded"),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![Ty::Array(Scalar::Str, 2)],
+            slot_align: vec![None],
+            value_tys: vec![Ty::Str, i64_ty],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::StoreConstArray {
+                        slot: 0,
+                        elems: strings,
+                        elem: Ty::Str,
+                    },
+                    Stmt::Let(
+                        0,
+                        Rvalue::Index(0, Operand::Const(Const::Int(0, i64_ty))),
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::Call(direct_program("take"), vec![Operand::Value(0)]),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(1))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        assert!(validate_mir_producers(&pooled_array).is_ok());
+        let mut bad_pooled = pooled_array;
+        let Stmt::StoreConstArray { elems, .. } =
+            &mut bad_pooled.fns[folded].blocks[0].stmts[0]
+        else {
+            panic!("StoreConstArray fixture changed shape")
+        };
+        elems[0] = ConstElem::Bool(false);
+        assert_xml_producer_rejected(&bad_pooled, "StoreConstArray constant element type");
+
+        let xml = mir(
+            r#"import std.xml
+fn identity(value: Result<xml.reader, Error>) -> Result<xml.reader, Error> = value
+fn parse_identity(source: string) -> Result<xml.reader, Error> = identity(xml.parse(source))
+fn advance(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn forward(borrow mut reader: xml.reader) -> Option<xml.event> = advance(reader)
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            validate_mir_producers(&xml).is_ok(),
+            "whole parse results and exclusive reborrows must certify"
+        );
+        let forward = xml_test_function(&xml, "forward");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::Out] {
+            let mut insufficient = xml.clone();
+            insufficient.fns[forward].param_modes[0] = mode;
+            assert_xml_producer_rejected(
+                &insufficient,
+                &format!("{mode:?} source upgraded for a BorrowMut call"),
             );
         }
     }
