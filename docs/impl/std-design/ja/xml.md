@@ -375,6 +375,9 @@ full post-redesign review は existing-producer closure を one axis として�
 | Post-redesign full review P2: `SubSlice` は whole result path だけを admitし selected string-element path を rejectした。 | subslice path transfer は exact selected element/deeper path を preserveし range operand を provenance から除外。 | subsliced `slice<str>` index/forward は pass、path/type/range mutation は reject。 |
 | Post-redesign full review P2: by-value leaf check が enclosing carrier から Move authority を継承した。 | transfer authority は selected type ごとに計算し、Move leaf だけ ownership、Copy view は readability を要求。 | mixed Move/Copy carrier owner が owned string sibling と shared string-view sibling を区別。 |
 
+| Existing-producer repair review P2: `MakeDynArray` が scalar/AoS layout だけを想定し column-major allocation/store を省略。 | SoA result は exact `SoaAlloc` nominal identity と length に bindし、selected field は対応する typed `StoreColumn` write を辿る。allocation authority と stored string provenance は分離したまま。 | 数値・文字列を含む `to_soa` consumer は whole/per-unit build で pass。allocation/store nominal mutation は reject。 |
+| Existing-producer repair review P2: runtime column aggregation が生成した buffer element に pointer-store equation がない。 | 数値・文字列 key の column aggregator は `PtrStore` と同じ producer set に typed buffer write を追加。key view は source key column だけを辿り、数値 aggregate output は borrowed payload を持たない。 | 数値 grouped result を string-producing helper に渡す経路と grouped string-key clone は pass。forged runtime output identity/type は reject。 |
+
 ## Deferred surface
 
 `io.reader` streaming、incremental/fallible `next`、caller-buffer text decode、raw span/source location、

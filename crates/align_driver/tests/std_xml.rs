@@ -15,6 +15,34 @@ pub Row { name: str, age: i64 }
 pub Carrier { owned: string, view: str }
 pub fn consume(value: Carrier) -> i64 = value.owned.len() + value.view.len()
 pub fn tail(values: slice<str>) -> str { rest := values[1..]; return rest[0] }
+pub Point { key: i64, value: i64 }
+fn describe(value: i64) -> str = if value == 2 { "two" } else { "other" }
+pub fn transposed() -> string {
+  arena {
+    rows := [Point { key: 1, value: 2 }].to_soa()
+    return describe(rows[0].value).clone()
+  }
+}
+pub fn grouped(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<Point> := json.decode(data)?
+    groups := rows.group_by(.key).sum(.value)
+    return Ok(describe(groups.1[0]).clone())
+  }
+}
+pub fn string_groups(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<Row> := json.decode(data)?
+    groups := rows.group_by(.name).count()
+    return Ok(groups.0[0].clone())
+  }
+}
+pub fn transposed_strings() -> string {
+  arena {
+    rows := [Row { name: "text", age: 1 }].to_soa()
+    return rows[0].name.clone()
+  }
+}
 fn length(row: Row) -> i64 = row.name.len()
 pub fn summarize(data: str) -> Result<i64, Error> {
   rows: array<Row> := json.decode(data)?
@@ -35,14 +63,21 @@ fn main() -> Result<(), Error> {
   values := ["first", "second"]
   print(container_support.tail(values))
   print(container_support.summarize("[{\"name\":\"abc\",\"age\":1}]")?)
+  print(container_support.transposed())
+  print(container_support.grouped("[{\"key\":1,\"value\":2}]")?)
+  print(container_support.string_groups("[{\"name\":\"abc\",\"age\":1}]")?)
+  print(container_support.transposed_strings())
   return Ok(())
 }
 "#;
     let files = &[("container_support.align", support), ("main.align", main)];
+    let whole = build_and_run_multi("producer-container-whole", files, "main.align");
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), "9\nsecond\n9\ntwo\ntwo\nabc\ntext\n");
     let output = build_per_unit_multi("producer-container-interface", files, "main.align")
         .link_and_run();
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "9\nsecond\n9\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "9\nsecond\n9\ntwo\ntwo\nabc\ntext\n");
 }
 
 fn documented_first_key(path: &str) -> String {

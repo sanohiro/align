@@ -4921,6 +4921,7 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::IndexPtr { .. }
         | Rvalue::ArenaAlloc { .. }
         | Rvalue::HeapAllocBuf { .. }
+        | Rvalue::SoaAlloc { .. }
         | Rvalue::MakeDynArray { .. }
         | Rvalue::MakeSlice(..)
         | Rvalue::ConstArray { .. }
@@ -4958,7 +4959,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::VecSum { .. }
         | Rvalue::MaskAny { .. }
         | Rvalue::VecLoad { .. }
-        | Rvalue::SoaAlloc { .. }
         | Rvalue::GroupAgg { .. }
         | Rvalue::GroupAggStrCols { .. }
         | Rvalue::GroupAggStr { .. }
@@ -6419,7 +6419,29 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 self.check_operand(&mut equation, &count, i64_ty);
                 equation.seed = Some(XmlAccessProvenance::Owned);
             }
+            Rvalue::SoaAlloc { handle, len, struct_id } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let expected = self.graph.program.structs.get(struct_id as usize)
+                    .and_then(|record| record.fields.first())
+                    .and_then(|field| align_sema::ty_to_scalar(field.ty))
+                    .map(Ty::Box);
+                if !path.is_empty() || expected != Some(result_ty)
+                    || xml_operand_base_ty(self.graph.function, &handle) != Some(Ty::ArenaHandle)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &handle, Ty::ArenaHandle);
+                self.check_operand(&mut equation, &len, i64_ty);
+                equation.seed = Some(XmlAccessProvenance::Shared);
+            }
             Rvalue::MakeDynArray { ptr, len } => {
+                let same_operand = |left: &Operand, right: &Operand| match (left, right) {
+                    (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) => a == b,
+                    (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt))) => a == b && at == bt,
+                    _ => false,
+                };
                 let Operand::Value(ptr_value) = ptr else {
                     equation.invalid = true;
                     return equation;
@@ -6438,6 +6460,55 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     bits: 64,
                     signed: true,
                 });
+                if let Ty::Soa(struct_id) = result_ty {
+                    let Some(Some(Rvalue::SoaAlloc { struct_id: allocated, len: allocated_len, .. })) =
+                        self.graph.value_definitions.get(ptr_value as usize)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if *allocated != struct_id || !same_operand(allocated_len, &len)
+                        || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    self.check_operand(&mut equation, &ptr, Ty::Box(element));
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    if path.is_empty() {
+                        self.add_operand(&mut equation, &ptr, Ty::Box(element), Vec::new());
+                        return equation;
+                    }
+                    let Some((XmlAccessPathSegment::StructField(selected_field), remaining)) = path.split_first() else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    let mut found_store = false;
+                    for statement in self.graph.function.blocks.iter().flat_map(|block| &block.stmts) {
+                        let Stmt::StoreColumn { base, len: stored_len, index, field, struct_id: stored_id, value: stored } = statement else {
+                            continue;
+                        };
+                        if !same_operand(base, &ptr) { continue; }
+                        let field_ty = self.graph.program.structs.get(struct_id as usize)
+                            .and_then(|record| record.fields.get(*field as usize))
+                            .map(|field| field.ty);
+                        if *stored_id != struct_id || !same_operand(stored_len, &len)
+                            || xml_operand_base_ty(self.graph.function, index) != Some(i64_ty)
+                            || field_ty.is_none()
+                            || xml_operand_base_ty(self.graph.function, stored) != field_ty
+                        {
+                            equation.invalid = true;
+                            continue;
+                        }
+                        self.check_operand(&mut equation, index, i64_ty);
+                        if *field == *selected_field {
+                            found_store = true;
+                            self.add_operand(&mut equation, stored, selected_ty, remaining.to_vec());
+                        }
+                    }
+                    if !found_store { equation.invalid = true; }
+                    return equation;
+                }
                 if result_ty != expected_result
                     || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
                 {
@@ -6473,6 +6544,49 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .iter()
                     .flat_map(|block| &block.stmts)
                 {
+                    // Runtime column aggregators write their caller-owned buffers directly,
+                    // without PtrStore statements. Keep those writes in the same producer set.
+                    if let Stmt::Let(count, runtime @ (Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op }
+                        | Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op })) = statement
+                    {
+                        if same_operand(out_keys, &ptr) || same_operand(out_vals, &ptr) {
+                            found_store = true;
+                            let key_scalar = if matches!(runtime, Rvalue::GroupAggStrCols { .. }) {
+                                Scalar::Str
+                            } else {
+                                Scalar::Int(IntTy { bits: 64, signed: true })
+                            };
+                            let integer_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+                            let keys_ty = xml_operand_base_ty(self.graph.function, keys);
+                            let vals_ty = xml_operand_base_ty(self.graph.function, vals);
+                            let valid_column = |ty, scalar| matches!(ty, Some(Ty::Slice(s) | Ty::DynArray(s)) if s == scalar);
+                            let count_only = matches!(op, hir::GroupOp::Count);
+                            if self.graph.function.value_tys.get(*count as usize) != Some(&i64_ty)
+                                || !valid_column(keys_ty, key_scalar)
+                                || (!count_only && !valid_column(vals_ty, integer_scalar))
+                                || xml_operand_base_ty(self.graph.function, out_keys) != Some(Ty::Box(key_scalar))
+                                || xml_operand_base_ty(self.graph.function, out_vals) != Some(Ty::Box(integer_scalar))
+                                || same_operand(out_keys, out_vals)
+                                || element_ty != if same_operand(out_keys, &ptr) { scalar_to_ty(key_scalar) } else { i64_ty }
+                                || !remaining.is_empty()
+                            {
+                                equation.invalid = true;
+                                continue;
+                            }
+                            if let Some(keys_ty) = keys_ty {
+                                self.check_whole_operand(&mut equation, keys, keys_ty);
+                            }
+                            if !count_only && let Some(vals_ty) = vals_ty {
+                                self.check_whole_operand(&mut equation, vals, vals_ty);
+                            }
+                            if same_operand(out_keys, &ptr) {
+                                self.add_operand(&mut equation, keys, selected_ty, vec![XmlAccessPathSegment::Element]);
+                            } else {
+                                Self::add_source(&mut equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
+                            }
+                        }
+                        continue;
+                    }
                     let (stored_ptr, index, stored) = match statement {
                         Stmt::PtrStore(stored_ptr, index, stored) => {
                             (stored_ptr, index, stored)
@@ -32676,6 +32790,28 @@ fn soa_whole(data: str) -> Result<string, Error> {
     return Ok(row.name.clone())
   }
 }
+Point { key: i64, value: i64 }
+fn describe(value: i64) -> str = if value == 2 { "two" } else { "other" }
+fn transposed() -> string {
+  arena {
+    rows := [User { name: "text", age: 2 }].to_soa()
+    return rows[0].name.clone()
+  }
+}
+fn grouped(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<Point> := json.decode(data)?
+    groups := rows.group_by(.key).sum(.value)
+    return Ok(describe(groups.1[0]).clone())
+  }
+}
+fn grouped_strings(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<User> := json.decode(data)?
+    groups := rows.group_by(.name).count()
+    return Ok(groups.0[0].clone())
+  }
+}
 fn main() -> i32 = 0
 "#,
         );
@@ -32691,6 +32827,8 @@ fn main() -> i32 = 0
             "IndexColumn",
             "SoaGather",
             "IndexPtr",
+            "SoaAlloc",
+            "StoreColumn",
         ] {
             let mut malformed = dynamic.clone();
             let changed = malformed
@@ -32707,6 +32845,11 @@ fn main() -> i32 = 0
                         *struct_id = u32::MAX;
                         Some(())
                     }
+                    ("SoaAlloc", Stmt::Let(_, Rvalue::SoaAlloc { struct_id, .. }))
+                    | ("StoreColumn", Stmt::StoreColumn { struct_id, .. }) => {
+                        *struct_id = u32::MAX;
+                        Some(())
+                    }
                     _ => None,
                 })
                 .is_some();
@@ -32715,6 +32858,20 @@ fn main() -> i32 = 0
                 &malformed,
                 &format!("dynamic {variant} nominal identity"),
             );
+        }
+
+        for string_keys in [false, true] {
+            let mut malformed = dynamic.clone();
+            let changed = malformed.fns.iter_mut()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, Rvalue::GroupAgg { out_vals, .. }) if !string_keys => Some(out_vals),
+                    Stmt::Let(_, Rvalue::GroupAggStrCols { out_keys, .. }) if string_keys => Some(out_keys),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("missing runtime buffer writer fixture"));
+            *changed = Operand::Const(Const::Bool(false));
+            assert_xml_producer_rejected(&malformed, "runtime buffer output identity/type");
         }
 
         let tail_first = xml_test_function(&ordinary, "tail_first");
