@@ -21,7 +21,9 @@ The reviewed predecessor is
 MIR producer validator and its direct codegen/driver owners. It changes no
 language, XML, DB, ABI, or package contract.
 
-The latest full review reported the following five P2 findings. Earlier reader
+The predecessor full review reported five P2 findings, and the changed-slice
+review of the coherent repair reported one more P2 in the same malformed-MIR
+closure. Earlier reader
 use-after-free and native callback identity findings motivated the committed
 redesign; this register does not claim those earlier fixes can be removed safely.
 
@@ -32,6 +34,7 @@ redesign; this register does not claim those earlier fixes can be removed safely
 | X3 | Source regression introduced by producer validation. | `XmlParse` now certifies only its exact builtin `Error` payload in addition to the whole result and reader payload. Input ownership and cleanup identity checks remain mandatory. |
 | X4 | Source regression plus type-class malformed-MIR gaps. | Numeric equations cover the source-admitted scalar and vector arithmetic, vector/scalar broadcasts, comparisons, lane masks, vector selection, scalar unary operators, and exact widths. Scalar-left arithmetic was rejected as an invalid fixture because sema does not admit it under the vector expectation; the validator was not widened to manufacture a new language rule. |
 | X5 | Malformed-MIR contract gap. | `MaybeAbsent` becomes present only with the exact discriminator guard. Statically inactive guarded payloads remain absent. Option, Result, enum, and optional-reader joins have positive and guard-removal/wrong-predicate mutations. |
+| X6 | Malformed-MIR allocation-safety gap. | Every caller-owned buffer passed to the direct group, dictionary, gather, and lookup runtime writers authenticates its `HeapAllocBuf` count against that writer's exact row, column, or explicit write bound. One parameterized mutation owner replaces each sibling allocation count with a smaller valid `i64`, for both whole-program and per-unit validation. |
 
 ## Consolidated DB and performance result
 
@@ -50,7 +53,7 @@ reuses only fully validated `Present` node results. It never caches absent,
 maybe-absent, unresolved, or invalid states, and the graph is immutable for the
 cache lifetime. The same owner completed in 102.52 seconds after the repair.
 
-The repair is roughly 1,000 changed hand-written lines because the five findings
+The repair is roughly 1,000 changed hand-written lines because the six findings
 and the DB regression are one shared validator failure domain. Splitting its
 producer equations from the cross-path malformed-MIR owners would create a
 dormant producer/consumer chain and duplicate the same certification proof,

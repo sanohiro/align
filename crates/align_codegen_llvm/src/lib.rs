@@ -5877,6 +5877,142 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
+    fn same_operand(left: &Operand, right: &Operand) -> bool {
+        matches!((left, right),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b)
+            || matches!((left, right),
+                (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt)))
+                    if a == b && at == bt)
+    }
+
+    /// Authenticate the allocation count behind a caller-owned runtime output buffer. Merely
+    /// proving that the pointer has the expected scalar type does not prove that the runtime may
+    /// write its declared bound through it.
+    fn heap_buffer_capacity_matches(&self, output: &Operand, bound: &Operand) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*output as usize),
+            Some(Some(Rvalue::HeapAllocBuf { count, .. }))
+                if Self::same_operand(count, bound)
+        )
+    }
+
+    fn heap_buffer_capacity_matches_slice_len(
+        &self,
+        output: &Operand,
+        source: &Operand,
+    ) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        let Some(Some(Rvalue::HeapAllocBuf { count: Operand::Value(count), .. })) =
+            self.graph.value_definitions.get(*output as usize)
+        else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*count as usize),
+            Some(Some(Rvalue::SliceLen(actual))) if self.same_runtime_row_count(actual, source)
+        )
+    }
+
+    fn same_runtime_row_count(&self, left: &Operand, right: &Operand) -> bool {
+        if Self::same_operand(left, right) {
+            return true;
+        }
+        let (Operand::Value(left), Operand::Value(right)) = (left, right) else {
+            return false;
+        };
+        let dictionary_field = |value: ValueId| match self
+            .graph
+            .value_definitions
+            .get(value as usize)
+        {
+            Some(Some(Rvalue::DictField { base, idx })) => Some((*base, *idx)),
+            _ => None,
+        };
+        matches!(
+            (dictionary_field(*left), dictionary_field(*right)),
+            (Some((left_base, left_field)), Some((right_base, right_field)))
+                if left_base == right_base
+                    && matches!((left_field, right_field), (0, 1) | (1, 0))
+        )
+    }
+
+    fn heap_buffer_capacity_matches_slot_len(&self, output: &Operand, source: Slot) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        let Some(Some(Rvalue::HeapAllocBuf { count: Operand::Value(count), .. })) =
+            self.graph.value_definitions.get(*output as usize)
+        else { return false; };
+        let Some(Some(Rvalue::SliceLen(Operand::Value(array)))) =
+            self.graph.value_definitions.get(*count as usize)
+        else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*array as usize),
+            Some(Some(Rvalue::Load(actual))) if *actual == source
+        )
+    }
+
+    fn add_column_buffer_writer(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        writer: (ValueId, &Rvalue),
+        output: (&Operand, &Operand, Ty, &[XmlAccessPathSegment]),
+    ) -> bool {
+        let (count, runtime) = writer;
+        let (ptr, len, selected_ty, remaining) = output;
+        let (keys, vals, out_keys, out_vals, op, key_scalar) = match runtime {
+            Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op } =>
+                (keys, vals, out_keys, out_vals, *op,
+                    Scalar::Int(IntTy { bits: 64, signed: true })),
+            Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op } =>
+                (keys, vals, out_keys, out_vals, *op, Scalar::Str),
+            _ => return false,
+        };
+        let same = Self::same_operand;
+        if !same(ptr, out_keys) && !same(ptr, out_vals) {
+            return false;
+        }
+        let integer_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let i64_ty = scalar_to_ty(integer_scalar);
+        let keys_ty = xml_operand_base_ty(self.graph.function, keys);
+        let vals_ty = xml_operand_base_ty(self.graph.function, vals);
+        let valid_column = |ty, scalar| {
+            matches!(ty, Some(Ty::Slice(actual) | Ty::DynArray(actual)) if actual == scalar)
+        };
+        let count_only = matches!(op, hir::GroupOp::Count);
+        if self.graph.function.value_tys.get(count as usize) != Some(&i64_ty)
+            || !same(len, &Operand::Value(count))
+            || !valid_column(keys_ty, key_scalar)
+            || (!count_only && !valid_column(vals_ty, integer_scalar))
+            || xml_operand_base_ty(self.graph.function, out_keys) != Some(Ty::Box(key_scalar))
+            || xml_operand_base_ty(self.graph.function, out_vals) != Some(Ty::Box(integer_scalar))
+            || !self.heap_buffer_capacity_matches_slice_len(out_keys, keys)
+            || !self.heap_buffer_capacity_matches_slice_len(out_vals, keys)
+            || same(out_keys, out_vals)
+            || selected_ty != if same(out_keys, ptr) { scalar_to_ty(key_scalar) } else { i64_ty }
+            || !remaining.is_empty()
+        {
+            equation.invalid = true;
+            return true;
+        }
+        if let Some(keys_ty) = keys_ty {
+            self.check_whole_operand(equation, keys, keys_ty);
+            let source = self.source(keys, scalar_to_ty(key_scalar),
+                vec![XmlAccessPathSegment::Element]);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+        if !count_only && let Some(vals_ty) = vals_ty {
+            self.check_whole_operand(equation, vals, vals_ty);
+            let source = self.source(vals, i64_ty, vec![XmlAccessPathSegment::Element]);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+        self.check_operand(equation, out_keys, Ty::Box(key_scalar));
+        self.check_operand(equation, out_vals, Ty::Box(integer_scalar));
+        if same(out_keys, ptr) {
+            self.add_operand(equation, keys, selected_ty, vec![XmlAccessPathSegment::Element]);
+        } else {
+            Self::add_source(equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
+        }
+        true
+    }
+
     /// Runtime AoS writers share the source row layout and output-buffer contract. Numeric
     /// outputs own their copied values; key views retain only the selected source key field.
     fn add_aos_buffer_writer(
@@ -5896,8 +6032,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 (*base, *struct_id, *key_field, Vec::new(), out_dict, vec![out_ids], true),
             _ => return false,
         };
-        let same = |left: &Operand, right: &Operand|
-            matches!((left, right), (Operand::Value(a), Operand::Value(b)) if a == b);
+        let same = Self::same_operand;
         let key_output = same(ptr, out_keys);
         if !key_output && !out_vals.iter().any(|out| same(ptr, out)) { return false; }
         let integer = Scalar::Int(IntTy { bits: 64, signed: true });
@@ -5928,6 +6063,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             if outputs[..index].iter().any(|(other, _)| same(out, other)) {
                 equation.invalid = true;
             }
+            if !self.heap_buffer_capacity_matches_slot_len(out, base) {
+                equation.invalid = true;
+            }
             self.check_operand(equation, out, Ty::Box(*scalar));
         }
         let source = self.queue(XmlAccessNode::Slot(base, Vec::new()));
@@ -5951,8 +6089,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
     ) -> bool {
         let (value, runtime) = writer;
         let (ptr, len, selected_ty, remaining) = output;
-        let same = |left: &Operand, right: &Operand|
-            matches!((left, right), (Operand::Value(a), Operand::Value(b)) if a == b);
+        let same = Self::same_operand;
         let integer = Scalar::Int(IntTy { bits: 64, signed: true });
         let i64_ty = scalar_to_ty(integer);
         match runtime {
@@ -5961,6 +6098,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if self.graph.function.value_tys.get(value as usize) != Some(&Ty::Unit)
                     || self.graph.program.structs.get(*struct_id as usize)
                         .and_then(|row| row.fields.get(*field as usize)).map(|field| field.ty) != Some(i64_ty)
+                    || !self.heap_buffer_capacity_matches_slice_len(out, source)
                     || selected_ty != i64_ty || !remaining.is_empty()
                 { equation.invalid = true; return true; }
                 self.check_whole_operand(equation, source, base_ty);
@@ -5970,7 +6108,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
             Rvalue::DictLookup { ids, n, dict, out } if same(ptr, out) => {
                 if self.graph.function.value_tys.get(value as usize) != Some(&Ty::Unit)
-                    || !same(len, n) || selected_ty != Ty::Str || !remaining.is_empty()
+                    || !same(len, n)
+                    || !self.heap_buffer_capacity_matches(out, n)
+                    || selected_ty != Ty::Str || !remaining.is_empty()
                 { equation.invalid = true; return true; }
                 self.check_operand(equation, ids, Ty::Box(integer));
                 self.check_operand(equation, n, i64_ty);
@@ -6770,64 +6910,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     if let Stmt::Let(count, runtime) = statement {
                         let output = (&ptr, &len, selected_ty, remaining);
-                        if self.add_aos_buffer_writer(&mut equation, (*count, runtime), output)
+                        if self.add_column_buffer_writer(&mut equation, (*count, runtime), output)
+                            || self.add_aos_buffer_writer(&mut equation, (*count, runtime), output)
                             || self.add_dictionary_buffer_writer(&mut equation, (*count, runtime), output)
                         {
                             found_store = true;
                             continue;
                         }
-                    }
-                    // Runtime column aggregators write their caller-owned buffers directly,
-                    // without PtrStore statements. Keep those writes in the same producer set.
-                    if let Stmt::Let(count, runtime @ (Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op }
-                        | Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op })) = statement
-                    {
-                        if same_operand(out_keys, &ptr) || same_operand(out_vals, &ptr) {
-                            found_store = true;
-                            let key_scalar = if matches!(runtime, Rvalue::GroupAggStrCols { .. }) {
-                                Scalar::Str
-                            } else {
-                                Scalar::Int(IntTy { bits: 64, signed: true })
-                            };
-                            let integer_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
-                            let keys_ty = xml_operand_base_ty(self.graph.function, keys);
-                            let vals_ty = xml_operand_base_ty(self.graph.function, vals);
-                            let valid_column = |ty, scalar| matches!(ty, Some(Ty::Slice(s) | Ty::DynArray(s)) if s == scalar);
-                            let count_only = matches!(op, hir::GroupOp::Count);
-                            if self.graph.function.value_tys.get(*count as usize) != Some(&i64_ty)
-                                || !same_operand(&len, &Operand::Value(*count))
-                                || !valid_column(keys_ty, key_scalar)
-                                || (!count_only && !valid_column(vals_ty, integer_scalar))
-                                || xml_operand_base_ty(self.graph.function, out_keys) != Some(Ty::Box(key_scalar))
-                                || xml_operand_base_ty(self.graph.function, out_vals) != Some(Ty::Box(integer_scalar))
-                                || same_operand(out_keys, out_vals)
-                                || element_ty != if same_operand(out_keys, &ptr) { scalar_to_ty(key_scalar) } else { i64_ty }
-                                || !remaining.is_empty()
-                            {
-                                equation.invalid = true;
-                                continue;
-                            }
-                            if let Some(keys_ty) = keys_ty {
-                                self.check_whole_operand(&mut equation, keys, keys_ty);
-                                let source = self.source(keys, scalar_to_ty(key_scalar),
-                                    vec![XmlAccessPathSegment::Element]);
-                                Self::add_required_source(&mut equation, source, OperandRequirement::READ);
-                            }
-                            if !count_only && let Some(vals_ty) = vals_ty {
-                                self.check_whole_operand(&mut equation, vals, vals_ty);
-                                let source = self.source(vals, i64_ty,
-                                    vec![XmlAccessPathSegment::Element]);
-                                Self::add_required_source(&mut equation, source, OperandRequirement::READ);
-                            }
-                            self.check_operand(&mut equation, out_keys, Ty::Box(key_scalar));
-                            self.check_operand(&mut equation, out_vals, Ty::Box(integer_scalar));
-                            if same_operand(out_keys, &ptr) {
-                                self.add_operand(&mut equation, keys, selected_ty, vec![XmlAccessPathSegment::Element]);
-                            } else {
-                                Self::add_source(&mut equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
-                            }
-                        }
-                        continue;
                     }
                     let (stored_ptr, index, stored) = match statement {
                         Stmt::PtrStore(stored_ptr, index, stored) => {
@@ -6863,6 +6952,23 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !found_store {
                     equation.invalid = true;
                 }
+            }
+            runtime @ (Rvalue::GroupAgg { .. } | Rvalue::GroupAggStrCols { .. }) => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let (out, key) = match &runtime {
+                    Rvalue::GroupAgg { out_keys, .. } => (out_keys, i64_ty),
+                    Rvalue::GroupAggStrCols { out_keys, .. } => (out_keys, Ty::Str),
+                    _ => { equation.invalid = true; return equation; }
+                };
+                let mut inputs = XmlAccessEquation::default();
+                if result_ty != i64_ty || !path.is_empty()
+                    || !self.add_column_buffer_writer(&mut inputs, (value, &runtime),
+                        (out, &Operand::Value(value), key, &[]))
+                { equation.invalid = true; return equation; }
+                equation.invalid |= inputs.invalid;
+                equation.checks.extend(inputs.checks);
+                equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
+                equation.seed = Some(XmlAccessProvenance::Owned);
             }
             runtime @ (Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::DictEncode { .. }) => {
                 let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
@@ -8666,8 +8772,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::VecSum { .. }
             | Rvalue::MaskAny { .. }
             | Rvalue::VecLoad { .. }
-            | Rvalue::GroupAgg { .. }
-            | Rvalue::GroupAggStrCols { .. }
             | Rvalue::Chunks { .. }
             | Rvalue::ParMapParallel { .. }
             | Rvalue::ParMapReduce { .. }
@@ -10953,6 +11057,20 @@ fn validate_resource_rvalues_component(
                             )
                             && result == Ty::String
                     }
+                    Rvalue::GroupAgg { .. }
+                    | Rvalue::GroupAggStrCols { .. }
+                    | Rvalue::GroupAggStr { .. }
+                    | Rvalue::GroupAggMultiStr { .. }
+                    | Rvalue::DictEncode { .. }
+                    | Rvalue::GatherColumnI64 { .. }
+                    | Rvalue::DictLookup { .. } => matches!(
+                        xml_access(&Operand::Value(*value), result),
+                        XmlProducerState::Present(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                    ),
                     Rvalue::ResourceViewFromRaw {
                         owner,
                         ptr,
@@ -33738,6 +33856,37 @@ fn main() -> i32 = 0
                 }).unwrap_or_else(|| panic!("missing runtime buffer writer fixture"));
             *changed = Operand::Const(Const::Bool(false));
             assert_xml_producer_rejected(&malformed, "runtime buffer output identity/type");
+
+            let (function, outputs) = dynamic.fns.iter().enumerate()
+                .find_map(|(function, definition)| definition.blocks.iter()
+                    .flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::GroupAgg { out_keys, out_vals, .. }) if !string_keys =>
+                            Some((function, vec![out_keys.clone(), out_vals.clone()])),
+                        Stmt::Let(_, Rvalue::GroupAggStrCols { out_keys, out_vals, .. }) if string_keys =>
+                            Some((function, vec![out_keys.clone(), out_vals.clone()])),
+                        _ => None,
+                    }))
+                .unwrap_or_else(|| panic!("missing runtime buffer capacity fixture"));
+            for (index, output) in outputs.into_iter().enumerate() {
+                let Operand::Value(output) = output else {
+                    panic!("runtime output is not a value")
+                };
+                let mut undersized = dynamic.clone();
+                let count = undersized.fns[function].blocks.iter_mut()
+                    .flat_map(|block| &mut block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::HeapAllocBuf { count, .. }) if *value == output =>
+                            Some(count),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing runtime output allocation"));
+                *count = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true })));
+                assert_xml_producer_rejected(
+                    &undersized,
+                    &format!("runtime buffer {index} capacity"),
+                );
+            }
         }
 
         let tail_first = xml_test_function(&ordinary, "tail_first");
@@ -34050,7 +34199,7 @@ fn main() -> i32 = 0
                         Some((captures, capture_tys))
                     }
                     _ => None,
-                }).expect("captured source must lower a closure environment");
+                }).unwrap_or_else(|| panic!("captured source must lower a closure environment"));
             assert_eq!(captures.len(), 1);
             assert_eq!(capture_tys.as_slice(), &[Ty::Str]);
             match mutation {
@@ -34291,6 +34440,66 @@ fn main() -> i32 = 0
                 }
                 assert!(changed, "missing {label} {axis} mutation target");
                 assert_xml_producer_rejected(&malformed, &format!("AoS {label} {axis}"));
+            }
+
+            let mut capacity_owners = vec![owner];
+            if label.starts_with("encoded-") {
+                capacity_owners.push(xml_test_function(&program, "numbers"));
+            }
+            for selected_owner in capacity_owners {
+                let mut outputs = Vec::new();
+                for statement in program.fns[selected_owner].blocks.iter()
+                    .flat_map(|block| &block.stmts)
+                {
+                    let Stmt::Let(_, runtime) = statement else { continue; };
+                    match runtime {
+                        Rvalue::GroupAgg { out_keys, out_vals, .. }
+                        | Rvalue::GroupAggStrCols { out_keys, out_vals, .. }
+                        | Rvalue::GroupAggStr { out_keys, out_vals, .. } => {
+                            outputs.push(out_keys.clone());
+                            outputs.push(out_vals.clone());
+                        }
+                        Rvalue::GroupAggMultiStr { out_keys, out_vals, .. } => {
+                            outputs.push(out_keys.clone());
+                            outputs.extend(out_vals.iter().cloned());
+                        }
+                        Rvalue::DictEncode { out_ids, out_dict, .. } => {
+                            outputs.push(out_ids.clone());
+                            outputs.push(out_dict.clone());
+                        }
+                        Rvalue::GatherColumnI64 { out, .. }
+                        | Rvalue::DictLookup { out, .. } => outputs.push(out.clone()),
+                        _ => {}
+                    }
+                }
+                outputs.sort_by_key(|operand| match operand {
+                    Operand::Value(value) => *value,
+                    _ => u32::MAX,
+                });
+                outputs.dedup_by(|left, right| matches!(
+                    (left, right),
+                    (Operand::Value(left), Operand::Value(right)) if left == right
+                ));
+                assert!(!outputs.is_empty(), "missing {label} writer outputs");
+                for output in outputs {
+                    let Operand::Value(output) = output else {
+                        panic!("{label} runtime output is not a value")
+                    };
+                    let mut undersized = program.clone();
+                    let count = undersized.fns[selected_owner].blocks.iter_mut()
+                        .flat_map(|block| &mut block.stmts)
+                        .find_map(|statement| match statement {
+                            Stmt::Let(value, Rvalue::HeapAllocBuf { count, .. })
+                                if *value == output => Some(count),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing {label} output allocation {output}"));
+                    *count = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true })));
+                    assert_xml_producer_rejected(
+                        &undersized,
+                        &format!("AoS {label} output allocation {output} capacity"),
+                    );
+                }
             }
         }
     }
