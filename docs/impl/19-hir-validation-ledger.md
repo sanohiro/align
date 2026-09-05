@@ -2032,8 +2032,12 @@ Canonical type record version 3 uses the implemented codec leaves `Ty=65..=70` /
 `[3, 0, 0, 0, 0, 72]`; `Ty::Option(Scalar::XmlReader)` encodes exactly as
 `[3, 0, 0, 0, 0, 4, 48]`. Both directions return the identical semantic root. Unknown 73/49,
 missing root/payload, truncated, and trailing bytes reject before cache publication. Interface
-format 8 remains unchanged because `xml.reader` and `xml.event` use the existing nominal named-type
-and enum grammar.
+format 9 appends one `ProducerCertification` byte immediately after each function record's
+`return_cleanup`: tag 0 is `RevalidateGenericBody` and requires nonempty type parameters plus a
+present generic body; tag 1 is `ValidatedBody` and requires empty type parameters plus no body.
+Other tags and presence mismatches reject. A non-generic record receives tag 1 only after the exact
+local MIR body passes the reusable producer validator before interface publication; a generic body
+is re-lowered and passes that validator in the consumer.
 
 Both type leaves and all seven checked expression families (`XmlParse`,
 `XmlNext`, `XmlName`, `XmlAttributeCount`, `XmlAttributeName`, `XmlAttributeValue`, `XmlText`)
