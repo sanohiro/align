@@ -433,6 +433,76 @@ it does not admit arbitrary raw calls or add another producer certificate.
 The two P1 findings on the native-view candidate are closed against this full
 bridge/observation product, not by checking only the reported offset and call.
 
+### Reader action and discriminator closure
+
+The full review reopens the reader-action/discriminator axis. A reader receiver
+is a live owner observation until all eager getter operands have completed,
+not merely a handle checked before evaluating the index. Reuse the existing
+storage-generation/value-snapshot machinery: reserve owner roots, validate at
+the action, then retire only consumed input observations. A borrowed result
+keeps its own completion observation; an owned/scalar result does not retain
+the getter's reader input. The exact receiver of `next` is exempt only from
+its own successful transition and must not forward that stale observation.
+
+Independent boundary inspection additionally found that a reader field beside
+an array can inherit the array's fallback roots, leaving persistent name views
+unprotected. `XmlReader` has an explicit `OwnedOpaque` leaf in the existing
+projected storage-generation directory. Its content is empty; its release owner
+owns the reader shell/input, not an array allocation. Existing
+struct/tuple/Option/Result/enum path formation, parameter seeding, construction,
+move transfer, return/break, replacement, and Drop must carry that leaf. Borrowed
+parameters retain caller provenance and acquire no local release owner.
+
+Reuse the exact-place reservation machinery for the pending receiver action.
+`next` and mutable-call effects share the projected replacement transition:
+rename current/prior identities through all snapshots, invalidate the old
+`Observation` roots on the current control edge, and install a fresh observation
+header at the same exact place. Advancement does not end the directory's release
+ownership; it preserves the release owner, caller origin, and sibling headers.
+Do not substitute a whole-local root or add a second cursor identity map.
+Ordinary, eager-worklist, and transparent-spine completion share one
+receiver-input retirement operation
+after publishing result facts. The source owner must distinguish consumed input
+snapshots from a new borrowed-result snapshot and from another pending getter's
+snapshot of the same reader. This changes internal safety machinery only; the
+public ownership/region contract and interface record shape remain unchanged.
+
+The independent plan review requires observation identity to be separate from
+release ownership: borrowed leaves carry a projection- and generation-qualified
+`Observation` root in the shared directory, preserve caller origin across renames
+and joins, and keep empty release sets. Advancing invalidates precisely the old
+observation; it must neither mint a local release nor broadly invalidate sibling
+headers. Directory reachability includes scalar observation roots and
+both control-value edges' non-storage facts. Renaming covers these roots; return
+(including early return) and mutable-retention summaries project caller roots
+while metadata remains available. An advancing helper records mutation even when
+it retains caller provenance, unlike a no-op exclusive helper.
+
+At a control join, a generation retained only by a scalar observation supplies
+caller-origin metadata, not a live owner header. Its edge-local invalidity remains
+in observer facts; its directory record must not carry a sticky release-ended bit
+or release set into a peer edge's live owner. This keeps old views invalid while
+allowing a fresh view after an optional replacement or advancement. Collection
+header/release semantics are unchanged.
+
+Receiver syntax stays bound-local. Existing tuple/tagged transport owners extract
+a bound reader before a method call. Mixed reader/array carriers are exercised by
+shared `name(holder.first)` calls, whole-holder consumption, and advancement of a
+separate peer reader. Projected method syntax, partial-reader-field `BorrowMut`,
+and reader-field replacement remain rejected by existing sema; this closure does
+not claim source coverage for field advancement or fixed-reader-array transport.
+Borrowed helpers advance repeatedly and return fresh names; old observations
+invalidate while the current reader and owned getter results remain usable.
+
+| Axis | Closure / owner |
+|---|---|
+| Reader selection | `xml_reader_actions_reserve_exact_observations_through_eager_indices` covers local and borrowed reader observations plus a shared reader-field argument beside another reader and a collection header: whole-holder consumption invalidates its name, while advancing a separate peer does not. Existing tuple/tagged transport owners retain their admitted bound-reader extraction paths. |
+| Index action | The action owner parameterizes both indexed getters over consumption, local replacement, advancement, and direct/indirect consuming calls, and covers an early-return index. Invalidating indices reject before execution; a divergent index emits no getter action. It also distinguishes no-op exclusive helpers, repeated advancing helpers, old-view rejection, fresh-view acceptance, and branch/loop joins. |
+| Result and interface observation | `xml_advanced_borrowed_readers_keep_interface_roots_and_owned_getter_results` executes repeated imported advancing helpers in whole/per-unit builds, observes the exact fresh names, and uses an owned attribute value after later advances. The action owner separately checks old borrowed names and owned getter independence. |
+| Producer inventory | One exhaustive rvalue equation match replaces the parallel Graph classifier and wildcard fallback. It owns implemented equations and the explicit non-protected result arm, so adding an uncovered rvalue is a compile-time failure rather than a classified Graph variant with no equation. |
+| Guarded absence | Option, Result, and enum extractions distinguish an inactive discriminator edge from an unguarded absent payload. Prove the matching discriminator on every entry path using the same SSA operand, including default enum arms formed by excluded alternatives. A guarded `Absent` stays absent; a guarded `MaybeAbsent(access)` refines to `Present(access)`, without inventing access for an inactive payload. Malformed equations still reject. Source and malformed-MIR owners cover `else`, `match`, joins, and both active and absent states. |
+| Existing scalar/view siblings | `XmlNext` validates its reader, exact event enum, and complete option/payload paths. Checked arithmetic accepts whole option and payload, preserving exact operand checks. Codec name and each column-kind operation have exact shared-view/result equations. Whole/per-unit source owners and result/base/index/kind mutations close these cells. |
+
 ## Deferred surface
 
 The first capability deliberately omits streaming from `io.reader`, incremental/fallible `next`,

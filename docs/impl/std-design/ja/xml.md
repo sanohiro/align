@@ -405,6 +405,64 @@ offset と slot identity だけでは exact return ABI も guard 後に観測し
 native-view candidate の P1 2件は報告された offset と call だけでなく、この bridge/observation
 product 全体で閉じる。
 
+### Reader action and discriminator closure
+
+full review は reader-action/discriminator axis を再開する。reader receiver は index 評価前に
+確認する handle だけでなく、全 eager getter operand の完了まで生存する owner observation。
+既存 storage-generation/value-snapshot 機構で owner root を予約し、action 時に検証後、
+消費済み input observation だけを終了する。borrowed result は自身の completion observation を
+保持し、owned/scalar result は getter の reader input を保持しない。`next` の exact receiver は
+自身の成功 transition だけを免除し、その stale observation を親へ渡さない。
+
+独立 boundary inspection は array の隣の reader field が array の fallback root を継承し、
+persistent name view を保護しない経路も発見した。`XmlReader` は既存 projected storage-generation
+directory に explicit `OwnedOpaque` leaf を持つ。content は空で、その release owner は array
+allocation でなく reader shell/input を所有する。既存 struct/tuple/Option/Result/enum path formation、
+parameter seed、construction、move transfer、return/break、replacement、Drop がこの leaf を保持する。
+borrowed parameter は caller provenance を維持し local release owner を取得しない。
+
+pending receiver action は既存 exact-place reservation を再利用する。`next` と mutable-call
+effect は projected replacement transition を共有し、全 snapshot の current/prior identity を
+rename、current control edge の旧 `Observation` root を無効化し、同じ exact place に新 observation
+header を設置する。advance は directory の release ownership を終了せず、release owner、caller
+origin、sibling header を保持する。whole-local root や第二の cursor identity map は追加しない。
+通常、eager-worklist、transparent-spine completion は result fact 公開後の receiver-input retirement を共有する。
+owner は消費済み input snapshot、新 borrowed-result snapshot、同じ reader を予約する別 pending
+getter の snapshot を区別する。internal safety machinery だけの変更で public ownership/region
+contract と interface record shape は不変。
+
+独立 plan review は observation identity と release ownership の分離を要求する。
+borrowed leaf は shared directory の projection/generation-qualified `Observation` root を持ち、
+rename/join 後も caller origin を保持し release set は空。advance は旧 observation だけを無効化し、
+local release を捏造せず sibling header を一括無効化しない。directory reachability は
+scalar observation root と両 control-value edge の non-storage fact を含み、rename も対象にする。
+early return を含む return と mutable-retention summary は metadata がある間に caller root へ
+projectする。advancing helper は caller provenance を保持していても mutation を記録し、no-op
+exclusive helper と区別する。
+
+control join では scalar observation だけが保持する generation は caller-origin metadata を供給し、
+live owner header ではない。edge-local invalidity は observer fact に残し、directory record の sticky
+release-ended bit や release set を peer edge の live owner へ持ち込まない。これにより古い view は
+無効なまま、optional replacement/advance 後の fresh view を許可する。collection header/release の
+semantics は変えない。
+
+receiver syntax は bound-local のまま。既存 tuple/tagged transport owner は bound reader へ
+取り出してから method を呼ぶ。mixed reader/array carrier は shared `name(holder.first)` call、
+whole-holder consumption、別 peer reader の advance で検証する。projected method syntax、
+partial-reader-field `BorrowMut`、reader-field replacement は既存 sema が引き続き rejectし、
+この closure は field advancement や fixed-reader-array transport の source coverage を主張しない。
+borrowed helper の反復 advance と fresh name return では古い observation を無効化し、current reader
+と owned getter result は利用可能なまま保持する。
+
+| Axis | Closure / owner |
+|---|---|
+| Reader selection | `xml_reader_actions_reserve_exact_observations_through_eager_indices` は local/borrowed reader observation と、別 reader・collection header の隣の shared reader-field argument を検証する。whole-holder consumption はその name を無効化し、別 peer の advance は無効化しない。既存 tuple/tagged transport owner は許可された bound-reader extraction path を維持する。 |
+| Index action | action owner は両 indexed getter に対する consume、local replacement、advance、direct/indirect consuming call を parameterizeし、early-return index も検証する。無効化する index は実行前に rejectし、divergent index は getter action を生成しない。no-op exclusive helper、反復 advancing helper、old-view rejection、fresh-view acceptance、branch/loop join も区別する。 |
+| Result and interface observation | `xml_advanced_borrowed_readers_keep_interface_roots_and_owned_getter_results` は whole/per-unit build で imported advancing helper を反復実行し、exact fresh name と、後続 advance 後の owned attribute value 利用を確認する。action owner は古い borrowed name と owned getter の独立性を別途検証する。 |
+| Producer inventory | 単一 exhaustive rvalue equation match が並列 Graph classifier と wildcard fallback を置き換える。実装 equation と明示 non-protected result arm を所有し、未対応 rvalue の追加は equation のない Graph variant ではなく compile-time failure となる。 |
+| Guarded absence | Option、Result、enum extraction は inactive discriminator edge と unguarded absent payload を区別。同じ SSA operand の discriminator を全 entry path で証明し、他 alternative を除外する default enum arm も含む。guarded `Absent` は absent のまま、guarded `MaybeAbsent(access)` は `Present(access)` へ refineし、inactive payload の access を捏造しない。malformed equation は reject。source/MIR owner は `else`、`match`、join、active/absent state を検証。 |
+| Existing scalar/view siblings | `XmlNext` は reader、exact event enum、whole option/payload path を検証。checked arithmetic は exact operand check を維持して whole option/payload を許可。codec name と全 column kind は exact shared-view/result equation を持つ。whole/per-unit source owner と result/base/index/kind mutation が閉じる。 |
+
 ## Deferred surface
 
 `io.reader` streaming、incremental/fallible `next`、caller-buffer text decode、raw span/source location、

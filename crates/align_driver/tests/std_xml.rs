@@ -11,6 +11,19 @@ fn producer_certification_preserves_non_xml_container_interfaces() {
     }
     let support = r#"module container_support
 import core.json
+import core.codec
+pub fn codec_name(batch: codec.batch) -> Option<str> = batch.name(0)
+pub fn codec_text(column: codec.str_column) -> Option<str> = column.at(0)
+pub Choice { A(string), B(string) }
+pub fn absent() -> string { value: Option<string> := None; return value else "fallback".clone() }
+pub fn alternate() -> string {
+  value: Result<string, string> := Err("error".clone())
+  return match value { Ok(text) => text, Err(error) => error }
+}
+pub fn selected() -> string {
+  value := Choice.A("alpha".clone())
+  return match value { A(text) => text, B(text) => text }
+}
 pub Row { name: str, age: i64 }
 pub Carrier { owned: string, view: str }
 pub fn consume(value: Carrier) -> i64 = value.owned.len() + value.view.len()
@@ -67,17 +80,26 @@ fn main() -> Result<(), Error> {
   print(container_support.grouped("[{\"key\":1,\"value\":2}]")?)
   print(container_support.string_groups("[{\"name\":\"abc\",\"age\":1}]")?)
   print(container_support.transposed_strings())
+  print(container_support.absent())
+  print(container_support.alternate())
+  print(container_support.selected())
   return Ok(())
 }
 "#;
     let files = &[("container_support.align", support), ("main.align", main)];
     let whole = build_and_run_multi("producer-container-whole", files, "main.align");
     assert_eq!(whole.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&whole.stdout), "9\nsecond\n9\ntwo\ntwo\nabc\ntext\n");
-    let output = build_per_unit_multi("producer-container-interface", files, "main.align")
-        .link_and_run();
+    assert_eq!(
+        String::from_utf8_lossy(&whole.stdout),
+        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\n"
+    );
+    let output =
+        build_per_unit_multi("producer-container-interface", files, "main.align").link_and_run();
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "9\nsecond\n9\ntwo\ntwo\nabc\ntext\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "9\nsecond\n9\ntwo\ntwo\nabc\ntext\nfallback\nerror\nalpha\n"
+    );
 }
 
 fn documented_first_key(path: &str) -> String {
@@ -116,9 +138,10 @@ fn english_and_japanese_designs_share_one_syntax_checked_example() {
     let english = documented_first_key(&format!("{root}/../../docs/impl/std-design/xml.md"));
     let japanese = documented_first_key(&format!("{root}/../../docs/impl/std-design/ja/xml.md"));
     assert_eq!(english, japanese, "the translated public example drifted");
+    let diagnostics = check_diagnostics("std-xml-documented-example", &english);
     assert!(
-        !check_errs("std-xml-documented-example", &english),
-        "the documented std.xml example must type-check",
+        diagnostics.is_empty(),
+        "the documented std.xml example must type-check: {diagnostics}"
     );
 }
 
@@ -448,6 +471,189 @@ fn xml_name_views_are_capped_by_owned_reader_storage_and_preserve_borrowed_roots
 }
 
 #[test]
+fn xml_reader_actions_reserve_exact_observations_through_eager_indices() {
+    let helpers = r#"import std.xml
+fn discard(reader: xml.reader) -> i64 = 0
+fn step(borrow mut reader: xml.reader) -> i64 { reader.next(); return 0 }
+fn name(borrow reader: xml.reader) -> str = reader.name()
+fn fresh(borrow mut reader: xml.reader) -> str { reader.next(); reader.next(); return reader.name() }
+fn noop(borrow mut reader: xml.reader) {}
+fn show(value: str, index: i64) { print(value) }
+Holder { first: xml.reader, second: xml.reader, values: array<i64> }
+fn discard_holder(holder: Holder) -> i64 = 0
+"#;
+    for getter in ["attribute_name", "attribute_value"] {
+        for index in [
+            "discard(doc)",
+            "{ moved := doc; 0 }",
+            "step(doc)",
+            "{ doc.next(); 0 }",
+            "{ doc = xml.parse(\"<b/>\".clone())?; 0 }",
+            "{ call := discard; call(doc) }",
+        ] {
+            let source = format!(
+                "{helpers}\nfn main() -> Result<(), Error> {{ mut doc := xml.parse(\"<a x='v'/>\".clone())?; doc.next(); value := doc.{getter}({index}); return Ok(()) }}"
+            );
+            let diagnostics = check_diagnostics("xml-reserved-reader", &source);
+            assert!(
+                diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+                "{getter}({index}) must reject the invalidating index: {diagnostics}"
+            );
+        }
+    }
+    for body in [
+        "old := doc.name(); doc.next(); print(old)",
+        "old := name(doc); step(doc); print(old)",
+        "old := fresh(doc); discard(doc); print(old)",
+        "old := fresh(doc); doc.next(); print(old)",
+        "old := doc.name(); if true { event := doc.next() }; print(old)",
+        "old := doc.name(); loop { doc.next(); break }; print(old)",
+        "old := doc.name(); if true { doc = xml.parse(\"<c/>\".clone())? }; print(old)",
+        "show(doc.name(), step(doc))",
+        "call := show; call(doc.name(), step(doc))",
+        "show(if true { doc.name() } else { \"\" }, step(doc))",
+    ] {
+        let source = format!(
+            "{helpers}\nfn main() -> Result<(), Error> {{ mut doc := xml.parse(\"<a><b/></a>\".clone())?; doc.next(); {body}; return Ok(()) }}"
+        );
+        let diagnostics = check_diagnostics("xml-old-observation", &source);
+        assert!(diagnostics.contains("invalidated"), "{body}: {diagnostics}");
+    }
+    for body in [
+        "doc.next(); doc.next(); print(doc.name())",
+        "owned := doc.attribute_value(0); doc.next(); print(owned)",
+        "old := doc.name(); noop(doc); print(old)",
+        "print(fresh(doc))",
+        "old := doc.name(); if true { doc = xml.parse(\"<c/>\".clone())? }; print(doc.name())",
+        "old := doc.name(); if true { event := doc.next() }; print(doc.name())",
+        "loop { doc.next(); if true { break }; doc.next() }; print(doc.name())",
+        "doc.attribute_value({ return Ok(()); 0 })",
+    ] {
+        let source = format!(
+            "{helpers}\nfn main() -> Result<(), Error> {{ mut doc := xml.parse(\"<a x='v'><b/></a>\".clone())?; doc.next(); {body}; return Ok(()) }}"
+        );
+        let diagnostics = check_diagnostics("xml-fresh-observation", &source);
+        assert!(diagnostics.is_empty(), "{body}: {diagnostics}");
+    }
+    for (action, accepted) in [("discard_holder(holder)", false), ("step(peer)", true)] {
+        let source = format!(
+            "{helpers}\nfn main() -> Result<(), Error> {{ mut peer := xml.parse(\"<p/>\".clone())?; holder := Holder {{ first: xml.parse(\"<a/>\".clone())?, second: xml.parse(\"<b/>\".clone())?, values: [1].to_array() }}; old := name(holder.first); {action}; print(old); return Ok(()) }}"
+        );
+        let diagnostics = check_diagnostics("xml-projected-observation", &source);
+        assert_eq!(diagnostics.is_empty(), accepted, "{action}: {diagnostics}");
+    }
+    for (body, accepted) in [
+        ("old := reader.name(); reader.next(); print(old)", false),
+        ("reader.next(); reader.next(); print(reader.name())", true),
+        ("old := fresh(reader); step(reader); print(old)", false),
+        ("print(fresh(reader)); print(fresh(reader))", true),
+    ] {
+        let source = format!("{helpers}\nfn inspect(borrow mut reader: xml.reader) {{ {body} }}");
+        let diagnostics = check_diagnostics("xml-borrowed-observation", &source);
+        assert_eq!(diagnostics.is_empty(), accepted, "{body}: {diagnostics}");
+    }
+}
+
+#[test]
+fn xml_advanced_borrowed_readers_keep_interface_roots_and_owned_getter_results() {
+    if !backend_available() {
+        return;
+    }
+    let support = r#"module reader_support
+import std.xml
+pub fn next_name(borrow mut reader: xml.reader) -> str {
+  reader.next()
+  return reader.name()
+}
+pub fn twice(borrow mut reader: xml.reader) -> str {
+  first := next_name(reader)
+  return next_name(reader)
+}
+"#;
+    let main = r#"import std.xml
+import reader_support
+fn main() -> Result<(), Error> {
+  mut reader := xml.parse("<root x='value'><leaf/></root>".clone())?
+  reader.next()
+  value := reader.attribute_value(0)
+  print(reader_support.twice(reader))
+  print(reader_support.next_name(reader))
+  print(value)
+  return Ok(())
+}
+"#;
+    let files = &[("reader_support.align", support), ("main.align", main)];
+    let checked = diff_check_multi("xml-advanced-reader-summary", files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole: {}\nper-unit: {}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let summary = checked
+        .per_unit
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "reader_support")
+        .expect("reader support summary");
+    for function in summary
+        .fns
+        .iter()
+        .filter(|function| matches!(function.name.as_str(), "next_name" | "twice"))
+    {
+        assert_eq!(
+            function.return_borrow,
+            align_sema::hir::ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            }
+        );
+        assert_eq!(
+            function.return_region,
+            align_sema::hir::ReturnRegionSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            }
+        );
+    }
+    let invalid = main
+        .replace(
+            "print(reader_support.twice(reader))",
+            "old := reader_support.twice(reader)",
+        )
+        .replace("print(value)", "print(value); print(old)");
+    let rejected = diff_check_multi(
+        "xml-advanced-reader-expired",
+        &[("reader_support.align", support), ("main.align", &invalid)],
+        "main.align",
+    );
+    assert!(
+        rejected.whole_errors
+            && rejected.per_unit_errors
+            && rejected.whole_diags.contains("invalidated")
+            && rejected.per_unit_diags.contains("invalidated"),
+        "whole: {}\nper-unit: {}",
+        rejected.whole_diags,
+        rejected.per_unit_diags
+    );
+    for output in [
+        build_and_run_multi("xml-advanced-reader-whole", files, "main.align"),
+        build_per_unit_multi("xml-advanced-reader-units", files, "main.align").link_and_run(),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "leaf\nroot\nvalue\n"
+        );
+    }
+}
+
+#[test]
 fn xml_reader_crosses_generic_result_sum_and_per_unit_interfaces() {
     let files = &[
         (
@@ -582,7 +788,9 @@ pub fn main() -> Result<(), Error> {
         "xml_text",
     ] {
         assert!(
-            llvm.contains(&format!("%{operation}.valid = icmp eq i32 %{operation}.status, 0")),
+            llvm.contains(&format!(
+                "%{operation}.valid = icmp eq i32 %{operation}.status, 0"
+            )),
             "{operation} must accept only zero:\n{llvm}"
         );
         assert!(

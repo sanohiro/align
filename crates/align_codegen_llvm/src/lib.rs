@@ -4288,6 +4288,33 @@ fn require_xml_presence(state: Option<XmlProducerState>) -> Option<XmlProducerSt
     })
 }
 
+fn xml_event_definition_valid(program: &Program, event_enum: u32) -> bool {
+    let Some(definition) = program.enums.get(event_enum as usize) else {
+        return false;
+    };
+    const NAMES: [&str; 3] = ["Start", "End", "Text"];
+    program
+        .enums
+        .iter()
+        .filter(|candidate| {
+            candidate.name == "xml.event" || candidate.source_name == "xml.event"
+        })
+        .count()
+        == 1
+        && definition.name == "xml.event"
+        && definition.source_name == "xml.event"
+        && definition.variants.len() == NAMES.len()
+        && definition
+            .variants
+            .iter()
+            .zip(NAMES)
+            .all(|(variant, expected)| {
+                variant.name == expected
+                    && variant.payload.is_empty()
+                    && variant.field_base == 1
+            })
+}
+
 fn xml_argument_access(function: &align_mir::Function, index: u32) -> XmlAccessProvenance {
     match function.param_modes.get(index as usize) {
         Some(align_ast::ParamMode::ByValue) => XmlAccessProvenance::Owned,
@@ -4330,6 +4357,7 @@ struct XmlAccessEquation {
     invalid: bool,
     absent: bool,
     require_present: bool,
+    guarded_absence: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -4841,339 +4869,6 @@ fn xml_direct_call_facts(
     found
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum XmlProducerVariantClass {
-    Graph,
-    Irrelevant,
-}
-
-fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
-    match rvalue {
-        Rvalue::Use(..)
-        | Rvalue::Load(..)
-        | Rvalue::Un(..)
-        | Rvalue::Cast { .. }
-        | Rvalue::Bin(..)
-        | Rvalue::IntArith { .. }
-        | Rvalue::MathOp { .. }
-        | Rvalue::Call(..)
-        | Rvalue::CallWithCleanup(..)
-        | Rvalue::FnAddr { .. }
-        | Rvalue::Closure { .. }
-        | Rvalue::CallIndirect { .. }
-        | Rvalue::CallIndirectWithCleanup(..)
-        | Rvalue::Field(..)
-        | Rvalue::Select { .. }
-        | Rvalue::OptionSome(..)
-        | Rvalue::OptionNone
-        | Rvalue::OptionIsSome(..)
-        | Rvalue::OptionUnwrap(..)
-        | Rvalue::ResultOk(..)
-        | Rvalue::ResultErr(..)
-        | Rvalue::ResultIsOk(..)
-        | Rvalue::ResultUnwrapOk(..)
-        | Rvalue::ResultUnwrapErr(..)
-        | Rvalue::MakeEnum { .. }
-        | Rvalue::MakeError { .. }
-        | Rvalue::EnumTagEq { .. }
-        | Rvalue::EnumPayload { .. }
-        | Rvalue::StaticData(..)
-        | Rvalue::StaticDescriptorView { .. }
-        | Rvalue::MakeTuple { .. }
-        | Rvalue::TupleIndex { .. }
-        | Rvalue::SliceLen(..)
-        | Rvalue::SubSlice { .. }
-        | Rvalue::StrLit(..)
-        | Rvalue::StrClone(..)
-        | Rvalue::CloneIn { .. }
-        | Rvalue::StrTrim { .. }
-        | Rvalue::BuilderNew { .. }
-        | Rvalue::BuilderToString(..)
-        | Rvalue::TemplateHtmlNew { .. }
-        | Rvalue::TemplateHtmlToString { .. }
-        | Rvalue::Template(..)
-        | Rvalue::FsReadFile { .. }
-        | Rvalue::XmlParse { .. }
-        | Rvalue::XmlNext { .. }
-        | Rvalue::XmlName { .. }
-        | Rvalue::XmlAttributeCount(..)
-        | Rvalue::XmlAttributeName { .. }
-        | Rvalue::XmlAttributeValue { .. }
-        | Rvalue::XmlText { .. }
-        | Rvalue::PathJoin { .. }
-        | Rvalue::PathComponent { .. }
-        | Rvalue::PathNormalize { .. }
-        | Rvalue::EncodingEncode { .. }
-        | Rvalue::RegexReplace { .. }
-        | Rvalue::ArrayBuilderNew { .. }
-        | Rvalue::ArrayBuilderBuild { .. }
-        | Rvalue::CliGetStr { .. }
-        | Rvalue::CliUsage { .. }
-        | Rvalue::RunOutputView { .. }
-        | Rvalue::HttpSseStreamLastEventId { .. }
-        | Rvalue::HttpCtxMethod { .. }
-        | Rvalue::HttpCtxPath { .. }
-        | Rvalue::ResourceViewFromRaw { .. }
-        | Rvalue::ColumnBatchRow { .. }
-        | Rvalue::ColumnBatchSoa { .. }
-        | Rvalue::RawCall { .. }
-        | Rvalue::SoaColumn { .. }
-        | Rvalue::Index(..)
-        | Rvalue::IndexField(..)
-        | Rvalue::IndexFieldPtr { .. }
-        | Rvalue::IndexColumn { .. }
-        | Rvalue::SoaGather { .. }
-        | Rvalue::IndexPtr { .. }
-        | Rvalue::ArenaAlloc { .. }
-        | Rvalue::HeapAllocBuf { .. }
-        | Rvalue::SoaAlloc { .. }
-        | Rvalue::MakeDynArray { .. }
-        | Rvalue::MakeSlice(..)
-        | Rvalue::ConstArray { .. }
-        | Rvalue::SliceIndex(..)
-        | Rvalue::SliceIndexNoalias { .. } => XmlProducerVariantClass::Graph,
-        Rvalue::SqliteCallbackDescriptor(..)
-        | Rvalue::ArenaBegin
-        | Rvalue::TgBegin
-        | Rvalue::SpawnTask { .. }
-        | Rvalue::TgWaitResult { .. }
-        | Rvalue::HeapAlloc(..)
-        | Rvalue::RawAlloc(..)
-        | Rvalue::ColumnBatchCreate { .. }
-        | Rvalue::ColumnBatchAppend { .. }
-        | Rvalue::RawNull
-        | Rvalue::RawLoad { .. }
-        | Rvalue::RawPointerLoad { .. }
-        | Rvalue::RawOffset { .. }
-        | Rvalue::RawIsNull(..)
-        | Rvalue::ResourceFromRaw { .. }
-        | Rvalue::ResourceBorrow { .. }
-        | Rvalue::ResourceRaw { .. }
-        | Rvalue::ResourceIntoRaw { .. }
-        | Rvalue::BoxGet(..)
-        | Rvalue::BoxClone(..)
-        | Rvalue::MakeVec { .. }
-        | Rvalue::VecExtract { .. }
-        | Rvalue::VecInsert { .. }
-        | Rvalue::VecSumWhere { .. }
-        | Rvalue::VecDot { .. }
-        | Rvalue::VecMinMax { .. }
-        | Rvalue::VecSum { .. }
-        | Rvalue::MaskAny { .. }
-        | Rvalue::VecLoad { .. }
-        | Rvalue::GroupAgg { .. }
-        | Rvalue::GroupAggStrCols { .. }
-        | Rvalue::GroupAggStr { .. }
-        | Rvalue::GroupAggMultiStr { .. }
-        | Rvalue::DictEncode { .. }
-        | Rvalue::MakeDictEncoded { .. }
-        | Rvalue::DictField { .. }
-        | Rvalue::GatherColumnI64 { .. }
-        | Rvalue::DictLookup { .. }
-        | Rvalue::Chunks { .. }
-        | Rvalue::ParMapParallel { .. }
-        | Rvalue::ParMapReduce { .. }
-        | Rvalue::SlicePtr(..)
-        | Rvalue::StrPredicate { .. }
-        | Rvalue::StrFinderNew { .. }
-        | Rvalue::StrFinderFind { .. }
-        | Rvalue::BuilderWriteStr(..)
-        | Rvalue::BuilderWriteInt(..)
-        | Rvalue::BuilderWriteBool(..)
-        | Rvalue::BuilderWriteChar(..)
-        | Rvalue::BuilderWriteFloat(..)
-        | Rvalue::BuilderWriteStrIntStr(..)
-        | Rvalue::TemplateHtmlWrite { .. }
-        | Rvalue::TemplateHtmlRaw { .. }
-        | Rvalue::JsonEncodeBounded { .. }
-        | Rvalue::JsonDecode { .. }
-        | Rvalue::JsonOwnedDecode { .. }
-        | Rvalue::JsonDecodeArray { .. }
-        | Rvalue::JsonDecodeScalar { .. }
-        | Rvalue::JsonDecodeStructArray { .. }
-        | Rvalue::JsonDecodeSoa { .. }
-        | Rvalue::CsvDecode { .. }
-        | Rvalue::JsonDecodeUnion { .. }
-        | Rvalue::JsonDoc { .. }
-        | Rvalue::JsonDocKind { .. }
-        | Rvalue::JsonDocGet { .. }
-        | Rvalue::JsonDocAt { .. }
-        | Rvalue::JsonDocAsStr { .. }
-        | Rvalue::JsonDocAsScalar { .. }
-        | Rvalue::JsonDocLen { .. }
-        | Rvalue::JsonDocKey { .. }
-        | Rvalue::JsonDocElems { .. }
-        | Rvalue::JsonScanNew { .. }
-        | Rvalue::JsonScanNext { .. }
-        | Rvalue::ReaderOpen { .. }
-        | Rvalue::ReaderOpenBeneath { .. }
-        | Rvalue::WriterCreate { .. }
-        | Rvalue::WriterCreateExclusive { .. }
-        | Rvalue::WriterCreateExclusiveBeneath { .. }
-        | Rvalue::ReaderStdin
-        | Rvalue::WriterStd { .. }
-        | Rvalue::ReaderRead(..)
-        | Rvalue::ReaderBuffered(..)
-        | Rvalue::ReaderReadLine(..)
-        | Rvalue::BytesAsStr { .. }
-        | Rvalue::WriterWrite(..)
-        | Rvalue::WriterWriteBuilder(..)
-        | Rvalue::WriterFlush(..)
-        | Rvalue::LogNew(..)
-        | Rvalue::LogEnabled(..)
-        | Rvalue::LogLine(..)
-        | Rvalue::LogLineBuilder(..)
-        | Rvalue::LogFlush(..)
-        | Rvalue::CodecOpen(..)
-        | Rvalue::CodecBatchRows(..)
-        | Rvalue::CodecBatchColumns(..)
-        | Rvalue::CodecBatchName(..)
-        | Rvalue::CodecBatchKind(..)
-        | Rvalue::CodecBatchFind(..)
-        | Rvalue::CodecBatchColumn { .. }
-        | Rvalue::CodecColumnLen(..)
-        | Rvalue::CodecColumnAt { .. }
-        | Rvalue::CodecEncoderNew { .. }
-        | Rvalue::CodecEncoderPut { .. }
-        | Rvalue::CodecEncoderFinish(..)
-        | Rvalue::FrameInnerJoin { .. }
-        | Rvalue::IoCopy(..)
-        | Rvalue::FileCreateRw { .. }
-        | Rvalue::FileOpenRw { .. }
-        | Rvalue::FilePread { .. }
-        | Rvalue::FilePwrite { .. }
-        | Rvalue::FileLen { .. }
-        | Rvalue::BufferNew(..)
-        | Rvalue::BufferBytes(..)
-        | Rvalue::BufferLen(..)
-        | Rvalue::BufferCapacity(..)
-        | Rvalue::BytesRead { .. }
-        | Rvalue::BufferPut { .. }
-        | Rvalue::BufferAppend { .. }
-        | Rvalue::ArrayBuilderPush { .. }
-        | Rvalue::ArrayBuilderPushStr { .. }
-        | Rvalue::ArrayBuilderAppend { .. }
-        | Rvalue::FsWriteFile { .. }
-        | Rvalue::FsWriteFileBuilder { .. }
-        | Rvalue::FsExists { .. }
-        | Rvalue::FsRemove { .. }
-        | Rvalue::RenameNoReplace { .. }
-        | Rvalue::FsReadDir { .. }
-        | Rvalue::DnsResolve { .. }
-        | Rvalue::TcpConnect { .. }
-        | Rvalue::ConnReader(..)
-        | Rvalue::ConnWriter(..)
-        | Rvalue::TcpReadTimeout { .. }
-        | Rvalue::TcpWriteTimeout { .. }
-        | Rvalue::TcpListen { .. }
-        | Rvalue::TcpAccept { .. }
-        | Rvalue::UdpBind { .. }
-        | Rvalue::UdpSendTo { .. }
-        | Rvalue::UdpRecvFrom { .. }
-        | Rvalue::ProcessSpawn { .. }
-        | Rvalue::ChildWait { .. }
-        | Rvalue::ChildKill { .. }
-        | Rvalue::ProcessExec { .. }
-        | Rvalue::FsReadFileView { .. }
-        | Rvalue::FsReadBytesView { .. }
-        | Rvalue::EnvGet { .. }
-        | Rvalue::EnvSet { .. }
-        | Rvalue::TimeNow
-        | Rvalue::ProcessCpuCount
-        | Rvalue::TimeInstant
-        | Rvalue::TimeSleep { .. }
-        | Rvalue::RegexCompile { .. }
-        | Rvalue::RegexIsMatch { .. }
-        | Rvalue::RegexFind { .. }
-        | Rvalue::RegexFindAll { .. }
-        | Rvalue::RegexSplit { .. }
-        | Rvalue::RegexCaptures { .. }
-        | Rvalue::RegexGroupCount { .. }
-        | Rvalue::RegexGroupIndex { .. }
-        | Rvalue::CapturesGroup { .. }
-        | Rvalue::EncodingDecode { .. }
-        | Rvalue::CompressCompress { .. }
-        | Rvalue::CompressDecompress { .. }
-        | Rvalue::Utf8Valid { .. }
-        | Rvalue::CryptoCtEqual { .. }
-        | Rvalue::CryptoRandom { .. }
-        | Rvalue::CryptoHash { .. }
-        | Rvalue::CryptoHmac { .. }
-        | Rvalue::CryptoHkdf { .. }
-        | Rvalue::CryptoAead { .. }
-        | Rvalue::CryptoArgon2(..)
-        | Rvalue::CryptoPrivateKeyFromPem { .. }
-        | Rvalue::CryptoPublicKeyFromPem { .. }
-        | Rvalue::CryptoPublicKeyFromJwk(..)
-        | Rvalue::CryptoSign { .. }
-        | Rvalue::CryptoVerify(..)
-        | Rvalue::RandSeed { .. }
-        | Rvalue::RandNext { .. }
-        | Rvalue::RandRange { .. }
-        | Rvalue::RandShuffle { .. }
-        | Rvalue::RandSample { .. }
-        | Rvalue::CliCommand { .. }
-        | Rvalue::CliFlag { .. }
-        | Rvalue::CliParse { .. }
-        | Rvalue::CliGetBool { .. }
-        | Rvalue::CliGetI64 { .. }
-        | Rvalue::HttpRequest { .. }
-        | Rvalue::HttpHeader { .. }
-        | Rvalue::HttpBody { .. }
-        | Rvalue::HttpRequestTimeout { .. }
-        | Rvalue::HttpRequestMaxResponseBodyBytes { .. }
-        | Rvalue::HttpClientTimeout { .. }
-        | Rvalue::HttpClientMaxResponseBodyBytes { .. }
-        | Rvalue::Command { .. }
-        | Rvalue::CommandCwd { .. }
-        | Rvalue::CommandTimeout { .. }
-        | Rvalue::CommandMaxCapture { .. }
-        | Rvalue::CommandEnv { .. }
-        | Rvalue::CommandEnvClear { .. }
-        | Rvalue::CommandRun { .. }
-        | Rvalue::CommandRunBytes { .. }
-        | Rvalue::RunOutputCode { .. }
-        | Rvalue::RunBytesCode { .. }
-        | Rvalue::RunBytesView { .. }
-        | Rvalue::HttpParse { .. }
-        | Rvalue::HttpRespStatus { .. }
-        | Rvalue::HttpRespHeader { .. }
-        | Rvalue::HttpRespBody { .. }
-        | Rvalue::HttpClient
-        | Rvalue::HttpClientGet { .. }
-        | Rvalue::HttpClientPost { .. }
-        | Rvalue::HttpClientRequest { .. }
-        | Rvalue::HttpClientRequestStream { .. }
-        | Rvalue::HttpReadStreamStatus { .. }
-        | Rvalue::HttpReadStreamHeader { .. }
-        | Rvalue::HttpReadStreamRead { .. }
-        | Rvalue::HttpReadStreamSse { .. }
-        | Rvalue::HttpSseStreamRetryMs { .. }
-        | Rvalue::HttpSseStreamNext { .. }
-        | Rvalue::HttpGetMany { .. }
-        | Rvalue::HttpServe { .. }
-        | Rvalue::HttpAccept { .. }
-        | Rvalue::HttpCtxHeader { .. }
-        | Rvalue::HttpHeadersCount { .. }
-        | Rvalue::HttpHeadersTokensValid { .. }
-        | Rvalue::HttpHeadersContainsToken { .. }
-        | Rvalue::HttpCtxUpgradeReady { .. }
-        | Rvalue::HttpCtxBody { .. }
-        | Rvalue::HttpResponseBuilder { .. }
-        | Rvalue::HttpRbHeader { .. }
-        | Rvalue::HttpRbBody { .. }
-        | Rvalue::HttpRespond { .. }
-        | Rvalue::HttpRespondStream { .. }
-        | Rvalue::HttpRespondUpgrade { .. }
-        | Rvalue::HttpUpgradeReadExact { .. }
-        | Rvalue::HttpUpgradeWrite { .. }
-        | Rvalue::HttpUpgradeDeadline { .. }
-        | Rvalue::HttpUpgradeShutdown { .. }
-        | Rvalue::HttpStreamSend { .. }
-        | Rvalue::HttpStreamFinish { .. }
-        | Rvalue::HttpStreamReject { .. } => XmlProducerVariantClass::Irrelevant,
-    }
-}
 
 fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
     matches!(
@@ -5741,6 +5436,67 @@ impl<'a> XmlAccessAnalyzer<'a> {
             })
     }
 
+    fn extraction_guard_matches(&self, result: ValueId, operand: &Operand, selected: &XmlAccessPathSegment) -> bool {
+        let (count, selected_tag) = match selected {
+            XmlAccessPathSegment::OptionSome | XmlAccessPathSegment::ResultOk => (2, 1),
+            XmlAccessPathSegment::ResultErr => (2, 0),
+            XmlAccessPathSegment::EnumPayload { enum_id, variant, .. } => {
+                let Some(count) = self.graph.program.enums.get(*enum_id as usize)
+                    .and_then(|definition| u32::try_from(definition.variants.len()).ok())
+                else { return false; };
+                (count, *variant)
+            }
+            _ => return false,
+        };
+        let function = self.graph.function;
+        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
+            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
+        )) else { return false; };
+        let same_operand = |candidate: &Operand| matches!((candidate, operand),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b);
+        let mut pending = vec![(block.id, (0..count).collect::<Vec<_>>() )];
+        let mut visited = HashSet::new();
+        let mut proved = false;
+        while let Some((block, allowed)) = pending.pop() {
+            if allowed.iter().all(|tag| *tag == selected_tag) {
+                proved = true;
+                continue;
+            }
+            if block == function.entry { return false; }
+            if !visited.insert((block, allowed.clone())) { continue; }
+            let mut has_predecessor = false;
+            for predecessor in &function.blocks {
+                let (condition, yes, no) = match &predecessor.term {
+                    Term::Goto(target) if *target == block => (None, block, block),
+                    Term::Branch(condition, yes, no) if *yes == block || *no == block => (Some(condition), *yes, *no),
+                    _ => continue,
+                };
+                has_predecessor = true;
+                let mut allowed = allowed.clone();
+                if yes != no
+                    && let Some(Operand::Value(condition)) = condition
+                    && function.value_tys.get(*condition as usize) == Some(&Ty::Bool)
+                    && predecessor.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if value == condition))
+                    && let Some(Some(predicate)) = self.graph.value_definitions.get(*condition as usize)
+                {
+                    let tested = match (predicate, selected) {
+                        (Rvalue::OptionIsSome(value), XmlAccessPathSegment::OptionSome) if same_operand(value) => Some(1),
+                        (Rvalue::ResultIsOk(value), XmlAccessPathSegment::ResultOk | XmlAccessPathSegment::ResultErr) if same_operand(value) => Some(1),
+                        (Rvalue::EnumTagEq { enum_id, scrutinee, variant }, XmlAccessPathSegment::EnumPayload { enum_id: expected, .. })
+                            if enum_id == expected && same_operand(scrutinee) && *variant < count => Some(*variant),
+                        _ => None,
+                    };
+                    if let Some(tested) = tested {
+                        allowed.retain(|tag| (*tag == tested) == (yes == block));
+                    }
+                }
+                pending.push((predecessor.id, allowed));
+            }
+            if !has_predecessor { return false; }
+        }
+        proved
+    }
+
     fn query_descriptor_row_matches(&self, descriptor: u32, row: u32) -> bool {
         let program = self.graph.program;
         let Some(definition) = program.structs.get(descriptor as usize) else { return false; };
@@ -6026,19 +5782,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         let definition = (*definition).clone();
         let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
-        if xml_producer_variant_class(&definition) == XmlProducerVariantClass::Irrelevant {
-            if xml_owned_leaf_paths(self.graph.program, result_ty)
-                .is_some_and(|leaves| leaves.is_empty())
-            {
-                // The complete rvalue validator owns this variant's operand and option equation.
-                // This graph may treat it as a readable leaf only after the actual result type is
-                // structurally proven unable to hide a protected producer.
-                equation.seed = Some(XmlAccessProvenance::Owned);
-            } else {
-                equation.invalid = true;
-            }
-            return equation;
-        }
         match definition {
             Rvalue::Use(operand) => {
                 let Some(source_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
@@ -7160,6 +6903,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 } else {
                     equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, &operand,
+                        &XmlAccessPathSegment::EnumPayload { enum_id, variant, slot });
                     let mut selected_path = vec![XmlAccessPathSegment::EnumPayload {
                         enum_id,
                         variant,
@@ -7268,6 +7013,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 } else {
                     equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, &operand,
+                        &XmlAccessPathSegment::OptionSome);
                     let mut selected_path = vec![XmlAccessPathSegment::OptionSome];
                     selected_path.extend(path);
                     let Some(source_selected) =
@@ -7399,6 +7146,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 } else {
                     equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, operand,
+                        &if ok { XmlAccessPathSegment::ResultOk } else { XmlAccessPathSegment::ResultErr });
                     let mut selected_path = vec![if ok {
                         XmlAccessPathSegment::ResultOk
                     } else {
@@ -8319,6 +8068,47 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
+            Rvalue::XmlNext { reader, event_enum } => {
+                if result_ty != Ty::Option(Scalar::Enum(event_enum))
+                    || !xml_event_definition_valid(self.graph.program, event_enum)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    let source = self.check_source(&reader, Ty::XmlReader);
+                    Self::add_required_source(&mut equation, source,
+                        xml_mode_requirement(self.graph.program, Ty::XmlReader, align_ast::ParamMode::BorrowMut));
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::CodecBatchName(batch, index) => {
+                if result_ty != Ty::Option(Scalar::Str)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &batch, Ty::CodecBatch);
+                    self.check_operand(&mut equation, &index, Ty::Int(IntTy { bits: 64, signed: true }));
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::CodecColumnAt { column, index, kind } => {
+                let (column_ty, scalar) = match kind {
+                    hir::CodecPutKind::I64 => (Ty::CodecI64Column, Scalar::Int(IntTy { bits: 64, signed: true })),
+                    hir::CodecPutKind::F64 => (Ty::CodecF64Column, Scalar::Float(FloatTy { bits: 64 })),
+                    hir::CodecPutKind::Bool => (Ty::CodecBoolColumn, Scalar::Bool),
+                    hir::CodecPutKind::Str => (Ty::CodecStrColumn, Scalar::Str),
+                };
+                if result_ty != Ty::Option(scalar)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &column, column_ty);
+                    self.check_operand(&mut equation, &index, Ty::Int(IntTy { bits: 64, signed: true }));
+                    equation.seed = Some(if scalar == Scalar::Str { XmlAccessProvenance::Shared } else { XmlAccessProvenance::Owned });
+                }
+            }
             Rvalue::XmlName { reader } => {
                 if result_ty != Ty::Str
                     || !path.is_empty()
@@ -8428,7 +8218,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     ),
                 };
                 if !relation_matches
-                    || path != payload_path
+                    || !(path.is_empty() || path == payload_path)
                     || xml_operand_base_ty(self.graph.function, &a) != Some(int_ty)
                     || xml_operand_base_ty(self.graph.function, &b) != Some(int_ty)
                 {
@@ -8453,7 +8243,254 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }
                 }
             }
-            _ => equation.invalid = true,
+            // Exhaustive non-protected producers. Keeping this in the equation match
+            // makes a missing semantic producer arm a compiler error, not a fallback.
+            Rvalue::SqliteCallbackDescriptor(..)
+            | Rvalue::ArenaBegin
+            | Rvalue::TgBegin
+            | Rvalue::SpawnTask { .. }
+            | Rvalue::TgWaitResult { .. }
+            | Rvalue::HeapAlloc(..)
+            | Rvalue::RawAlloc(..)
+            | Rvalue::ColumnBatchCreate { .. }
+            | Rvalue::ColumnBatchAppend { .. }
+            | Rvalue::RawNull
+            | Rvalue::RawLoad { .. }
+            | Rvalue::RawPointerLoad { .. }
+            | Rvalue::RawOffset { .. }
+            | Rvalue::RawIsNull(..)
+            | Rvalue::ResourceFromRaw { .. }
+            | Rvalue::ResourceBorrow { .. }
+            | Rvalue::ResourceRaw { .. }
+            | Rvalue::ResourceIntoRaw { .. }
+            | Rvalue::BoxGet(..)
+            | Rvalue::BoxClone(..)
+            | Rvalue::MakeVec { .. }
+            | Rvalue::VecExtract { .. }
+            | Rvalue::VecInsert { .. }
+            | Rvalue::VecSumWhere { .. }
+            | Rvalue::VecDot { .. }
+            | Rvalue::VecMinMax { .. }
+            | Rvalue::VecSum { .. }
+            | Rvalue::MaskAny { .. }
+            | Rvalue::VecLoad { .. }
+            | Rvalue::GroupAgg { .. }
+            | Rvalue::GroupAggStrCols { .. }
+            | Rvalue::GroupAggStr { .. }
+            | Rvalue::GroupAggMultiStr { .. }
+            | Rvalue::DictEncode { .. }
+            | Rvalue::MakeDictEncoded { .. }
+            | Rvalue::DictField { .. }
+            | Rvalue::GatherColumnI64 { .. }
+            | Rvalue::DictLookup { .. }
+            | Rvalue::Chunks { .. }
+            | Rvalue::ParMapParallel { .. }
+            | Rvalue::ParMapReduce { .. }
+            | Rvalue::SlicePtr(..)
+            | Rvalue::StrPredicate { .. }
+            | Rvalue::StrFinderNew { .. }
+            | Rvalue::StrFinderFind { .. }
+            | Rvalue::BuilderWriteStr(..)
+            | Rvalue::BuilderWriteInt(..)
+            | Rvalue::BuilderWriteBool(..)
+            | Rvalue::BuilderWriteChar(..)
+            | Rvalue::BuilderWriteFloat(..)
+            | Rvalue::BuilderWriteStrIntStr(..)
+            | Rvalue::TemplateHtmlWrite { .. }
+            | Rvalue::TemplateHtmlRaw { .. }
+            | Rvalue::JsonEncodeBounded { .. }
+            | Rvalue::JsonDecode { .. }
+            | Rvalue::JsonOwnedDecode { .. }
+            | Rvalue::JsonDecodeArray { .. }
+            | Rvalue::JsonDecodeScalar { .. }
+            | Rvalue::JsonDecodeStructArray { .. }
+            | Rvalue::JsonDecodeSoa { .. }
+            | Rvalue::CsvDecode { .. }
+            | Rvalue::JsonDecodeUnion { .. }
+            | Rvalue::JsonDoc { .. }
+            | Rvalue::JsonDocKind { .. }
+            | Rvalue::JsonDocGet { .. }
+            | Rvalue::JsonDocAt { .. }
+            | Rvalue::JsonDocAsStr { .. }
+            | Rvalue::JsonDocAsScalar { .. }
+            | Rvalue::JsonDocLen { .. }
+            | Rvalue::JsonDocKey { .. }
+            | Rvalue::JsonDocElems { .. }
+            | Rvalue::JsonScanNew { .. }
+            | Rvalue::JsonScanNext { .. }
+            | Rvalue::ReaderOpen { .. }
+            | Rvalue::ReaderOpenBeneath { .. }
+            | Rvalue::WriterCreate { .. }
+            | Rvalue::WriterCreateExclusive { .. }
+            | Rvalue::WriterCreateExclusiveBeneath { .. }
+            | Rvalue::ReaderStdin
+            | Rvalue::WriterStd { .. }
+            | Rvalue::ReaderRead(..)
+            | Rvalue::ReaderBuffered(..)
+            | Rvalue::ReaderReadLine(..)
+            | Rvalue::BytesAsStr { .. }
+            | Rvalue::WriterWrite(..)
+            | Rvalue::WriterWriteBuilder(..)
+            | Rvalue::WriterFlush(..)
+            | Rvalue::LogNew(..)
+            | Rvalue::LogEnabled(..)
+            | Rvalue::LogLine(..)
+            | Rvalue::LogLineBuilder(..)
+            | Rvalue::LogFlush(..)
+            | Rvalue::CodecOpen(..)
+            | Rvalue::CodecBatchRows(..)
+            | Rvalue::CodecBatchColumns(..)
+            | Rvalue::CodecBatchKind(..)
+            | Rvalue::CodecBatchFind(..)
+            | Rvalue::CodecBatchColumn { .. }
+            | Rvalue::CodecColumnLen(..)
+            | Rvalue::CodecEncoderNew { .. }
+            | Rvalue::CodecEncoderPut { .. }
+            | Rvalue::CodecEncoderFinish(..)
+            | Rvalue::FrameInnerJoin { .. }
+            | Rvalue::IoCopy(..)
+            | Rvalue::FileCreateRw { .. }
+            | Rvalue::FileOpenRw { .. }
+            | Rvalue::FilePread { .. }
+            | Rvalue::FilePwrite { .. }
+            | Rvalue::FileLen { .. }
+            | Rvalue::BufferNew(..)
+            | Rvalue::BufferBytes(..)
+            | Rvalue::BufferLen(..)
+            | Rvalue::BufferCapacity(..)
+            | Rvalue::BytesRead { .. }
+            | Rvalue::BufferPut { .. }
+            | Rvalue::BufferAppend { .. }
+            | Rvalue::ArrayBuilderPush { .. }
+            | Rvalue::ArrayBuilderPushStr { .. }
+            | Rvalue::ArrayBuilderAppend { .. }
+            | Rvalue::FsWriteFile { .. }
+            | Rvalue::FsWriteFileBuilder { .. }
+            | Rvalue::FsExists { .. }
+            | Rvalue::FsRemove { .. }
+            | Rvalue::RenameNoReplace { .. }
+            | Rvalue::FsReadDir { .. }
+            | Rvalue::DnsResolve { .. }
+            | Rvalue::TcpConnect { .. }
+            | Rvalue::ConnReader(..)
+            | Rvalue::ConnWriter(..)
+            | Rvalue::TcpReadTimeout { .. }
+            | Rvalue::TcpWriteTimeout { .. }
+            | Rvalue::TcpListen { .. }
+            | Rvalue::TcpAccept { .. }
+            | Rvalue::UdpBind { .. }
+            | Rvalue::UdpSendTo { .. }
+            | Rvalue::UdpRecvFrom { .. }
+            | Rvalue::ProcessSpawn { .. }
+            | Rvalue::ChildWait { .. }
+            | Rvalue::ChildKill { .. }
+            | Rvalue::ProcessExec { .. }
+            | Rvalue::FsReadFileView { .. }
+            | Rvalue::FsReadBytesView { .. }
+            | Rvalue::EnvGet { .. }
+            | Rvalue::EnvSet { .. }
+            | Rvalue::TimeNow
+            | Rvalue::ProcessCpuCount
+            | Rvalue::TimeInstant
+            | Rvalue::TimeSleep { .. }
+            | Rvalue::RegexCompile { .. }
+            | Rvalue::RegexIsMatch { .. }
+            | Rvalue::RegexFind { .. }
+            | Rvalue::RegexFindAll { .. }
+            | Rvalue::RegexSplit { .. }
+            | Rvalue::RegexCaptures { .. }
+            | Rvalue::RegexGroupCount { .. }
+            | Rvalue::RegexGroupIndex { .. }
+            | Rvalue::CapturesGroup { .. }
+            | Rvalue::EncodingDecode { .. }
+            | Rvalue::CompressCompress { .. }
+            | Rvalue::CompressDecompress { .. }
+            | Rvalue::Utf8Valid { .. }
+            | Rvalue::CryptoCtEqual { .. }
+            | Rvalue::CryptoRandom { .. }
+            | Rvalue::CryptoHash { .. }
+            | Rvalue::CryptoHmac { .. }
+            | Rvalue::CryptoHkdf { .. }
+            | Rvalue::CryptoAead { .. }
+            | Rvalue::CryptoArgon2(..)
+            | Rvalue::CryptoPrivateKeyFromPem { .. }
+            | Rvalue::CryptoPublicKeyFromPem { .. }
+            | Rvalue::CryptoPublicKeyFromJwk(..)
+            | Rvalue::CryptoSign { .. }
+            | Rvalue::CryptoVerify(..)
+            | Rvalue::RandSeed { .. }
+            | Rvalue::RandNext { .. }
+            | Rvalue::RandRange { .. }
+            | Rvalue::RandShuffle { .. }
+            | Rvalue::RandSample { .. }
+            | Rvalue::CliCommand { .. }
+            | Rvalue::CliFlag { .. }
+            | Rvalue::CliParse { .. }
+            | Rvalue::CliGetBool { .. }
+            | Rvalue::CliGetI64 { .. }
+            | Rvalue::HttpRequest { .. }
+            | Rvalue::HttpHeader { .. }
+            | Rvalue::HttpBody { .. }
+            | Rvalue::HttpRequestTimeout { .. }
+            | Rvalue::HttpRequestMaxResponseBodyBytes { .. }
+            | Rvalue::HttpClientTimeout { .. }
+            | Rvalue::HttpClientMaxResponseBodyBytes { .. }
+            | Rvalue::Command { .. }
+            | Rvalue::CommandCwd { .. }
+            | Rvalue::CommandTimeout { .. }
+            | Rvalue::CommandMaxCapture { .. }
+            | Rvalue::CommandEnv { .. }
+            | Rvalue::CommandEnvClear { .. }
+            | Rvalue::CommandRun { .. }
+            | Rvalue::CommandRunBytes { .. }
+            | Rvalue::RunOutputCode { .. }
+            | Rvalue::RunBytesCode { .. }
+            | Rvalue::RunBytesView { .. }
+            | Rvalue::HttpParse { .. }
+            | Rvalue::HttpRespStatus { .. }
+            | Rvalue::HttpRespHeader { .. }
+            | Rvalue::HttpRespBody { .. }
+            | Rvalue::HttpClient
+            | Rvalue::HttpClientGet { .. }
+            | Rvalue::HttpClientPost { .. }
+            | Rvalue::HttpClientRequest { .. }
+            | Rvalue::HttpClientRequestStream { .. }
+            | Rvalue::HttpReadStreamStatus { .. }
+            | Rvalue::HttpReadStreamHeader { .. }
+            | Rvalue::HttpReadStreamRead { .. }
+            | Rvalue::HttpReadStreamSse { .. }
+            | Rvalue::HttpSseStreamRetryMs { .. }
+            | Rvalue::HttpSseStreamNext { .. }
+            | Rvalue::HttpGetMany { .. }
+            | Rvalue::HttpServe { .. }
+            | Rvalue::HttpAccept { .. }
+            | Rvalue::HttpCtxHeader { .. }
+            | Rvalue::HttpHeadersCount { .. }
+            | Rvalue::HttpHeadersTokensValid { .. }
+            | Rvalue::HttpHeadersContainsToken { .. }
+            | Rvalue::HttpCtxUpgradeReady { .. }
+            | Rvalue::HttpCtxBody { .. }
+            | Rvalue::HttpResponseBuilder { .. }
+            | Rvalue::HttpRbHeader { .. }
+            | Rvalue::HttpRbBody { .. }
+            | Rvalue::HttpRespond { .. }
+            | Rvalue::HttpRespondStream { .. }
+            | Rvalue::HttpRespondUpgrade { .. }
+            | Rvalue::HttpUpgradeReadExact { .. }
+            | Rvalue::HttpUpgradeWrite { .. }
+            | Rvalue::HttpUpgradeDeadline { .. }
+            | Rvalue::HttpUpgradeShutdown { .. }
+            | Rvalue::HttpStreamSend { .. }
+            | Rvalue::HttpStreamFinish { .. }
+            | Rvalue::HttpStreamReject { .. } => {
+                if xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty())
+                {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    equation.invalid = true;
+                }
+            }
         }
         equation
     }
@@ -9198,7 +9235,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 } else {
                     next
                 };
-                let next = if equation.require_present {
+                let next = if equation.guarded_absence && next == Some(XmlProducerState::Absent) {
+                    next
+                } else if equation.require_present {
                     require_xml_presence(next)
                 } else {
                     next
@@ -9748,32 +9787,6 @@ fn validate_resource_rvalues_component(
     component: &[usize],
     local_contracts: &HashSet<ProgramCall>,
 ) -> Result<(), CodegenError> {
-    let xml_event_definition_valid = |event_enum: u32| {
-        let Some(definition) = program.enums.get(event_enum as usize) else {
-            return false;
-        };
-        const NAMES: [&str; 3] = ["Start", "End", "Text"];
-        program
-            .enums
-            .iter()
-            .filter(|candidate| {
-                candidate.name == "xml.event" || candidate.source_name == "xml.event"
-            })
-            .count()
-            == 1
-            && definition.name == "xml.event"
-            && definition.source_name == "xml.event"
-            && definition.variants.len() == NAMES.len()
-            && definition
-                .variants
-                .iter()
-                .zip(NAMES)
-                .all(|(variant, expected)| {
-                    variant.name == expected
-                        && variant.payload.is_empty()
-                        && variant.field_base == 1
-                })
-    };
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
             align_mir::Operand::Const(align_mir::Const::Int(_, ty))
@@ -10442,7 +10455,7 @@ fn validate_resource_rvalues_component(
                                 )
                             )
                             && result == Ty::Option(Scalar::Enum(*event_enum))
-                            && xml_event_definition_valid(*event_enum)
+                            && xml_event_definition_valid(program, *event_enum)
                     }
                     Rvalue::XmlAttributeCount(reader) => {
                         canonical_xml_value(reader)
@@ -35836,6 +35849,97 @@ fn main() -> i32 = 0
                     .contains("resource operation contract mismatch"),
                 "unexpected diagnostic: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn producer_equations_preserve_guarded_absence_and_scalar_view_siblings() {
+        for source in [
+            "fn selected() -> string { value: Option<string> := None; return value else \"fallback\".clone() }",
+            "fn selected() -> string { value: Result<string, string> := Err(\"error\".clone()); return match value { Ok(text) => text, Err(error) => error } }",
+            "Choice { A(string), B(string) }\nfn selected() -> string { value := Choice.A(\"alpha\".clone()); return match value { A(text) => text, B(text) => text } }",
+            "import core.codec\nfn selected(batch: codec.batch) -> Option<str> = batch.name(0)",
+            "import core.codec\nfn selected(column: codec.str_column) -> Option<str> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.i64_column) -> Option<i64> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.f64_column) -> Option<f64> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.bool_column) -> Option<bool> = column.at(0)",
+            "import std.xml\nObservation { event: Option<xml.event>, label: string }\nfn selected(borrow mut reader: xml.reader) -> Observation = Observation { event: reader.next(), label: \"label\".clone() }",
+            "import std.xml\nfn selected(borrow reader: xml.reader, index: i64) -> string { checked := index.checked_add(1); return reader.attribute_value(checked else 0) }",
+        ] {
+            let program = mir(&format!("{source}\nfn main() -> i32 = 0\n"));
+            let result = validate_mir_producers(&program);
+            assert!(result.is_ok(), "producer sibling {source}: {result:?}");
+        }
+        let program = mir("fn selected() -> string { value: Option<string> := None; return value else \"fallback\".clone() }\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "selected");
+        let mut unguarded = program.clone();
+        for block in &mut unguarded.fns[owner].blocks {
+            if let Term::Branch(_, yes, _) = block.term {
+                block.term = Term::Goto(yes);
+                break;
+            }
+        }
+        assert_xml_producer_rejected(&unguarded, "unguarded-absent-payload");
+        let mut wrong_predicate = program.clone();
+        for block in &mut wrong_predicate.fns[owner].blocks {
+            if let Term::Branch(condition, _, _) = &mut block.term {
+                *condition = Operand::Const(Const::Bool(true));
+                break;
+            }
+        }
+        assert_xml_producer_rejected(&wrong_predicate, "unrelated-absence-guard");
+
+        let program = mir("fn selected(other: Option<string>) -> string { value: Option<string> := None; return value else \"fallback\".clone() }\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "selected");
+        let mut wrong_operand = program.clone();
+        let mut changed = false;
+        for block in &mut wrong_operand.fns[owner].blocks {
+            for statement in &mut block.stmts {
+                if let Stmt::Let(_, Rvalue::OptionIsSome(operand)) = statement {
+                    *operand = Operand::Arg(0);
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed);
+        assert_xml_producer_rejected(&wrong_operand, "different-ssa-absence-guard");
+
+        for source in [
+            "import core.codec\nfn selected(batch: codec.batch) -> Option<str> = batch.name(0)",
+            "import core.codec\nfn selected(column: codec.str_column) -> Option<str> = column.at(0)",
+        ] {
+            let program = mir(&format!("{source}\nfn main() -> i32 = 0\n"));
+            let owner = xml_test_function(&program, "selected");
+            for axis in ["index", "base", "result", "kind"] {
+                let mut malformed = program.clone();
+                let function = &mut malformed.fns[owner];
+                let mut changed = false;
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(value, rvalue) = statement else { continue; };
+                        let (base, index) = match rvalue {
+                            Rvalue::CodecBatchName(base, index) => (base, index),
+                            Rvalue::CodecColumnAt { column, index, kind } => {
+                                if axis == "kind" { *kind = hir::CodecPutKind::Bool; }
+                                (column, index)
+                            }
+                            _ => continue,
+                        };
+                        match axis {
+                            "index" => *index = Operand::Const(Const::Bool(false)),
+                            "base" => *base = Operand::Const(Const::Bool(false)),
+                            "result" => function.value_tys[*value as usize] = Ty::Option(Scalar::Bool),
+                            "kind" if source.contains("batch.name") => continue,
+                            "kind" => {},
+                            _ => panic!("unknown codec mutation"),
+                        }
+                        changed = true;
+                    }
+                }
+                if axis == "kind" && source.contains("batch.name") { continue; }
+                assert!(changed);
+                assert_xml_producer_rejected(&malformed, axis);
+            }
         }
     }
 
