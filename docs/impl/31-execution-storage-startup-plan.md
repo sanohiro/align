@@ -1,12 +1,14 @@
 # Execution, Storage, and Startup Optimization Plan
 
-> **Status:** UMBRELLA DESIGNED; every slice remains unapproved and
-> unscheduled. No implementation slice is active.
+> **Status:** UMBRELLA DESIGNED; implementation slices remain unapproved.
+> Post-XML qualification schedules S0A/S0B exact design first. No implementation
+> slice is active.
 >
-> **Queue position:** `HANDOFF.md` remains the live work queue. `core.codec`
-> remains the next language capability. This track consumes no language
-> milestone and must not displace that work without an explicit scheduling
-> decision.
+> **Queue position:** `HANDOFF.md` remains the live work queue.
+> `32-post-xml-consolidation-plan.md` records the owner's 2026-09-05 scheduling
+> decision: finish `std.xml` and its intended release if pursued, qualify the
+> baseline with packet 33, then design S0A/S0B. This track consumes no language
+> milestone; scheduling does not approve a slice's missing contract.
 >
 > **Contract boundary:** this document approves no syntax, language semantic,
 > library API, CLI, runtime ABI, environment variable, persisted profile, or
@@ -30,7 +32,7 @@ needs them, and admit each new strategy from measured evidence.
 The original proposal is accepted only with the corrections in this plan. In
 particular, virtual `chunks` lowering and byte/work-aware parallel grain already
 exist in narrower forms; runtime partitioning and hot/cold guidance are already
-recorded deferrals; `std.log` is implemented; and `core.codec` remains next.
+recorded deferrals; and `std.log` and `core.codec` are implemented.
 This document consolidates those tracks without taking ownership away from
 their narrower plans.
 
@@ -56,6 +58,8 @@ Read the narrow owner before scheduling a slice:
 21-build-perf-plan.md
 22-repl-plan.md
 23-friction-ledger.md
+32-post-xml-consolidation-plan.md
+33-consolidation-baseline-packet.md
 ```
 
 This plan owns only:
@@ -342,7 +346,7 @@ their individual gates are met.
 
 ### S0A — Parent-measured startup baseline
 
-**Status:** ELIGIBLE FOR A SLICE LEDGER; not scheduled.
+**Status:** EXACT DESIGN NEXT AFTER V0; implementation unapproved.
 
 Create a benchmark family that measures from the parent immediately before
 process creation through child observation/reap. An in-program clock is not a
@@ -432,7 +436,7 @@ independent design review before implementation.
 
 ### S0B — Current-decision observation
 
-**Status:** DESIGN-DEPENDENT; not scheduled.
+**Status:** EXACT DESIGN NEXT AFTER V0; implementation unapproved.
 
 Instrument existing selectors at their actual decision points and collect
 only the facts they already use. Generated code must remain byte-for-byte
@@ -770,8 +774,9 @@ into a flaky timing gate.
 
 ## 9. Scheduling rules
 
-1. `HANDOFF.md` continues to name `core.codec` as the next language capability.
-   This track remains independent and consumes no milestone.
+1. `HANDOFF.md` owns the live task. Plan 32 selects post-XML/release baseline
+   qualification, then S0A/S0B exact design and observation. This track consumes
+   no language milestone and does not interrupt the XML owner's work.
 2. S0A and S0B are independently useful capabilities and may be promoted
    separately. Neither requires S1.
 3. S0B cannot begin until the exact `09-explain-opt.md` extension is reviewed.

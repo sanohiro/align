@@ -7,6 +7,17 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
+library work. If its owner proceeds with the intended release, complete that
+release before binding the consolidation baseline; this preparation does not
+select or publish a version. Then execute V0 in
+[`docs/impl/33-consolidation-baseline-packet.md`](docs/impl/33-consolidation-baseline-packet.md).
+[`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
+owns the sequence: baseline qualification -> S0A/S0B exact design and observation
+-> one bounded consolidation -> an evidence-selected optimization if needed ->
+reassessment. `std.time` named formatters, cloud packages, and additional
+transports are paused during this phase. S1–S6 are not a mandatory backlog.
+
 _Last updated: 2026-09-04._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
@@ -36,7 +47,8 @@ builder, default escaping, explicit raw write, and consuming zero-copy finisher 
 #939. The next convergence capability, `std.xml`, is designed in
 `docs/impl/std-design/xml.md`: it consumes one UTF-8 string, validates the complete bounded XML 1.0
 profile before publishing a forward reader, rejects every DTD/entity-declaration/PI path, and keeps
-namespaces lexical. Implementation is the next work item; `std.time` named formatters follow it.
+namespaces lexical. Implementation is the current work item; the post-XML
+consolidation transition above replaces the automatic `std.time` follow-up.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.

@@ -3846,15 +3846,18 @@ measure-first optimization track. It approves the direction of reducing byte
 movement, materialization, owner-local working sets, runtime wakes, loaded
 pages, and hot-code footprint while adding no language or library surface.
 
-This track consumes no language milestone and does not replace the live queue.
-`pkg.ws` and `pkg.template` are implemented after `pkg.csv`. The next library capability is selected
-from the remaining independently gated queue below; no unmarked outline is implementation work.
-Promotion of an optimization slice is a separate explicit
-scheduling decision.
+This track consumes no language milestone. The owner-selected post-XML queue is
+[`32-post-xml-consolidation-plan.md`](32-post-xml-consolidation-plan.md): complete
+the `std.xml` PR and, if its owner proceeds, the intended release; then execute
+the existing-tool baseline qualification in
+[`33-consolidation-baseline-packet.md`](33-consolidation-baseline-packet.md).
+S0A/S0B exact design and observation precede one bounded consolidation and an
+optional evidence-selected optimization. `HANDOFF.md` owns the live transition.
+No optimization implementation is approved by this scheduling decision.
 
 ```text
-S0A  parent-measured startup baseline       eligible for an exact slice ledger
-S0B  current-plan explanation               waits for the exact explain-opt contract
+S0A  parent-measured startup baseline       exact slice design after V0
+S0B  current-plan explanation               exact explain-opt design after V0
 S1   extend shipped virtual chunks          first generated-code candidate; measure-first
 S2   straight-line fixed region frames      consumer/evidence-gated
 S3   runtime capability partition           existing deployment/closure trigger-gated
@@ -3864,13 +3867,19 @@ S6   shape input and hot/cold guidance       schema/corpus-gated
 S7+  multiversion/layout/I/O/minimal target  independently deferred
 ```
 
-Only S0A and S0B are candidates for initial promotion. Their benchmark and
-reporting failure domains remain independently mergeable. S1 and later do not
+S0A and S0B are the first scheduled design candidates after qualification. Their
+benchmark and reporting failure domains remain independently mergeable; each
+still needs its exact contract and review before implementation. S1 and later do not
 become implementation work from their position in this list; each first closes
 the public/safety boundary, implementation closure matrix, owner tests, and any
 explicit evidence gate required by the plan.
 
 ## Post-pkg.db library waves (planned; each item gated independently)
+
+**Post-XML pause (2026-09-05):** the remaining library queue below resumes only
+after the bounded consolidation phase closes and the next consumer is selected.
+Finish the current `std.xml` PR and its owner's intended release first. Do not
+automatically start `std.time`, cloud packages, or additional transports.
 
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
 An item without a status is not a committed contract: it becomes a gated design under
@@ -3886,7 +3895,8 @@ pending. This section records their sequencing and status; it does not lock an u
      highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
 2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — IMPLEMENTED 2026-08-30
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
-3. Small pieces: std.xml (well-formed read-only) — DESIGNED 2026-09-05; then std.time named formatters
+3. Small pieces: std.xml (well-formed read-only) — DESIGNED 2026-09-05; current implementation
+     std.time named formatters are paused until post-XML consolidation closes and cloud work is selected
      unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
      (encoding.percent_encode already shipped; only a '/'-passthrough path variant remains)
 4. Transport: mTLS / Unix domain socket / proxy, then HTTP/2
