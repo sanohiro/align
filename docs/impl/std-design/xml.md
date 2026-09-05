@@ -413,6 +413,26 @@ The full post-redesign review reopens the existing-producer closure as one axis:
 | Native view callback closure | The existing checked native view bridges retain their closed `RawPointerLoad` offset/signature relation: batch row at 40 and batch SoA at 48 with the same-plan aborting guard; current row at 48 through the same rows resource; descriptor row at 88 and QueryMeta at 96 through a validated Query descriptor. Exact modes, result, resource/row identity, borrow/region roots, cleanup, and argument types are checked. These unsafe ABI bridges seed only shared Copy views, never owned strings, XML readers, or callables, and receive no body certificate. | Whole/per-unit DB batch/current-row/metadata owners plus `native_view_callbacks_preserve_only_the_closed_shared_result_contract` exercise row/SoA siblings and offset, guard, root, mode, callee, and nominal mutations. |
 | Publication versus emission stage | Interface publication validates typed producer graphs, including callable producers and copied call facts, without generating final callback/parallel-kernel ABI identities. Full callable/native preflight still runs before emission. This preserves consumer-owned diagnostic precedence for imported callback bodies and avoids repeating final ABI construction while publishing dependency summaries. | Existing imported callback signature and transitive parallel-transfer owners retain their original source diagnostics; callback LLVM, per-unit linking, runtime owners, and producer-graph mutation owners remain gates. |
 
+### Native callback identity and observation closure
+
+The native-view repair is reopened on the callback-identity/observation axis.
+Offset and slot identity alone are not proof of either an exact return ABI or
+the value observed after a guard. The boundary remains the existing closed
+native bridges, with shared Copy results and caller-owned unsafe preconditions;
+it does not admit arbitrary raw calls or add another producer certificate.
+
+| Bridge / axis | Required proof before shared provenance | Owner |
+|---|---|---|
+| Descriptor decoder (88) | The complete length-delimited Query nominal identifies the exact result Row; a suffix or an arbitrary string-bearing struct is insufficient. | Native callback mutation owner: distinct result nominal, malformed descriptor argument encoding, and whole/per-unit positive decoder. |
+| QueryMeta (96) | `QueryMetaTypes::resolve` is shared by the thunk producer and MIR consumer: one unique package nominal, all 24 exact fields, enum tags, and layout own the return ABI. | `native_metadata_views_use_the_producers_exact_layout_authority` mutates nominal, duplicate identity, field type/name/count, enum order, alignment, and descriptor shape; existing metadata DB owners. |
+| Batch row (40), batch SoA (48) | The guard's plan observation occurs in the predecessor before the guard; the plan reload and callback pointer load occur in the success block before the call. No intervening plan store may change either observation. The false edge aborts. | One parameterized row/SoA owner moves either load before the guard, changes the observed slot between load and guard, and changes it between guard and call. |
+| Current row (48) | Callback resource extraction and the borrowed result root observe the same rows resource without an intervening slot replacement. | Native callback owner: resource nominal and replacement between observations. |
+| Transfer / publication | Shared results cannot acquire Move/exclusive authority through return, field projection, or copied call facts; publication and emission retain the same producer rejection. | Existing producer graph owners, native mutation owner, and provisioned DB gate. |
+| Borrowed parameter entry storage | Borrow/BorrowMut parameter slots alias initialized caller storage even without a synthetic prologue Store. The seed preserves the declared authority and still validates all subsequent stores. ByValue/Out slots receive no implicit readable seed. | `borrowed_parameter_slots_have_entry_storage_without_a_prologue_store` covers both modes and malformed replacements; generated DB text/byte binders exercise the actual no-prologue producer. |
+
+The two P1 findings on the native-view candidate are closed against this full
+bridge/observation product, not by checking only the reported offset and call.
+
 ## Deferred surface
 
 The first capability deliberately omits streaming from `io.reader`, incremental/fallible `next`,

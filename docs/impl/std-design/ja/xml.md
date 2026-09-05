@@ -386,6 +386,25 @@ full post-redesign review は existing-producer closure を one axis として�
 | Native view callback closure | 既存 checked native view bridge の closed `RawPointerLoad` offset/signature relation を維持する。batch row は 40、batch SoA は 48 で same-plan aborting guard を必要とし、current row は同じ rows resource 経由の 48、descriptor row は validated Query descriptor 経由の 88、QueryMeta は 96。exact mode、result、resource/row identity、borrow/region root、cleanup、argument type を確認する。unsafe ABI bridge は shared Copy view だけを seedし、owned string、XML reader、callable や body certificate を生成しない。 | whole/per-unit DB batch/current-row/metadata owner と `native_view_callbacks_preserve_only_the_closed_shared_result_contract` が row/SoA sibling、offset、guard、root、mode、callee、nominal mutation を検証。 |
 | Publication versus emission stage | interface publication は callable producer と copied call fact を含む typed producer graph を validateし、最終 callback/parallel-kernel ABI identity は生成しない。full callable/native preflight は emission 前に実行する。imported callback body の consumer-owned diagnostic precedence を維持し、dependency summary 公開時の最終 ABI 構築の重複を避ける。 | 既存 imported callback signature と transitive parallel-transfer owner は本来の source diagnostic を維持。callback LLVM、per-unit link、runtime owner、producer-graph mutation owner は引き続き gate。 |
 
+### Native callback identity and observation closure
+
+native-view 修正は callback-identity/observation axis を再開する。
+offset と slot identity だけでは exact return ABI も guard 後に観測した値も証明しない。
+既存 closed native bridge、shared Copy result、caller-owned unsafe precondition を維持し、
+任意 raw call や別の producer certificate は追加しない。
+
+| Bridge / axis | shared provenance 前に必要な証明 | Owner |
+|---|---|---|
+| Descriptor decoder (88) | 完全な length-delimited Query nominal が exact result Row を特定する。suffix や任意 string-bearing struct では不十分。 | native callback mutation owner: 別 result nominal、壊れた descriptor argument encoding、whole/per-unit positive decoder。 |
+| QueryMeta (96) | thunk producer と MIR consumer は `QueryMetaTypes::resolve` を共有し、一意な package nominal、24個すべての exact field、enum tag、layout が return ABI を所有する。 | `native_metadata_views_use_the_producers_exact_layout_authority` が nominal、duplicate identity、field type/name/count、enum order、alignment、descriptor shape を変更。既存 metadata DB owner。 |
+| Batch row (40), batch SoA (48) | guard の plan observation は predecessor の guard 前、plan reload と callback pointer load は success block の call 前にある。途中の plan store は両 observation を変更できず false edge は abort。 | parameterized row/SoA owner が各 load の guard 前移動、load と guard 間および guard と call 間の slot 変更を検証。 |
+| Current row (48) | callback resource extraction と borrowed result root は途中の slot replacement なしに同じ rows resource を観測する。 | native callback owner: resource nominal と observation 間 replacement。 |
+| Transfer / publication | shared result は return、field projection、copied call fact 経由で Move/exclusive authority を得ない。publication と emission は同じ producer rejection を維持。 | 既存 producer graph owner、native mutation owner、provisioned DB gate。 |
+| Borrowed parameter entry storage | Borrow/BorrowMut parameter slot は合成 prologue Store がなくても初期化済み caller storage を aliasする。seed は宣言された authority を維持し、後続の全 store を検証する。ByValue/Out slot には暗黙 readable seed を与えない。 | `borrowed_parameter_slots_have_entry_storage_without_a_prologue_store` が両 mode と不正 replacement を検証し、生成 DB text/byte binder が実際の no-prologue producer を実行する。 |
+
+native-view candidate の P1 2件は報告された offset と call だけでなく、この bridge/observation
+product 全体で閉じる。
+
 ## Deferred surface
 
 `io.reader` streaming、incremental/fallible `next`、caller-buffer text decode、raw span/source location、

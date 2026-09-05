@@ -17,6 +17,8 @@ pub mod thinlto;
 
 mod drop_codegen;
 mod llvm_build_id;
+mod query_meta_layout;
+pub use query_meta_layout::QueryMetaTypes;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
@@ -5690,12 +5692,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
-    fn batch_plan_guard_matches(&self, result: ValueId, plan: &Operand) -> bool {
+    fn batch_plan_guard_matches(&self, result: ValueId, callee: ValueId, plan: &Operand) -> bool {
         let Some(plan_slot) = self.load_slot(plan) else { return false; };
         let function = self.graph.function;
         let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
             |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
         )) else { return false; };
+        let position = |block: &Block, value: ValueId| block.stmts.iter().position(
+            |statement| matches!(statement, Stmt::Let(id, _) if *id == value)
+        );
+        let Operand::Value(plan_value) = plan else { return false; };
+        let (Some(plan_position), Some(pointer_position), Some(call_position)) =
+            (position(block, *plan_value), position(block, callee), position(block, result))
+        else { return false; };
+        if !(plan_position < pointer_position && pointer_position < call_position) { return false; }
         if block.id == function.entry || block.stmts.iter().any(|statement| {
             matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
         }) { return false; }
@@ -5714,10 +5724,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let Some(condition_position) = predecessor.stmts.iter().position(
             |statement| matches!(statement, Stmt::Let(value, _) if value == condition)
         ) else { return false; };
+        let Some(Operand::Value(guard_plan)) = arguments.first() else { return false; };
+        let Some(guard_plan_position) = position(predecessor, *guard_plan) else { return false; };
         target.as_str() == "pkg.db.internal.resource$batch_plan_valid"
             && arguments.len() == 1
             && self.load_slot(&arguments[0]) == Some(plan_slot)
-            && !predecessor.stmts[condition_position..].iter().any(|statement| {
+            && guard_plan_position < condition_position
+            && !predecessor.stmts[guard_plan_position..].iter().any(|statement| {
                 matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
             })
             && function.blocks.iter().find(|candidate| candidate.id == *no).is_some_and(|failure| {
@@ -5726,6 +5739,48 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), args)) if args.is_empty()
                     ))
             })
+    }
+
+    fn query_descriptor_row_matches(&self, descriptor: u32, row: u32) -> bool {
+        let program = self.graph.program;
+        let Some(definition) = program.structs.get(descriptor as usize) else { return false; };
+        let Some(arguments) = definition.name.strip_prefix("pkg.db$query$S") else { return false; };
+        let Some((length_text, rest)) = arguments.split_once('_') else { return false; };
+        let Ok(length) = length_text.parse::<usize>() else { return false; };
+        if length.to_string() != length_text {
+            return false;
+        }
+        let Some(params) = rest.get(..length) else { return false; };
+        let Some(row_name) = rest.get(length..).and_then(|tail| tail.strip_prefix('$')) else { return false; };
+        let matches_name = |definition: &StructDef, encoded: &str| {
+            let direct = format!("S{}_{}", definition.name.len(), definition.name);
+            let reconstructed = definition.name.replace(['.', '$'], "_");
+            encoded == direct || encoded == format!("S{}_{}", reconstructed.len(), reconstructed)
+        };
+        program.structs.iter().any(|definition| matches_name(definition, &format!("S{length}_{params}")))
+            && program.structs.get(row as usize).is_some_and(|definition| matches_name(definition, row_name))
+    }
+
+    fn same_slot_observation(&self, first: &Operand, second: &Operand) -> bool {
+        let Some(slot) = self.load_slot(first) else { return false; };
+        if self.load_slot(second) != Some(slot) { return false; }
+        let function = self.graph.function;
+        if matches!(first, Operand::Arg(_)) || matches!(second, Operand::Arg(_)) {
+            return function.blocks.iter().flat_map(|block| &block.stmts).all(|statement| {
+                !matches!(statement, Stmt::Store(target, source) if *target == slot
+                    && !matches!(source, Operand::Arg(index) if function.params.get(*index as usize) == Some(&slot)))
+            });
+        }
+        let (Operand::Value(first), Operand::Value(second)) = (first, second) else { return false; };
+        function.blocks.iter().any(|block| {
+            let position = |value: ValueId| block.stmts.iter().position(
+                |statement| matches!(statement, Stmt::Let(id, _) if *id == value)
+            );
+            let (Some(first), Some(second)) = (position(*first), position(*second)) else { return false; };
+            !block.stmts[first.min(second)..=first.max(second)].iter().any(
+                |statement| matches!(statement, Stmt::Store(target, _) if *target == slot)
+            )
+        })
     }
 
     // These are the existing checked-HIR native view bridges, not bodyless Align
@@ -5769,15 +5824,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let expected = if soa { vec![Ty::Raw, Ty::ResourceRef(*resource)] }
                     else { vec![Ty::Raw, Ty::ResourceRef(*resource), i64_ty] };
                 return *param_tys == expected && *offset == if soa { 48 } else { 40 }
-                    && self.batch_plan_guard_matches(result, ptr);
+                    && self.batch_plan_guard_matches(result, *callee, ptr);
             }
             if !soa && *offset == 48 && param_tys == &[Ty::Raw, Ty::ResourceRef(*resource)]
                 && db_resource_matches_row(self.graph.program, *resource, row, "rows")
                 && let Operand::Value(pointer) = ptr
                 && let Some(Some(Rvalue::ResourceRaw { reference, resource: owner })) = self.graph.value_definitions.get(*pointer as usize)
             {
-                return *owner == *resource && self.load_slot(reference).is_some()
-                    && self.load_slot(reference) == self.load_slot(&args[1]);
+                return *owner == *resource && self.same_slot_observation(reference, &args[1]);
             }
             return false;
         }
@@ -5788,10 +5842,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
             .is_some_and(|definition| definition.name.starts_with("pkg.db$query$")
                 && align_sema::static_descriptor_struct_is_valid(definition));
         descriptor_matches && unrooted && match *offset {
-            88 => param_tys == &[Ty::Raw] && matches!(ret_ty, Ty::Struct(_)),
+            88 => param_tys == &[Ty::Raw] && matches!(ret_ty, Ty::Struct(row)
+                if self.query_descriptor_row_matches(*descriptor, *row)),
             96 => param_tys == &[Ty::Int(IntTy { bits: 8, signed: false }), Ty::Int(IntTy { bits: 8, signed: false }), i64_ty]
-                && matches!(ret_ty, Ty::Option(Scalar::Struct(id)) if self.graph.program.structs.get(*id as usize)
-                    .is_some_and(|definition| definition.source_name == "pkg.db$QueryMeta")),
+                && matches!(ret_ty, Ty::Option(Scalar::Struct(id)) if QueryMetaTypes::resolve(self.graph.program)
+                    .is_ok_and(|types| types.row == *id)),
             _ => false,
         }
     }
@@ -8841,6 +8896,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return equation;
         };
+        // Borrow parameters alias caller storage at function entry; unlike by-value
+        // locals, LLVM does not wait for an explicit MIR Store to initialize them.
+        // Keep every later store as a dependency so this seed cannot hide corruption.
+        if let Some(parameter) = self.graph.function.params.iter().position(|candidate| *candidate == slot)
+            && matches!(self.graph.function.param_modes.get(parameter),
+                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut))
+            && let Ok(parameter) = u32::try_from(parameter)
+        {
+            equation.seed = Some(xml_argument_access(self.graph.function, parameter));
+        }
         let (Some(root_stores), Some(field_stores)) = (
             self.graph.slot_stores.roots.get(slot as usize),
             self.graph.slot_stores.fields.get(slot as usize),
@@ -35775,6 +35840,109 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn native_metadata_views_use_the_producers_exact_layout_authority() {
+        let mut program = mir(r#"
+Driver { SQLite, PostgreSQL }
+DriverRestriction { AnySupportedDriver, SQLiteOnly, PostgreSQLOnly }
+MetaStatementClass { Select, Dml, Ddl, Native, Unknown }
+MetaQueryState { Declared, DatabaseChecked }
+MetaQueryEntry { Summary, Parameter, Column }
+MetaNullability { Yes, No, Unknown }
+QueryMeta {
+  query_id: str, driver: Driver, driver_restriction: DriverRestriction,
+  statement_class: MetaStatementClass, artifact_digest: str, state: MetaQueryState,
+  metadata_fingerprint: Option<str>, source_sql_hash: str, driver_wire_sql_hash: str,
+  rewrite_format_version: i64, prepare_identity: Option<str>, schema_identity: Option<str>,
+  server_identity: Option<str>, entry: MetaQueryEntry, ordinal: Option<i64>,
+  source_name: Option<str>, source_alias: Option<str>, logical_type: Option<str>,
+  native_type: Option<str>, native_type_id: Option<i64>, origin_schema: Option<str>,
+  origin_table: Option<str>, origin_column: Option<str>, nullable: MetaNullability,
+}
+Query { data: i64 }
+fn metadata(query: Query) -> i32 = 0
+fn main() -> i32 = 0
+"#);
+        for definition in &mut program.enums {
+            definition.source_name = format!("pkg.db${}", definition.source_name);
+        }
+        let row = program.structs.iter().position(|definition| definition.source_name == "QueryMeta")
+            .and_then(|index| u32::try_from(index).ok()).unwrap_or_else(|| panic!("metadata fixture row"));
+        program.structs[row as usize].source_name = "pkg.db$QueryMeta".to_owned();
+        let descriptor = program.structs.iter().position(|definition| definition.source_name == "Query")
+            .and_then(|index| u32::try_from(index).ok()).unwrap_or_else(|| panic!("metadata fixture descriptor"));
+        program.structs[descriptor as usize].name = "pkg.db$query$S9_QueryMeta$S9_QueryMeta".to_owned();
+        program.structs[descriptor as usize].fields[0].name = align_sema::STATIC_DESCRIPTOR_DATA_FIELD.to_owned();
+        program.structs[descriptor as usize].fields[0].ty = Ty::Raw;
+        let owner = xml_test_function(&program, "metadata");
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+        let result_ty = Ty::Option(Scalar::Struct(row));
+        let function = &mut program.fns[owner];
+        function.slots = vec![Ty::Struct(descriptor)];
+        function.params = vec![0];
+        function.slot_align = vec![None];
+        function.param_modes = vec![align_ast::ParamMode::ByValue];
+        function.borrow_mut_cleanup_slots = vec![None];
+        function.ret = result_ty;
+        function.value_tys = vec![Ty::Raw, Ty::Raw, result_ty];
+        function.blocks = vec![Block { id: 0, stmts: vec![
+            Stmt::Store(0, Operand::Arg(0)),
+            Stmt::Let(0, Rvalue::Field(0, vec![0])),
+            Stmt::Let(1, Rvalue::RawPointerLoad { ptr: Operand::Value(0), offset: Operand::Const(Const::Int(96, i64_ty)) }),
+            Stmt::Let(2, Rvalue::RawCall {
+                callee: Operand::Value(1), args: vec![Operand::Const(Const::Int(0, u8_ty)), Operand::Const(Const::Int(0, u8_ty)), Operand::Const(Const::Int(0, i64_ty))],
+                param_tys: vec![u8_ty, u8_ty, i64_ty], ret_ty: result_ty,
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![align_ast::ParamMode::ByValue; 3], return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None, return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            }),
+        ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(2))) }];
+        let result = validate_mir_producers(&program);
+        assert!(result.is_ok(), "native metadata fixture: {result:?}");
+        for axis in ["field-type", "field-name", "field-count", "enum-layout", "nominal", "duplicate", "alignment", "descriptor"] {
+            let mut malformed = program.clone();
+            match axis {
+                "field-type" => malformed.structs[row as usize].fields[9].ty = u8_ty,
+                "field-name" => malformed.structs[row as usize].fields[0].name = "wrong".to_owned(),
+                "field-count" => { malformed.structs[row as usize].fields.pop(); },
+                "enum-layout" => malformed.enums[0].variants.swap(0, 1),
+                "nominal" => malformed.structs[row as usize].source_name = "Other".to_owned(),
+                "duplicate" => malformed.structs.push(malformed.structs[row as usize].clone()),
+                "alignment" => malformed.structs[row as usize].align = Some(32),
+                "descriptor" => malformed.structs[descriptor as usize].fields[0].name = "wrong".to_owned(),
+                _ => panic!("unknown metadata mutation"),
+            }
+            assert_xml_producer_rejected(&malformed, axis);
+        }
+    }
+
+    #[test]
+    fn borrowed_parameter_slots_have_entry_storage_without_a_prologue_store() {
+        let program = mir("Row { text: str }\nfn project(borrow row: Row) -> str = row.text\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "project");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+            let mut generated = program.clone();
+            let function = &mut generated.fns[owner];
+            let slot = function.params[0];
+            function.param_modes[0] = mode;
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| !matches!(statement, Stmt::Store(target, _) if *target == slot));
+                block.stmt_lines.clear();
+            }
+            let result = validate_mir_producers(&generated);
+            assert!(result.is_ok(), "implicit borrowed parameter mode {mode:?}: {result:?}");
+            for malformed_mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::Out] {
+                let mut malformed = generated.clone();
+                malformed.fns[owner].param_modes[0] = malformed_mode;
+                assert_xml_producer_rejected(&malformed, "uninitialized-non-borrow-parameter");
+            }
+            generated.fns[owner].blocks[0].stmts.insert(0, Stmt::Store(slot, Operand::Const(Const::Bool(false))));
+            assert_xml_producer_rejected(&generated, "borrowed-parameter-invalid-replacement");
+        }
+    }
+
+    #[test]
     fn native_view_callbacks_preserve_only_the_closed_shared_result_contract() {
         let mut program = mir("fn guard(plan: raw) -> bool = true\nfn native_view(plan: raw) -> i32 = 0\nfn main() -> i32 = 0\n");
         let row = u32::try_from(program.structs.len()).unwrap_or_else(|_| panic!("native fixture struct count"));
@@ -35832,6 +36000,36 @@ fn main() -> i32 = 0
         ];
         let result = validate_mir_producers(&program);
         assert!(result.is_ok(), "native fixture validation: {result:?}");
+        for soa in [false, true] {
+            for axis in ["pointer-before-guard", "reload-before-guard", "stale-guard-observation", "post-guard-store"] {
+                let mut malformed = program.clone();
+                let function = &mut malformed.fns[owner];
+                if soa {
+                    function.ret = Ty::Soa(row);
+                    function.value_tys[7] = Ty::Soa(row);
+                    if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] {
+                        *offset = Operand::Const(Const::Int(48, i64_ty));
+                    }
+                    if let Stmt::Let(_, Rvalue::RawCall { args, param_tys, ret_ty, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                        args.pop(); param_tys.pop(); signature.param_modes.pop(); *ret_ty = Ty::Soa(row);
+                    }
+                }
+                match axis {
+                    "pointer-before-guard" => {
+                        let loads = function.blocks[1].stmts.drain(..2).collect::<Vec<_>>();
+                        function.blocks[0].stmts.splice(5..5, loads);
+                    }
+                    "reload-before-guard" => {
+                        let load = function.blocks[1].stmts.remove(0);
+                        function.blocks[0].stmts.insert(5, load);
+                    }
+                    "stale-guard-observation" => function.blocks[0].stmts.insert(5, Stmt::Store(0, Operand::Arg(1))),
+                    "post-guard-store" => function.blocks[1].stmts.insert(0, Stmt::Store(0, Operand::Arg(1))),
+                    _ => panic!("unknown guard observation mutation"),
+                }
+                assert_xml_producer_rejected(&malformed, axis);
+            }
+        }
         for soa in [true, false] {
             let mut sibling = program.clone();
             let function = &mut sibling.fns[owner];
@@ -35851,6 +36049,17 @@ fn main() -> i32 = 0
             }
             let result = validate_mir_producers(&sibling);
             assert!(result.is_ok(), "native sibling soa={soa}: {result:?}");
+            if !soa {
+                let function = &mut sibling.fns[owner];
+                function.slots.push(reference);
+                function.params.push(4);
+                function.slot_align.push(None);
+                function.param_modes.push(align_ast::ParamMode::ByValue);
+                function.borrow_mut_cleanup_slots.push(None);
+                function.blocks[0].stmts.insert(0, Stmt::Store(4, Operand::Arg(4)));
+                function.blocks[1].stmts.insert(2, Stmt::Store(2, Operand::Arg(4)));
+                assert_xml_producer_rejected(&sibling, "current-row-replaced-observation");
+            }
         }
         for axis in ["offset", "guard", "root", "mode", "callee", "nominal", "plan"] {
             let mut malformed = program.clone();
@@ -35871,6 +36080,53 @@ fn main() -> i32 = 0
             }
             assert_xml_producer_rejected(&malformed, axis);
         }
+
+        let mut decoder = program.clone();
+        let descriptor = u32::try_from(decoder.structs.len()).unwrap_or_else(|_| panic!("descriptor fixture count"));
+        decoder.structs.push(StructDef {
+            name: "pkg.db$query$S3_Row$S3_Row".to_owned(), source_name: "pkg.db$query".to_owned(),
+            fields: vec![hir::FieldDef { name: align_sema::STATIC_DESCRIPTOR_DATA_FIELD.to_owned(), ty: Ty::Raw }],
+            align: None, c_repr: false,
+        });
+        let function = &mut decoder.fns[owner];
+        function.slots = vec![Ty::Struct(descriptor), Ty::Raw];
+        function.params = vec![0, 1];
+        function.slot_align = vec![None; 2];
+        function.param_modes = vec![align_ast::ParamMode::ByValue; 2];
+        function.borrow_mut_cleanup_slots = vec![None; 2];
+        function.return_borrow = hir::ReturnBorrowSummary::None;
+        function.return_region = hir::ReturnRegionSummary::None;
+        function.value_tys = vec![Ty::Raw, Ty::Raw, Ty::Struct(row)];
+        function.blocks = vec![Block { id: 0, stmts: vec![
+            Stmt::Store(0, Operand::Arg(0)), Stmt::Store(1, Operand::Arg(1)),
+            Stmt::Let(0, Rvalue::Field(0, vec![0])),
+            Stmt::Let(1, Rvalue::RawPointerLoad { ptr: Operand::Value(0), offset: Operand::Const(Const::Int(88, i64_ty)) }),
+            Stmt::Let(2, Rvalue::RawCall {
+                callee: Operand::Value(1), args: vec![Operand::Arg(1)], param_tys: vec![Ty::Raw], ret_ty: Ty::Struct(row),
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![align_ast::ParamMode::ByValue], return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None, return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            }),
+        ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(2))) }];
+        let result = validate_mir_producers(&decoder);
+        assert!(result.is_ok(), "native decoder fixture: {result:?}");
+        for name in ["pkg.db$query$S3_Row$S5_Other", "pkg.db$query$S03_Row$S3_Row", "pkg.db$query$S9_Row$S3_Row"] {
+            let mut malformed = decoder.clone();
+            malformed.structs[descriptor as usize].name = name.to_owned();
+            assert_xml_producer_rejected(&malformed, "decoder-row-nominal");
+        }
+        let other = u32::try_from(decoder.structs.len()).unwrap_or_else(|_| panic!("other fixture count"));
+        let mut other_row = decoder.structs[row as usize].clone();
+        other_row.name = "Other".to_owned();
+        other_row.source_name = "Other".to_owned();
+        decoder.structs.push(other_row);
+        decoder.fns[owner].ret = Ty::Struct(other);
+        decoder.fns[owner].value_tys[2] = Ty::Struct(other);
+        if let Stmt::Let(_, Rvalue::RawCall { ret_ty, .. }) = &mut decoder.fns[owner].blocks[0].stmts[4] {
+            *ret_ty = Ty::Struct(other);
+        }
+        assert_xml_producer_rejected(&decoder, "decoder-result-nominal");
     }
 
     fn raw_call_program() -> Program {
