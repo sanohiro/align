@@ -383,6 +383,9 @@ full post-redesign review は existing-producer closure を one axis として�
 
 | DB owner sweep: returned dependent Move resource が retained parent region から shared access を継承した。 | certified Move return は自身の shell を所有する。region dependency は lifetime を制約するが transfer/exclusive-borrow authority は失わせない。selected Copy view leaf は input root を辿り、String/XML cleanup-bit check は不変。 | `resource_ownership::returned_dependent_resource_retains_its_own_mutable_authority` が whole/per-unit の return 後 BorrowMut をカバー。既存 parent move/mutable-borrow negative は lifetime exclusion を維持。 |
 
+| Native view callback closure | 既存 checked native view bridge の closed `RawPointerLoad` offset/signature relation を維持する。batch row は 40、batch SoA は 48 で same-plan aborting guard を必要とし、current row は同じ rows resource 経由の 48、descriptor row は validated Query descriptor 経由の 88、QueryMeta は 96。exact mode、result、resource/row identity、borrow/region root、cleanup、argument type を確認する。unsafe ABI bridge は shared Copy view だけを seedし、owned string、XML reader、callable や body certificate を生成しない。 | whole/per-unit DB batch/current-row/metadata owner と `native_view_callbacks_preserve_only_the_closed_shared_result_contract` が row/SoA sibling、offset、guard、root、mode、callee、nominal mutation を検証。 |
+| Publication versus emission stage | interface publication は callable producer と copied call fact を含む typed producer graph を validateし、最終 callback/parallel-kernel ABI identity は生成しない。full callable/native preflight は emission 前に実行する。imported callback body の consumer-owned diagnostic precedence を維持し、dependency summary 公開時の最終 ABI 構築の重複を避ける。 | 既存 imported callback signature と transitive parallel-transfer owner は本来の source diagnostic を維持。callback LLVM、per-unit link、runtime owner、producer-graph mutation owner は引き続き gate。 |
+
 ## Deferred surface
 
 `io.reader` streaming、incremental/fallible `next`、caller-buffer text decode、raw span/source location、

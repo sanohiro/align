@@ -4914,6 +4914,7 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::ResourceViewFromRaw { .. }
         | Rvalue::ColumnBatchRow { .. }
         | Rvalue::ColumnBatchSoa { .. }
+        | Rvalue::RawCall { .. }
         | Rvalue::SoaColumn { .. }
         | Rvalue::Index(..)
         | Rvalue::IndexField(..)
@@ -4930,7 +4931,6 @@ fn xml_producer_variant_class(rvalue: &Rvalue) -> XmlProducerVariantClass {
         | Rvalue::SliceIndex(..)
         | Rvalue::SliceIndexNoalias { .. } => XmlProducerVariantClass::Graph,
         Rvalue::SqliteCallbackDescriptor(..)
-        | Rvalue::RawCall { .. }
         | Rvalue::ArenaBegin
         | Rvalue::TgBegin
         | Rvalue::SpawnTask { .. }
@@ -5679,6 +5679,123 @@ impl<'a> XmlAccessAnalyzer<'a> {
         true
     }
 
+    fn load_slot(&self, operand: &Operand) -> Option<Slot> {
+        match operand {
+            Operand::Arg(index) => self.graph.function.params.get(*index as usize).copied(),
+            Operand::Value(value) => match self.graph.value_definitions.get(*value as usize)? {
+                Some(Rvalue::Load(slot)) => Some(*slot),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn batch_plan_guard_matches(&self, result: ValueId, plan: &Operand) -> bool {
+        let Some(plan_slot) = self.load_slot(plan) else { return false; };
+        let function = self.graph.function;
+        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
+            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
+        )) else { return false; };
+        if block.id == function.entry || block.stmts.iter().any(|statement| {
+            matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
+        }) { return false; }
+        let mut predecessors = function.blocks.iter().filter(|candidate| match &candidate.term {
+            Term::Goto(target) => *target == block.id,
+            Term::Branch(_, yes, no) => *yes == block.id || *no == block.id,
+            _ => false,
+        });
+        let Some(predecessor) = predecessors.next() else { return false; };
+        if predecessors.next().is_some() { return false; }
+        let Term::Branch(Operand::Value(condition), yes, no) = &predecessor.term else { return false; };
+        if *yes != block.id || yes == no { return false; }
+        let Some(Some(Rvalue::Call(DirectCall::Program(target), arguments))) =
+            self.graph.value_definitions.get(*condition as usize)
+        else { return false; };
+        let Some(condition_position) = predecessor.stmts.iter().position(
+            |statement| matches!(statement, Stmt::Let(value, _) if value == condition)
+        ) else { return false; };
+        target.as_str() == "pkg.db.internal.resource$batch_plan_valid"
+            && arguments.len() == 1
+            && self.load_slot(&arguments[0]) == Some(plan_slot)
+            && !predecessor.stmts[condition_position..].iter().any(|statement| {
+                matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
+            })
+            && function.blocks.iter().find(|candidate| candidate.id == *no).is_some_and(|failure| {
+                matches!(failure.term, Term::Unreachable)
+                    && failure.stmts.iter().any(|statement| matches!(statement,
+                        Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), args)) if args.is_empty()
+                    ))
+            })
+    }
+
+    // These are the existing checked-HIR native view bridges, not bodyless Align
+    // certificates. Their unsafe native preconditions remain caller-owned; they may
+    // publish shared Copy views, never an owned string, XML handle, or callable.
+    fn native_view_call_matches(&self, result: ValueId, rvalue: &Rvalue) -> bool {
+        let Rvalue::RawCall { callee, args, param_tys, ret_ty, signature } = rvalue else { return false; };
+        if args.len() != param_tys.len()
+            || signature.param_modes != vec![align_ast::ParamMode::ByValue; args.len()]
+            || signature.return_cleanup != hir::ReturnCleanupAbi::None
+            || args.iter().zip(param_tys).any(|(argument, expected)| {
+                xml_operand_base_ty(self.graph.function, argument) != Some(*expected)
+            })
+            || align_sema::ty_is_move(*ret_ty, &self.graph.program.structs,
+                &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types)
+            || !xml_owned_leaf_paths(self.graph.program, *ret_ty)
+                .is_some_and(|leaves| leaves.iter().all(|(ty, _)| *ty == Ty::Str))
+        { return false; }
+        let Operand::Value(callee) = callee else { return false; };
+        let Some(Some(Rvalue::RawPointerLoad { ptr, offset: Operand::Const(Const::Int(offset, offset_ty)) })) =
+            self.graph.value_definitions.get(*callee as usize)
+        else { return false; };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if *offset_ty != i64_ty || xml_operand_base_ty(self.graph.function, ptr) != Some(Ty::Raw) {
+            return false;
+        }
+        let rooted = signature.return_borrow == hir::ReturnBorrowSummary::Roots { params: vec![1], captures: vec![] }
+            && signature.return_region == hir::ReturnRegionSummary::Roots { params: vec![1], captures: vec![] };
+        let unrooted = signature.return_borrow == hir::ReturnBorrowSummary::None
+            && signature.return_region == hir::ReturnRegionSummary::None;
+        if let Some(Ty::ResourceRef(resource)) = param_tys.get(1) {
+            let (row, soa) = match ret_ty {
+                Ty::Struct(row) => (*row, false),
+                Ty::Soa(row) => (*row, true),
+                _ => return false,
+            };
+            let row_borrows = soa || align_sema::ty_may_borrow(*ret_ty, &self.graph.program.structs,
+                &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types);
+            if !(if row_borrows { rooted } else { unrooted }) { return false; }
+            if db_resource_matches_row(self.graph.program, *resource, row, "batch") {
+                let expected = if soa { vec![Ty::Raw, Ty::ResourceRef(*resource)] }
+                    else { vec![Ty::Raw, Ty::ResourceRef(*resource), i64_ty] };
+                return *param_tys == expected && *offset == if soa { 48 } else { 40 }
+                    && self.batch_plan_guard_matches(result, ptr);
+            }
+            if !soa && *offset == 48 && param_tys == &[Ty::Raw, Ty::ResourceRef(*resource)]
+                && db_resource_matches_row(self.graph.program, *resource, row, "rows")
+                && let Operand::Value(pointer) = ptr
+                && let Some(Some(Rvalue::ResourceRaw { reference, resource: owner })) = self.graph.value_definitions.get(*pointer as usize)
+            {
+                return *owner == *resource && self.load_slot(reference).is_some()
+                    && self.load_slot(reference) == self.load_slot(&args[1]);
+            }
+            return false;
+        }
+        let Operand::Value(pointer) = ptr else { return false; };
+        let Some(Some(Rvalue::Field(slot, fields))) = self.graph.value_definitions.get(*pointer as usize) else { return false; };
+        let Some(Ty::Struct(descriptor)) = self.graph.function.slots.get(*slot as usize) else { return false; };
+        let descriptor_matches = fields.as_slice() == [0] && self.graph.program.structs.get(*descriptor as usize)
+            .is_some_and(|definition| definition.name.starts_with("pkg.db$query$")
+                && align_sema::static_descriptor_struct_is_valid(definition));
+        descriptor_matches && unrooted && match *offset {
+            88 => param_tys == &[Ty::Raw] && matches!(ret_ty, Ty::Struct(_)),
+            96 => param_tys == &[Ty::Int(IntTy { bits: 8, signed: false }), Ty::Int(IntTy { bits: 8, signed: false }), i64_ty]
+                && matches!(ret_ty, Ty::Option(Scalar::Struct(id)) if self.graph.program.structs.get(*id as usize)
+                    .is_some_and(|definition| definition.source_name == "pkg.db$QueryMeta")),
+            _ => false,
+        }
+    }
+
     fn call_roots(
         borrow: &hir::ReturnBorrowSummary,
         region: &hir::ReturnRegionSummary,
@@ -5895,6 +6012,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     } else {
                         self.add_operand(&mut equation, &operand, source_selected, path);
                     }
+                }
+            }
+            ref native @ Rvalue::RawCall { ref callee, ref args, ref param_tys, ret_ty, .. } => {
+                let unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if ret_ty != result_ty || (!unprotected && !self.native_view_call_matches(value, native)) {
+                    equation.invalid = true;
+                } else if unprotected {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    self.check_operand(&mut equation, callee, Ty::Raw);
+                    if let Operand::Value(callee) = callee
+                        && let Some(Some(Rvalue::RawPointerLoad { ptr, .. })) = self.graph.value_definitions.get(*callee as usize)
+                    {
+                        self.check_operand(&mut equation, ptr, Ty::Raw);
+                    }
+                    for (argument, expected) in args.iter().zip(param_tys) {
+                        self.check_whole_operand(&mut equation, argument, *expected);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
             Rvalue::ColumnBatchRow { payload, owner, index, struct_id, resource } => {
@@ -9503,8 +9640,13 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Code
     validate_resource_program(program)?;
     validate_slice_index_rvalues(program)?;
     validate_fixed_element_nulling(program)?;
-    let declarations = callable_declarations(program)?;
-    callable_preflight(program, &[], declarations, ModuleScope::Whole)?;
+    // Publication certifies the typed producer graph, not final native codegen.
+    // Generated callback/parallel-kernel preflight runs at emission, after the
+    // consumer's interface checks and diagnostic precedence have completed.
+    // Running it here both repeats canonical ABI construction for every imported
+    // declaration and rejects dependency bodies before their consumer can report
+    // the owning source-level error. Callable producers and copied call facts are
+    // authenticated below by the same graph used at emission.
     validate_resource_rvalues(program)?;
     let certified = program
         .fns
@@ -35629,6 +35771,105 @@ fn main() -> i32 = 0
                     .contains("resource operation contract mismatch"),
                 "unexpected diagnostic: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn native_view_callbacks_preserve_only_the_closed_shared_result_contract() {
+        let mut program = mir("fn guard(plan: raw) -> bool = true\nfn native_view(plan: raw) -> i32 = 0\nfn main() -> i32 = 0\n");
+        let row = u32::try_from(program.structs.len()).unwrap_or_else(|_| panic!("native fixture struct count"));
+        program.structs.push(StructDef {
+            name: "Row".to_owned(), source_name: "Row".to_owned(),
+            fields: vec![hir::FieldDef { name: "text".to_owned(), ty: Ty::Str }],
+            align: None, c_repr: false,
+        });
+        let resource = u32::try_from(program.resources.len()).unwrap_or_else(|_| panic!("native fixture resource count"));
+        program.resources.push(hir::ResourceDef {
+            name: "pkg.db$batch$S3_Row".to_owned(), source_name: "pkg.db$batch$S3_Row".to_owned(),
+            declaring_module: "pkg.db".to_owned(), generic_arity: 1,
+            drop_hook: "pkg.db.internal.resource$drop_batch".to_owned(),
+            drop_thunk: "__align_resource_drop$pkg.db$batch".to_owned(),
+            representation_version: 1, drop_abi_fingerprint: *b"align-res-drop-1",
+        });
+        let guard = xml_test_function(&program, "guard");
+        program.fns[guard].name = program_call("pkg.db.internal.resource$batch_plan_valid");
+        let owner = xml_test_function(&program, "native_view");
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let reference = Ty::ResourceRef(resource);
+        let function = &mut program.fns[owner];
+        function.slots = vec![Ty::Raw, Ty::Raw, reference, i64_ty];
+        function.params = vec![0, 1, 2, 3];
+        function.param_modes = vec![align_ast::ParamMode::ByValue; 4];
+        function.borrow_mut_cleanup_slots = vec![None; 4];
+        function.slot_align = vec![None; 4];
+        function.ret = Ty::Struct(row);
+        function.return_borrow = hir::ReturnBorrowSummary::Roots { params: vec![2], captures: vec![] };
+        function.return_region = hir::ReturnRegionSummary::Roots { params: vec![2], captures: vec![] };
+        function.value_tys = vec![Ty::Raw, Ty::Bool, Ty::Raw, Ty::Raw, Ty::Raw, reference, i64_ty, Ty::Struct(row), Ty::Unit];
+        function.blocks = vec![
+            Block { id: 0, stmts: vec![
+                Stmt::Store(0, Operand::Arg(0)), Stmt::Store(1, Operand::Arg(1)),
+                Stmt::Store(2, Operand::Arg(2)), Stmt::Store(3, Operand::Arg(3)),
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(1, Rvalue::Call(DirectCall::Program(program_call("pkg.db.internal.resource$batch_plan_valid")), vec![Operand::Value(0)])),
+            ], stmt_lines: vec![], term: Term::Branch(Operand::Value(1), 1, 2) },
+            Block { id: 1, stmts: vec![
+                Stmt::Let(2, Rvalue::Load(0)),
+                Stmt::Let(3, Rvalue::RawPointerLoad { ptr: Operand::Value(2), offset: Operand::Const(Const::Int(40, i64_ty)) }),
+                Stmt::Let(4, Rvalue::Load(1)), Stmt::Let(5, Rvalue::Load(2)), Stmt::Let(6, Rvalue::Load(3)),
+                Stmt::Let(7, Rvalue::RawCall {
+                    callee: Operand::Value(3), args: vec![Operand::Value(4), Operand::Value(5), Operand::Value(6)],
+                    param_tys: vec![Ty::Raw, reference, i64_ty], ret_ty: Ty::Struct(row),
+                    signature: Box::new(align_mir::FnSignatureFacts {
+                        param_modes: vec![align_ast::ParamMode::ByValue; 3],
+                        return_borrow: hir::ReturnBorrowSummary::Roots { params: vec![1], captures: vec![] },
+                        return_region: hir::ReturnRegionSummary::Roots { params: vec![1], captures: vec![] },
+                        return_cleanup: hir::ReturnCleanupAbi::None,
+                    }),
+                }),
+            ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(7))) },
+            Block { id: 2, stmts: vec![Stmt::Let(8, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]))], stmt_lines: vec![], term: Term::Unreachable },
+        ];
+        let result = validate_mir_producers(&program);
+        assert!(result.is_ok(), "native fixture validation: {result:?}");
+        for soa in [true, false] {
+            let mut sibling = program.clone();
+            let function = &mut sibling.fns[owner];
+            let result_ty = if soa { Ty::Soa(row) } else { Ty::Struct(row) };
+            function.ret = result_ty;
+            function.value_tys[7] = result_ty;
+            if !soa {
+                sibling.resources[resource as usize].name = "pkg.db$rows$S3_Row".to_owned();
+                sibling.resources[resource as usize].source_name = "pkg.db$rows$S3_Row".to_owned();
+                function.blocks[1].stmts[0] = Stmt::Let(2, Rvalue::ResourceRaw { reference: Operand::Arg(2), resource });
+            }
+            if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] {
+                *offset = Operand::Const(Const::Int(48, i64_ty));
+            }
+            if let Stmt::Let(_, Rvalue::RawCall { args, param_tys, ret_ty, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                args.pop(); param_tys.pop(); signature.param_modes.pop(); *ret_ty = result_ty;
+            }
+            let result = validate_mir_producers(&sibling);
+            assert!(result.is_ok(), "native sibling soa={soa}: {result:?}");
+        }
+        for axis in ["offset", "guard", "root", "mode", "callee", "nominal", "plan"] {
+            let mut malformed = program.clone();
+            let function = &mut malformed.fns[owner];
+            match axis {
+                "offset" => if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] { *offset = Operand::Const(Const::Int(41, i64_ty)); },
+                "guard" => function.blocks[0].term = Term::Goto(1),
+                "plan" => function.blocks[0].stmts[0] = Stmt::Store(0, Operand::Const(Const::Bool(false))),
+                "nominal" => malformed.resources[resource as usize].name = "pkg.db$batch$S5_Other".to_owned(),
+                _ => if let Stmt::Let(_, Rvalue::RawCall { callee, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                    match axis {
+                        "root" => signature.return_region = hir::ReturnRegionSummary::None,
+                        "mode" => signature.param_modes[1] = align_ast::ParamMode::BorrowMut,
+                        "callee" => *callee = Operand::Arg(0),
+                        _ => panic!("unknown native-view mutation"),
+                    }
+                },
+            }
+            assert_xml_producer_rejected(&malformed, axis);
         }
     }
 
