@@ -299,6 +299,15 @@ mutation-discriminating owner covers it.
 | Allocation and work bounds | Invalid positive-length parse: zero shell allocation and one input free. Canonical empty invalid: zero input allocation/free. Mechanical rejection: zero ownership/free. Valid parse: one shell, retained input, no event/tree/table allocation. `next`/view/count: zero allocation. Each nonempty owned getter: one exact allocation; empty attribute value: zero. Fixed 256 scratch and bounded per-byte passes. | Allocation/finder counters including canonical-empty, rejected noncanonical-empty, and positive-invalid cases; early-invalid read bounds, deep/attribute boundary RSS/stack owner, long document event traversal work counters, repeated getter allocation, no timing benchmark. |
 | Diagnostics and documents | Diagnose exact qualified spellings, bound/mutable receiver requirements, consuming input, wrong state/index, and unsupported XML profile. Keep specification/design/history/roadmap/runtime/HIR ledgers and Japanese mirror synchronized. | Diagnostic assertions, syntax-check public example, doc/mirror/link consistency, and source-of-truth diff owner. |
 
+The reopened producer-closure cells are:
+
+| Cell | Implementation closure | Owner evidence |
+|---|---|---|
+| Same-worklist callable dependencies | `CallIndirect` and `CallIndirectWithCleanup` add the exact callee node and callable/read requirement to the current analyzer worklist. Equation construction never starts a nested analyzer, so value/slot/capture/call cycles converge or reject under one total fixed point. | Whole/per-unit owners cover a closure capture whose slot is assigned from that closure's indirect result, with and without dynamic cleanup, and require bounded convergence. |
+| Source-monotone reborrows | Canonical borrowed call operands first resolve their actual source state and then apply the destination mode product. No mode may manufacture read, write, exclusive, move, or callable authority. | Borrowed-call mutations cross actual Shared/Exclusive/Owned/Out sources against Borrow/BorrowMut/Out. Shared→BorrowMut, Out→BorrowMut, invalid→readable, and forged paths reject; Owned/Exclusive→BorrowMut and readable→Borrow pass. |
+| Array-backed producer closure | `Index`, `IndexField`, `MakeSlice`, `ConstArray`, `StoreIndex`, and `StoreConstArray` have exact array/element/path, readable-index, constant-element, and source-access equations, including static `str` sharing. | Fixed and static string arrays exercise direct element, field, and slice-view forwarding without importing XML. Malformed slot/element/result/index/count/type and constant-element mutations reject before LLVM. |
+| Whole-result atomicity | `XmlParse` validates its input and unique cleanup companion for both the whole `Result` path and its `ResultOk` reader path. The whole equation proves readability without manufacturing reader ownership on the error alternative. | A `Result<xml.reader, Error>` identity wrapper accepts both parse outcomes in whole/per-unit builds; missing, aliased, or wrong-typed cleanup still rejects. |
+
 The implementation is one capability boundary. The reader type, full-document validator, cursor,
 views, Drop, HIR/MIR forms, and eight runtime rows form one strict producer-to-consumer chain; no
 dormant subset leaves a useful stable consumer. It crosses more than three compiler layers and may
@@ -319,7 +328,14 @@ producer equations, and classified valid `CloneIn` and other semantic carriers a
 The matrix is therefore reopened on the **raw ABI representation phase**, **interface
 provenance**, **typed MIR producer relation**, **structural presence**, **callable identity**,
 **interprocedural producer certification**, **operand requirements**, **producer/seed atomicity**,
-**semantic producer inventory**, **total validity**, and **runtime-status/result identity** axes. Shape-only rejection, post-shape
+**semantic producer inventory**, **total validity**, and **runtime-status/result identity** axes. The post-rebase review reopens the
+same boundary on **same-worklist callable dependencies**, **array-backed producer closure**,
+**source-monotone reborrows**, and **whole-result atomicity**: an indirect callee is a checked
+dependency in its caller's existing fixed point rather than a nested analysis; every fixed/static
+array value, view, element, element field, and store that can carry a protected leaf has an exact
+typed equation; a borrow can only preserve or reduce its authenticated source capabilities; and an
+atomic cleanup-returning result has a valid whole-value equation as well as selected payload
+equations. Shape-only rejection, post-shape
 caller preconditions, and ownership acceptance are distinct phases; cleanup capability is not
 borrow provenance; XML MIR authenticates one typed producer fact per selected structural path;
 and each semantic XML rvalue owns one final source result while LLVM lowering owns its complete
@@ -356,6 +372,10 @@ checked status map.
 | Interprocedural-plan review P1: disjoint readable/writable requirements could not express initialized exclusive `BorrowMut`, and callable identity replaced rather than composed with Move authority. | Requirements are a product of read/write/exclusive/move/callable capabilities. The complete mode × Copy/Move/callable mapping is normative and structural carriers apply it per selected leaf. | Shared→BorrowMut, Out→BorrowMut, Out-read, noncanonical destination, and by-value callable Move mutations reject in both compilation modes. |
 | Interprocedural-plan review P1: rejecting every unseeded call/return SCC would reject legal non-returning recursion. | Local function contracts are checked coinductively per exact call-graph SCC. Provisional contracts validate internal edges and actual return equations without inventing an intra-function producer seed; only the latter graph retains least-founded unseeded-cycle rejection. | Self and mutual non-returning protected-result recursion pass; raw/contradictory return branches and exact edge-field mutations reject the whole SCC. |
 | Interprocedural-plan review P3: the English and Japanese matrix grouped the three reopened axes in different positions. | Both matrices place interprocedural certification, operand/seed requirements, and semantic inventory directly after MIR/runtime selection and before LLVM/interface rows. | Author-side ordered-row comparison. |
+| Post-rebase review P1: indirect callee validation started a fresh analyzer while building an equation, so a capture/slot/call cycle could recurse without bound outside the fixed point. | Callee identity and readability are validation-only dependencies in the caller's existing analyzer. No equation constructor invokes another producer analysis. | Direct and cleanup-returning indirect-call owners form a capture/slot/result cycle and require deterministic convergence or rejection without recursive descent. |
+| Post-rebase review P1: fixed/static array producers were classified irrelevant even when their element or view carried `str`, rejecting ordinary non-XML programs. | Array views, constants, element loads, element-field loads, and both indexed and pooled-constant stores receive exact typed equations and propagate only their selected element path. | Positive fixed/static string-array forwarding runs without `std.xml`; per-variant type, path, index, count, and constant-element mutations reject before LLVM. |
+| Post-rebase review P1: canonical borrowed call operands replaced their source access with the destination mode, allowing Shared or invalid state to become Exclusive. | Reborrow validation is source-monotone: authenticate the descriptor and actual source state first, then test the complete destination mode requirement without upgrading the state. | Shared→BorrowMut, Out→BorrowMut, invalid→any readable mode, and forged paths reject; Owned/Exclusive→BorrowMut and readable sources→Borrow pass. |
+| Post-rebase review P2: `XmlParse` had only a selected `ResultOk` equation, so a valid whole `Result<xml.reader, Error>` argument failed an identity wrapper. | The atomic parse equation validates input/result/cleanup once and publishes a readable whole result; the selected Ok path additionally carries owned reader provenance. | Whole/per-unit identity wrappers accept both parse outcomes while cleanup range/type/distinctness/definition mutations still reject. |
 
 ## Deferred surface
 

@@ -275,6 +275,15 @@ multiple cell を閉じてよく、existing mutation-discriminating owner があ
 | Allocation/work | invalid positive-length parse は shell 0/input free 1。canonical empty invalid は input allocation/free 0。mechanical rejection は ownership/free 0。valid は shell 1/retained input/event/tree allocation 0。next/view/count 0。nonempty owned getter 1、empty attr 0。fixed scratch/bounded pass。 | canonical-empty/rejected noncanonical-empty/positive-invalid を含む counter、early-invalid read bound、depth/attribute RSS/stack、long traversal、repeat getter。timing benchmark なし。 |
 | Diagnostics/docs | exact qualified spelling、bound/mutable receiver、consuming input、wrong state/index、unsupported profile。spec/design/history/roadmap/runtime/HIR ledger と JA mirror を同期。 | diagnostic、example syntax、doc/mirror/link/source-of-truth。 |
 
+reopened producer-closure cell は次のとおり。
+
+| Cell | Implementation closure | Owner evidence |
+|---|---|---|
+| Same-worklist callable dependency | `CallIndirect`/`CallIndirectWithCleanup` は exact callee node と callable/read requirement を current analyzer worklist に追加。equation construction は nested analyzer を開始せず、value/slot/capture/call cycle は one total fixed point で converge または reject。 | whole/per-unit owner は closure capture slot を closure の indirect result から代入する cycle を dynamic cleanup 有無双方で作り bounded convergence を要求。 |
+| Source-monotone reborrow | canonical borrowed call operand は actual source state を resolve 後 destination mode product を適用し authority を生成しない。 | actual Shared/Exclusive/Owned/Out source と Borrow/BorrowMut/Out を交差。Shared→BorrowMut、Out→BorrowMut、invalid→readable、forged path は reject。Owned/Exclusive→BorrowMut と readable→Borrow は pass。 |
+| Array-backed producer closure | `Index`、`IndexField`、`MakeSlice`、`ConstArray`、`StoreIndex`、`StoreConstArray` は static `str` sharing を含む exact array/element/path、readable index、constant element、source access equation を持つ。 | fixed/static string array は XML import なしで direct element/field/slice-view forwarding を実行し、malformed slot/element/result/index/count/type/constant-element mutation は LLVM 前 reject。 |
+| Whole-result atomicity | `XmlParse` は whole `Result` path と `ResultOk` reader path の双方で input と unique cleanup companion を検証。whole equation は error alternative に reader ownership を生成せず readability を証明。 | `Result<xml.reader, Error>` identity wrapper は whole/per-unit で parse の両 outcome を acceptし、missing/aliased/wrong-typed cleanup は reject。 |
+
 implementation は one capability boundary。reader type、full validator、cursor、view、Drop、HIR/MIR、eight
 runtime row は strict producer-to-consumer chain で dormant subset に useful consumer はない。3 compiler
 layer を越え、roughly 1,000 hand-written lines を超える可能性があるが、split は Move/region/ABI proof を
@@ -293,7 +302,13 @@ semantic carrier を rejected と分類した。このため matrix を **raw AB
 **interface provenance**、**typed MIR producer relation**、**structural presence**、**callable identity**、
 **interprocedural producer certification**、**operand requirements**、**producer/seed atomicity**、
 **semantic producer inventory**、**total validity**、
-**runtime-status/result identity** axis で再オープンする。shape-only rejection、post-shape caller
+**runtime-status/result identity** axis で再オープンする。post-rebase review は同じ boundary を
+**same-worklist callable dependency**、**array-backed producer closure**、
+**source-monotone reborrow**、**whole-result atomicity** でも再オープンする。indirect callee は
+別 analyzer でなく caller の existing fixed point 内の checked dependency。protected leaf を運べる
+fixed/static array の value/view/element/element field/store は全て exact typed equation を持つ。
+borrow は authenticated source capability を保持または縮小するだけで、atomic cleanup-returning
+result は selected payload と whole value の両 equation を持つ。shape-only rejection、post-shape caller
 precondition、ownership acceptance は別 phase。cleanup capability は borrow provenance ではなく、XML MIR
 は selected structural path ごとに one typed producer fact を認証する。各 semantic XML rvalue は one final
 source result、LLVM lowering は complete checked status map を所有する。
@@ -329,6 +344,10 @@ source result、LLVM lowering は complete checked status map を所有する。
 | Interprocedural-plan review P1: disjoint readable/writable requirement は initialized exclusive `BorrowMut` を表現できず、callable identity が Move authority と合成されず置換されていた。 | requirement は read/write/exclusive/move/callable capability の product。complete mode × Copy/Move/callable mapping を normative とし structural carrier は selected leaf ごとに適用。 | Shared→BorrowMut、Out→BorrowMut、Out-read、noncanonical destination、by-value callable Move mutation は両 compilation mode で reject。 |
 | Interprocedural-plan review P1: 全 unseeded call/return SCC reject は legal non-returning recursion を拒否する。 | local function contract は exact call-graph SCC ごとに coinductive check。provisional contract は intra-function producer seed を捏造せず internal edge/actual return equation を検証し、least-founded unseeded-cycle rejection は latter value graph だけに残す。 | self/mutual non-returning protected-result recursion は pass。raw/contradictory return branch と exact edge-field mutation は whole SCC を reject。 |
 | Interprocedural-plan review P3: English/Japanese matrix で reopened three axis の配置が異なった。 | 両 matrix は interprocedural certification、operand/seed requirement、semantic inventory を MIR/runtime selection 直後、LLVM/interface row 前に置く。 | author-side ordered-row comparison。 |
+| Post-rebase review P1: indirect callee validation が equation 構築中に fresh analyzer を開始し、capture/slot/call cycle が fixed point 外で unbounded recursion になり得た。 | callee identity/readability は caller existing analyzer の validation-only dependency。equation constructor は別 producer analysis を呼ばない。 | direct/cleanup-returning indirect-call owner が capture/slot/result cycle を形成し recursive descent なしの deterministic convergence/rejection を要求。 |
+| Post-rebase review P1: fixed/static array producer が `str` element/view を持っても irrelevant 扱いされ普通の non-XML program を rejectした。 | array view/constant/element/element-field load と indexed/pooled-constant store に exact typed equation を与え selected element path だけを propagate。 | XML import なしの fixed/static string-array forwarding は pass。variant ごとの type/path/index/count/constant-element mutation は LLVM 前 reject。 |
+| Post-rebase review P1: canonical borrowed call operand が source access を destination mode で置換し Shared/invalid を Exclusive にできた。 | reborrow validation は source-monotone。descriptor と actual source state を先に authenticateし、state を upgrade せず complete destination mode requirement を検査。 | Shared→BorrowMut、Out→BorrowMut、invalid→readable mode、forged path は reject。Owned/Exclusive→BorrowMut と readable→Borrow は pass。 |
+| Post-rebase review P2: `XmlParse` は selected `ResultOk` equation だけを持ち valid whole `Result<xml.reader, Error>` identity wrapper を rejectした。 | atomic parse equation は input/result/cleanup を一度検証し readable whole result を publish。selected Ok path は追加で owned reader provenance を持つ。 | whole/per-unit identity wrapper は parse の両 outcome を acceptし cleanup range/type/distinctness/definition mutation は reject。 |
 
 ## Deferred surface
 
