@@ -8,7 +8,7 @@
 //! loads, writes are stores; `if` is conditional branches; comparisons are `icmp`;
 //! calls are `call`. The generated `main` is the C entry (crt0 calls it).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// ThinLTO driver-facing surface (production): safe wrappers over the C++ shim's
@@ -17,6 +17,8 @@ pub mod thinlto;
 
 mod drop_codegen;
 mod llvm_build_id;
+mod query_meta_layout;
+pub use query_meta_layout::QueryMetaTypes;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
@@ -4167,8 +4169,6144 @@ fn validate_template_html_mir_signatures(program: &Program) -> Result<(), Codege
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XmlAccessProvenance {
+    Owned,
+    Shared,
+    Exclusive,
+    Unreadable,
+    Mixed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XmlProducerState {
+    Present(XmlAccessProvenance),
+    MaybeAbsent(XmlAccessProvenance),
+    Absent,
+    Invalid,
+}
+
+impl XmlProducerState {
+    fn owned_if_present(self) -> bool {
+        matches!(
+            self,
+            Self::Present(XmlAccessProvenance::Owned)
+                | Self::MaybeAbsent(XmlAccessProvenance::Owned)
+                | Self::Absent
+        )
+    }
+}
+
+struct XmlSlotStores<'a> {
+    roots: Vec<Vec<&'a Operand>>,
+    fields: Vec<Vec<(&'a [u32], &'a Operand)>>,
+    elements: Vec<Vec<(&'a Operand, &'a Operand)>>,
+    element_fields: Vec<Vec<(&'a Operand, &'a [u32], &'a Operand)>>,
+    constant_elements: Vec<Vec<(&'a [ConstElem], Ty)>>,
+    producers: Vec<Vec<(ValueId, &'a Rvalue)>>,
+}
+
+struct ValidatedProducerGraph<'a> {
+    function: &'a align_mir::Function,
+    program: &'a Program,
+    local_contracts: &'a HashSet<ProgramCall>,
+    value_definitions: &'a [Option<&'a Rvalue>],
+    auxiliary_value_definitions: &'a [Option<&'a Rvalue>],
+    duplicate_values: &'a [bool],
+    slot_stores: &'a XmlSlotStores<'a>,
+    primary_definitions: &'a [u32],
+    auxiliary_definitions: &'a [u32],
+}
+
+fn merge_xml_access(
+    current: Option<XmlAccessProvenance>,
+    next: XmlAccessProvenance,
+) -> Option<XmlAccessProvenance> {
+    Some(match current {
+        None => next,
+        Some(current) if current == next => current,
+        Some(current @ (XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed)) => current,
+        Some(_) if matches!(next, XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed) => next,
+        Some(XmlAccessProvenance::Owned) => next,
+        Some(XmlAccessProvenance::Shared) => match next {
+            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
+                XmlAccessProvenance::Shared
+            }
+            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Mixed,
+            current => current,
+        },
+        Some(XmlAccessProvenance::Exclusive) => match next {
+            XmlAccessProvenance::Owned => XmlAccessProvenance::Exclusive,
+            XmlAccessProvenance::Shared => XmlAccessProvenance::Shared,
+            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Unreadable,
+            current => current,
+        },
+        Some(XmlAccessProvenance::Unreadable) => match next {
+            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
+                XmlAccessProvenance::Unreadable
+            }
+            XmlAccessProvenance::Shared => XmlAccessProvenance::Mixed,
+            current => current,
+        },
+    })
+}
+
+fn merge_xml_state(
+    current: Option<XmlProducerState>,
+    next: XmlProducerState,
+) -> Option<XmlProducerState> {
+    use XmlProducerState::{Absent, Invalid, MaybeAbsent, Present};
+    Some(match (current, next) {
+        (None, next) => next,
+        (Some(Invalid), _) | (_, Invalid) => Invalid,
+        (Some(Absent), Absent) => Absent,
+        (Some(Absent), Present(access)) | (Some(Present(access)), Absent) => {
+            MaybeAbsent(access)
+        }
+        (Some(Absent), MaybeAbsent(access)) | (Some(MaybeAbsent(access)), Absent) => {
+            MaybeAbsent(access)
+        }
+        (Some(Present(current)), Present(next)) => {
+            Present(
+                merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
+            )
+        }
+        (Some(Present(current)), MaybeAbsent(next))
+        | (Some(MaybeAbsent(current)), Present(next))
+        | (Some(MaybeAbsent(current)), MaybeAbsent(next)) => MaybeAbsent(
+            merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
+        ),
+    })
+}
+
+fn require_xml_presence(
+    state: Option<XmlProducerState>,
+    guarded: bool,
+) -> Option<XmlProducerState> {
+    state.map(|state| match state {
+        XmlProducerState::MaybeAbsent(access) if guarded => XmlProducerState::Present(access),
+        XmlProducerState::Absent if guarded => XmlProducerState::Absent,
+        XmlProducerState::MaybeAbsent(_) | XmlProducerState::Absent
+        | XmlProducerState::Invalid => XmlProducerState::Invalid,
+        present @ XmlProducerState::Present(_) => present,
+    })
+}
+
+fn xml_event_definition_valid(program: &Program, event_enum: u32) -> bool {
+    let Some(definition) = program.enums.get(event_enum as usize) else {
+        return false;
+    };
+    const NAMES: [&str; 3] = ["Start", "End", "Text"];
+    program
+        .enums
+        .iter()
+        .filter(|candidate| {
+            candidate.name == "xml.event" || candidate.source_name == "xml.event"
+        })
+        .count()
+        == 1
+        && definition.name == "xml.event"
+        && definition.source_name == "xml.event"
+        && definition.variants.len() == NAMES.len()
+        && definition
+            .variants
+            .iter()
+            .zip(NAMES)
+            .all(|(variant, expected)| {
+                variant.name == expected
+                    && variant.payload.is_empty()
+                    && variant.field_base == 1
+            })
+}
+
+fn xml_argument_access(function: &align_mir::Function, index: u32) -> XmlAccessProvenance {
+    match function.param_modes.get(index as usize) {
+        Some(align_ast::ParamMode::ByValue) => XmlAccessProvenance::Owned,
+        Some(align_ast::ParamMode::Borrow) => XmlAccessProvenance::Shared,
+        Some(align_ast::ParamMode::BorrowMut) => XmlAccessProvenance::Exclusive,
+        Some(align_ast::ParamMode::Out) => XmlAccessProvenance::Unreadable,
+        None => XmlAccessProvenance::Unknown,
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum XmlAccessPathSegment {
+    StructField(u32),
+    TupleElement(u32),
+    Element,
+    EnumPayload { enum_id: u32, variant: u32, slot: u32 },
+    OptionSome,
+    ResultOk,
+    ResultErr,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum XmlAccessNode {
+    Value(ValueId, Vec<XmlAccessPathSegment>),
+    Slot(Slot, Vec<XmlAccessPathSegment>),
+    CaptureValue(ValueId, Vec<XmlAccessPathSegment>, u32),
+    CaptureSlot(Slot, Vec<XmlAccessPathSegment>, u32),
+}
+
+#[derive(Clone, Debug)]
+enum XmlAccessSource {
+    Seed(XmlAccessProvenance),
+    Node(XmlAccessNode),
+    Invalid,
+}
+
+#[derive(Debug, Default)]
+struct XmlAccessEquation {
+    seed: Option<XmlAccessProvenance>,
+    dependencies: Vec<XmlAccessNode>,
+    checks: Vec<(XmlAccessNode, OperandRequirement)>,
+    invalid: bool,
+    absent: bool,
+    require_present: bool,
+    guarded_absence: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OperandRequirement {
+    read: bool,
+    write: bool,
+    exclusive: bool,
+    move_value: bool,
+    callable: bool,
+}
+
+impl OperandRequirement {
+    const READ: Self = Self {
+        read: true,
+        write: false,
+        exclusive: false,
+        move_value: false,
+        callable: false,
+    };
+
+    fn is_satisfied_by(self, state: XmlProducerState) -> bool {
+        let access = match state {
+            XmlProducerState::Present(access) | XmlProducerState::MaybeAbsent(access) => access,
+            // A statically inactive option/result/enum leaf has no value on which any capability
+            // could be exercised. Its requirement is therefore vacuous; active alternatives still
+            // carry and must satisfy the full product.
+            XmlProducerState::Absent => return true,
+            XmlProducerState::Invalid => return false,
+        };
+        let (read, write, exclusive, move_value) = match access {
+            XmlAccessProvenance::Owned => (true, true, true, true),
+            XmlAccessProvenance::Shared => (true, false, false, false),
+            XmlAccessProvenance::Exclusive => (true, true, true, false),
+            XmlAccessProvenance::Unreadable => (false, true, true, false),
+            XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed => {
+                (false, false, false, false)
+            }
+        };
+        (!self.read || read)
+            && (!self.write || write)
+            && (!self.exclusive || exclusive)
+            && (!self.move_value || move_value)
+            // Callable identity is certified by the node's semantic equation. It remains an
+            // orthogonal requirement here so mode capabilities cannot replace that proof.
+            && (!self.callable
+                || !matches!(
+                    access,
+                    XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed
+                ))
+    }
+}
+
+fn xml_mode_requirement(
+    program: &Program,
+    selected: Ty,
+    mode: align_ast::ParamMode,
+) -> OperandRequirement {
+    let move_value = align_sema::ty_is_move(
+        selected,
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
+    );
+    let mut requirement = match mode {
+        align_ast::ParamMode::ByValue => OperandRequirement {
+            read: true,
+            move_value,
+            ..OperandRequirement::default()
+        },
+        align_ast::ParamMode::Borrow => OperandRequirement::READ,
+        align_ast::ParamMode::BorrowMut => OperandRequirement {
+            read: true,
+            write: true,
+            exclusive: true,
+            ..OperandRequirement::default()
+        },
+        align_ast::ParamMode::Out => OperandRequirement {
+            write: true,
+            exclusive: true,
+            ..OperandRequirement::default()
+        },
+    };
+    requirement.callable = matches!(selected, Ty::Fn(_));
+    requirement
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct XmlCallFacts {
+    params: Vec<Ty>,
+    modes: Vec<align_ast::ParamMode>,
+    ret: Ty,
+    borrow: hir::ReturnBorrowSummary,
+    region: hir::ReturnRegionSummary,
+    cleanup: hir::ReturnCleanupAbi,
+}
+
+fn xml_fn_type_facts(program: &Program, id: u32) -> Option<XmlCallFacts> {
+    let definition = program.fn_types.get(id as usize)?;
+    Some(XmlCallFacts {
+        params: definition
+            .params
+            .iter()
+            .map(|(_, scalar)| scalar_to_ty(*scalar))
+            .collect(),
+        modes: definition.params.iter().map(|(mode, _)| *mode).collect(),
+        ret: definition.ret,
+        borrow: definition.return_borrow.clone(),
+        region: definition.return_region.clone(),
+        cleanup: definition.return_cleanup,
+    })
+}
+
+fn xml_signature_matches_facts(
+    signature: &align_mir::FnSignatureFacts,
+    facts: &XmlCallFacts,
+) -> bool {
+    signature.param_modes == facts.modes
+        && signature.return_borrow == facts.borrow
+        && signature.return_region == facts.region
+        && signature.return_cleanup == facts.cleanup
+}
+
+struct XmlCallResult<'a> {
+    result: ValueId,
+    result_ty: Ty,
+    selected_ty: Ty,
+    args: &'a [Operand],
+    callee: Option<&'a Operand>,
+    facts: &'a XmlCallFacts,
+    cleanup: Option<ValueId>,
+    modes_match: bool,
+}
+
+fn xml_operand_base_ty(function: &align_mir::Function, operand: &Operand) -> Option<Ty> {
+    Some(match operand {
+        Operand::Const(Const::Int(_, ty)) | Operand::Const(Const::Float(_, ty)) => *ty,
+        Operand::Const(Const::Char(_)) => Ty::Char,
+        Operand::Const(Const::Bool(_)) => Ty::Bool,
+        Operand::Const(Const::Unit) => Ty::Unit,
+        Operand::Value(value) => *function.value_tys.get(*value as usize)?,
+        Operand::Arg(index) => {
+            let slot = *function.params.get(*index as usize)?;
+            *function.slots.get(slot as usize)?
+        }
+        Operand::BorrowedPlace(place) => place.ty,
+        Operand::BorrowedElementPlace(place) => place.element_ty,
+        Operand::BorrowedFixedElementPlace(place) => place.ty,
+        Operand::BorrowedCleanupArg(_) => Ty::Bool,
+    })
+}
+
+fn xml_numeric_scalar_ty(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int(IntTy { bits: 8 | 16 | 32 | 64, .. })
+            | Ty::Float(FloatTy { bits: 32 | 64 })
+    )
+}
+
+fn xml_numeric_vector_shape(ty: Ty) -> Option<(Scalar, u32)> {
+    let Ty::Vec(element, lanes @ (2 | 4 | 8 | 16)) = ty else {
+        return None;
+    };
+    xml_numeric_scalar_ty(scalar_to_ty(element)).then_some((element, lanes))
+}
+
+fn xml_option_payload(program: &Program, ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Option(payload) => Some(scalar_to_ty(payload)),
+        Ty::Tagged(id) => match program.tagged_types.get(id as usize)? {
+            hir::TaggedType::Option(payload) => Some(scalar_to_ty(*payload)),
+            hir::TaggedType::Result(..) => None,
+        },
+        _ => None,
+    }
+}
+
+fn xml_result_payload(program: &Program, ty: Ty, ok: bool) -> Option<Ty> {
+    let (success, failure) = match ty {
+        Ty::Result(success, failure) => (success, failure),
+        Ty::Tagged(id) => match program.tagged_types.get(id as usize)? {
+            hir::TaggedType::Result(success, failure) => (*success, *failure),
+            hir::TaggedType::Option(..) => return None,
+        },
+        _ => return None,
+    };
+    Some(scalar_to_ty(if ok { success } else { failure }))
+}
+
+fn xml_ty_matches_tagged_body(program: &Program, actual: Ty, expected: Ty) -> bool {
+    fn tagged_matches(program: &Program, id: u32, body: Ty) -> bool {
+        match (program.tagged_types.get(id as usize), body) {
+            (Some(hir::TaggedType::Option(payload)), Ty::Option(actual)) => *payload == actual,
+            (Some(hir::TaggedType::Result(ok, error)), Ty::Result(actual_ok, actual_error)) => {
+                *ok == actual_ok && *error == actual_error
+            }
+            _ => false,
+        }
+    }
+
+    actual == expected
+        || matches!(expected, Ty::Tagged(id) if tagged_matches(program, id, actual))
+        || matches!(actual, Ty::Tagged(id) if tagged_matches(program, id, expected))
+}
+
+fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
+    let bytes = Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    match (actual, expected) {
+        (Ty::Option(actual), Ty::Option(expected)) => {
+            xml_ty_is_view_retype(scalar_to_ty(actual), scalar_to_ty(expected))
+        }
+        (Ty::String, Ty::Str) => true,
+        (Ty::String | Ty::Str, Ty::Slice(element)) => element == bytes,
+        (Ty::DynArray(actual), Ty::Slice(expected)) => actual == expected,
+        (
+            Ty::DynStructArray(actual, Layout::Aos),
+            Ty::Slice(Scalar::Struct(expected)),
+        ) => actual == expected,
+        _ => false,
+    }
+}
+
+fn xml_dict_field_ty(program: &Program, id: u32, key: u32, index: u32) -> Option<Ty> {
+    if program.structs.get(id as usize)?.fields.get(key as usize)?.ty != Ty::Str {
+        return None;
+    }
+    match index {
+        0 => Some(Ty::DynStructArray(id, Layout::Aos)),
+        1 => Some(Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))),
+        2 => Some(Ty::DynArray(Scalar::Str)),
+        _ => None,
+    }
+}
+
+fn xml_selected_ty(
+    program: &Program,
+    mut ty: Ty,
+    path: &[XmlAccessPathSegment],
+) -> Option<Ty> {
+    for segment in path {
+        ty = match *segment {
+            XmlAccessPathSegment::StructField(field) => {
+                let id = match ty {
+                    Ty::Struct(id) | Ty::Soa(id) => id,
+                    _ => return None,
+                };
+                program
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(field as usize)?
+                    .ty
+            }
+            XmlAccessPathSegment::TupleElement(index) => {
+                if let Ty::DictEncoded(id, key) = ty {
+                    ty = xml_dict_field_ty(program, id, key, index)?;
+                    continue;
+                }
+                let Ty::Tuple(id) = ty else { return None };
+                scalar_to_ty(*program.tuples.get(id as usize)?.elems.get(index as usize)?)
+            }
+            XmlAccessPathSegment::Element => match ty {
+                Ty::Box(payload)
+                | Ty::Array(payload, _)
+                | Ty::Slice(payload)
+                | Ty::DynArray(payload)
+                | Ty::Task(payload)
+                | Ty::DynVecArray(payload, _)
+                | Ty::DynMaskArray(payload, _)
+                | Ty::DynFixedArray(payload, _) => scalar_to_ty(payload),
+                Ty::DynSliceArray(payload) => {
+                    scalar_to_ty(align_sema::prim_to_scalar(payload))
+                }
+                Ty::ArrayBuilder(payload) => scalar_to_ty(payload),
+                Ty::VecArrayBuilder(payload, lanes) => Ty::Vec(payload, lanes),
+                Ty::MaskArrayBuilder(payload, lanes) => Ty::Mask(payload, lanes),
+                Ty::FixedArrayBuilder(payload, length) => Ty::Array(payload, length),
+                Ty::FixedStructArrayBuilder(id, length) => Ty::StructArray(id, length),
+                Ty::StructArray(id, _)
+                | Ty::DynStructArray(id, _)
+                | Ty::DynFixedStructArray(id, _) => Ty::Struct(id),
+                _ => return None,
+            },
+            XmlAccessPathSegment::EnumPayload {
+                enum_id,
+                variant,
+                slot,
+            } => {
+                if ty != Ty::Enum(enum_id) {
+                    return None;
+                }
+                let payload = program
+                    .enums
+                    .get(enum_id as usize)?
+                    .variants
+                    .get(variant as usize)?
+                    .payload
+                    .get(slot as usize)?;
+                scalar_to_ty(*payload)
+            }
+            XmlAccessPathSegment::OptionSome => xml_option_payload(program, ty)?,
+            XmlAccessPathSegment::ResultOk => xml_result_payload(program, ty, true)?,
+            XmlAccessPathSegment::ResultErr => xml_result_payload(program, ty, false)?,
+        };
+    }
+    Some(ty)
+}
+
+fn xml_inline_array_element(program: &Program, ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Array(element, _) => Some(scalar_to_ty(element)),
+        Ty::StructArray(id, _) if program.structs.get(id as usize).is_some() => {
+            Some(Ty::Struct(id))
+        }
+        _ => None,
+    }
+}
+
+fn xml_owned_leaf_paths(
+    program: &Program,
+    root: Ty,
+) -> Option<Vec<(Ty, Vec<XmlAccessPathSegment>)>> {
+    let mut leaves = Vec::new();
+    let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
+    while let Some((ty, path, mut ancestors)) = pending.pop() {
+        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) {
+            leaves.push((ty, path));
+            continue;
+        }
+        let aggregate = matches!(
+            ty,
+            Ty::Struct(_)
+                | Ty::Tuple(_)
+                | Ty::DictEncoded(..)
+                | Ty::Enum(_)
+                | Ty::Option(_)
+                | Ty::Result(..)
+                | Ty::Tagged(_)
+                | Ty::Box(_)
+                | Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(_)
+                | Ty::DynSliceArray(_)
+                | Ty::DynArray(_)
+                | Ty::DynVecArray(..)
+                | Ty::DynMaskArray(..)
+                | Ty::DynFixedArray(..)
+                | Ty::DynFixedStructArray(..)
+                | Ty::Soa(_)
+                | Ty::Task(_)
+                | Ty::ArrayBuilder(_)
+                | Ty::VecArrayBuilder(..)
+                | Ty::MaskArrayBuilder(..)
+                | Ty::FixedArrayBuilder(..)
+                | Ty::FixedStructArrayBuilder(..)
+        );
+        if aggregate {
+            if ancestors.contains(&ty) {
+                return None;
+            }
+            ancestors.push(ty);
+        }
+        match ty {
+            Ty::Struct(id) => {
+                let definition = program.structs.get(id as usize)?;
+                for (field, definition) in definition.fields.iter().enumerate() {
+                    let mut selected = path.clone();
+                    selected.push(XmlAccessPathSegment::StructField(u32::try_from(field).ok()?));
+                    pending.push((definition.ty, selected, ancestors.clone()));
+                }
+            }
+            Ty::Tuple(id) => {
+                let definition = program.tuples.get(id as usize)?;
+                for (index, element) in definition.elems.iter().enumerate() {
+                    let mut selected = path.clone();
+                    selected.push(XmlAccessPathSegment::TupleElement(u32::try_from(index).ok()?));
+                    pending.push((scalar_to_ty(*element), selected, ancestors.clone()));
+                }
+            }
+            Ty::DictEncoded(id, key) => {
+                for index in 0..3 {
+                    let mut selected = path.clone();
+                    selected.push(XmlAccessPathSegment::TupleElement(index));
+                    pending.push((xml_dict_field_ty(program, id, key, index)?, selected, ancestors.clone()));
+                }
+            }
+            Ty::Enum(enum_id) => {
+                let definition = program.enums.get(enum_id as usize)?;
+                for (variant, definition) in definition.variants.iter().enumerate() {
+                    for (slot, payload) in definition.payload.iter().enumerate() {
+                        let mut selected = path.clone();
+                        selected.push(XmlAccessPathSegment::EnumPayload {
+                            enum_id,
+                            variant: u32::try_from(variant).ok()?,
+                            slot: u32::try_from(slot).ok()?,
+                        });
+                        pending.push((scalar_to_ty(*payload), selected, ancestors.clone()));
+                    }
+                }
+            }
+            Ty::Option(payload) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::OptionSome);
+                pending.push((scalar_to_ty(payload), selected, ancestors));
+            }
+            Ty::Result(success, failure) => {
+                let mut ok = path.clone();
+                ok.push(XmlAccessPathSegment::ResultOk);
+                pending.push((scalar_to_ty(success), ok, ancestors.clone()));
+                let mut error = path;
+                error.push(XmlAccessPathSegment::ResultErr);
+                pending.push((scalar_to_ty(failure), error, ancestors));
+            }
+            Ty::Tagged(id) => match program.tagged_types.get(id as usize)? {
+                hir::TaggedType::Option(payload) => {
+                    let mut selected = path;
+                    selected.push(XmlAccessPathSegment::OptionSome);
+                    pending.push((scalar_to_ty(*payload), selected, ancestors));
+                }
+                hir::TaggedType::Result(success, failure) => {
+                    let mut ok = path.clone();
+                    ok.push(XmlAccessPathSegment::ResultOk);
+                    pending.push((scalar_to_ty(*success), ok, ancestors.clone()));
+                    let mut error = path;
+                    error.push(XmlAccessPathSegment::ResultErr);
+                    pending.push((scalar_to_ty(*failure), error, ancestors));
+                }
+            },
+            Ty::Box(payload)
+            | Ty::Array(payload, _)
+            | Ty::Slice(payload)
+            | Ty::DynArray(payload)
+            | Ty::Task(payload)
+            | Ty::DynVecArray(payload, _)
+            | Ty::DynMaskArray(payload, _)
+            | Ty::DynFixedArray(payload, _) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((scalar_to_ty(payload), selected, ancestors));
+            }
+            Ty::DynSliceArray(payload) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((
+                    scalar_to_ty(align_sema::prim_to_scalar(payload)),
+                    selected,
+                    ancestors,
+                ));
+            }
+            Ty::ArrayBuilder(payload) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((scalar_to_ty(payload), selected, ancestors));
+            }
+            Ty::VecArrayBuilder(payload, lanes) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Vec(payload, lanes), selected, ancestors));
+            }
+            Ty::MaskArrayBuilder(payload, lanes) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Mask(payload, lanes), selected, ancestors));
+            }
+            Ty::FixedArrayBuilder(payload, length) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Array(payload, length), selected, ancestors));
+            }
+            Ty::FixedStructArrayBuilder(id, length) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::StructArray(id, length), selected, ancestors));
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _) => {
+                let mut selected = path;
+                selected.push(XmlAccessPathSegment::Element);
+                pending.push((Ty::Struct(id), selected, ancestors));
+            }
+            Ty::Soa(id) => {
+                let definition = program.structs.get(id as usize)?;
+                for (field, definition) in definition.fields.iter().enumerate() {
+                    let mut selected = path.clone();
+                    selected.push(XmlAccessPathSegment::StructField(
+                        u32::try_from(field).ok()?,
+                    ));
+                    pending.push((definition.ty, selected, ancestors.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(leaves)
+}
+
+fn xml_direct_call_facts(
+    program: &Program,
+    target: &ProgramCall,
+    local_contracts: &HashSet<ProgramCall>,
+) -> Option<XmlCallFacts> {
+    let mut found = None;
+    for function in &program.fns {
+        if &function.name != target {
+            continue;
+        }
+        if !local_contracts.contains(target) {
+            return None;
+        }
+        let params = function
+            .params
+            .iter()
+            .map(|slot| function.slots.get(*slot as usize).copied())
+            .collect::<Option<Vec<_>>>()?;
+        let facts = XmlCallFacts {
+            params,
+            modes: function.param_modes.clone(),
+            ret: function.ret,
+            borrow: function.return_borrow.clone(),
+            region: function.return_region.clone(),
+            cleanup: function.return_cleanup,
+        };
+        if found.replace(facts).is_some() {
+            return None;
+        }
+    }
+    for function in &program.imported_fns {
+        if &function.name != target {
+            continue;
+        }
+        if !function.producer_certified {
+            return None;
+        }
+        let facts = XmlCallFacts {
+            params: function.params.clone(),
+            modes: function.param_modes.clone(),
+            ret: function.ret,
+            borrow: function.return_borrow.clone(),
+            region: function.return_region.clone(),
+            cleanup: function.return_cleanup,
+        };
+        if found.replace(facts).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+
+fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
+    matches!(
+        (element, ty),
+        (ConstElem::Int(_), Ty::Int(_))
+            | (ConstElem::Float(_), Ty::Float(_))
+            | (ConstElem::Char(_), Ty::Char)
+            | (ConstElem::Bool(_), Ty::Bool)
+            | (ConstElem::Str(_), Ty::Str)
+    )
+}
+
+fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
+    use XmlAccessProvenance::{Owned, Shared};
+
+    let owned = |slot| vec![(slot, Owned)];
+    match rvalue {
+        Rvalue::JsonDecode { out, arena, .. }
+        | Rvalue::JsonDecodeStructArray { out, arena, .. }
+        | Rvalue::JsonDecodeUnion { out, arena, .. } => {
+            vec![(*out, if arena.is_some() { Shared } else { Owned })]
+        }
+        Rvalue::JsonDecodeSoa { out, .. } | Rvalue::CsvDecode { out, .. } => {
+            vec![(*out, Shared)]
+        }
+        Rvalue::JsonDoc { out, .. }
+        | Rvalue::JsonDocGet { out, .. }
+        | Rvalue::JsonDocAt { out, .. }
+        | Rvalue::JsonDocAsStr { out, .. }
+        | Rvalue::JsonDocKey { out, .. }
+        | Rvalue::JsonDocElems { out, .. }
+        | Rvalue::BytesAsStr { out, .. }
+        | Rvalue::FsReadFileView { out, .. }
+        | Rvalue::FsReadBytesView { out, .. }
+        | Rvalue::HttpRespHeader { out, .. }
+        | Rvalue::HttpReadStreamHeader { out, .. }
+        | Rvalue::HttpCtxHeader { out, .. } => vec![(*out, Shared)],
+        Rvalue::JsonScanNext { cursor, row, .. } => {
+            vec![(*cursor, Owned), (*row, Shared)]
+        }
+        Rvalue::HttpSseStreamNext {
+            present,
+            retry_present,
+            retry_ms,
+            event,
+            data,
+            last_event_id,
+            ..
+        } => vec![
+            (*present, Owned),
+            (*retry_present, Owned),
+            (*retry_ms, Owned),
+            (*event, Shared),
+            (*data, Shared),
+            (*last_event_id, Shared),
+        ],
+        Rvalue::CryptoArgon2(args) => owned(args.out),
+        Rvalue::CryptoPublicKeyFromJwk(args) => owned(args.out),
+        Rvalue::CryptoVerify(args) => owned(args.out),
+        Rvalue::JsonEncodeBounded { out, .. }
+        | Rvalue::JsonOwnedDecode { out, .. }
+        | Rvalue::JsonDecodeArray { out, .. }
+        | Rvalue::JsonDecodeScalar { out, .. }
+        | Rvalue::JsonDocAsScalar { out, .. }
+        | Rvalue::FsReadFile { out, .. }
+        | Rvalue::ReaderOpen { out, .. }
+        | Rvalue::ReaderOpenBeneath { out, .. }
+        | Rvalue::WriterCreate { out, .. }
+        | Rvalue::WriterCreateExclusive { out, .. }
+        | Rvalue::WriterCreateExclusiveBeneath { out, .. }
+        | Rvalue::CodecEncoderNew { out, .. }
+        | Rvalue::FrameInnerJoin { out, .. }
+        | Rvalue::FileCreateRw { out, .. }
+        | Rvalue::FileOpenRw { out, .. }
+        | Rvalue::FsReadDir { out, .. }
+        | Rvalue::DnsResolve { out, .. }
+        | Rvalue::TcpConnect { out, .. }
+        | Rvalue::TcpListen { out, .. }
+        | Rvalue::TcpAccept { out, .. }
+        | Rvalue::UdpBind { out, .. }
+        | Rvalue::ProcessSpawn { out, .. }
+        | Rvalue::EnvGet { out, .. }
+        | Rvalue::RegexCompile { out, .. }
+        | Rvalue::RegexFind { out, .. }
+        | Rvalue::RegexFindAll { out, .. }
+        | Rvalue::RegexSplit { out, .. }
+        | Rvalue::RegexCaptures { out, .. }
+        | Rvalue::CapturesGroup { out, .. }
+        | Rvalue::EncodingDecode { out, .. }
+        | Rvalue::CompressCompress { out, .. }
+        | Rvalue::CompressDecompress { out, .. }
+        | Rvalue::CryptoHkdf { out, .. }
+        | Rvalue::CryptoAead { out, .. }
+        | Rvalue::CryptoPrivateKeyFromPem { out, .. }
+        | Rvalue::CryptoPublicKeyFromPem { out, .. }
+        | Rvalue::CryptoSign { out, .. }
+        | Rvalue::RandSeed { out, .. }
+        | Rvalue::CliParse { out, .. }
+        | Rvalue::CommandRun { out, .. }
+        | Rvalue::CommandRunBytes { out, .. }
+        | Rvalue::HttpParse { out, .. }
+        | Rvalue::HttpClientGet { out, .. }
+        | Rvalue::HttpClientPost { out, .. }
+        | Rvalue::HttpClientRequest { out, .. }
+        | Rvalue::HttpClientRequestStream { out, .. }
+        | Rvalue::HttpReadStreamRead { out, .. }
+        | Rvalue::HttpGetMany { out, .. }
+        | Rvalue::HttpServe { out, .. }
+        | Rvalue::HttpAccept { out, .. }
+        | Rvalue::HttpRespondStream { out, .. }
+        | Rvalue::HttpRespondUpgrade { out, .. } => owned(*out),
+        _ => Vec::new(),
+    }
+}
+
+fn xml_out_producer_result_ty(rvalue: &Rvalue) -> Option<Ty> {
+    if xml_written_slots(rvalue).is_empty() {
+        return None;
+    }
+    Some(match rvalue {
+        Rvalue::JsonDocGet { .. }
+        | Rvalue::JsonDocAt { .. }
+        | Rvalue::JsonDocElems { .. }
+        | Rvalue::RandSeed { .. } => Ty::Unit,
+        _ => Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        }),
+    })
+}
+
+fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::JsonEncodeBounded { max_bytes, .. } => vec![max_bytes],
+        Rvalue::JsonDecode { input, arena, .. }
+        | Rvalue::JsonDecodeStructArray { input, arena, .. }
+        | Rvalue::JsonDecodeUnion { input, arena, .. } => {
+            let mut operands = vec![input];
+            operands.extend(arena.iter());
+            operands
+        }
+        Rvalue::JsonOwnedDecode { input, .. }
+        | Rvalue::JsonDecodeArray { input, .. }
+        | Rvalue::JsonDecodeScalar { input, .. }
+        | Rvalue::FsReadFile { path: input, .. }
+        | Rvalue::ReaderOpen { path: input, .. }
+        | Rvalue::WriterCreate { path: input, .. }
+        | Rvalue::WriterCreateExclusive { path: input, .. }
+        | Rvalue::FileCreateRw { path: input, .. }
+        | Rvalue::FileOpenRw { path: input, .. }
+        | Rvalue::FsReadDir { path: input, .. }
+        | Rvalue::DnsResolve { host: input, .. }
+        | Rvalue::BytesAsStr { bytes: input, .. }
+        | Rvalue::EnvGet { name: input, .. }
+        | Rvalue::RegexCompile { pattern: input, .. }
+        | Rvalue::EncodingDecode { input, .. }
+        | Rvalue::CompressDecompress { data: input, .. }
+        | Rvalue::CryptoPrivateKeyFromPem { pem: input, .. }
+        | Rvalue::CryptoPublicKeyFromPem { pem: input, .. }
+        | Rvalue::CommandRun { command: input, .. }
+        | Rvalue::CommandRunBytes { command: input, .. }
+        | Rvalue::HttpParse { data: input, .. }
+        | Rvalue::HttpAccept { server: input, .. } => vec![input],
+        Rvalue::JsonDecodeSoa { input, arena, .. }
+        | Rvalue::JsonDoc { input, arena, .. }
+        | Rvalue::FsReadFileView {
+            path: input, arena, ..
+        }
+        | Rvalue::FsReadBytesView {
+            path: input, arena, ..
+        } => vec![input, arena],
+        Rvalue::CsvDecode {
+            input,
+            arena,
+            options,
+            ..
+        } => vec![input, arena, options],
+        Rvalue::JsonDocGet { doc, key, .. } => vec![doc, key],
+        Rvalue::JsonDocAt { doc, index, .. } | Rvalue::JsonDocKey { doc, index, .. } => {
+            vec![doc, index]
+        }
+        Rvalue::JsonDocAsStr { doc, .. } | Rvalue::JsonDocAsScalar { doc, .. } => vec![doc],
+        Rvalue::JsonDocElems { doc, arena, .. } => vec![doc, arena],
+        Rvalue::JsonScanNext { scanner, .. } => vec![scanner],
+        Rvalue::ReaderOpenBeneath { root, relative, .. }
+        | Rvalue::WriterCreateExclusiveBeneath { root, relative, .. } => vec![root, relative],
+        Rvalue::CodecEncoderNew { rows, .. } => vec![rows],
+        Rvalue::FrameInnerJoin {
+            left,
+            right,
+            max_pairs,
+            ..
+        } => vec![left, right, max_pairs],
+        Rvalue::TcpConnect {
+            host,
+            port,
+            timeout_ns,
+            ..
+        } => vec![host, port, timeout_ns],
+        Rvalue::TcpListen { host, port, .. }
+        | Rvalue::UdpBind { host, port, .. } => vec![host, port],
+        Rvalue::TcpAccept { listener, .. } => vec![listener],
+        Rvalue::ProcessSpawn { cmd, args, .. } | Rvalue::CliParse { cmd, args, .. } => {
+            vec![cmd, args]
+        }
+        Rvalue::RegexFind {
+            regex,
+            text,
+            start,
+            ..
+        } => vec![regex, text, start],
+        Rvalue::RegexFindAll { regex, text, .. }
+        | Rvalue::RegexSplit { regex, text, .. }
+        | Rvalue::RegexCaptures { regex, text, .. } => vec![regex, text],
+        Rvalue::CapturesGroup { caps, index, .. } => vec![caps, index],
+        Rvalue::CompressCompress { data, level, .. } => vec![data, level],
+        Rvalue::CryptoHkdf {
+            salt,
+            ikm,
+            info,
+            len,
+            ..
+        } => vec![salt, ikm, info, len],
+        Rvalue::CryptoAead {
+            key,
+            nonce,
+            input,
+            aad,
+            ..
+        } => vec![key, nonce, input, aad],
+        Rvalue::CryptoArgon2(args) => vec![
+            &args.password,
+            &args.salt,
+            &args.m_cost,
+            &args.t_cost,
+            &args.parallelism,
+            &args.len,
+        ],
+        Rvalue::CryptoPublicKeyFromJwk(args) => {
+            let mut operands = vec![&args.first];
+            operands.extend(args.second.iter());
+            operands
+        }
+        Rvalue::CryptoVerify(args) => vec![&args.key, &args.message, &args.signature],
+        Rvalue::CryptoSign { key, message, .. } => vec![key, message],
+        Rvalue::RandSeed { seed, .. } => seed.iter().collect(),
+        Rvalue::HttpRespHeader { resp, name, .. } => vec![resp, name],
+        Rvalue::HttpClientGet { client, url, .. } => vec![client, url],
+        Rvalue::HttpClientPost {
+            client,
+            url,
+            body,
+            ..
+        } => vec![client, url, body],
+        Rvalue::HttpClientRequest { client, req, .. }
+        | Rvalue::HttpClientRequestStream { client, req, .. } => vec![client, req],
+        Rvalue::HttpReadStreamHeader { stream, name, .. } => vec![stream, name],
+        Rvalue::HttpReadStreamRead { stream, buffer, .. }
+        | Rvalue::HttpSseStreamNext { stream, buffer, .. } => vec![stream, buffer],
+        Rvalue::HttpGetMany {
+            client,
+            urls,
+            max_concurrency,
+            ..
+        } => vec![client, urls, max_concurrency],
+        Rvalue::HttpServe { host, port, .. } => vec![host, port],
+        Rvalue::HttpCtxHeader { ctx, name, .. } => vec![ctx, name],
+        Rvalue::HttpRespondStream { ctx, rb, .. }
+        | Rvalue::HttpRespondUpgrade { ctx, rb, .. } => vec![ctx, rb],
+        _ => Vec::new(),
+    }
+}
+
+fn xml_array_builder_output(builder: Ty) -> Option<Ty> {
+    Some(match builder {
+        Ty::ArrayBuilder(Scalar::Struct(id)) => Ty::DynStructArray(id, Layout::Aos),
+        Ty::ArrayBuilder(element) => Ty::DynArray(element),
+        Ty::VecArrayBuilder(element, lanes) => Ty::DynVecArray(element, lanes),
+        Ty::MaskArrayBuilder(element, lanes) => Ty::DynMaskArray(element, lanes),
+        Ty::FixedArrayBuilder(element, length) => Ty::DynFixedArray(element, length),
+        Ty::FixedStructArrayBuilder(id, length) => Ty::DynFixedStructArray(id, length),
+        _ => return None,
+    })
+}
+
+fn assert_xml_stmt_variant_classified(statement: &Stmt) {
+    match statement {
+        Stmt::Let(..)
+        | Stmt::Store(..)
+        | Stmt::StoreField(..)
+        | Stmt::StoreIndex(..)
+        | Stmt::StoreConstArray { .. }
+        | Stmt::PtrStore(..)
+        | Stmt::PtrStoreNoalias { .. }
+        | Stmt::VecStore { .. }
+        | Stmt::StoreElemField(..)
+        | Stmt::StoreElemFieldPtr { .. }
+        | Stmt::StoreColumn { .. }
+        | Stmt::ArenaEnd(..)
+        | Stmt::RawFree(..)
+        | Stmt::ColumnBatchFinish { .. }
+        | Stmt::ColumnBatchDrop { .. }
+        | Stmt::RawStore { .. }
+        | Stmt::TgWait(..)
+        | Stmt::TgEnd(..)
+        | Stmt::DropFlagInit(..)
+        | Stmt::NullTupleField(..)
+        | Stmt::NullStructField(..)
+        | Stmt::NullElemField(..)
+        | Stmt::Drop(..)
+        | Stmt::DropElem(..)
+        | Stmt::DropElemField(..)
+        | Stmt::BorrowedElementReservation { .. }
+        | Stmt::DropValue(..) => {}
+    }
+}
+
+struct XmlAccessAnalyzer<'a> {
+    graph: &'a ValidatedProducerGraph<'a>,
+    equations: HashMap<XmlAccessNode, XmlAccessEquation>,
+    scheduled: HashSet<XmlAccessNode>,
+    pending: VecDeque<XmlAccessNode>,
+}
+
+impl<'a> XmlAccessAnalyzer<'a> {
+    fn new(graph: &'a ValidatedProducerGraph<'a>) -> Self {
+        Self {
+            graph,
+            equations: HashMap::new(),
+            scheduled: HashSet::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn queue(&mut self, node: XmlAccessNode) -> XmlAccessSource {
+        if self.scheduled.insert(node.clone()) {
+            self.pending.push_back(node.clone());
+        }
+        XmlAccessSource::Node(node)
+    }
+
+    fn source(
+        &mut self,
+        operand: &Operand,
+        expected: Ty,
+        path: Vec<XmlAccessPathSegment>,
+    ) -> XmlAccessSource {
+        let Some(base) = xml_operand_base_ty(self.graph.function, operand) else {
+            return XmlAccessSource::Invalid;
+        };
+        if xml_selected_ty(self.graph.program, base, &path) != Some(expected) {
+            return XmlAccessSource::Invalid;
+        }
+        match operand {
+            Operand::Arg(index) => {
+                XmlAccessSource::Seed(xml_argument_access(self.graph.function, *index))
+            }
+            Operand::Const(_) if path.is_empty() => {
+                XmlAccessSource::Seed(XmlAccessProvenance::Owned)
+            }
+            Operand::Value(value) => self.queue(XmlAccessNode::Value(*value, path)),
+            Operand::BorrowedCleanupArg(index)
+                if path.is_empty()
+                    && self
+                        .graph
+                        .function
+                        .borrow_mut_cleanup_slots
+                        .get(*index as usize)
+                        .is_some_and(Option::is_some) =>
+            {
+                XmlAccessSource::Seed(XmlAccessProvenance::Shared)
+            }
+            Operand::BorrowedPlace(_)
+            | Operand::BorrowedElementPlace(_)
+            | Operand::BorrowedFixedElementPlace(_)
+            | Operand::BorrowedCleanupArg(_)
+            | Operand::Const(_) => XmlAccessSource::Invalid,
+        }
+    }
+
+    fn add_source(equation: &mut XmlAccessEquation, source: XmlAccessSource) {
+        match source {
+            XmlAccessSource::Seed(access) => {
+                equation.seed = merge_xml_access(equation.seed, access);
+            }
+            XmlAccessSource::Node(node) => equation.dependencies.push(node),
+            XmlAccessSource::Invalid => equation.invalid = true,
+        }
+    }
+
+    fn add_required_source(
+        equation: &mut XmlAccessEquation,
+        source: XmlAccessSource,
+        requirement: OperandRequirement,
+    ) {
+        match source {
+            XmlAccessSource::Seed(access) => {
+                if !requirement.is_satisfied_by(XmlProducerState::Present(access)) {
+                    equation.invalid = true;
+                }
+            }
+            XmlAccessSource::Node(node) => equation.checks.push((node, requirement)),
+            XmlAccessSource::Invalid => equation.invalid = true,
+        }
+    }
+
+    fn check_source(&mut self, operand: &Operand, expected: Ty) -> XmlAccessSource {
+        if xml_operand_base_ty(self.graph.function, operand) != Some(expected) {
+            return XmlAccessSource::Invalid;
+        }
+        match operand {
+            Operand::Value(value) => self.queue(XmlAccessNode::Value(*value, Vec::new())),
+            Operand::Arg(index) => {
+                XmlAccessSource::Seed(xml_argument_access(self.graph.function, *index))
+            }
+            Operand::Const(_) => XmlAccessSource::Seed(XmlAccessProvenance::Owned),
+            Operand::BorrowedCleanupArg(index)
+                if self
+                    .graph
+                    .function
+                    .borrow_mut_cleanup_slots
+                    .get(*index as usize)
+                    .is_some_and(Option::is_some) =>
+            {
+                XmlAccessSource::Seed(XmlAccessProvenance::Shared)
+            }
+            Operand::BorrowedPlace(_)
+            | Operand::BorrowedElementPlace(_)
+            | Operand::BorrowedFixedElementPlace(_)
+            | Operand::BorrowedCleanupArg(_) => XmlAccessSource::Invalid,
+        }
+    }
+
+    fn add_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+        path: Vec<XmlAccessPathSegment>,
+    ) {
+        let source = self.source(operand, expected, path);
+        Self::add_source(equation, source);
+    }
+
+    fn check_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        let source = self.check_source(operand, expected);
+        Self::add_required_source(equation, source, OperandRequirement::READ);
+    }
+
+    fn check_whole_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        let Some(leaves) = xml_owned_leaf_paths(self.graph.program, expected) else {
+            equation.invalid = true;
+            return;
+        };
+        if leaves.is_empty() {
+            self.check_operand(equation, operand, expected);
+            return;
+        }
+        for (selected, path) in leaves {
+            let source = self.source(operand, selected, path);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+    }
+
+    fn check_template_piece(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        piece: &align_mir::TemplatePiece,
+    ) -> bool {
+        let operand_ty = |operand: &Operand| xml_operand_base_ty(self.graph.function, operand);
+        if !bounded_json_piece_is_type_safe(self.graph.program, self.graph.function, piece) {
+            return false;
+        }
+        let operand = match piece {
+            align_mir::TemplatePiece::Static(_) | align_mir::TemplatePiece::PopComma => None,
+            align_mir::TemplatePiece::IntHole(operand)
+            | align_mir::TemplatePiece::StrHole(operand)
+            | align_mir::TemplatePiece::JsonStrHole(operand)
+            | align_mir::TemplatePiece::BoolHole(operand)
+            | align_mir::TemplatePiece::CharHole(operand)
+            | align_mir::TemplatePiece::FloatHole(operand)
+            | align_mir::TemplatePiece::OptionField { opt: operand, .. }
+            | align_mir::TemplatePiece::OptionStructField { opt: operand, .. }
+            | align_mir::TemplatePiece::StructArrayField { array: operand, .. }
+            | align_mir::TemplatePiece::ScalarArrayField { array: operand, .. }
+            | align_mir::TemplatePiece::UnionValue { value: operand, .. }
+            | align_mir::TemplatePiece::OwnedJsonObject { value: operand, .. } => Some(operand),
+        };
+        if let Some(operand) = operand {
+            let Some(expected) = operand_ty(operand) else {
+                return false;
+            };
+            self.check_operand(equation, operand, expected);
+        }
+        true
+    }
+
+    fn load_slot(&self, operand: &Operand) -> Option<Slot> {
+        match operand {
+            Operand::Arg(index) => self.graph.function.params.get(*index as usize).copied(),
+            Operand::Value(value) => match self.graph.value_definitions.get(*value as usize)? {
+                Some(Rvalue::Load(slot)) => Some(*slot),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn batch_plan_guard_matches(&self, result: ValueId, callee: ValueId, plan: &Operand) -> bool {
+        let Some(plan_slot) = self.load_slot(plan) else { return false; };
+        let function = self.graph.function;
+        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
+            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
+        )) else { return false; };
+        let position = |block: &Block, value: ValueId| block.stmts.iter().position(
+            |statement| matches!(statement, Stmt::Let(id, _) if *id == value)
+        );
+        let Operand::Value(plan_value) = plan else { return false; };
+        let (Some(plan_position), Some(pointer_position), Some(call_position)) =
+            (position(block, *plan_value), position(block, callee), position(block, result))
+        else { return false; };
+        if !(plan_position < pointer_position && pointer_position < call_position) { return false; }
+        if block.id == function.entry || block.stmts.iter().any(|statement| {
+            matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
+        }) { return false; }
+        let mut predecessors = function.blocks.iter().filter(|candidate| match &candidate.term {
+            Term::Goto(target) => *target == block.id,
+            Term::Branch(_, yes, no) => *yes == block.id || *no == block.id,
+            _ => false,
+        });
+        let Some(predecessor) = predecessors.next() else { return false; };
+        if predecessors.next().is_some() { return false; }
+        let Term::Branch(Operand::Value(condition), yes, no) = &predecessor.term else { return false; };
+        if *yes != block.id || yes == no { return false; }
+        let Some(Some(Rvalue::Call(DirectCall::Program(target), arguments))) =
+            self.graph.value_definitions.get(*condition as usize)
+        else { return false; };
+        let Some(condition_position) = predecessor.stmts.iter().position(
+            |statement| matches!(statement, Stmt::Let(value, _) if value == condition)
+        ) else { return false; };
+        let Some(Operand::Value(guard_plan)) = arguments.first() else { return false; };
+        let Some(guard_plan_position) = position(predecessor, *guard_plan) else { return false; };
+        target.as_str() == "pkg.db.internal.resource$batch_plan_valid"
+            && arguments.len() == 1
+            && self.load_slot(&arguments[0]) == Some(plan_slot)
+            && guard_plan_position < condition_position
+            && !predecessor.stmts[guard_plan_position..].iter().any(|statement| {
+                matches!(statement, Stmt::Store(slot, _) if *slot == plan_slot)
+            })
+            && function.blocks.iter().find(|candidate| candidate.id == *no).is_some_and(|failure| {
+                matches!(failure.term, Term::Unreachable)
+                    && failure.stmts.iter().any(|statement| matches!(statement,
+                        Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), args)) if args.is_empty()
+                    ))
+            })
+    }
+
+    fn extraction_guard_matches(&self, result: ValueId, operand: &Operand, selected: &XmlAccessPathSegment) -> bool {
+        let (count, selected_tag) = match selected {
+            XmlAccessPathSegment::OptionSome | XmlAccessPathSegment::ResultOk => (2, 1),
+            XmlAccessPathSegment::ResultErr => (2, 0),
+            XmlAccessPathSegment::EnumPayload { enum_id, variant, .. } => {
+                let Some(count) = self.graph.program.enums.get(*enum_id as usize)
+                    .and_then(|definition| u32::try_from(definition.variants.len()).ok())
+                else { return false; };
+                (count, *variant)
+            }
+            _ => return false,
+        };
+        let function = self.graph.function;
+        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
+            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
+        )) else { return false; };
+        let same_operand = |candidate: &Operand| matches!((candidate, operand),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b);
+        let mut pending = vec![(block.id, (0..count).collect::<Vec<_>>() )];
+        let mut visited = HashSet::new();
+        let mut proved = false;
+        while let Some((block, allowed)) = pending.pop() {
+            if allowed.iter().all(|tag| *tag == selected_tag) {
+                proved = true;
+                continue;
+            }
+            if block == function.entry { return false; }
+            if !visited.insert((block, allowed.clone())) { continue; }
+            let mut has_predecessor = false;
+            for predecessor in &function.blocks {
+                let (condition, yes, no) = match &predecessor.term {
+                    Term::Goto(target) if *target == block => (None, block, block),
+                    Term::Branch(condition, yes, no) if *yes == block || *no == block => (Some(condition), *yes, *no),
+                    _ => continue,
+                };
+                has_predecessor = true;
+                let mut allowed = allowed.clone();
+                if yes != no
+                    && let Some(Operand::Value(condition)) = condition
+                    && function.value_tys.get(*condition as usize) == Some(&Ty::Bool)
+                    && predecessor.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if value == condition))
+                    && let Some(Some(predicate)) = self.graph.value_definitions.get(*condition as usize)
+                {
+                    let tested = match (predicate, selected) {
+                        (Rvalue::OptionIsSome(value), XmlAccessPathSegment::OptionSome) if same_operand(value) => Some(1),
+                        (Rvalue::ResultIsOk(value), XmlAccessPathSegment::ResultOk | XmlAccessPathSegment::ResultErr) if same_operand(value) => Some(1),
+                        (Rvalue::EnumTagEq { enum_id, scrutinee, variant }, XmlAccessPathSegment::EnumPayload { enum_id: expected, .. })
+                            if enum_id == expected && same_operand(scrutinee) && *variant < count => Some(*variant),
+                        _ => None,
+                    };
+                    if let Some(tested) = tested {
+                        allowed.retain(|tag| (*tag == tested) == (yes == block));
+                    }
+                }
+                pending.push((predecessor.id, allowed));
+            }
+            if !has_predecessor { return false; }
+        }
+        proved
+    }
+
+    fn query_descriptor_row_matches(&self, descriptor: u32, row: u32) -> bool {
+        let program = self.graph.program;
+        let Some(definition) = program.structs.get(descriptor as usize) else { return false; };
+        let Some(arguments) = definition.name.strip_prefix("pkg.db$query$S") else { return false; };
+        let Some((length_text, rest)) = arguments.split_once('_') else { return false; };
+        let Ok(length) = length_text.parse::<usize>() else { return false; };
+        if length.to_string() != length_text {
+            return false;
+        }
+        let Some(params) = rest.get(..length) else { return false; };
+        let Some(row_name) = rest.get(length..).and_then(|tail| tail.strip_prefix('$')) else { return false; };
+        let matches_name = |definition: &StructDef, encoded: &str| {
+            let direct = format!("S{}_{}", definition.name.len(), definition.name);
+            let reconstructed = definition.name.replace(['.', '$'], "_");
+            encoded == direct || encoded == format!("S{}_{}", reconstructed.len(), reconstructed)
+        };
+        program.structs.iter().any(|definition| matches_name(definition, &format!("S{length}_{params}")))
+            && program.structs.get(row as usize).is_some_and(|definition| matches_name(definition, row_name))
+    }
+
+    fn same_slot_observation(&self, first: &Operand, second: &Operand) -> bool {
+        let Some(slot) = self.load_slot(first) else { return false; };
+        if self.load_slot(second) != Some(slot) { return false; }
+        let function = self.graph.function;
+        if matches!(first, Operand::Arg(_)) || matches!(second, Operand::Arg(_)) {
+            return function.blocks.iter().flat_map(|block| &block.stmts).all(|statement| {
+                !matches!(statement, Stmt::Store(target, source) if *target == slot
+                    && !matches!(source, Operand::Arg(index) if function.params.get(*index as usize) == Some(&slot)))
+            });
+        }
+        let (Operand::Value(first), Operand::Value(second)) = (first, second) else { return false; };
+        function.blocks.iter().any(|block| {
+            let position = |value: ValueId| block.stmts.iter().position(
+                |statement| matches!(statement, Stmt::Let(id, _) if *id == value)
+            );
+            let (Some(first), Some(second)) = (position(*first), position(*second)) else { return false; };
+            !block.stmts[first.min(second)..=first.max(second)].iter().any(
+                |statement| matches!(statement, Stmt::Store(target, _) if *target == slot)
+            )
+        })
+    }
+
+    // These are the existing checked-HIR native view bridges, not bodyless Align
+    // certificates. Their unsafe native preconditions remain caller-owned; they may
+    // publish shared Copy views, never an owned string, XML handle, or callable.
+    fn native_view_call_matches(&self, result: ValueId, rvalue: &Rvalue) -> bool {
+        let Rvalue::RawCall { callee, args, param_tys, ret_ty, signature } = rvalue else { return false; };
+        if args.len() != param_tys.len()
+            || signature.param_modes != vec![align_ast::ParamMode::ByValue; args.len()]
+            || signature.return_cleanup != hir::ReturnCleanupAbi::None
+            || args.iter().zip(param_tys).any(|(argument, expected)| {
+                xml_operand_base_ty(self.graph.function, argument) != Some(*expected)
+            })
+            || align_sema::ty_is_move(*ret_ty, &self.graph.program.structs,
+                &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types)
+            || !xml_owned_leaf_paths(self.graph.program, *ret_ty)
+                .is_some_and(|leaves| leaves.iter().all(|(ty, _)| *ty == Ty::Str))
+        { return false; }
+        let Operand::Value(callee) = callee else { return false; };
+        let Some(Some(Rvalue::RawPointerLoad { ptr, offset: Operand::Const(Const::Int(offset, offset_ty)) })) =
+            self.graph.value_definitions.get(*callee as usize)
+        else { return false; };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if *offset_ty != i64_ty || xml_operand_base_ty(self.graph.function, ptr) != Some(Ty::Raw) {
+            return false;
+        }
+        let rooted = signature.return_borrow == hir::ReturnBorrowSummary::Roots { params: vec![1], captures: vec![] }
+            && signature.return_region == hir::ReturnRegionSummary::Roots { params: vec![1], captures: vec![] };
+        let unrooted = signature.return_borrow == hir::ReturnBorrowSummary::None
+            && signature.return_region == hir::ReturnRegionSummary::None;
+        if let Some(Ty::ResourceRef(resource)) = param_tys.get(1) {
+            let (row, soa) = match ret_ty {
+                Ty::Struct(row) => (*row, false),
+                Ty::Soa(row) => (*row, true),
+                _ => return false,
+            };
+            let row_borrows = soa || align_sema::ty_may_borrow(*ret_ty, &self.graph.program.structs,
+                &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types);
+            if !(if row_borrows { rooted } else { unrooted }) { return false; }
+            if db_resource_matches_row(self.graph.program, *resource, row, "batch") {
+                let expected = if soa { vec![Ty::Raw, Ty::ResourceRef(*resource)] }
+                    else { vec![Ty::Raw, Ty::ResourceRef(*resource), i64_ty] };
+                return *param_tys == expected && *offset == if soa { 48 } else { 40 }
+                    && self.batch_plan_guard_matches(result, *callee, ptr);
+            }
+            if !soa && *offset == 48 && param_tys == &[Ty::Raw, Ty::ResourceRef(*resource)]
+                && db_resource_matches_row(self.graph.program, *resource, row, "rows")
+                && let Operand::Value(pointer) = ptr
+                && let Some(Some(Rvalue::ResourceRaw { reference, resource: owner })) = self.graph.value_definitions.get(*pointer as usize)
+            {
+                return *owner == *resource && self.same_slot_observation(reference, &args[1]);
+            }
+            return false;
+        }
+        let Operand::Value(pointer) = ptr else { return false; };
+        let Some(Some(Rvalue::Field(slot, fields))) = self.graph.value_definitions.get(*pointer as usize) else { return false; };
+        let Some(Ty::Struct(descriptor)) = self.graph.function.slots.get(*slot as usize) else { return false; };
+        let descriptor_matches = fields.as_slice() == [0] && self.graph.program.structs.get(*descriptor as usize)
+            .is_some_and(|definition| definition.name.starts_with("pkg.db$query$")
+                && align_sema::static_descriptor_struct_is_valid(definition));
+        descriptor_matches && unrooted && match *offset {
+            88 => param_tys == &[Ty::Raw] && matches!(ret_ty, Ty::Struct(row)
+                if self.query_descriptor_row_matches(*descriptor, *row)),
+            96 => param_tys == &[Ty::Int(IntTy { bits: 8, signed: false }), Ty::Int(IntTy { bits: 8, signed: false }), i64_ty]
+                && matches!(ret_ty, Ty::Option(Scalar::Struct(id)) if QueryMetaTypes::resolve(self.graph.program)
+                    .is_ok_and(|types| types.row == *id)),
+            _ => false,
+        }
+    }
+
+    fn call_roots(
+        borrow: &hir::ReturnBorrowSummary,
+        region: &hir::ReturnRegionSummary,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut roots = Vec::new();
+        let mut captured = Vec::new();
+        if let hir::ReturnBorrowSummary::Roots { params, captures } = borrow {
+            roots.extend(params.iter().copied());
+            captured.extend(captures.iter().copied());
+        }
+        if let hir::ReturnRegionSummary::Roots { params, captures } = region {
+            roots.extend(params.iter().copied());
+            captured.extend(captures.iter().copied());
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        captured.sort_unstable();
+        captured.dedup();
+        (roots, captured)
+    }
+
+    /// Follow exactly the ordinary callable producer edges, with the same shape and sibling
+    /// checks, until the selected capture reaches its validated closure environment. Keeping the
+    /// projection on the existing worklist also closes copied, stored, and control-joined callees
+    /// without recursively walking cyclic callable/slot graphs.
+    fn capture_equation(
+        &mut self,
+        node: XmlAccessNode,
+        capture: u32,
+    ) -> XmlAccessEquation {
+        let (selected, captured, mut equation) = match &node {
+            XmlAccessNode::Value(value, path) => {
+                let selected = self.graph.function.value_tys.get(*value as usize)
+                    .and_then(|ty| xml_selected_ty(self.graph.program, *ty, path));
+                let captured = if path.is_empty() {
+                    match self.graph.value_definitions.get(*value as usize) {
+                        Some(Some(Rvalue::Closure { captures, capture_tys, .. })) => {
+                            Some(captures.get(capture as usize)
+                                .zip(capture_tys.get(capture as usize))
+                                .map(|(operand, ty)| (operand.clone(), *ty)))
+                        }
+                        _ => None,
+                    }
+                } else { None };
+                (selected, captured, self.value_equation(*value, path.clone()))
+            }
+            XmlAccessNode::Slot(slot, path) => {
+                let selected = self.graph.function.slots.get(*slot as usize)
+                    .and_then(|ty| xml_selected_ty(self.graph.program, *ty, path));
+                (selected, None, self.slot_equation(*slot, path.clone()))
+            }
+            XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..) => {
+                return XmlAccessEquation { invalid: true, ..XmlAccessEquation::default() };
+            }
+        };
+        if !matches!(selected, Some(Ty::Fn(_))) {
+            equation.invalid = true;
+            return equation;
+        }
+        let callable = self.queue(node);
+        Self::add_required_source(&mut equation, callable, OperandRequirement {
+            read: true,
+            callable: true,
+            ..OperandRequirement::default()
+        });
+        if let Some(captured) = captured {
+            equation.seed = None;
+            equation.dependencies.clear();
+            if let Some((operand, ty)) = captured {
+                self.add_operand(&mut equation, &operand, ty, Vec::new());
+            } else {
+                equation.invalid = true;
+            }
+            return equation;
+        }
+        // A function address or parameter capability alone does not authenticate an environment.
+        // Every reaching producer must expose the requested capture, not just one joined branch.
+        if equation.seed.is_some() || (equation.dependencies.is_empty() && !equation.absent) {
+            equation.invalid = true;
+        }
+        equation.seed = None;
+        for dependency in std::mem::take(&mut equation.dependencies) {
+            let source = match dependency {
+                XmlAccessNode::Value(value, path) => {
+                    self.queue(XmlAccessNode::CaptureValue(value, path, capture))
+                }
+                XmlAccessNode::Slot(slot, path) => {
+                    self.queue(XmlAccessNode::CaptureSlot(slot, path, capture))
+                }
+                XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..) => {
+                    XmlAccessSource::Invalid
+                }
+            };
+            Self::add_source(&mut equation, source);
+        }
+        equation
+    }
+
+    fn add_call_result(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        call: XmlCallResult<'_>,
+    ) {
+        let XmlCallResult {
+            result,
+            result_ty,
+            selected_ty,
+            args,
+            callee,
+            facts,
+            cleanup,
+            modes_match,
+        } = call;
+        let argument_types_match = args.len() == facts.params.len()
+            && facts.modes.len() == facts.params.len()
+            && args
+                .iter()
+                .zip(&facts.params)
+                .all(|(operand, expected)| {
+                    xml_operand_base_ty(self.graph.function, operand) == Some(*expected)
+                });
+        let cleanup_matches = match (cleanup, facts.cleanup) {
+            (None, hir::ReturnCleanupAbi::None) => true,
+            (Some(cleanup), hir::ReturnCleanupAbi::DynamicBit) => {
+                cleanup != result
+                    && self.graph.function.value_tys.get(cleanup as usize) == Some(&Ty::Bool)
+                    && self.graph.primary_definitions.get(cleanup as usize) == Some(&0)
+                    && self.graph.auxiliary_definitions.get(cleanup as usize) == Some(&1)
+            }
+            _ => false,
+        };
+        let (roots, captures) = Self::call_roots(&facts.borrow, &facts.region);
+        if !argument_types_match
+            || !modes_match
+            || facts.ret != result_ty
+            || !cleanup_matches
+            || roots.iter().any(|root| *root as usize >= args.len())
+            || (!captures.is_empty() && callee.is_none())
+        {
+            equation.invalid = true;
+            return;
+        }
+        for ((argument, expected), mode) in args.iter().zip(&facts.params).zip(&facts.modes) {
+            let canonical_borrow = matches!(
+                argument,
+                Operand::BorrowedPlace(_)
+                    | Operand::BorrowedElementPlace(_)
+                    | Operand::BorrowedFixedElementPlace(_)
+            ) && matches!(
+                mode,
+                align_ast::ParamMode::Borrow
+                    | align_ast::ParamMode::BorrowMut
+                    | align_ast::ParamMode::Out
+            );
+            if !canonical_borrow {
+                self.check_whole_operand(equation, argument, *expected);
+            }
+        }
+        let mut captured_sources = Vec::new();
+        for capture in captures {
+            let source = match callee {
+                Some(Operand::Value(value)) => {
+                    self.queue(XmlAccessNode::CaptureValue(*value, Vec::new(), capture))
+                }
+                _ => XmlAccessSource::Invalid,
+            };
+            Self::add_required_source(equation, source.clone(), OperandRequirement::READ);
+            captured_sources.push(source);
+        }
+        if matches!(selected_ty, Ty::String | Ty::XmlReader) {
+            if facts.cleanup != hir::ReturnCleanupAbi::DynamicBit {
+                equation.invalid = true;
+            } else {
+                equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+            }
+            return;
+        }
+        // A returned Move carrier owns its shell even when that shell retains a region
+        // dependency on an argument (for example, a DB cursor borrowing its connection).
+        // Selected Copy views still follow their input roots below; lifetime dependence
+        // must not downgrade the new owner's transfer or exclusive-borrow authority.
+        if (roots.is_empty() && captured_sources.is_empty()) || align_sema::ty_is_move(
+            selected_ty,
+            &self.graph.program.structs,
+            &self.graph.program.tuples,
+            &self.graph.program.enums,
+            &self.graph.program.tagged_types,
+        ) {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+            return;
+        }
+        for source in captured_sources {
+            Self::add_source(equation, source);
+        }
+        for root in roots {
+            let Some((operand, expected)) = args.get(root as usize).zip(facts.params.get(root as usize)) else {
+                equation.invalid = true;
+                return;
+            };
+            match facts.modes.get(root as usize) {
+                Some(align_ast::ParamMode::Borrow) => Self::add_source(
+                    equation,
+                    XmlAccessSource::Seed(XmlAccessProvenance::Shared),
+                ),
+                Some(align_ast::ParamMode::BorrowMut) => Self::add_source(
+                    equation,
+                    XmlAccessSource::Seed(XmlAccessProvenance::Exclusive),
+                ),
+                Some(align_ast::ParamMode::Out) => Self::add_source(
+                    equation,
+                    XmlAccessSource::Seed(XmlAccessProvenance::Unreadable),
+                ),
+                Some(align_ast::ParamMode::ByValue) => {
+                    self.add_operand(equation, operand, *expected, Vec::new());
+                }
+                None => equation.invalid = true,
+            }
+        }
+    }
+
+    fn same_operand(left: &Operand, right: &Operand) -> bool {
+        matches!((left, right),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b)
+            || matches!((left, right),
+                (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt)))
+                    if a == b && at == bt)
+    }
+
+    /// Authenticate the allocation count behind a caller-owned runtime output buffer. Merely
+    /// proving that the pointer has the expected scalar type does not prove that the runtime may
+    /// write its declared bound through it.
+    fn heap_buffer_capacity_matches(&self, output: &Operand, bound: &Operand) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*output as usize),
+            Some(Some(Rvalue::HeapAllocBuf { count, .. }))
+                if Self::same_operand(count, bound)
+        )
+    }
+
+    fn heap_buffer_capacity_matches_slice_len(
+        &self,
+        output: &Operand,
+        source: &Operand,
+    ) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        let Some(Some(Rvalue::HeapAllocBuf { count: Operand::Value(count), .. })) =
+            self.graph.value_definitions.get(*output as usize)
+        else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*count as usize),
+            Some(Some(Rvalue::SliceLen(actual))) if self.same_runtime_row_count(actual, source)
+        )
+    }
+
+    fn same_runtime_row_count(&self, left: &Operand, right: &Operand) -> bool {
+        if Self::same_operand(left, right) {
+            return true;
+        }
+        let (Operand::Value(left), Operand::Value(right)) = (left, right) else {
+            return false;
+        };
+        let dictionary_field = |value: ValueId| match self
+            .graph
+            .value_definitions
+            .get(value as usize)
+        {
+            Some(Some(Rvalue::DictField { base, idx })) => Some((*base, *idx)),
+            _ => None,
+        };
+        matches!(
+            (dictionary_field(*left), dictionary_field(*right)),
+            (Some((left_base, left_field)), Some((right_base, right_field)))
+                if left_base == right_base
+                    && matches!((left_field, right_field), (0, 1) | (1, 0))
+        )
+    }
+
+    fn heap_buffer_capacity_matches_slot_len(&self, output: &Operand, source: Slot) -> bool {
+        let Operand::Value(output) = output else { return false; };
+        let Some(Some(Rvalue::HeapAllocBuf { count: Operand::Value(count), .. })) =
+            self.graph.value_definitions.get(*output as usize)
+        else { return false; };
+        let Some(Some(Rvalue::SliceLen(Operand::Value(array)))) =
+            self.graph.value_definitions.get(*count as usize)
+        else { return false; };
+        matches!(
+            self.graph.value_definitions.get(*array as usize),
+            Some(Some(Rvalue::Load(actual))) if *actual == source
+        )
+    }
+
+    fn add_column_buffer_writer(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        writer: (ValueId, &Rvalue),
+        output: (&Operand, &Operand, Ty, &[XmlAccessPathSegment]),
+    ) -> bool {
+        let (count, runtime) = writer;
+        let (ptr, len, selected_ty, remaining) = output;
+        let (keys, vals, out_keys, out_vals, op, key_scalar) = match runtime {
+            Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op } =>
+                (keys, vals, out_keys, out_vals, *op,
+                    Scalar::Int(IntTy { bits: 64, signed: true })),
+            Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op } =>
+                (keys, vals, out_keys, out_vals, *op, Scalar::Str),
+            _ => return false,
+        };
+        let same = Self::same_operand;
+        if !same(ptr, out_keys) && !same(ptr, out_vals) {
+            return false;
+        }
+        let integer_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let i64_ty = scalar_to_ty(integer_scalar);
+        let keys_ty = xml_operand_base_ty(self.graph.function, keys);
+        let vals_ty = xml_operand_base_ty(self.graph.function, vals);
+        let valid_column = |ty, scalar| {
+            matches!(ty, Some(Ty::Slice(actual) | Ty::DynArray(actual)) if actual == scalar)
+        };
+        let count_only = matches!(op, hir::GroupOp::Count);
+        if self.graph.function.value_tys.get(count as usize) != Some(&i64_ty)
+            || !same(len, &Operand::Value(count))
+            || !valid_column(keys_ty, key_scalar)
+            || (!count_only && !valid_column(vals_ty, integer_scalar))
+            || xml_operand_base_ty(self.graph.function, out_keys) != Some(Ty::Box(key_scalar))
+            || xml_operand_base_ty(self.graph.function, out_vals) != Some(Ty::Box(integer_scalar))
+            || !self.heap_buffer_capacity_matches_slice_len(out_keys, keys)
+            || !self.heap_buffer_capacity_matches_slice_len(out_vals, keys)
+            || same(out_keys, out_vals)
+            || selected_ty != if same(out_keys, ptr) { scalar_to_ty(key_scalar) } else { i64_ty }
+            || !remaining.is_empty()
+        {
+            equation.invalid = true;
+            return true;
+        }
+        if let Some(keys_ty) = keys_ty {
+            self.check_whole_operand(equation, keys, keys_ty);
+            let source = self.source(keys, scalar_to_ty(key_scalar),
+                vec![XmlAccessPathSegment::Element]);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+        if !count_only && let Some(vals_ty) = vals_ty {
+            self.check_whole_operand(equation, vals, vals_ty);
+            let source = self.source(vals, i64_ty, vec![XmlAccessPathSegment::Element]);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+        self.check_operand(equation, out_keys, Ty::Box(key_scalar));
+        self.check_operand(equation, out_vals, Ty::Box(integer_scalar));
+        if same(out_keys, ptr) {
+            self.add_operand(equation, keys, selected_ty, vec![XmlAccessPathSegment::Element]);
+        } else {
+            Self::add_source(equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
+        }
+        true
+    }
+
+    /// Runtime AoS writers share the source row layout and output-buffer contract. Numeric
+    /// outputs own their copied values; key views retain only the selected source key field.
+    fn add_aos_buffer_writer(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        writer: (ValueId, &Rvalue),
+        output: (&Operand, &Operand, Ty, &[XmlAccessPathSegment]),
+    ) -> bool {
+        let (count, runtime) = writer;
+        let (ptr, len, selected_ty, remaining) = output;
+        let (base, struct_id, key_field, aggs, out_keys, out_vals, dictionary) = match runtime {
+            Rvalue::GroupAggStr { base, struct_id, key_field, value_field, op, out_keys, out_vals } =>
+                (*base, *struct_id, *key_field, vec![(*op, *value_field)], out_keys, vec![out_vals], false),
+            Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } =>
+                (*base, *struct_id, *key_field, aggs.clone(), out_keys, out_vals.iter().collect(), false),
+            Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } =>
+                (*base, *struct_id, *key_field, Vec::new(), out_dict, vec![out_ids], true),
+            _ => return false,
+        };
+        let same = Self::same_operand;
+        let key_output = same(ptr, out_keys);
+        if !key_output && !out_vals.iter().any(|out| same(ptr, out)) { return false; }
+        let integer = Scalar::Int(IntTy { bits: 64, signed: true });
+        let i64_ty = scalar_to_ty(integer);
+        let base_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+        let field_ty = |field| self.graph.program.structs.get(struct_id as usize)
+            .and_then(|record| record.fields.get(field as usize)).map(|field| field.ty);
+        let valid_agg = |(op, field): &(hir::GroupOp, Option<u32>)| match (op, field) {
+            (hir::GroupOp::Count, None) => true,
+            (hir::GroupOp::Sum | hir::GroupOp::Min | hir::GroupOp::Max, Some(field)) =>
+                field_ty(*field) == Some(i64_ty),
+            _ => false,
+        };
+        if self.graph.function.slots.get(base as usize) != Some(&base_ty)
+            || field_ty(key_field) != Some(Ty::Str)
+            || self.graph.function.value_tys.get(count as usize) != Some(&i64_ty)
+            || (!dictionary && (aggs.is_empty() || aggs.len() != out_vals.len() || !aggs.iter().all(valid_agg)))
+            || ((!dictionary || key_output) && !same(len, &Operand::Value(count)))
+            || selected_ty != if key_output { Ty::Str } else { i64_ty }
+            || !remaining.is_empty()
+        {
+            equation.invalid = true;
+            return true;
+        }
+        let mut outputs = vec![(out_keys, Scalar::Str)];
+        outputs.extend(out_vals.iter().map(|out| (*out, integer)));
+        for (index, (out, scalar)) in outputs.iter().enumerate() {
+            if outputs[..index].iter().any(|(other, _)| same(out, other)) {
+                equation.invalid = true;
+            }
+            if !self.heap_buffer_capacity_matches_slot_len(out, base) {
+                equation.invalid = true;
+            }
+            self.check_operand(equation, out, Ty::Box(*scalar));
+        }
+        let source = self.queue(XmlAccessNode::Slot(base, Vec::new()));
+        Self::add_required_source(equation, source, OperandRequirement::READ);
+        if key_output {
+            let source = self.queue(XmlAccessNode::Slot(base, vec![
+                XmlAccessPathSegment::Element, XmlAccessPathSegment::StructField(key_field),
+            ]));
+            Self::add_source(equation, source);
+        } else {
+            Self::add_source(equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
+        }
+        true
+    }
+
+    fn add_dictionary_buffer_writer(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        writer: (ValueId, &Rvalue),
+        output: (&Operand, &Operand, Ty, &[XmlAccessPathSegment]),
+    ) -> bool {
+        let (value, runtime) = writer;
+        let (ptr, len, selected_ty, remaining) = output;
+        let same = Self::same_operand;
+        let integer = Scalar::Int(IntTy { bits: 64, signed: true });
+        let i64_ty = scalar_to_ty(integer);
+        match runtime {
+            Rvalue::GatherColumnI64 { source, struct_id, field, out } if same(ptr, out) => {
+                let base_ty = Ty::DynStructArray(*struct_id, Layout::Aos);
+                if self.graph.function.value_tys.get(value as usize) != Some(&Ty::Unit)
+                    || self.graph.program.structs.get(*struct_id as usize)
+                        .and_then(|row| row.fields.get(*field as usize)).map(|field| field.ty) != Some(i64_ty)
+                    || !self.heap_buffer_capacity_matches_slice_len(out, source)
+                    || selected_ty != i64_ty || !remaining.is_empty()
+                { equation.invalid = true; return true; }
+                self.check_whole_operand(equation, source, base_ty);
+                self.check_operand(equation, out, Ty::Box(integer));
+                equation.seed = Some(XmlAccessProvenance::Owned);
+                true
+            }
+            Rvalue::DictLookup { ids, n, dict, out } if same(ptr, out) => {
+                if self.graph.function.value_tys.get(value as usize) != Some(&Ty::Unit)
+                    || !same(len, n)
+                    || !self.heap_buffer_capacity_matches(out, n)
+                    || selected_ty != Ty::Str || !remaining.is_empty()
+                { equation.invalid = true; return true; }
+                self.check_operand(equation, ids, Ty::Box(integer));
+                self.check_operand(equation, n, i64_ty);
+                self.check_operand(equation, out, Ty::Box(Scalar::Str));
+                self.check_whole_operand(equation, dict, Ty::DynArray(Scalar::Str));
+                self.add_operand(equation, dict, Ty::Str, vec![XmlAccessPathSegment::Element]);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn value_equation(
+        &mut self,
+        value: ValueId,
+        path: Vec<XmlAccessPathSegment>,
+    ) -> XmlAccessEquation {
+        let mut equation = XmlAccessEquation::default();
+        let Some(result_ty) = self.graph.function.value_tys.get(value as usize).copied() else {
+            equation.invalid = true;
+            return equation;
+        };
+        let Some(selected_ty) = xml_selected_ty(self.graph.program, result_ty, &path) else {
+            equation.invalid = true;
+            return equation;
+        };
+        if path.is_empty()
+            && result_ty == Ty::Bool
+            && self.graph.primary_definitions.get(value as usize) == Some(&0)
+            && self.graph.auxiliary_definitions.get(value as usize) == Some(&1)
+            && self
+                .graph
+                .auxiliary_value_definitions
+                .get(value as usize)
+                .is_some_and(|definition| {
+                    definition.is_some_and(|definition| match definition {
+                        Rvalue::CallWithCleanup(call) => call.cleanup == value,
+                        Rvalue::CallIndirectWithCleanup(call) => call.cleanup == value,
+                        Rvalue::XmlParse { cleanup, .. } => *cleanup == value,
+                        _ => false,
+                    })
+                })
+        {
+            equation.seed = Some(XmlAccessProvenance::Owned);
+            return equation;
+        }
+        let Some(Some(definition)) = self.graph.value_definitions.get(value as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        if self.graph.duplicate_values.get(value as usize) != Some(&false) {
+            equation.invalid = true;
+            return equation;
+        }
+        let definition = (*definition).clone();
+        let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
+        match definition {
+            Rvalue::Use(operand) => {
+                let Some(source_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(self.graph.program, source_ty, result_ty)
+                    && !xml_ty_is_view_retype(source_ty, result_ty)
+                {
+                    equation.invalid = true;
+                } else if path.is_empty() {
+                    self.add_operand(&mut equation, &operand, source_ty, Vec::new());
+                } else {
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, source_ty, &path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) && !xml_ty_is_view_retype(source_selected, selected_ty) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(&mut equation, &operand, source_selected, path);
+                    }
+                }
+            }
+            ref native @ Rvalue::RawCall { ref callee, ref args, ref param_tys, ret_ty, .. } => {
+                let unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if ret_ty != result_ty || (!unprotected && !self.native_view_call_matches(value, native)) {
+                    equation.invalid = true;
+                } else if unprotected {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    self.check_operand(&mut equation, callee, Ty::Raw);
+                    if let Operand::Value(callee) = callee
+                        && let Some(Some(Rvalue::RawPointerLoad { ptr, .. })) = self.graph.value_definitions.get(*callee as usize)
+                    {
+                        self.check_operand(&mut equation, ptr, Ty::Raw);
+                    }
+                    for (argument, expected) in args.iter().zip(param_tys) {
+                        self.check_whole_operand(&mut equation, argument, *expected);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ColumnBatchRow { payload, owner, index, struct_id, resource } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != Ty::Struct(struct_id)
+                    || !db_resource_matches_row(self.graph.program, resource, struct_id, "batch")
+                    || xml_operand_base_ty(self.graph.function, &payload) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &owner) != Some(Ty::ResourceRef(resource))
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &payload, Ty::Raw);
+                    self.check_operand(&mut equation, &owner, Ty::ResourceRef(resource));
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ColumnBatchSoa { payload, owner, struct_id, resource } => {
+                if result_ty != Ty::Soa(struct_id)
+                    || !db_resource_matches_row(self.graph.program, resource, struct_id, "batch")
+                    || xml_operand_base_ty(self.graph.function, &payload) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &owner) != Some(Ty::ResourceRef(resource))
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &payload, Ty::Raw);
+                    self.check_operand(&mut equation, &owner, Ty::ResourceRef(resource));
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ResourceViewFromRaw {
+                owner,
+                ptr,
+                len,
+                resource,
+                view,
+                allow_null_if_empty,
+                check_nonnegative_len,
+                check_alignment,
+                check_utf8,
+            } => {
+                let expected = match view {
+                    hir::ResourceViewKind::StrUtf8 => Some((
+                        Ty::Option(Scalar::Str),
+                        Ty::Str,
+                        1,
+                        true,
+                    )),
+                    hir::ResourceViewKind::Slice(scalar) => {
+                        let bits = match scalar {
+                            Scalar::Int(integer) => integer.bits,
+                            Scalar::Float(float) => float.bits,
+                            _ => {
+                                equation.invalid = true;
+                                return equation;
+                            }
+                        };
+                        align_sema::scalar_to_prim(scalar).map(|primitive| {
+                            let payload = Ty::Slice(align_sema::prim_to_scalar(primitive));
+                            (
+                                Ty::Option(Scalar::Slice(primitive)),
+                                payload,
+                                u32::from(bits) / 8,
+                                false,
+                            )
+                        })
+                    }
+                };
+                let Some((expected_result, payload_ty, alignment, utf8)) = expected else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let path_valid = path.is_empty()
+                    || path.as_slice() == [XmlAccessPathSegment::OptionSome]
+                        && selected_ty == payload_ty;
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    result_ty,
+                    expected_result,
+                ) || !path_valid
+                    || self
+                        .graph
+                        .program
+                        .resources
+                        .get(resource as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, &owner)
+                        != Some(Ty::ResourceRef(resource))
+                    || xml_operand_base_ty(self.graph.function, &ptr) != Some(Ty::Raw)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                    || !allow_null_if_empty
+                    || !check_nonnegative_len
+                    || check_alignment != alignment
+                    || check_utf8 != utf8
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(
+                        &mut equation,
+                        &owner,
+                        Ty::ResourceRef(resource),
+                    );
+                    self.check_operand(&mut equation, &ptr, Ty::Raw);
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::Load(slot) => {
+                if self.graph.function.slots.get(slot as usize) != Some(&result_ty) {
+                    equation.invalid = true;
+                } else {
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, path)),
+                    );
+                }
+            }
+            Rvalue::Index(slot, index) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(element_ty) = xml_inline_array_element(self.graph.program, slot_ty) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if result_ty != element_ty
+                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                }
+            }
+            Rvalue::IndexField(slot, index, fields) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !matches!(slot_ty, Ty::StructArray(..)) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let mut result_path = vec![XmlAccessPathSegment::Element];
+                result_path.extend(
+                    fields
+                        .iter()
+                        .copied()
+                        .map(XmlAccessPathSegment::StructField),
+                );
+                let Some(expected_result) =
+                    xml_selected_ty(self.graph.program, slot_ty, &result_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = result_path;
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if fields.is_empty()
+                    || result_ty != expected_result
+                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                }
+            }
+            Rvalue::MakeSlice(slot, length) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let view_matches = match (slot_ty, result_ty) {
+                    (Ty::Array(element, actual), Ty::Slice(view)) => {
+                        element == view && u32::try_from(length) == Ok(actual)
+                    }
+                    (Ty::StructArray(id, actual), Ty::Slice(Scalar::Struct(view))) => {
+                        id == view && u32::try_from(length) == Ok(actual)
+                    }
+                    _ => false,
+                };
+                if !view_matches {
+                    equation.invalid = true;
+                } else if length == 0 {
+                    // Exact zero-length inline storage has no element producer to follow.
+                    // Bounds validation keeps every element read unreachable; this is a
+                    // readable empty view, not an uninitialized nonempty payload.
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if path.is_empty() {
+                    let source = self.queue(XmlAccessNode::Slot(
+                        slot,
+                        vec![XmlAccessPathSegment::Element],
+                    ));
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if let Some(remaining) =
+                    path.strip_prefix(&[XmlAccessPathSegment::Element])
+                {
+                    let mut source_path = vec![XmlAccessPathSegment::Element];
+                    source_path.extend_from_slice(remaining);
+                    if xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        != Some(selected_ty)
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                } else {
+                    equation.invalid = true;
+                }
+            }
+            Rvalue::ConstArray { elems, elem } => {
+                let result_matches = align_sema::ty_to_scalar(elem)
+                    .is_some_and(|element| result_ty == Ty::Slice(element));
+                let path_matches = path.is_empty()
+                    || path.as_slice() == [XmlAccessPathSegment::Element]
+                        && selected_ty == elem;
+                if !result_matches
+                    || !path_matches
+                    || elems
+                        .iter()
+                        .any(|element| !xml_const_element_matches_ty(element, elem))
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::SliceIndex(source, index)
+            | Rvalue::SliceIndexNoalias {
+                slice: source,
+                index,
+                ..
+            } => {
+                let Some(source_ty) = xml_operand_base_ty(self.graph.function, &source) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(path);
+                let Some(source_selected) =
+                    xml_selected_ty(self.graph.program, source_ty, &source_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let selection_matches = {
+                    source_selected == selected_ty
+                        || (source_selected == Ty::String && selected_ty == Ty::Str)
+                };
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if !slice_index_result_matches(
+                    self.graph.program,
+                    source_ty,
+                    result_ty,
+                    slice_index_noalias,
+                ) || !selection_matches
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_whole_operand(&mut equation, &source, source_ty);
+                self.check_operand(&mut equation, &index, i64_ty);
+                self.add_operand(
+                    &mut equation,
+                    &source,
+                    source_selected,
+                    source_path,
+                );
+            }
+            Rvalue::SoaColumn {
+                base,
+                struct_id,
+                field,
+            } => {
+                let Some(field_ty) = self
+                    .graph
+                    .program
+                    .structs
+                    .get(struct_id as usize)
+                    .and_then(|definition| definition.fields.get(field as usize))
+                    .map(|field| field.ty)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(field_scalar) = align_sema::ty_to_scalar(field_ty) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if self.graph.function.slots.get(base as usize) != Some(&Ty::Soa(struct_id))
+                    || result_ty != Ty::Slice(field_scalar)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let mut source_path = vec![XmlAccessPathSegment::StructField(field)];
+                if path.is_empty() {
+                    let source = self.queue(XmlAccessNode::Slot(base, source_path));
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if let Some(remaining) =
+                    path.strip_prefix(&[XmlAccessPathSegment::Element])
+                {
+                    source_path.extend_from_slice(remaining);
+                    if xml_selected_ty(self.graph.program, Ty::Soa(struct_id), &source_path)
+                        != Some(selected_ty)
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(base, source_path)),
+                    );
+                } else {
+                    equation.invalid = true;
+                }
+            }
+            Rvalue::IndexFieldPtr {
+                base,
+                index,
+                field,
+                struct_id,
+            } => {
+                let base_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+                let Some(field_ty) = self
+                    .graph
+                    .program
+                    .structs
+                    .get(struct_id as usize)
+                    .and_then(|record| record.fields.get(field as usize))
+                    .map(|field| field.ty)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![
+                    XmlAccessPathSegment::Element,
+                    XmlAccessPathSegment::StructField(field),
+                ];
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if result_ty != field_ty
+                    || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
+                    || xml_selected_ty(self.graph.program, base_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &index, i64_ty);
+                self.add_operand(
+                    &mut equation,
+                    &base,
+                    selected_ty,
+                    source_path,
+                );
+            }
+            Rvalue::IndexColumn {
+                base,
+                index,
+                field,
+                struct_id,
+            } => {
+                let base_ty = Ty::Soa(struct_id);
+                let Some(field_ty) = self
+                    .graph
+                    .program
+                    .structs
+                    .get(struct_id as usize)
+                    .and_then(|record| record.fields.get(field as usize))
+                    .map(|field| field.ty)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut source_path = vec![XmlAccessPathSegment::StructField(field)];
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if result_ty != field_ty
+                    || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
+                    || xml_selected_ty(self.graph.program, base_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &index, i64_ty);
+                self.add_operand(
+                    &mut equation,
+                    &base,
+                    selected_ty,
+                    source_path,
+                );
+            }
+            Rvalue::IndexPtr {
+                base,
+                index,
+                struct_id,
+            } => {
+                let base_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(path);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if self
+                    .graph
+                    .program
+                    .structs
+                    .get(struct_id as usize)
+                    .is_none()
+                    || result_ty != Ty::Struct(struct_id)
+                    || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
+                    || xml_selected_ty(self.graph.program, base_ty, &source_path)
+                        != Some(selected_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &index, i64_ty);
+                self.add_operand(
+                    &mut equation,
+                    &base,
+                    selected_ty,
+                    source_path,
+                );
+            }
+            Rvalue::SoaGather {
+                base,
+                index,
+                struct_id,
+            } => {
+                let Some(definition) = self.graph.program.structs.get(struct_id as usize) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let base_ty = Ty::Soa(struct_id);
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if result_ty != Ty::Struct(struct_id)
+                    || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &index, i64_ty);
+                if path.is_empty() {
+                    for (field, field_definition) in definition.fields.iter().enumerate() {
+                        let Ok(field) = u32::try_from(field) else {
+                            equation.invalid = true;
+                            return equation;
+                        };
+                        let source = self.source(
+                            &base,
+                            field_definition.ty,
+                            vec![XmlAccessPathSegment::StructField(field)],
+                        );
+                        Self::add_required_source(
+                            &mut equation,
+                            source,
+                            OperandRequirement::READ,
+                        );
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else {
+                    if xml_selected_ty(self.graph.program, base_ty, &path) != Some(selected_ty) {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    self.add_operand(&mut equation, &base, selected_ty, path);
+                }
+            }
+            Rvalue::ArenaAlloc {
+                handle,
+                count,
+                elem,
+            } => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let expected_result = align_sema::ty_to_scalar(elem).map(Ty::Box);
+                if !path.is_empty()
+                    || expected_result != Some(result_ty)
+                    || xml_operand_base_ty(self.graph.function, &handle)
+                        != Some(Ty::ArenaHandle)
+                    || xml_operand_base_ty(self.graph.function, &count) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &handle, Ty::ArenaHandle);
+                self.check_operand(&mut equation, &count, i64_ty);
+                equation.seed = Some(XmlAccessProvenance::Shared);
+            }
+            Rvalue::HeapAllocBuf { count, elem } => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let expected_result = align_sema::ty_to_scalar(elem).map(Ty::Box);
+                if !path.is_empty()
+                    || expected_result != Some(result_ty)
+                    || xml_operand_base_ty(self.graph.function, &count) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &count, i64_ty);
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::SoaAlloc { handle, len, struct_id } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let expected = self.graph.program.structs.get(struct_id as usize)
+                    .and_then(|record| record.fields.first())
+                    .and_then(|field| align_sema::ty_to_scalar(field.ty))
+                    .map(Ty::Box);
+                if !path.is_empty() || expected != Some(result_ty)
+                    || xml_operand_base_ty(self.graph.function, &handle) != Some(Ty::ArenaHandle)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &handle, Ty::ArenaHandle);
+                self.check_operand(&mut equation, &len, i64_ty);
+                equation.seed = Some(XmlAccessProvenance::Shared);
+            }
+            Rvalue::MakeDynArray { ptr, len } => {
+                let same_operand = |left: &Operand, right: &Operand| match (left, right) {
+                    (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) => a == b,
+                    (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt))) => a == b && at == bt,
+                    _ => false,
+                };
+                let Operand::Value(ptr_value) = ptr else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let ptr = Operand::Value(ptr_value);
+                let Some(Ty::Box(element)) = xml_operand_base_ty(self.graph.function, &ptr) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let element_ty = scalar_to_ty(element);
+                let expected_result = match element {
+                    Scalar::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+                    _ => Ty::DynArray(element),
+                };
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                if let Ty::Soa(struct_id) = result_ty {
+                    let Some(Some(Rvalue::SoaAlloc { struct_id: allocated, len: allocated_len, .. })) =
+                        self.graph.value_definitions.get(ptr_value as usize)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if *allocated != struct_id || !same_operand(allocated_len, &len)
+                        || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    self.check_operand(&mut equation, &ptr, Ty::Box(element));
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    if path.is_empty() {
+                        self.add_operand(&mut equation, &ptr, Ty::Box(element), Vec::new());
+                        return equation;
+                    }
+                    let Some((XmlAccessPathSegment::StructField(selected_field), remaining)) = path.split_first() else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    let mut found_store = false;
+                    for statement in self.graph.function.blocks.iter().flat_map(|block| &block.stmts) {
+                        let Stmt::StoreColumn { base, len: stored_len, index, field, struct_id: stored_id, value: stored } = statement else {
+                            continue;
+                        };
+                        if !same_operand(base, &ptr) { continue; }
+                        let field_ty = self.graph.program.structs.get(struct_id as usize)
+                            .and_then(|record| record.fields.get(*field as usize))
+                            .map(|field| field.ty);
+                        if *stored_id != struct_id || !same_operand(stored_len, &len)
+                            || xml_operand_base_ty(self.graph.function, index) != Some(i64_ty)
+                            || field_ty.is_none()
+                            || xml_operand_base_ty(self.graph.function, stored) != field_ty
+                        {
+                            equation.invalid = true;
+                            continue;
+                        }
+                        self.check_operand(&mut equation, index, i64_ty);
+                        if *field == *selected_field {
+                            found_store = true;
+                            self.add_operand(&mut equation, stored, selected_ty, remaining.to_vec());
+                        }
+                    }
+                    if !found_store { equation.invalid = true; }
+                    return equation;
+                }
+                if result_ty != expected_result
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &ptr, Ty::Box(element));
+                self.check_operand(&mut equation, &len, i64_ty);
+                if path.is_empty() {
+                    self.add_operand(
+                        &mut equation,
+                        &ptr,
+                        Ty::Box(element),
+                        Vec::new(),
+                    );
+                    return equation;
+                }
+                let Some(remaining) = path.strip_prefix(&[XmlAccessPathSegment::Element]) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if xml_selected_ty(self.graph.program, element_ty, remaining)
+                    != Some(selected_ty)
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let mut found_store = false;
+                for statement in self
+                    .graph
+                    .function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                {
+                    if let Stmt::Let(count, runtime) = statement {
+                        let output = (&ptr, &len, selected_ty, remaining);
+                        if self.add_column_buffer_writer(&mut equation, (*count, runtime), output)
+                            || self.add_aos_buffer_writer(&mut equation, (*count, runtime), output)
+                            || self.add_dictionary_buffer_writer(&mut equation, (*count, runtime), output)
+                        {
+                            found_store = true;
+                            continue;
+                        }
+                    }
+                    let (stored_ptr, index, stored) = match statement {
+                        Stmt::PtrStore(stored_ptr, index, stored) => {
+                            (stored_ptr, index, stored)
+                        }
+                        Stmt::PtrStoreNoalias {
+                            ptr: stored_ptr,
+                            index,
+                            value: stored,
+                            ..
+                        } => (stored_ptr, index, stored),
+                        _ => continue,
+                    };
+                    if !matches!(stored_ptr, Operand::Value(value) if *value == ptr_value) {
+                        continue;
+                    }
+                    found_store = true;
+                    if xml_operand_base_ty(self.graph.function, index) != Some(i64_ty)
+                        || xml_operand_base_ty(self.graph.function, stored) != Some(element_ty)
+                    {
+                        equation.invalid = true;
+                        continue;
+                    }
+                    self.check_operand(&mut equation, index, i64_ty);
+                    self.check_whole_operand(&mut equation, stored, element_ty);
+                    self.add_operand(
+                        &mut equation,
+                        stored,
+                        selected_ty,
+                        remaining.to_vec(),
+                    );
+                }
+                if !found_store {
+                    equation.invalid = true;
+                }
+            }
+            runtime @ (Rvalue::GroupAgg { .. } | Rvalue::GroupAggStrCols { .. }) => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let (out, key) = match &runtime {
+                    Rvalue::GroupAgg { out_keys, .. } => (out_keys, i64_ty),
+                    Rvalue::GroupAggStrCols { out_keys, .. } => (out_keys, Ty::Str),
+                    _ => { equation.invalid = true; return equation; }
+                };
+                let mut inputs = XmlAccessEquation::default();
+                if result_ty != i64_ty || !path.is_empty()
+                    || !self.add_column_buffer_writer(&mut inputs, (value, &runtime),
+                        (out, &Operand::Value(value), key, &[]))
+                { equation.invalid = true; return equation; }
+                equation.invalid |= inputs.invalid;
+                equation.checks.extend(inputs.checks);
+                equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            runtime @ (Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::DictEncode { .. }) => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let out = match &runtime {
+                    Rvalue::GroupAggStr { out_keys, .. } | Rvalue::GroupAggMultiStr { out_keys, .. } => out_keys,
+                    Rvalue::DictEncode { out_dict, .. } => out_dict,
+                    _ => { equation.invalid = true; return equation; }
+                };
+                let mut inputs = XmlAccessEquation::default();
+                if result_ty != i64_ty || !path.is_empty()
+                    || !self.add_aos_buffer_writer(&mut inputs, (value, &runtime),
+                        (out, &Operand::Value(value), Ty::Str, &[]))
+                { equation.invalid = true; return equation; }
+                equation.invalid |= inputs.invalid;
+                equation.checks.extend(inputs.checks);
+                equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            runtime @ (Rvalue::GatherColumnI64 { .. } | Rvalue::DictLookup { .. }) => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let unused_length = Operand::Const(Const::Int(0, i64_ty));
+                let (out, length, element) = match &runtime {
+                    Rvalue::GatherColumnI64 { out, .. } => (out, &unused_length, i64_ty),
+                    Rvalue::DictLookup { out, n, .. } => (out, n, Ty::Str),
+                    _ => { equation.invalid = true; return equation; }
+                };
+                let mut inputs = XmlAccessEquation::default();
+                if result_ty != Ty::Unit || !path.is_empty()
+                    || !self.add_dictionary_buffer_writer(&mut inputs, (value, &runtime), (out, length, element, &[]))
+                { equation.invalid = true; return equation; }
+                equation.invalid |= inputs.invalid;
+                equation.checks.extend(inputs.checks);
+                equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::MakeDictEncoded { source, ids, dict } => {
+                let Ty::DictEncoded(id, key) = result_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let operands = [&source, &ids, &dict];
+                for (index, operand) in operands.iter().enumerate() {
+                    let Some(expected) = u32::try_from(index).ok()
+                        .and_then(|index| xml_dict_field_ty(self.graph.program, id, key, index))
+                    else { equation.invalid = true; return equation; };
+                    self.check_whole_operand(&mut equation, operand, expected);
+                }
+                if path.is_empty() {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else if let Some((XmlAccessPathSegment::TupleElement(index), tail)) = path.split_first() {
+                    if let Some(operand) = operands.get(*index as usize) {
+                        self.add_operand(&mut equation, operand, selected_ty, tail.to_vec());
+                    } else { equation.invalid = true; }
+                } else { equation.invalid = true; }
+            }
+            Rvalue::DictField { base, idx } => {
+                let Some(Ty::DictEncoded(id, key)) = self.graph.function.slots.get(base as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if xml_dict_field_ty(self.graph.program, id, key, idx) != Some(result_ty) {
+                    equation.invalid = true;
+                } else {
+                    let mut source_path = vec![XmlAccessPathSegment::TupleElement(idx)];
+                    source_path.extend(path);
+                    let source = self.queue(XmlAccessNode::Slot(base, source_path));
+                    Self::add_source(&mut equation, source);
+                }
+            }
+            Rvalue::Field(slot, fields) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let mut selected_path = fields
+                    .iter()
+                    .copied()
+                    .map(XmlAccessPathSegment::StructField)
+                    .collect::<Vec<_>>();
+                if fields.is_empty()
+                    || xml_selected_ty(self.graph.program, slot_ty, &selected_path) != Some(result_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    selected_path.extend(path);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, selected_path)),
+                    );
+                }
+            }
+            Rvalue::Select { cond, a, b } => {
+                let condition_ty = xml_operand_base_ty(self.graph.function, &cond);
+                let condition_matches = condition_ty == Some(Ty::Bool)
+                    || xml_numeric_vector_shape(result_ty).is_some_and(|(element, lanes)| {
+                        path.is_empty() && condition_ty == Some(Ty::Mask(element, lanes))
+                    });
+                if !condition_matches
+                    || xml_operand_base_ty(self.graph.function, &a) != Some(result_ty)
+                    || xml_operand_base_ty(self.graph.function, &b) != Some(result_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    // A condition is checked without contributing its access to either result
+                    // arm, for both scalar branchless selection and lane-wise SIMD selection.
+                    let Some(condition_ty) = condition_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(&mut equation, &cond, condition_ty);
+                    self.add_operand(&mut equation, &a, selected_ty, path.clone());
+                    self.add_operand(&mut equation, &b, selected_ty, path);
+                }
+            }
+            Rvalue::MakeTuple { tuple_id, elems } => {
+                let Some(tuple) = self.graph.program.tuples.get(tuple_id as usize) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let operand_tys = elems
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>();
+                if result_ty != Ty::Tuple(tuple_id)
+                    || elems.len() != tuple.elems.len()
+                    || operand_tys.as_ref().is_none_or(|actual| {
+                        actual.iter().zip(&tuple.elems).any(|(actual, expected)| {
+                            !xml_ty_matches_tagged_body(
+                                self.graph.program,
+                                *actual,
+                                scalar_to_ty(*expected),
+                            )
+                        })
+                    })
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let Some(operand_tys) = operand_tys else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                for (operand, actual) in elems.iter().zip(&operand_tys) {
+                    self.check_operand(&mut equation, operand, *actual);
+                }
+                if path.is_empty() {
+                    if elems.is_empty() {
+                        equation.seed = Some(XmlAccessProvenance::Owned);
+                    } else {
+                        for (operand, actual) in elems.iter().zip(&operand_tys) {
+                            self.add_operand(
+                                &mut equation,
+                                operand,
+                                *actual,
+                                Vec::new(),
+                            );
+                        }
+                    }
+                    return equation;
+                }
+                let Some((XmlAccessPathSegment::TupleElement(index), rest)) = path.split_first()
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(operand) = elems.get(*index as usize) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual) = operand_tys.get(*index as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual, rest)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
+            }
+            Rvalue::TupleIndex { tuple, index } => {
+                let Some(tuple_ty) = xml_operand_base_ty(self.graph.function, &tuple) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Ty::Tuple(tuple_id) = tuple_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(payload_ty) = self
+                    .graph
+                    .program
+                    .tuples
+                    .get(tuple_id as usize)
+                    .and_then(|definition| definition.elems.get(index as usize))
+                    .copied()
+                    .map(scalar_to_ty)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(self.graph.program, result_ty, payload_ty) {
+                    equation.invalid = true;
+                } else {
+                    let mut selected_path = vec![XmlAccessPathSegment::TupleElement(index)];
+                    selected_path.extend(path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, tuple_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &tuple,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
+                }
+            }
+            Rvalue::MakeEnum {
+                enum_id,
+                variant,
+                payload,
+            } => {
+                let Some(definition) = self
+                    .graph
+                    .program
+                    .enums
+                    .get(enum_id as usize)
+                    .and_then(|definition| definition.variants.get(variant as usize))
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let operand_tys = payload
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>();
+                if result_ty != Ty::Enum(enum_id)
+                    || payload.len() != definition.payload.len()
+                    || operand_tys.as_ref().is_none_or(|actual| {
+                        actual
+                            .iter()
+                            .zip(&definition.payload)
+                            .any(|(actual, expected)| {
+                                !xml_ty_matches_tagged_body(
+                                    self.graph.program,
+                                    *actual,
+                                    scalar_to_ty(*expected),
+                                )
+                            })
+                    })
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let Some(operand_tys) = operand_tys else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if let Some(XmlAccessPathSegment::EnumPayload {
+                    enum_id: path_enum,
+                    variant: path_variant,
+                    ..
+                }) = path.first()
+                    && (*path_enum != enum_id || *path_variant != variant)
+                {
+                    equation.absent = true;
+                    return equation;
+                }
+                for (operand, actual) in payload.iter().zip(&operand_tys) {
+                    self.check_operand(&mut equation, operand, *actual);
+                }
+                if path.is_empty() {
+                    if payload.is_empty() {
+                        equation.seed = Some(XmlAccessProvenance::Owned);
+                    } else {
+                        for (operand, actual) in payload.iter().zip(&operand_tys) {
+                            self.add_operand(
+                                &mut equation,
+                                operand,
+                                *actual,
+                                Vec::new(),
+                            );
+                        }
+                    }
+                    return equation;
+                }
+                let Some((XmlAccessPathSegment::EnumPayload {
+                    enum_id: path_enum,
+                    variant: path_variant,
+                    slot,
+                }, rest)) = path.split_first()
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if *path_enum != enum_id || *path_variant != variant {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let Some(operand) = payload.get(*slot as usize) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual) = operand_tys.get(*slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual, rest)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
+            }
+            Rvalue::EnumPayload {
+                enum_id,
+                variant,
+                slot,
+                operand,
+            } => {
+                let Some(payload_ty) = self
+                    .graph
+                    .program
+                    .enums
+                    .get(enum_id as usize)
+                    .and_then(|definition| definition.variants.get(variant as usize))
+                    .and_then(|definition| definition.payload.get(slot as usize))
+                    .copied()
+                    .map(scalar_to_ty)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if xml_operand_base_ty(self.graph.function, &operand) != Some(Ty::Enum(enum_id))
+                    || !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        result_ty,
+                        payload_ty,
+                    )
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, &operand,
+                        &XmlAccessPathSegment::EnumPayload { enum_id, variant, slot });
+                    let mut selected_path = vec![XmlAccessPathSegment::EnumPayload {
+                        enum_id,
+                        variant,
+                        slot,
+                    }];
+                    selected_path.extend(path);
+                    let Some(source_selected) = xml_selected_ty(
+                        self.graph.program,
+                        Ty::Enum(enum_id),
+                        &selected_path,
+                    ) else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
+                }
+            }
+            Rvalue::OptionSome(operand) => {
+                let Some(payload_ty) = xml_option_payload(self.graph.program, result_ty) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_payload_ty) =
+                    xml_operand_base_ty(self.graph.function, &operand)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_payload_ty,
+                    payload_ty,
+                ) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &operand, actual_payload_ty);
+                if path.is_empty() {
+                    self.add_operand(
+                        &mut equation,
+                        &operand,
+                        actual_payload_ty,
+                        Vec::new(),
+                    );
+                    return equation;
+                }
+                let Some((XmlAccessPathSegment::OptionSome, rest)) = path.split_first() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_selected) =
+                    xml_selected_ty(self.graph.program, actual_payload_ty, rest)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_selected,
+                    selected_ty,
+                ) {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        &operand,
+                        actual_selected,
+                        rest.to_vec(),
+                    );
+                }
+            }
+            Rvalue::OptionNone => {
+                if xml_option_payload(self.graph.program, result_ty).is_none() {
+                    equation.invalid = true;
+                } else if path.is_empty() {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else if matches!(path.first(), Some(XmlAccessPathSegment::OptionSome)) {
+                    equation.absent = true;
+                } else {
+                    equation.invalid = true;
+                }
+            }
+            Rvalue::OptionUnwrap(operand) => {
+                let Some(option_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let payload_matches = xml_option_payload(self.graph.program, option_ty)
+                    .is_some_and(|payload| {
+                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                    });
+                if !payload_matches {
+                    equation.invalid = true;
+                } else {
+                    equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, &operand,
+                        &XmlAccessPathSegment::OptionSome);
+                    let mut selected_path = vec![XmlAccessPathSegment::OptionSome];
+                    selected_path.extend(path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, option_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        selected_ty,
+                        source_selected,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            &operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
+                }
+            }
+            Rvalue::OptionIsSome(operand) => {
+                let wrapper_ty = xml_operand_base_ty(self.graph.function, &operand);
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !wrapper_ty.is_some_and(|ty| {
+                        xml_option_payload(self.graph.program, ty).is_some()
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(wrapper_ty) = wrapper_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &operand,
+                        wrapper_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::ResultOk(ref operand) | Rvalue::ResultErr(ref operand) => {
+                let ok = matches!(&definition, Rvalue::ResultOk(_));
+                let Some(payload_ty) = xml_result_payload(self.graph.program, result_ty, ok) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(actual_payload_ty) =
+                    xml_operand_base_ty(self.graph.function, operand)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !xml_ty_matches_tagged_body(
+                    self.graph.program,
+                    actual_payload_ty,
+                    payload_ty,
+                ) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let expected_segment = if ok {
+                    XmlAccessPathSegment::ResultOk
+                } else {
+                    XmlAccessPathSegment::ResultErr
+                };
+                if let Some(segment) = path.first()
+                    && matches!(segment, XmlAccessPathSegment::ResultOk | XmlAccessPathSegment::ResultErr)
+                    && segment != &expected_segment
+                {
+                    equation.absent = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, operand, actual_payload_ty);
+                if path.is_empty() {
+                    self.add_operand(
+                        &mut equation,
+                        operand,
+                        actual_payload_ty,
+                        Vec::new(),
+                    );
+                    return equation;
+                }
+                let Some((segment, rest)) = path.split_first() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if segment != &expected_segment {
+                    equation.invalid = true;
+                } else {
+                    let Some(actual_selected) =
+                        xml_selected_ty(self.graph.program, actual_payload_ty, rest)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        actual_selected,
+                        selected_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            operand,
+                            actual_selected,
+                            rest.to_vec(),
+                        );
+                    }
+                }
+            }
+            Rvalue::ResultUnwrapOk(ref operand) | Rvalue::ResultUnwrapErr(ref operand) => {
+                let ok = matches!(&definition, Rvalue::ResultUnwrapOk(_));
+                let Some(wrapper_ty) = xml_operand_base_ty(self.graph.function, operand) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let payload_matches = xml_result_payload(self.graph.program, wrapper_ty, ok)
+                    .is_some_and(|payload| {
+                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                    });
+                if !payload_matches {
+                    equation.invalid = true;
+                } else {
+                    equation.require_present = true;
+                    equation.guarded_absence = self.extraction_guard_matches(value, operand,
+                        &if ok { XmlAccessPathSegment::ResultOk } else { XmlAccessPathSegment::ResultErr });
+                    let mut selected_path = vec![if ok {
+                        XmlAccessPathSegment::ResultOk
+                    } else {
+                        XmlAccessPathSegment::ResultErr
+                    }];
+                    selected_path.extend(path);
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, wrapper_ty, &selected_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if !xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        selected_ty,
+                        source_selected,
+                    ) {
+                        equation.invalid = true;
+                    } else {
+                        self.add_operand(
+                            &mut equation,
+                            operand,
+                            source_selected,
+                            selected_path,
+                        );
+                    }
+                }
+            }
+            Rvalue::ResultIsOk(operand) => {
+                let wrapper_ty = xml_operand_base_ty(self.graph.function, &operand);
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !wrapper_ty.is_some_and(|ty| {
+                        xml_result_payload(self.graph.program, ty, true).is_some()
+                            && xml_result_payload(self.graph.program, ty, false).is_some()
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(wrapper_ty) = wrapper_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &operand,
+                        wrapper_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::EnumTagEq {
+                enum_id,
+                scrutinee,
+                variant,
+            } => {
+                let variant_valid = self
+                    .graph
+                    .program
+                    .enums
+                    .get(enum_id as usize)
+                    .is_some_and(|definition| (variant as usize) < definition.variants.len());
+                if result_ty != Ty::Bool
+                    || !path.is_empty()
+                    || !variant_valid
+                    || xml_operand_base_ty(self.graph.function, &scrutinee)
+                        != Some(Ty::Enum(enum_id))
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &scrutinee, Ty::Enum(enum_id));
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::MakeError { enum_id, tag, code } => {
+                let i32_ty = Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                });
+                if result_ty != Ty::Enum(enum_id)
+                    || !path.is_empty()
+                    || !builtin_error_enum_is_exact(self.graph.program, enum_id)
+                    || xml_operand_base_ty(self.graph.function, &tag) != Some(i32_ty)
+                    || xml_operand_base_ty(self.graph.function, &code) != Some(i32_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &tag, i32_ty);
+                    self.check_operand(&mut equation, &code, i32_ty);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::FnAddr { target, signature } => {
+                let Ty::Fn(id) = result_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(canonical) = xml_fn_type_facts(self.graph.program, id) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target_facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &target,
+                    self.graph.local_contracts,
+                ) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !path.is_empty()
+                    || canonical != target_facts
+                    || !xml_signature_matches_facts(&signature, &canonical)
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::Closure {
+                lifted,
+                captures,
+                capture_tys,
+                signature,
+            } => {
+                let Ty::Fn(id) = result_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(canonical) = xml_fn_type_facts(self.graph.program, id) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target) = self
+                    .graph
+                    .program
+                    .fns
+                    .iter()
+                    .find(|function| function.name == lifted)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(explicit) = target.params.len().checked_sub(capture_tys.len()) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(explicit_param_slots) = target.params.get(..explicit) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(target_capture_slots) = target.params.get(explicit..) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some(explicit_modes) = target.param_modes.get(..explicit) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let explicit_params = explicit_param_slots
+                    .iter()
+                    .map(|slot| target.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>();
+                let target_capture_tys = target_capture_slots
+                    .iter()
+                    .map(|slot| target.slots.get(*slot as usize).copied())
+                    .collect::<Option<Vec<_>>>();
+                let facts = explicit_params.map(|params| XmlCallFacts {
+                    params,
+                    modes: explicit_modes.to_vec(),
+                    ret: target.ret,
+                    borrow: target.return_borrow.clone(),
+                    region: target.return_region.clone(),
+                    cleanup: target.return_cleanup,
+                });
+                let captures_match = captures.len() == capture_tys.len()
+                    && target_capture_tys.as_ref() == Some(&capture_tys)
+                    && captures.iter().zip(&capture_tys).all(|(operand, expected)| {
+                        xml_operand_base_ty(self.graph.function, operand) == Some(*expected)
+                    });
+                if !path.is_empty()
+                    || facts.as_ref() != Some(&canonical)
+                    || !xml_signature_matches_facts(&signature, &canonical)
+                    || !captures_match
+                {
+                    equation.invalid = true;
+                } else {
+                    for (capture, expected) in captures.iter().zip(&capture_tys) {
+                        self.check_operand(&mut equation, capture, *expected);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::Call(DirectCall::Runtime(key), args) => {
+                let Some(argument_types) = args
+                    .iter()
+                    .map(|operand| xml_operand_base_ty(self.graph.function, operand))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let result_is_unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if !path.is_empty()
+                    || !result_is_unprotected
+                    || !direct_runtime_key_is_valid(
+                        key,
+                        &argument_types,
+                        result_ty,
+                        self.graph.program,
+                    )
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                for (argument, expected) in args.iter().zip(argument_types) {
+                    self.check_whole_operand(&mut equation, argument, expected);
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::Call(DirectCall::Program(target), args) => {
+                if let Some(facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &target,
+                    self.graph.local_contracts,
+                ) {
+                    self.add_call_result(&mut equation, XmlCallResult {
+                        result: value,
+                        result_ty,
+                        selected_ty,
+                        args: &args,
+                        callee: None,
+                        facts: &facts,
+                        cleanup: None,
+                        modes_match: direct_operands_match_modes(
+                            &target,
+                            &args,
+                            &facts.modes,
+                            &facts.params,
+                            self.graph.program,
+                        ),
+                    });
+                    return equation;
+                }
+                let has_align_declaration = self
+                    .graph
+                    .program
+                    .fns
+                    .iter()
+                    .any(|function| function.name == target)
+                    || self
+                        .graph
+                        .program
+                        .imported_fns
+                        .iter()
+                        .any(|function| function.name == target);
+                let mut externs = self
+                    .graph
+                    .program
+                    .externs
+                    .iter()
+                    .filter(|declaration| declaration.name == target);
+                let Some(extern_) = externs.next() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let result_is_unprotected = xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty());
+                if has_align_declaration
+                    || externs.next().is_some()
+                    || !path.is_empty()
+                    || !result_is_unprotected
+                    || extern_.ret != result_ty
+                    || !direct_operands_match_modes(
+                        &target,
+                        &args,
+                        &extern_.param_modes,
+                        &extern_.params,
+                        self.graph.program,
+                    )
+                    || args.len() != extern_.params.len()
+                    || args.iter().zip(&extern_.params).any(|(argument, expected)| {
+                        xml_operand_base_ty(self.graph.function, argument) != Some(*expected)
+                    })
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                for (argument, expected) in args.iter().zip(&extern_.params) {
+                    self.check_whole_operand(&mut equation, argument, *expected);
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::CallWithCleanup(call) => {
+                let Some(facts) = xml_direct_call_facts(
+                    self.graph.program,
+                    &call.target,
+                    self.graph.local_contracts,
+                ) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                self.add_call_result(&mut equation, XmlCallResult {
+                    result: value,
+                    result_ty,
+                    selected_ty,
+                    args: &call.args,
+                    callee: None,
+                    facts: &facts,
+                    cleanup: Some(call.cleanup),
+                    modes_match: direct_operands_match_modes(
+                        &call.target,
+                        &call.args,
+                        &facts.modes,
+                        &facts.params,
+                        self.graph.program,
+                    ),
+                });
+            }
+            Rvalue::CallIndirect {
+                callee,
+                args,
+                param_tys,
+                ret_ty,
+                signature,
+            } => {
+                let Some(Ty::Fn(id)) = xml_operand_base_ty(self.graph.function, &callee) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let facts = XmlCallFacts {
+                    params: param_tys,
+                    modes: signature.param_modes,
+                    ret: ret_ty,
+                    borrow: signature.return_borrow,
+                    region: signature.return_region,
+                    cleanup: signature.return_cleanup,
+                };
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let callee_source = self.check_source(&callee, Ty::Fn(id));
+                Self::add_required_source(
+                    &mut equation,
+                    callee_source,
+                    OperandRequirement {
+                        read: true,
+                        callable: true,
+                        ..OperandRequirement::default()
+                    },
+                );
+                self.add_call_result(&mut equation, XmlCallResult {
+                    result: value,
+                    result_ty,
+                    selected_ty,
+                    args: &args,
+                    callee: Some(&callee),
+                    facts: &facts,
+                    cleanup: None,
+                    modes_match: operands_match_modes(
+                        &args,
+                        &facts.modes,
+                        &facts.params,
+                        self.graph.program,
+                    ),
+                });
+            }
+            Rvalue::CallIndirectWithCleanup(call) => {
+                let Some(Ty::Fn(id)) = xml_operand_base_ty(self.graph.function, &call.callee) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let facts = XmlCallFacts {
+                    params: call.param_tys,
+                    modes: call.signature.param_modes,
+                    ret: call.ret_ty,
+                    borrow: call.signature.return_borrow,
+                    region: call.signature.return_region,
+                    cleanup: call.signature.return_cleanup,
+                };
+                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let callee_source = self.check_source(&call.callee, Ty::Fn(id));
+                Self::add_required_source(
+                    &mut equation,
+                    callee_source,
+                    OperandRequirement {
+                        read: true,
+                        callable: true,
+                        ..OperandRequirement::default()
+                    },
+                );
+                self.add_call_result(&mut equation, XmlCallResult {
+                    result: value,
+                    result_ty,
+                    selected_ty,
+                    args: &call.args,
+                    callee: Some(&call.callee),
+                    facts: &facts,
+                    cleanup: Some(call.cleanup),
+                    modes_match: operands_match_modes(
+                        &call.args,
+                        &facts.modes,
+                        &facts.params,
+                        self.graph.program,
+                    ),
+                });
+            }
+            Rvalue::SubSlice {
+                base,
+                start,
+                len,
+                elem,
+            } => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let base_ty = xml_operand_base_ty(self.graph.function, &base);
+                let relation_matches = match base_ty {
+                    Some(Ty::Str | Ty::String) => {
+                        result_ty == Ty::Str
+                            && elem
+                                == Ty::Int(IntTy {
+                                    bits: 8,
+                                    signed: false,
+                                })
+                    }
+                    Some(Ty::Slice(element) | Ty::DynArray(element)) => {
+                        result_ty == Ty::Slice(element) && elem == scalar_to_ty(element)
+                    }
+                    Some(Ty::Array(element, _)) => {
+                        result_ty == Ty::Slice(element) && elem == scalar_to_ty(element)
+                    }
+                    _ => false,
+                };
+                let source_path = if path.is_empty() {
+                    Some(Vec::new())
+                } else if path.starts_with(&[XmlAccessPathSegment::Element]) {
+                    Some(path.clone())
+                } else {
+                    None
+                };
+                if source_path.is_none()
+                    || !relation_matches
+                    || xml_operand_base_ty(self.graph.function, &start) != Some(i64_ty)
+                    || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &start, i64_ty);
+                    self.check_operand(&mut equation, &len, i64_ty);
+                    let Some(base_ty) = base_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    let source_path = source_path.unwrap_or_default();
+                    let Some(source_selected) =
+                        xml_selected_ty(self.graph.program, base_ty, &source_path)
+                    else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    if path.is_empty() || source_selected == selected_ty {
+                        self.add_operand(
+                            &mut equation,
+                            &base,
+                            source_selected,
+                            source_path,
+                        );
+                    } else {
+                        equation.invalid = true;
+                    }
+                }
+            }
+            Rvalue::SliceLen(input) => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let input_ty = xml_operand_base_ty(self.graph.function, &input);
+                let input_is_view = matches!(
+                    input_ty,
+                    Some(
+                        Ty::Str
+                            | Ty::String
+                            | Ty::Slice(_)
+                            | Ty::Array(_, _)
+                            | Ty::DynArray(_)
+                            | Ty::DynStructArray(_, _)
+                            | Ty::DynSliceArray(_)
+                            | Ty::Soa(_)
+                    )
+                );
+                if result_ty != i64_ty || !path.is_empty() || !input_is_view {
+                    equation.invalid = true;
+                } else {
+                    let Some(input_ty) = input_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &input,
+                        input_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::FsReadFile { path: input, out } => {
+                let i32_ty = Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                });
+                if result_ty != i32_ty
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &input) != Some(Ty::Str)
+                    || self.graph.function.slots.get(out as usize) != Some(&Ty::String)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &input, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::StrLit(_) => {
+                if result_ty != Ty::Str || !path.is_empty() {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::Template(pieces, arena) => {
+                if result_ty != Ty::Str || !path.is_empty() {
+                    equation.invalid = true;
+                } else {
+                    for piece in &pieces {
+                        if !self.check_template_piece(&mut equation, piece) {
+                            equation.invalid = true;
+                        }
+                    }
+                    if let Some(arena) = &arena {
+                        if xml_operand_base_ty(self.graph.function, arena)
+                            != Some(Ty::ArenaHandle)
+                        {
+                            equation.invalid = true;
+                        } else {
+                            self.check_operand(&mut equation, arena, Ty::ArenaHandle);
+                        }
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::StrTrim { recv, .. } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &recv) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(&mut equation, &recv, Ty::Str, Vec::new());
+                }
+            }
+            Rvalue::StrClone(operand) => {
+                let source_ty = xml_operand_base_ty(self.graph.function, &operand);
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || !matches!(source_ty, Some(Ty::Str | Ty::String))
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(source_ty) = source_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(&mut equation, &operand, source_ty);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::CloneIn { value, handle } => {
+                let source_ty = xml_operand_base_ty(self.graph.function, &value);
+                let byte_view = Ty::Slice(Scalar::Int(IntTy {
+                    bits: 8,
+                    signed: false,
+                }));
+                let cloneable = matches!(result_ty, Ty::Str) || result_ty == byte_view
+                    || align_sema::region_plain_type_ok(
+                        result_ty,
+                        &self.graph.program.structs,
+                        &self.graph.program.enums,
+                        &self.graph.program.tagged_types,
+                    );
+                if source_ty != Some(result_ty)
+                    || !cloneable
+                    || xml_operand_base_ty(self.graph.function, &handle)
+                        != Some(Ty::ArenaHandle)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_whole_operand(&mut equation, &value, result_ty);
+                    let source = self.source(&value, selected_ty, path);
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    self.check_operand(&mut equation, &handle, Ty::ArenaHandle);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::ArrayBuilderNew { elem, region } => {
+                let element = xml_selected_ty(
+                    self.graph.program,
+                    result_ty,
+                    &[XmlAccessPathSegment::Element],
+                );
+                let builder_shape = xml_array_builder_output(result_ty).is_some();
+                let region_valid = region.as_ref().is_none_or(|region| {
+                    xml_operand_base_ty(self.graph.function, region) == Some(Ty::ArenaHandle)
+                });
+                if !builder_shape || element != Some(elem) || !region_valid {
+                    equation.invalid = true;
+                } else {
+                    if let Some(region) = &region {
+                        self.check_operand(&mut equation, region, Ty::ArenaHandle);
+                    }
+                    equation.seed = Some(if path.is_empty() || region.is_none() {
+                        XmlAccessProvenance::Owned
+                    } else {
+                        XmlAccessProvenance::Shared
+                    });
+                }
+            }
+            Rvalue::ArrayBuilderBuild { builder } => {
+                let Some(builder_ty) = xml_operand_base_ty(self.graph.function, &builder) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if xml_array_builder_output(builder_ty) != Some(result_ty) {
+                    equation.invalid = true;
+                } else {
+                    self.check_whole_operand(&mut equation, &builder, builder_ty);
+                    if path.is_empty() {
+                        self.add_operand(&mut equation, &builder, builder_ty, Vec::new());
+                    } else {
+                        self.add_operand(&mut equation, &builder, selected_ty, path);
+                    }
+                }
+            }
+            Rvalue::PathJoin { a, b } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &a) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, &b) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &a, Ty::Str);
+                    self.check_operand(&mut equation, &b, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::PathNormalize { path: source } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &source) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &source, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::EncodingEncode { data, .. } => {
+                let data_ty = xml_operand_base_ty(self.graph.function, &data);
+                let byte_view = matches!(
+                    data_ty,
+                    Some(Ty::Str | Ty::String | Ty::Slice(Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    })))
+                );
+                if result_ty != Ty::String || !path.is_empty() || !byte_view {
+                    equation.invalid = true;
+                } else {
+                    let Some(data_ty) = data_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.check_operand(
+                        &mut equation,
+                        &data,
+                        data_ty,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::RegexReplace {
+                regex, text, repl, ..
+            } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &regex) != Some(Ty::Regex)
+                    || xml_operand_base_ty(self.graph.function, &text) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, &repl) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &regex, Ty::Regex);
+                    self.check_operand(&mut equation, &text, Ty::Str);
+                    self.check_operand(&mut equation, &repl, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::CliUsage { cmd } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &cmd) != Some(Ty::CliCommand)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &cmd, Ty::CliCommand);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::StaticData(_) => {
+                if result_ty != Ty::Raw || !path.is_empty() {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::StaticDescriptorView { ptr, .. } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &ptr) != Some(Ty::Raw)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &ptr, Ty::Raw);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::PathComponent { path: source, .. } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &source) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(&mut equation, &source, Ty::Str, Vec::new());
+                }
+            }
+            Rvalue::CliGetStr { parsed, name } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &parsed) != Some(Ty::CliParsed)
+                    || xml_operand_base_ty(self.graph.function, &name) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &parsed, Ty::CliParsed);
+                    self.check_operand(&mut equation, &name, Ty::Str);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::RunOutputView { out, .. } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &out) != Some(Ty::RunOutput)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &out, Ty::RunOutput);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::HttpSseStreamLastEventId { stream } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &stream)
+                        != Some(Ty::HttpSseStream)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &stream, Ty::HttpSseStream);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::HttpCtxMethod { ctx } | Rvalue::HttpCtxPath { ctx } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &ctx)
+                        != Some(Ty::HttpRequestCtx)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &ctx, Ty::HttpRequestCtx);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::BuilderToString(builder) => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &builder) != Some(Ty::Builder)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &builder, Ty::Builder);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::BuilderNew { capacity } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != Ty::Builder
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &capacity) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &capacity, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::TemplateHtmlToString { resource, output } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &output)
+                        != Some(Ty::Resource(resource))
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(
+                        &mut equation,
+                        &output,
+                        Ty::Resource(resource),
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::TemplateHtmlNew { resource } => {
+                if result_ty != Ty::Resource(resource)
+                    || !path.is_empty()
+                    || self.graph.program.resources.get(resource as usize).is_none()
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::XmlParse {
+                input,
+                error_enum,
+                cleanup,
+            } => {
+                let valid = result_ty
+                    == Ty::Result(Scalar::XmlReader, Scalar::Enum(error_enum))
+                    && xml_operand_base_ty(self.graph.function, &input) == Some(Ty::String)
+                    && cleanup != value
+                    && self.graph.function.value_tys.get(cleanup as usize) == Some(&Ty::Bool)
+                    && self.graph.primary_definitions.get(cleanup as usize) == Some(&0)
+                    && self.graph.auxiliary_definitions.get(cleanup as usize) == Some(&1);
+                if !valid {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let input = self.check_source(&input, Ty::String);
+                Self::add_required_source(
+                    &mut equation,
+                    input,
+                    OperandRequirement {
+                        read: true,
+                        move_value: true,
+                        ..OperandRequirement::default()
+                    },
+                );
+                let whole_result = path.is_empty() && selected_ty == result_ty;
+                let reader_payload = path.as_slice() == [XmlAccessPathSegment::ResultOk]
+                    && selected_ty == Ty::XmlReader;
+                let error_payload = path.as_slice() == [XmlAccessPathSegment::ResultErr]
+                    && selected_ty == Ty::Enum(error_enum);
+                if whole_result || reader_payload || error_payload {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    equation.invalid = true;
+                }
+            }
+            Rvalue::XmlAttributeValue { reader, index } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &reader) != Some(Ty::XmlReader)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &reader, Ty::XmlReader);
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::XmlText { reader } => {
+                if result_ty != Ty::String
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &reader) != Some(Ty::XmlReader)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &reader, Ty::XmlReader);
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::XmlAttributeCount(reader) => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != i64_ty
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &reader) != Some(Ty::XmlReader)
+                {
+                    equation.invalid = true;
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::XmlNext { reader, event_enum } => {
+                if result_ty != Ty::Option(Scalar::Enum(event_enum))
+                    || !xml_event_definition_valid(self.graph.program, event_enum)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    let source = self.check_source(&reader, Ty::XmlReader);
+                    Self::add_required_source(&mut equation, source,
+                        xml_mode_requirement(self.graph.program, Ty::XmlReader, align_ast::ParamMode::BorrowMut));
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
+            Rvalue::CodecBatchName(batch, index) => {
+                if result_ty != Ty::Option(Scalar::Str)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &batch, Ty::CodecBatch);
+                    self.check_operand(&mut equation, &index, Ty::Int(IntTy { bits: 64, signed: true }));
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                }
+            }
+            Rvalue::CodecColumnAt { column, index, kind } => {
+                let (column_ty, scalar) = match kind {
+                    hir::CodecPutKind::I64 => (Ty::CodecI64Column, Scalar::Int(IntTy { bits: 64, signed: true })),
+                    hir::CodecPutKind::F64 => (Ty::CodecF64Column, Scalar::Float(FloatTy { bits: 64 })),
+                    hir::CodecPutKind::Bool => (Ty::CodecBoolColumn, Scalar::Bool),
+                    hir::CodecPutKind::Str => (Ty::CodecStrColumn, Scalar::Str),
+                };
+                if result_ty != Ty::Option(scalar)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::OptionSome])
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &column, column_ty);
+                    self.check_operand(&mut equation, &index, Ty::Int(IntTy { bits: 64, signed: true }));
+                    equation.seed = Some(if scalar == Scalar::Str { XmlAccessProvenance::Shared } else { XmlAccessProvenance::Owned });
+                }
+            }
+            Rvalue::XmlName { reader } => {
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &reader) != Some(Ty::XmlReader)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(
+                        &mut equation,
+                        &reader,
+                        Ty::XmlReader,
+                        Vec::new(),
+                    );
+                }
+            }
+            Rvalue::XmlAttributeName { reader, index } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                if result_ty != Ty::Str
+                    || !path.is_empty()
+                    || xml_operand_base_ty(self.graph.function, &reader) != Some(Ty::XmlReader)
+                    || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &index, i64_ty);
+                    self.add_operand(
+                        &mut equation,
+                        &reader,
+                        Ty::XmlReader,
+                        Vec::new(),
+                    );
+                }
+            }
+            Rvalue::Un(operation, operand) => {
+                let operation_matches = match operation {
+                    UnOp::Neg => xml_numeric_scalar_ty(result_ty),
+                    UnOp::Not => result_ty == Ty::Bool,
+                    UnOp::BitNot => {
+                        matches!(result_ty, Ty::Int(_)) && xml_numeric_scalar_ty(result_ty)
+                    }
+                };
+                if !path.is_empty()
+                    || !operation_matches
+                    || xml_operand_base_ty(self.graph.function, &operand) != Some(result_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(&mut equation, &operand, result_ty, Vec::new());
+                }
+            }
+            Rvalue::Cast { operand, from, to } => {
+                if !path.is_empty()
+                    || result_ty != to
+                    || xml_operand_base_ty(self.graph.function, &operand) != Some(from)
+                    || matches!(result_ty, Ty::String | Ty::XmlReader)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(&mut equation, &operand, from, Vec::new());
+                }
+            }
+            Rvalue::Bin(operation, left, right) => {
+                let left_ty = xml_operand_base_ty(self.graph.function, &left);
+                let right_ty = xml_operand_base_ty(self.graph.function, &right);
+                // Sema and gen_bin retain the scalar operand for broadcasts in either order.
+                // The vector fixes both the numeric element and lane count; masks are results
+                // of comparisons only, never numeric operands or bitwise/logical vectors.
+                if matches!(left_ty, Some(Ty::Vec(..)))
+                    || matches!(right_ty, Some(Ty::Vec(..)))
+                {
+                    let vector = left_ty.and_then(xml_numeric_vector_shape)
+                        .or_else(|| right_ty.and_then(xml_numeric_vector_shape));
+                    let relation_matches = vector.is_some_and(|(element, lanes)| {
+                        let vector_ty = Ty::Vec(element, lanes);
+                        let scalar_ty = scalar_to_ty(element);
+                        let operand_matches = |ty| ty == Some(vector_ty) || ty == Some(scalar_ty);
+                        operand_matches(left_ty)
+                            && operand_matches(right_ty)
+                            && match operation {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                                    result_ty == vector_ty
+                                }
+                                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                                    result_ty == Ty::Mask(element, lanes)
+                                }
+                                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                                | BinOp::Shl | BinOp::Shr | BinOp::And | BinOp::Or => false,
+                            }
+                    });
+                    if !path.is_empty() || !relation_matches {
+                        equation.invalid = true;
+                    } else if let (Some(left_ty), Some(right_ty)) = (left_ty, right_ty) {
+                        self.add_operand(&mut equation, &left, left_ty, Vec::new());
+                        self.add_operand(&mut equation, &right, right_ty, Vec::new());
+                    }
+                    return equation;
+                }
+                let operand_ty = left_ty.filter(|left_ty| Some(*left_ty) == right_ty);
+                let relation_matches = match operation {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                        operand_ty == Some(result_ty)
+                            && xml_numeric_scalar_ty(result_ty)
+                    }
+                    BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr => {
+                        operand_ty == Some(result_ty)
+                            && matches!(result_ty, Ty::Int(_))
+                            && xml_numeric_scalar_ty(result_ty)
+                    }
+                    BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge => {
+                        result_ty == Ty::Bool
+                            && operand_ty.is_some_and(|ty| {
+                                xml_numeric_scalar_ty(ty)
+                                    || matches!(ty, Ty::Char | Ty::Str)
+                                    || (ty == Ty::Bool && matches!(operation, BinOp::Eq | BinOp::Ne))
+                            })
+                    }
+                    BinOp::And | BinOp::Or => {
+                        result_ty == Ty::Bool && operand_ty == Some(Ty::Bool)
+                    }
+                };
+                if !path.is_empty()
+                    || !relation_matches
+                {
+                    equation.invalid = true;
+                } else {
+                    let Some(operand_ty) = operand_ty else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.add_operand(&mut equation, &left, operand_ty, Vec::new());
+                    self.add_operand(&mut equation, &right, operand_ty, Vec::new());
+                }
+            }
+            Rvalue::IntArith {
+                mode, int_ty, a, b, ..
+            } => {
+                let (payload_path, relation_matches) = match mode {
+                    align_sema::ArithMode::Saturating => (Vec::new(), result_ty == int_ty),
+                    align_sema::ArithMode::Checked => (
+                        vec![XmlAccessPathSegment::OptionSome],
+                        xml_option_payload(self.graph.program, result_ty) == Some(int_ty),
+                    ),
+                };
+                if !relation_matches
+                    || !(path.is_empty() || path == payload_path)
+                    || xml_operand_base_ty(self.graph.function, &a) != Some(int_ty)
+                    || xml_operand_base_ty(self.graph.function, &b) != Some(int_ty)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.add_operand(&mut equation, &a, int_ty, Vec::new());
+                    self.add_operand(&mut equation, &b, int_ty, Vec::new());
+                }
+            }
+            Rvalue::MathOp { ty, operands, .. } => {
+                if !path.is_empty()
+                    || result_ty != ty
+                    || operands.is_empty()
+                    || operands
+                        .iter()
+                        .any(|operand| xml_operand_base_ty(self.graph.function, operand) != Some(ty))
+                {
+                    equation.invalid = true;
+                } else {
+                    for operand in &operands {
+                        self.add_operand(&mut equation, operand, ty, Vec::new());
+                    }
+                }
+            }
+            // Exhaustive non-protected producers. Keeping this in the equation match
+            // makes a missing semantic producer arm a compiler error, not a fallback.
+            Rvalue::SqliteCallbackDescriptor(..)
+            | Rvalue::ArenaBegin
+            | Rvalue::TgBegin
+            | Rvalue::SpawnTask { .. }
+            | Rvalue::TgWaitResult { .. }
+            | Rvalue::HeapAlloc(..)
+            | Rvalue::RawAlloc(..)
+            | Rvalue::ColumnBatchCreate { .. }
+            | Rvalue::ColumnBatchAppend { .. }
+            | Rvalue::RawNull
+            | Rvalue::RawLoad { .. }
+            | Rvalue::RawPointerLoad { .. }
+            | Rvalue::RawOffset { .. }
+            | Rvalue::RawIsNull(..)
+            | Rvalue::ResourceFromRaw { .. }
+            | Rvalue::ResourceBorrow { .. }
+            | Rvalue::ResourceRaw { .. }
+            | Rvalue::ResourceIntoRaw { .. }
+            | Rvalue::BoxGet(..)
+            | Rvalue::BoxClone(..)
+            | Rvalue::MakeVec { .. }
+            | Rvalue::VecExtract { .. }
+            | Rvalue::VecInsert { .. }
+            | Rvalue::VecSumWhere { .. }
+            | Rvalue::VecDot { .. }
+            | Rvalue::VecMinMax { .. }
+            | Rvalue::VecSum { .. }
+            | Rvalue::MaskAny { .. }
+            | Rvalue::VecLoad { .. }
+            | Rvalue::Chunks { .. }
+            | Rvalue::ParMapParallel { .. }
+            | Rvalue::ParMapReduce { .. }
+            | Rvalue::SlicePtr(..)
+            | Rvalue::StrPredicate { .. }
+            | Rvalue::StrFinderNew { .. }
+            | Rvalue::StrFinderFind { .. }
+            | Rvalue::BuilderWriteStr(..)
+            | Rvalue::BuilderWriteInt(..)
+            | Rvalue::BuilderWriteBool(..)
+            | Rvalue::BuilderWriteChar(..)
+            | Rvalue::BuilderWriteFloat(..)
+            | Rvalue::BuilderWriteStrIntStr(..)
+            | Rvalue::TemplateHtmlWrite { .. }
+            | Rvalue::TemplateHtmlRaw { .. }
+            | Rvalue::JsonEncodeBounded { .. }
+            | Rvalue::JsonDecode { .. }
+            | Rvalue::JsonOwnedDecode { .. }
+            | Rvalue::JsonDecodeArray { .. }
+            | Rvalue::JsonDecodeScalar { .. }
+            | Rvalue::JsonDecodeStructArray { .. }
+            | Rvalue::JsonDecodeSoa { .. }
+            | Rvalue::CsvDecode { .. }
+            | Rvalue::JsonDecodeUnion { .. }
+            | Rvalue::JsonDoc { .. }
+            | Rvalue::JsonDocKind { .. }
+            | Rvalue::JsonDocGet { .. }
+            | Rvalue::JsonDocAt { .. }
+            | Rvalue::JsonDocAsStr { .. }
+            | Rvalue::JsonDocAsScalar { .. }
+            | Rvalue::JsonDocLen { .. }
+            | Rvalue::JsonDocKey { .. }
+            | Rvalue::JsonDocElems { .. }
+            | Rvalue::JsonScanNew { .. }
+            | Rvalue::JsonScanNext { .. }
+            | Rvalue::ReaderOpen { .. }
+            | Rvalue::ReaderOpenBeneath { .. }
+            | Rvalue::WriterCreate { .. }
+            | Rvalue::WriterCreateExclusive { .. }
+            | Rvalue::WriterCreateExclusiveBeneath { .. }
+            | Rvalue::ReaderStdin
+            | Rvalue::WriterStd { .. }
+            | Rvalue::ReaderRead(..)
+            | Rvalue::ReaderBuffered(..)
+            | Rvalue::ReaderReadLine(..)
+            | Rvalue::BytesAsStr { .. }
+            | Rvalue::WriterWrite(..)
+            | Rvalue::WriterWriteBuilder(..)
+            | Rvalue::WriterFlush(..)
+            | Rvalue::LogNew(..)
+            | Rvalue::LogEnabled(..)
+            | Rvalue::LogLine(..)
+            | Rvalue::LogLineBuilder(..)
+            | Rvalue::LogFlush(..)
+            | Rvalue::CodecOpen(..)
+            | Rvalue::CodecBatchRows(..)
+            | Rvalue::CodecBatchColumns(..)
+            | Rvalue::CodecBatchKind(..)
+            | Rvalue::CodecBatchFind(..)
+            | Rvalue::CodecBatchColumn { .. }
+            | Rvalue::CodecColumnLen(..)
+            | Rvalue::CodecEncoderNew { .. }
+            | Rvalue::CodecEncoderPut { .. }
+            | Rvalue::CodecEncoderFinish(..)
+            | Rvalue::FrameInnerJoin { .. }
+            | Rvalue::IoCopy(..)
+            | Rvalue::FileCreateRw { .. }
+            | Rvalue::FileOpenRw { .. }
+            | Rvalue::FilePread { .. }
+            | Rvalue::FilePwrite { .. }
+            | Rvalue::FileLen { .. }
+            | Rvalue::BufferNew(..)
+            | Rvalue::BufferBytes(..)
+            | Rvalue::BufferLen(..)
+            | Rvalue::BufferCapacity(..)
+            | Rvalue::BytesRead { .. }
+            | Rvalue::BufferPut { .. }
+            | Rvalue::BufferAppend { .. }
+            | Rvalue::ArrayBuilderPush { .. }
+            | Rvalue::ArrayBuilderPushStr { .. }
+            | Rvalue::ArrayBuilderAppend { .. }
+            | Rvalue::FsWriteFile { .. }
+            | Rvalue::FsWriteFileBuilder { .. }
+            | Rvalue::FsExists { .. }
+            | Rvalue::FsRemove { .. }
+            | Rvalue::RenameNoReplace { .. }
+            | Rvalue::FsReadDir { .. }
+            | Rvalue::DnsResolve { .. }
+            | Rvalue::TcpConnect { .. }
+            | Rvalue::ConnReader(..)
+            | Rvalue::ConnWriter(..)
+            | Rvalue::TcpReadTimeout { .. }
+            | Rvalue::TcpWriteTimeout { .. }
+            | Rvalue::TcpListen { .. }
+            | Rvalue::TcpAccept { .. }
+            | Rvalue::UdpBind { .. }
+            | Rvalue::UdpSendTo { .. }
+            | Rvalue::UdpRecvFrom { .. }
+            | Rvalue::ProcessSpawn { .. }
+            | Rvalue::ChildWait { .. }
+            | Rvalue::ChildKill { .. }
+            | Rvalue::ProcessExec { .. }
+            | Rvalue::FsReadFileView { .. }
+            | Rvalue::FsReadBytesView { .. }
+            | Rvalue::EnvGet { .. }
+            | Rvalue::EnvSet { .. }
+            | Rvalue::TimeNow
+            | Rvalue::ProcessCpuCount
+            | Rvalue::TimeInstant
+            | Rvalue::TimeSleep { .. }
+            | Rvalue::RegexCompile { .. }
+            | Rvalue::RegexIsMatch { .. }
+            | Rvalue::RegexFind { .. }
+            | Rvalue::RegexFindAll { .. }
+            | Rvalue::RegexSplit { .. }
+            | Rvalue::RegexCaptures { .. }
+            | Rvalue::RegexGroupCount { .. }
+            | Rvalue::RegexGroupIndex { .. }
+            | Rvalue::CapturesGroup { .. }
+            | Rvalue::EncodingDecode { .. }
+            | Rvalue::CompressCompress { .. }
+            | Rvalue::CompressDecompress { .. }
+            | Rvalue::Utf8Valid { .. }
+            | Rvalue::CryptoCtEqual { .. }
+            | Rvalue::CryptoRandom { .. }
+            | Rvalue::CryptoHash { .. }
+            | Rvalue::CryptoHmac { .. }
+            | Rvalue::CryptoHkdf { .. }
+            | Rvalue::CryptoAead { .. }
+            | Rvalue::CryptoArgon2(..)
+            | Rvalue::CryptoPrivateKeyFromPem { .. }
+            | Rvalue::CryptoPublicKeyFromPem { .. }
+            | Rvalue::CryptoPublicKeyFromJwk(..)
+            | Rvalue::CryptoSign { .. }
+            | Rvalue::CryptoVerify(..)
+            | Rvalue::RandSeed { .. }
+            | Rvalue::RandNext { .. }
+            | Rvalue::RandRange { .. }
+            | Rvalue::RandShuffle { .. }
+            | Rvalue::RandSample { .. }
+            | Rvalue::CliCommand { .. }
+            | Rvalue::CliFlag { .. }
+            | Rvalue::CliParse { .. }
+            | Rvalue::CliGetBool { .. }
+            | Rvalue::CliGetI64 { .. }
+            | Rvalue::HttpRequest { .. }
+            | Rvalue::HttpHeader { .. }
+            | Rvalue::HttpBody { .. }
+            | Rvalue::HttpRequestTimeout { .. }
+            | Rvalue::HttpRequestMaxResponseBodyBytes { .. }
+            | Rvalue::HttpClientTimeout { .. }
+            | Rvalue::HttpClientMaxResponseBodyBytes { .. }
+            | Rvalue::Command { .. }
+            | Rvalue::CommandCwd { .. }
+            | Rvalue::CommandTimeout { .. }
+            | Rvalue::CommandMaxCapture { .. }
+            | Rvalue::CommandEnv { .. }
+            | Rvalue::CommandEnvClear { .. }
+            | Rvalue::CommandRun { .. }
+            | Rvalue::CommandRunBytes { .. }
+            | Rvalue::RunOutputCode { .. }
+            | Rvalue::RunBytesCode { .. }
+            | Rvalue::RunBytesView { .. }
+            | Rvalue::HttpParse { .. }
+            | Rvalue::HttpRespStatus { .. }
+            | Rvalue::HttpRespHeader { .. }
+            | Rvalue::HttpRespBody { .. }
+            | Rvalue::HttpClient
+            | Rvalue::HttpClientGet { .. }
+            | Rvalue::HttpClientPost { .. }
+            | Rvalue::HttpClientRequest { .. }
+            | Rvalue::HttpClientRequestStream { .. }
+            | Rvalue::HttpReadStreamStatus { .. }
+            | Rvalue::HttpReadStreamHeader { .. }
+            | Rvalue::HttpReadStreamRead { .. }
+            | Rvalue::HttpReadStreamSse { .. }
+            | Rvalue::HttpSseStreamRetryMs { .. }
+            | Rvalue::HttpSseStreamNext { .. }
+            | Rvalue::HttpGetMany { .. }
+            | Rvalue::HttpServe { .. }
+            | Rvalue::HttpAccept { .. }
+            | Rvalue::HttpCtxHeader { .. }
+            | Rvalue::HttpHeadersCount { .. }
+            | Rvalue::HttpHeadersTokensValid { .. }
+            | Rvalue::HttpHeadersContainsToken { .. }
+            | Rvalue::HttpCtxUpgradeReady { .. }
+            | Rvalue::HttpCtxBody { .. }
+            | Rvalue::HttpResponseBuilder { .. }
+            | Rvalue::HttpRbHeader { .. }
+            | Rvalue::HttpRbBody { .. }
+            | Rvalue::HttpRespond { .. }
+            | Rvalue::HttpRespondStream { .. }
+            | Rvalue::HttpRespondUpgrade { .. }
+            | Rvalue::HttpUpgradeReadExact { .. }
+            | Rvalue::HttpUpgradeWrite { .. }
+            | Rvalue::HttpUpgradeDeadline { .. }
+            | Rvalue::HttpUpgradeShutdown { .. }
+            | Rvalue::HttpStreamSend { .. }
+            | Rvalue::HttpStreamFinish { .. }
+            | Rvalue::HttpStreamReject { .. } => {
+                if xml_owned_leaf_paths(self.graph.program, result_ty)
+                    .is_some_and(|leaves| leaves.is_empty())
+                {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    equation.invalid = true;
+                }
+            }
+        }
+        equation
+    }
+
+    fn add_out_producer(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        slot: Slot,
+        slot_ty: Ty,
+        selected_ty: Ty,
+        path: &[XmlAccessPathSegment],
+        producer: (ValueId, &Rvalue),
+    ) {
+        let (value, rvalue) = producer;
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let bytes_ty = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }));
+        let expected_result = xml_out_producer_result_ty(rvalue);
+        let result_is_unique = expected_result.is_some()
+            && self.graph.function.value_tys.get(value as usize) == expected_result.as_ref()
+            && self.graph.primary_definitions.get(value as usize) == Some(&1)
+            && self.graph.auxiliary_definitions.get(value as usize) == Some(&0)
+            && !self
+                .graph
+                .duplicate_values
+                .get(value as usize)
+                .copied()
+                .unwrap_or(true)
+            && self
+                .graph
+                .value_definitions
+                .get(value as usize)
+                .is_some_and(|definition| {
+                    definition.is_some_and(|candidate| std::ptr::eq(candidate, rvalue))
+                });
+        let Some(recorded_access) = xml_written_slots(rvalue)
+            .into_iter()
+            .find_map(|(written, access)| (written == slot).then_some(access))
+        else {
+            equation.invalid = true;
+            return;
+        };
+        if !result_is_unique
+            || xml_selected_ty(self.graph.program, slot_ty, path) != Some(selected_ty)
+        {
+            equation.invalid = true;
+            return;
+        }
+
+        let (expected_out, access) = match rvalue {
+            Rvalue::JsonEncodeBounded {
+                pieces,
+                max_bytes,
+                out,
+            } => {
+                if slot_ty != Ty::String
+                    || xml_operand_base_ty(self.graph.function, max_bytes) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, max_bytes, i64_ty);
+                for piece in pieces {
+                    if !self.check_template_piece(equation, piece) {
+                        equation.invalid = true;
+                    }
+                }
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecode {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Struct(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonOwnedDecode { plan, input, out } => {
+                let canonical = align_sema::owned_json_graph_plan_v2(
+                        &self.graph.program.structs,
+                        plan.root,
+                    )
+                    .is_ok_and(|canonical| canonical == *plan);
+                if slot_ty != Ty::Struct(plan.root)
+                    || !canonical
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeArray { elem, input, out } => {
+                let Some(scalar) = align_sema::ty_to_scalar(*elem)
+                    .filter(|_| matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool))
+                else {
+                    equation.invalid = true;
+                    return;
+                };
+                if slot_ty != Ty::DynArray(scalar)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeScalar { scalar, input, out } => {
+                if slot_ty != *scalar
+                    || !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDecodeStructArray {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::DynStructArray(*struct_id, align_sema::Layout::Aos)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonDecodeSoa {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Soa(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                self.check_operand(equation, arena, Ty::ArenaHandle);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::CsvDecode {
+                struct_id,
+                options_struct_id,
+                input,
+                arena,
+                options,
+                out,
+            } => {
+                if slot_ty != Ty::Soa(*struct_id)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*options_struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    || xml_operand_base_ty(self.graph.function, options)
+                        != Some(Ty::Struct(*options_struct_id))
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                self.check_operand(equation, arena, Ty::ArenaHandle);
+                self.check_whole_operand(equation, options, Ty::Struct(*options_struct_id));
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::JsonDecodeUnion {
+                enum_id,
+                input,
+                out,
+                arena,
+            } => {
+                if slot_ty != Ty::Enum(*enum_id)
+                    || self.graph.program.enums.get(*enum_id as usize).is_none()
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || arena.as_ref().is_some_and(|arena| {
+                        xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                    })
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena {
+                    self.check_operand(equation, arena, Ty::ArenaHandle);
+                }
+                (
+                    *out,
+                    if arena.is_some() {
+                        XmlAccessProvenance::Shared
+                    } else {
+                        XmlAccessProvenance::Owned
+                    },
+                )
+            }
+            Rvalue::JsonScanNext {
+                scanner,
+                struct_id,
+                cursor,
+                row,
+            } => {
+                if slot != *row
+                    || slot_ty != Ty::StructArray(*struct_id, 1)
+                    || self
+                        .graph
+                        .program
+                        .structs
+                        .get(*struct_id as usize)
+                        .is_none()
+                    || xml_operand_base_ty(self.graph.function, scanner)
+                        != Some(Ty::JsonScanner(*struct_id))
+                    || self.graph.function.slots.get(*cursor as usize) != Some(&i64_ty)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, scanner, Ty::JsonScanner(*struct_id));
+                (*row, XmlAccessProvenance::Shared)
+            }
+            Rvalue::FsReadFile { path: input, out } => {
+                if slot_ty != Ty::String
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::EnvGet { name, out } => {
+                if slot_ty != Ty::String
+                    || xml_operand_base_ty(self.graph.function, name) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, name, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::FsReadDir { path: input, out } | Rvalue::DnsResolve { host: input, out } => {
+                if slot_ty != Ty::DynArray(Scalar::String)
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::JsonDocAsStr { doc, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, doc) != Some(Ty::JsonDoc)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, doc, Ty::JsonDoc);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::JsonDocKey { doc, index, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, doc) != Some(Ty::JsonDoc)
+                    || xml_operand_base_ty(self.graph.function, index) != Some(i64_ty)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, doc, Ty::JsonDoc);
+                self.check_operand(equation, index, i64_ty);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::BytesAsStr { bytes, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, bytes) != Some(bytes_ty)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, bytes, bytes_ty);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::FsReadFileView {
+                path: input,
+                arena,
+                out,
+            } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, arena) != Some(Ty::ArenaHandle)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, input, Ty::Str);
+                self.check_operand(equation, arena, Ty::ArenaHandle);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::HttpRespHeader { resp, name, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, resp) != Some(Ty::HttpResponse)
+                    || xml_operand_base_ty(self.graph.function, name) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, resp, Ty::HttpResponse);
+                self.check_operand(equation, name, Ty::Str);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::HttpReadStreamHeader { stream, name, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, stream)
+                        != Some(Ty::HttpReadStream)
+                    || xml_operand_base_ty(self.graph.function, name) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, stream, Ty::HttpReadStream);
+                self.check_operand(equation, name, Ty::Str);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            Rvalue::HttpCtxHeader { ctx, name, out } => {
+                if slot_ty != Ty::Str
+                    || xml_operand_base_ty(self.graph.function, ctx) != Some(Ty::HttpHeaders)
+                    || xml_operand_base_ty(self.graph.function, name) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_operand(equation, ctx, Ty::HttpHeaders);
+                self.check_operand(equation, name, Ty::Str);
+                (*out, XmlAccessProvenance::Shared)
+            }
+            _ => {
+                for operand in xml_out_producer_operands(rvalue) {
+                    let Some(expected) = xml_operand_base_ty(self.graph.function, operand) else {
+                        equation.invalid = true;
+                        continue;
+                    };
+                    self.check_whole_operand(equation, operand, expected);
+                }
+                (slot, recorded_access)
+            }
+        };
+        if expected_out != slot || access != recorded_access {
+            equation.invalid = true;
+        } else {
+            equation.seed = merge_xml_access(equation.seed, access);
+        }
+    }
+
+    fn slot_equation(
+        &mut self,
+        slot: Slot,
+        path: Vec<XmlAccessPathSegment>,
+    ) -> XmlAccessEquation {
+        let mut equation = XmlAccessEquation::default();
+        let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+            equation.invalid = true;
+            return equation;
+        };
+        let Some(selected_ty) = xml_selected_ty(self.graph.program, slot_ty, &path) else {
+            equation.invalid = true;
+            return equation;
+        };
+        // Borrow parameters alias caller storage at function entry; unlike by-value
+        // locals, LLVM does not wait for an explicit MIR Store to initialize them.
+        // Keep every later store as a dependency so this seed cannot hide corruption.
+        if let Some(parameter) = self.graph.function.params.iter().position(|candidate| *candidate == slot)
+            && matches!(self.graph.function.param_modes.get(parameter),
+                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut))
+            && let Ok(parameter) = u32::try_from(parameter)
+        {
+            equation.seed = Some(xml_argument_access(self.graph.function, parameter));
+        }
+        let (Some(root_stores), Some(field_stores)) = (
+            self.graph.slot_stores.roots.get(slot as usize),
+            self.graph.slot_stores.fields.get(slot as usize),
+        ) else {
+            equation.invalid = true;
+            return equation;
+        };
+        let root_stores = root_stores.iter().map(|operand| (*operand).clone()).collect::<Vec<_>>();
+        let field_stores = field_stores
+            .iter()
+            .map(|(fields, operand)| ((*fields).to_vec(), (*operand).clone()))
+            .collect::<Vec<_>>();
+        let Some(element_stores) = self.graph.slot_stores.elements.get(slot as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        let element_stores = element_stores
+            .iter()
+            .map(|(index, operand)| ((*index).clone(), (*operand).clone()))
+            .collect::<Vec<_>>();
+        let Some(element_field_stores) = self.graph.slot_stores.element_fields.get(slot as usize)
+        else {
+            equation.invalid = true;
+            return equation;
+        };
+        let element_field_stores = element_field_stores
+            .iter()
+            .map(|(index, fields, operand)| {
+                ((*index).clone(), (*fields).to_vec(), (*operand).clone())
+            })
+            .collect::<Vec<_>>();
+        let whole_element_from_fields = if path.as_slice() == [XmlAccessPathSegment::Element] {
+            match slot_ty {
+                Ty::StructArray(id, _) => self
+                    .graph
+                    .program
+                    .structs
+                    .get(id as usize)
+                    .is_some_and(|definition| {
+                        !definition.fields.is_empty()
+                            && definition.fields.iter().enumerate().all(|(field, _)| {
+                                element_field_stores.iter().any(|(_, path, _)| {
+                                    path.first().copied() == u32::try_from(field).ok()
+                                })
+                            })
+                    }),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let Some(constant_stores) = self.graph.slot_stores.constant_elements.get(slot as usize)
+        else {
+            equation.invalid = true;
+            return equation;
+        };
+        let constant_stores = constant_stores
+            .iter()
+            .map(|(elements, element)| ((*elements).to_vec(), *element))
+            .collect::<Vec<_>>();
+        let Some(producers) = self.graph.slot_stores.producers.get(slot as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        let producers = producers.clone();
+        for (value, producer) in producers {
+            self.add_out_producer(
+                &mut equation,
+                slot,
+                slot_ty,
+                selected_ty,
+                &path,
+                (value, producer),
+            );
+        }
+        for operand in root_stores {
+            if xml_operand_base_ty(self.graph.function, &operand) != Some(slot_ty) {
+                equation.invalid = true;
+            } else {
+                self.check_whole_operand(&mut equation, &operand, slot_ty);
+                self.add_operand(&mut equation, &operand, selected_ty, path.clone());
+            }
+        }
+        for (fields, operand) in field_stores {
+            let stored_path = fields
+                .iter()
+                .copied()
+                .map(XmlAccessPathSegment::StructField)
+                .collect::<Vec<_>>();
+            let Some(stored_ty) = xml_selected_ty(self.graph.program, slot_ty, &stored_path) else {
+                equation.invalid = true;
+                continue;
+            };
+            if fields.is_empty()
+                || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
+            {
+                equation.invalid = true;
+                continue;
+            }
+            self.check_whole_operand(&mut equation, &operand, stored_ty);
+            if path.is_empty() {
+                self.add_operand(&mut equation, &operand, stored_ty, Vec::new());
+            } else if path.starts_with(&stored_path) {
+                self.add_operand(
+                    &mut equation,
+                    &operand,
+                    selected_ty,
+                    path[stored_path.len()..].to_vec(),
+                );
+            }
+        }
+        let element_path = path
+            .strip_prefix(&[XmlAccessPathSegment::Element])
+            .map(<[_]>::to_vec);
+        for (index, operand) in element_stores {
+            let i64_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            let Some(element_ty) = xml_inline_array_element(self.graph.program, slot_ty) else {
+                equation.invalid = true;
+                continue;
+            };
+            if xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                || xml_operand_base_ty(self.graph.function, &operand) != Some(element_ty)
+            {
+                equation.invalid = true;
+                continue;
+            }
+            self.check_operand(&mut equation, &index, i64_ty);
+            self.check_whole_operand(&mut equation, &operand, element_ty);
+            let Some(remaining) = element_path.as_ref() else {
+                equation.invalid = true;
+                continue;
+            };
+            if xml_selected_ty(self.graph.program, element_ty, remaining) != Some(selected_ty) {
+                equation.invalid = true;
+                continue;
+            }
+            self.add_operand(
+                &mut equation,
+                &operand,
+                selected_ty,
+                remaining.clone(),
+            );
+        }
+        for (index, fields, operand) in element_field_stores {
+            let i64_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            let mut stored_path = vec![XmlAccessPathSegment::Element];
+            stored_path.extend(
+                fields
+                    .iter()
+                    .copied()
+                    .map(XmlAccessPathSegment::StructField),
+            );
+            let Some(stored_ty) = xml_selected_ty(self.graph.program, slot_ty, &stored_path)
+            else {
+                equation.invalid = true;
+                continue;
+            };
+            if fields.is_empty()
+                || !matches!(slot_ty, Ty::StructArray(..))
+                || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
+                || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
+            {
+                equation.invalid = true;
+                continue;
+            }
+            self.check_operand(&mut equation, &index, i64_ty);
+            self.check_whole_operand(&mut equation, &operand, stored_ty);
+            if path.starts_with(&stored_path) {
+                self.add_operand(
+                    &mut equation,
+                    &operand,
+                    selected_ty,
+                    path[stored_path.len()..].to_vec(),
+                );
+            }
+        }
+        if whole_element_from_fields {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+        }
+        for (elements, element_ty) in constant_stores {
+            let valid_shape = match slot_ty {
+                Ty::Array(element, length) => {
+                    scalar_to_ty(element) == element_ty
+                        && usize::try_from(length) == Ok(elements.len())
+                }
+                _ => false,
+            };
+            if !valid_shape
+                || elements
+                    .iter()
+                    .any(|element| !xml_const_element_matches_ty(element, element_ty))
+                || element_path.as_deref() != Some(&[])
+                || selected_ty != element_ty
+            {
+                equation.invalid = true;
+                continue;
+            }
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Shared);
+        }
+        if equation.seed.is_none() && equation.dependencies.is_empty() && !equation.invalid {
+            equation.invalid = true;
+        }
+        equation
+    }
+
+    fn build(
+        mut self,
+        root: XmlAccessSource,
+        cache: Option<&std::cell::RefCell<HashMap<XmlAccessNode, XmlAccessProvenance>>>,
+    ) -> XmlProducerState {
+        let root_node = match root {
+            XmlAccessSource::Seed(access) => return XmlProducerState::Present(access),
+            XmlAccessSource::Invalid => return XmlProducerState::Invalid,
+            XmlAccessSource::Node(node) => node,
+        };
+        while let Some(node) = self.pending.pop_front() {
+            if self.equations.contains_key(&node) {
+                continue;
+            }
+            if let Some(access) = cache
+                .and_then(|cache| cache.borrow().get(&node).copied())
+            {
+                self.equations.insert(
+                    node,
+                    XmlAccessEquation {
+                        seed: Some(access),
+                        ..XmlAccessEquation::default()
+                    },
+                );
+                continue;
+            }
+            self.equations
+                .insert(node.clone(), XmlAccessEquation::default());
+            let equation = match &node {
+                XmlAccessNode::Value(value, path) => self.value_equation(*value, path.clone()),
+                XmlAccessNode::Slot(slot, path) => self.slot_equation(*slot, path.clone()),
+                XmlAccessNode::CaptureValue(value, path, capture) => {
+                    self.capture_equation(XmlAccessNode::Value(*value, path.clone()), *capture)
+                }
+                XmlAccessNode::CaptureSlot(slot, path, capture) => {
+                    self.capture_equation(XmlAccessNode::Slot(*slot, path.clone()), *capture)
+                }
+            };
+            self.equations.insert(node, equation);
+        }
+
+        let mut validation_reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
+        for (node, equation) in &self.equations {
+            for dependency in &equation.dependencies {
+                validation_reverse
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(node.clone());
+            }
+            for (dependency, _) in &equation.checks {
+                validation_reverse
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(node.clone());
+            }
+        }
+
+        let mut values = HashMap::<XmlAccessNode, XmlProducerState>::new();
+        let mut reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
+        let mut ready = VecDeque::new();
+        for (node, equation) in &self.equations {
+            for dependency in &equation.dependencies {
+                reverse
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(node.clone());
+            }
+            let initial = if equation.invalid {
+                Some(XmlProducerState::Invalid)
+            } else if equation.absent {
+                Some(XmlProducerState::Absent)
+            } else {
+                equation.seed.map(XmlProducerState::Present)
+            };
+            if let Some(initial) = initial {
+                values.insert(node.clone(), initial);
+                ready.push_back(node.clone());
+            }
+        }
+        while let Some(changed) = ready.pop_front() {
+            let Some(parents) = reverse.get(&changed) else {
+                continue;
+            };
+            for parent in parents {
+                let Some(equation) = self.equations.get(parent) else {
+                    continue;
+                };
+                let next = equation.dependencies.iter().fold(
+                    equation.seed.map(XmlProducerState::Present),
+                    |current, dependency| {
+                        values
+                            .get(dependency)
+                            .copied()
+                            .map_or(current, |state| merge_xml_state(current, state))
+                    },
+                );
+                let next = if equation.invalid {
+                    Some(XmlProducerState::Invalid)
+                } else if equation.absent {
+                    merge_xml_state(next, XmlProducerState::Absent)
+                } else {
+                    next
+                };
+                let next = if equation.require_present {
+                    require_xml_presence(next, equation.guarded_absence)
+                } else {
+                    next
+                };
+                if let Some(next) = next
+                    && values.get(parent) != Some(&next)
+                {
+                    values.insert(parent.clone(), next);
+                    ready.push_back(parent.clone());
+                }
+            }
+        }
+
+        // Access propagation intentionally excludes validation-only dependencies. Once
+        // selected-path convergence is complete, however, every such dependency must have
+        // produced a total typed state. An unresolved check-only cycle is therefore invalid,
+        // and invalidity flows through both kinds of edge.
+        let mut invalid = self
+            .equations
+            .iter()
+            .filter(|(node, equation)| {
+                equation.invalid
+                    || !values.contains_key(*node)
+                    || values.get(*node) == Some(&XmlProducerState::Invalid)
+                    || equation.checks.iter().any(|(dependency, requirement)| {
+                        values
+                            .get(dependency)
+                            .copied()
+                            .is_none_or(|state| !requirement.is_satisfied_by(state))
+                    })
+            })
+            .map(|(node, _)| node)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut invalid_ready = invalid.iter().cloned().collect::<VecDeque<_>>();
+        while let Some(changed) = invalid_ready.pop_front() {
+            let Some(parents) = validation_reverse.get(&changed) else {
+                continue;
+            };
+            for parent in parents {
+                if invalid.insert(parent.clone()) {
+                    invalid_ready.push_back(parent.clone());
+                }
+            }
+        }
+        if let Some(cache) = cache {
+            let mut cache = cache.borrow_mut();
+            for (node, state) in &values {
+                if !invalid.contains(node)
+                    && let XmlProducerState::Present(access) = state
+                {
+                    cache.insert(node.clone(), *access);
+                }
+            }
+        }
+        if invalid.contains(&root_node) {
+            return XmlProducerState::Invalid;
+        }
+        values
+            .get(&root_node)
+            .copied()
+            .unwrap_or(XmlProducerState::Invalid)
+    }
+}
+
+fn xml_operand_access(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+    expected: Ty,
+) -> XmlProducerState {
+    let mut analysis = XmlAccessAnalyzer::new(graph);
+    let root = analysis.source(operand, expected, Vec::new());
+    analysis.build(root, None)
+}
+
+fn xml_operand_path_access(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+    selected: Ty,
+    path: Vec<XmlAccessPathSegment>,
+    cache: &std::cell::RefCell<HashMap<XmlAccessNode, XmlAccessProvenance>>,
+) -> XmlProducerState {
+    let mut analysis = XmlAccessAnalyzer::new(graph);
+    let root = analysis.source(operand, selected, path);
+    analysis.build(root, Some(cache))
+}
+
+fn xml_slot_path_access(
+    graph: &ValidatedProducerGraph<'_>,
+    slot: Slot,
+    selected: Ty,
+    path: Vec<XmlAccessPathSegment>,
+) -> XmlProducerState {
+    if graph
+        .function
+        .slots
+        .get(slot as usize)
+        .copied()
+        .and_then(|root| xml_selected_ty(graph.program, root, &path))
+        != Some(selected)
+    {
+        return XmlProducerState::Invalid;
+    }
+    let mut analysis = XmlAccessAnalyzer::new(graph);
+    let root = analysis.queue(XmlAccessNode::Slot(slot, path));
+    analysis.build(root, None)
+}
+
+fn xml_borrowed_path(
+    program: &Program,
+    mut ty: Ty,
+    path: &[hir::BorrowedPathSegment],
+) -> Option<(Ty, Vec<XmlAccessPathSegment>)> {
+    let mut selected = Vec::with_capacity(path.len());
+    for segment in path {
+        match *segment {
+            hir::BorrowedPathSegment::RootSlot => return None,
+            hir::BorrowedPathSegment::StructField(field) => {
+                let Ty::Struct(id) = ty else { return None };
+                ty = program
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(field as usize)?
+                    .ty;
+                selected.push(XmlAccessPathSegment::StructField(field));
+            }
+            hir::BorrowedPathSegment::EnumPayload {
+                variant,
+                payload_ordinal,
+            } => {
+                let Ty::Enum(enum_id) = ty else { return None };
+                ty = scalar_to_ty(
+                    *program
+                        .enums
+                        .get(enum_id as usize)?
+                        .variants
+                        .get(variant as usize)?
+                        .payload
+                        .get(payload_ordinal as usize)?,
+                );
+                selected.push(XmlAccessPathSegment::EnumPayload {
+                    enum_id,
+                    variant,
+                    slot: payload_ordinal,
+                });
+            }
+            hir::BorrowedPathSegment::OptionSome => {
+                ty = xml_option_payload(program, ty)?;
+                selected.push(XmlAccessPathSegment::OptionSome);
+            }
+            hir::BorrowedPathSegment::ResultOk => {
+                ty = xml_result_payload(program, ty, true)?;
+                selected.push(XmlAccessPathSegment::ResultOk);
+            }
+            hir::BorrowedPathSegment::ResultErr => {
+                ty = xml_result_payload(program, ty, false)?;
+                selected.push(XmlAccessPathSegment::ResultErr);
+            }
+        }
+    }
+    Some((ty, selected))
+}
+
+fn xml_borrowed_access(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+) -> XmlProducerState {
+    let (slot, path, expected) = match operand {
+        Operand::BorrowedPlace(place) => {
+            let Some(root) = graph.function.slots.get(place.slot as usize).copied() else {
+                return XmlProducerState::Invalid;
+            };
+            let Some((selected, path)) = xml_borrowed_path(graph.program, root, &place.path) else {
+                return XmlProducerState::Invalid;
+            };
+            let view_retype = matches!(
+                (selected, place.ty),
+                (Ty::Array(element, _), Ty::Slice(view))
+                    | (Ty::DynArray(element), Ty::Slice(view))
+                    if element == view
+            );
+            if selected != place.ty && !view_retype {
+                return XmlProducerState::Invalid;
+            }
+            (place.slot, path, selected)
+        }
+        Operand::BorrowedElementPlace(place) => {
+            return xml_borrowed_access(
+                graph,
+                &Operand::BorrowedPlace(Box::new(place.base.clone())),
+            );
+        }
+        Operand::BorrowedFixedElementPlace(place) => {
+            let Some(mut ty) = graph.function.slots.get(place.base as usize).copied() else {
+                return XmlProducerState::Invalid;
+            };
+            let Ty::DynFixedStructArray(struct_id, len) = ty else {
+                return XmlProducerState::Invalid;
+            };
+            if place.index >= len {
+                return XmlProducerState::Invalid;
+            }
+            ty = Ty::Struct(struct_id);
+            let mut path = Vec::with_capacity(place.path.len());
+            for field in &place.path {
+                let Ty::Struct(id) = ty else {
+                    return XmlProducerState::Invalid;
+                };
+                let Some(next) = graph
+                    .program
+                    .structs
+                    .get(id as usize)
+                    .and_then(|definition| definition.fields.get(*field as usize))
+                    .map(|field| field.ty)
+                else {
+                    return XmlProducerState::Invalid;
+                };
+                ty = next;
+                path.push(XmlAccessPathSegment::StructField(*field));
+            }
+            if ty != place.ty {
+                return XmlProducerState::Invalid;
+            }
+            // Fixed arrays have no selected-path representation in the XML graph. Their owning
+            // local/parameter root nevertheless supplies the borrow authority after the ordinary
+            // borrowed-place validator has authenticated the element descriptor.
+            let access = graph
+                .function
+                .params
+                .iter()
+                .position(|candidate| *candidate == place.base)
+                .map_or(XmlAccessProvenance::Owned, |index| {
+                    xml_argument_access(graph.function, index as u32)
+                });
+            return XmlProducerState::Present(access);
+        }
+        _ => return XmlProducerState::Invalid,
+    };
+    if let Some(index) = graph
+        .function
+        .params
+        .iter()
+        .position(|candidate| *candidate == slot)
+    {
+        XmlProducerState::Present(xml_argument_access(graph.function, index as u32))
+    } else {
+        xml_slot_path_access(graph, slot, expected, path)
+    }
+}
+
+fn xml_borrowed_storage_access(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+) -> XmlProducerState {
+    let slot = match operand {
+        Operand::BorrowedPlace(place) => place.slot,
+        Operand::BorrowedElementPlace(place) => place.base.slot,
+        Operand::BorrowedFixedElementPlace(place) => place.base,
+        _ => return XmlProducerState::Invalid,
+    };
+    if graph.function.slots.get(slot as usize).is_none() {
+        return XmlProducerState::Invalid;
+    }
+    let access = graph
+        .function
+        .params
+        .iter()
+        .position(|candidate| *candidate == slot)
+        .map_or(XmlAccessProvenance::Owned, |index| {
+            xml_argument_access(graph.function, index as u32)
+        });
+    XmlProducerState::Present(access)
+}
+
+fn xml_borrowed_mode_satisfied(
+    program: &Program,
+    parameter: Ty,
+    selected: Ty,
+    mode: align_ast::ParamMode,
+    payload: XmlProducerState,
+    storage: XmlProducerState,
+) -> bool {
+    let mut readable_payload = OperandRequirement::READ;
+    readable_payload.callable = matches!(selected, Ty::Fn(_));
+    match mode {
+        // A canonical borrowed descriptor is also the physical representation of a Copy view
+        // passed by value. The call-shape check above already rejects a borrowed carrier for a
+        // Move parameter; the remaining Copy case needs only readable payload provenance.
+        align_ast::ParamMode::ByValue => readable_payload.is_satisfied_by(payload),
+        align_ast::ParamMode::Borrow => readable_payload.is_satisfied_by(payload),
+        align_ast::ParamMode::BorrowMut => {
+            if align_sema::ty_is_move(
+                parameter,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            ) {
+                xml_mode_requirement(program, selected, mode)
+                    .is_satisfied_by(payload)
+            } else {
+                readable_payload.is_satisfied_by(payload)
+                    && OperandRequirement {
+                        write: true,
+                        exclusive: true,
+                        ..OperandRequirement::default()
+                    }
+                    .is_satisfied_by(storage)
+            }
+        }
+        align_ast::ParamMode::Out => OperandRequirement {
+            write: true,
+            exclusive: true,
+            ..OperandRequirement::default()
+        }
+        .is_satisfied_by(storage),
+    }
+}
+
+fn xml_borrowed_descriptor_path_valid(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+) -> bool {
+    let (place, element_base) = match operand {
+        Operand::BorrowedPlace(place) => (place.as_ref(), false),
+        Operand::BorrowedElementPlace(place) => (&place.base, true),
+        Operand::BorrowedFixedElementPlace(place) => {
+            return graph.function.slots.get(place.base as usize).is_some();
+        }
+        _ => return false,
+    };
+    let path = if element_base
+        && matches!(place.path.first(), Some(hir::BorrowedPathSegment::RootSlot))
+    {
+        let Some(path) = place.path.get(1..) else {
+            return false;
+        };
+        path
+    } else {
+        &place.path
+    };
+    let Some((selected, _)) = graph
+        .function
+        .slots
+        .get(place.slot as usize)
+        .copied()
+        .and_then(|root| xml_borrowed_path(graph.program, root, path))
+    else {
+        return false;
+    };
+    // A traversable projection is canonical enough to defer its final retype check to callable
+    // preflight, which owns the precise borrowed-place diagnostic. Root descriptors still need an
+    // exact type here so a relabeled whole value cannot bypass producer authentication.
+    !path.is_empty()
+        || selected == place.ty
+        || (!element_base
+            && matches!(
+                (selected, place.ty),
+                (Ty::Array(element, _), Ty::Slice(view))
+                    | (Ty::DynArray(element), Ty::Slice(view))
+                    if element == view
+            ))
+}
+
+fn xml_return_cleanup_companion(
+    graph: &ValidatedProducerGraph<'_>,
+    returned: &Operand,
+) -> Option<Option<ValueId>> {
+    let Operand::Value(initial) = returned else {
+        return Some(None);
+    };
+    let mut value = *initial;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(value) || graph.duplicate_values.get(value as usize) != Some(&false) {
+            return None;
+        }
+        let definition = graph.value_definitions.get(value as usize)?.as_ref()?;
+        match definition {
+            Rvalue::CallWithCleanup(call) => return Some(Some(call.cleanup)),
+            Rvalue::CallIndirectWithCleanup(call) => return Some(Some(call.cleanup)),
+            Rvalue::XmlParse { cleanup, .. } => return Some(Some(*cleanup)),
+            Rvalue::Use(Operand::Value(next)) => value = *next,
+            _ => return Some(None),
+        }
+    }
+}
+
+fn xml_local_call_components(program: &Program) -> Result<Vec<Vec<usize>>, CodegenError> {
+    let mut indices = HashMap::new();
+    for (index, function) in program.fns.iter().enumerate() {
+        if indices.insert(function.name.clone(), index).is_some() {
+            return Err(CodegenError::Lowering(
+                "MIR producer certification contains duplicate local function names".to_owned(),
+            ));
+        }
+    }
+
+    let mut edges = vec![Vec::<usize>::new(); program.fns.len()];
+    for (source, function) in program.fns.iter().enumerate() {
+        for rvalue in function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter_map(|statement| match statement {
+                Stmt::Let(_, rvalue) => Some(rvalue),
+                _ => None,
+            })
+        {
+            let target = match rvalue {
+                Rvalue::Call(DirectCall::Program(target), _) | Rvalue::FnAddr { target, .. } => {
+                    Some(target)
+                }
+                Rvalue::CallWithCleanup(call) => Some(&call.target),
+                Rvalue::Closure { lifted, .. } => Some(lifted),
+                _ => None,
+            };
+            if let Some(target) = target.and_then(|target| indices.get(target).copied()) {
+                edges[source].push(target);
+            }
+        }
+        edges[source].sort_unstable();
+        edges[source].dedup();
+    }
+
+    // Iterative Kosaraju keeps a malformed enormous call graph from consuming the native stack.
+    let mut visited = vec![false; edges.len()];
+    let mut finish = Vec::with_capacity(edges.len());
+    for start in 0..edges.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut pending = vec![(start, 0usize)];
+        while let Some((node, next)) = pending.last_mut() {
+            if let Some(target) = edges[*node].get(*next).copied() {
+                *next += 1;
+                if !visited[target] {
+                    visited[target] = true;
+                    pending.push((target, 0));
+                }
+            } else {
+                finish.push(*node);
+                pending.pop();
+            }
+        }
+    }
+    let mut reverse = vec![Vec::<usize>::new(); edges.len()];
+    for (source, targets) in edges.iter().enumerate() {
+        for target in targets {
+            reverse[*target].push(source);
+        }
+    }
+    visited.fill(false);
+    let mut components = Vec::new();
+    for start in finish.into_iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut component = Vec::new();
+        let mut pending = vec![start];
+        while let Some(node) = pending.pop() {
+            component.push(node);
+            for source in &reverse[node] {
+                if !visited[*source] {
+                    visited[*source] = true;
+                    pending.push(*source);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+
+    let mut owner = vec![usize::MAX; edges.len()];
+    for (component, members) in components.iter().enumerate() {
+        for member in members {
+            owner[*member] = component;
+        }
+    }
+    let mut dependencies = vec![HashSet::<usize>::new(); components.len()];
+    for (source, targets) in edges.iter().enumerate() {
+        for target in targets {
+            if owner[source] != owner[*target] {
+                dependencies[owner[source]].insert(owner[*target]);
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(components.len());
+    let mut complete = HashSet::new();
+    while ordered.len() != components.len() {
+        let Some(next) = (0..components.len()).find(|candidate| {
+            !complete.contains(candidate)
+                && dependencies[*candidate]
+                    .iter()
+                    .all(|dependency| complete.contains(dependency))
+        }) else {
+            return Err(CodegenError::Lowering(
+                "MIR producer call-graph condensation is cyclic".to_owned(),
+            ));
+        };
+        complete.insert(next);
+        ordered.push(components[next].clone());
+    }
+    Ok(ordered)
+}
+
+/// Validate the complete MIR producer graph and return the exact local bodies whose declared
+/// contracts were certified together. Interface publication consumes this set; it must never infer
+/// certification from a declaration alone.
+pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, CodegenError> {
+    validate_tagged_program(program)?;
+    validate_resource_program(program)?;
+    validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
+    // Publication certifies the typed producer graph, not final native codegen.
+    // Generated callback/parallel-kernel preflight runs at emission, after the
+    // consumer's interface checks and diagnostic precedence have completed.
+    // Running it here both repeats canonical ABI construction for every imported
+    // declaration and rejects dependency bodies before their consumer can report
+    // the owning source-level error. Callable producers and copied call facts are
+    // authenticated below by the same graph used at emission.
+    validate_resource_rvalues(program)?;
+    let certified = program
+        .fns
+        .iter()
+        .map(|function| function.name.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    if certified.len() != program.fns.len() {
+        return Err(CodegenError::Lowering(
+            "MIR producer certification contains duplicate local function names".to_owned(),
+        ));
+    }
+    Ok(certified)
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     validate_template_html_mir_signatures(program)?;
+    let components = xml_local_call_components(program)?;
+    let mut certified = HashSet::<ProgramCall>::new();
+    for component in components {
+        let mut provisional = certified.clone();
+        provisional.extend(
+            component
+                .iter()
+                .map(|member| program.fns[*member].name.clone()),
+        );
+        validate_resource_rvalues_component(program, &component, &provisional)?;
+        certified = provisional;
+    }
+    Ok(())
+}
+
+fn validate_resource_rvalues_component(
+    program: &Program,
+    component: &[usize],
+    local_contracts: &HashSet<ProgramCall>,
+) -> Result<(), CodegenError> {
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
             align_mir::Operand::Const(align_mir::Const::Int(_, ty))
@@ -4239,7 +10377,388 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 .collect::<Option<Vec<_>>>()
         })
     };
-    for function in &program.fns {
+    for (function_index, function) in program.fns.iter().enumerate() {
+        if component.binary_search(&function_index).is_err() {
+            continue;
+        }
+        let mut primary_definitions = vec![0u32; function.value_tys.len()];
+        let mut auxiliary_definitions = vec![0u32; function.value_tys.len()];
+        let mut value_definitions = vec![None; function.value_tys.len()];
+        let mut auxiliary_value_definitions = vec![None; function.value_tys.len()];
+        let mut duplicate_values = vec![false; function.value_tys.len()];
+        let mut slot_stores = XmlSlotStores {
+            roots: vec![Vec::new(); function.slots.len()],
+            fields: vec![Vec::new(); function.slots.len()],
+            elements: vec![Vec::new(); function.slots.len()],
+            element_fields: vec![Vec::new(); function.slots.len()],
+            constant_elements: vec![Vec::new(); function.slots.len()],
+            producers: vec![Vec::new(); function.slots.len()],
+        };
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                assert_xml_stmt_variant_classified(statement);
+                match statement {
+                    Stmt::Let(value, rvalue) => {
+                        if let Some(count) = primary_definitions.get_mut(*value as usize) {
+                            *count = count.saturating_add(1);
+                        }
+                        if let Some(definition) = value_definitions.get_mut(*value as usize) {
+                            if definition.is_some() {
+                                if let Some(duplicate) =
+                                    duplicate_values.get_mut(*value as usize)
+                                {
+                                    *duplicate = true;
+                                }
+                            } else {
+                                *definition = Some(rvalue);
+                            }
+                        }
+                        let auxiliary = match rvalue {
+                            Rvalue::CallWithCleanup(call) => Some(call.cleanup),
+                            Rvalue::CallIndirectWithCleanup(call) => Some(call.cleanup),
+                            Rvalue::XmlParse { cleanup, .. } => Some(*cleanup),
+                            _ => None,
+                        };
+                        if let Some(auxiliary) = auxiliary
+                            && let Some(count) = auxiliary_definitions.get_mut(auxiliary as usize)
+                        {
+                            *count = count.saturating_add(1);
+                            if let Some(definition) =
+                                auxiliary_value_definitions.get_mut(auxiliary as usize)
+                                && definition.is_none()
+                            {
+                                *definition = Some(rvalue);
+                            }
+                        }
+                        for (out, _) in xml_written_slots(rvalue) {
+                            if let Some(producers) = slot_stores.producers.get_mut(out as usize) {
+                                producers.push((*value, rvalue));
+                            }
+                        }
+                    }
+                    Stmt::Store(slot, operand) => {
+                        if let Some(stores) = slot_stores.roots.get_mut(*slot as usize) {
+                            stores.push(operand);
+                        }
+                    }
+                    Stmt::StoreField(slot, path, operand) => {
+                        if let Some(stores) = slot_stores.fields.get_mut(*slot as usize) {
+                            stores.push((path.as_slice(), operand));
+                        }
+                    }
+                    Stmt::StoreIndex(slot, index, operand) => {
+                        if let Some(stores) = slot_stores.elements.get_mut(*slot as usize) {
+                            stores.push((index, operand));
+                        }
+                    }
+                    Stmt::StoreElemField(slot, index, path, operand) => {
+                        if let Some(stores) = slot_stores.element_fields.get_mut(*slot as usize) {
+                            stores.push((index, path.as_slice(), operand));
+                        }
+                    }
+                    Stmt::StoreConstArray { slot, elems, elem } => {
+                        if let Some(stores) =
+                            slot_stores.constant_elements.get_mut(*slot as usize)
+                        {
+                            stores.push((elems.as_slice(), *elem));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let access_graph = ValidatedProducerGraph {
+            function,
+            program,
+            local_contracts,
+            value_definitions: &value_definitions,
+            auxiliary_value_definitions: &auxiliary_value_definitions,
+            duplicate_values: &duplicate_values,
+            slot_stores: &slot_stores,
+            primary_definitions: &primary_definitions,
+            auxiliary_definitions: &auxiliary_definitions,
+        };
+        // Every query below uses this immutable function graph. Reuse only nodes that a complete
+        // fixed point proved Present; absent, conditional, unresolved, and invalid states must be
+        // recomputed so a different selected root cannot erase their discriminator requirements.
+        let access_node_cache =
+            std::cell::RefCell::new(HashMap::<XmlAccessNode, XmlAccessProvenance>::new());
+        let cached_path_access =
+            |operand: &Operand, selected: Ty, path: Vec<XmlAccessPathSegment>| {
+                xml_operand_path_access(
+                    &access_graph,
+                    operand,
+                    selected,
+                    path,
+                    &access_node_cache,
+                )
+            };
+        let xml_access = |operand: &Operand, expected: Ty| {
+            cached_path_access(operand, expected, Vec::new())
+        };
+        let return_leaves = xml_owned_leaf_paths(program, function.ret)
+            .ok_or_else(|| fail(function, "producer return type graph is malformed"))?;
+        let return_leaf_valid = |operand: &Operand, selected: Ty, path: &[XmlAccessPathSegment]| {
+            let state = if matches!(
+                operand,
+                Operand::BorrowedPlace(_)
+                    | Operand::BorrowedElementPlace(_)
+                    | Operand::BorrowedFixedElementPlace(_)
+            ) {
+                xml_borrowed_access(&access_graph, operand)
+            } else {
+                cached_path_access(operand, selected, path.to_vec())
+            };
+            if matches!(selected, Ty::String | Ty::XmlReader) {
+                state.owned_if_present()
+            } else {
+                matches!(
+                    state,
+                    XmlProducerState::Present(
+                        XmlAccessProvenance::Owned
+                            | XmlAccessProvenance::Shared
+                            | XmlAccessProvenance::Exclusive
+                    )
+                        | XmlProducerState::MaybeAbsent(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                        | XmlProducerState::Absent
+                )
+            }
+        };
+        for block in &function.blocks {
+            let (returned, cleanup) = match &block.term {
+                Term::Return(Some(returned)) => (Some(returned), None),
+                Term::ReturnWithCleanup(returned) => {
+                    (Some(&returned.0), Some(&returned.1))
+                }
+                Term::Return(None) => {
+                    if function.ret != Ty::Unit
+                        || function.return_cleanup != hir::ReturnCleanupAbi::None
+                    {
+                        return Err(fail(
+                            function,
+                            "producer return omitted its declared value or cleanup bit",
+                        ));
+                    }
+                    (None, None)
+                }
+                Term::Goto(_) | Term::Branch(..) | Term::Unreachable => (None, None),
+            };
+            if let Some(returned) = returned
+            {
+                if xml_operand_base_ty(function, returned) != Some(function.ret) {
+                    return Err(fail(
+                        function,
+                        "producer return operand disagrees with its declared result type",
+                    ));
+                }
+                if let Some((selected, path)) = return_leaves
+                    .iter()
+                    .find(|(selected, path)| !return_leaf_valid(returned, *selected, path))
+                {
+                    return Err(fail(
+                        function,
+                        &format!(
+                            "producer return leaf {selected:?} at {path:?} is not certified by its body"
+                        ),
+                    ));
+                }
+                if cleanup.is_some()
+                    != (function.return_cleanup == hir::ReturnCleanupAbi::DynamicBit)
+                {
+                    return Err(fail(
+                        function,
+                        "producer return cleanup mode is not certified by its body",
+                    ));
+                }
+                let companion = xml_return_cleanup_companion(&access_graph, returned)
+                    .ok_or_else(|| fail(function, "producer return cleanup source is malformed"))?;
+                if let Some(expected) = companion
+                    && !matches!(cleanup, Some(Operand::Value(actual)) if *actual == expected)
+                {
+                    return Err(fail(
+                        function,
+                        "producer return cleanup is detached from its value producer",
+                    ));
+                }
+                if cleanup.is_some_and(|cleanup| {
+                    !matches!(
+                        xml_access(cleanup, Ty::Bool),
+                        XmlProducerState::Present(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                    )
+                }) {
+                    return Err(fail(
+                        function,
+                        "producer return cleanup operand is not certified by its body",
+                    ));
+                }
+                if return_leaves.is_empty()
+                    && align_sema::ty_is_move(
+                        function.ret,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    )
+                    && !xml_mode_requirement(
+                        program,
+                        function.ret,
+                        align_ast::ParamMode::ByValue,
+                    )
+                    .is_satisfied_by(xml_access(returned, function.ret))
+                {
+                    return Err(fail(
+                        function,
+                        "producer return does not transfer its declared Move value",
+                    ));
+                }
+            }
+        }
+        let indirect_call_valid = |
+            callee: &Operand,
+            params: &[Ty],
+            ret: Ty,
+            signature: &align_mir::FnSignatureFacts,
+        | {
+            let Some(Ty::Fn(id)) = xml_operand_base_ty(function, callee) else {
+                return false;
+            };
+            let copied = XmlCallFacts {
+                params: params.to_vec(),
+                modes: signature.param_modes.clone(),
+                ret,
+                borrow: signature.return_borrow.clone(),
+                region: signature.return_region.clone(),
+                cleanup: signature.return_cleanup,
+            };
+            xml_fn_type_facts(program, id).as_ref() == Some(&copied)
+                && matches!(
+                    xml_access(callee, Ty::Fn(id)),
+                    XmlProducerState::Present(
+                        XmlAccessProvenance::Owned
+                            | XmlAccessProvenance::Shared
+                            | XmlAccessProvenance::Exclusive
+                    )
+                )
+        };
+        let canonical_xml_value = |operand: &Operand| {
+            matches!(operand, Operand::Value(_) | Operand::Arg(_))
+        };
+        let readable_xml_index = |operand: &Operand| {
+            matches!(
+                operand,
+                Operand::Value(_) | Operand::Arg(_) | Operand::Const(Const::Int(_, _))
+            ) && matches!(
+                xml_access(operand, i64_ty),
+                XmlProducerState::Present(
+                    XmlAccessProvenance::Owned
+                        | XmlAccessProvenance::Shared
+                        | XmlAccessProvenance::Exclusive
+                )
+            )
+        };
+        let xml_call_arguments_valid =
+            |args: &[Operand], params: &[Ty], modes: &[align_ast::ParamMode]| {
+                args.len() == params.len()
+                    && modes.len() == params.len()
+                    && args
+                        .iter()
+                        .zip(params)
+                        .zip(modes)
+                        .all(|((operand, expected), mode)| {
+                            let Some(leaves) = xml_owned_leaf_paths(program, *expected) else {
+                                return false;
+                            };
+                            let canonical_borrow = matches!(
+                                operand,
+                                Operand::BorrowedPlace(_)
+                                    | Operand::BorrowedElementPlace(_)
+                                    | Operand::BorrowedFixedElementPlace(_)
+                            );
+                            let canonical_borrow_path = canonical_borrow
+                                && xml_borrowed_descriptor_path_valid(&access_graph, operand);
+                            let canonical_shape = !matches!(mode, align_ast::ParamMode::Out)
+                                || canonical_borrow;
+                            let parameter_moves = align_sema::ty_is_move(
+                                *expected,
+                                &program.structs,
+                                &program.tuples,
+                                &program.enums,
+                                &program.tagged_types,
+                            );
+                            let by_value_shape = !matches!(mode, align_ast::ParamMode::ByValue)
+                                || !parameter_moves
+                                || matches!(operand, Operand::Value(_) | Operand::Arg(_));
+                            if canonical_borrow {
+                                if !canonical_borrow_path {
+                                    return false;
+                                }
+                                let payload = xml_borrowed_access(&access_graph, operand);
+                                let storage =
+                                    xml_borrowed_storage_access(&access_graph, operand);
+                                if leaves.is_empty() {
+                                    return canonical_shape
+                                        && by_value_shape
+                                        && xml_borrowed_mode_satisfied(
+                                            program,
+                                            *expected,
+                                            *expected,
+                                            *mode,
+                                            payload,
+                                            storage,
+                                        );
+                                }
+                                return canonical_shape
+                                    && by_value_shape
+                                    && leaves.iter().all(|(selected, _)| {
+                                        xml_borrowed_mode_satisfied(
+                                            program,
+                                            *expected,
+                                            *selected,
+                                            *mode,
+                                            payload,
+                                            storage,
+                                        )
+                                    });
+                            }
+                            if leaves.is_empty() {
+                                if !parameter_moves {
+                                    // Copy-only carriers have no producer capability for this
+                                    // validator to authenticate. Callable preflight owns their
+                                    // exact Out/Borrow/BorrowMut destination and mode shape.
+                                    return true;
+                                }
+                                let state = xml_operand_access(
+                                    &access_graph,
+                                    operand,
+                                    *expected,
+                                );
+                                return canonical_shape
+                                    && by_value_shape
+                                    && xml_mode_requirement(
+                                        program,
+                                        *expected,
+                                        *mode,
+                                    )
+                                    .is_satisfied_by(state);
+                            }
+                            canonical_shape
+                                && by_value_shape
+                                && leaves.iter().all(|(selected, path)| {
+                                    let state =
+                                        cached_path_access(operand, *selected, path.clone());
+                                    xml_mode_requirement(program, *selected, *mode)
+                                        .is_satisfied_by(state)
+                                })
+                        })
+            };
         for block in &function.blocks {
             for statement in &block.stmts {
                 match statement {
@@ -4260,6 +10779,148 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                let protected_call_boundary = |args: &[Operand]| {
+                    xml_owned_leaf_paths(program, result)
+                        .is_none_or(|leaves| !leaves.is_empty())
+                        || args.iter().any(|operand| {
+                            xml_operand_base_ty(function, operand)
+                                .and_then(|ty| xml_owned_leaf_paths(program, ty))
+                                .is_none_or(|leaves| !leaves.is_empty())
+                        })
+                };
+                let call_arguments_valid = match rvalue {
+                    Rvalue::Call(DirectCall::Program(target), args) => {
+                        xml_direct_call_facts(program, target, local_contracts).map_or_else(
+                            || {
+                                let has_align_declaration = program
+                                    .fns
+                                    .iter()
+                                    .any(|function| &function.name == target)
+                                    || program
+                                        .imported_fns
+                                        .iter()
+                                        .any(|function| &function.name == target);
+                                let matching = program
+                                    .externs
+                                    .iter()
+                                    .filter(|declaration| &declaration.name == target)
+                                    .collect::<Vec<_>>();
+                                if !protected_call_boundary(args) {
+                                    true
+                                } else if !has_align_declaration
+                                    && let [declaration] = matching.as_slice()
+                                {
+                                    direct_operands_match_modes(
+                                        target,
+                                        args,
+                                        &declaration.param_modes,
+                                        &declaration.params,
+                                        program,
+                                    ) && xml_call_arguments_valid(
+                                        args,
+                                        &declaration.params,
+                                        &declaration.param_modes,
+                                    )
+                                } else {
+                                    false
+                                }
+                            },
+                            |facts| {
+                                let deferred_borrowed = args.iter().any(|operand| {
+                                    xml_borrowed_descriptor_path_valid(&access_graph, operand)
+                                });
+                                let mode_valid = deferred_borrowed || direct_operands_match_modes(
+                                    target,
+                                    args,
+                                    &facts.modes,
+                                    &facts.params,
+                                    program,
+                                );
+                                let producer_valid =
+                                    xml_call_arguments_valid(args, &facts.params, &facts.modes);
+                                mode_valid && producer_valid
+                            },
+                        )
+                    }
+                    Rvalue::CallWithCleanup(call) => {
+                        xml_direct_call_facts(program, &call.target, local_contracts).map_or_else(
+                            || !protected_call_boundary(&call.args),
+                            |facts| {
+                                (call.args.iter().any(|operand| {
+                                    xml_borrowed_descriptor_path_valid(&access_graph, operand)
+                                }) || direct_operands_match_modes(
+                                    &call.target,
+                                    &call.args,
+                                    &facts.modes,
+                                    &facts.params,
+                                    program,
+                                )) && xml_call_arguments_valid(
+                                    &call.args,
+                                    &facts.params,
+                                    &facts.modes,
+                                )
+                            },
+                        )
+                    }
+                    Rvalue::CallIndirect {
+                        callee,
+                        args,
+                        param_tys,
+                        ret_ty,
+                        signature,
+                        ..
+                    } => {
+                        indirect_call_valid(callee, param_tys, *ret_ty, signature)
+                            && operands_match_modes(
+                                args,
+                                &signature.param_modes,
+                                param_tys,
+                                program,
+                            )
+                            && xml_call_arguments_valid(
+                                args,
+                                param_tys,
+                                &signature.param_modes,
+                            )
+                    }
+                    Rvalue::CallIndirectWithCleanup(call) => {
+                        indirect_call_valid(
+                            &call.callee,
+                            &call.param_tys,
+                            call.ret_ty,
+                            &call.signature,
+                        ) && operands_match_modes(
+                            &call.args,
+                            &call.signature.param_modes,
+                            &call.param_tys,
+                            program,
+                        ) && xml_call_arguments_valid(
+                            &call.args,
+                            &call.param_tys,
+                            &call.signature.param_modes,
+                        )
+                    }
+                    _ => true,
+                };
+                if !call_arguments_valid {
+                    return Err(fail(
+                        function,
+                        "XML-capable call argument provenance mismatch",
+                    ));
+                }
+                if matches!(
+                    rvalue,
+                    Rvalue::XmlParse { .. }
+                        | Rvalue::XmlNext { .. }
+                        | Rvalue::XmlName { .. }
+                        | Rvalue::XmlAttributeCount(_)
+                        | Rvalue::XmlAttributeName { .. }
+                        | Rvalue::XmlAttributeValue { .. }
+                        | Rvalue::XmlText { .. }
+                ) && primary_definitions.get(*value as usize) != Some(&1)
+                {
+                    return Err(fail(function, "XML primary result definition is not unique"));
+                }
                 let valid = match rvalue {
                     Rvalue::RawIsNull(pointer) => {
                         operand_ty(function, pointer) == Some(Ty::Raw) && result == Ty::Bool
@@ -4297,6 +10958,119 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                             && operand_ty(function, owner) == Some(Ty::Resource(*resource))
                             && result == Ty::Raw
                     }
+                    Rvalue::XmlParse {
+                        input,
+                        error_enum,
+                        cleanup,
+                    } => {
+                        let input_state = xml_access(input, Ty::String);
+                        canonical_xml_value(input)
+                            && operand_ty(function, input) == Some(Ty::String)
+                            && input_state == XmlProducerState::Present(XmlAccessProvenance::Owned)
+                            && result
+                                == Ty::Result(Scalar::XmlReader, Scalar::Enum(*error_enum))
+                            && builtin_error_enum_is_exact(program, *error_enum)
+                            && *cleanup != *value
+                            && function.value_tys.get(*cleanup as usize) == Some(&Ty::Bool)
+                            && primary_definitions.get(*cleanup as usize) == Some(&0)
+                            && auxiliary_definitions.get(*cleanup as usize) == Some(&1)
+                    }
+                    Rvalue::XmlNext { reader, event_enum } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && result == Ty::Option(Scalar::Enum(*event_enum))
+                            && xml_event_definition_valid(program, *event_enum)
+                    }
+                    Rvalue::XmlAttributeCount(reader) => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && result == i64_ty
+                    }
+                    Rvalue::XmlName { reader } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && result == Ty::Str
+                    }
+                    Rvalue::XmlAttributeName { reader, index } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && operand_ty(function, index) == Some(i64_ty)
+                            && readable_xml_index(index)
+                            && result == Ty::Str
+                    }
+                    Rvalue::XmlAttributeValue { reader, index } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && operand_ty(function, index) == Some(i64_ty)
+                            && readable_xml_index(index)
+                            && result == Ty::String
+                    }
+                    Rvalue::XmlText { reader } => {
+                        canonical_xml_value(reader)
+                            && operand_ty(function, reader) == Some(Ty::XmlReader)
+                            && matches!(
+                                xml_access(reader, Ty::XmlReader),
+                                XmlProducerState::Present(
+                                    XmlAccessProvenance::Owned
+                                        | XmlAccessProvenance::Shared
+                                        | XmlAccessProvenance::Exclusive
+                                )
+                            )
+                            && result == Ty::String
+                    }
+                    Rvalue::GroupAgg { .. }
+                    | Rvalue::GroupAggStrCols { .. }
+                    | Rvalue::GroupAggStr { .. }
+                    | Rvalue::GroupAggMultiStr { .. }
+                    | Rvalue::DictEncode { .. }
+                    | Rvalue::GatherColumnI64 { .. }
+                    | Rvalue::DictLookup { .. } => matches!(
+                        xml_access(&Operand::Value(*value), result),
+                        XmlProducerState::Present(
+                            XmlAccessProvenance::Owned
+                                | XmlAccessProvenance::Shared
+                                | XmlAccessProvenance::Exclusive
+                        )
+                    ),
                     Rvalue::ResourceViewFromRaw {
                         owner,
                         ptr,
@@ -4456,7 +11230,21 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     _ => continue,
                 };
                 if !valid {
-                    return Err(fail(function, "resource operation contract mismatch"));
+                    let detail = if matches!(
+                        rvalue,
+                        Rvalue::XmlParse { .. }
+                            | Rvalue::XmlNext { .. }
+                            | Rvalue::XmlName { .. }
+                            | Rvalue::XmlAttributeCount(_)
+                            | Rvalue::XmlAttributeName { .. }
+                            | Rvalue::XmlAttributeValue { .. }
+                            | Rvalue::XmlText { .. }
+                    ) {
+                        "XML operation contract mismatch"
+                    } else {
+                        "resource operation contract mismatch"
+                    };
+                    return Err(fail(function, detail));
                 }
             }
         }
@@ -5079,6 +11867,7 @@ fn validate_tagged_program_inner(
                 | Scalar::Reader
                 | Scalar::Writer
                 | Scalar::Logger
+                | Scalar::XmlReader
                 | Scalar::Buffer
                 | Scalar::CodecBatch
                 | Scalar::CodecI64Column
@@ -5219,6 +12008,7 @@ fn validate_tagged_program_inner(
                         | Ty::Writer
                         | Ty::Reader
                         | Ty::Logger
+                        | Ty::XmlReader
                         | Ty::Buffer
                         | Ty::CodecBatch
                         | Ty::CodecI64Column
@@ -6773,7 +13563,7 @@ fn direct_operands_match_modes(
     {
         return false;
     }
-    let Ty::Resource(resource) = types[0] else {
+    let Some(Ty::Resource(resource)) = types.first().copied() else {
         return false;
     };
     let projected = match &args[0] {
@@ -8429,6 +15219,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::Buffer
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
@@ -8647,6 +15438,7 @@ fn abi_type<'c>(
         | Ty::Writer
         | Ty::Reader
         | Ty::Logger
+        | Ty::XmlReader
         | Ty::Buffer
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
@@ -9011,8 +15803,8 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
-        Scalar::Reader | Scalar::Writer | Scalar::Logger => {
-            unreachable!("an I/O/logger handle is not a box/array payload")
+        Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
+            unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
         Scalar::Buffer | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
@@ -9122,6 +15914,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Writer => RuntimeKey::IoWriterFree,
         Ty::Reader => RuntimeKey::IoReaderFree,
         Ty::Logger => RuntimeKey::LogFree,
+        Ty::XmlReader => RuntimeKey::XmlFree,
         Ty::Buffer => RuntimeKey::BufferFree,
         Ty::CodecEncoder => RuntimeKey::CodecEncoderFreeV1,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
@@ -15841,6 +22634,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..) => return self.gen_log_rvalue(rv),
+            Rvalue::XmlParse { .. }
+            | Rvalue::XmlNext { .. }
+            | Rvalue::XmlName { .. }
+            | Rvalue::XmlAttributeCount(_)
+            | Rvalue::XmlAttributeName { .. }
+            | Rvalue::XmlAttributeValue { .. }
+            | Rvalue::XmlText { .. } => {
+                return self.gen_xml_rvalue(rv, result_ty)
+            }
             Rvalue::CodecOpen(_)
             | Rvalue::CodecBatchRows(_)
             | Rvalue::CodecBatchColumns(_)
@@ -18205,6 +25007,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Writer
             | Ty::Reader
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::Buffer
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
@@ -20461,6 +27264,398 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| self.err("log_flush must return i32"))?
             }
             _ => return Err(self.err("gen_log_rvalue on a non-logger operation")),
+        };
+        Ok(Some(value))
+    }
+
+    fn xml_abort_unless(
+        &mut self,
+        condition: IntValue<'c>,
+        name: &str,
+    ) -> Result<(), CodegenError> {
+        let valid = self
+            .ctx
+            .append_basic_block(self.func, &format!("{name}.valid"));
+        let invalid = self
+            .ctx
+            .append_basic_block(self.func, &format!("{name}.invalid"));
+        self.builder
+            .build_conditional_branch(condition, valid, invalid)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(invalid);
+        self.builder
+            .build_call(
+                self.runtime(RuntimeKey::ProcessAbort),
+                &[],
+                &format!("{name}.abort"),
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unreachable()
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(valid);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn gen_xml_rvalue(
+        &mut self,
+        rv: &Rvalue,
+        result_ty: Ty,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let value = match rv {
+            Rvalue::XmlParse {
+                input,
+                error_enum,
+                cleanup,
+            } => {
+                let (pointer, length) = self.split_str(input)?;
+                let out = self.alloca_at_entry(self.llvm_type(Ty::XmlReader), "xml.parse.out")?;
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlParse),
+                        &[pointer.into(), length.into(), out.into()],
+                        "xml.parse.status",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_parse must return i32"))?
+                    .into_int_value();
+                let ok = self.ctx.append_basic_block(self.func, "xml.parse.ok");
+                let invalid = self.ctx.append_basic_block(self.func, "xml.parse.invalid");
+                let abort = self.ctx.append_basic_block(self.func, "xml.parse.abort");
+                let join = self.ctx.append_basic_block(self.func, "xml.parse.join");
+                let i32_type = self.ctx.i32_type();
+                self.builder
+                    .build_switch(
+                        status,
+                        abort,
+                        &[
+                            (i32_type.const_zero(), ok),
+                            (i32_type.const_int((-1_i32) as u64, true), invalid),
+                        ],
+                    )
+                    .map_err(|error| self.err(error))?;
+
+                let Ty::Result(ok_scalar, error_scalar) = result_ty else {
+                    return Err(self.err("xml.parse result is not Result<xml.reader, Error>"));
+                };
+                let result_type = result_struct_type(
+                    self.ctx,
+                    ok_scalar,
+                    error_scalar,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+
+                self.builder.position_at_end(ok);
+                let reader = self
+                    .builder
+                    .build_load(self.llvm_type(Ty::XmlReader), out, "xml.parse.reader")
+                    .map_err(|error| self.err(error))?;
+                let ok_result = self
+                    .builder
+                    .build_insert_value(result_type.const_zero(), reader, 1, "xml.parse.ok.value")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let ok_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("xml.parse ok block is absent"))?;
+
+                self.builder.position_at_end(invalid);
+                let error_type = *self
+                    .enum_types
+                    .get(*error_enum as usize)
+                    .ok_or_else(|| self.err("xml.parse Error enum type is absent"))?;
+                let error = self
+                    .builder
+                    .build_insert_value(
+                        error_type.const_zero(),
+                        i32_type.const_int(align_sema::ERROR_VARIANT_INVALID as u64, false),
+                        0,
+                        "xml.parse.error.invalid",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        result_type.const_zero(),
+                        self.ctx.i8_type().const_int(1, false),
+                        0,
+                        "xml.parse.err.tag",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let invalid_result = self
+                    .builder
+                    .build_insert_value(tagged, error, 2, "xml.parse.err.value")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let invalid_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("xml.parse invalid block is absent"))?;
+
+                self.builder.position_at_end(abort);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::ProcessAbort),
+                        &[],
+                        "xml.parse.status.abort",
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| self.err(error))?;
+
+                self.builder.position_at_end(join);
+                let result = self
+                    .builder
+                    .build_phi(result_type, "xml.parse.result")
+                    .map_err(|error| self.err(error))?;
+                result.add_incoming(&[
+                    (&ok_result, ok_end),
+                    (&invalid_result, invalid_end),
+                ]);
+                let cleanup_value = self
+                    .builder
+                    .build_phi(self.ctx.bool_type(), "xml.parse.cleanup")
+                    .map_err(|error| self.err(error))?;
+                cleanup_value.add_incoming(&[
+                    (&self.ctx.bool_type().const_int(1, false), ok_end),
+                    (&self.ctx.bool_type().const_zero(), invalid_end),
+                ]);
+                self.values.insert(*cleanup, cleanup_value.as_basic_value());
+                result.as_basic_value()
+            }
+            Rvalue::XmlNext { reader, event_enum } => {
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlNext),
+                        &[self.operand(reader)?.into()],
+                        "xml.next.status",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_next must return i32"))?
+                    .into_int_value();
+                let cases = [
+                    self.ctx.append_basic_block(self.func, "xml.next.none"),
+                    self.ctx.append_basic_block(self.func, "xml.next.start"),
+                    self.ctx.append_basic_block(self.func, "xml.next.end"),
+                    self.ctx.append_basic_block(self.func, "xml.next.text"),
+                ];
+                let abort = self.ctx.append_basic_block(self.func, "xml.next.abort");
+                let join = self.ctx.append_basic_block(self.func, "xml.next.join");
+                let i32_type = self.ctx.i32_type();
+                let switch_cases = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(status, &block)| (i32_type.const_int(status as u64, false), block))
+                    .collect::<Vec<_>>();
+                self.builder
+                    .build_switch(status, abort, &switch_cases)
+                    .map_err(|error| self.err(error))?;
+                let Ty::Option(payload) = result_ty else {
+                    return Err(self.err("xml.next result is not Option<xml.event>"));
+                };
+                let option_type = option_struct_type(
+                    self.ctx,
+                    payload,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                let event_type = *self
+                    .enum_types
+                    .get(*event_enum as usize)
+                    .ok_or_else(|| self.err("xml.next event enum type is absent"))?;
+                let mut incoming = Vec::with_capacity(4);
+                for (status, &block) in cases.iter().enumerate() {
+                    self.builder.position_at_end(block);
+                    let option = if status == 0 {
+                        option_type.const_zero()
+                    } else {
+                        let event = self
+                            .builder
+                            .build_insert_value(
+                                event_type.const_zero(),
+                                i32_type.const_int((status - 1) as u64, false),
+                                0,
+                                "xml.next.event",
+                            )
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value();
+                        let tagged = self
+                            .builder
+                            .build_insert_value(
+                                option_type.const_zero(),
+                                self.ctx.i8_type().const_int(1, false),
+                                0,
+                                "xml.next.some.tag",
+                            )
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value();
+                        self.builder
+                            .build_insert_value(tagged, event, 1, "xml.next.some.value")
+                            .map_err(|error| self.err(error))?
+                            .into_struct_value()
+                    };
+                    self.builder
+                        .build_unconditional_branch(join)
+                        .map_err(|error| self.err(error))?;
+                    let end = self
+                        .builder
+                        .get_insert_block()
+                        .ok_or_else(|| self.err("xml.next case block is absent"))?;
+                    incoming.push((option, end));
+                }
+                self.builder.position_at_end(abort);
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::ProcessAbort),
+                        &[],
+                        "xml.next.status.abort",
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(join);
+                let option = self
+                    .builder
+                    .build_phi(option_type, "xml.next.result")
+                    .map_err(|error| self.err(error))?;
+                let incoming_refs = incoming
+                    .iter()
+                    .map(|(value, block)| (value as &dyn BasicValue<'c>, *block))
+                    .collect::<Vec<_>>();
+                option.add_incoming(&incoming_refs);
+                option.as_basic_value()
+            }
+            Rvalue::XmlAttributeCount(reader) => {
+                let count = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::XmlAttributeCount),
+                        &[self.operand(reader)?.into()],
+                        "xml.attribute_count",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("xml_attribute_count must return i64"))?
+                    .into_int_value();
+                let nonnegative = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        count,
+                        self.ctx.i64_type().const_zero(),
+                        "xml.attribute_count.nonnegative",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let bounded = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLE,
+                        count,
+                        self.ctx.i64_type().const_int(256, false),
+                        "xml.attribute_count.bounded",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let valid = self
+                    .builder
+                    .build_and(nonnegative, bounded, "xml.attribute_count.valid")
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, "xml.attribute_count")?;
+                count.into()
+            }
+            Rvalue::XmlName { reader } | Rvalue::XmlText { reader } => {
+                let key = if matches!(rv, Rvalue::XmlName { .. }) {
+                    RuntimeKey::XmlName
+                } else {
+                    RuntimeKey::XmlText
+                };
+                let out = self.alloca_at_entry(self.llvm_type(result_ty), key.logical_name())?;
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(key),
+                        &[self.operand(reader)?.into(), out.into()],
+                        &format!("{}.status", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("XML getter must return i32"))?
+                    .into_int_value();
+                let valid = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.ctx.i32_type().const_zero(),
+                        &format!("{}.valid", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, key.logical_name())?;
+                self.builder
+                    .build_load(self.llvm_type(result_ty), out, key.logical_name())
+                    .map_err(|error| self.err(error))?
+            }
+            Rvalue::XmlAttributeName { reader, index }
+            | Rvalue::XmlAttributeValue { reader, index } => {
+                let key = if matches!(rv, Rvalue::XmlAttributeName { .. }) {
+                    RuntimeKey::XmlAttributeName
+                } else {
+                    RuntimeKey::XmlAttributeValue
+                };
+                let out = self.alloca_at_entry(self.llvm_type(result_ty), key.logical_name())?;
+                let status = self
+                    .builder
+                    .build_call(
+                        self.runtime(key),
+                        &[
+                            self.operand(reader)?.into(),
+                            out.into(),
+                            self.operand(index)?.into(),
+                        ],
+                        &format!("{}.status", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("indexed XML getter must return i32"))?
+                    .into_int_value();
+                let valid = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.ctx.i32_type().const_zero(),
+                        &format!("{}.valid", key.logical_name()),
+                    )
+                    .map_err(|error| self.err(error))?;
+                self.xml_abort_unless(valid, key.logical_name())?;
+                self.builder
+                    .build_load(self.llvm_type(result_ty), out, key.logical_name())
+                    .map_err(|error| self.err(error))?
+            }
+            _ => return Err(self.err("gen_xml_rvalue on a non-XML operation")),
         };
         Ok(Some(value))
     }
@@ -23463,6 +30658,180 @@ mod tests {
         ProgramCall::try_from_logical(name).expect("valid test program call")
     }
 
+    #[test]
+    fn producer_optional_owned_views_preserve_binder_access_without_minting_ownership() {
+        for (owned, view) in [
+            ("string", "str"),
+            ("Option<string>", "Option<str>"),
+            ("array<u8>", "slice<u8>"),
+            ("Option<array<u8>>", "Option<slice<u8>>"),
+        ] {
+            let mut program = mir(&format!(
+                "Source {{ field: {owned} }}\nfn inspect(borrow value: Source) -> i32 = 0\nfn accept(value: {view}) -> i32 = 0\nfn main() -> i32 = 0\n"
+            ));
+            let owner = xml_test_function(&program, "inspect");
+            let consumer = xml_test_function(&program, "accept");
+            let view_ty = program.fns[consumer].slots[program.fns[consumer].params[0] as usize];
+            let target = program.fns[consumer].name.clone();
+            let source_ty = program.structs[0].fields[0].ty;
+            let function = &mut program.fns[owner];
+            let parameter = function.params[0];
+            function.value_tys = vec![source_ty, view_ty, function.ret];
+            function.blocks = vec![Block { id: 0, stmts: vec![
+                Stmt::Let(0, Rvalue::Field(parameter, vec![0])),
+                Stmt::Let(1, Rvalue::Use(Operand::Value(0))),
+                Stmt::Let(2, Rvalue::Call(DirectCall::Program(target), vec![Operand::Value(1)])),
+            ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(2))) }];
+            function.entry = 0;
+            assert!(validate_resource_rvalues(&program).is_ok(), "borrowed binder {owned} -> {view}");
+            assert!(validate_thin_partition_program(&program, &[]).is_ok(), "per-unit binder {owned} -> {view}");
+            assert!(!xml_ty_is_view_retype(view_ty, source_ty), "views cannot mint owners");
+        }
+    }
+
+    #[test]
+    fn producer_vector_numeric_relations_preserve_the_source_operator_domain() {
+        for scalar in ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"] {
+            for lanes in [2, 4, 8, 16] {
+                let vector = format!("vec{lanes}<{scalar}>");
+                let mask = format!("mask{lanes}<{scalar}>");
+                let mut source = format!(
+                    "fn vector_label(value: {vector}) -> str = \"vector\"\n\
+                     fn mask_label(value: {mask}) -> str = \"mask\"\n\
+                     fn scalar_label(value: {scalar}) -> str = \"scalar\"\n\
+                     fn bool_label(value: bool) -> str = \"bool\"\n"
+                );
+                for (index, operator) in ["+", "-", "*", "/", "%"].into_iter().enumerate() {
+                    // An enclosing vector expectation currently rejects scalar-left
+                    // arithmetic in sema; test admitted source without widening it.
+                    for (order, left, right) in [("vv", "a", "b"), ("vs", "a", "scalar")] {
+                        source.push_str(&format!(
+                            "fn arithmetic_{index}_{order}(a: {vector}, b: {vector}, scalar: {scalar}) -> str = vector_label({left} {operator} {right})\n"
+                        ));
+                    }
+                }
+                for (index, operator) in ["==", "!=", "<", "<=", ">", ">="].into_iter().enumerate() {
+                    for (order, left, right) in [("vv", "a", "b"), ("vs", "a", "scalar"), ("sv", "scalar", "b")] {
+                        source.push_str(&format!(
+                            "fn comparison_{index}_{order}(a: {vector}, b: {vector}, scalar: {scalar}) -> str = mask_label({left} {operator} {right})\n"
+                        ));
+                    }
+                }
+                source.push_str(&format!(
+                    "fn selected(a: {vector}, b: {vector}, scalar: {scalar}) -> str = vector_label(select(a > scalar, a + scalar, b - scalar))\n"
+                ));
+                if scalar.starts_with('i') || scalar.starts_with('f') {
+                    source.push_str(&format!(
+                        "fn negative(value: {scalar}) -> str = scalar_label(-value)\n"
+                    ));
+                }
+                if !scalar.starts_with('f') {
+                    source.push_str(&format!(
+                        "fn complement(value: {scalar}) -> str = scalar_label(~value)\n"
+                    ));
+                }
+                source.push_str("fn logical(value: bool) -> str = bool_label(!value)\nfn main() -> i32 = 0\n");
+                let program = mir(&source);
+                for result in [
+                    validate_resource_rvalues(&program),
+                    validate_thin_partition_program(&program, &[]),
+                ] {
+                    assert!(result.is_ok(), "numeric producers {vector}: {result:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn producer_vector_numeric_relations_reject_forged_operands_and_operators() {
+        let program = mir(r#"
+fn label(value: vec4<i32>) -> str = "vector"
+fn selected(a: vec4<i32>, b: vec4<i32>, narrow: vec2<i32>, floating: vec4<f32>, scalar: i32, wide: i64, mask: mask4<i32>, narrow_mask: mask2<i32>, float_mask: mask4<f32>, flag: bool) -> str = label(a + b)
+fn main() -> i32 = 0
+"#);
+        let owner = xml_test_function(&program, "selected");
+        let replace = |replacement: Rvalue| {
+            let mut changed = program.clone();
+            let rvalue = changed.fns[owner].blocks.iter_mut()
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, rvalue @ Rvalue::Bin(..)) => Some(rvalue),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("vector arithmetic fixture lost its producer"));
+            *rvalue = replacement;
+            changed
+        };
+        for condition in [6, 9] {
+            let valid = replace(Rvalue::Select {
+                cond: Operand::Arg(condition),
+                a: Operand::Arg(0),
+                b: Operand::Arg(1),
+            });
+            for result in [
+                validate_resource_rvalues(&valid),
+                validate_thin_partition_program(&valid, &[]),
+            ] {
+                assert!(result.is_ok(), "valid vector select condition {condition}: {result:?}");
+            }
+        }
+        for (left, right) in [(0, 1), (0, 4), (4, 0)] {
+            let valid = replace(Rvalue::Bin(BinOp::Add, Operand::Arg(left), Operand::Arg(right)));
+            assert!(validate_resource_rvalues(&valid).is_ok(), "valid numeric broadcast");
+            assert!(validate_thin_partition_program(&valid, &[]).is_ok(), "per-unit numeric broadcast");
+        }
+        for bad_operand in [2, 3, 5, 6, 9] {
+            for (left, right) in [(0, bad_operand), (bad_operand, 1)] {
+                let malformed = replace(Rvalue::Bin(BinOp::Add, Operand::Arg(left), Operand::Arg(right)));
+                assert_xml_producer_rejected(&malformed, "vector width/element/broadcast relation");
+            }
+        }
+        for operation in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr, BinOp::And, BinOp::Or, BinOp::Eq] {
+            let malformed = replace(Rvalue::Bin(operation, Operand::Arg(0), Operand::Arg(1)));
+            assert_xml_producer_rejected(&malformed, "vector operator/result relation");
+        }
+        for operation in [UnOp::Neg, UnOp::Not, UnOp::BitNot] {
+            let malformed = replace(Rvalue::Un(operation, Operand::Arg(0)));
+            assert_xml_producer_rejected(&malformed, "unary vector operator is not a source operation");
+        }
+        for (condition, other) in [(0, 1), (7, 1), (8, 1), (6, 2), (6, 3), (6, 4)] {
+            let malformed = replace(Rvalue::Select {
+                cond: Operand::Arg(condition),
+                a: Operand::Arg(0),
+                b: Operand::Arg(other),
+            });
+            assert_xml_producer_rejected(&malformed, "select exact mask/vector relation");
+        }
+    }
+
+    #[test]
+    fn producer_vector_numeric_relations_reject_invalid_numeric_type_shapes() {
+        for (source_type, malformed_type) in [
+            ("i32", Ty::Int(IntTy { bits: 3, signed: true })),
+            ("f64", Ty::Float(FloatTy { bits: 16 })),
+            ("vec4<i32>", Ty::Vec(Scalar::Int(IntTy { bits: 32, signed: true }), 3)),
+            ("vec4<i32>", Ty::Vec(Scalar::Bool, 4)),
+        ] {
+            let vector = source_type.starts_with("vec");
+            let mut program = mir(&format!(
+                "fn label(value: {}) -> str = \"comparison\"\n\
+                 fn selected(a: {source_type}, b: {source_type}) -> str = label(a == b)\n\
+                 fn main() -> i32 = 0\n",
+                if vector { "mask4<i32>" } else { "bool" },
+            ));
+            let owner = xml_test_function(&program, "selected");
+            let original = program.fns[owner].slots[program.fns[owner].params[0] as usize];
+            for function in &mut program.fns {
+                for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                    if *ty == original {
+                        *ty = malformed_type;
+                    }
+                }
+            }
+            assert_xml_producer_rejected(&program, "numeric element width/vector lane domain");
+        }
+    }
+
     /// The handle **set** belongs to `align_sema::is_move_handle`; this file only maps it to each
     /// handle's runtime free symbol. A handle sema admits with no row in that map used to return
     /// `None`, which emits no drop at all — a silent leak at every drop site. Sweep the producer's
@@ -23984,7 +31353,7 @@ mod tests {
         assert_lowering(
             emit_llvm_ir(&invalid_base, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a descriptor with an invalid array path must fail"),
-            "borrowed place field path crosses a non-struct type",
+            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
 
         let mut stale_root = mir(source);
@@ -24226,7 +31595,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
-            "borrowed element array root changes between its bounds guard and call action",
+            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
 
         let by_value_source = r#"Record { value: string }
@@ -24274,7 +31643,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a same-action by-value peer must not consume the indexed root"),
-            "borrowed element array root changes between its bounds guard and call action",
+            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
     }
 
@@ -24499,6 +31868,7 @@ fn main() -> i32 = 0
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
         });
         let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, false, &[], None).unwrap();
         assert_eq!(declarations(&per_unit), expected);
@@ -24756,7 +32126,10 @@ fn main() -> i32 = 0
         assert!(changed, "fixture must contain the borrowed call operand");
         let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a borrowed place with a forged type must fail closed");
-        assert_lowering(error, "callable target invalid:696e7370656374");
+        assert_lowering(
+            error,
+            "resource MIR in function 'main' is malformed: XML-capable call argument provenance mismatch",
+        );
     }
 
     #[test]
@@ -24802,7 +32175,10 @@ fn main() -> i32 = 0
             "a slice view forged from an array with another element must fail closed"
         );
         if let Err(error) = malformed {
-            assert_lowering(error, "borrowed place type disagrees with its field path");
+            assert_lowering(
+                error,
+                "resource MIR in function 'inspect' is malformed: XML-capable call argument provenance mismatch",
+            );
         }
     }
 
@@ -24984,6 +32360,7 @@ fn main() -> i32 = 0
             return_borrow: view.return_borrow,
             return_region: view.return_region,
             return_cleanup: view.return_cleanup,
+            producer_certified: true,
         });
         let ctx = Context::create();
         let module = ctx.create_module("returned_borrow_imported");
@@ -25736,6 +33113,15 @@ fn main() -> i32 = 0
         finish.borrow_mut_cleanup_slots = vec![None];
         finish.slots = vec![Ty::Resource(resource)];
         finish.slot_align = vec![None];
+        if let Stmt::Let(_, Rvalue::TemplateHtmlToString { output, .. }) =
+            &mut finish.blocks[0].stmts[0]
+        {
+            *output = Operand::Arg(0);
+        }
+        finish.blocks[0].term = Term::ReturnWithCleanup(Box::new((
+            Operand::Value(0),
+            Operand::Const(Const::Bool(true)),
+        )));
         let mut html = template_mir_function(
             "pkg.template$html",
             Rvalue::TemplateHtmlNew { resource },
@@ -25743,6 +33129,10 @@ fn main() -> i32 = 0
         );
         html.ret = Ty::Resource(resource);
         html.return_cleanup = hir::ReturnCleanupAbi::DynamicBit;
+        html.blocks[0].term = Term::ReturnWithCleanup(Box::new((
+            Operand::Value(0),
+            Operand::Const(Const::Bool(true)),
+        )));
         Program {
             fns: vec![html, write, raw, finish],
             sqlite_callback_effects: Default::default(),
@@ -25770,7 +33160,8 @@ fn main() -> i32 = 0
     #[test]
     fn template_html_mir_gate_rejects_resource_type_operand_and_placement_mutations() {
         let program = template_mir_program();
-        assert!(validate_resource_rvalues(&program).is_ok());
+        let validation = validate_resource_rvalues(&program);
+        assert!(validation.is_ok(), "valid template MIR was rejected: {validation:?}");
 
         let mut malformed = program.clone();
         malformed.resources[0].drop_thunk.push_str("_wrong");
@@ -25811,6 +33202,7 @@ fn main() -> i32 = 0
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
         });
         assert!(validate_resource_rvalues(&imported).is_ok());
         imported.imported_fns[0].param_modes[0] = align_ast::ParamMode::ByValue;
@@ -25827,6 +33219,2449 @@ fn main() -> i32 = 0
             *resource = 9;
         }
         assert!(validate_resource_rvalues(&malformed).is_err());
+    }
+
+    #[test]
+    fn xml_mir_gate_rejects_every_operand_result_cleanup_and_event_mutation() {
+        let program = mir(
+            r#"import std.xml
+fn source() -> string = "<a x='v'>text</a>".clone()
+fn main() -> Result<(), Error> {
+  mut reader := xml.parse(source())?
+  event := reader.next()
+  name := reader.name()
+  count := reader.attribute_count()
+  attribute_name := reader.attribute_name(0)
+  attribute_value := reader.attribute_value(0)
+  text := reader.text()
+  return Ok(())
+}
+"#,
+        );
+        assert!(validate_resource_rvalues(&program).is_ok());
+        assert!(validate_thin_partition_program(&program, &[]).is_ok());
+
+        let mut sites = Vec::new();
+        for (function_index, function) in program.fns.iter().enumerate() {
+            for (block_index, block) in function.blocks.iter().enumerate() {
+                for (statement_index, statement) in block.stmts.iter().enumerate() {
+                    if matches!(
+                        statement,
+                        Stmt::Let(
+                            _,
+                            Rvalue::XmlParse { .. }
+                                | Rvalue::XmlNext { .. }
+                                | Rvalue::XmlName { .. }
+                                | Rvalue::XmlAttributeCount(_)
+                                | Rvalue::XmlAttributeName { .. }
+                                | Rvalue::XmlAttributeValue { .. }
+                                | Rvalue::XmlText { .. }
+                        )
+                    ) {
+                        sites.push((function_index, block_index, statement_index));
+                    }
+                }
+            }
+        }
+        assert_eq!(sites.len(), 7, "the source must exercise every XML rvalue");
+
+        for &(function_index, block_index, statement_index) in &sites {
+            let mut malformed_result = program.clone();
+            let result = match &malformed_result.fns[function_index].blocks[block_index].stmts
+                [statement_index]
+            {
+                Stmt::Let(result, _) => *result,
+                _ => panic!("XML site inventory contains a non-let statement"),
+            };
+            malformed_result.fns[function_index].value_tys[result as usize] = Ty::Unit;
+            assert!(
+                validate_resource_rvalues(&malformed_result).is_err(),
+                "an XML result-type mutation was accepted at {function_index}:{block_index}:{statement_index}"
+            );
+
+            let mut malformed_operand = program.clone();
+            let Stmt::Let(_, rvalue) = &mut malformed_operand.fns[function_index].blocks
+                [block_index]
+                .stmts[statement_index]
+            else {
+                panic!("XML site inventory contains a non-let statement")
+            };
+            match rvalue {
+                Rvalue::XmlParse { input, .. } => *input = Operand::Value(u32::MAX),
+                Rvalue::XmlNext { reader, .. }
+                | Rvalue::XmlAttributeCount(reader)
+                | Rvalue::XmlName { reader, .. }
+                | Rvalue::XmlAttributeName { reader, .. }
+                | Rvalue::XmlAttributeValue { reader, .. }
+                | Rvalue::XmlText { reader, .. } => *reader = Operand::Value(u32::MAX),
+                _ => panic!("XML site inventory contains a non-XML rvalue"),
+            }
+            assert!(
+                validate_resource_rvalues(&malformed_operand).is_err(),
+                "an XML operand mutation was accepted at {function_index}:{block_index}:{statement_index}"
+            );
+
+            let expected = match &program.fns[function_index].blocks[block_index].stmts
+                [statement_index]
+            {
+                Stmt::Let(_, Rvalue::XmlParse { .. }) => Ty::String,
+                Stmt::Let(_, _) => Ty::XmlReader,
+                _ => panic!("XML site inventory contains a non-let statement"),
+            };
+            let base = align_mir::BorrowedPlace {
+                slot: u32::MAX,
+                path: Vec::new(),
+                ty: expected,
+                cleanup: None,
+            };
+            let forged_operands = [
+                Operand::BorrowedPlace(Box::new(base.clone())),
+                Operand::BorrowedElementPlace(Box::new(align_mir::BorrowedElementPlace {
+                    base: base.clone(),
+                    index: Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                    )),
+                    element_ty: expected,
+                    guard: align_mir::BorrowedElementGuard {
+                        reservation: u32::MAX,
+                        len: Operand::Const(Const::Int(
+                            1,
+                            Ty::Int(IntTy {
+                                bits: 64,
+                                signed: true,
+                            }),
+                        )),
+                    },
+                })),
+                Operand::BorrowedFixedElementPlace(Box::new(
+                    align_mir::BorrowedFixedElementPlace {
+                        base: u32::MAX,
+                        index: 0,
+                        path: Vec::new(),
+                        ty: expected,
+                        cleanup: None,
+                    },
+                )),
+            ];
+            for forged in forged_operands {
+                let mut malformed = program.clone();
+                let Stmt::Let(_, rvalue) = &mut malformed.fns[function_index].blocks[block_index]
+                    .stmts[statement_index]
+                else {
+                    panic!("XML site inventory contains a non-let statement")
+                };
+                match rvalue {
+                    Rvalue::XmlParse { input, .. } => *input = forged,
+                    Rvalue::XmlNext { reader, .. }
+                    | Rvalue::XmlAttributeCount(reader)
+                    | Rvalue::XmlName { reader, .. }
+                    | Rvalue::XmlAttributeName { reader, .. }
+                    | Rvalue::XmlAttributeValue { reader, .. }
+                    | Rvalue::XmlText { reader, .. } => *reader = forged,
+                    _ => panic!("XML site inventory contains a non-XML rvalue"),
+                }
+                assert!(
+                    validate_resource_rvalues(&malformed).is_err(),
+                    "a forged borrowed XML operand was accepted at {function_index}:{block_index}:{statement_index}"
+                );
+            }
+
+            let mut malformed_index = program.clone();
+            let Stmt::Let(_, rvalue) = &mut malformed_index.fns[function_index].blocks[block_index]
+                .stmts[statement_index]
+            else {
+                panic!("XML site inventory contains a non-let statement")
+            };
+            if let Rvalue::XmlAttributeName { index, .. }
+            | Rvalue::XmlAttributeValue { index, .. } = rvalue
+            {
+                *index = Operand::Value(u32::MAX);
+                assert!(
+                    validate_resource_rvalues(&malformed_index).is_err(),
+                    "an XML index mutation was accepted at {function_index}:{block_index}:{statement_index}"
+                );
+            }
+        }
+
+        let parse_site = sites
+            .iter()
+            .copied()
+            .find(|&(function, block, statement)| {
+                matches!(
+                    program.fns[function].blocks[block].stmts[statement],
+                    Stmt::Let(_, Rvalue::XmlParse { .. })
+                )
+            })
+            .unwrap_or_else(|| panic!("missing xml.parse site"));
+        for cleanup in [u32::MAX, 0] {
+            let mut malformed = program.clone();
+            let (function, block, statement) = parse_site;
+            let Stmt::Let(_, Rvalue::XmlParse { cleanup: actual, .. }) =
+                &mut malformed.fns[function].blocks[block].stmts[statement]
+            else {
+                panic!("xml.parse inventory site changed shape")
+            };
+            *actual = cleanup;
+            assert!(validate_resource_rvalues(&malformed).is_err());
+        }
+        let mut wrong_cleanup_type = program.clone();
+        let (function, block, statement) = parse_site;
+        let Stmt::Let(_, Rvalue::XmlParse { cleanup, .. }) =
+            &wrong_cleanup_type.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let cleanup = *cleanup;
+        wrong_cleanup_type.fns[function].value_tys[cleanup as usize] = Ty::Unit;
+        assert!(validate_resource_rvalues(&wrong_cleanup_type).is_err());
+
+        let call_cleanup = program
+            .fns
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::CallWithCleanup(call)) => Some(call.cleanup),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing owned string call cleanup"));
+        let mut aliased_cleanup = program.clone();
+        let Stmt::Let(_, Rvalue::XmlParse { cleanup, .. }) =
+            &mut aliased_cleanup.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *cleanup = call_cleanup;
+        assert!(validate_resource_rvalues(&aliased_cleanup).is_err());
+
+        let mut duplicate_cleanup = program.clone();
+        let Stmt::Let(original_result, duplicate_parse) = duplicate_cleanup.fns[function].blocks
+            [block]
+            .stmts[statement]
+            .clone()
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let duplicate_result = duplicate_cleanup.fns[function].value_tys.len() as u32;
+        let duplicate_result_ty = duplicate_cleanup.fns[function].value_tys
+            [original_result as usize];
+        duplicate_cleanup.fns[function]
+            .value_tys
+            .push(duplicate_result_ty);
+        duplicate_cleanup.fns[function].blocks[block]
+            .stmts
+            .push(Stmt::Let(duplicate_result, duplicate_parse));
+        assert!(validate_resource_rvalues(&duplicate_cleanup).is_err());
+        assert!(validate_thin_partition_program(&duplicate_cleanup, &[]).is_err());
+
+        let mut duplicate_primary = program.clone();
+        let Stmt::Let(original_result, mut duplicate_parse) = duplicate_primary.fns[function]
+            .blocks[block]
+            .stmts[statement]
+            .clone()
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        let duplicate_cleanup = duplicate_primary.fns[function].value_tys.len() as u32;
+        duplicate_primary.fns[function].value_tys.push(Ty::Bool);
+        let Rvalue::XmlParse { cleanup, .. } = &mut duplicate_parse else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *cleanup = duplicate_cleanup;
+        duplicate_primary.fns[function].blocks[block]
+            .stmts
+            .push(Stmt::Let(original_result, duplicate_parse));
+        assert!(validate_resource_rvalues(&duplicate_primary).is_err());
+
+        let mut wrong_error_enum = program.clone();
+        let Stmt::Let(_, Rvalue::XmlParse { error_enum, .. }) =
+            &mut wrong_error_enum.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.parse inventory site changed shape")
+        };
+        *error_enum = u32::MAX;
+        assert!(validate_resource_rvalues(&wrong_error_enum).is_err());
+
+        let next_site = sites
+            .iter()
+            .copied()
+            .find(|&(function, block, statement)| {
+                matches!(
+                    program.fns[function].blocks[block].stmts[statement],
+                    Stmt::Let(_, Rvalue::XmlNext { .. })
+                )
+            })
+            .unwrap_or_else(|| panic!("missing xml.next site"));
+        let mut wrong_event_enum = program.clone();
+        let (function, block, statement) = next_site;
+        let Stmt::Let(_, Rvalue::XmlNext { event_enum, .. }) =
+            &mut wrong_event_enum.fns[function].blocks[block].stmts[statement]
+        else {
+            panic!("xml.next inventory site changed shape")
+        };
+        *event_enum = u32::MAX;
+        assert!(validate_resource_rvalues(&wrong_event_enum).is_err());
+
+        let event_index = program
+            .enums
+            .iter()
+            .position(|definition| definition.name == "xml.event")
+            .unwrap_or_else(|| panic!("missing builtin xml.event definition"));
+        let mut event_mutations = Vec::new();
+        let mut malformed = program.clone();
+        malformed.enums[event_index].name.push_str(".forged");
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].source_name.push_str(".forged");
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants.swap(0, 1);
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants[0].payload.push(Scalar::Bool);
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants[0].field_base = 2;
+        event_mutations.push(malformed);
+        let mut malformed = program.clone();
+        malformed.enums[event_index].variants.pop();
+        event_mutations.push(malformed);
+        let mut malformed = program;
+        malformed.enums.push(malformed.enums[event_index].clone());
+        event_mutations.push(malformed);
+        for malformed in event_mutations {
+            assert!(validate_resource_rvalues(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn xml_mir_gate_derives_access_from_parameter_producers() {
+        let program = mir(
+            r#"import std.xml
+fn make() -> string = "<a/>".clone()
+fn parse_owned(source: string) -> Result<xml.reader, Error> = xml.parse(source)
+fn parse_direct() -> Result<xml.reader, Error> = xml.parse(make())
+fn parse_indirect() -> Result<xml.reader, Error> { maker := make; return xml.parse(maker()) }
+fn parse_control(flag: bool) -> Result<xml.reader, Error> = xml.parse(if flag { make() } else { make() })
+fn parse_loop() -> Result<xml.reader, Error> = xml.parse(loop { break make() })
+fn parse_join(first: string, second: string, flag: bool) -> Result<xml.reader, Error> = xml.parse(if flag { first } else { second })
+fn next_exclusive(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn name_shared(borrow reader: xml.reader) -> str = reader.name()
+fn count_shared(borrow reader: xml.reader) -> i64 = reader.attribute_count()
+fn attribute_name_shared(borrow reader: xml.reader, index: i64) -> str = reader.attribute_name(index)
+fn value_shared(borrow reader: xml.reader, index: i64) -> string = reader.attribute_value(index)
+fn text_shared(borrow reader: xml.reader) -> string = reader.text()
+fn main() -> i32 = 0
+"#,
+        );
+        let validation = validate_resource_rvalues(&program);
+        assert!(
+            validation.is_ok(),
+            "fresh, direct, indirect, and control-result producers must authenticate: {validation:?}"
+        );
+
+        let function_index = |name: &str| {
+            program
+                .fns
+                .iter()
+                .position(|function| function.name.as_str() == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let parse = function_index("parse_owned");
+        for mode in [
+            align_ast::ParamMode::Borrow,
+            align_ast::ParamMode::BorrowMut,
+            align_ast::ParamMode::Out,
+        ] {
+            let mut malformed = program.clone();
+            malformed.fns[parse].param_modes[0] = mode;
+            assert!(
+                validate_resource_rvalues(&malformed).is_err(),
+                "xml.parse accepted {mode:?} input provenance through its load/store chain"
+            );
+        }
+
+        let next = function_index("next_exclusive");
+        let mut shared_next = program.clone();
+        shared_next.fns[next].param_modes[0] = align_ast::ParamMode::Borrow;
+        assert!(
+            validate_resource_rvalues(&shared_next).is_err(),
+            "xml.next accepted shared parameter provenance"
+        );
+        let mut owned_next = program.clone();
+        owned_next.fns[next].param_modes[0] = align_ast::ParamMode::ByValue;
+        assert!(validate_resource_rvalues(&owned_next).is_ok());
+        let mut unreadable_next = program.clone();
+        unreadable_next.fns[next].param_modes[0] = align_ast::ParamMode::Out;
+        assert!(validate_resource_rvalues(&unreadable_next).is_err());
+
+        let getters = [
+            function_index("name_shared"),
+            function_index("count_shared"),
+            function_index("attribute_name_shared"),
+            function_index("value_shared"),
+            function_index("text_shared"),
+        ];
+        for getter in getters {
+            for mode in [
+                align_ast::ParamMode::ByValue,
+                align_ast::ParamMode::Borrow,
+                align_ast::ParamMode::BorrowMut,
+            ] {
+                let mut readable = program.clone();
+                readable.fns[getter].param_modes[0] = mode;
+                assert!(
+                    validate_resource_rvalues(&readable).is_ok(),
+                    "XML getter rejected readable {mode:?} provenance"
+                );
+            }
+            let mut unreadable = program.clone();
+            unreadable.fns[getter].param_modes[0] = align_ast::ParamMode::Out;
+            assert!(validate_resource_rvalues(&unreadable).is_err());
+        }
+
+        for indexed in [
+            function_index("attribute_name_shared"),
+            function_index("value_shared"),
+        ] {
+            let mut unreadable_index = program.clone();
+            unreadable_index.fns[indexed].param_modes[1] = align_ast::ParamMode::Out;
+            assert!(
+                validate_resource_rvalues(&unreadable_index).is_err(),
+                "XML index accepted an unreadable Out producer"
+            );
+        }
+
+        let join = function_index("parse_join");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::Out] {
+            let mut mixed = program.clone();
+            mixed.fns[join].param_modes[1] = mode;
+            assert!(
+                validate_resource_rvalues(&mixed).is_err(),
+                "xml.parse accepted an {mode:?} branch in a producer join"
+            );
+        }
+
+        for function in std::iter::once(parse)
+            .chain(std::iter::once(next))
+            .chain(getters)
+        {
+            let mut direct_arg = program.clone();
+            let rvalue = direct_arg.fns[function]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, rvalue @ Rvalue::XmlParse { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlNext { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlName { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeCount(_))
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeName { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlAttributeValue { .. })
+                    | Stmt::Let(_, rvalue @ Rvalue::XmlText { .. }) => Some(rvalue),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing XML parameter operation"));
+            match rvalue {
+                Rvalue::XmlParse { input, .. } => *input = Operand::Arg(0),
+                Rvalue::XmlNext { reader, .. }
+                | Rvalue::XmlName { reader }
+                | Rvalue::XmlAttributeCount(reader)
+                | Rvalue::XmlAttributeName { reader, .. }
+                | Rvalue::XmlAttributeValue { reader, .. }
+                | Rvalue::XmlText { reader } => *reader = Operand::Arg(0),
+                _ => panic!("XML parameter operation changed shape"),
+            }
+            assert!(
+                validate_resource_rvalues(&direct_arg).is_ok(),
+                "a raw argument with the operation's canonical mode must remain valid"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_closure_keeps_calls_arrays_reborrows_and_whole_results_total() {
+        let ordinary = mir(
+            r#"Record { value: str }
+fn take(value: str) -> i64 = value.len()
+fn take_many(values: slice<str>) -> i64 = take(values[0])
+fn fixed(first: str, second: str) -> i64 {
+  values := [first, second]
+  records := [Record { value: first }, Record { value: second }]
+  return take(values[0]) + take(records[1].value) + take_many(values)
+}
+fn folded() -> i64 { values := ["a", "b"]; return take(values[0]) }
+fn label(values: slice<i64>) -> str = "ok"
+fn numeric(value: i64) -> str { values := [value, 2]; return label(values) }
+Numbers { first: i64, second: i64 }
+fn label_record(value: Numbers) -> str = "ok"
+fn numeric_record(value: i64) -> str {
+  values := [Numbers { first: value, second: 2 }]
+  return label_record(values[0])
+}
+View { text: str }
+fn replace(borrow mut value: View) { value.text = "new" }
+fn replace_copy(borrow source: View) -> str {
+  mut copy := source
+  replace(copy)
+  return copy.text
+}
+Carrier { owned: string, view: str }
+fn inspect_carrier(value: Carrier) -> i64 = value.owned.len() + value.view.len()
+fn mixed_carrier(source: str) -> i64 =
+  inspect_carrier(Carrier { owned: "owned".clone(), view: source })
+fn mixed_inputs(owned: string, source: str) -> i64 =
+  inspect_carrier(Carrier { owned: owned, view: source })
+fn tail_first(values: slice<str>) -> str { tail := values[1..]; return tail[0] }
+fn tail_forward(values: slice<str>) -> i64 { tail := values[1..]; return take_many(tail) }
+fn empty_view() -> i64 = take_many([])
+fn capture_cycle() -> i64 {
+  mut n: i64 := 0
+  f := fn x: i64 { n + x }
+  n = f(1)
+  return n
+}
+fn main() -> i32 = 0
+"#,
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_mir_producers(&ordinary)
+        }));
+        assert!(
+            matches!(outcome, Ok(Ok(_))),
+            "ordinary arrays, subslices, mixed carriers, and a callable cycle must certify: {outcome:?}"
+        );
+
+        let dynamic = mir(
+            r#"import core.json
+User { name: str, age: i64 }
+fn aos_field(data: str) -> Result<string, Error> {
+  rows: array<User> := json.decode(data)?
+  return Ok(rows[0].name.clone())
+}
+fn aos_whole(data: str) -> Result<string, Error> {
+  rows: array<User> := json.decode(data)?
+  row := rows[0]
+  return Ok(row.name.clone())
+}
+fn user_name_len(user: User) -> i64 = user.name.len()
+fn aos_map(data: str) -> Result<i64, Error> {
+  rows: array<User> := json.decode(data)?
+  return Ok(rows.map(user_name_len).sum())
+}
+fn soa_column(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<User> := json.decode(data)?
+    names := rows.name
+    return Ok(names[0].clone())
+  }
+}
+fn soa_field(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<User> := json.decode(data)?
+    return Ok(rows[0].name.clone())
+  }
+}
+fn soa_whole(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<User> := json.decode(data)?
+    materialized := rows.to_array()
+    row := materialized[0]
+    return Ok(row.name.clone())
+  }
+}
+Point { key: i64, value: i64 }
+fn describe(value: i64) -> str = if value == 2 { "two" } else { "other" }
+fn transposed() -> string {
+  arena {
+    rows := [User { name: "text", age: 2 }].to_soa()
+    return rows[0].name.clone()
+  }
+}
+fn grouped(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<Point> := json.decode(data)?
+    groups := rows.group_by(.key).sum(.value)
+    return Ok(describe(groups.1[0]).clone())
+  }
+}
+fn grouped_strings(data: str) -> Result<string, Error> {
+  arena {
+    rows: soa<User> := json.decode(data)?
+    groups := rows.group_by(.name).count()
+    return Ok(groups.0[0].clone())
+  }
+}
+fn main() -> i32 = 0
+"#,
+        );
+        let dynamic_validation = validate_mir_producers(&dynamic);
+        assert!(
+            dynamic_validation.is_ok(),
+            "dynamic AoS and SoA protected projections must certify: {dynamic_validation:?}"
+        );
+
+        for variant in [
+            "SoaColumn",
+            "IndexFieldPtr",
+            "IndexColumn",
+            "SoaGather",
+            "IndexPtr",
+            "SoaAlloc",
+            "StoreColumn",
+        ] {
+            let mut malformed = dynamic.clone();
+            let changed = malformed
+                .fns
+                .iter_mut()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match (variant, statement) {
+                    ("SoaColumn", Stmt::Let(_, Rvalue::SoaColumn { struct_id, .. }))
+                    | ("IndexFieldPtr", Stmt::Let(_, Rvalue::IndexFieldPtr { struct_id, .. }))
+                    | ("IndexColumn", Stmt::Let(_, Rvalue::IndexColumn { struct_id, .. }))
+                    | ("SoaGather", Stmt::Let(_, Rvalue::SoaGather { struct_id, .. }))
+                    | ("IndexPtr", Stmt::Let(_, Rvalue::IndexPtr { struct_id, .. })) => {
+                        *struct_id = u32::MAX;
+                        Some(())
+                    }
+                    ("SoaAlloc", Stmt::Let(_, Rvalue::SoaAlloc { struct_id, .. }))
+                    | ("StoreColumn", Stmt::StoreColumn { struct_id, .. }) => {
+                        *struct_id = u32::MAX;
+                        Some(())
+                    }
+                    _ => None,
+                })
+                .is_some();
+            assert!(changed, "missing dynamic {variant} producer");
+            assert_xml_producer_rejected(
+                &malformed,
+                &format!("dynamic {variant} nominal identity"),
+            );
+        }
+
+        for string_keys in [false, true] {
+            let mut malformed = dynamic.clone();
+            let changed = malformed.fns.iter_mut()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, Rvalue::GroupAgg { out_vals, .. }) if !string_keys => Some(out_vals),
+                    Stmt::Let(_, Rvalue::GroupAggStrCols { out_keys, .. }) if string_keys => Some(out_keys),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("missing runtime buffer writer fixture"));
+            *changed = Operand::Const(Const::Bool(false));
+            assert_xml_producer_rejected(&malformed, "runtime buffer output identity/type");
+
+            let (function, outputs) = dynamic.fns.iter().enumerate()
+                .find_map(|(function, definition)| definition.blocks.iter()
+                    .flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::GroupAgg { out_keys, out_vals, .. }) if !string_keys =>
+                            Some((function, vec![out_keys.clone(), out_vals.clone()])),
+                        Stmt::Let(_, Rvalue::GroupAggStrCols { out_keys, out_vals, .. }) if string_keys =>
+                            Some((function, vec![out_keys.clone(), out_vals.clone()])),
+                        _ => None,
+                    }))
+                .unwrap_or_else(|| panic!("missing runtime buffer capacity fixture"));
+            for (index, output) in outputs.into_iter().enumerate() {
+                let Operand::Value(output) = output else {
+                    panic!("runtime output is not a value")
+                };
+                let mut undersized = dynamic.clone();
+                let count = undersized.fns[function].blocks.iter_mut()
+                    .flat_map(|block| &mut block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::HeapAllocBuf { count, .. }) if *value == output =>
+                            Some(count),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing runtime output allocation"));
+                *count = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true })));
+                assert_xml_producer_rejected(
+                    &undersized,
+                    &format!("runtime buffer {index} capacity"),
+                );
+            }
+        }
+
+        let tail_first = xml_test_function(&ordinary, "tail_first");
+        let empty_view = xml_test_function(&ordinary, "empty_view");
+        let mut forged_empty_length = ordinary.clone();
+        let empty_length = forged_empty_length.fns[empty_view].blocks.iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::MakeSlice(_, length)) => Some(length),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing empty view fixture"));
+        *empty_length = 1;
+        assert_xml_producer_rejected(&forged_empty_length, "empty view forged nonempty length");
+        let mut bad_subslice = ordinary.clone();
+        let elem = bad_subslice.fns[tail_first]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::SubSlice { elem, .. }) => Some(elem),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing protected SubSlice producer"));
+        *elem = Ty::Bool;
+        assert_xml_producer_rejected(&bad_subslice, "SubSlice element type");
+
+        let mixed_inputs = xml_test_function(&ordinary, "mixed_inputs");
+        let mut shared_owned_leaf = ordinary.clone();
+        shared_owned_leaf.fns[mixed_inputs].param_modes[0] = align_ast::ParamMode::Borrow;
+        assert_xml_producer_rejected(
+            &shared_owned_leaf,
+            "shared owned-string leaf transferred by value",
+        );
+        let mut unreadable_view_leaf = ordinary.clone();
+        unreadable_view_leaf.fns[mixed_inputs].param_modes[1] = align_ast::ParamMode::Out;
+        assert_xml_producer_rejected(
+            &unreadable_view_leaf,
+            "unreadable Copy-view leaf passed by value",
+        );
+
+        let fixed = xml_test_function(&ordinary, "fixed");
+        let mut bad_index = ordinary.clone();
+        let indexed = bad_index.fns[fixed]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(value, Rvalue::Index(..)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array Index producer"));
+        bad_index.fns[fixed].value_tys[indexed as usize] = Ty::Bool;
+        assert_xml_producer_rejected(&bad_index, "fixed-array Index result type");
+
+        let mut non_inline_slot = ordinary.clone();
+        let slot = non_inline_slot.fns[fixed]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Index(slot, _)) => Some(*slot),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array Index slot"));
+        non_inline_slot.fns[fixed].slots[slot as usize] = Ty::Slice(Scalar::Str);
+        assert_xml_producer_rejected(&non_inline_slot, "slice slot used by fixed Index");
+
+        let replace_copy = xml_test_function(&ordinary, "replace_copy");
+        let mut shared_storage = ordinary.clone();
+        let source = shared_storage.fns[replace_copy].params[0];
+        let place = shared_storage.fns[replace_copy]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), arguments))
+                    if target.as_str() == "replace" => arguments.first_mut(),
+                _ => None,
+            })
+            .and_then(|operand| match operand {
+                Operand::BorrowedPlace(place) => Some(place),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing Copy-local BorrowMut descriptor"));
+        place.slot = source;
+        assert_xml_producer_rejected(
+            &shared_storage,
+            "shared Copy parameter used as BorrowMut storage",
+        );
+
+        let mut bad_index_field = ordinary.clone();
+        let fields = bad_index_field.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::IndexField(_, _, fields)) => Some(fields),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array IndexField producer"));
+        fields[0] = u32::MAX;
+        assert_xml_producer_rejected(&bad_index_field, "fixed-array IndexField path");
+
+        let mut bad_slice = ordinary.clone();
+        let length = bad_slice.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::MakeSlice(_, length)) => Some(length),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array MakeSlice producer"));
+        *length += 1;
+        assert_xml_producer_rejected(&bad_slice, "fixed-array MakeSlice length");
+
+        let mut bad_store = ordinary.clone();
+        let stored = bad_store.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreIndex(_, _, stored) => Some(stored),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array StoreIndex producer"));
+        *stored = Operand::Const(Const::Bool(false));
+        assert_xml_producer_rejected(&bad_store, "fixed-array StoreIndex operand");
+
+        let mut bad_field_store = ordinary.clone();
+        let stored = bad_field_store.fns[fixed]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreElemField(_, _, _, stored) => Some(stored),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed-array StoreElemField producer"));
+        *stored = Operand::Const(Const::Bool(false));
+        assert_xml_producer_rejected(&bad_field_store, "fixed-array StoreElemField operand");
+
+        let folded = xml_test_function(&ordinary, "folded");
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let strings = vec![ConstElem::Str("a".to_owned()), ConstElem::Str("b".to_owned())];
+        let mut static_array = ordinary.clone();
+        static_array.fns[folded] = Function {
+            name: program_call("folded"),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: Vec::new(),
+            slot_align: Vec::new(),
+            value_tys: vec![Ty::Slice(Scalar::Str), Ty::Str, i64_ty],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let(
+                        0,
+                        Rvalue::ConstArray {
+                            elems: strings.clone(),
+                            elem: Ty::Str,
+                        },
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::SliceIndex(
+                            Operand::Value(0),
+                            Operand::Const(Const::Int(0, i64_ty)),
+                        ),
+                    ),
+                    Stmt::Let(
+                        2,
+                        Rvalue::Call(direct_program("take"), vec![Operand::Value(1)]),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(2))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        assert!(validate_mir_producers(&static_array).is_ok());
+        let mut bad_constant = static_array;
+        let Stmt::Let(_, Rvalue::ConstArray { elem, .. }) =
+            &mut bad_constant.fns[folded].blocks[0].stmts[0]
+        else {
+            panic!("static ConstArray fixture changed shape")
+        };
+        *elem = Ty::Bool;
+        assert_xml_producer_rejected(&bad_constant, "static ConstArray element type");
+
+        let mut pooled_array = ordinary.clone();
+        pooled_array.fns[folded] = Function {
+            name: program_call("folded"),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![Ty::Array(Scalar::Str, 2)],
+            slot_align: vec![None],
+            value_tys: vec![Ty::Str, i64_ty],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::StoreConstArray {
+                        slot: 0,
+                        elems: strings,
+                        elem: Ty::Str,
+                    },
+                    Stmt::Let(
+                        0,
+                        Rvalue::Index(0, Operand::Const(Const::Int(0, i64_ty))),
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::Call(direct_program("take"), vec![Operand::Value(0)]),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(1))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        assert!(validate_mir_producers(&pooled_array).is_ok());
+        let mut bad_pooled = pooled_array;
+        let Stmt::StoreConstArray { elems, .. } =
+            &mut bad_pooled.fns[folded].blocks[0].stmts[0]
+        else {
+            panic!("StoreConstArray fixture changed shape")
+        };
+        elems[0] = ConstElem::Bool(false);
+        assert_xml_producer_rejected(&bad_pooled, "StoreConstArray constant element type");
+
+        let xml = mir(
+            r#"import std.xml
+fn identity(value: Result<xml.reader, Error>) -> Result<xml.reader, Error> = value
+fn parse_identity(source: string) -> Result<xml.reader, Error> = identity(xml.parse(source))
+fn advance(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn forward(borrow mut reader: xml.reader) -> Option<xml.event> = advance(reader)
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            validate_mir_producers(&xml).is_ok(),
+            "whole parse results and exclusive reborrows must certify"
+        );
+        let forward = xml_test_function(&xml, "forward");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::Out] {
+            let mut insufficient = xml.clone();
+            insufficient.fns[forward].param_modes[0] = mode;
+            assert_xml_producer_rejected(
+                &insufficient,
+                &format!("{mode:?} source upgraded for a BorrowMut call"),
+            );
+        }
+    }
+
+    #[test]
+    fn producer_captured_callable_roots_follow_validated_environments() {
+        let base = mir(
+            r#"Holder { callback: fn() -> str }
+fn captured(value: str) -> str {
+  callback := fn { value }
+  return callback()
+}
+fn joined(left: str, right: str, choose: bool) -> str {
+  mut callback := fn { left }
+  if choose { callback = fn { right } }
+  return callback()
+}
+fn stored(value: str) -> str {
+  holder := Holder { callback: fn { value } }
+  return holder.callback()
+}
+fn wrapped(value: str) -> str = captured(value)
+fn mixed(value: str, fallback: str, choose: bool) -> str {
+  callback := fn alternative: str { if choose { value } else { alternative } }
+  return callback(fallback)
+}
+fn owned(value: str) -> string {
+  callback := fn { value.clone() }
+  return callback()
+}
+fn main() -> i32 = 0
+"#,
+        );
+        let validated = validate_mir_producers(&base);
+        assert!(validated.is_ok(), "captured callable producer roots: {validated:?}");
+        let partition = validate_thin_partition_program(&base, &[]);
+        assert!(partition.is_ok(), "per-unit captured callable roots: {partition:?}");
+
+        let captured = xml_test_function(&base, "captured");
+        let mutate_closure = |program: &mut Program, mutation: u8| {
+            let (captures, capture_tys) = program.fns[captured].blocks.iter_mut()
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(_, Rvalue::Closure { captures, capture_tys, .. }) => {
+                        Some((captures, capture_tys))
+                    }
+                    _ => None,
+                }).unwrap_or_else(|| panic!("captured source must lower a closure environment"));
+            assert_eq!(captures.len(), 1);
+            assert_eq!(capture_tys.as_slice(), &[Ty::Str]);
+            match mutation {
+                0 => { captures.clear(); }
+                1 => { captures[0] = Operand::Const(Const::Bool(false)); }
+                2 => { capture_tys[0] = Ty::Bool; }
+                _ => panic!("unknown capture mutation"),
+            }
+        };
+        for (mutation, label) in [
+            (0, "missing captured environment field"),
+            (1, "wrong-typed captured environment operand"),
+            (2, "forged captured environment layout"),
+        ] {
+            let mut malformed = base.clone();
+            mutate_closure(&mut malformed, mutation);
+            assert_xml_producer_rejected(&malformed, label);
+        }
+
+        // Change every copied summary together, so signature equality alone cannot reject the
+        // forged index. The environment still has only capture 0; capture 1 has no producer.
+        fn forge_capture_index(
+            borrow: &mut hir::ReturnBorrowSummary,
+            region: &mut hir::ReturnRegionSummary,
+        ) {
+            if let hir::ReturnBorrowSummary::Roots { captures, .. } = borrow
+                && !captures.is_empty()
+            {
+                *captures = vec![1];
+            }
+            if let hir::ReturnRegionSummary::Roots { captures, .. } = region
+                && !captures.is_empty()
+            {
+                *captures = vec![1];
+            }
+        }
+        let mut forged = base.clone();
+        for function in &mut forged.fns {
+            forge_capture_index(&mut function.return_borrow, &mut function.return_region);
+            for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                let signature = match statement {
+                    Stmt::Let(_, Rvalue::Closure { signature, .. }
+                        | Rvalue::FnAddr { signature, .. }
+                        | Rvalue::CallIndirect { signature, .. }) => Some(signature.as_mut()),
+                    Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) => {
+                        Some(&mut call.signature)
+                    }
+                    _ => None,
+                };
+                if let Some(signature) = signature {
+                    forge_capture_index(&mut signature.return_borrow, &mut signature.return_region);
+                }
+            }
+        }
+        for function in &mut forged.fn_types {
+            forge_capture_index(&mut function.return_borrow, &mut function.return_region);
+        }
+        assert_xml_producer_rejected(&forged, "capture root beyond the validated environment");
+    }
+
+    fn xml_test_function(program: &Program, name: &str) -> usize {
+        program
+            .fns
+            .iter()
+            .position(|function| function.name.as_str() == name)
+            .unwrap_or_else(|| panic!("missing XML test function {name}"))
+    }
+
+    fn xml_test_value(function: &mut Function, ty: Ty) -> ValueId {
+        let value = u32::try_from(function.value_tys.len())
+            .unwrap_or_else(|_| panic!("XML test value inventory exceeds u32"));
+        function.value_tys.push(ty);
+        value
+    }
+
+    fn insert_before_xml_test_operation(function: &mut Function, statements: Vec<Stmt>) {
+        let (block_index, statement_index) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block.stmts.iter().position(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Let(
+                            _,
+                            Rvalue::XmlParse { .. }
+                                | Rvalue::XmlNext { .. }
+                                | Rvalue::XmlName { .. }
+                                | Rvalue::XmlAttributeCount(_)
+                                | Rvalue::XmlAttributeName { .. }
+                                | Rvalue::XmlAttributeValue { .. }
+                                | Rvalue::XmlText { .. }
+                        )
+                    )
+                })
+                .map(|statement_index| (block_index, statement_index))
+            })
+            .unwrap_or_else(|| panic!("missing XML test operation"));
+        let count = statements.len();
+        let complete_source_lines = function.blocks[block_index].stmt_lines.len()
+            == function.blocks[block_index].stmts.len();
+        function.blocks[block_index]
+            .stmts
+            .splice(statement_index..statement_index, statements);
+        if complete_source_lines {
+            function.blocks[block_index]
+                .stmt_lines
+                .splice(statement_index..statement_index, std::iter::repeat_n((0, 0), count));
+        }
+    }
+
+    fn replace_xml_test_reader(function: &mut Function, reader: Operand) {
+        let operation = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::XmlNext { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing XML next operation"));
+        let Rvalue::XmlNext { reader: actual, .. } = operation else {
+            panic!("XML next operation changed shape")
+        };
+        *actual = reader;
+    }
+
+    fn replace_xml_test_parse_input(function: &mut Function, input: Operand) {
+        let operation = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::XmlParse { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing XML parse operation"));
+        let Rvalue::XmlParse { input: actual, .. } = operation else {
+            panic!("XML parse operation changed shape")
+        };
+        *actual = input;
+    }
+
+    fn assert_xml_producer_rejected(program: &Program, label: &str) {
+        assert!(
+            validate_resource_rvalues(program).is_err(),
+            "XML producer mutation was accepted: {label}"
+        );
+        assert!(
+            validate_thin_partition_program(program, &[]).is_err(),
+            "per-unit XML producer mutation was accepted: {label}"
+        );
+    }
+
+    #[test]
+    fn producer_aos_aggregator_buffers_preserve_keys_and_validate_sibling_writers() {
+        for (label, setup) in [
+            ("sum", "groups := rows.group_by(.key).sum(.value)"),
+            ("min", "groups := rows.group_by(.key).min(.value)"),
+            ("max", "groups := rows.group_by(.key).max(.value)"),
+            ("count", "groups := rows.group_by(.key).count()"),
+            ("multi", "groups := rows.group_by(.key).agg(sum(.value), min(.value), max(.value), count())"),
+            ("encoded-sum", "encoded := rows.dict_encode(.key); groups := encoded.group_by(.key).sum(.value)"),
+            ("encoded-min", "encoded := rows.dict_encode(.key); groups := encoded.group_by(.key).min(.value)"),
+            ("encoded-max", "encoded := rows.dict_encode(.key); groups := encoded.group_by(.key).max(.value)"),
+            ("encoded-count", "encoded := rows.dict_encode(.key); groups := encoded.group_by(.key).count()"),
+        ] {
+            let program = mir(&format!(
+                "Row {{ key: str, value: i64 }}\nfn describe(value: i64) -> str = \"number\"\n\
+                 fn selected(rows: array<Row>) -> string {{ {setup}; return groups.0[0].clone() }}\n\
+                 fn numbers(rows: array<Row>) -> string {{ {setup}; return describe(groups.1[0]).clone() }}\n\
+                 fn main() -> i32 = 0\n"
+            ));
+            let result = validate_mir_producers(&program);
+            assert!(result.is_ok(), "{label} AoS buffer producer: {result:?}");
+            let result = validate_thin_partition_program(&program, &[]);
+            assert!(result.is_ok(), "{label} per-unit AoS buffer producer: {result:?}");
+            let owner = xml_test_function(&program, "selected");
+            for axis in ["base", "nominal", "key", "value", "output", "alias", "arity", "count", "dictionary", "gather", "lookup"] {
+                let relevant = match axis {
+                    "arity" => label == "multi",
+                    "value" => label != "count" && !label.starts_with("encoded-"),
+                    "dictionary" | "lookup" => label.starts_with("encoded-"),
+                    "gather" => label.starts_with("encoded-") && label != "encoded-count",
+                    _ => true,
+                };
+                if !relevant { continue; }
+                let mut malformed = program.clone();
+                // A gathered numeric column does not produce the string key. Select
+                // the consumer that actually reads the numeric aggregate instead.
+                let selected_owner = if axis == "gather" {
+                    xml_test_function(&program, "numbers")
+                } else { owner };
+                let function = &mut malformed.fns[selected_owner];
+                let mut changed = false;
+                for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                    let Stmt::Let(result, runtime) = statement else { continue; };
+                    if axis == "dictionary" {
+                        if let Rvalue::MakeDictEncoded { dict, .. } = runtime {
+                            *dict = Operand::Const(Const::Bool(false)); changed = true; break;
+                        }
+                    } else if axis == "gather" {
+                        if let Rvalue::GatherColumnI64 { field, .. } = runtime {
+                            *field = 0; changed = true; break;
+                        }
+                    } else if axis == "lookup" {
+                        if let Rvalue::DictLookup { n, .. } = runtime {
+                            *n = Operand::Const(Const::Bool(false)); changed = true; break;
+                        }
+                    } else {
+                        let (base, struct_id, key_field, out_keys, out_value) = match runtime {
+                            Rvalue::GroupAggStr { base, struct_id, key_field, value_field, out_keys, out_vals, .. } => {
+                                if axis == "value" { *value_field = Some(0); changed = true; break; }
+                                (base, struct_id, key_field, out_keys, out_vals)
+                            }
+                            Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } => {
+                                if axis == "value" { aggs[0].1 = Some(0); changed = true; break; }
+                                if axis == "arity" { out_vals.pop(); changed = true; break; }
+                                (base, struct_id, key_field, out_keys, &mut out_vals[0])
+                            }
+                            Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } =>
+                                (base, struct_id, key_field, out_dict, out_ids),
+                            _ => continue,
+                        };
+                        match axis {
+                            "base" => *base = u32::MAX,
+                            "nominal" => *struct_id = u32::MAX,
+                            "key" => *key_field = 1,
+                            "output" => *out_keys = Operand::Const(Const::Bool(false)),
+                            "alias" => *out_value = out_keys.clone(),
+                            "count" => function.value_tys[*result as usize] = Ty::Bool,
+                            _ => continue,
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+                assert!(changed, "missing {label} {axis} mutation target");
+                assert_xml_producer_rejected(&malformed, &format!("AoS {label} {axis}"));
+            }
+
+            let mut capacity_owners = vec![owner];
+            if label.starts_with("encoded-") {
+                capacity_owners.push(xml_test_function(&program, "numbers"));
+            }
+            for selected_owner in capacity_owners {
+                let mut outputs = Vec::new();
+                for statement in program.fns[selected_owner].blocks.iter()
+                    .flat_map(|block| &block.stmts)
+                {
+                    let Stmt::Let(_, runtime) = statement else { continue; };
+                    match runtime {
+                        Rvalue::GroupAgg { out_keys, out_vals, .. }
+                        | Rvalue::GroupAggStrCols { out_keys, out_vals, .. }
+                        | Rvalue::GroupAggStr { out_keys, out_vals, .. } => {
+                            outputs.push(out_keys.clone());
+                            outputs.push(out_vals.clone());
+                        }
+                        Rvalue::GroupAggMultiStr { out_keys, out_vals, .. } => {
+                            outputs.push(out_keys.clone());
+                            outputs.extend(out_vals.iter().cloned());
+                        }
+                        Rvalue::DictEncode { out_ids, out_dict, .. } => {
+                            outputs.push(out_ids.clone());
+                            outputs.push(out_dict.clone());
+                        }
+                        Rvalue::GatherColumnI64 { out, .. }
+                        | Rvalue::DictLookup { out, .. } => outputs.push(out.clone()),
+                        _ => {}
+                    }
+                }
+                outputs.sort_by_key(|operand| match operand {
+                    Operand::Value(value) => *value,
+                    _ => u32::MAX,
+                });
+                outputs.dedup_by(|left, right| matches!(
+                    (left, right),
+                    (Operand::Value(left), Operand::Value(right)) if left == right
+                ));
+                assert!(!outputs.is_empty(), "missing {label} writer outputs");
+                for output in outputs {
+                    let Operand::Value(output) = output else {
+                        panic!("{label} runtime output is not a value")
+                    };
+                    let mut undersized = program.clone();
+                    let count = undersized.fns[selected_owner].blocks.iter_mut()
+                        .flat_map(|block| &mut block.stmts)
+                        .find_map(|statement| match statement {
+                            Stmt::Let(value, Rvalue::HeapAllocBuf { count, .. })
+                                if *value == output => Some(count),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing {label} output allocation {output}"));
+                    *count = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true })));
+                    assert_xml_producer_rejected(
+                        &undersized,
+                        &format!("AoS {label} output allocation {output} capacity"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xml_access_join_is_the_capability_intersection() {
+        use XmlAccessProvenance::{
+            Exclusive, Mixed, Owned, Shared, Unknown, Unreadable,
+        };
+
+        let cases = [
+            (Owned, Shared, Shared),
+            (Owned, Exclusive, Exclusive),
+            (Owned, Unreadable, Unreadable),
+            (Shared, Exclusive, Shared),
+            (Shared, Unreadable, Mixed),
+            (Exclusive, Unreadable, Unreadable),
+            (Owned, Unknown, Unknown),
+            (Shared, Mixed, Mixed),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(merge_xml_access(Some(left), right), Some(expected));
+            assert_eq!(merge_xml_access(Some(right), left), Some(expected));
+        }
+    }
+
+    #[test]
+    fn xml_mir_gate_authenticates_types_on_every_producer_edge() {
+        let base = mir(
+            r#"import std.xml
+fn make() -> string = "<a/>".clone()
+fn next_one(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn parse_gate(first: string, second: string, flag: bool) -> Result<xml.reader, Error> = xml.parse(first)
+fn forward(source: string) -> Result<xml.reader, Error> = parse_gate(source, "<b/>".clone(), true)
+fn main() -> i32 = 0
+"#,
+        );
+        let next = xml_test_function(&base, "next_one");
+
+        let mut forged_use = base.clone();
+        let parameter = forged_use.fns[next].params[0];
+        forged_use.fns[next].slots[parameter as usize] = Ty::Raw;
+        let value = xml_test_value(&mut forged_use.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_use.fns[next],
+            vec![Stmt::Let(value, Rvalue::Use(Operand::Arg(0)))],
+        );
+        replace_xml_test_reader(&mut forged_use.fns[next], Operand::Value(value));
+        assert_xml_producer_rejected(&forged_use, "raw through Use");
+
+        let mut forged_slot = base.clone();
+        let parameter = forged_slot.fns[next].params[0];
+        forged_slot.fns[next].slots[parameter as usize] = Ty::Raw;
+        let slot = u32::try_from(forged_slot.fns[next].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        forged_slot.fns[next].slots.push(Ty::XmlReader);
+        forged_slot.fns[next].slot_align.push(None);
+        let value = xml_test_value(&mut forged_slot.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_slot.fns[next],
+            vec![
+                Stmt::Store(slot, Operand::Arg(0)),
+                Stmt::Let(value, Rvalue::Load(slot)),
+            ],
+        );
+        replace_xml_test_reader(&mut forged_slot.fns[next], Operand::Value(value));
+        assert_xml_producer_rejected(&forged_slot, "raw through Store/Load");
+
+        let mut forged_field = base.clone();
+        let parameter = forged_field.fns[next].params[0];
+        forged_field.fns[next].slots[parameter as usize] = Ty::Raw;
+        let struct_id = u32::try_from(forged_field.structs.len())
+            .unwrap_or_else(|_| panic!("XML test struct inventory exceeds u32"));
+        forged_field.structs.push(hir::StructDef {
+            name: "XmlTypedField".to_owned(),
+            source_name: "XmlTypedField".to_owned(),
+            fields: vec![hir::FieldDef {
+                name: "reader".to_owned(),
+                ty: Ty::XmlReader,
+            }],
+            align: None,
+            c_repr: false,
+        });
+        let slot = u32::try_from(forged_field.fns[next].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        forged_field.fns[next].slots.push(Ty::Struct(struct_id));
+        forged_field.fns[next].slot_align.push(None);
+        let value = xml_test_value(&mut forged_field.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_field.fns[next],
+            vec![
+                Stmt::StoreField(slot, vec![0], Operand::Arg(0)),
+                Stmt::Let(value, Rvalue::Field(slot, vec![0])),
+            ],
+        );
+        replace_xml_test_reader(&mut forged_field.fns[next], Operand::Value(value));
+        assert_xml_producer_rejected(&forged_field, "raw through StoreField/Field");
+
+        let mut forged_tuple = base.clone();
+        let parameter = forged_tuple.fns[next].params[0];
+        forged_tuple.fns[next].slots[parameter as usize] = Ty::Raw;
+        let tuple_id = u32::try_from(forged_tuple.tuples.len())
+            .unwrap_or_else(|_| panic!("XML test tuple inventory exceeds u32"));
+        forged_tuple.tuples.push(hir::TupleDef {
+            elems: vec![Scalar::XmlReader],
+        });
+        let tuple = xml_test_value(&mut forged_tuple.fns[next], Ty::Tuple(tuple_id));
+        let reader = xml_test_value(&mut forged_tuple.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_tuple.fns[next],
+            vec![
+                Stmt::Let(
+                    tuple,
+                    Rvalue::MakeTuple {
+                        tuple_id,
+                        elems: vec![Operand::Arg(0)],
+                    },
+                ),
+                Stmt::Let(
+                    reader,
+                    Rvalue::TupleIndex {
+                        tuple: Operand::Value(tuple),
+                        index: 0,
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_reader(&mut forged_tuple.fns[next], Operand::Value(reader));
+        assert_xml_producer_rejected(&forged_tuple, "raw through tuple projection");
+
+        let mut forged_tuple_sibling = base.clone();
+        let tuple_id = u32::try_from(forged_tuple_sibling.tuples.len())
+            .unwrap_or_else(|_| panic!("XML test tuple inventory exceeds u32"));
+        forged_tuple_sibling.tuples.push(hir::TupleDef {
+            elems: vec![Scalar::XmlReader, Scalar::Str],
+        });
+        let tuple = xml_test_value(&mut forged_tuple_sibling.fns[next], Ty::Tuple(tuple_id));
+        let reader = xml_test_value(&mut forged_tuple_sibling.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_tuple_sibling.fns[next],
+            vec![
+                Stmt::Let(
+                    tuple,
+                    Rvalue::MakeTuple {
+                        tuple_id,
+                        elems: vec![Operand::Arg(0), Operand::Arg(0)],
+                    },
+                ),
+                Stmt::Let(
+                    reader,
+                    Rvalue::TupleIndex {
+                        tuple: Operand::Value(tuple),
+                        index: 0,
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_reader(
+            &mut forged_tuple_sibling.fns[next],
+            Operand::Value(reader),
+        );
+        assert_xml_producer_rejected(
+            &forged_tuple_sibling,
+            "wrong-typed unrelated tuple sibling",
+        );
+
+        let mut forged_enum = base.clone();
+        let parameter = forged_enum.fns[next].params[0];
+        forged_enum.fns[next].slots[parameter as usize] = Ty::Raw;
+        let enum_id = u32::try_from(forged_enum.enums.len())
+            .unwrap_or_else(|_| panic!("XML test enum inventory exceeds u32"));
+        forged_enum.enums.push(hir::EnumDef {
+            name: "XmlTypedEnum".to_owned(),
+            source_name: "XmlTypedEnum".to_owned(),
+            variants: vec![hir::EnumVariant {
+                name: "Reader".to_owned(),
+                payload: vec![Scalar::XmlReader],
+                field_base: 1,
+            }],
+        });
+        let carrier = xml_test_value(&mut forged_enum.fns[next], Ty::Enum(enum_id));
+        let reader = xml_test_value(&mut forged_enum.fns[next], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut forged_enum.fns[next],
+            vec![
+                Stmt::Let(
+                    carrier,
+                    Rvalue::MakeEnum {
+                        enum_id,
+                        variant: 0,
+                        payload: vec![Operand::Arg(0)],
+                    },
+                ),
+                Stmt::Let(
+                    reader,
+                    Rvalue::EnumPayload {
+                        enum_id,
+                        variant: 0,
+                        slot: 0,
+                        operand: Operand::Value(carrier),
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_reader(&mut forged_enum.fns[next], Operand::Value(reader));
+        assert_xml_producer_rejected(&forged_enum, "raw through enum projection");
+
+        for (label, wrapper, unwrap) in [
+            (
+                "raw through Option",
+                Rvalue::OptionSome(Operand::Arg(0)),
+                Rvalue::OptionUnwrap(Operand::Value(0)),
+            ),
+            (
+                "raw through Result",
+                Rvalue::ResultOk(Operand::Arg(0)),
+                Rvalue::ResultUnwrapOk(Operand::Value(0)),
+            ),
+        ] {
+            let mut malformed = base.clone();
+            let parameter = malformed.fns[next].params[0];
+            malformed.fns[next].slots[parameter as usize] = Ty::Raw;
+            let wrapper_ty = if label.contains("Option") {
+                Ty::Option(Scalar::XmlReader)
+            } else {
+                Ty::Result(Scalar::XmlReader, Scalar::Unit)
+            };
+            let wrapped = xml_test_value(&mut malformed.fns[next], wrapper_ty);
+            let reader = xml_test_value(&mut malformed.fns[next], Ty::XmlReader);
+            let unwrap = match unwrap {
+                Rvalue::OptionUnwrap(_) => Rvalue::OptionUnwrap(Operand::Value(wrapped)),
+                Rvalue::ResultUnwrapOk(_) => Rvalue::ResultUnwrapOk(Operand::Value(wrapped)),
+                _ => panic!("XML tagged test inventory changed shape"),
+            };
+            insert_before_xml_test_operation(
+                &mut malformed.fns[next],
+                vec![Stmt::Let(wrapped, wrapper), Stmt::Let(reader, unwrap)],
+            );
+            replace_xml_test_reader(&mut malformed.fns[next], Operand::Value(reader));
+            assert_xml_producer_rejected(&malformed, label);
+        }
+
+        let mut forged_call = base.clone();
+        let target = forged_call.fns[xml_test_function(&forged_call, "make")]
+            .name
+            .clone();
+        let reader = xml_test_value(&mut forged_call.fns[next], Ty::XmlReader);
+        let cleanup = xml_test_value(&mut forged_call.fns[next], Ty::Bool);
+        insert_before_xml_test_operation(
+            &mut forged_call.fns[next],
+            vec![Stmt::Let(
+                reader,
+                Rvalue::CallWithCleanup(Box::new(align_mir::DirectCallWithCleanup {
+                    target,
+                    args: Vec::new(),
+                    cleanup,
+                })),
+            )],
+        );
+        replace_xml_test_reader(&mut forged_call.fns[next], Operand::Value(reader));
+        assert_xml_producer_rejected(&forged_call, "string call result as xml.reader");
+
+        let mut forged_condition = base.clone();
+        let function = xml_test_function(&forged_condition, "parse_gate");
+        let parameter = forged_condition.fns[function].params[2];
+        forged_condition.fns[function].slots[parameter as usize] = Ty::Raw;
+        let condition = xml_test_value(&mut forged_condition.fns[function], Ty::Bool);
+        let source = xml_test_value(&mut forged_condition.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut forged_condition.fns[function],
+            vec![
+                Stmt::Let(condition, Rvalue::Use(Operand::Arg(2))),
+                Stmt::Let(
+                    source,
+                    Rvalue::Select {
+                        cond: Operand::Value(condition),
+                        a: Operand::Arg(0),
+                        b: Operand::Arg(1),
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut forged_condition.fns[function],
+            Operand::Value(source),
+        );
+        assert_xml_producer_rejected(&forged_condition, "raw through Select condition");
+
+        let mut forged_clone = base.clone();
+        let function = xml_test_function(&forged_clone, "parse_gate");
+        let parameter = forged_clone.fns[function].params[2];
+        forged_clone.fns[function].slots[parameter as usize] = Ty::Raw;
+        let view = xml_test_value(&mut forged_clone.fns[function], Ty::Str);
+        let source = xml_test_value(&mut forged_clone.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut forged_clone.fns[function],
+            vec![
+                Stmt::Let(view, Rvalue::Use(Operand::Arg(2))),
+                Stmt::Let(source, Rvalue::StrClone(Operand::Value(view))),
+            ],
+        );
+        replace_xml_test_parse_input(&mut forged_clone.fns[function], Operand::Value(source));
+        assert_xml_producer_rejected(&forged_clone, "raw through StrClone");
+
+        let mut forged_builder = base;
+        let function = xml_test_function(&forged_builder, "parse_gate");
+        let parameter = forged_builder.fns[function].params[2];
+        forged_builder.fns[function].slots[parameter as usize] = Ty::Raw;
+        let builder = xml_test_value(&mut forged_builder.fns[function], Ty::Builder);
+        let source = xml_test_value(&mut forged_builder.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut forged_builder.fns[function],
+            vec![
+                Stmt::Let(builder, Rvalue::Use(Operand::Arg(2))),
+                Stmt::Let(source, Rvalue::BuilderToString(Operand::Value(builder))),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut forged_builder.fns[function],
+            Operand::Value(source),
+        );
+        assert_xml_producer_rejected(&forged_builder, "raw through BuilderToString");
+
+        let mut forged_call_argument = mir(
+            r#"import std.xml
+fn parse_owned(source: string) -> Result<xml.reader, Error> = xml.parse(source)
+fn forward(source: string) -> Result<xml.reader, Error> = parse_owned(source)
+fn main() -> i32 = 0
+"#,
+        );
+        let function = xml_test_function(&forged_call_argument, "forward");
+        let parameter = forged_call_argument.fns[function].params[0];
+        forged_call_argument.fns[function].slots[parameter as usize] = Ty::Raw;
+        let value = xml_test_value(&mut forged_call_argument.fns[function], Ty::String);
+        let (block, statement) = forged_call_argument.fns[function]
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block, body)| {
+                body.stmts
+                    .iter()
+                    .position(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(
+                                _,
+                                Rvalue::Call(DirectCall::Program(_), _)
+                                    | Rvalue::CallWithCleanup(_)
+                            )
+                        )
+                    })
+                    .map(|statement| (block, statement))
+            })
+            .unwrap_or_else(|| panic!("missing forwarded XML call"));
+        let body = &mut forged_call_argument.fns[function].blocks[block];
+        let complete_source_lines = body.stmt_lines.len() == body.stmts.len();
+        body.stmts
+            .insert(statement, Stmt::Let(value, Rvalue::Use(Operand::Arg(0))));
+        if complete_source_lines {
+            body.stmt_lines.insert(statement, (0, 0));
+        }
+        match &mut body.stmts[statement + 1] {
+            Stmt::Let(_, Rvalue::Call(DirectCall::Program(_), args)) => {
+                args[0] = Operand::Value(value);
+            }
+            Stmt::Let(_, Rvalue::CallWithCleanup(call)) => {
+                call.args[0] = Operand::Value(value);
+            }
+            _ => panic!("forwarded XML call changed shape"),
+        }
+        assert_xml_producer_rejected(
+            &forged_call_argument,
+            "raw through a String call argument",
+        );
+
+        let mut forged_carrier_argument = mir(
+            r#"import std.xml
+Carrier { reader: xml.reader }
+fn consume(carrier: Carrier) -> Option<xml.event> {
+  mut reader := carrier.reader
+  return reader.next()
+}
+fn forward(reader: xml.reader) -> Option<xml.event> = consume(Carrier { reader: reader })
+fn main() -> i32 = 0
+"#,
+        );
+        let function = xml_test_function(&forged_carrier_argument, "forward");
+        let parameter = forged_carrier_argument.fns[function].params[0];
+        forged_carrier_argument.fns[function].slots[parameter as usize] = Ty::Raw;
+        assert_xml_producer_rejected(
+            &forged_carrier_argument,
+            "raw through an aggregate call argument",
+        );
+    }
+
+    #[test]
+    fn xml_mir_gate_projects_only_the_selected_structural_path() {
+        let base = mir(
+            r#"import std.xml
+fn next_pair(borrow mut reader: xml.reader, borrow peer: xml.reader) -> Option<xml.event> = reader.next()
+fn parse_select(first: string, second: string, borrow flag: bool) -> Result<xml.reader, Error> = xml.parse(first)
+fn main() -> i32 = 0
+"#,
+        );
+
+        let mut tuple = base.clone();
+        let function = xml_test_function(&tuple, "next_pair");
+        let tuple_id = u32::try_from(tuple.tuples.len())
+            .unwrap_or_else(|_| panic!("XML test tuple inventory exceeds u32"));
+        tuple.tuples.push(hir::TupleDef {
+            elems: vec![Scalar::XmlReader, Scalar::Str],
+        });
+        let peer_name = xml_test_value(&mut tuple.fns[function], Ty::Str);
+        let carrier = xml_test_value(&mut tuple.fns[function], Ty::Tuple(tuple_id));
+        let reader = xml_test_value(&mut tuple.fns[function], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut tuple.fns[function],
+            vec![
+                Stmt::Let(peer_name, Rvalue::XmlName { reader: Operand::Arg(1) }),
+                Stmt::Let(
+                    carrier,
+                    Rvalue::MakeTuple {
+                        tuple_id,
+                        elems: vec![Operand::Arg(0), Operand::Value(peer_name)],
+                    },
+                ),
+                Stmt::Let(
+                    reader,
+                    Rvalue::TupleIndex {
+                        tuple: Operand::Value(carrier),
+                        index: 0,
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_reader(&mut tuple.fns[function], Operand::Value(reader));
+        assert!(validate_resource_rvalues(&tuple).is_ok());
+
+        let mut enum_carrier = base.clone();
+        let function = xml_test_function(&enum_carrier, "next_pair");
+        let enum_id = u32::try_from(enum_carrier.enums.len())
+            .unwrap_or_else(|_| panic!("XML test enum inventory exceeds u32"));
+        enum_carrier.enums.push(hir::EnumDef {
+            name: "XmlAccessCarrier".to_owned(),
+            source_name: "XmlAccessCarrier".to_owned(),
+            variants: vec![hir::EnumVariant {
+                name: "Both".to_owned(),
+                payload: vec![Scalar::XmlReader, Scalar::Str],
+                field_base: 1,
+            }],
+        });
+        let peer_name = xml_test_value(&mut enum_carrier.fns[function], Ty::Str);
+        let carrier = xml_test_value(&mut enum_carrier.fns[function], Ty::Enum(enum_id));
+        let reader = xml_test_value(&mut enum_carrier.fns[function], Ty::XmlReader);
+        insert_before_xml_test_operation(
+            &mut enum_carrier.fns[function],
+            vec![
+                Stmt::Let(peer_name, Rvalue::XmlName { reader: Operand::Arg(1) }),
+                Stmt::Let(
+                    carrier,
+                    Rvalue::MakeEnum {
+                        enum_id,
+                        variant: 0,
+                        payload: vec![Operand::Arg(0), Operand::Value(peer_name)],
+                    },
+                ),
+                Stmt::Let(
+                    reader,
+                    Rvalue::EnumPayload {
+                        enum_id,
+                        variant: 0,
+                        slot: 0,
+                        operand: Operand::Value(carrier),
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_reader(
+            &mut enum_carrier.fns[function],
+            Operand::Value(reader),
+        );
+        assert!(validate_resource_rvalues(&enum_carrier).is_ok());
+
+        let mut selected = base;
+        let function = xml_test_function(&selected, "parse_select");
+        let source = xml_test_value(&mut selected.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut selected.fns[function],
+            vec![Stmt::Let(
+                source,
+                Rvalue::Select {
+                    cond: Operand::Arg(2),
+                    a: Operand::Arg(0),
+                    b: Operand::Arg(1),
+                },
+            )],
+        );
+        replace_xml_test_parse_input(&mut selected.fns[function], Operand::Value(source));
+        assert!(
+            validate_resource_rvalues(&selected).is_ok(),
+            "a shared-origin bool condition must not taint two owned alternatives"
+        );
+        let mut mixed = selected;
+        mixed.fns[function].param_modes[1] = align_ast::ParamMode::Borrow;
+        assert_xml_producer_rejected(&mixed, "owned/shared selected alternatives");
+    }
+
+    #[test]
+    fn xml_mir_gate_separates_inactive_presence_and_authenticates_indirect_calls() {
+        let base = mir(
+            r#"import std.xml
+Choice { Text(string), Empty }
+fn take_option(value: Option<string>) -> i64 = 1
+fn take_result(value: Result<string, Error>) -> i64 = 2
+fn take_choice(value: Choice) -> i64 = 3
+fn copy(source: string) -> string = source
+fn indirect(source: string) -> Result<xml.reader, Error> { call := copy; return xml.parse(call(source)) }
+fn valid() -> i64 {
+  a := take_option(None)
+  b := take_result(Err(Error.Invalid))
+  c := take_choice(Choice.Empty)
+  return a + b + c
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+
+        let function = xml_test_function(&base, "indirect");
+        let indirect_site = base.fns[function]
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block, body)| {
+                body.stmts.iter().position(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Let(_, Rvalue::CallIndirectWithCleanup(_))
+                    )
+                }).map(|statement| (block, statement))
+            })
+            .unwrap_or_else(|| panic!("missing indirect string call"));
+
+        let mutate_call = |program: &mut Program, mutation: usize| {
+            let Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) =
+                &mut program.fns[function].blocks[indirect_site.0].stmts[indirect_site.1]
+            else {
+                panic!("indirect string call changed shape")
+            };
+            match mutation {
+                0 => call.param_tys[0] = Ty::Raw,
+                1 => call.signature.param_modes[0] = align_ast::ParamMode::Borrow,
+                2 => call.ret_ty = Ty::XmlReader,
+                3 => call.signature.return_borrow = hir::ReturnBorrowSummary::Roots {
+                    params: vec![0],
+                    captures: Vec::new(),
+                },
+                4 => call.signature.return_region = hir::ReturnRegionSummary::Roots {
+                    params: vec![0],
+                    captures: Vec::new(),
+                },
+                5 => call.signature.return_cleanup = hir::ReturnCleanupAbi::None,
+                _ => panic!("unknown indirect-call mutation"),
+            }
+        };
+        for mutation in 0..6 {
+            let mut malformed = base.clone();
+            mutate_call(&mut malformed, mutation);
+            assert_xml_producer_rejected(
+                &malformed,
+                &format!("forged indirect-call fact {mutation}"),
+            );
+        }
+
+        let callee = match &base.fns[function].blocks[indirect_site.0].stmts[indirect_site.1] {
+            Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) => match call.callee {
+                Operand::Value(value) => value,
+                _ => panic!("indirect callee is not a value"),
+            },
+            _ => panic!("indirect string call changed shape"),
+        };
+        let mut wrong_type_id = base.clone();
+        wrong_type_id.fns[function].value_tys[callee as usize] = Ty::Fn(u32::MAX);
+        assert_xml_producer_rejected(&wrong_type_id, "forged indirect callee type id");
+
+        let mut forged_callee = base.clone();
+        let definition = forged_callee.fns[function]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find(|statement| matches!(statement, Stmt::Let(value, _) if *value == callee))
+            .unwrap_or_else(|| panic!("missing indirect callee producer"));
+        let Stmt::Let(_, rvalue) = definition else {
+            panic!("callee producer changed shape")
+        };
+        *rvalue = Rvalue::RawNull;
+        assert_xml_producer_rejected(&forged_callee, "raw indirect callee producer");
+
+        let mut forged_stored_callee = base;
+        let fn_address = forged_stored_callee.fns[function]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::FnAddr { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing stored function-address producer"));
+        *fn_address = Rvalue::RawNull;
+        assert_xml_producer_rejected(
+            &forged_stored_callee,
+            "raw function address through store/load",
+        );
+    }
+
+    #[test]
+    fn xml_mir_gate_worklist_terminates_and_fails_closed() {
+        let base = mir(
+            r#"import std.xml
+fn parse_one(source: string) -> Result<xml.reader, Error> = xml.parse(source)
+fn main() -> i32 = 0
+"#,
+        );
+        let function = xml_test_function(&base, "parse_one");
+
+        let mut long_chain = base.clone();
+        let mut source = Operand::Arg(0);
+        let mut statements = Vec::new();
+        for _ in 0..4096 {
+            let value = xml_test_value(&mut long_chain.fns[function], Ty::String);
+            statements.push(Stmt::Let(value, Rvalue::Use(source)));
+            source = Operand::Value(value);
+        }
+        insert_before_xml_test_operation(&mut long_chain.fns[function], statements);
+        replace_xml_test_parse_input(&mut long_chain.fns[function], source);
+        assert!(validate_resource_rvalues(&long_chain).is_ok());
+
+        let mut seeded_cycle = base.clone();
+        let slot = u32::try_from(seeded_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        seeded_cycle.fns[function].slots.push(Ty::String);
+        seeded_cycle.fns[function].slot_align.push(None);
+        let loaded = xml_test_value(&mut seeded_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut seeded_cycle.fns[function],
+            vec![
+                Stmt::Store(slot, Operand::Arg(0)),
+                Stmt::Let(loaded, Rvalue::Load(slot)),
+                Stmt::Store(slot, Operand::Value(loaded)),
+            ],
+        );
+        replace_xml_test_parse_input(&mut seeded_cycle.fns[function], Operand::Value(loaded));
+        assert!(validate_resource_rvalues(&seeded_cycle).is_ok());
+
+        let mut unseeded_cycle = base.clone();
+        let slot = u32::try_from(unseeded_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        unseeded_cycle.fns[function].slots.push(Ty::String);
+        unseeded_cycle.fns[function].slot_align.push(None);
+        let loaded = xml_test_value(&mut unseeded_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut unseeded_cycle.fns[function],
+            vec![
+                Stmt::Let(loaded, Rvalue::Load(slot)),
+                Stmt::Store(slot, Operand::Value(loaded)),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut unseeded_cycle.fns[function],
+            Operand::Value(loaded),
+        );
+        assert_xml_producer_rejected(&unseeded_cycle, "unseeded producer cycle");
+
+        let mut check_cycle = base.clone();
+        let bool_slot = u32::try_from(check_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        check_cycle.fns[function].slots.push(Ty::Bool);
+        check_cycle.fns[function].slot_align.push(None);
+        let condition = xml_test_value(&mut check_cycle.fns[function], Ty::Bool);
+        let selected = xml_test_value(&mut check_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut check_cycle.fns[function],
+            vec![
+                Stmt::Let(condition, Rvalue::Load(bool_slot)),
+                Stmt::Store(bool_slot, Operand::Value(condition)),
+                Stmt::Let(
+                    selected,
+                    Rvalue::Select {
+                        cond: Operand::Value(condition),
+                        a: Operand::Arg(0),
+                        b: Operand::Arg(0),
+                    },
+                ),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut check_cycle.fns[function],
+            Operand::Value(selected),
+        );
+        assert_xml_producer_rejected(&check_cycle, "unseeded Select condition cycle");
+
+        let mut clone_cycle = base.clone();
+        let view_slot = u32::try_from(clone_cycle.fns[function].slots.len())
+            .unwrap_or_else(|_| panic!("XML test slot inventory exceeds u32"));
+        clone_cycle.fns[function].slots.push(Ty::Str);
+        clone_cycle.fns[function].slot_align.push(None);
+        let view = xml_test_value(&mut clone_cycle.fns[function], Ty::Str);
+        let cloned = xml_test_value(&mut clone_cycle.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut clone_cycle.fns[function],
+            vec![
+                Stmt::Let(view, Rvalue::Load(view_slot)),
+                Stmt::Store(view_slot, Operand::Value(view)),
+                Stmt::Let(cloned, Rvalue::StrClone(Operand::Value(view))),
+            ],
+        );
+        replace_xml_test_parse_input(
+            &mut clone_cycle.fns[function],
+            Operand::Value(cloned),
+        );
+        assert_xml_producer_rejected(&clone_cycle, "unseeded StrClone input cycle");
+
+        let mut duplicate = base;
+        let value = xml_test_value(&mut duplicate.fns[function], Ty::String);
+        insert_before_xml_test_operation(
+            &mut duplicate.fns[function],
+            vec![
+                Stmt::Let(value, Rvalue::Use(Operand::Arg(0))),
+                Stmt::Let(value, Rvalue::Use(Operand::Arg(0))),
+            ],
+        );
+        replace_xml_test_parse_input(&mut duplicate.fns[function], Operand::Value(value));
+        assert_xml_producer_rejected(&duplicate, "duplicate producer definition");
+    }
+
+    fn xml_out_producer_program(
+        rvalue: Rvalue,
+        params: Vec<Ty>,
+        out_ty: Ty,
+    ) -> Program {
+        let out = u32::try_from(params.len())
+            .unwrap_or_else(|_| panic!("test parameter inventory exceeds u32"));
+        let mut slots = params.clone();
+        slots.push(out_ty);
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let owns_dynamic_payload = matches!(out_ty, Ty::String | Ty::DynArray(Scalar::String));
+        let term = if owns_dynamic_payload {
+            Term::ReturnWithCleanup(Box::new((
+                Operand::Value(1),
+                Operand::Const(Const::Bool(true)),
+            )))
+        } else {
+            Term::Return(Some(Operand::Value(1)))
+        };
+        Program {
+            fns: vec![Function {
+                name: program_call("producer"),
+                params: (0..out).collect(),
+                param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
+                borrow_mut_cleanup_slots: vec![None; params.len()],
+                ret: out_ty,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: if owns_dynamic_payload {
+                    hir::ReturnCleanupAbi::DynamicBit
+                } else {
+                    hir::ReturnCleanupAbi::None
+                },
+                slots,
+                slot_align: vec![None; params.len() + 1],
+                value_tys: vec![i32_ty, out_ty],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, rvalue), Stmt::Let(1, Rvalue::Load(out))],
+                    stmt_lines: vec![(0, 0); 2],
+                    term,
+                }],
+                entry: 0,
+                exportable: false,
+            }],
+            ..Program::default()
+        }
+    }
+
+    #[test]
+    fn xml_out_slot_seed_is_atomic_with_its_exact_producer() {
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let bytes_ty = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }));
+        let cases = [
+            (
+                "json.encode_bounded",
+                Rvalue::JsonEncodeBounded {
+                    pieces: vec![align_mir::TemplatePiece::StrHole(Operand::Arg(0))],
+                    max_bytes: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::Str, i64_ty],
+                Ty::String,
+            ),
+            (
+                "fs.read_file",
+                Rvalue::FsReadFile {
+                    path: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::Str],
+                Ty::String,
+            ),
+            (
+                "env.get",
+                Rvalue::EnvGet {
+                    name: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::Str],
+                Ty::String,
+            ),
+            (
+                "fs.read_dir",
+                Rvalue::FsReadDir {
+                    path: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::Str],
+                Ty::DynArray(Scalar::String),
+            ),
+            (
+                "json.doc.as_str",
+                Rvalue::JsonDocAsStr {
+                    doc: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::JsonDoc],
+                Ty::Str,
+            ),
+            (
+                "json.doc.key",
+                Rvalue::JsonDocKey {
+                    doc: Operand::Arg(0),
+                    index: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::JsonDoc, i64_ty],
+                Ty::Str,
+            ),
+            (
+                "bytes.as_str",
+                Rvalue::BytesAsStr {
+                    bytes: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![bytes_ty],
+                Ty::Str,
+            ),
+            (
+                "fs.read_file_view",
+                Rvalue::FsReadFileView {
+                    path: Operand::Arg(0),
+                    arena: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::Str, Ty::ArenaHandle],
+                Ty::Str,
+            ),
+            (
+                "http.response.header",
+                Rvalue::HttpRespHeader {
+                    resp: Operand::Arg(0),
+                    name: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::HttpResponse, Ty::Str],
+                Ty::Str,
+            ),
+            (
+                "http.read_stream.header",
+                Rvalue::HttpReadStreamHeader {
+                    stream: Operand::Arg(0),
+                    name: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::HttpReadStream, Ty::Str],
+                Ty::Str,
+            ),
+            (
+                "http.headers.get",
+                Rvalue::HttpCtxHeader {
+                    ctx: Operand::Arg(0),
+                    name: Operand::Arg(1),
+                    out: 2,
+                },
+                vec![Ty::HttpHeaders, Ty::Str],
+                Ty::Str,
+            ),
+        ];
+
+        for (name, rvalue, params, out_ty) in cases {
+            let program = xml_out_producer_program(rvalue, params, out_ty);
+            assert!(
+                validate_resource_rvalues(&program).is_ok(),
+                "valid {name} out producer was rejected"
+            );
+
+            let mut bad_result = program.clone();
+            bad_result.fns[0].value_tys[0] = Ty::Bool;
+            assert_xml_producer_rejected(&bad_result, &format!("{name} result type"));
+
+            let mut detached = program.clone();
+            let Stmt::Let(_, producer) = &mut detached.fns[0].blocks[0].stmts[0] else {
+                panic!("out producer fixture changed shape")
+            };
+            match producer {
+                Rvalue::JsonEncodeBounded { out, .. }
+                | Rvalue::FsReadFile { out, .. }
+                | Rvalue::FsReadDir { out, .. }
+                | Rvalue::EnvGet { out, .. }
+                | Rvalue::JsonDocAsStr { out, .. }
+                | Rvalue::JsonDocKey { out, .. }
+                | Rvalue::BytesAsStr { out, .. }
+                | Rvalue::FsReadFileView { out, .. }
+                | Rvalue::HttpRespHeader { out, .. }
+                | Rvalue::HttpReadStreamHeader { out, .. }
+                | Rvalue::HttpCtxHeader { out, .. } => *out = u32::MAX,
+                _ => panic!("out producer inventory changed shape"),
+            }
+            assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
+        }
+    }
+
+    #[test]
+    fn xml_function_certification_closes_local_imported_callable_and_recursive_edges() {
+        let base = mir(
+            r#"Row { name: str }
+fn make() -> string = "<a/>".clone()
+fn invoke(callback: fn() -> string) -> string = callback()
+fn wrap() -> string = invoke(make)
+fn clone_row(row: Row, out: region) -> Row = row.clone_in(out)
+fn clone_text(value: str, out: region) -> string = value.clone_in(out).clone()
+fn recursive() -> string = recursive()
+fn recurse_left() -> string = recurse_right()
+fn recurse_right() -> string = recurse_left()
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            validate_mir_producers(&base).is_ok(),
+            "direct, callable, and non-returning recursive bodies must certify together"
+        );
+
+        let make = xml_test_function(&base, "make");
+        let mut raw_return = base.clone();
+        let producer = raw_return.fns[make]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::StrClone(_)) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing string return producer"));
+        *producer = Rvalue::RawNull;
+        assert_xml_producer_rejected(&raw_return, "raw local return relabeled string");
+
+        let wrap = xml_test_function(&base, "wrap");
+        let mut raw_callable = base.clone();
+        let producer = raw_callable.fns[wrap]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::FnAddr { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing callable producer"));
+        *producer = Rvalue::RawNull;
+        assert_xml_producer_rejected(&raw_callable, "raw callable argument");
+
+        let cloned = xml_test_function(&base, "clone_row");
+        let mut raw_clone = base.clone();
+        let producer = raw_clone.fns[cloned]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::CloneIn { .. }) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing clone_in producer"));
+        *producer = Rvalue::RawNull;
+        assert_xml_producer_rejected(&raw_clone, "raw clone_in carrier");
+
+        let mut imported = base.clone();
+        let make_function = imported.fns.remove(make);
+        imported.imported_fns.push(align_mir::ImportedFn {
+            name: make_function.name,
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            ret: make_function.ret,
+            return_borrow: make_function.return_borrow,
+            return_region: make_function.return_region,
+            return_cleanup: make_function.return_cleanup,
+            producer_certified: true,
+        });
+        assert!(
+            validate_mir_producers(&imported).is_ok(),
+            "an exact certified imported producer must satisfy its bodyless boundary"
+        );
+        imported.imported_fns[0].producer_certified = false;
+        assert_xml_producer_rejected(&imported, "uncertified imported producer");
+
+        let main = xml_test_function(&base, "main");
+        let mut duplicate_name = base.clone();
+        duplicate_name.fns.push(duplicate_name.fns[main].clone());
+        assert!(
+            validate_mir_producers(&duplicate_name).is_err(),
+            "certification must not collapse duplicate local function names"
+        );
+
+        let mut missing_return = base.clone();
+        missing_return.fns[make].blocks[0].term = Term::Return(None);
+        assert_xml_producer_rejected(
+            &missing_return,
+            "protected non-unit function omitted its return value",
+        );
+
+        let mut detached_cleanup = base.clone();
+        let returned = detached_cleanup.fns[wrap]
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.term {
+                Term::ReturnWithCleanup(returned) => Some(returned),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing cleanup-carrying wrapper return"));
+        returned.1 = Operand::Const(Const::Bool(true));
+        assert_xml_producer_rejected(
+            &detached_cleanup,
+            "return cleanup detached from its call result",
+        );
+
+        let invoke = xml_test_function(&base, "invoke");
+        let mut wrong_direct_mode = base.clone();
+        wrong_direct_mode.fns[invoke].param_modes[0] = align_ast::ParamMode::Borrow;
+        assert_xml_producer_rejected(
+            &wrong_direct_mode,
+            "direct edge disagrees with its callable mode product",
+        );
+
+        let recursive = xml_test_function(&base, "recursive");
+        let mut contradictory = base;
+        let producer = contradictory.fns[recursive]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, rvalue @ Rvalue::CallWithCleanup(_)) => Some(rvalue),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing recursive producer"));
+        *producer = Rvalue::RawNull;
+        assert_xml_producer_rejected(&contradictory, "contradictory recursive return");
+    }
+
+    #[test]
+    fn xml_whole_carrier_operations_validate_unselected_siblings() {
+        let base = mir(
+            r#"Pair { first: str, second: str }
+fn clone_first(first: str, second: str, out: region) -> string {
+  pair := Pair { first: first, second: second }
+  copied := pair.clone_in(out)
+  return copied.first.clone()
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(validate_mir_producers(&base).is_ok());
+
+        let function = xml_test_function(&base, "clone_first");
+        let mut malformed = base;
+        let second = malformed.fns[function].params[1];
+        malformed.fns[function].slots[second as usize] = Ty::Raw;
+        assert_xml_producer_rejected(
+            &malformed,
+            "CloneIn/StoreField ignored an invalid unselected sibling",
+        );
+    }
+
+    #[test]
+    fn producer_publication_preflight_returns_errors_instead_of_panicking() {
+        let base = mir(
+            r#"fn apply(f: fn(i64) -> i64, value: i64) -> i64 = f(value)
+fn capture(base: i64) -> i64 = apply(fn value: i64 { value + base }, 1)
+fn main() -> i32 = 0
+"#,
+        );
+
+        let mut malformed_closure = base.clone();
+        let lifted = malformed_closure
+            .fns
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Closure { lifted, .. }) => Some(lifted.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing capturing closure producer"));
+        let target = xml_test_function(&malformed_closure, lifted.as_str());
+        malformed_closure.fns[target].param_modes.clear();
+
+        let mut malformed_import = base.clone();
+        malformed_import.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("malformed$import"),
+            params: vec![Ty::Str],
+            param_modes: Vec::new(),
+            ret: Ty::Unit,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
+        });
+
+        let mut malformed_local = base;
+        malformed_local.fns[0].param_modes.clear();
+
+        for (label, malformed) in [
+            ("lifted closure", malformed_closure),
+            ("imported declaration", malformed_import),
+            ("local declaration", malformed_local),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_mir_producers(&malformed)
+            }));
+            assert!(
+                matches!(outcome, Ok(Err(_))),
+                "malformed {label} must return CodegenError without panicking"
+            );
+        }
+
+        assert!(
+            !direct_operands_match_modes(
+                &program_call("pkg.template$write"),
+                &[Operand::Const(Const::Unit), Operand::Const(Const::Unit)],
+                &[
+                    align_ast::ParamMode::BorrowMut,
+                    align_ast::ParamMode::ByValue,
+                ],
+                &[],
+                &Program::default(),
+            ),
+            "an empty template type vector must fail closed"
+        );
     }
 
     #[test]
@@ -26679,6 +36514,7 @@ fn main() -> i32 = 0
                         return_borrow: hir::ReturnBorrowSummary::None,
                         return_region: hir::ReturnRegionSummary::None,
                         return_cleanup: hir::ReturnCleanupAbi::None,
+                        producer_certified: true,
                     }],
                     link_libs: Vec::new(),
                     structs: vec![row.clone(), other.clone()],
@@ -27017,6 +36853,423 @@ fn main() -> i32 = 0
                 "unexpected diagnostic: {error}"
             );
         }
+    }
+
+    #[test]
+    fn producer_equations_preserve_guarded_absence_and_scalar_view_siblings() {
+        for source in [
+            "fn selected() -> string { value: Option<string> := None; return value else \"fallback\".clone() }",
+            "fn selected() -> string { value: Result<string, string> := Err(\"error\".clone()); return match value { Ok(text) => text, Err(error) => error } }",
+            "Choice { A(string), B(string) }\nfn selected() -> string { value := Choice.A(\"alpha\".clone()); return match value { A(text) => text, B(text) => text } }",
+            "import core.codec\nfn selected(batch: codec.batch) -> Option<str> = batch.name(0)",
+            "import core.codec\nfn selected(column: codec.str_column) -> Option<str> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.i64_column) -> Option<i64> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.f64_column) -> Option<f64> = column.at(0)",
+            "import core.codec\nfn selected(column: codec.bool_column) -> Option<bool> = column.at(0)",
+            "import std.xml\nObservation { event: Option<xml.event>, label: string }\nfn selected(borrow mut reader: xml.reader) -> Observation = Observation { event: reader.next(), label: \"label\".clone() }",
+            "import std.xml\nfn selected(borrow reader: xml.reader, index: i64) -> string { checked := index.checked_add(1); return reader.attribute_value(checked else 0) }",
+            "import std.xml\nfn describe(error: Error) -> str = \"error\"\nfn selected() -> string { result := xml.parse(\"<bad\".clone()); return match result { Ok(reader) => reader.text(), Err(error) => describe(error).clone() } }",
+        ] {
+            let program = mir(&format!("{source}\nfn main() -> i32 = 0\n"));
+            let result = validate_mir_producers(&program);
+            assert!(result.is_ok(), "producer sibling {source}: {result:?}");
+            let result = validate_thin_partition_program(&program, &[]);
+            assert!(result.is_ok(), "per-unit producer sibling {source}: {result:?}");
+        }
+        for source in [
+            "fn selected(flag: bool) -> string { value: Option<string> := if flag { Some(\"present\".clone()) } else { None }; return value else \"fallback\".clone() }",
+            "fn selected(flag: bool) -> string { value: Result<string, string> := if flag { Ok(\"present\".clone()) } else { Err(\"error\".clone()) }; return match value { Ok(text) => text, Err(error) => error } }",
+            "Choice { A(string), B(string) }\nfn selected(flag: bool) -> string { value := if flag { Choice.A(\"alpha\".clone()) } else { Choice.B(\"beta\".clone()) }; return match value { A(text) => text, B(text) => text } }",
+            "import std.xml\nfn selected(flag: bool) -> Result<string, Error> { doc := xml.parse(\"<r/>\".clone())?; value: Option<xml.reader> := if flag { Some(doc) } else { None }; reader := value else { return Ok(\"none\".clone()) }; return Ok(reader.text()) }",
+        ] {
+            let program = mir(&format!("{source}\nfn main() -> i32 = 0\n"));
+            assert!(validate_mir_producers(&program).is_ok(), "joined presence: {source}");
+            assert!(validate_thin_partition_program(&program, &[]).is_ok(), "per-unit joined presence: {source}");
+            let owner = xml_test_function(&program, "selected");
+            for axis in ["unguarded", "unrelated-predicate"] {
+                let mut malformed = program.clone();
+                let function = &mut malformed.fns[owner];
+                let predicates = function.blocks.iter().flat_map(|block| &block.stmts)
+                    .filter_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::OptionIsSome(_) | Rvalue::ResultIsOk(_)
+                            | Rvalue::EnumTagEq { .. }) => Some(*value),
+                        _ => None,
+                    }).collect::<HashSet<_>>();
+                let mut changed = false;
+                for block in &mut function.blocks {
+                    if let Term::Branch(Operand::Value(predicate), yes, no) = block.term
+                        && predicates.contains(&predicate)
+                    {
+                        block.term = if axis == "unguarded" { Term::Goto(yes) }
+                            else { Term::Branch(Operand::Const(Const::Bool(true)), yes, no) };
+                        changed = true;
+                    }
+                }
+                assert!(changed, "missing joined payload guard: {source}");
+                assert_xml_producer_rejected(&malformed, &format!("maybe-absent-{axis}: {source}"));
+            }
+        }
+        let program = mir("fn selected() -> string { value: Option<string> := None; return value else \"fallback\".clone() }\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "selected");
+        let mut unguarded = program.clone();
+        for block in &mut unguarded.fns[owner].blocks {
+            if let Term::Branch(_, yes, _) = block.term {
+                block.term = Term::Goto(yes);
+                break;
+            }
+        }
+        assert_xml_producer_rejected(&unguarded, "unguarded-absent-payload");
+        let mut wrong_predicate = program.clone();
+        for block in &mut wrong_predicate.fns[owner].blocks {
+            if let Term::Branch(condition, _, _) = &mut block.term {
+                *condition = Operand::Const(Const::Bool(true));
+                break;
+            }
+        }
+        assert_xml_producer_rejected(&wrong_predicate, "unrelated-absence-guard");
+
+        let program = mir("fn selected(other: Option<string>) -> string { value: Option<string> := None; return value else \"fallback\".clone() }\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "selected");
+        let mut wrong_operand = program.clone();
+        let mut changed = false;
+        for block in &mut wrong_operand.fns[owner].blocks {
+            for statement in &mut block.stmts {
+                if let Stmt::Let(_, Rvalue::OptionIsSome(operand)) = statement {
+                    *operand = Operand::Arg(0);
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed);
+        assert_xml_producer_rejected(&wrong_operand, "different-ssa-absence-guard");
+
+        for source in [
+            "import core.codec\nfn selected(batch: codec.batch) -> Option<str> = batch.name(0)",
+            "import core.codec\nfn selected(column: codec.str_column) -> Option<str> = column.at(0)",
+        ] {
+            let program = mir(&format!("{source}\nfn main() -> i32 = 0\n"));
+            let owner = xml_test_function(&program, "selected");
+            for axis in ["index", "base", "result", "kind"] {
+                let mut malformed = program.clone();
+                let function = &mut malformed.fns[owner];
+                let mut changed = false;
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(value, rvalue) = statement else { continue; };
+                        let (base, index) = match rvalue {
+                            Rvalue::CodecBatchName(base, index) => (base, index),
+                            Rvalue::CodecColumnAt { column, index, kind } => {
+                                if axis == "kind" { *kind = hir::CodecPutKind::Bool; }
+                                (column, index)
+                            }
+                            _ => continue,
+                        };
+                        match axis {
+                            "index" => *index = Operand::Const(Const::Bool(false)),
+                            "base" => *base = Operand::Const(Const::Bool(false)),
+                            "result" => function.value_tys[*value as usize] = Ty::Option(Scalar::Bool),
+                            "kind" if source.contains("batch.name") => continue,
+                            "kind" => {},
+                            _ => panic!("unknown codec mutation"),
+                        }
+                        changed = true;
+                    }
+                }
+                if axis == "kind" && source.contains("batch.name") { continue; }
+                assert!(changed);
+                assert_xml_producer_rejected(&malformed, axis);
+            }
+        }
+    }
+
+    #[test]
+    fn native_metadata_views_use_the_producers_exact_layout_authority() {
+        let mut program = mir(r#"
+Driver { SQLite, PostgreSQL }
+DriverRestriction { AnySupportedDriver, SQLiteOnly, PostgreSQLOnly }
+MetaStatementClass { Select, Dml, Ddl, Native, Unknown }
+MetaQueryState { Declared, DatabaseChecked }
+MetaQueryEntry { Summary, Parameter, Column }
+MetaNullability { Yes, No, Unknown }
+QueryMeta {
+  query_id: str, driver: Driver, driver_restriction: DriverRestriction,
+  statement_class: MetaStatementClass, artifact_digest: str, state: MetaQueryState,
+  metadata_fingerprint: Option<str>, source_sql_hash: str, driver_wire_sql_hash: str,
+  rewrite_format_version: i64, prepare_identity: Option<str>, schema_identity: Option<str>,
+  server_identity: Option<str>, entry: MetaQueryEntry, ordinal: Option<i64>,
+  source_name: Option<str>, source_alias: Option<str>, logical_type: Option<str>,
+  native_type: Option<str>, native_type_id: Option<i64>, origin_schema: Option<str>,
+  origin_table: Option<str>, origin_column: Option<str>, nullable: MetaNullability,
+}
+Query { data: i64 }
+fn metadata(query: Query) -> i32 = 0
+fn main() -> i32 = 0
+"#);
+        for definition in &mut program.enums {
+            definition.source_name = format!("pkg.db${}", definition.source_name);
+        }
+        let row = program.structs.iter().position(|definition| definition.source_name == "QueryMeta")
+            .and_then(|index| u32::try_from(index).ok()).unwrap_or_else(|| panic!("metadata fixture row"));
+        program.structs[row as usize].source_name = "pkg.db$QueryMeta".to_owned();
+        let descriptor = program.structs.iter().position(|definition| definition.source_name == "Query")
+            .and_then(|index| u32::try_from(index).ok()).unwrap_or_else(|| panic!("metadata fixture descriptor"));
+        program.structs[descriptor as usize].name = "pkg.db$query$S9_QueryMeta$S9_QueryMeta".to_owned();
+        program.structs[descriptor as usize].fields[0].name = align_sema::STATIC_DESCRIPTOR_DATA_FIELD.to_owned();
+        program.structs[descriptor as usize].fields[0].ty = Ty::Raw;
+        let owner = xml_test_function(&program, "metadata");
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+        let result_ty = Ty::Option(Scalar::Struct(row));
+        let function = &mut program.fns[owner];
+        function.slots = vec![Ty::Struct(descriptor)];
+        function.params = vec![0];
+        function.slot_align = vec![None];
+        function.param_modes = vec![align_ast::ParamMode::ByValue];
+        function.borrow_mut_cleanup_slots = vec![None];
+        function.ret = result_ty;
+        function.value_tys = vec![Ty::Raw, Ty::Raw, result_ty];
+        function.blocks = vec![Block { id: 0, stmts: vec![
+            Stmt::Store(0, Operand::Arg(0)),
+            Stmt::Let(0, Rvalue::Field(0, vec![0])),
+            Stmt::Let(1, Rvalue::RawPointerLoad { ptr: Operand::Value(0), offset: Operand::Const(Const::Int(96, i64_ty)) }),
+            Stmt::Let(2, Rvalue::RawCall {
+                callee: Operand::Value(1), args: vec![Operand::Const(Const::Int(0, u8_ty)), Operand::Const(Const::Int(0, u8_ty)), Operand::Const(Const::Int(0, i64_ty))],
+                param_tys: vec![u8_ty, u8_ty, i64_ty], ret_ty: result_ty,
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![align_ast::ParamMode::ByValue; 3], return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None, return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            }),
+        ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(2))) }];
+        let result = validate_mir_producers(&program);
+        assert!(result.is_ok(), "native metadata fixture: {result:?}");
+        for axis in ["field-type", "field-name", "field-count", "enum-layout", "nominal", "duplicate", "alignment", "descriptor"] {
+            let mut malformed = program.clone();
+            match axis {
+                "field-type" => malformed.structs[row as usize].fields[9].ty = u8_ty,
+                "field-name" => malformed.structs[row as usize].fields[0].name = "wrong".to_owned(),
+                "field-count" => { malformed.structs[row as usize].fields.pop(); },
+                "enum-layout" => malformed.enums[0].variants.swap(0, 1),
+                "nominal" => malformed.structs[row as usize].source_name = "Other".to_owned(),
+                "duplicate" => malformed.structs.push(malformed.structs[row as usize].clone()),
+                "alignment" => malformed.structs[row as usize].align = Some(32),
+                "descriptor" => malformed.structs[descriptor as usize].fields[0].name = "wrong".to_owned(),
+                _ => panic!("unknown metadata mutation"),
+            }
+            assert_xml_producer_rejected(&malformed, axis);
+        }
+    }
+
+    #[test]
+    fn borrowed_parameter_slots_have_entry_storage_without_a_prologue_store() {
+        let program = mir("Row { text: str }\nfn project(borrow row: Row) -> str = row.text\nfn main() -> i32 = 0\n");
+        let owner = xml_test_function(&program, "project");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+            let mut generated = program.clone();
+            let function = &mut generated.fns[owner];
+            let slot = function.params[0];
+            function.param_modes[0] = mode;
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| !matches!(statement, Stmt::Store(target, _) if *target == slot));
+                block.stmt_lines.clear();
+            }
+            let result = validate_mir_producers(&generated);
+            assert!(result.is_ok(), "implicit borrowed parameter mode {mode:?}: {result:?}");
+            for malformed_mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::Out] {
+                let mut malformed = generated.clone();
+                malformed.fns[owner].param_modes[0] = malformed_mode;
+                assert_xml_producer_rejected(&malformed, "uninitialized-non-borrow-parameter");
+            }
+            generated.fns[owner].blocks[0].stmts.insert(0, Stmt::Store(slot, Operand::Const(Const::Bool(false))));
+            assert_xml_producer_rejected(&generated, "borrowed-parameter-invalid-replacement");
+        }
+    }
+
+    #[test]
+    fn native_view_callbacks_preserve_only_the_closed_shared_result_contract() {
+        let mut program = mir("fn guard(plan: raw) -> bool = true\nfn native_view(plan: raw) -> i32 = 0\nfn main() -> i32 = 0\n");
+        let row = u32::try_from(program.structs.len()).unwrap_or_else(|_| panic!("native fixture struct count"));
+        program.structs.push(StructDef {
+            name: "Row".to_owned(), source_name: "Row".to_owned(),
+            fields: vec![hir::FieldDef { name: "text".to_owned(), ty: Ty::Str }],
+            align: None, c_repr: false,
+        });
+        let resource = u32::try_from(program.resources.len()).unwrap_or_else(|_| panic!("native fixture resource count"));
+        program.resources.push(hir::ResourceDef {
+            name: "pkg.db$batch$S3_Row".to_owned(), source_name: "pkg.db$batch$S3_Row".to_owned(),
+            declaring_module: "pkg.db".to_owned(), generic_arity: 1,
+            drop_hook: "pkg.db.internal.resource$drop_batch".to_owned(),
+            drop_thunk: "__align_resource_drop$pkg.db$batch".to_owned(),
+            representation_version: 1, drop_abi_fingerprint: *b"align-res-drop-1",
+        });
+        let guard = xml_test_function(&program, "guard");
+        program.fns[guard].name = program_call("pkg.db.internal.resource$batch_plan_valid");
+        let owner = xml_test_function(&program, "native_view");
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let reference = Ty::ResourceRef(resource);
+        let function = &mut program.fns[owner];
+        function.slots = vec![Ty::Raw, Ty::Raw, reference, i64_ty];
+        function.params = vec![0, 1, 2, 3];
+        function.param_modes = vec![align_ast::ParamMode::ByValue; 4];
+        function.borrow_mut_cleanup_slots = vec![None; 4];
+        function.slot_align = vec![None; 4];
+        function.ret = Ty::Struct(row);
+        function.return_borrow = hir::ReturnBorrowSummary::Roots { params: vec![2], captures: vec![] };
+        function.return_region = hir::ReturnRegionSummary::Roots { params: vec![2], captures: vec![] };
+        function.value_tys = vec![Ty::Raw, Ty::Bool, Ty::Raw, Ty::Raw, Ty::Raw, reference, i64_ty, Ty::Struct(row), Ty::Unit];
+        function.blocks = vec![
+            Block { id: 0, stmts: vec![
+                Stmt::Store(0, Operand::Arg(0)), Stmt::Store(1, Operand::Arg(1)),
+                Stmt::Store(2, Operand::Arg(2)), Stmt::Store(3, Operand::Arg(3)),
+                Stmt::Let(0, Rvalue::Load(0)),
+                Stmt::Let(1, Rvalue::Call(DirectCall::Program(program_call("pkg.db.internal.resource$batch_plan_valid")), vec![Operand::Value(0)])),
+            ], stmt_lines: vec![], term: Term::Branch(Operand::Value(1), 1, 2) },
+            Block { id: 1, stmts: vec![
+                Stmt::Let(2, Rvalue::Load(0)),
+                Stmt::Let(3, Rvalue::RawPointerLoad { ptr: Operand::Value(2), offset: Operand::Const(Const::Int(40, i64_ty)) }),
+                Stmt::Let(4, Rvalue::Load(1)), Stmt::Let(5, Rvalue::Load(2)), Stmt::Let(6, Rvalue::Load(3)),
+                Stmt::Let(7, Rvalue::RawCall {
+                    callee: Operand::Value(3), args: vec![Operand::Value(4), Operand::Value(5), Operand::Value(6)],
+                    param_tys: vec![Ty::Raw, reference, i64_ty], ret_ty: Ty::Struct(row),
+                    signature: Box::new(align_mir::FnSignatureFacts {
+                        param_modes: vec![align_ast::ParamMode::ByValue; 3],
+                        return_borrow: hir::ReturnBorrowSummary::Roots { params: vec![1], captures: vec![] },
+                        return_region: hir::ReturnRegionSummary::Roots { params: vec![1], captures: vec![] },
+                        return_cleanup: hir::ReturnCleanupAbi::None,
+                    }),
+                }),
+            ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(7))) },
+            Block { id: 2, stmts: vec![Stmt::Let(8, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]))], stmt_lines: vec![], term: Term::Unreachable },
+        ];
+        let result = validate_mir_producers(&program);
+        assert!(result.is_ok(), "native fixture validation: {result:?}");
+        for soa in [false, true] {
+            for axis in ["pointer-before-guard", "reload-before-guard", "stale-guard-observation", "post-guard-store"] {
+                let mut malformed = program.clone();
+                let function = &mut malformed.fns[owner];
+                if soa {
+                    function.ret = Ty::Soa(row);
+                    function.value_tys[7] = Ty::Soa(row);
+                    if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] {
+                        *offset = Operand::Const(Const::Int(48, i64_ty));
+                    }
+                    if let Stmt::Let(_, Rvalue::RawCall { args, param_tys, ret_ty, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                        args.pop(); param_tys.pop(); signature.param_modes.pop(); *ret_ty = Ty::Soa(row);
+                    }
+                }
+                match axis {
+                    "pointer-before-guard" => {
+                        let loads = function.blocks[1].stmts.drain(..2).collect::<Vec<_>>();
+                        function.blocks[0].stmts.splice(5..5, loads);
+                    }
+                    "reload-before-guard" => {
+                        let load = function.blocks[1].stmts.remove(0);
+                        function.blocks[0].stmts.insert(5, load);
+                    }
+                    "stale-guard-observation" => function.blocks[0].stmts.insert(5, Stmt::Store(0, Operand::Arg(1))),
+                    "post-guard-store" => function.blocks[1].stmts.insert(0, Stmt::Store(0, Operand::Arg(1))),
+                    _ => panic!("unknown guard observation mutation"),
+                }
+                assert_xml_producer_rejected(&malformed, axis);
+            }
+        }
+        for soa in [true, false] {
+            let mut sibling = program.clone();
+            let function = &mut sibling.fns[owner];
+            let result_ty = if soa { Ty::Soa(row) } else { Ty::Struct(row) };
+            function.ret = result_ty;
+            function.value_tys[7] = result_ty;
+            if !soa {
+                sibling.resources[resource as usize].name = "pkg.db$rows$S3_Row".to_owned();
+                sibling.resources[resource as usize].source_name = "pkg.db$rows$S3_Row".to_owned();
+                function.blocks[1].stmts[0] = Stmt::Let(2, Rvalue::ResourceRaw { reference: Operand::Arg(2), resource });
+            }
+            if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] {
+                *offset = Operand::Const(Const::Int(48, i64_ty));
+            }
+            if let Stmt::Let(_, Rvalue::RawCall { args, param_tys, ret_ty, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                args.pop(); param_tys.pop(); signature.param_modes.pop(); *ret_ty = result_ty;
+            }
+            let result = validate_mir_producers(&sibling);
+            assert!(result.is_ok(), "native sibling soa={soa}: {result:?}");
+            if !soa {
+                let function = &mut sibling.fns[owner];
+                function.slots.push(reference);
+                function.params.push(4);
+                function.slot_align.push(None);
+                function.param_modes.push(align_ast::ParamMode::ByValue);
+                function.borrow_mut_cleanup_slots.push(None);
+                function.blocks[0].stmts.insert(0, Stmt::Store(4, Operand::Arg(4)));
+                function.blocks[1].stmts.insert(2, Stmt::Store(2, Operand::Arg(4)));
+                assert_xml_producer_rejected(&sibling, "current-row-replaced-observation");
+            }
+        }
+        for axis in ["offset", "guard", "root", "mode", "callee", "nominal", "plan"] {
+            let mut malformed = program.clone();
+            let function = &mut malformed.fns[owner];
+            match axis {
+                "offset" => if let Stmt::Let(_, Rvalue::RawPointerLoad { offset, .. }) = &mut function.blocks[1].stmts[1] { *offset = Operand::Const(Const::Int(41, i64_ty)); },
+                "guard" => function.blocks[0].term = Term::Goto(1),
+                "plan" => function.blocks[0].stmts[0] = Stmt::Store(0, Operand::Const(Const::Bool(false))),
+                "nominal" => malformed.resources[resource as usize].name = "pkg.db$batch$S5_Other".to_owned(),
+                _ => if let Stmt::Let(_, Rvalue::RawCall { callee, signature, .. }) = &mut function.blocks[1].stmts[5] {
+                    match axis {
+                        "root" => signature.return_region = hir::ReturnRegionSummary::None,
+                        "mode" => signature.param_modes[1] = align_ast::ParamMode::BorrowMut,
+                        "callee" => *callee = Operand::Arg(0),
+                        _ => panic!("unknown native-view mutation"),
+                    }
+                },
+            }
+            assert_xml_producer_rejected(&malformed, axis);
+        }
+
+        let mut decoder = program.clone();
+        let descriptor = u32::try_from(decoder.structs.len()).unwrap_or_else(|_| panic!("descriptor fixture count"));
+        decoder.structs.push(StructDef {
+            name: "pkg.db$query$S3_Row$S3_Row".to_owned(), source_name: "pkg.db$query".to_owned(),
+            fields: vec![hir::FieldDef { name: align_sema::STATIC_DESCRIPTOR_DATA_FIELD.to_owned(), ty: Ty::Raw }],
+            align: None, c_repr: false,
+        });
+        let function = &mut decoder.fns[owner];
+        function.slots = vec![Ty::Struct(descriptor), Ty::Raw];
+        function.params = vec![0, 1];
+        function.slot_align = vec![None; 2];
+        function.param_modes = vec![align_ast::ParamMode::ByValue; 2];
+        function.borrow_mut_cleanup_slots = vec![None; 2];
+        function.return_borrow = hir::ReturnBorrowSummary::None;
+        function.return_region = hir::ReturnRegionSummary::None;
+        function.value_tys = vec![Ty::Raw, Ty::Raw, Ty::Struct(row)];
+        function.blocks = vec![Block { id: 0, stmts: vec![
+            Stmt::Store(0, Operand::Arg(0)), Stmt::Store(1, Operand::Arg(1)),
+            Stmt::Let(0, Rvalue::Field(0, vec![0])),
+            Stmt::Let(1, Rvalue::RawPointerLoad { ptr: Operand::Value(0), offset: Operand::Const(Const::Int(88, i64_ty)) }),
+            Stmt::Let(2, Rvalue::RawCall {
+                callee: Operand::Value(1), args: vec![Operand::Arg(1)], param_tys: vec![Ty::Raw], ret_ty: Ty::Struct(row),
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![align_ast::ParamMode::ByValue], return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None, return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            }),
+        ], stmt_lines: vec![], term: Term::Return(Some(Operand::Value(2))) }];
+        let result = validate_mir_producers(&decoder);
+        assert!(result.is_ok(), "native decoder fixture: {result:?}");
+        for name in ["pkg.db$query$S3_Row$S5_Other", "pkg.db$query$S03_Row$S3_Row", "pkg.db$query$S9_Row$S3_Row"] {
+            let mut malformed = decoder.clone();
+            malformed.structs[descriptor as usize].name = name.to_owned();
+            assert_xml_producer_rejected(&malformed, "decoder-row-nominal");
+        }
+        let other = u32::try_from(decoder.structs.len()).unwrap_or_else(|_| panic!("other fixture count"));
+        let mut other_row = decoder.structs[row as usize].clone();
+        other_row.name = "Other".to_owned();
+        other_row.source_name = "Other".to_owned();
+        decoder.structs.push(other_row);
+        decoder.fns[owner].ret = Ty::Struct(other);
+        decoder.fns[owner].value_tys[2] = Ty::Struct(other);
+        if let Stmt::Let(_, Rvalue::RawCall { ret_ty, .. }) = &mut decoder.fns[owner].blocks[0].stmts[4] {
+            *ret_ty = Ty::Struct(other);
+        }
+        assert_xml_producer_rejected(&decoder, "decoder-result-nominal");
     }
 
     fn raw_call_program() -> Program {

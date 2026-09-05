@@ -2016,7 +2016,7 @@ context/view inputs remain the direct ABI owner's hard-abort responsibility and 
 represented as ordinary HIR zero/false results. The checked response-head size and allocation are
 runtime publication prerequisites after semantic validation, not a second HIR result state.
 
-### Planned `std.xml` records (designed 2026-09-05; inactive until implementation)
+### `std.xml` records (implemented 2026-09-05)
 
 The accepted XML capability adds `Ty::XmlReader` and `Scalar::XmlReader` as one nominal Move-handle
 family. `xml.event` remains an ordinary source-nameable `Ty::Enum`/`Scalar::Enum` aggregate with the
@@ -2025,20 +2025,35 @@ shortcut. `XmlNext` produces `Option<Scalar::Enum(xml.event)>`. `XmlName` and `X
 return a `str` region rooted in both the reader and its current cursor generation; `XmlText` and
 `XmlAttributeValue` return owned `string` with no reader region.
 
-Canonical type record version 3 already uses the implemented codec leaves `Ty=65..=70` /
+Canonical type record version 3 uses the implemented codec leaves `Ty=65..=70` /
 `Scalar=41..=46` and the implemented HTTP Upgrade leaves `Ty::HttpUpgrade=71` /
-`Scalar::HttpUpgrade=47`. XML reserves the next append-only leaves `Ty::XmlReader=72` and
+`Scalar::HttpUpgrade=47`. XML uses the next append-only leaves `Ty::XmlReader=72` and
 `Scalar::XmlReader=48`; 73 and 49 remain the next unknown tags. `Ty::XmlReader` encodes exactly as
 `[3, 0, 0, 0, 0, 72]`; `Ty::Option(Scalar::XmlReader)` encodes exactly as
 `[3, 0, 0, 0, 0, 4, 48]`. Both directions return the identical semantic root. Unknown 73/49,
 missing root/payload, truncated, and trailing bytes reject before cache publication. Interface
-format 8 remains unchanged because `xml.reader` and `xml.event` use the existing nominal named-type
-and enum grammar.
+format 9 appends one `ProducerCertification` byte immediately after each function record's
+`return_cleanup`: tag 0 is `RevalidateGenericBody` and requires nonempty type parameters plus a
+present generic body; tag 1 is `ValidatedBody` and requires empty type parameters plus no body.
+Other tags and presence mismatches reject. A non-generic record receives tag 1 only after the exact
+local MIR body passes the reusable producer validator before interface publication; a generic body
+is re-lowered and passes that validator in the consumer.
 
-Implementation activates both type leaves and all seven checked expression families (`XmlParse`,
+Both type leaves and all seven checked expression families (`XmlParse`,
 `XmlNext`, `XmlName`, `XmlAttributeCount`, `XmlAttributeName`, `XmlAttributeValue`, `XmlText`)
-atomically with their clone/replay, depth, effect, ownership, current-cursor region, traversal,
-finalization, source-shape, semantic projection, and malformed validation arms. The parameterized
-owners in `std-design/xml.md` must fail on a missing form, wrong reader/event/result, lost mutable
-receiver or cursor generation, owned/view result confusion, unknown canonical tag, or status/event
-decode after unchecked HIR/MIR.
+activate atomically with their clone/replay, depth, effect, ownership, current-cursor region,
+traversal, finalization, source-shape, semantic projection, and malformed validation arms. Each
+family lowers to one semantic MIR rvalue whose primary value already has the public source result
+type. `XmlParse` additionally defines one distinct boolean cleanup companion and attaches it to the
+returned `Result`; it has no source-visible status or out slot.
+
+The LLVM preflight derives each XML operand's access class from its producer graph: parameter mode,
+ordinary slot moves and joins, fresh values, direct/indirect/imported call summaries, and aggregate
+projection. Parse admits only owned input, next admits owned or exclusive reader access, getters
+admit readable reader access, and `Out` or raw borrowed-place descriptors fail closed. The LLVM
+emitter alone maps parse status `0/-1`, next status `0/1/2/3`, attribute counts `0..=256`, and
+zero-only getter statuses to their final results; every other native status aborts. The
+parameterized owners in `std-design/xml.md` fail on a missing form, wrong reader/event/result,
+duplicate or aliased cleanup definition, lost mutable receiver or cursor generation, owned/view
+result confusion, unknown canonical tag, forged access provenance, or unchecked status/event
+decode in either whole-program or per-unit emission.

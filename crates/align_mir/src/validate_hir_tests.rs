@@ -110,6 +110,7 @@ fn declaration_header_program() -> hir::Program {
             captures: Vec::new(),
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -352,6 +353,7 @@ fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: align_sema::FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -507,6 +509,60 @@ pub fn main() -> Result<(), Error> {
     };
     *variant = 5;
     assert!(!body_core_metadata_is_valid(&bad_variant));
+}
+
+#[test]
+fn xml_hir_requires_the_builtin_event_and_exact_operation_envelopes() {
+    let source = r#"
+import std.xml
+fn parse_it(source: string) -> Result<xml.reader, Error> = xml.parse(source)
+fn next_it(borrow mut reader: xml.reader) -> Option<xml.event> = reader.next()
+fn name_it(borrow reader: xml.reader) -> str = reader.name()
+fn count_it(borrow reader: xml.reader) -> i64 = reader.attribute_count()
+fn attr_name_it(borrow reader: xml.reader, index: i64) -> str = reader.attribute_name(index)
+fn attr_value_it(borrow reader: xml.reader, index: i64) -> string = reader.attribute_value(index)
+fn text_it(borrow reader: xml.reader) -> string = reader.text()
+fn main() -> i32 = 0
+"#;
+    let program = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut wrong_event = program.clone();
+    let event = wrong_event
+        .enums
+        .iter_mut()
+        .find(|definition| definition.name == "xml.event")
+        .unwrap_or_else(|| panic!("missing builtin xml.event definition"));
+    event.variants.swap(0, 1);
+    assert!(!body_core_metadata_is_valid(&wrong_event));
+
+    let mut wrong_parse = program.clone();
+    let parse = body_value_expression_mut(&mut wrong_parse, "parse_it");
+    let hir::ExprKind::XmlParse { input } = &mut parse.kind else {
+        panic!("parse_it must contain XmlParse")
+    };
+    input.ty = Ty::Str;
+    assert!(!body_core_metadata_is_valid(&wrong_parse));
+
+    let mut wrong_next = program.clone();
+    body_value_expression_mut(&mut wrong_next, "next_it").ty = Ty::Option(Scalar::Bool);
+    assert!(!body_core_metadata_is_valid(&wrong_next));
+
+    let mut wrong_name = program.clone();
+    let name = body_value_expression_mut(&mut wrong_name, "name_it");
+    let hir::ExprKind::XmlName { reader } = &mut name.kind else {
+        panic!("name_it must contain XmlName")
+    };
+    reader.ty = Ty::Raw;
+    assert!(!body_core_metadata_is_valid(&wrong_name));
+
+    let mut wrong_index = program;
+    let attribute = body_value_expression_mut(&mut wrong_index, "attr_value_it");
+    let hir::ExprKind::XmlAttributeValue { index, .. } = &mut attribute.kind else {
+        panic!("attr_value_it must contain XmlAttributeValue")
+    };
+    index.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&wrong_index));
 }
 
 #[test]
@@ -1444,6 +1500,7 @@ fn checked_interface_program(
                 provenance.1,
                 hir::ReturnCleanupAbi::None,
                 Vec::new(),
+                true,
             ),
         );
     }
@@ -3685,6 +3742,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
             captures: Vec::new(),
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Unknown,
         parallel_transfer_params: Vec::new(),
     });
@@ -3701,6 +3759,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Impure,
         parallel_transfer_params: Vec::new(),
     });
@@ -3920,6 +3979,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     }
@@ -3988,6 +4048,7 @@ fn with_return(ty: Ty) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -6657,6 +6718,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
         });
@@ -6694,6 +6756,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
         });
@@ -6712,6 +6775,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
     });
@@ -11696,7 +11760,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // synchronized with the exhaustive validation, source-shape, replay-clone, and
         // canonical-graph matches.
         variants,
-        315,
+        322,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -15827,6 +15891,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column

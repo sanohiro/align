@@ -226,6 +226,9 @@ pub enum Scalar {
     /// A `log.logger` payload. The Move handle owns one writer and preserves that writer's region;
     /// aggregate storage therefore carries the same borrowed-descriptor provenance.
     Logger,
+    /// A validated `std.xml` forward-reader payload. The Move handle owns its source string and
+    /// fixed cursor shell; aggregate storage owns and drops that complete pair.
+    XmlReader,
     /// A validated `core.codec` batch view into one borrowed canonical envelope.
     CodecBatch,
     /// Alignment-independent typed column views borrowed from a validated codec batch.
@@ -347,7 +350,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -626,6 +629,9 @@ pub enum Ty {
     /// logger preserves the writer's descriptor provenance and region, latches its first sink
     /// failure, and is Drop-freed through the writer's ordinary flush/close path.
     Logger,
+    /// `xml.reader` (`std.xml`) — a Move forward cursor owning one consumed source string and one
+    /// fixed runtime shell. It borrows no outside storage and is Drop-freed exactly once.
+    XmlReader,
     /// Validated, Copy views over one canonical `core.codec` envelope. Every value retains the
     /// exact input storage region and generation; no variant owns or aligns the underlying bytes.
     CodecBatch,
@@ -927,6 +933,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Builder
         | Ty::Writer
         | Ty::Logger
+        | Ty::XmlReader
         | Ty::CodecBatch
         | Ty::CodecI64Column
         | Ty::CodecF64Column
@@ -999,6 +1006,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
@@ -1064,6 +1072,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
         Ty::Logger => Some(Scalar::Logger),
+        Ty::XmlReader => Some(Scalar::XmlReader),
         Ty::CodecBatch => Some(Scalar::CodecBatch),
         Ty::CodecI64Column => Some(Scalar::CodecI64Column),
         Ty::CodecF64Column => Some(Scalar::CodecF64Column),
@@ -1204,6 +1213,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Logger => Ty::Logger,
+        Scalar::XmlReader => Ty::XmlReader,
         Scalar::CodecBatch => Ty::CodecBatch,
         Scalar::CodecI64Column => Ty::CodecI64Column,
         Scalar::CodecF64Column => Ty::CodecF64Column,
@@ -2473,6 +2483,7 @@ pub fn drop_plan(
                         | Ty::StrFinder
                         | Ty::Writer
                         | Ty::Logger
+                        | Ty::XmlReader
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2935,6 +2946,7 @@ pub fn ty_contains_signature_key(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3207,6 +3219,7 @@ fn ty_contains_http_upgrade(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3320,6 +3333,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -3454,6 +3468,7 @@ fn ty_contains_http_receive_stream(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -3536,6 +3551,7 @@ pub fn http_stream_carrier_class(
             | Scalar::Reader
             | Scalar::Writer
             | Scalar::Logger
+            | Scalar::XmlReader
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
@@ -3669,6 +3685,7 @@ pub fn http_stream_carrier_class(
             | Ty::Builder
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -4309,6 +4326,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("reader", Ty::Reader),
     ("writer", Ty::Writer),
     ("log.logger", Ty::Logger),
+    ("xml.reader", Ty::XmlReader),
     ("codec.batch", Ty::CodecBatch),
     ("codec.i64_column", Ty::CodecI64Column),
     ("codec.f64_column", Ty::CodecF64Column),
@@ -7196,6 +7214,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         hir::ReturnRegionSummary,
         hir::ReturnCleanupAbi,
         Vec<u32>,
+        bool,
     ),
 >;
 
@@ -8606,6 +8625,25 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         });
     }
 
+    // The builtin `xml.event` enum (`std.xml`). Its ordinals are source-visible and lower through
+    // the ordinary tag-only enum representation; the runtime uses one-based next statuses.
+    {
+        let xml_event_id = enums.len() as u32;
+        enum_ids.insert("xml.event".to_string(), xml_event_id);
+        enums.push(hir::EnumDef {
+            name: "xml.event".to_string(),
+            source_name: "xml.event".to_string(),
+            variants: ["Start", "End", "Text"]
+                .into_iter()
+                .map(|variant| hir::EnumVariant {
+                    name: variant.to_string(),
+                    payload: Vec::new(),
+                    field_base: 1,
+                })
+                .collect(),
+        });
+    }
+
     // The builtin `codec.kind` enum (`core.codec`). Its source ordinals are also the exact v1 wire
     // descriptor tags, so it remains the ordinary checked enum aggregate all the way to lowering.
     {
@@ -9002,6 +9040,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // `log.logger` may cross a sum-type boundary as an owned tagged carrier.
                     // The enum's tag-switched drop forwards the active handle to `log_free`.
                     Ty::Logger => payload.push(Scalar::Logger),
+                    // `xml.reader` is the same one-pointer Move leaf in concrete and generic sum
+                    // payloads. The active arm owns the reader and its consumed source string.
+                    Ty::XmlReader => payload.push(Scalar::XmlReader),
                     Ty::CodecBatch => payload.push(Scalar::CodecBatch),
                     Ty::CodecI64Column => payload.push(Scalar::CodecI64Column),
                     Ty::CodecF64Column => payload.push(Scalar::CodecF64Column),
@@ -9564,7 +9605,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _, _)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -9940,13 +9981,16 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     }
                     let return_provenance_known =
                         external_return_provenance.contains_key(&mangled);
+                    let producer_certified = external_return_provenance
+                        .get(&mangled)
+                        .is_some_and(|(_, _, _, _, certified)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots)| roots.clone())
+                        .map(|(_, _, _, roots, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -9976,6 +10020,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
                         return_cleanup: sig.return_cleanup,
+                        producer_certified,
                         effect,
                         parallel_transfer_params,
                     });
@@ -12291,6 +12336,8 @@ fn summary_from_roots(roots: &BorrowRoots, explicit_params: u32) -> hir::ReturnB
                 captures.push(index - explicit_params)
             }
             BorrowRoot::Local(_)
+            | BorrowRoot::Observation(_)
+            | BorrowRoot::EndedObservation(..)
             | BorrowRoot::StorageLocal(..)
             | BorrowRoot::IterTemp(_)
             | BorrowRoot::EndedLocal(_, _)
@@ -15662,6 +15709,16 @@ impl EffectScan<'_> {
                 walk!(logger);
                 self.impure_direct = true;
             }
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => walk!(input),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                walk!(reader);
+                walk!(index);
+            }
             // `core.codec` is entirely in-memory and Pure; walk every operand in source order.
             ExprKind::CodecOpen { input }
             | ExprKind::CodecBatchRows { batch: input }
@@ -17769,6 +17826,9 @@ impl EscapeState {
             BorrowRoot::EndedParamStorage(parameter, ended) => {
                 (BorrowRoot::ParamStorage(parameter), Some(ended), true)
             }
+            BorrowRoot::EndedObservation(generation, ended) => {
+                (BorrowRoot::Observation(generation), Some(ended), true)
+            }
             live => (live, None, false),
         };
         let local_fallback = matches!(live, BorrowRoot::Local(_) | BorrowRoot::StorageLocal(..));
@@ -17792,11 +17852,15 @@ impl EscapeState {
                 resolved.content = EscapeResolvedContent::unknown_root();
                 resolved
             }
+            BorrowRoot::Observation(generation) => {
+                self.resolve_storage_reference(&StorageGenerationRef { generation, content_path: Vec::new() }, visiting)
+            }
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedStorageLocal(..)
             | BorrowRoot::EndedIterTemp(..)
             | BorrowRoot::EndedParam(..)
-            | BorrowRoot::EndedParamStorage(..) => unreachable!(),
+            | BorrowRoot::EndedParamStorage(..)
+            | BorrowRoot::EndedObservation(..) => unreachable!(),
         };
         // A Local fallback contributes only its frozen region/content evidence. In particular it
         // cannot acquire the candidate generation's release owner, allocation mode, descriptor,
@@ -18051,7 +18115,7 @@ fn seed_escape_parameter_storage(
                     })
                 })
                 .collect();
-            let owns_dynamic = header.kind == StorageHeaderKind::OwnedDynamic && !borrowed;
+            let owns_dynamic = header.kind.owns_storage() && !borrowed;
             StorageHeaderFormation {
                 path: path.clone(),
                 generation: generation.clone(),
@@ -19368,7 +19432,7 @@ impl<'a> EscapeCheck<'a> {
                     }));
                 }
                 if leaf.descriptor.is_some_and(|descriptor| {
-                    descriptor.kind == StorageHeaderKind::OwnedDynamic
+                    descriptor.kind.owns_storage()
                 }) && resolved
                     .allocation
                     .is_some_and(|allocation| !allocation.may_individual)
@@ -19396,7 +19460,7 @@ impl<'a> EscapeCheck<'a> {
                 && leaf
                     .descriptor
                     .is_some_and(|descriptor| {
-                        descriptor.kind == StorageHeaderKind::OwnedDynamic
+                        descriptor.kind.owns_storage()
                     })
             {
                 allocation = Some(allocation.map_or(mode, |current| current.join(mode)));
@@ -19582,6 +19646,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -20823,7 +20888,8 @@ impl<'a> EscapeCheck<'a> {
                         .get(&Self::expr_key(expression))
                         .cloned()
                         .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
-                    let storage_region = snapshot.storage_region;
+                    let opaque = descriptor.kind == StorageHeaderKind::OwnedOpaque;
+                    let storage_region = if opaque { Region::Frame } else { snapshot.storage_region };
                     let releases = match storage_region {
                         Region::Arena(depth) => [EscapeReleasePlace::Arena { depth }]
                             .into_iter()
@@ -20848,15 +20914,15 @@ impl<'a> EscapeCheck<'a> {
                             descriptor: Some(descriptor),
                             storage_region,
                             allocation: EscapeAllocationMode {
-                                individual: snapshot.individual,
-                                may_individual: snapshot.may_individual,
+                                individual: opaque || snapshot.individual,
+                                may_individual: opaque || snapshot.may_individual,
                             },
                             releases,
                             ended: None,
                         }),
                         content: Some(EscapeGenerationContent {
-                            direct_regions: initializer.non_storage,
-                            dependencies: initializer.headers,
+                            direct_regions: if opaque { EscapeRegionFact::default() } else { initializer.non_storage },
+                            dependencies: if opaque { ProjectedHeaderFact::default() } else { initializer.headers },
                         }),
                     });
                 }
@@ -21690,6 +21756,7 @@ impl<'a> EscapeCheck<'a> {
             Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::Fn(_)
             | Ty::ArenaHandle
             | Ty::ArrayBuilder(_)
@@ -23208,6 +23275,17 @@ impl<'a> EscapeCheck<'a> {
             // `log.new` transfers the writer and therefore inherits its exact region. An owned
             // writer is Static; a writer borrowed from a connection remains connection-bound.
             ExprKind::LogNew { output, .. } => work.push(Work::Eval(output, depth)),
+            ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeName { reader, .. } => push_fold(
+                &mut work,
+                self.borrowed_storage_cap(reader),
+                vec![(reader, depth, None)],
+            ),
+            ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. } => values.push(Region::Static),
             ExprKind::CodecOpen { input } => work.push(Work::Eval(input, depth)),
             // The runtime returns one free-standing allocator-owned `array<RowPair>`. It does not
             // use the surrounding arena and retains neither input view, so the result is Static
@@ -24254,6 +24332,13 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoPublicKeyFromJwk { .. }
             | ExprKind::CryptoSign { .. }
             | ExprKind::CryptoVerify { .. }
+            | ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlName { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeName { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => {}
             }
@@ -25476,7 +25561,7 @@ impl<'a> EscapeCheck<'a> {
             if typed
                 .headers
                 .iter()
-                .any(|header| header.kind != StorageHeaderKind::OwnedDynamic)
+                .any(|header| !header.kind.owns_storage())
             {
                 continue;
             }
@@ -26062,7 +26147,7 @@ impl<'a> EscapeCheck<'a> {
 
         if replacing {
             for header in &typed.headers {
-                if header.kind != StorageHeaderKind::OwnedDynamic {
+                if !header.kind.owns_storage() {
                     continue;
                 }
                 let mut path = destination_prefix.to_vec();
@@ -26207,7 +26292,7 @@ impl<'a> EscapeCheck<'a> {
         if owns_selected_value {
             let lexical = self.mutable_root_storage_region(local, depth);
             for header in &typed.headers {
-                if header.kind != StorageHeaderKind::OwnedDynamic {
+                if !header.kind.owns_storage() {
                     continue;
                 }
                 let Some(leaf) = installed.headers.leaves.get(&header.path) else {
@@ -27791,6 +27876,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(message, depth);
             }
             ExprKind::LogFlush { logger } => self.walk(logger, depth),
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => self.walk(input, depth),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                self.walk(reader, depth);
+                self.walk(index, depth);
+            }
             ExprKind::CodecOpen { input } => self.walk(input, depth),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch } => self.walk(batch, depth),
@@ -28352,6 +28447,8 @@ enum BorrowRoot {
     /// provenance so an exact mutable-retention summary can translate it through the call-site
     /// argument's storage roots without pinning an unrelated aggregate header.
     ParamStorage(u32),
+    /// A cursor observation, independent of which place releases the native owner.
+    Observation(StorageGeneration),
     /// An already-ended root carried by a completion-time value snapshot. Keeping this marker in
     /// the fact lets projection and named-summary selection transport the invalidation without
     /// widening it to an unselected sibling.
@@ -28365,6 +28462,7 @@ enum BorrowRoot {
     EndedIterTemp(u32, BorrowEnd),
     EndedParam(u32, BorrowEnd),
     EndedParamStorage(u32, BorrowEnd),
+    EndedObservation(StorageGeneration, BorrowEnd),
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
@@ -28471,11 +28569,13 @@ impl BorrowRoot {
             Self::IterTemp(depth) => Self::EndedIterTemp(*depth, how),
             Self::Param(param) => Self::EndedParam(*param, how),
             Self::ParamStorage(param) => Self::EndedParamStorage(*param, how),
+            Self::Observation(generation) => Self::EndedObservation(generation.clone(), how),
             already @ (Self::EndedLocal(..)
             | Self::EndedStorageLocal(..)
             | Self::EndedIterTemp(..)
             | Self::EndedParam(..)
-            | Self::EndedParamStorage(..)) => already.clone(),
+            | Self::EndedParamStorage(..)
+            | Self::EndedObservation(..)) => already.clone(),
         }
     }
 
@@ -28485,12 +28585,14 @@ impl BorrowRoot {
             | Self::StorageLocal(..)
             | Self::IterTemp(_)
             | Self::Param(_)
-            | Self::ParamStorage(_) => Some(self.clone()),
+            | Self::ParamStorage(_)
+            | Self::Observation(_) => Some(self.clone()),
             Self::EndedLocal(..)
             | Self::EndedStorageLocal(..)
             | Self::EndedIterTemp(..)
             | Self::EndedParam(..)
-            | Self::EndedParamStorage(..) => None,
+            | Self::EndedParamStorage(..)
+            | Self::EndedObservation(..) => None,
         }
     }
 
@@ -28503,16 +28605,24 @@ impl BorrowRoot {
             Self::EndedIterTemp(depth, how) => Some((Self::IterTemp(*depth), *how)),
             Self::EndedParam(param, how) => Some((Self::Param(*param), *how)),
             Self::EndedParamStorage(param, how) => Some((Self::ParamStorage(*param), *how)),
+            Self::EndedObservation(generation, how) => {
+                Some((Self::Observation(generation.clone()), *how))
+            }
             Self::Local(_)
             | Self::StorageLocal(..)
             | Self::IterTemp(_)
             | Self::Param(_)
-            | Self::ParamStorage(_) => None,
+            | Self::ParamStorage(_)
+            | Self::Observation(_) => None,
         }
     }
 
     fn rename_generation(self, renames: &StorageGenerationRenames) -> Self {
         match self {
+            Self::Observation(generation) => Self::Observation(renames.apply(&generation)),
+            Self::EndedObservation(generation, how) => {
+                Self::EndedObservation(renames.apply(&generation), how)
+            }
             Self::StorageLocal(generation, local, path) => {
                 Self::StorageLocal(renames.apply(&generation), local, path)
             }
@@ -28984,7 +29094,16 @@ impl<Fact> StorageGenerationContents<Fact> {
 enum StorageHeaderKind {
     InlineFixed,
     OwnedDynamic,
+    /// An owned native leaf with no indexed content. Observation and release identities still
+    /// follow the ordinary projected generation directory.
+    OwnedOpaque,
     View,
+}
+
+impl StorageHeaderKind {
+    fn owns_storage(self) -> bool {
+        matches!(self, Self::OwnedDynamic | Self::OwnedOpaque)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -29088,6 +29207,7 @@ fn storage_type_paths(root: Ty, context: StorageTypeContext<'_>) -> StorageTypeP
                         Some(StorageHeaderKind::OwnedDynamic)
                     }
                     Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_) => Some(StorageHeaderKind::View),
+                    Ty::XmlReader => Some(StorageHeaderKind::OwnedOpaque),
                     _ => None,
                 };
                 if let Some(kind) = header {
@@ -29632,6 +29752,9 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::RunBytesStderr { .. }
         | ExprKind::HttpRespBody { .. }
         | ExprKind::HttpCtxBody { .. } => StorageVariantPolicy::UnknownView,
+        ExprKind::XmlName { .. } | ExprKind::XmlAttributeName { .. } => {
+            StorageVariantPolicy::UnknownView
+        }
 
         ExprKind::CallFnValue { .. } | ExprKind::Call { .. } | ExprKind::RawCall { .. } => {
             StorageVariantPolicy::Call
@@ -29659,7 +29782,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CsvDecode { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::SoaColumns)
         }
-        ExprKind::TemplateHtmlNew { .. } | ExprKind::TemplateHtmlToString { .. } => {
+        ExprKind::TemplateHtmlNew { .. } | ExprKind::TemplateHtmlToString { .. }
+        | ExprKind::XmlParse { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
         ExprKind::CloneIn { .. } => StorageVariantPolicy::Fresh(StorageContentInitializer::CloneIn),
@@ -29778,6 +29902,10 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::LogEnabled { .. }
         | ExprKind::LogLine { .. }
         | ExprKind::LogFlush { .. }
+        | ExprKind::XmlNext { .. }
+        | ExprKind::XmlAttributeCount { .. }
+        | ExprKind::XmlAttributeValue { .. }
+        | ExprKind::XmlText { .. }
         | ExprKind::CodecBatchRows { .. }
         | ExprKind::CodecBatchColumns { .. }
         | ExprKind::CodecBatchKind { .. }
@@ -30471,6 +30599,8 @@ struct MoveGenerationEntry {
     /// changes `releases` but scalar views completed before that action retain the old root; a
     /// generation end must therefore retire the complete, projection-preserving history.
     historical_release_roots: BorrowRoots,
+    /// Caller storage survives cursor advances without acquiring a local release place.
+    caller_origins: std::collections::BTreeSet<u32>,
     ended: Option<BorrowEnd>,
 }
 
@@ -30488,6 +30618,10 @@ impl MoveGenerationEntry {
             descriptor,
             releases,
             historical_release_roots,
+            caller_origins: match generation {
+                StorageGeneration::CallerStorage { parameter, .. } => [*parameter].into(),
+                _ => Default::default(),
+            },
             ended: None,
         }
     }
@@ -30503,6 +30637,7 @@ impl MoveGenerationEntry {
                 .flatten(),
             releases,
             historical_release_roots,
+            caller_origins: self.caller_origins.union(&other.caller_origins).copied().collect(),
             ended: match (self.ended, other.ended) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (Some(ended), None) | (None, Some(ended)) => Some(ended),
@@ -30688,12 +30823,12 @@ impl MoveControlEdge {
         // transition on this edge. Prune both tables against the union of completed values so that
         // sticky metadata survives the join instead of being discarded before its peer makes the
         // generation reachable.
-        let joined_value_headers = self.value.headers.join(&other.value.headers);
+        let joined_value = self.value.join(&other.value);
         self.borrows
-            .retain_reachable_storage_with(&joined_value_headers);
+            .retain_reachable_storage_with(&joined_value);
         other
             .borrows
-            .retain_reachable_storage_with(&joined_value_headers);
+            .retain_reachable_storage_with(&joined_value);
         Self {
             moved: &self.moved | &other.moved,
             borrows: BorrowState::join_prepruned(&self.borrows, &other.borrows),
@@ -30715,6 +30850,18 @@ impl MoveControlEdge {
 }
 
 impl BorrowState {
+    fn summary_roots(&self, roots: BorrowRoots) -> BorrowRoots {
+        roots.into_iter().flat_map(|root| {
+            if let BorrowRoot::Observation(generation) = &root {
+                self.storage.directory.entries.get(generation)
+                    .into_iter().flat_map(|entry| entry.caller_origins.iter().copied())
+                    .map(BorrowRoot::ParamStorage).collect::<BorrowRoots>()
+            } else {
+                [root].into()
+            }
+        }).collect()
+    }
+
     fn begin_value_headers(&mut self, snapshot: usize, headers: ProjectedHeaderFact) {
         if headers.leaves.is_empty() {
             self.value_headers.remove(&snapshot);
@@ -30788,7 +30935,7 @@ impl BorrowState {
     /// be ended on one branch and live on another, but if the ending branch retained no alias to
     /// it, publishing that unreachable sticky end onto the live branch would create a false
     /// cross-branch invalidation.
-    fn retain_reachable_storage_with(&mut self, extra: &ProjectedHeaderFact) {
+    fn retain_reachable_storage_with(&mut self, extra: &MoveValueFact) {
         fn add_headers(
             reachable: &mut std::collections::BTreeSet<StorageGeneration>,
             headers: &ProjectedHeaderFact,
@@ -30805,6 +30952,33 @@ impl BorrowState {
         }
 
         let mut reachable = std::collections::BTreeSet::new();
+        let mut header_reachable = std::collections::BTreeSet::new();
+        for headers in self.headers.values().chain(self.value_headers.values()).chain(self.pipeline_headers.values()) {
+            add_headers(&mut header_reachable, headers);
+        }
+        add_headers(&mut header_reachable, &extra.headers);
+        loop {
+            let before = header_reachable.len();
+            for generation in header_reachable.clone() {
+                if let Some(content) = self.storage.contents.entries.get(&generation) {
+                    add_headers(&mut header_reachable, &content.headers);
+                }
+            }
+            if before == header_reachable.len() { break; }
+        }
+        fn add_roots(reachable: &mut std::collections::BTreeSet<StorageGeneration>, roots: &BorrowRoots) {
+            reachable.extend(roots.iter().filter_map(|root| match root {
+                BorrowRoot::Observation(generation) | BorrowRoot::EndedObservation(generation, _) => Some(generation.clone()),
+                _ => None,
+            }));
+        }
+        for roots in self.sources.values().chain(self.value_sources.values()).chain(self.pipeline_sources.values()) {
+            add_roots(&mut reachable, roots);
+        }
+        for fact in self.facts.values() {
+            add_roots(&mut reachable, &fact.flatten());
+        }
+        add_roots(&mut reachable, &extra.non_storage.flatten());
         for headers in self
             .headers
             .values()
@@ -30813,12 +30987,13 @@ impl BorrowState {
         {
             add_headers(&mut reachable, headers);
         }
-        add_headers(&mut reachable, extra);
+        add_headers(&mut reachable, &extra.headers);
         loop {
             let before = reachable.len();
             for generation in reachable.clone() {
                 if let Some(content) = self.storage.contents.entries.get(&generation) {
                     add_headers(&mut reachable, &content.headers);
+                    add_roots(&mut reachable, &content.non_storage.flatten());
                 }
             }
             if reachable.len() == before {
@@ -30833,6 +31008,18 @@ impl BorrowState {
             .contents
             .entries
             .retain(|generation, _| reachable.contains(generation));
+        // A scalar observation retains caller-origin metadata, not a live owner header. Its
+        // edge-local invalidity is already in the observer facts; carrying a sticky release end
+        // into a peer's still-live owner would reject a fresh observation after an optional
+        // replacement. Array/header ending semantics are unchanged.
+        for (generation, entry) in &mut self.storage.directory.entries {
+            if entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque)
+                && !header_reachable.contains(generation)
+            {
+                entry.ended = None;
+                entry.releases.clear();
+            }
+        }
     }
 
     fn resolve_headers(&self, headers: &ProjectedHeaderFact) -> MoveValueFact {
@@ -30872,12 +31059,16 @@ impl BorrowState {
                         | StorageGeneration::ParameterValue { .. } => BorrowRoots::new(),
                     };
                     if let Some(entry) = state.storage.directory.entries.get(generation) {
-                        owners.extend(
-                            entry
-                                .releases
-                                .iter()
-                                .filter_map(|release| BorrowRoot::release(generation, release)),
-                        );
+                        if entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque) {
+                            owners = [BorrowRoot::Observation(generation.clone())].into();
+                        } else {
+                            owners.extend(
+                                entry
+                                    .releases
+                                    .iter()
+                                    .filter_map(|release| BorrowRoot::release(generation, release)),
+                            );
+                        }
                         if let Some(how) = entry.ended {
                             owners = if owners.is_empty() {
                                 // Staging/arena/loop-result/returned releases have no user-facing
@@ -30918,12 +31109,15 @@ impl BorrowState {
             .flat_map(|leaf| leaf.generations.iter())
         {
             let generation = &reference.generation;
+            let entry = self.storage.directory.entries.get(generation);
+            if entry.is_some_and(|entry| entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque)) {
+                roots.insert(BorrowRoot::Observation(generation.clone()));
+                continue;
+            }
             if let StorageGeneration::CallerStorage { parameter, .. } = generation {
                 roots.insert(BorrowRoot::ParamStorage(*parameter));
             }
-            let Some(entry) = self.storage.directory.entries.get(generation) else {
-                continue;
-            };
+            let Some(entry) = entry else { continue; };
             for release in &entry.releases {
                 if let Some(root) = BorrowRoot::release(generation, release) {
                     roots.insert(root);
@@ -30942,7 +31136,7 @@ impl BorrowState {
         destination_prefix: &[BorrowProjection],
     ) {
         for header in typed {
-            if header.kind != StorageHeaderKind::OwnedDynamic {
+            if !header.kind.owns_storage() {
                 continue;
             }
             let Some(leaf) = headers.leaves.get(&header.path) else {
@@ -31010,6 +31204,9 @@ impl BorrowState {
                 continue;
             };
             historical_roots.extend(entry.historical_release_roots.iter().cloned());
+            if entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque) {
+                historical_roots.insert(BorrowRoot::Observation(generation.clone()));
+            }
             entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
         }
         self.mark_matching_roots_ended(how, |root| historical_roots.contains(root));
@@ -31880,6 +32077,10 @@ impl<'a> MoveCheck<'a> {
             let hir_depth::BodyEvent::ExprEnter(expression) = event else {
                 continue;
             };
+            if let Some(reader) = Self::reader_action_receiver(expression) {
+                arguments.insert(Self::expr_key(reader));
+                places.insert(Self::expr_key(reader));
+            }
             let (call_arguments, modes) = match &expression.kind {
                 ExprKind::Call { func, args, .. } => (
                     args.as_slice(),
@@ -32069,7 +32270,7 @@ impl<'a> MoveCheck<'a> {
         self.validate_value_snapshot(key, key, value.span);
         self.transfer_completed_value_to_returned(value);
         self.borrows.end_all_staging_releases(BorrowEnd::Dropped);
-        self.return_roots.extend(self.borrow_sources(value));
+        self.return_roots.extend(self.borrows.summary_roots(self.borrow_sources(value)));
     }
 
     fn check(mut self) -> MoveCheckResult {
@@ -32162,7 +32363,7 @@ impl<'a> MoveCheck<'a> {
             // The storage directory is authoritative after a mutable transition. Reading the
             // legacy projected fact here would preserve the destination's pre-call roots after a
             // strong content clear, and would miss a Copy view rebound to another parameter.
-            let mut roots = self.local_borrow_fact(local).flatten();
+            let mut roots = self.borrows.summary_roots(self.local_borrow_fact(local).flatten());
             if mode == ast::ParamMode::BorrowMut
                 && !self
                     .borrows
@@ -33404,48 +33605,16 @@ impl<'a> MoveCheck<'a> {
                 if header.kind == StorageHeaderKind::View {
                     continue;
                 }
-                self.borrows.end_release(
-                    &MoveReleasePlace::Local {
-                        local: place.root,
-                        path: destination_path.clone(),
-                    },
-                    BorrowEnd::Consumed,
-                );
                 let generation = StorageGeneration::current(StorageOrigin::CallMutation {
                     call: action_key,
                     destination_parameter: *index as u32,
                     path: destination_path.clone().into(),
                 });
-                self.borrows.storage.directory.entries.insert(
-                    generation.clone(),
-                    MoveGenerationEntry::new(
-                        &generation,
-                        Some(StorageHeaderDescriptor {
-                            ty: header.ty,
-                            kind: header.kind,
-                        }),
-                        [MoveReleasePlace::Local {
-                            local: place.root,
-                            path: destination_path,
-                        }]
-                        .into_iter()
-                        .collect(),
-                    ),
-                );
-                self.borrows
-                    .storage
-                    .contents
-                    .entries
-                    .insert(generation.clone(), incoming_content.clone());
                 replacement.leaves.insert(
                     header.path.clone(),
-                    StorageHeaderLeaf::known_typed(
-                        generation,
-                        StorageHeaderDescriptor {
-                            ty: header.ty,
-                            kind: header.kind,
-                        },
-                    ),
+                    self.replace_projected_generation(place.root, &destination_path,
+                        StorageHeaderDescriptor { ty: header.ty, kind: header.kind },
+                        generation, incoming_content.clone()),
                 );
             }
             let mut destination = self.local_headers(place.root);
@@ -33482,6 +33651,10 @@ impl<'a> MoveCheck<'a> {
             }
         }
         for (index, _, roots) in &exclusive_roots {
+            let roots = roots.iter().filter(|root| {
+                !matches!(root, BorrowRoot::Observation(_))
+                    || destinations.iter().any(|(destination, ..)| destination == index)
+            }).cloned().collect::<BorrowRoots>();
             if args.get(*index).is_some_and(|argument| {
                 matches!(
                     expand_tagged_ty(argument.ty, self.tagged_types),
@@ -33504,13 +33677,13 @@ impl<'a> MoveCheck<'a> {
                 .map(|place| place.root)
             {
                 self.borrows.invalidate_roots_except_local(
-                    roots,
+                    &roots,
                     BorrowEnd::Consumed,
                     owner,
                 );
             } else {
                 self.borrows
-                    .invalidate_roots(roots, BorrowEnd::Consumed);
+                    .invalidate_roots(&roots, BorrowEnd::Consumed);
             }
         }
         let mut backing_updates = std::collections::HashMap::new();
@@ -33565,6 +33738,14 @@ impl<'a> MoveCheck<'a> {
                             );
                             post.value = self.normalize_borrow_fact(argument.ty, incoming.clone());
                             post.storage = replacement_storage.join(&post.value);
+                            if let Some(place) = Self::mutable_actual_place(argument) {
+                                let path = place.path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+                                let headers = self.local_headers(place.root).project_path(&path);
+                                let opaque = ProjectedHeaderFact { leaves: headers.leaves.into_iter()
+                                    .filter(|(_, leaf)| leaf.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque))
+                                    .collect() };
+                                post.storage = post.storage.join(&self.borrows.resolve_headers(&opaque).non_storage);
+                            }
                             post.backing = replacement
                                 .clone()
                                 .unwrap_or_else(MutableBackingFact::unknown);
@@ -33711,6 +33892,7 @@ impl<'a> MoveCheck<'a> {
 
     fn backing_root_local(&self, root: &BorrowRoot) -> Option<LocalId> {
         match root {
+            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
             BorrowRoot::Local(local) | BorrowRoot::StorageLocal(_, local, _) => Some(*local),
             BorrowRoot::ParamStorage(position) => {
                 self.f.params.get(*position as usize).copied()
@@ -35442,7 +35624,8 @@ impl<'a> MoveCheck<'a> {
                     .map(|arena| MoveReleasePlace::ArenaScope { arena })
                     .into_iter()
                     .collect()
-            } else if result.initializer != StorageContentInitializer::CallSummary
+            } else if result.header_kind != Some(StorageHeaderKind::OwnedOpaque)
+                && result.initializer != StorageContentInitializer::CallSummary
                 && let Some(arena) = active_arena
             {
                 // Language materializers inside an arena allocate in that enclosing region. Call
@@ -35465,8 +35648,12 @@ impl<'a> MoveCheck<'a> {
                     releases,
                 )),
                 content: Some(MoveValueFact {
-                    non_storage: fact.project_path(&result.path),
-                    headers: if result.initializer
+                    non_storage: if result.header_kind == Some(StorageHeaderKind::OwnedOpaque) {
+                        BorrowFact::default()
+                    } else { fact.project_path(&result.path) },
+                    headers: if result.header_kind == Some(StorageHeaderKind::OwnedOpaque) {
+                        ProjectedHeaderFact::default()
+                    } else if result.initializer
                         == StorageContentInitializer::CallSummary
                     {
                         result
@@ -35610,6 +35797,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn validate_value_snapshot(&mut self, action: usize, snapshot: usize, span: Span) {
+        self.validate_mutable_place_snapshot(action, snapshot, span);
         let Some((root, how)) = self.ended_value_snapshot(snapshot) else {
             return;
         };
@@ -35620,6 +35808,9 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         let message = match root {
+            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
+                "value snapshot was invalidated before the enclosing operation: its reader observation ended".to_string()
+            }
             BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => {
                 let owner = self
                     .f
@@ -35706,6 +35897,24 @@ impl<'a> MoveCheck<'a> {
                     ..
                 }
         )
+    }
+
+    fn reader_action_receiver(expression: &Expr) -> Option<&Expr> {
+        match &expression.kind {
+            ExprKind::XmlNext { reader } | ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeCount { reader } | ExprKind::XmlText { reader }
+            | ExprKind::XmlAttributeName { reader, .. }
+            | ExprKind::XmlAttributeValue { reader, .. } => Some(reader),
+            _ => None,
+        }
+    }
+
+    fn retire_reader_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
+        if let Some(reader) = Self::reader_action_receiver(expression) {
+            let key = Self::expr_key(reader);
+            self.clear_value_snapshot(key);
+            children.retain(|snapshot| *snapshot != key);
+        }
     }
 
     /// A mutable operand is deliberately advanced by its own enclosing action. Validating that
@@ -36187,6 +36396,7 @@ impl<'a> MoveCheck<'a> {
 
     fn root_is_region_capability(&self, root: &BorrowRoot) -> bool {
         let local = match root {
+            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
             BorrowRoot::Local(local)
             | BorrowRoot::StorageLocal(_, local, _)
             | BorrowRoot::EndedLocal(local, _)
@@ -36769,6 +36979,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
             // Logger construction transfers the writer without widening or severing its region.
             ExprKind::LogNew { output, .. } => self.borrow_sources(output),
+            ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeName { reader, .. } => self.storage_roots(reader),
             ExprKind::CodecOpen { input } => self.storage_roots(input),
             ExprKind::CodecBatchName { batch, .. }
             | ExprKind::CodecBatchI64s { batch, .. }
@@ -37143,6 +37355,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CryptoPrivateKeyFromPem { .. } | ExprKind::CryptoPublicKeyFromPem { .. }
             | ExprKind::CryptoPublicKeyFromJwk { .. } | ExprKind::CryptoSign { .. }
             | ExprKind::CryptoVerify { .. }
+            | ExprKind::XmlParse { .. }
+            | ExprKind::XmlNext { .. }
+            | ExprKind::XmlAttributeCount { .. }
+            | ExprKind::XmlAttributeValue { .. }
+            | ExprKind::XmlText { .. }
             // std.regex: a compiled `regex` is a freshly owned Move handle (it copies the pattern
             // into the automaton); `is_match` is a `bool`; `find`/`find_at` yield an `Option<regex_match>`
             // whose `{start,end}` are Copy byte offsets, NOT a view into the text; `find_all`/`split`
@@ -37418,7 +37635,7 @@ impl<'a> MoveCheck<'a> {
             let owned_paths = typed
                 .headers
                 .iter()
-                .filter(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+                .filter(|header| header.kind.owns_storage())
                 .map(|header| {
                     let mut path = destination_prefix.to_vec();
                     path.extend(&header.path);
@@ -37549,7 +37766,7 @@ impl<'a> MoveCheck<'a> {
                     leaves: typed
                         .headers
                         .iter()
-                        .filter(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+                        .filter(|header| header.kind.owns_storage())
                         .filter_map(|header| {
                             transferable
                                 .leaves
@@ -37892,7 +38109,7 @@ impl<'a> MoveCheck<'a> {
                 storage_type_paths(record.ty, self.storage_type_context())
                     .headers
                     .iter()
-                    .any(|header| header.kind == StorageHeaderKind::OwnedDynamic)
+                    .any(|header| header.kind.owns_storage())
             })
     }
 
@@ -37902,7 +38119,7 @@ impl<'a> MoveCheck<'a> {
             .headers
             .iter()
             .any(|header| {
-                header.kind == StorageHeaderKind::OwnedDynamic
+                header.kind.owns_storage()
                     && headers.leaves.contains_key(&header.path)
             })
     }
@@ -38021,6 +38238,7 @@ impl<'a> MoveCheck<'a> {
     ) {
         for root in roots {
             let owner = match root {
+                BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
                 BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => Some(*owner),
                 BorrowRoot::Param(position) | BorrowRoot::ParamStorage(position) => {
                     self.f.params.get(*position as usize).copied()
@@ -38069,6 +38287,7 @@ impl<'a> MoveCheck<'a> {
             .end_generations(generations, BorrowEnd::Consumed);
         for root in storage_roots {
             match root {
+                BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {}
                 BorrowRoot::Local(owner) => {
                     self.invalidate_mutable_place(owner, &[]);
                     if !generation_backed {
@@ -38114,6 +38333,64 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// One exact replacement authority for native cursor advancement and mutable call effects.
+    /// Opaque leaves retain the selected release owner and caller origin, but end the old
+    /// observation even when borrowed storage has no release place in this frame.
+    fn replace_projected_generation(
+        &mut self,
+        local: LocalId,
+        path: &[BorrowProjection],
+        descriptor: StorageHeaderDescriptor,
+        generation: StorageGeneration,
+        incoming: MoveValueFact,
+    ) -> StorageHeaderLeaf {
+        let opaque = descriptor.kind == StorageHeaderKind::OwnedOpaque;
+        let mut releases = std::collections::BTreeSet::new();
+        let mut caller_origins = std::collections::BTreeSet::new();
+        if opaque {
+            let old = self.local_headers(local).project_path(path);
+            let generations = old.leaves.get(&Vec::new()).into_iter()
+                .flat_map(|leaf| leaf.generations.iter()).map(|r| r.generation.clone())
+                .collect::<Vec<_>>();
+            for old in &generations {
+                if let Some(entry) = self.borrows.storage.directory.entries.get(old) {
+                    releases.extend(entry.releases.iter().cloned());
+                    caller_origins.extend(entry.caller_origins.iter().copied());
+                }
+            }
+            let observations = generations.into_iter().map(BorrowRoot::Observation).collect::<BorrowRoots>();
+            self.borrows.mark_matching_roots_ended(BorrowEnd::Consumed, |root| observations.contains(root));
+            self.borrows.invalidate_roots(&observations, BorrowEnd::Consumed);
+        } else {
+            let release = MoveReleasePlace::Local { local, path: path.to_vec() };
+            self.borrows.end_release(&release, BorrowEnd::Consumed);
+            releases.insert(release);
+        }
+        let mut entry = MoveGenerationEntry::new(&generation, Some(descriptor), releases);
+        entry.caller_origins = caller_origins;
+        self.borrows.storage.directory.entries.insert(generation.clone(), entry);
+        self.borrows.storage.contents.entries.insert(generation.clone(),
+            if opaque { MoveValueFact::default() } else { incoming });
+        StorageHeaderLeaf::known_typed(generation, descriptor)
+    }
+
+    fn advance_reader_observation(&mut self, action: &Expr, reader: &Expr) {
+        let Some(place) = Self::mutable_actual_place(reader) else { return; };
+        self.mark_borrow_mut_modified(place.root);
+        self.invalidate_source_mutation_target(reader);
+        let path = place.path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+        let origin = StorageOrigin::CallMutation {
+            call: Self::expr_key(action), destination_parameter: 0, path: path.clone().into(),
+        };
+        self.apply_generation_renames(&StorageGenerationRenames::from_origins([origin.clone()]));
+        let leaf = self.replace_projected_generation(place.root, &path,
+            StorageHeaderDescriptor { ty: Ty::XmlReader, kind: StorageHeaderKind::OwnedOpaque },
+            StorageGeneration::current(origin), MoveValueFact::default());
+        let mut headers = self.local_headers(place.root);
+        headers.replace_path(&path, ProjectedHeaderFact { leaves: [(Vec::new(), leaf)].into() });
+        self.borrows.headers.insert(place.root, headers);
+    }
+
     /// Whether MIR emits a drop for this local — the same boundary predicate that builds
     /// `Fn::drop_locals`, so sema's scope-end invalidation covers exactly the locals whose storage
     /// is actually freed. A local outside this set is never dropped early, so views into it stay
@@ -38138,6 +38415,7 @@ impl<'a> MoveCheck<'a> {
     /// local not yet bound on this path has no live borrower to invalidate.
     fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
         let ended = |root: &BorrowRoot| match root {
+            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => false,
             BorrowRoot::Local(id) => drops.contains(id),
             BorrowRoot::StorageLocal(..) => false,
             BorrowRoot::IterTemp(d) => *d >= depth,
@@ -38240,6 +38518,9 @@ impl<'a> MoveCheck<'a> {
             .get(local as usize)
             .map_or("<borrow>", |l| l.name.as_str());
         let msg = match (root, how) {
+            (BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..), _) => format!(
+                "use of invalidated borrow '{borrower}': its reader was advanced, replaced, consumed, or dropped; create a new view from the current reader"
+            ),
             (BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _), _) => {
                 let source = self
                     .f
@@ -38396,6 +38677,9 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let message = match root {
+            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
+                "pipeline source snapshot was invalidated before terminal action: its reader observation ended".to_string()
+            }
             BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => {
                 let owner = self
                     .f
@@ -38776,7 +39060,7 @@ impl<'a> MoveCheck<'a> {
                     // Control expressions establish match-arm payload bindings while they are
                     // walked. Query after that walk so an explicit `return match ...` observes the
                     // same binding provenance as a trailing match expression.
-                    self.return_roots.extend(self.borrow_sources(e));
+                    self.return_roots.extend(self.borrows.summary_roots(self.borrow_sources(e)));
                     self.collect_borrow_mut_exit_roots();
                 }
                 Stmt::Return(None) => {
@@ -39156,7 +39440,7 @@ impl<'a> MoveCheck<'a> {
         }
         self.begin_value_snapshot_frame();
         let falls_through = self.expr_inner(e, moved, consuming, direct);
-        let child_snapshots = self.finish_value_snapshot_frame();
+        let mut child_snapshots = self.finish_value_snapshot_frame();
         if falls_through
             && !Self::defers_child_snapshot_validation(&e.kind)
         {
@@ -39183,6 +39467,7 @@ impl<'a> MoveCheck<'a> {
                     self.record_parent_value_snapshot(key);
                 }
             }
+            self.retire_reader_action_input(e, &mut child_snapshots);
             self.finish_child_staging_frontier(e, &child_snapshots);
             self.record_parent_value_snapshots(&child_snapshots);
         }
@@ -40062,7 +40347,7 @@ impl<'a> MoveCheck<'a> {
                 } => {
                     let falls_through =
                         values.pop().expect("Move expression result");
-                    let child_snapshots = self.finish_value_snapshot_frame();
+                    let mut child_snapshots = self.finish_value_snapshot_frame();
                     if falls_through
                         && !Self::defers_child_snapshot_validation(
                             &expression.kind,
@@ -40103,6 +40388,9 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     let ownership_action = Self::kind_has_ownership_action(&expression.kind);
+                    if falls_through {
+                        self.retire_reader_action_input(expression, &mut child_snapshots);
+                    }
                     if falls_through && !ownership_action {
                         self.finish_child_staging_frontier(expression, &child_snapshots);
                         self.record_parent_value_snapshots(&child_snapshots);
@@ -40122,6 +40410,7 @@ impl<'a> MoveCheck<'a> {
     fn action_values(expression: &Expr) -> Vec<&Expr> {
         match &expression.kind {
             ExprKind::LogNew { output, .. } => vec![output],
+            ExprKind::XmlParse { input } => vec![input],
             ExprKind::StructLit { fields, .. } => fields.iter().collect(),
             ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
                 elems.iter().collect()
@@ -40225,7 +40514,7 @@ impl<'a> MoveCheck<'a> {
         }
         let headers = self.forwarded_headers(expression);
         for (operand, header) in typed.headers.into_iter().enumerate() {
-            if header.kind != StorageHeaderKind::OwnedDynamic {
+            if !header.kind.owns_storage() {
                 continue;
             }
             let Some(leaf) = headers.leaves.get(&header.path) else {
@@ -40284,7 +40573,7 @@ impl<'a> MoveCheck<'a> {
                 continue;
             };
             match header.kind {
-                StorageHeaderKind::OwnedDynamic => {
+                StorageHeaderKind::OwnedDynamic | StorageHeaderKind::OwnedOpaque => {
                     for reference in &leaf.generations {
                         let Some(entry) = self
                             .borrows
@@ -40352,7 +40641,7 @@ impl<'a> MoveCheck<'a> {
                 continue;
             };
             match header.kind {
-                StorageHeaderKind::OwnedDynamic => {
+                StorageHeaderKind::OwnedDynamic | StorageHeaderKind::OwnedOpaque => {
                     for reference in &leaf.generations {
                         let Some(entry) = self
                             .borrows
@@ -40482,6 +40771,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultErr(_)
             | ExprKind::EnumValue { .. }
             | ExprKind::LogNew { .. }
+            | ExprKind::XmlParse { .. }
             | ExprKind::Closure { .. }
                 if !deferred_action =>
             {
@@ -40617,6 +40907,10 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RandSample { rng, .. } => {
                 Some(SourceVisibleMutationAction::Source(rng))
             }
+            // Advancing the cursor invalidates every zero-copy name view of the current event.
+            // Treat the reader's owned input as mutable storage so both local and borrow-mut
+            // parameter roots end at this exact call boundary.
+            ExprKind::XmlNext { reader } => Some(SourceVisibleMutationAction::Storage(reader)),
             ExprKind::RandShuffle { rng, xs, .. } => {
                 Some(SourceVisibleMutationAction::Shuffle {
                     source: rng,
@@ -40651,6 +40945,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::ResultErr(_)
                 | ExprKind::EnumValue { .. }
                 | ExprKind::LogNew { .. }
+                | ExprKind::XmlParse { .. }
                 | ExprKind::Closure { .. }
         )
     }
@@ -40659,6 +40954,10 @@ impl<'a> MoveCheck<'a> {
     /// Opaque handle interiors are deliberately absent: only operations that replace a visible
     /// source place or write a caller-visible collection backing end a place reservation.
     fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        if let ExprKind::XmlNext { reader } = &expression.kind {
+            self.advance_reader_observation(expression, reader);
+            return;
+        }
         let Some(action) = Self::source_visible_mutation_action(&expression.kind) else {
             return;
         };
@@ -41726,7 +42025,7 @@ impl<'a> MoveCheck<'a> {
                         self.transfer_completed_value_to_returned(value);
                         self.end_active_staging_releases(false, BorrowEnd::Dropped);
                         self.return_roots
-                            .extend(self.borrow_sources(value));
+                            .extend(self.borrows.summary_roots(self.borrow_sources(value)));
                         self.collect_borrow_mut_exit_roots();
                     }
                     falls_through = false;
@@ -41937,7 +42236,7 @@ impl<'a> MoveCheck<'a> {
                     falls_through.then_some(BorrowEnd::Dropped),
                 );
             }
-            let child_snapshots = self.finish_value_snapshot_frame();
+            let mut child_snapshots = self.finish_value_snapshot_frame();
             if !falls_through {
                 self.non_fallthrough.insert(wrapper.span);
             } else {
@@ -41950,7 +42249,7 @@ impl<'a> MoveCheck<'a> {
                         self.tagged_types,
                     )
                 {
-                    self.return_roots.extend(error_roots);
+                    self.return_roots.extend(self.borrows.summary_roots(error_roots));
                 }
                 if !Self::defers_child_snapshot_validation(&wrapper.kind) {
                     for &snapshot in &child_snapshots {
@@ -41971,6 +42270,7 @@ impl<'a> MoveCheck<'a> {
                         self.record_parent_value_snapshot(key);
                     }
                 }
+                self.retire_reader_action_input(wrapper, &mut child_snapshots);
                 self.finish_child_staging_frontier(wrapper, &child_snapshots);
                 self.record_parent_value_snapshots(&child_snapshots);
             }
@@ -42643,7 +42943,7 @@ impl<'a> MoveCheck<'a> {
                     self.enums,
                     self.tagged_types,
                 ) {
-                    self.return_roots.extend(error_roots);
+                    self.return_roots.extend(self.borrows.summary_roots(error_roots));
                 }
             }
             // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
@@ -42683,6 +42983,16 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, message, moved, false, false);
             }
             ExprKind::LogFlush { logger } => move_expr!(self, logger, moved, false, false),
+            ExprKind::XmlParse { input } => move_expr_deferred!(self, input, moved),
+            ExprKind::XmlNext { reader }
+            | ExprKind::XmlName { reader }
+            | ExprKind::XmlAttributeCount { reader }
+            | ExprKind::XmlText { reader } => move_expr!(self, reader, moved, false, false),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, index, moved, false, false);
+            }
             ExprKind::CodecOpen { input } => move_expr!(self, input, moved, false, false),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch }
@@ -43906,6 +44216,8 @@ struct Checker<'a, 't> {
     json_kind_enum_id: u32,
     /// The id of the builtin `log.level` enum. Runtime calls receive only its validated field 0.
     log_level_enum_id: u32,
+    /// The id of the builtin `xml.event` enum returned by `xml.reader.next()`.
+    xml_event_enum_id: u32,
     /// The id of the builtin `codec.kind` enum. Its ordinal is the canonical wire tag.
     codec_kind_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
@@ -44133,6 +44445,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `Error`), so its id is always present in `enum_ids`.
             json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
             log_level_enum_id: *enum_ids.get("log.level").expect("builtin log.level enum registered"),
+            xml_event_enum_id: *enum_ids
+                .get("xml.event")
+                .expect("builtin xml.event enum registered"),
             codec_kind_enum_id: *enum_ids.get("codec.kind").expect("builtin codec.kind enum registered"),
             structs,
             struct_templates,
@@ -46995,6 +47310,17 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return Ok(Some("codec.kind".to_string()));
         }
+        if flat == "xml.event" {
+            if !self.imports.contains("std.xml") {
+                self.diags.error(
+                    "`xml.event` requires `import std.xml` — the capability is not imported"
+                        .to_string(),
+                    recv.span,
+                );
+                return Err(());
+            }
+            return Ok(Some("xml.event".to_string()));
+        }
         if let Some(alias) = builtin_nominal_alias_by_explicit(&flat) {
             if let Some(required) = alias.required_import
                 && !self.imports.contains(required)
@@ -49498,6 +49824,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.log", "log.new", span);
                 return self.check_log_new(args, span);
             }
+            if module == "xml" && method == "parse" {
+                self.require_import("std.xml", "xml.parse", span);
+                return self.check_xml_parse(args, span);
+            }
             if module == "codec" && matches!(method, "open" | "encoder") {
                 self.require_import("core.codec", &format!("codec.{method}"), span);
                 return self.check_codec_constructor(method, args, span);
@@ -49940,6 +50270,30 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
+        }
+        if matches!(
+            method,
+            "next" | "name" | "attribute_count" | "attribute_name" | "attribute_value" | "text"
+        ) && self
+            .resolve_place(recv)
+            .is_some_and(|(_, _, ty)| ty == Ty::XmlReader)
+        {
+            let recv_expr = self.check_expr(recv, None);
+            return self.check_xml_reader_method(recv, recv_expr, method, args, span);
+        }
+        if matches!(
+            method,
+            "attribute_count" | "attribute_name" | "attribute_value" | "text"
+        ) {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Error {
+                return err;
+            }
+            self.diags.error(
+                format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                span,
+            );
+            return err;
         }
         if matches!(
             method,
@@ -61308,6 +61662,137 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::WriterStd { fd, buffered: true }, ty: Ty::Writer, span }
     }
 
+    fn check_xml_parse(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [input] = args else {
+            self.diags.error(
+                format!(
+                    "'xml.parse' expects 1 owned string argument, got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err;
+        };
+        let input = self.check_expr(input, Some(Ty::String));
+        if input.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::XmlParse {
+                input: Box::new(input),
+            },
+            ty: Ty::Result(Scalar::XmlReader, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    fn check_xml_reader_method(
+        &mut self,
+        recv: &ast::Expr,
+        recv_expr: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Expr {
+        let err = Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        self.require_import("std.xml", &format!("xml.reader.{method}"), span);
+        let Some((reader_id, _)) = self.place_local(recv) else {
+            self.diags.error(
+                format!("'.{method}()' needs a bound xml.reader local"),
+                recv.span,
+            );
+            return err;
+        };
+        if method == "next" && !self.locals[reader_id as usize].is_mut {
+            let name = self.locals[reader_id as usize].name.clone();
+            self.diags.error(
+                format!("cannot advance immutable xml.reader '{name}' (declare with `mut`)"),
+                recv.span,
+            );
+            return err;
+        }
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        match method {
+            "next" | "name" | "attribute_count" | "text" => {
+                if !args.is_empty() {
+                    self.diags.error(
+                        format!("'.{method}()' takes no arguments, got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let kind = match method {
+                    "next" => ExprKind::XmlNext {
+                        reader: Box::new(recv_expr),
+                    },
+                    "name" => ExprKind::XmlName {
+                        reader: Box::new(recv_expr),
+                    },
+                    "attribute_count" => ExprKind::XmlAttributeCount {
+                        reader: Box::new(recv_expr),
+                    },
+                    "text" => ExprKind::XmlText {
+                        reader: Box::new(recv_expr),
+                    },
+                    _ => unreachable!(),
+                };
+                let ty = match method {
+                    "next" => Ty::Option(Scalar::Enum(self.xml_event_enum_id)),
+                    "name" => Ty::Str,
+                    "attribute_count" => i64_ty,
+                    "text" => Ty::String,
+                    _ => unreachable!(),
+                };
+                Expr { kind, ty, span }
+            }
+            "attribute_name" | "attribute_value" => {
+                let [index] = args else {
+                    self.diags.error(
+                        format!("'.{method}()' takes 1 index argument, got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                };
+                let index = self.check_expr(index, None);
+                if index.ty == Ty::Error
+                    || !self.require_i64_arg(index.ty, index.span, &format!("'.{method}()' index"))
+                {
+                    return err;
+                }
+                let ty = if method == "attribute_name" {
+                    Ty::Str
+                } else {
+                    Ty::String
+                };
+                let kind = if method == "attribute_name" {
+                    ExprKind::XmlAttributeName {
+                        reader: Box::new(recv_expr),
+                        index: Box::new(index),
+                    }
+                } else {
+                    ExprKind::XmlAttributeValue {
+                        reader: Box::new(recv_expr),
+                        index: Box::new(index),
+                    }
+                };
+                Expr { kind, ty, span }
+            }
+            _ => unreachable!("xml reader dispatch is closed"),
+        }
+    }
+
     /// `log.new(output, minimum)` transfers one writer into a region-identical logger. Both
     /// arguments are checked before move analysis consumes `output`.
     fn check_log_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -64290,6 +64775,16 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(message);
             }
             ExprKind::LogFlush { logger } => self.finalize_expr(logger),
+            ExprKind::XmlParse { input }
+            | ExprKind::XmlNext { reader: input }
+            | ExprKind::XmlName { reader: input }
+            | ExprKind::XmlAttributeCount { reader: input }
+            | ExprKind::XmlText { reader: input } => self.finalize_expr(input),
+            ExprKind::XmlAttributeName { reader, index }
+            | ExprKind::XmlAttributeValue { reader, index } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(index);
+            }
             ExprKind::CodecOpen { input } => self.finalize_expr(input),
             ExprKind::CodecBatchRows { batch }
             | ExprKind::CodecBatchColumns { batch }
@@ -65009,6 +65504,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
     "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
     "std.log",
+    "std.xml",
 ];
 
 /// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
@@ -65338,6 +65834,7 @@ fn ty_name(ty: Ty) -> String {
         // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::Writer => "writer".to_string(),
         Ty::Logger => "log.logger".to_string(),
+        Ty::XmlReader => "xml.reader".to_string(),
         Ty::CodecBatch => "codec.batch".to_string(),
         Ty::CodecI64Column => "codec.i64_column".to_string(),
         Ty::CodecF64Column => "codec.f64_column".to_string(),
@@ -65745,6 +66242,7 @@ fn resolved_type_source_spelling(
             Ty::Builder => "builder".to_string(),
             Ty::Writer => "writer".to_string(),
             Ty::Logger => "log.logger".to_string(),
+            Ty::XmlReader => "xml.reader".to_string(),
             Ty::CodecBatch => "codec.batch".to_string(),
             Ty::CodecI64Column => "codec.i64_column".to_string(),
             Ty::CodecF64Column => "codec.f64_column".to_string(),
@@ -66872,7 +67370,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -66962,6 +67460,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::Reader
             | Ty::Writer
             | Ty::Logger
+            | Ty::XmlReader
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
@@ -67503,6 +68002,31 @@ fn resolve_type(
         } else {
             cx.enum_ids
                 .get("log.level")
+                .map(|&id| Ty::Enum(id))
+                .unwrap_or(Ty::Error)
+        };
+    }
+    // `std.xml` exposes one tag-only enum and one opaque Move reader, both qualified.
+    if path.segments.len() == 2
+        && path.segments[0].name == "xml"
+        && matches!(name, "event" | "reader")
+    {
+        if !cx.builtin_imports.contains("std.xml") {
+            diags.error(
+                format!("`xml.{name}` requires `import std.xml` — the capability is not imported"),
+                span,
+            );
+            return Ty::Error;
+        }
+        if !args.is_empty() {
+            diags.error(format!("`xml.{name}` takes no type arguments"), span);
+            return Ty::Error;
+        }
+        return if name == "reader" {
+            Ty::XmlReader
+        } else {
+            cx.enum_ids
+                .get("xml.event")
                 .map(|&id| Ty::Enum(id))
                 .unwrap_or(Ty::Error)
         };
@@ -68343,6 +68867,7 @@ pub fn is_move_handle(ty: Ty) -> bool {
 pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Writer,
     Ty::Logger,
+    Ty::XmlReader,
     Ty::CodecEncoder,
     Ty::Reader,
     Ty::Buffer,
@@ -68756,6 +69281,7 @@ fn enum_payload_ok(
         // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
         Scalar::ResponseBuilder
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
@@ -70118,7 +70644,7 @@ mod tests {
         // wildcard-free policy above classifies them explicitly beside the existing package and
         // core operations.
         assert_eq!(
-            variants, 315,
+            variants, 322,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

@@ -88,6 +88,16 @@ pub enum Effect {
     Unknown,
 }
 
+/// Producer-side proof state carried by each exported function record.
+///
+/// Generic bodies are re-lowered and validated in the consumer. A non-generic body is absent from
+/// the interface and may be trusted only when the producer validated its exact MIR first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProducerCertification {
+    RevalidateGenericBody,
+    ValidatedBody,
+}
+
 impl From<align_sema::FnEffect> for Effect {
     fn from(e: align_sema::FnEffect) -> Effect {
         match e {
@@ -145,6 +155,7 @@ pub struct IFnSig {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
+    pub producer_certification: ProducerCertification,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
@@ -450,6 +461,7 @@ pub fn build_summaries(
     program: &align_sema::hir::Program,
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
+    producer_certifications: &HashSet<String>,
     target: &OwnedJsonTarget,
 ) -> Result<Vec<InterfaceSummary>, String> {
     build_summaries_with_effects(
@@ -458,6 +470,7 @@ pub fn build_summaries(
         mir,
         sources,
         &HashMap::new(),
+        producer_certifications,
         target,
     )
 }
@@ -484,6 +497,7 @@ pub fn build_summaries_with_effects(
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
     external_effects: &HashMap<String, align_sema::FnEffect>,
+    producer_certifications: &HashSet<String>,
     target: &OwnedJsonTarget,
 ) -> Result<Vec<InterfaceSummary>, String> {
     let effects: HashMap<String, Effect> = align_sema::fn_effects(program, external_effects)
@@ -614,6 +628,11 @@ pub fn build_summaries_with_effects(
                             }
                             apply_function_cleanup_metadata(&mut ret, function.ret, program);
                         }
+                        if !is_generic && !producer_certifications.contains(&canonical) {
+                            return Err(format!(
+                                "function '{canonical}' lacks MIR producer certification"
+                            ));
+                        }
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -622,6 +641,11 @@ pub fn build_summaries_with_effects(
                             return_borrow,
                             return_region,
                             return_cleanup,
+                            producer_certification: if is_generic {
+                                ProducerCertification::RevalidateGenericBody
+                            } else {
+                                ProducerCertification::ValidatedBody
+                            },
                             effect,
                             parallel_transfer_params,
                             resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
@@ -1348,6 +1372,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("box", 1, BuiltinCapability::Opaque),
     ("array_builder", 1, BuiltinCapability::Opaque),
     ("buffer", 0, BuiltinCapability::Opaque),
+    ("xml.reader", 0, BuiltinCapability::Opaque),
     ("codec.encoder", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
@@ -1930,6 +1955,16 @@ impl<'a> CapabilityAnalysis<'a> {
             || self.contains_noncleanup_move_builtin(ty)
     }
 
+    fn parameter_may_supply_return_provenance(
+        &self,
+        parameter: &IParam,
+        type_params: &[ITypeParam],
+    ) -> bool {
+        self.may_borrow(&parameter.ty, type_params)
+            || (matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+                && self.may_supply_return_provenance(&parameter.ty, type_params))
+    }
+
     fn contains_noncleanup_move_builtin(&self, ty: &IType) -> bool {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
@@ -2394,7 +2429,7 @@ fn validate_import_summaries(
     let ret_may_supply_provenance = analysis.may_supply_return_provenance(ret, type_params);
     let param_may_supply_provenance = params
         .iter()
-        .map(|param| analysis.may_supply_return_provenance(&param.ty, type_params))
+        .map(|param| analysis.parameter_may_supply_return_provenance(param, type_params))
         .collect::<Vec<_>>();
     for roots in [
         match borrow {
@@ -2420,7 +2455,7 @@ fn validate_import_summaries(
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            let Some((parameter, &may_supply_provenance)) = params
+            let Some((_, &may_supply_provenance)) = params
                 .get(index as usize)
                 .zip(param_may_supply_provenance.get(index as usize))
             else {
@@ -2428,9 +2463,7 @@ fn validate_import_summaries(
                     index,
                 ));
             };
-            if !may_supply_provenance
-                && !matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
-            {
+            if !may_supply_provenance {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
@@ -2641,6 +2674,9 @@ pub fn summary_to_source(
                         "log.level" | "log.logger" => {
                             builtin_type_imports.insert("std.log".to_string());
                         }
+                        "xml.event" | "xml.reader" => {
+                            builtin_type_imports.insert("std.xml".to_string());
+                        }
                         "codec.kind"
                         | "codec.batch"
                         | "codec.i64_column"
@@ -2768,6 +2804,7 @@ pub fn summary_return_provenance(
                 function.return_region.clone(),
                 function.return_cleanup,
                 function.parallel_transfer_params.clone(),
+                function.producer_certification == ProducerCertification::ValidatedBody,
             ),
         );
     }
@@ -2893,6 +2930,45 @@ mod builtin_spelling_tests {
             align_sema::builtin_spelling_needs_return_cleanup("i08"),
             align_sema::builtin_spelling_needs_return_cleanup("i8"),
             "the bridge must classify an integer spelling exactly as the type resolver does"
+        );
+    }
+
+    #[test]
+    fn xml_reader_return_cleanup_is_authenticated_from_the_independent_builtin_inventory() {
+        let mut summary = InterfaceSummary {
+            unit: "xml_provider".to_owned(),
+            fns: vec![IFnSig {
+                name: "reader".to_owned(),
+                type_params: Vec::new(),
+                params: Vec::new(),
+                ret: IType::Named {
+                    path: "xml.reader".to_owned(),
+                    args: Vec::new(),
+                },
+                return_borrow: ReturnBorrowSummary::None,
+                return_region: ReturnRegionSummary::None,
+                return_cleanup: align_sema::hir::ReturnCleanupAbi::DynamicBit,
+                producer_certification: ProducerCertification::ValidatedBody,
+                effect: Effect::Pure,
+                parallel_transfer_params: Vec::new(),
+                resource_hook_body: false,
+                generic_body: None,
+            }],
+            structs: Vec::new(),
+            owned_json_graphs: Vec::new(),
+            enums: Vec::new(),
+            resources: Vec::new(),
+            consts: Vec::new(),
+            capabilities: Vec::new(),
+            interface_hash: Hash128 { lo: 0, hi: 0 },
+            impl_hash: Hash128 { lo: 0, hi: 0 },
+        };
+        assert!(validate_for_import(&summary).is_ok());
+
+        summary.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::None;
+        assert_eq!(
+            validate_for_import(&summary),
+            Err(ImportCompatibilityError::ReturnCleanupMismatch),
         );
     }
 }

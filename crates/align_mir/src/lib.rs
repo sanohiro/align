@@ -102,6 +102,8 @@ pub struct ImportedFn {
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
     pub return_cleanup: hir::ReturnCleanupAbi,
+    /// The format-9 dependency record was emitted only after producer validation.
+    pub producer_certified: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1506,6 +1508,34 @@ pub enum Rvalue {
     LogLineBuilder(Operand, Operand, Operand),
     /// `l.flush()` — expose the first latched or current writer flush status as i32.
     LogFlush(Operand),
+    /// Consume an owned string into a validated XML reader and return the final source Result.
+    /// `cleanup` is the atomic companion definition: true only for `Ok(reader)`.
+    XmlParse {
+        input: Operand,
+        error_enum: u32,
+        cleanup: ValueId,
+    },
+    /// Advance an XML reader and return the final `Option<xml.event>`.
+    XmlNext {
+        reader: Operand,
+        event_enum: u32,
+    },
+    /// Return a borrowed `{ptr,len}` name view or abort on a private runtime rejection.
+    XmlName {
+        reader: Operand,
+    },
+    XmlAttributeCount(Operand),
+    XmlAttributeName {
+        reader: Operand,
+        index: Operand,
+    },
+    XmlAttributeValue {
+        reader: Operand,
+        index: Operand,
+    },
+    XmlText {
+        reader: Operand,
+    },
     /// Validate a canonical `core.codec` envelope. The successful batch value is the unchanged
     /// input `{ptr,len}` and is wrapped by MIR only after this status is zero.
     CodecOpen(Operand),
@@ -3314,6 +3344,7 @@ fn lower_program_unchecked(
                     return_borrow: import.return_borrow.clone(),
                     return_region: import.return_region.clone(),
                     return_cleanup: import.return_cleanup,
+                    producer_certified: import.producer_certified,
                 })
                 .collect()
         } else {
@@ -7197,6 +7228,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
             | hir::ExprKind::LogFlush { .. } => lower_log_expr(b, e),
+            hir::ExprKind::XmlParse { .. }
+            | hir::ExprKind::XmlNext { .. }
+            | hir::ExprKind::XmlName { .. }
+            | hir::ExprKind::XmlAttributeCount { .. }
+            | hir::ExprKind::XmlAttributeName { .. }
+            | hir::ExprKind::XmlAttributeValue { .. }
+            | hir::ExprKind::XmlText { .. } => lower_xml_expr(b, e),
             hir::ExprKind::CodecOpen { .. }
             | hir::ExprKind::CodecBatchRows { .. }
             | hir::ExprKind::CodecBatchColumns { .. }
@@ -14994,6 +15032,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Reader
         | Scalar::Writer
         | Scalar::Logger
+        | Scalar::XmlReader
         | Scalar::Buffer
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
@@ -17382,6 +17421,136 @@ fn lower_log_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         _ => {
             debug_assert!(false, "lower_log_expr dispatcher admitted a non-logger operation");
+            Operand::Const(Const::Unit)
+        }
+    }
+}
+
+fn lower_xml_parse(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let input_operand = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let Ty::Result(Scalar::XmlReader, Scalar::Enum(error_enum)) = result_ty else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let result = b.fresh_value(result_ty);
+    let cleanup = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        result,
+        Rvalue::XmlParse {
+            input: input_operand,
+            error_enum,
+            cleanup,
+        },
+    ));
+    b.attach_value_drop_flag(result, Operand::Value(cleanup));
+    b.attach_value_temp_drop_flag(result, Operand::Value(cleanup));
+    // Every compiler-produced call passes mechanical preflight, so success and public parse
+    // failure both transfer the source allocation to the runtime before this source is nulled.
+    null_moved_source(b, input);
+    Operand::Value(result)
+}
+
+fn lower_xml_next(b: &mut Builder, reader: &hir::Expr, result_ty: Ty) -> Operand {
+    let reader_operand = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+    let Ty::Option(Scalar::Enum(event_enum)) = result_ty else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::XmlNext {
+            reader: reader_operand,
+            event_enum,
+        },
+    ));
+    Operand::Value(value)
+}
+
+fn lower_xml_output(
+    b: &mut Builder,
+    reader: &hir::Expr,
+    index: Option<&hir::Expr>,
+    result_ty: Ty,
+    make: impl FnOnce(Operand, Option<Operand>) -> Option<Rvalue>,
+    borrowed: bool,
+) -> Operand {
+    let reader_operand = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+    let index_operand = match index {
+        Some(index) => Some(lower_required!(
+            b,
+            lower_expr(b, index),
+            Operand::Const(Const::Unit)
+        )),
+        None => None,
+    };
+    let Some(rvalue) = make(reader_operand.clone(), index_operand) else {
+        b.terminate(Term::Unreachable);
+        return terminated_operand();
+    };
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, rvalue));
+    if borrowed {
+        inherit_borrow_owners(b, value, [&reader_operand]);
+    }
+    Operand::Value(value)
+}
+
+#[inline(never)]
+fn lower_xml_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::XmlParse { input } => lower_xml_parse(b, input, e.ty),
+        hir::ExprKind::XmlNext { reader } => lower_xml_next(b, reader, e.ty),
+        hir::ExprKind::XmlName { reader } => lower_xml_output(
+            b,
+            reader,
+            None,
+            e.ty,
+            |reader, _| Some(Rvalue::XmlName { reader }),
+            true,
+        ),
+        hir::ExprKind::XmlAttributeName { reader, index } => lower_xml_output(
+            b,
+            reader,
+            Some(index),
+            e.ty,
+            |reader, index| {
+                Some(Rvalue::XmlAttributeName {
+                    reader,
+                    index: index?,
+                })
+            },
+            true,
+        ),
+        hir::ExprKind::XmlAttributeValue { reader, index } => lower_xml_output(
+            b,
+            reader,
+            Some(index),
+            e.ty,
+            |reader, index| {
+                Some(Rvalue::XmlAttributeValue {
+                    reader,
+                    index: index?,
+                })
+            },
+            false,
+        ),
+        hir::ExprKind::XmlText { reader } => lower_xml_output(
+            b,
+            reader,
+            None,
+            e.ty,
+            |reader, _| Some(Rvalue::XmlText { reader }),
+            false,
+        ),
+        hir::ExprKind::XmlAttributeCount { reader } => {
+            let reader = lower_required!(b, lower_expr(b, reader), Operand::Const(Const::Unit));
+            let count = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(count, Rvalue::XmlAttributeCount(reader)));
+            Operand::Value(count)
+        }
+        _ => {
+            debug_assert!(false, "lower_xml_expr dispatcher admitted a non-XML operation");
             Operand::Const(Const::Unit)
         }
     }
@@ -21014,6 +21183,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Logger => "log.logger".to_string(),
+        Ty::XmlReader => "xml.reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::CodecBatch => "codec.batch".to_string(),
         Ty::CodecI64Column => "codec.i64_column".to_string(),

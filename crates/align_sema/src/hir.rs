@@ -160,6 +160,8 @@ pub struct ImportedFn {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: ReturnCleanupAbi,
+    /// The dependency interface was emitted only after producer validation of this body.
+    pub producer_certified: bool,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
     /// after declaration validation because imported callable ABI records are unchanged.
     pub effect: crate::FnEffect,
@@ -1193,6 +1195,35 @@ pub enum ExprKind {
     LogLine { logger: Box<Expr>, level: Box<Expr>, message: Box<Expr>, builder: bool },
     /// `l.flush()` — expose the first latched or current writer flush error as `Result<(), Error>`.
     LogFlush { logger: Box<Expr> },
+    /// `xml.parse(input)` — consume one owned string and validate the complete document.
+    XmlParse {
+        input: Box<Expr>,
+    },
+    /// Advance a mutably borrowed XML cursor and return `Option<xml.event>`.
+    XmlNext {
+        reader: Box<Expr>,
+    },
+    /// Borrow the current element name from the reader-owned input.
+    XmlName {
+        reader: Box<Expr>,
+    },
+    XmlAttributeCount {
+        reader: Box<Expr>,
+    },
+    /// Borrow one current attribute name by source-order index.
+    XmlAttributeName {
+        reader: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Decode one current attribute value into a fresh owned string.
+    XmlAttributeValue {
+        reader: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Decode the current text event into a fresh owned string.
+    XmlText {
+        reader: Box<Expr>,
+    },
     /// `codec.open(input)` — validate one complete canonical v1 envelope and borrow its bytes.
     CodecOpen { input: Box<Expr> },
     CodecBatchRows { batch: Box<Expr> },

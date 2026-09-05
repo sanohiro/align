@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -169,6 +169,13 @@ fn write_return_cleanup(w: &mut Writer, value: align_sema::hir::ReturnCleanupAbi
     });
 }
 
+fn write_producer_certification(w: &mut Writer, value: crate::ProducerCertification) {
+    w.u8(match value {
+        crate::ProducerCertification::RevalidateGenericBody => 0,
+        crate::ProducerCertification::ValidatedBody => 1,
+    });
+}
+
 fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.str(&f.name);
     write_type_params(w, &f.type_params);
@@ -177,6 +184,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_return_borrow(w, &f.return_borrow);
     write_return_region(w, &f.return_region);
     write_return_cleanup(w, f.return_cleanup);
+    write_producer_certification(w, f.producer_certification);
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     w.bool(f.resource_hook_body);
@@ -514,6 +522,19 @@ fn read_return_cleanup(
     }
 }
 
+fn read_producer_certification(
+    r: &mut Reader<'_>,
+) -> Result<crate::ProducerCertification, DecodeError> {
+    match r.u8()? {
+        0 => Ok(crate::ProducerCertification::RevalidateGenericBody),
+        1 => Ok(crate::ProducerCertification::ValidatedBody),
+        tag => Err(DecodeError::BadTag {
+            what: "producer certification",
+            tag,
+        }),
+    }
+}
+
 fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let name = r.str()?;
     let type_params = read_type_params(r)?;
@@ -522,11 +543,25 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let return_borrow = read_return_borrow(r, params.len())?;
     let return_region = read_return_region(r, params.len())?;
     let return_cleanup = read_return_cleanup(r)?;
+    let producer_certification = read_producer_certification(r)?;
     let effect = read_effect(r)?;
     let parallel_transfer_params = r.seq(|r| r.u32())?;
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
     let resource_hook_body = r.bool()?;
     let generic_body = r.opt_str()?;
+    let certification_matches_body = match producer_certification {
+        crate::ProducerCertification::RevalidateGenericBody => {
+            !type_params.is_empty() && generic_body.is_some()
+        }
+        crate::ProducerCertification::ValidatedBody => {
+            type_params.is_empty() && generic_body.is_none()
+        }
+    };
+    if !certification_matches_body {
+        return Err(DecodeError::InvalidSummary(
+            "producer certification disagrees with function body presence",
+        ));
+    }
     Ok(IFnSig {
         name,
         type_params,
@@ -535,6 +570,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         return_borrow,
         return_region,
         return_cleanup,
+        producer_certification,
         effect,
         parallel_transfer_params,
         resource_hook_body,

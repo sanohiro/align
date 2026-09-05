@@ -7,6 +7,13 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**XML investigation closure:** the owner requested one consolidated
+investigate-then-repair record instead of further piecemeal fix rounds. Read
+[`docs/impl/xml-producer-investigation.md`](docs/impl/xml-producer-investigation.md)
+for the complete classification, coherent repair, explicit non-findings, and
+owner evidence. The remaining workflow is PR verification, merge, and versioned
+release; stop after that release.
+
 **Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
 library work. If its owner proceeds with the intended release, complete that
 release before binding the consolidation baseline; this preparation does not
@@ -18,7 +25,7 @@ owns the sequence: baseline qualification -> S0A/S0B exact design and observatio
 reassessment. `std.time` named formatters, cloud packages, and additional
 transports are paused during this phase. S1–S6 are not a mandatory backlog.
 
-_Last updated: 2026-09-04._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-05._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
@@ -44,11 +51,10 @@ transport, third `pkg.web` Handler variant, package-owned RFC 6455 handshake/fra
 reused-shape runtime rows activate as one capability.
 `pkg.template` is implemented against `docs/impl/pkg-design/template.md`: its opaque Move HTML text
 builder, default escaping, explicit raw write, and consuming zero-copy finisher are shipped in PR
-#939. The next convergence capability, `std.xml`, is designed in
-`docs/impl/std-design/xml.md`: it consumes one UTF-8 string, validates the complete bounded XML 1.0
-profile before publishing a forward reader, rejects every DTD/entity-declaration/PI path, and keeps
-namespaces lexical. Implementation is the current work item; the post-XML
-consolidation transition above replaces the automatic `std.time` follow-up.
+#939. `std.xml` is implemented against `docs/impl/std-design/xml.md`: it consumes one UTF-8 string,
+validates the complete bounded XML 1.0 profile before publishing a forward reader, rejects every
+DTD/entity-declaration/PI path, and keeps namespaces lexical. The post-XML consolidation transition
+above replaces the automatic `std.time` follow-up.
 
 Request 21's borrowed projection view repair is merged in Align PR #892 against
 `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; align-llm pin adoption remains.

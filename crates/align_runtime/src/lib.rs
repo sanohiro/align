@@ -20,6 +20,8 @@ mod crypto_asymmetric;
 pub use crypto_asymmetric::*;
 mod csv;
 pub use csv::*;
+mod xml;
+pub use xml::*;
 
 /// Builtin `print` for integers: write the decimal value + newline to stdout.
 ///

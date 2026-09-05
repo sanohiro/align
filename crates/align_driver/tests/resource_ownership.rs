@@ -178,6 +178,40 @@ fn resource_reference_rejects_use_after_owner_move() {
 }
 
 #[test]
+fn returned_dependent_resource_retains_its_own_mutable_authority() {
+    let root = r#"module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub resource stmt = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub fn prepare(parent: resource_ref<conn>) -> stmt {
+  unsafe { return resource.from_raw_borrowed(raw.alloc(8), parent) }
+}
+pub fn inspect(borrow mut child: stmt) -> str = "ok"
+"#;
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", r#"import pkg.db
+fn main() -> i32 {
+  parent := pkg.db.open()
+  mut child := pkg.db.prepare(resource.borrow(parent))
+  print(pkg.db.inspect(child))
+  return 0
+}
+"#),
+    ];
+    if !backend_available() { return; }
+    let whole = build_and_run_multi("dependent-resource-authority-whole", &project, "main.align");
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), "ok\n");
+    let per_unit = build_per_unit_multi("dependent-resource-authority-unit", &project, "main.align")
+        .link_and_run();
+    assert_eq!(per_unit.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "ok\n");
+}
+
+#[test]
 fn dependent_resource_blocks_parent_move_until_child_drop() {
     let root = "\
 module pkg.db
