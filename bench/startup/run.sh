@@ -70,6 +70,10 @@ export PATH LANG LC_ALL TZ
 unset CDPATH ENV BASH_ENV
 unset -f sh ps sleep dirname mkdir mktemp cp chmod id uname stat rm rmdir 2>/dev/null || :
 readonly PATH LANG LC_ALL TZ
+# Noninteractive callers can still have a controlling terminal. The worker is
+# deliberately a background job-control group, so it must not be suspended by
+# terminal job-control signals while the outer shell waits for it.
+trap '' TSTP TTIN TTOU
 
 private_exec() {
 outer_pgid=$1
@@ -157,7 +161,7 @@ esac
 
 # The observer validates descriptor identity, ownership, modes, link count and
 # digest. Unlinking before exec removes the last pathname alias.
-rm -- "$private_image" || exit 1
+rm -f -- "$private_image" || exit 1
 rmdir -- "$private_dir" || exit 1
 cleanup_armed=0
 trap - EXIT HUP INT TERM
@@ -167,6 +171,7 @@ umask "$old_umask"
 kill -USR1 "$watchdog_pid" 2>/dev/null || exit 1
 wait "$watchdog_pid" || exit 1
 kill -USR1 "$outer_pid" 2>/dev/null || exit 1
+trap - TSTP TTIN TTOU
 exec -c /dev/fd/9 --adopt-fd 9 --expected-sha256 "$observer_sha256" \
   --observer "$observer" --observer-sha256 "$observer_sha256" \
   --work-dir "$work_dir" --provenance "$provenance"
