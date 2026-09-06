@@ -4904,6 +4904,37 @@ struct PlanDecision {
     reason: PlanReason,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunksConsumer {
+    DirectLen,
+    DirectIndex,
+    Pipeline,
+    Parallel,
+    StoredOrBoundary,
+}
+
+fn chunks_plan(consumer: ChunksConsumer) -> PlanDecision {
+    let (strategy, reason) = match consumer {
+        ChunksConsumer::DirectLen => (PlanStrategy::VirtualCount, PlanReason::DirectLen),
+        ChunksConsumer::DirectIndex => (PlanStrategy::VirtualIndex, PlanReason::DirectIndex),
+        ChunksConsumer::Pipeline => {
+            (PlanStrategy::MaterializedHeaders, PlanReason::PipelineConsumer)
+        }
+        ChunksConsumer::Parallel => {
+            (PlanStrategy::MaterializedHeaders, PlanReason::ParallelConsumer)
+        }
+        ChunksConsumer::StoredOrBoundary => {
+            (PlanStrategy::MaterializedHeaders, PlanReason::StoredOrBoundary)
+        }
+    };
+    PlanDecision {
+        kind: PlanKind::Chunks,
+        state: PlanState::Selected,
+        strategy,
+        reason,
+    }
+}
+
 struct PendingPlanRecord {
     site: usize,
     collection_index: usize,
@@ -4943,23 +4974,6 @@ impl PlanCollector {
         });
     }
 
-    fn replace_chunks_reason(&mut self, site: usize, reason: PlanReason) {
-        let Some(record) = self
-            .records
-            .iter_mut()
-            .find(|record| record.site == site && record.decision.kind == PlanKind::Chunks)
-        else {
-            self.malformed = true;
-            return;
-        };
-        if !matches!(reason, PlanReason::ParallelConsumer | PlanReason::PipelineConsumer)
-            || record.decision.strategy != PlanStrategy::MaterializedHeaders
-        {
-            self.malformed = true;
-            return;
-        }
-        record.decision.reason = reason;
-    }
 }
 
 /// A `loop` being lowered — the target of a `break` inside its body. See [`Builder::loops`].
@@ -5034,14 +5048,6 @@ impl Builder {
     fn record_plan(&mut self, expression: &hir::Expr, decision: PlanDecision) {
         if let Some(plans) = &mut self.ctx.plans {
             plans.record(expression as *const hir::Expr as usize, expression.span, decision);
-        }
-    }
-
-    fn mark_chunks_consumer(&mut self, expression: &hir::Expr, reason: PlanReason) {
-        if let hir::ExprKind::ArrayChunks { .. } = expression.kind
-            && let Some(plans) = &mut self.ctx.plans
-        {
-            plans.replace_chunks_reason(expression as *const hir::Expr as usize, reason);
         }
     }
 
@@ -5882,17 +5888,37 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
 /// producers can extend it and scalar consumers can end it immediately.
 fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
+    lower_borrowed_owned_with_chunks_consumer(b, e, None)
+}
+
+/// Lower a borrowed use while supplying the final materializing chunks consumer before the
+/// chunks expression is lowered. Other expressions use the ordinary borrow-mode lowering.
+fn lower_borrowed_owned_with_chunks_consumer(
+    b: &mut Builder,
+    e: &hir::Expr,
+    chunks: Option<(&hir::Expr, &hir::Expr, Ty, ChunksConsumer)>,
+) -> Operand {
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
     if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         || !may_need_synthetic_owner(e)
     {
-        return lower_expr(b, e);
+        return match chunks {
+            Some((source, n, elem, consumer)) => {
+                lower_materialized_chunks(b, e, source, n, elem, consumer)
+            }
+            None => lower_expr(b, e),
+        };
     }
     // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
     let owner = b.new_synthetic_owner(e.ty);
-    let operand = lower_expr_for_borrow(b, e);
+    let operand = match chunks {
+        Some((source, n, elem, consumer)) => {
+            lower_materialized_chunks(b, e, source, n, elem, consumer)
+        }
+        None => lower_expr_for_borrow(b, e),
+    };
     if !lowering_continues(b) {
         return operand;
     }
@@ -5909,6 +5935,27 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
         Operand::Value(value)
     } else {
         operand
+    }
+}
+
+fn lower_chunks_pipeline_source(
+    b: &mut Builder,
+    source: &hir::Expr,
+    consumer: ChunksConsumer,
+) -> Operand {
+    if let hir::ExprKind::ArrayChunks {
+        source: base,
+        n,
+        elem,
+    } = &source.kind
+    {
+        lower_borrowed_owned_with_chunks_consumer(
+            b,
+            source,
+            Some((base, n, *elem, consumer)),
+        )
+    } else {
+        lower_borrowed_owned(b, source)
     }
 }
 
@@ -9644,7 +9691,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 CollectPlanInputs {
                     terminal: e,
                     terminal_captures: &[],
-                    source_consumer_reason: PlanReason::PipelineConsumer,
+                    chunks_consumer: ChunksConsumer::Pipeline,
                 },
             )
             .0,
@@ -9678,7 +9725,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     CollectPlanInputs {
                         terminal: e,
                         terminal_captures: &[],
-                        source_consumer_reason: PlanReason::PipelineConsumer,
+                        chunks_consumer: ChunksConsumer::Pipeline,
                     },
                 )
                 .0
@@ -9812,7 +9859,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         | Ty::DynArray(_)
                         | Ty::DynSliceArray(_)
                         | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
-                            lower_borrowed_owned(b, source)
+                            lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
                         }
                         _ => {
                             let (slot, n) = array_source_slot(b, source);
@@ -9827,7 +9874,6 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     if !lowering_continues(b) {
                         return Operand::Const(Const::Unit);
                     }
-                    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
                     let mut stage_records = Vec::with_capacity(stages.len());
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
@@ -9923,7 +9969,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     CollectPlanInputs {
                         terminal: e,
                         terminal_captures: &[],
-                        source_consumer_reason: PlanReason::ParallelConsumer,
+                        chunks_consumer: ChunksConsumer::Parallel,
                     },
                 )
                 .0;
@@ -9932,35 +9978,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 }
                 result
             }
-            hir::ExprKind::ArrayChunks { source, n, elem } => {
-                // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
-                lower_required_binding!(
-                    b,
-                    src = lower_chunks_source(b, source, *elem),
-                    Operand::Const(Const::Unit)
-                );
-                lower_required_binding!(b, n_op = lower_expr(b, n), Operand::Const(Const::Unit));
-                b.record_plan(
-                    e,
-                    PlanDecision {
-                        kind: PlanKind::Chunks,
-                        state: PlanState::Selected,
-                        strategy: PlanStrategy::MaterializedHeaders,
-                        reason: PlanReason::StoredOrBoundary,
-                    },
-                );
-                let v = b.fresh_value(e.ty);
-                inherit_borrow_owners(b, v, [&src]);
-                b.push(Stmt::Let(
-                    v,
-                    Rvalue::Chunks {
-                        src,
-                        n: n_op,
-                        elem: *elem,
-                    },
-                ));
-                Operand::Value(v)
-            }
+            hir::ExprKind::ArrayChunks { source, n, elem } => lower_materialized_chunks(
+                b,
+                e,
+                source,
+                n,
+                *elem,
+                ChunksConsumer::StoredOrBoundary,
+            ),
             hir::ExprKind::ArrayToSlice(inner) => {
                 if matches!(
                     inner.ty,
@@ -9985,21 +10010,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
                     // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
                     // materialized, but avoid allocating/filling headers for this scalar consumer.
+                    let decision = chunks_plan(ChunksConsumer::DirectLen);
                     lower_required_binding!(
                         b,
                         src = lower_chunks_source(b, source, *elem),
                         Operand::Const(Const::Unit)
                     );
                     lower_required_binding!(b, n = lower_expr(b, n), Operand::Const(Const::Unit));
-                    b.record_plan(
-                        inner,
-                        PlanDecision {
-                            kind: PlanKind::Chunks,
-                            state: PlanState::Selected,
-                            strategy: PlanStrategy::VirtualCount,
-                            reason: PlanReason::DirectLen,
-                        },
-                    );
+                    b.record_plan(inner, decision);
                     let src_len = b.fresh_value(i64_ty());
                     b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
                     let count = lower_chunks_count(b, Operand::Value(src_len), n);
@@ -11629,6 +11647,42 @@ fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand
     }
 }
 
+/// Materialize one chunks expression after its consumer has supplied the final representation
+/// classification. The same selected tuple drives the existing MIR representation and located
+/// reporting; it is never repaired after publication.
+fn lower_materialized_chunks(
+    b: &mut Builder,
+    expression: &hir::Expr,
+    source: &hir::Expr,
+    n: &hir::Expr,
+    elem: Ty,
+    consumer: ChunksConsumer,
+) -> Operand {
+    let decision = chunks_plan(consumer);
+    debug_assert_eq!(decision.strategy, PlanStrategy::MaterializedHeaders);
+
+    let src = lower_chunks_source(b, source, elem);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    let n_op = lower_expr(b, n);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    b.record_plan(expression, decision);
+    let value = b.fresh_value(expression.ty);
+    inherit_borrow_owners(b, value, [&src]);
+    b.push(Stmt::Let(
+        value,
+        Rvalue::Chunks {
+            src,
+            n: n_op,
+            elem,
+        },
+    ));
+    Operand::Value(value)
+}
+
 /// Compute the runtime `chunks` count without materializing its header array. The CFG guard keeps
 /// the division defined for `n <= 0`, matching `align_rt_chunks`'s canonical empty result.
 fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand {
@@ -11749,6 +11803,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
         // A direct `.chunks(n)[i]` computes exactly one borrowed sub-view. Stored/escaping chunk
         // arrays and pipeline consumers retain the materialized representation.
+        let decision = chunks_plan(ChunksConsumer::DirectIndex);
         let src = lower_required!(
             b,
             lower_chunks_source(b, source, *elem),
@@ -11756,15 +11811,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         );
         let n = lower_required!(b, lower_expr(b, n), Operand::Const(Const::Unit));
         let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
-        b.record_plan(
-            recv,
-            PlanDecision {
-                kind: PlanKind::Chunks,
-                state: PlanState::Selected,
-                strategy: PlanStrategy::VirtualIndex,
-                reason: PlanReason::DirectIndex,
-            },
-        );
+        b.record_plan(recv, decision);
         let src_len = b.fresh_value(i64_ty());
         b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
         let count = lower_chunks_count(b, Operand::Value(src_len), n.clone());
@@ -12724,12 +12771,16 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
     always_heap || (arena_if_in_arena && outside_arena)
 }
 
-fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
+fn setup_source(
+    b: &mut Builder,
+    source: &hir::Expr,
+    chunks_consumer: ChunksConsumer,
+) -> Option<SrcSetup> {
     if let hir::ExprKind::ArrayZip { sources, tuple_id } = &source.kind {
         let mut inputs = Vec::with_capacity(sources.len());
         let mut bound: Option<Operand> = None;
         for source in sources {
-            let setup = setup_source(b, source)?;
+            let setup = setup_source(b, source, chunks_consumer)?;
             debug_assert!(setup.zip.is_none(), "nested zip is rejected in sema");
             debug_assert!(
                 setup.temp_free.is_none(),
@@ -12772,11 +12823,10 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
             // through `if`/`match`/`else` joins and register a hidden owner for a selected fresh
             // value before evaluating later operands. Their early return/`?`/divergence then
             // cleans an owned source exactly once.
-            let sv = lower_borrowed_owned(b, source);
+            let sv = lower_chunks_pipeline_source(b, source, chunks_consumer);
             if !lowering_continues(b) {
                 return None;
             }
-            b.mark_chunks_consumer(source, PlanReason::PipelineConsumer);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             // A source that *owns* a fresh free-standing buffer nothing else holds must be freed
@@ -13179,7 +13229,9 @@ fn lower_array_par_map_reduce(
 ) -> Operand {
     let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
     let src = match source.ty {
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_borrowed_owned(b, source),
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
+            lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
+        }
         Ty::Array(_, _) => {
             let (slot, n) = array_source_slot(b, source);
             if !lowering_continues(b) {
@@ -13194,7 +13246,6 @@ fn lower_array_par_map_reduce(
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
     let mut capture_ops = Vec::with_capacity(captures.len());
     for capture in captures {
@@ -13249,7 +13300,7 @@ fn lower_array_reduce(
         struct_view,
         temp_free,
         zip,
-    }) = setup_source(b, source)
+    }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
     };
@@ -13964,7 +14015,7 @@ enum PreparedCollectKind {
 struct CollectPlanInputs<'a> {
     terminal: &'a hir::Expr,
     terminal_captures: &'a [hir::Expr],
-    source_consumer_reason: PlanReason,
+    chunks_consumer: ChunksConsumer,
 }
 
 /// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
@@ -13982,7 +14033,7 @@ fn lower_array_collect(
     let CollectPlanInputs {
         terminal,
         terminal_captures,
-        source_consumer_reason,
+        chunks_consumer,
     } = plan;
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
@@ -13998,11 +14049,10 @@ fn lower_array_collect(
         struct_view,
         temp_free,
         zip,
-    }) = setup_source(b, source)
+    }) = setup_source(b, source, chunks_consumer)
     else {
         return (Operand::Const(Const::Unit), Vec::new());
     };
-    b.mark_chunks_consumer(source, source_consumer_reason);
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
         return (Operand::Const(Const::Unit), Vec::new());
     };
@@ -14402,7 +14452,7 @@ fn lower_array_map_into(
         struct_view,
         temp_free,
         zip,
-    }) = setup_source(b, source)
+    }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
     };
@@ -14588,7 +14638,7 @@ fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Op
         bound,
         struct_view,
         ..
-    }) = setup_source(b, source)
+    }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
     };
@@ -15507,7 +15557,7 @@ fn lower_array_partition(
         struct_view,
         temp_free,
         zip,
-    }) = setup_source(b, source)
+    }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
     };
@@ -16054,7 +16104,7 @@ fn lower_array_sort(
         CollectPlanInputs {
             terminal,
             terminal_captures,
-            source_consumer_reason: PlanReason::PipelineConsumer,
+            chunks_consumer: ChunksConsumer::Pipeline,
         },
     );
     if !lowering_continues(b) {
@@ -22292,6 +22342,48 @@ mod tests {
     }
 
     #[test]
+    fn current_plan_chunks_decision_table_is_exhaustive() {
+        let cases = [
+            (
+                ChunksConsumer::DirectLen,
+                PlanStrategy::VirtualCount,
+                PlanReason::DirectLen,
+            ),
+            (
+                ChunksConsumer::DirectIndex,
+                PlanStrategy::VirtualIndex,
+                PlanReason::DirectIndex,
+            ),
+            (
+                ChunksConsumer::Pipeline,
+                PlanStrategy::MaterializedHeaders,
+                PlanReason::PipelineConsumer,
+            ),
+            (
+                ChunksConsumer::Parallel,
+                PlanStrategy::MaterializedHeaders,
+                PlanReason::ParallelConsumer,
+            ),
+            (
+                ChunksConsumer::StoredOrBoundary,
+                PlanStrategy::MaterializedHeaders,
+                PlanReason::StoredOrBoundary,
+            ),
+        ];
+        for (consumer, strategy, reason) in cases {
+            assert_eq!(
+                chunks_plan(consumer),
+                PlanDecision {
+                    kind: PlanKind::Chunks,
+                    state: PlanState::Selected,
+                    strategy,
+                    reason,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn current_plan_chunks_rows_follow_the_consumed_representation() {
         let cases = [
             (
@@ -22322,6 +22414,7 @@ mod tests {
         ];
         for (source, strategy, reason) in cases {
             let (program, _) = lower_current_plan(source);
+            let ordinary = lower(source);
             let record = one_kind(&program, PlanKind::Chunks);
             assert_eq!(
                 (record.state, record.strategy, record.reason),
@@ -22332,6 +22425,11 @@ mod tests {
                 any_rvalue(&program, |rvalue| matches!(rvalue, Rvalue::Chunks { .. })),
                 strategy == PlanStrategy::MaterializedHeaders,
                 "the published chunks strategy must be the representation consumed by MIR: {source}"
+            );
+            assert_eq!(
+                print::program_to_string(&program),
+                print::program_to_string(&ordinary),
+                "located collection must preserve ordinary chunks MIR: {source}"
             );
         }
     }
@@ -22842,15 +22940,6 @@ mod tests {
         assert!(collector.malformed);
         assert_eq!(collector.records.len(), 1);
 
-        let mut missing = PlanCollector {
-            resolver: Rc::new(PlanSourceResolver {
-                files: vec![PlanFileOrigin::Unauthenticated],
-            }),
-            records: Vec::new(),
-            malformed: false,
-        };
-        missing.replace_chunks_reason(99, PlanReason::ParallelConsumer);
-        assert!(missing.malformed, "a missing replacement target must fail closed");
     }
 
     #[test]
