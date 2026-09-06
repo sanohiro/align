@@ -230,7 +230,7 @@ behaviour-preserving robustness fix that helps every deep-lowering test, not jus
 
 ## S0B extension: current compiler decisions
 
-> **Status:** EXACT DESIGN ACCEPTED; implementation is next.
+> **Status:** IMPLEMENTED against the accepted exact design.
 >
 > **Authority:** This section is the exact S0B public-output and implementation
 > ledger required by `31-execution-storage-startup-plan.md`. The earlier Slice
@@ -617,6 +617,16 @@ becoming a second selector and prevents a new source/type/MIR variant from
 falling through to an optimistic record.
 
 ### Implementation closure matrix
+
+S0B is intentionally one capability PR even though its hand-written diff is
+expected to exceed roughly 1,000 lines. The selector-owned decisions, located
+source catalog, fail-closed validation, renderer, and parity/identity owners
+form one proof boundary: none is a useful stable consumer without the others.
+Splitting that dormant producer-to-consumer chain would duplicate record-shape,
+source-authentication, and codegen-identity proof while allowing intermediate
+commits that can collect but not safely publish (or publish records they did
+not authenticate). Keeping the boundary whole therefore lowers integration
+risk and leaves distinct LLVM-remark behavior unchanged.
 
 | Axis | Exact implementation closure | Owner evidence |
 |---|---|---|

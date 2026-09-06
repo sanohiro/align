@@ -64,7 +64,7 @@ alignc explain-opt file.align --verbose
 alignc size file.align --profile tiny
 ```
 
-`emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` translates vectorization and other optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
+`emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` reports the compiler's current storage and explicit-parallel execution choices, then translates vectorization and other LLVM optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
 
 ## Profiles, targets, and whole-program optimization
 

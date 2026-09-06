@@ -21,7 +21,8 @@ with all seven expected assets. The owner resumed capability work on 2026-09-06.
 V0 qualified the fixed R0-R5 corpus and XML evidence against the published
 v0.7.2 distribution and its matching source checkout; it found no new
 correctness defect. PR #955 made the S0A startup/resource observation harness
-available; current chunks representation decisions remain unavailable for S0B.
+available; S0B now reports the accepted current storage and explicit-parallel
+execution decisions through `explain-opt` without changing generated artifacts.
 
 The later align-llm `runtime_bundle.verify` graph exposed a v0.7.2 MIR producer-certification
 regression for an owned indexed string field crossing a loop join into an Ok record. Align PR #950
@@ -73,9 +74,9 @@ verification design, and change the workflow boundary first.
 **Current next work (owner-resumed 2026-09-06):** Request 55 and the fixed v0.7.3 release are
 complete. S0A is implemented in PR #955 against
 [`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md).
-The exact S0B current-decision observation extension is accepted in
-[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md); implement that
-capability next without changing its source-provenance or decision-presence strategy.
+The exact S0B current-decision observation extension is implemented against
+[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md). The next boundary
+is the one bounded consolidation owned by the post-XML sequence below.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->

@@ -2429,6 +2429,41 @@ struct LoadedUnit {
     fid: align_span::FileId,
 }
 
+fn located_plan_source_catalog(
+    source_map: &SourceMap,
+    loaded: &[LoadedUnit],
+    interface_fids: &HashMap<String, align_span::FileId>,
+) -> (align_mir::LocatedPlanSourceCatalog, bool) {
+    let mut files = vec![
+        align_mir::LocatedPlanSourceOrigin::NonHirInput;
+        source_map.files().len()
+    ];
+    let mut classified = vec![false; files.len()];
+    let mut malformed = false;
+    for unit in loaded {
+        let index = unit.fid as usize;
+        if index >= files.len() || classified[index] {
+            malformed = true;
+            continue;
+        }
+        classified[index] = true;
+        files[index] = align_mir::LocatedPlanSourceOrigin::User {
+            source_name: unit.file.clone().into_boxed_str(),
+            exact_source: unit.src.clone().into_boxed_str(),
+        };
+    }
+    for &fid in interface_fids.values() {
+        let index = fid as usize;
+        if index >= files.len() || classified[index] {
+            malformed = true;
+            continue;
+        }
+        classified[index] = true;
+        files[index] = align_mir::LocatedPlanSourceOrigin::SyntheticInterface;
+    }
+    (align_mir::LocatedPlanSourceCatalog { files }, malformed)
+}
+
 // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
 fn user_import(p: &align_ast::Path) -> bool {
     p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
@@ -3139,6 +3174,9 @@ fn walk_inner(
     // The rendered source is retained alongside the AST: it is the exact text sema consumes for that
     // dependency, and therefore the per-unit memo's dependency key material (`memo::unit_key`).
     let mut interface_ast_cache: HashMap<String, (String, align_ast::File)> = HashMap::new();
+    // File ids for the compiler-produced interfaces above. Located current-plan lowering uses this
+    // registry to withhold synthetic anchors instead of trusting a bare numeric `FileId`.
+    let mut interface_fids: HashMap<String, align_span::FileId> = HashMap::new();
     let mut publication_lock = None;
     let mut publication_lock_attempted = false;
     let mut publication_lock_span = None;
@@ -3295,6 +3333,7 @@ fn walk_inner(
                     Err(error) => {
                         let fid =
                             source_map.add_file(format!("<interface:{d}>"), String::new());
+                        interface_fids.insert(d.clone(), fid);
                         diags.error(
                             format!("cannot import interface `{d}`: {error}"),
                             align_span::Span::new(fid, 0, 0),
@@ -3307,6 +3346,7 @@ fn walk_inner(
                 // source is compiler-internal and always well-formed; its parse diagnostics are discarded.
                 let mut sink = Diagnostics::new();
                 let fid = source_map.add_file(format!("<interface:{d}>"), source.clone());
+                interface_fids.insert(d.clone(), fid);
                 let toks = align_lexer::tokenize(fid, &source, &mut sink);
                 let ast = align_parser::parse_file(toks, &mut sink);
                 interface_ast_cache.insert(d.clone(), (source, ast));
@@ -3511,7 +3551,17 @@ fn walk_inner(
             // object (`_main` undefined at link) with exit 0. Surface the shared rejection as a
             // loud internal error at the one walk every CLI verb shares.
             let lowered = if located {
-                try_lower_to_mir_per_unit_located(&program, source_map)
+                let (catalog, catalog_malformed) =
+                    located_plan_source_catalog(source_map, &loaded, &interface_fids);
+                try_lower_to_mir_per_unit_located_with_plan_catalog(
+                    &program,
+                    source_map,
+                    &catalog,
+                )
+                .map(|mut mir| {
+                    mir.plan_catalog_malformed |= catalog_malformed;
+                    mir
+                })
             } else {
                 try_lower_to_mir_per_unit(&program)
             };
@@ -5209,6 +5259,16 @@ pub fn try_lower_to_mir_per_unit_located(
     source_map: &SourceMap,
 ) -> Result<align_mir::Program, align_mir::LoweringRejected> {
     lower_memoized(hir, "per-unit-located", true, Some(source_map))
+}
+
+/// The `explain-opt` route: located per-unit lowering with the exact walk-owned source catalog used
+/// to authenticate current-plan anchors. It is intentionally never memoized.
+pub fn try_lower_to_mir_per_unit_located_with_plan_catalog(
+    hir: &align_sema::Program,
+    source_map: &SourceMap,
+    plan_catalog: &align_mir::LocatedPlanSourceCatalog,
+) -> Result<align_mir::Program, align_mir::LoweringRejected> {
+    align_mir::lower_program_checked_with_plan_catalog(hir, true, source_map, plan_catalog)
 }
 
 /// [`try_lower_to_mir_per_unit_located`] with the same fail-closed inspection contract as
@@ -9933,6 +9993,38 @@ mod tests {
 #[cfg(test)]
 mod walk_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PLAN_SCRATCH_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    struct PlanScratch(std::path::PathBuf);
+
+    impl PlanScratch {
+        fn new(tag: &str) -> Self {
+            loop {
+                let nonce = PLAN_SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "align-current-plan-{tag}-{}-{nonce}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create current-plan scratch directory: {error}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for PlanScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// P32: the per-module closure memo. The key needs a closure for every closure MEMBER of every
     /// unit, so without memoization a fan-in DAG would recompute the same closure once per
@@ -10028,6 +10120,177 @@ mod walk_tests {
         assert!(seeded.add_file("<interface:mid>".to_string(), String::new()) >= n as align_span::FileId);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn current_plan_catalog_classifies_user_interface_and_interleaved_non_hir_files() {
+        let source = "fn f(xs: slice<i64>) -> i64 = xs.chunks(2).len()\n";
+        let mut source_map = SourceMap::new();
+        let mut diagnostics = Diagnostics::new();
+        let loaded = load_units(
+            &mut source_map,
+            "main.align",
+            source,
+            &mut diagnostics,
+            None,
+        );
+        assert!(!diagnostics.has_errors());
+        let non_hir = source_map.add_file("query.sql", "select 1");
+        let interface = source_map.add_file("<interface:dep>", "module dep\n");
+        let interface_fids = HashMap::from([("dep".to_owned(), interface)]);
+        let (catalog, malformed) =
+            located_plan_source_catalog(&source_map, &loaded, &interface_fids);
+        assert!(!malformed);
+        assert!(matches!(
+            &catalog.files[loaded[0].fid as usize],
+            align_mir::LocatedPlanSourceOrigin::User { source_name, exact_source }
+                if source_name.as_ref() == "main.align" && exact_source.as_ref() == source
+        ));
+        assert!(matches!(
+            catalog.files[non_hir as usize],
+            align_mir::LocatedPlanSourceOrigin::NonHirInput
+        ));
+        assert!(matches!(
+            catalog.files[interface as usize],
+            align_mir::LocatedPlanSourceOrigin::SyntheticInterface
+        ));
+
+        let conflict = HashMap::from([("dep".to_owned(), loaded[0].fid)]);
+        let (_, malformed) = located_plan_source_catalog(&source_map, &loaded, &conflict);
+        assert!(malformed, "duplicate user/interface classification must fail closed");
+    }
+
+    #[test]
+    fn current_plan_whole_and_per_unit_routes_choose_the_same_decisions() {
+        let source = "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn make() -> array<i64> = [1, 2].to_array()\nfn dbl(x: i64) -> i64 = x * 2\nfn collect() -> array<i64> = make().map(dbl).to_array()\nfn run() -> i64 = [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\nfn main() -> i32 = 0\n";
+
+        let mut whole_map = SourceMap::new();
+        let checked = check(&mut whole_map, "plan.align", source);
+        assert!(!checked.diags.has_errors());
+        let whole_catalog = align_mir::LocatedPlanSourceCatalog {
+            files: whole_map
+                .files()
+                .iter()
+                .map(|file| align_mir::LocatedPlanSourceOrigin::User {
+                    source_name: file.name.clone().into_boxed_str(),
+                    exact_source: file.src.clone().into_boxed_str(),
+                })
+                .collect(),
+        };
+        let whole = align_mir::lower_program_checked_with_plan_catalog(
+            &checked.hir,
+            false,
+            &whole_map,
+            &whole_catalog,
+        )
+        .expect("whole located lowering");
+
+        let mut per_unit_map = SourceMap::new();
+        let walk = build_per_unit_located(&mut per_unit_map, "plan.align", source);
+        assert!(!walk.diags.has_errors());
+        assert_eq!(walk.units.len(), 1);
+        let per_unit = &walk.units[0].mir;
+        assert_eq!(
+            whole.plan_records, per_unit.plan_records,
+            "equal visible selector inputs must choose identical plans"
+        );
+        assert!(align_mir::current_plan_records_are_valid(&whole, &whole_map));
+        assert!(align_mir::current_plan_records_are_valid(per_unit, &per_unit_map));
+    }
+
+    #[test]
+    fn current_plan_side_table_is_absent_from_llvm_and_object_identity() {
+        if !backend_available() {
+            return;
+        }
+        let source = "fn run(xs: slice<i64>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n";
+        let mut source_map = SourceMap::new();
+        let walk = build_per_unit_located(&mut source_map, "plan.align", source);
+        assert!(!walk.diags.has_errors());
+        let located = walk.units[0].mir.clone();
+        assert!(!located.plan_records.is_empty());
+        let mut cleared = located.clone();
+        cleared.plan_records.clear();
+        cleared.plan_catalog_malformed = false;
+        assert_eq!(
+            align_mir::print::program_to_string(&located),
+            align_mir::print::program_to_string(&cleared),
+            "the side table must not enter MIR text"
+        );
+        assert_eq!(
+            align_interface::codegen_impl_hash(&located),
+            align_interface::codegen_impl_hash(&cleared),
+            "the side table must not enter implementation identity"
+        );
+        for optimized in [false, true] {
+            assert_eq!(
+                emit_llvm_ir(&located, BuildTarget::Baseline, optimized, &[], false).unwrap(),
+                emit_llvm_ir(&cleared, BuildTarget::Baseline, optimized, &[], false).unwrap(),
+                "the located side table must not enter LLVM"
+            );
+        }
+
+        let scratch = PlanScratch::new("object");
+        let with_plan = scratch.path().join("with.o");
+        let without_plan = scratch.path().join("without.o");
+        align_codegen_llvm::emit_object(
+            &located,
+            &with_plan,
+            &BuildTarget::Baseline,
+            Profile::Dev,
+            &[],
+            None,
+        )
+        .unwrap();
+        align_codegen_llvm::emit_object(
+            &cleared,
+            &without_plan,
+            &BuildTarget::Baseline,
+            Profile::Dev,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(with_plan).unwrap(), std::fs::read(without_plan).unwrap());
+    }
+
+    #[test]
+    fn current_plan_imported_generic_body_keeps_its_interface_source_unavailable() {
+        let scratch = PlanScratch::new("generic");
+        std::fs::write(
+            scratch.path().join("dep.align"),
+            "module dep\npub fn rows<T>(value: T) -> array<T> = [value].to_array()\n",
+        )
+        .unwrap();
+        let entry_source =
+            "module main\nimport dep\nfn main() -> i32 = dep.rows(1).sum() as i32\n";
+        let entry = scratch.path().join("main.align");
+        std::fs::write(&entry, entry_source).unwrap();
+
+        let mut source_map = SourceMap::new();
+        let walk = build_per_unit_located(
+            &mut source_map,
+            &entry.display().to_string(),
+            entry_source,
+        );
+        assert!(
+            !walk.diags.has_errors(),
+            "generic fixture rejected: {}",
+            format_diagnostics(&source_map, &walk.diags)
+        );
+        let main = walk
+            .units
+            .iter()
+            .find(|unit| unit.unit == "main")
+            .expect("main artifact");
+        let imported = main
+            .mir
+            .plan_records
+            .iter()
+            .find(|record| record.function.as_str().starts_with("dep$rows$"))
+            .unwrap_or_else(|| panic!("imported generic plan: {:?}", main.mir.plan_records));
+        assert!(imported.source.is_none());
+        assert!(align_mir::current_plan_records_are_valid(&main.mir, &source_map));
     }
 
     #[test]

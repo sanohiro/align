@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use align_mir::{PlanKind, PlanReason, PlanRecord, PlanState, PlanStrategy};
 use align_span::SourceMap;
 
 use crate::{build_per_unit_located, collect_opt_remarks, format_diagnostics, BuildTarget, DebugInfo};
@@ -415,6 +416,148 @@ fn unit_debug(file_path: &str) -> DebugInfo {
     DebugInfo { file, directory }
 }
 
+fn plan_kind(kind: PlanKind) -> &'static str {
+    match kind {
+        PlanKind::Chunks => "chunks",
+        PlanKind::BufferDonation => "buffer-donation",
+        PlanKind::ParMap => "par-map",
+    }
+}
+
+fn plan_state(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Selected => "selected",
+        PlanState::Rejected => "rejected",
+        PlanState::RuntimeSelected => "runtime-selected",
+        PlanState::NotApplicable => "not-applicable",
+        PlanState::Unavailable => "unavailable",
+    }
+}
+
+fn plan_strategy(strategy: PlanStrategy) -> &'static str {
+    match strategy {
+        PlanStrategy::VirtualCount => "virtual-count",
+        PlanStrategy::VirtualIndex => "virtual-index",
+        PlanStrategy::MaterializedHeaders => "materialized-headers",
+        PlanStrategy::ArenaOutput => "arena-output",
+        PlanStrategy::FreshOutput => "fresh-output",
+        PlanStrategy::ReuseSourceBuffer => "reuse-source-buffer",
+        PlanStrategy::RangeReduce => "range-reduce",
+        PlanStrategy::RangeMaterialize => "range-materialize",
+        PlanStrategy::SequentialCollect => "sequential-collect",
+    }
+}
+
+fn plan_explanation(reason: PlanReason) -> &'static str {
+    match reason {
+        PlanReason::DirectLen => "the direct `len` consumer needs only the chunk count",
+        PlanReason::DirectIndex => "the direct index consumer needs only one borrowed subview",
+        PlanReason::ParallelConsumer => {
+            "the current explicit-parallel consumer reads an owned header array"
+        }
+        PlanReason::PipelineConsumer => {
+            "the current synchronous pipeline consumer reads an owned header array"
+        }
+        PlanReason::StoredOrBoundary => {
+            "the chunks value crosses a stored, returned, call, or control-flow boundary"
+        }
+        PlanReason::ArenaOwnedOutput => {
+            "the output is arena-owned, so source-buffer reuse does not apply"
+        }
+        PlanReason::UnsupportedSourceOrStageShape => {
+            "this source or stage shape cannot reuse the source buffer"
+        }
+        PlanReason::SourceNotUniqueDead => "the source is not a unique dead heap temporary",
+        PlanReason::LayoutMismatch => "source and result element layouts are not identical",
+        PlanReason::MeasurementDisabled => {
+            "the measurement override disabled an otherwise eligible reuse; this is not the default plan"
+        }
+        PlanReason::EligibleUniqueSource => {
+            "a unique dead heap source with an identical layout is reused as the result buffer"
+        }
+        PlanReason::DirectIntegerSum => {
+            "the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, conservative work hint, and process-lifetime worker availability"
+        }
+        PlanReason::SupportedRangeKernel => {
+            "the runtime chooses caller-only or shared-pool range materialization from the input length, element layouts, conservative work hint, and process-lifetime worker availability"
+        }
+        PlanReason::UnsupportedSourceRepresentation => {
+            "the source representation has no current range-kernel form, so the explicit operation uses the sequential collector"
+        }
+        PlanReason::UnsupportedStageOrValueShape => {
+            "a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector"
+        }
+    }
+}
+
+fn escaped_plan_filename(file: &str) -> String {
+    let mut escaped = String::with_capacity(file.len());
+    for character in file.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn write_source_less_plan(out: &mut String, record: &PlanRecord) {
+    let _ = writeln!(
+        out,
+        "  [current plan `{}` #{} {}] {} `{}` — {}; source location is unavailable",
+        record.function,
+        record.construct_ordinal,
+        plan_kind(record.kind),
+        plan_state(record.state),
+        plan_strategy(record.strategy),
+        plan_explanation(record.reason),
+    );
+}
+
+fn render_current_plan(records: &[PlanRecord], verbose: bool, file: &str) -> String {
+    let mut out = String::new();
+    let file = escaped_plan_filename(file);
+    let mut index = 0usize;
+    while index < records.len() {
+        let record = &records[index];
+        if let Some(source) = record.source {
+            let _ = writeln!(
+                out,
+                "{}:{}:{}: current plan `{}` #{} {}: {} `{}` — {}",
+                file,
+                source.line,
+                source.column,
+                record.function,
+                record.construct_ordinal,
+                plan_kind(record.kind),
+                plan_state(record.state),
+                plan_strategy(record.strategy),
+                plan_explanation(record.reason),
+            );
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < records.len() && records[index].source.is_none() {
+            index += 1;
+        }
+        if verbose {
+            for record in &records[start..index] {
+                write_source_less_plan(&mut out, record);
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "+ {} current-plan record(s) without user source (see --verbose)",
+                index - start,
+            );
+        }
+    }
+    out
+}
+
 /// `alignc explain-opt <file> [--verbose]` — compile, capture remarks, and print the report. Exit
 /// code: `0` = compiled + report produced (missed optimizations are not errors); `1` = compile
 /// error / bad args (`docs/impl/09-explain-opt.md`).
@@ -435,19 +578,36 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
     };
     let mut sm = SourceMap::new();
     let walk = build_per_unit_located(&mut sm, path, &src);
-    if !walk.diags.is_empty() {
-        eprint!("{}", format_diagnostics(&sm, &walk.diags));
-    }
     if walk.diags.has_errors() {
+        eprint!("{}", format_diagnostics(&sm, &walk.diags));
         return ExitCode::FAILURE;
     }
     if walk.units.is_empty() {
+        if !walk.diags.is_empty() {
+            eprint!("{}", format_diagnostics(&sm, &walk.diags));
+        }
         eprintln!("alignc: no units to analyze");
         return ExitCode::FAILURE;
+    }
+    if walk
+        .units
+        .iter()
+        .any(|unit| !align_mir::current_plan_records_are_valid(&unit.mir, &sm))
+    {
+        eprintln!("alignc: cannot explain current plan: malformed record");
+        return ExitCode::FAILURE;
+    }
+    if !walk.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &walk.diags));
     }
 
     let multi = walk.units.len() > 1;
     let mut out = String::new();
+    if std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref() == Some("off") {
+        out.push_str(
+            "current-plan measurement override: buffer donation is disabled; donation rows are not the default plan\n",
+        );
+    }
     for unit in &walk.units {
         let debug = unit_debug(&unit.file);
         let remarks = match collect_opt_remarks(&unit.mir, target.clone(), &debug) {
@@ -461,6 +621,7 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
         if multi {
             let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
         }
+        out.push_str(&render_current_plan(&unit.mir.plan_records, verbose, &debug.file));
         out.push_str(&report.render(verbose));
     }
     print!("{out}");
@@ -470,6 +631,101 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_record(
+        ordinal: u32,
+        kind: PlanKind,
+        state: PlanState,
+        strategy: PlanStrategy,
+        reason: PlanReason,
+        source: Option<align_mir::PlanSource>,
+    ) -> PlanRecord {
+        PlanRecord {
+            function: align_mir::ProgramCall::try_from_logical("main$f").unwrap(),
+            construct_ordinal: ordinal,
+            kind,
+            state,
+            strategy,
+            reason,
+            source,
+        }
+    }
+
+    #[test]
+    fn current_plan_renderer_pins_anchored_and_source_less_grammar() {
+        let anchored = plan_record(
+            1,
+            PlanKind::Chunks,
+            PlanState::Selected,
+            PlanStrategy::VirtualCount,
+            PlanReason::DirectLen,
+            Some(align_mir::PlanSource {
+                file_id: 0,
+                span_lo: 0,
+                span_hi: 1,
+                line: 2,
+                column: 3,
+            }),
+        );
+        assert_eq!(
+            render_current_plan(&[anchored], false, "a\\b\nc\r.align"),
+            "a\\\\b\\nc\\r.align:2:3: current plan `main$f` #1 chunks: selected `virtual-count` — the direct `len` consumer needs only the chunk count\n"
+        );
+
+        let source_less = [
+            plan_record(
+                1,
+                PlanKind::BufferDonation,
+                PlanState::Rejected,
+                PlanStrategy::FreshOutput,
+                PlanReason::LayoutMismatch,
+                None,
+            ),
+            plan_record(
+                2,
+                PlanKind::ParMap,
+                PlanState::Rejected,
+                PlanStrategy::SequentialCollect,
+                PlanReason::UnsupportedStageOrValueShape,
+                None,
+            ),
+        ];
+        assert_eq!(
+            render_current_plan(&source_less, false, "ignored.align"),
+            "+ 2 current-plan record(s) without user source (see --verbose)\n"
+        );
+        assert_eq!(
+            render_current_plan(&source_less, true, "ignored.align"),
+            "  [current plan `main$f` #1 buffer-donation] rejected `fresh-output` — source and result element layouts are not identical; source location is unavailable\n  [current plan `main$f` #2 par-map] rejected `sequential-collect` — a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector; source location is unavailable\n"
+        );
+    }
+
+    #[test]
+    fn current_plan_renderer_table_is_exhaustive_and_exact() {
+        let rows = [
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualCount, PlanReason::DirectLen, "chunks", "selected", "virtual-count", "the direct `len` consumer needs only the chunk count"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualIndex, PlanReason::DirectIndex, "chunks", "selected", "virtual-index", "the direct index consumer needs only one borrowed subview"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::ParallelConsumer, "chunks", "selected", "materialized-headers", "the current explicit-parallel consumer reads an owned header array"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::PipelineConsumer, "chunks", "selected", "materialized-headers", "the current synchronous pipeline consumer reads an owned header array"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::StoredOrBoundary, "chunks", "selected", "materialized-headers", "the chunks value crosses a stored, returned, call, or control-flow boundary"),
+            (PlanKind::BufferDonation, PlanState::NotApplicable, PlanStrategy::ArenaOutput, PlanReason::ArenaOwnedOutput, "buffer-donation", "not-applicable", "arena-output", "the output is arena-owned, so source-buffer reuse does not apply"),
+            (PlanKind::BufferDonation, PlanState::NotApplicable, PlanStrategy::FreshOutput, PlanReason::UnsupportedSourceOrStageShape, "buffer-donation", "not-applicable", "fresh-output", "this source or stage shape cannot reuse the source buffer"),
+            (PlanKind::BufferDonation, PlanState::Rejected, PlanStrategy::FreshOutput, PlanReason::SourceNotUniqueDead, "buffer-donation", "rejected", "fresh-output", "the source is not a unique dead heap temporary"),
+            (PlanKind::BufferDonation, PlanState::Rejected, PlanStrategy::FreshOutput, PlanReason::LayoutMismatch, "buffer-donation", "rejected", "fresh-output", "source and result element layouts are not identical"),
+            (PlanKind::BufferDonation, PlanState::Unavailable, PlanStrategy::FreshOutput, PlanReason::MeasurementDisabled, "buffer-donation", "unavailable", "fresh-output", "the measurement override disabled an otherwise eligible reuse; this is not the default plan"),
+            (PlanKind::BufferDonation, PlanState::Selected, PlanStrategy::ReuseSourceBuffer, PlanReason::EligibleUniqueSource, "buffer-donation", "selected", "reuse-source-buffer", "a unique dead heap source with an identical layout is reused as the result buffer"),
+            (PlanKind::ParMap, PlanState::RuntimeSelected, PlanStrategy::RangeReduce, PlanReason::DirectIntegerSum, "par-map", "runtime-selected", "range-reduce", "the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, conservative work hint, and process-lifetime worker availability"),
+            (PlanKind::ParMap, PlanState::RuntimeSelected, PlanStrategy::RangeMaterialize, PlanReason::SupportedRangeKernel, "par-map", "runtime-selected", "range-materialize", "the runtime chooses caller-only or shared-pool range materialization from the input length, element layouts, conservative work hint, and process-lifetime worker availability"),
+            (PlanKind::ParMap, PlanState::Rejected, PlanStrategy::SequentialCollect, PlanReason::UnsupportedSourceRepresentation, "par-map", "rejected", "sequential-collect", "the source representation has no current range-kernel form, so the explicit operation uses the sequential collector"),
+            (PlanKind::ParMap, PlanState::Rejected, PlanStrategy::SequentialCollect, PlanReason::UnsupportedStageOrValueShape, "par-map", "rejected", "sequential-collect", "a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector"),
+        ];
+        for (kind, state, strategy, reason, kind_text, state_text, strategy_text, explanation) in rows {
+            assert_eq!(plan_kind(kind), kind_text);
+            assert_eq!(plan_state(state), state_text);
+            assert_eq!(plan_strategy(strategy), strategy_text);
+            assert_eq!(plan_explanation(reason), explanation);
+        }
+    }
 
     // Real LLVM remark strings captured from the probe kernels (`docs/impl/09-explain-opt.md`).
     // The translation table is keyed on these; breaking a pattern must drop the actionable line

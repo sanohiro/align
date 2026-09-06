@@ -125,6 +125,84 @@ fn verbose_shows_raw_passthrough() {
     assert!(v.contains("compiler-internal"), "verbose labels the internal remarks:\n{v}");
 }
 
+#[test]
+fn current_plan_rows_precede_llvm_and_do_not_change_under_verbose() {
+    if !align_driver::backend_available() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let source = "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\n\
+        fn run() -> i64 = [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n\
+        fn main() -> Result<(), Error> { print(run()); return Ok(()) }\n";
+    let src = write_src("current-plan", source);
+    let run = |target_cpu: &str, verbose: bool| {
+        let mut command = alignc();
+        command
+            .args(["explain-opt"])
+            .arg(src.path())
+            .args(["--target-cpu", target_cpu]);
+        if verbose {
+            command.arg("--verbose");
+        }
+        command.output().expect("run alignc")
+    };
+    let default = run("x86-64-v3", false);
+    let verbose = run("x86-64-v3", true);
+    assert!(default.status.success(), "default failed: {}", String::from_utf8_lossy(&default.stderr));
+    assert!(verbose.status.success(), "verbose failed: {}", String::from_utf8_lossy(&verbose.stderr));
+    let plan_lines = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|line| line.contains("current plan"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let default_plan = plan_lines(&default.stdout);
+    assert_eq!(default_plan, plan_lines(&verbose.stdout));
+    let baseline = run("baseline", false);
+    let native = run("native", false);
+    assert!(baseline.status.success());
+    assert!(native.status.success());
+    assert_eq!(
+        plan_lines(&baseline.stdout),
+        plan_lines(&native.stdout),
+        "current-plan decisions must be target-independent"
+    );
+    assert_eq!(default_plan.len(), 2);
+    assert!(default_plan[0].contains(
+        "current plan `run` #1 chunks: selected `materialized-headers` — the current explicit-parallel consumer reads an owned header array"
+    ));
+    assert!(default_plan[1].contains(
+        "current plan `run` #2 par-map: runtime-selected `range-reduce` — the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, conservative work hint, and process-lifetime worker availability"
+    ));
+    let stdout = String::from_utf8_lossy(&default.stdout);
+    assert!(
+        stdout.find("current plan").unwrap() < stdout.find("loop(s) vectorized").unwrap(),
+        "current-plan rows must precede LLVM output:\n{stdout}"
+    );
+}
+
+#[test]
+fn current_plan_measurement_override_banner_is_exact_and_first() {
+    if !align_driver::backend_available() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let src = write_src("current-plan-override", MAP_SUM);
+    let out = alignc()
+        .env("ALIGN_BUFFER_DONATE", "off")
+        .args(["explain-opt"])
+        .arg(src.path())
+        .args(["--target-cpu", "x86-64-v3"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "explain-opt failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next(),
+        Some(
+            "current-plan measurement override: buffer donation is disabled; donation rows are not the default plan"
+        )
+    );
+}
+
 /// A compile error → exit 1 (not a report), with a diagnostic, never a panic.
 #[test]
 fn compile_error_exits_one() {

@@ -1027,6 +1027,8 @@ fn valid_thin_symbol(value: &str) -> bool {
 fn resource_drop_hook_abi() -> Result<CanonicalFnAbi, CodegenError> {
     let program = Program {
         fns: Vec::new(),
+        plan_records: Vec::new(),
+        plan_catalog_malformed: false,
         sqlite_callback_effects: std::collections::BTreeMap::new(),
         externs: Vec::new(),
         imported_fns: Vec::new(),
@@ -1161,6 +1163,9 @@ pub fn emit_function_prelink_bc(
     functions.extend(peer_functions.iter().map(|function| (*function).clone()));
     let program = Program {
         fns: functions,
+        // Located current-plan records are diagnostic-only and never enter a ThinLTO view.
+        plan_records: Vec::new(),
+        plan_catalog_malformed: false,
         sqlite_callback_effects: shared.callback_effects.clone(),
         externs: shared.externs.to_vec(),
         imported_fns: shared.imported_fns.to_vec(),

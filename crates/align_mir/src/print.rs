@@ -20,8 +20,10 @@ pub fn program_to_string(p: &Program) -> String {
 /// [`program_to_string`] is intentionally a human-facing function-body view: it omits type tables,
 /// declarations, linkage, slot alignment, and other backend inputs. That makes it useful for
 /// `emit-mir`, but unsound as the complete object-cache fingerprint. This rendering instead uses
-/// the derived structural `Debug` form of [`Program`], so adding a field to the MIR automatically
-/// adds it to the fingerprint input rather than requiring another hand-maintained printer arm.
+/// the derived structural `Debug` form of [`Program`], so adding a codegen-relevant field to the
+/// MIR automatically adds it to the fingerprint input rather than requiring another
+/// hand-maintained printer arm. Located current-plan observations are diagnostic side data and are
+/// explicitly erased before rendering.
 ///
 /// Stability is required only within one compiler build: cache keys separately include the compiler
 /// build id and frontend schema version. MIR contains no unordered maps, pointers, or process-local
@@ -29,7 +31,13 @@ pub fn program_to_string(p: &Program) -> String {
 /// includes `stmt_lines`, because debug locations are codegen input; normal cached builds lower
 /// unlocated MIR and therefore keep comment/whitespace-only edits invisible.
 pub fn codegen_input_to_string(p: &Program) -> String {
-    format!("{p:?}")
+    if p.plan_records.is_empty() && !p.plan_catalog_malformed {
+        return format!("{p:?}");
+    }
+    let mut codegen_input = p.clone();
+    codegen_input.plan_records.clear();
+    codegen_input.plan_catalog_malformed = false;
+    format!("{codegen_input:?}")
 }
 
 /// The same stable, location-free text [`program_to_string`] prints for one function, without

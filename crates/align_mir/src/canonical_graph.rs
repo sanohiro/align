@@ -3072,6 +3072,8 @@ mod tests {
         Program {
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
+            plan_records: Vec::new(),
+            plan_catalog_malformed: false,
             externs: Vec::new(),
             imported_fns: Vec::new(),
             link_libs: Vec::new(),
@@ -4117,6 +4119,8 @@ mod tests {
         let mut program = Program {
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
+            plan_records: Vec::new(),
+            plan_catalog_malformed: false,
             externs: Vec::new(),
             imported_fns: Vec::new(),
             link_libs: Vec::new(),

@@ -405,7 +405,7 @@ fn emit_llvm_optimized_leaves_cross_unit_call_opaque() {
 
 // ---- 5. explain-opt multi-file -------------------------------------------------------------------
 
-const SCALE_UNIT: &str = "module util.math\npub fn scale(xs: array<i64>) -> i64 = xs.map(dbl).sum()\nfn dbl(x: i64) -> i64 = x * 2\n";
+const SCALE_UNIT: &str = "module util.math\npub fn scale(xs: array<i64>) -> i64 = xs.map(dbl).sum()\npub fn planned(xs: array<i64>) -> array<i64> = xs.map(dbl).to_array()\nfn dbl(x: i64) -> i64 = x * 2\n";
 const SCALE_MAIN: &str = "module main\nimport util.math\nfn main() -> i32 {\n  return util.math.scale([1, 2, 3, 4, 5, 6, 7, 8].to_array()) as i32\n}\n";
 
 #[test]
@@ -421,6 +421,18 @@ fn explain_opt_multi_file_has_per_unit_sections() {
     let dep_at = text.find("==== unit: util.math (math.align) ====").expect("dep section");
     let main_at = text.find("==== unit: main (main.align) ====").expect("entry section");
     assert!(dep_at < main_at, "the dependency section must come first");
+    let plan = text
+        .lines()
+        .find(|line| {
+            line.starts_with("math.align:3:")
+                && line.contains("current plan `util.math$planned` #1 buffer-donation:")
+        })
+        .unwrap_or_else(|| panic!("dependency current-plan row:\n{text}"));
+    let plan_at = text.find(plan).unwrap();
+    assert!(
+        dep_at < plan_at && plan_at < main_at,
+        "the dependency plan must stay inside its bottom-up section:\n{text}"
+    );
 
     // Deterministic order across runs.
     let b = proj.run(&["explain-opt", "main.align"]);
