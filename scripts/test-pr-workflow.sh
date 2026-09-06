@@ -2343,7 +2343,11 @@ grep -Fq 'scripts/build-prebuilt-cache.sh' "$release_workflow" || {
   echo "release.yml no longer warms the final release compiler's adjacent cache" >&2
   exit 1
 }
-for consumer in "$repo_root/scripts/build-prebuilt-cache.sh" "$repo_root/bench/prebuilt_cache/run.sh"; do
+for consumer in \
+  "$repo_root/scripts/build-prebuilt-cache.sh" \
+  "$repo_root/scripts/verify-prebuilt-cache-layout.sh" \
+  "$repo_root/bench/prebuilt_cache/run.sh"
+do
   grep -Fq '"$REPO_ROOT/scripts/prepare-prebuilt-cache-project.sh" "$PROJECT"' "$consumer" || {
     echo "$(basename "$consumer") no longer uses the shared prebuilt-cache corpus" >&2
     exit 1

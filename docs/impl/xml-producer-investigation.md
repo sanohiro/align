@@ -87,9 +87,10 @@ pkg_db_q4b full_matrix_parity_is_exact_on_both_drivers: passed in 102.52s
 The release follow-up additionally passes the direct lifted-capture mutation
 owner, the one-way HTTP header-view owner, and the exact `pkg.web` prebuilt-cache
 corpus that failed on all three v0.7.0 release platforms. Its exact committed
-SHA still requires the changed-slice review and `scripts/pre-pr.sh`. Merge and
-the v0.7.1 patch release remain the terminal workflow; this record does not
-authorize another feature or consumer repository work.
+SHA passed its review and `scripts/pre-pr.sh`, then merged in PR #946. The
+v0.7.1 tag did not publish because its release measurement used a stale corpus;
+the shared-corpus v0.7.2 correction and release are the terminal workflow. This
+record does not authorize another feature or consumer repository work.
 
 ## Evidence locations and focused commands
 
