@@ -14,14 +14,53 @@ for the complete classification, coherent repair, explicit non-findings, and
 owner evidence. The implementation and repair are merged in PR #944. The v0.7.0
 and v0.7.1 tags exist, but neither published a GitHub Release: v0.7.0 exposed a
 compiler validation defect while warming the shipped cache, and v0.7.1 exposed
-drift between the expanded warm corpus and the release measurement corpus.
-The shared-corpus v0.7.2 correction is the only remaining implementation work;
-stop after that release and the owner-requested release-timing handoff update.
+drift between the expanded warm corpus and the release measurement corpus. PR
+#947 removed the duplicated corpus definitions, and
+[v0.7.2](https://github.com/sanohiro/align/releases/tag/v0.7.2) is published
+with all seven expected assets. Stop here; do not begin another capability
+without an owner instruction.
 
-**Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
-library work. If its owner proceeds with the intended release, complete that
-release before binding the consolidation baseline; this preparation does not
-select or publish a version. Then execute V0 in
+## Release-cycle timing handoff
+
+The 2026-09-06 release cycle spent **91m27s in sequential GitHub automation**
+from the first release PR through successful publication. That subtotal excludes
+implementation, review, local tests, and human/agent coordination, so it is a
+lower bound rather than the total elapsed work. Keep this as one baseline, not a
+per-PR journal.
+
+| Stage | Wall time | Critical result |
+|---|---:|---|
+| [v0.7.0 release PR #945](https://github.com/sanohiro/align/pull/945) CI | 22m01s | portable-pool 21m41s; Linux x86 19m10s |
+| [v0.7.0 release](https://github.com/sanohiro/align/actions/runs/34001425254) | 9m02s | failed before publication; macOS 8m52s |
+| [v0.7.1 correction PR #946](https://github.com/sanohiro/align/pull/946) CI | 19m32s | portable-pool 19m07s; Linux x86 17m29s; catalog-stream 17m28s |
+| [v0.7.1 release](https://github.com/sanohiro/align/actions/runs/34005959470) | 9m52s | failed before publication; macOS 9m45s |
+| [v0.7.2 correction PR #947](https://github.com/sanohiro/align/pull/947) CI | 19m46s | Linux x86 19m25s; portable-pool 19m20s; delivery-callbacks 15m01s |
+| [v0.7.2 release](https://github.com/sanohiro/align/actions/runs/34008473129) | 11m14s | succeeded; macOS 10m13s; ARM64 9m16s; x86 9m08s; publish 48s |
+
+The 30-minute timeout is a hard kill, not a success target. A normal mandatory
+validation or release run should target **15 minutes or less**. Before adding or
+lengthening another gate, audit the existing cost and remove work that does not
+own the changed boundary. The first optimization investigation should measure:
+
+- why release-metadata and prebuilt-corpus corrections run all four PostgreSQL
+  shards, and whether the scope classifier can exclude them without weakening a
+  real database boundary;
+- why `align_mir` alone consumed about 11 minutes of local bounded-gate time and
+  drove the Linux gate close to 20 minutes, including redundant cases and safe
+  partitioning/concurrency;
+- duplicated local preflight, Linux CI, release PGO, cache-layout, and cache
+  measurement work, retaining only checks that supply distinct evidence; and
+- failure recovery that reuses already verified immutable build artifacts for a
+  post-build or publication retry, while still requiring a new version for an
+  actual source/compiler defect.
+
+Do not respond to another failure with the same full rerun and another narrow
+patch. Stop, identify which evidence is genuinely required, reopen the owning
+verification design, and change the workflow boundary first.
+
+**Paused next work (owner-selected 2026-09-05):** `std.xml` and its versioned
+release are complete. When the owner explicitly resumes capability work,
+execute V0 in
 [`docs/impl/33-consolidation-baseline-packet.md`](docs/impl/33-consolidation-baseline-packet.md).
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
