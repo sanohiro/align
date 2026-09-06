@@ -2343,6 +2343,12 @@ grep -Fq 'scripts/build-prebuilt-cache.sh' "$release_workflow" || {
   echo "release.yml no longer warms the final release compiler's adjacent cache" >&2
   exit 1
 }
+for consumer in "$repo_root/scripts/build-prebuilt-cache.sh" "$repo_root/bench/prebuilt_cache/run.sh"; do
+  grep -Fq '"$REPO_ROOT/scripts/prepare-prebuilt-cache-project.sh" "$PROJECT"' "$consumer" || {
+    echo "$(basename "$consumer") no longer uses the shared prebuilt-cache corpus" >&2
+    exit 1
+  }
+done
 grep -Fq 'scripts/verify-prebuilt-cache-layout.sh package' "$release_workflow" || {
   echo "release.yml no longer verifies the staged native cache layout" >&2
   exit 1
@@ -2533,6 +2539,7 @@ for script in \
   scripts/open-pr.sh \
   scripts/pr-tier.sh \
   scripts/pre-pr.sh \
+  scripts/prepare-prebuilt-cache-project.sh \
   scripts/review-bounded.sh \
   scripts/run-gate-binaries.sh \
   scripts/run-quiet.sh \

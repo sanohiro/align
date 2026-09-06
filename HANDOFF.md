@@ -12,10 +12,11 @@ investigate-then-repair record instead of further piecemeal fix rounds. Read
 [`docs/impl/xml-producer-investigation.md`](docs/impl/xml-producer-investigation.md)
 for the complete classification, coherent repair, explicit non-findings, and
 owner evidence. The implementation and repair are merged in PR #944. The v0.7.0
-tag exists, but its release workflow failed before publication while building
-the shipped-package prebuilt cache. The validator repair and v0.7.1 patch
-release are the only remaining implementation work; stop after that release
-and the owner-requested release-timing handoff update.
+and v0.7.1 tags exist, but neither published a GitHub Release: v0.7.0 exposed a
+compiler validation defect while warming the shipped cache, and v0.7.1 exposed
+drift between the expanded warm corpus and the release measurement corpus.
+The shared-corpus v0.7.2 correction is the only remaining implementation work;
+stop after that release and the owner-requested release-timing handoff update.
 
 **Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
 library work. If its owner proceeds with the intended release, complete that
