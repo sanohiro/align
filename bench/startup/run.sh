@@ -59,6 +59,18 @@ case "$observer_sha256" in
 esac
 [ "${#observer_sha256}" -eq 64 ] || usage
 
+# External acquisition helpers run under one fixed platform path and locale.
+# Clear startup hooks and exported helper functions before the first child or
+# filesystem mutation; the final observer exec still receives no environment.
+PATH=/usr/bin:/bin
+LANG=C
+LC_ALL=C
+TZ=UTC
+export PATH LANG LC_ALL TZ
+unset CDPATH ENV BASH_ENV
+unset -f sh ps sleep dirname mkdir mktemp cp chmod id uname stat rm rmdir 2>/dev/null || :
+readonly PATH LANG LC_ALL TZ
+
 private_exec() {
 outer_pgid=$1
 outer_pid=$2

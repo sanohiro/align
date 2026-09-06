@@ -525,6 +525,7 @@ fn validate_platform_provenance(provenance: &Provenance) -> AppResult<()> {
     if provenance.host_os != expected_os
         || provenance.host_arch != expected_arch
         || provenance.target_triple != expected_triple
+        || normalized_uname_arch(&provenance.host_kernel)? != expected_arch
     {
         return Err(AppError::usage(
             "provenance platform does not match the observer",
@@ -548,6 +549,18 @@ fn validate_platform_provenance(provenance: &Provenance) -> AppResult<()> {
         return Err(AppError::usage("provenance libc identity mismatch"));
     }
     Ok(())
+}
+
+fn normalized_uname_arch(kernel: &[u8]) -> AppResult<&'static [u8]> {
+    let fields = decode_list(kernel)?;
+    if fields.len() != 4 {
+        return Err(AppError::usage("kernel identity field count mismatch"));
+    }
+    match fields[3].as_slice() {
+        b"x86_64" => Ok(b"x86_64"),
+        b"aarch64" | b"arm64" => Ok(b"aarch64"),
+        _ => Err(AppError::usage("uname machine is unsupported")),
+    }
 }
 
 fn current_host_kernel() -> AppResult<Vec<u8>> {
@@ -1128,7 +1141,7 @@ fn validate_fixtures(repo: &Path) -> AppResult<[u8; 32]> {
         let mut options = OpenOptions::new();
         options
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let mut file = options
             .open(&path)
             .map_err(|error| AppError::usage(format!("fixture {}: {error}", fixture.id)))?;
@@ -1142,9 +1155,20 @@ fn validate_fixtures(repo: &Path) -> AppResult<[u8; 32]> {
             )));
         }
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut bytes)
+        Read::by_ref(&mut file)
+            .take(FIXTURE_MAX + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| AppError::usage(format!("fixture {}: {error}", fixture.id)))?;
-        if bytes != fixture.bytes {
+        let after = file
+            .metadata()
+            .map_err(|error| AppError::usage(format!("fixture {}: {error}", fixture.id)))?;
+        if bytes.len() as u64 != metadata.len()
+            || metadata.dev() != after.dev()
+            || metadata.ino() != after.ino()
+            || metadata.mode() != after.mode()
+            || metadata.len() != after.len()
+            || bytes != fixture.bytes
+        {
             return Err(AppError::usage(format!(
                 "fixture {} differs from the compiled inventory",
                 fixture.id
@@ -2814,6 +2838,7 @@ fn wait4_reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
 }
 
 fn confirm_group_absence(pid: libc::pid_t, deadline: u64) -> AppResult<()> {
+    let mut initially_present = false;
     loop {
         // SAFETY: signal zero probes the previously pinned group without delivery.
         if unsafe { libc::kill(-pid, 0) } == -1 {
@@ -2822,10 +2847,17 @@ fn confirm_group_absence(pid: libc::pid_t, deadline: u64) -> AppResult<()> {
                 continue;
             }
             if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
+                return if initially_present {
+                    Err(AppError::operational(
+                        "group-absence: helper survived the first probe",
+                    ))
+                } else {
+                    Ok(())
+                };
             }
             return Err(AppError::io("group-absence", error));
         }
+        initially_present = true;
         if monotonic_ns().map_err(|error| AppError::io("group-absence", error))? >= deadline {
             return Err(AppError::operational("group-absence: terminal deadline"));
         }
@@ -2930,21 +2962,9 @@ fn produce_evidence(
                 arm_index,
                 arm,
                 execution_state,
-            )?;
-            require_same(
                 &mut llvm_identity,
-                artifact.key.llvm_build_id,
-                "LLVM build identity",
-            )?;
-            require_same(
                 &mut llvm_version,
-                artifact.key.llvm_version.clone(),
-                "LLVM version",
-            )?;
-            require_same(
                 &mut rt_lto_by_arm[arm_index],
-                artifact.key.rt_lto_digest.expect("validated"),
-                "runtime LTO identity",
             )?;
             artifacts.push(artifact);
         }
@@ -3147,6 +3167,9 @@ fn build_artifact(
     arm_index: usize,
     arm: &SealedArm,
     execution_state: &[u8],
+    llvm_identity: &mut Option<Hash128>,
+    llvm_version: &mut Option<String>,
+    rt_lto_identity: &mut Option<Hash128>,
 ) -> AppResult<Artifact> {
     let cache = work.join("cache").join(fixture.id).join(arm.arm.name);
     let fixture_cache_parent = cache.parent().expect("fixed cache topology");
@@ -3232,13 +3255,20 @@ fn build_artifact(
         .read_exact(&mut header)
         .map_err(|error| AppError::io("artifact header", error))?;
     validate_native_image(&header, &provenance.target_triple, true)?;
-    let executable_sha256 = sha256_reader(&mut executable_file, FILE_MAX)?;
     let key = validate_cache(&cache_root, provenance, &arm.arm, &arm.compiler_bytes)?;
     if directory_identity(cache_root.as_raw_fd(), "cache root")? != cache_identity {
         return Err(AppError::operational(
             "cache root identity changed across build",
         ));
     }
+    require_same(llvm_identity, key.llvm_build_id, "LLVM build identity")?;
+    require_same(llvm_version, key.llvm_version.clone(), "LLVM version")?;
+    require_same(
+        rt_lto_identity,
+        key.rt_lto_digest.expect("validated codegen key"),
+        "runtime LTO identity",
+    )?;
+    let executable_sha256 = sha256_reader(&mut executable_file, FILE_MAX)?;
     let inspector_arguments = vec![
         OsString::from("--sections"),
         OsString::from("--needed-libs"),
@@ -5523,19 +5553,6 @@ fn measure_all(
                 break;
             }
             let artifact = &fixture_artifacts[scheduled.arm];
-            if let Err(error) = revalidate_artifacts(std::slice::from_ref(artifact)) {
-                results.row(&unstarted_sample_row_with_details(
-                    fixture,
-                    *scheduled,
-                    &provenance.arms,
-                    SampleOutcome::FormationError,
-                    None,
-                    "spawn-actions",
-                    Some(error.message.as_bytes()),
-                )?)?;
-                fixture_failed = true;
-                break;
-            }
             let argv: Vec<OsString> = std::iter::once(artifact.executable.as_os_str().to_owned())
                 .chain(
                     fixture
@@ -6141,7 +6158,7 @@ impl Provenance {
         let mut options = OpenOptions::new();
         options
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let mut file = options
             .open(path)
             .map_err(|error| AppError::usage(format!("provenance: {error}")))?;
@@ -7242,6 +7259,7 @@ fn current_environment_cstrings() -> AppResult<Vec<CString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
@@ -7334,6 +7352,34 @@ mod tests {
         for bad in [b"0".as_slice(), b"AA", b"gg"] {
             assert!(decode_hex(bad, true).is_err());
         }
+    }
+
+    #[test]
+    fn uname_machine_normalization_rejects_emulated_hosts() {
+        for (machine, expected) in [
+            (b"x86_64".as_slice(), b"x86_64".as_slice()),
+            (b"aarch64".as_slice(), b"aarch64".as_slice()),
+            (b"arm64".as_slice(), b"aarch64".as_slice()),
+        ] {
+            let record = encode_list_bytes(&[b"system", b"release", b"version", machine]).unwrap();
+            assert_eq!(normalized_uname_arch(&record).unwrap(), expected);
+        }
+        let record = encode_list_bytes(&[b"system", b"release", b"version", b"riscv64"]).unwrap();
+        assert!(normalized_uname_arch(&record).is_err());
+    }
+
+    #[test]
+    fn provenance_fifo_is_rejected_without_waiting_for_a_writer() {
+        let directory = temporary_directory("provenance-fifo");
+        let fifo = directory.join("provenance");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c names a new path in the test-owned directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(Provenance::read(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_file(fifo).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -7634,6 +7680,25 @@ mod tests {
             nonpoisoning_lock(mutex).generation = u64::MAX;
         }
         assert!(watchdog.reserve().is_err());
+    }
+
+    #[test]
+    fn group_absence_rejects_a_helper_present_at_the_first_probe() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 0.2 &"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let group = i32::try_from(leader.id()).unwrap();
+        assert!(leader.wait().unwrap().success());
+        let deadline = monotonic_ns().unwrap() + 1_000_000_000;
+        let error = confirm_group_absence(group, deadline).unwrap_err();
+        assert!(error.message.contains("survived the first probe"));
     }
 
     #[test]
