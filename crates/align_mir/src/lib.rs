@@ -4704,6 +4704,52 @@ impl Builder {
 
 // The source type tables and shared signature maps are distinct lowering invariants; keeping them
 // explicit here makes the one Builder construction auditable and avoids a bag-of-context fields.
+fn lower_lifted_borrow_summary(
+    summary: &hir::ReturnBorrowSummary,
+    explicit: u32,
+) -> hir::ReturnBorrowSummary {
+    match summary {
+        hir::ReturnBorrowSummary::None => hir::ReturnBorrowSummary::None,
+        hir::ReturnBorrowSummary::Roots { params, captures } => {
+            let mut params = params.clone();
+            params.extend(
+                captures
+                    .iter()
+                    .map(|capture| explicit.saturating_add(*capture)),
+            );
+            params.sort_unstable();
+            params.dedup();
+            hir::ReturnBorrowSummary::Roots {
+                params,
+                captures: Vec::new(),
+            }
+        }
+    }
+}
+
+fn lower_lifted_region_summary(
+    summary: &hir::ReturnRegionSummary,
+    explicit: u32,
+) -> hir::ReturnRegionSummary {
+    match summary {
+        hir::ReturnRegionSummary::None => hir::ReturnRegionSummary::None,
+        hir::ReturnRegionSummary::Roots { params, captures } => {
+            let mut params = params.clone();
+            params.extend(
+                captures
+                    .iter()
+                    .map(|capture| explicit.saturating_add(*capture)),
+            );
+            params.sort_unstable();
+            params.dedup();
+            hir::ReturnRegionSummary::Roots {
+                params,
+                captures: Vec::new(),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_fn(
     f: &hir::Fn,
@@ -4869,14 +4915,29 @@ fn lower_fn(
         })
         .collect();
 
+    let (return_borrow, return_region) = match f.origin {
+        hir::FnOrigin::Lifted { capture_count } => {
+            let explicit = usize::try_from(capture_count)
+                .ok()
+                .and_then(|capture_count| f.params.len().checked_sub(capture_count))
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or(u32::MAX);
+            (
+                lower_lifted_borrow_summary(&f.return_borrow, explicit),
+                lower_lifted_region_summary(&f.return_region, explicit),
+            )
+        }
+        _ => (f.return_borrow.clone(), f.return_region.clone()),
+    };
+
     Function {
         name: ProgramCall::from_validated(&f.name),
         params,
         param_modes: f.param_modes.clone(),
         borrow_mut_cleanup_slots,
         ret: f.ret,
-        return_borrow: f.return_borrow.clone(),
-        return_region: f.return_region.clone(),
+        return_borrow,
+        return_region,
         return_cleanup: f.return_cleanup,
         slots: b.slots,
         slot_align: b.slot_align,
