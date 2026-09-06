@@ -1142,9 +1142,12 @@ link-count or byte mutation after return.
 `fs.create_private_temp_dir(prefix: str) -> Result<string, Error>` accepts an exact 1..=64-byte
 ASCII alphanumeric/underscore/hyphen prefix (the first byte is alphanumeric), selects `/tmp` on
 Linux or `_CS_DARWIN_USER_TEMP_DIR` on macOS without environment input, and atomically creates a
-`0700`-or-narrower directory named by the prefix plus 128 random bits. It returns the owned absolute
+`0700`-or-narrower directory named by the prefix plus 128 random bits. Only that platform-owned root
+spelling is canonicalized before strict traversal, consuming macOS's terminal slash and `/var`
+compatibility spelling. It returns the owned canonical absolute
 path, never reuses an occupant, and bounds collision retries at 128. Output allocation precedes
-filesystem mutation. `fs.remove_empty_dir(path: str) -> Result<(), Error>` accepts only an absolute
+filesystem mutation. Interrupted random reads retry, a negative failure uses native-error mapping,
+and zero progress is `Error.Invalid`. `fs.remove_empty_dir(path: str) -> Result<(), Error>` accepts only an absolute
 strict path, retains and revalidates every ancestor and the final no-follow directory, and removes
 only the empty directory selected by one descriptor-relative `AT_REMOVEDIR` call. It does not
 recurse or remove a symlink/file/special entry. That syscall is the final namespace linearization

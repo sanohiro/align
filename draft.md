@@ -3086,12 +3086,16 @@ content mutation. `fs.open_beneath` remains unchanged and continues to permit mu
 `fs.create_private_temp_dir` accepts a 1..=64-byte ASCII filename prefix whose first byte is
 alphanumeric and whose remaining bytes are alphanumeric, `_`, or `-`. It ignores application
 environment and path input: Linux uses `/tmp`, while macOS uses the platform
-`_CS_DARWIN_USER_TEMP_DIR`. It appends `-` plus 32 lowercase hexadecimal digits from 128 fresh
-OS-CSPRNG bits, retains and walks the platform root without following symlinks, and atomically
+`_CS_DARWIN_USER_TEMP_DIR`. It canonicalizes only that platform-owned spelling before validating
+and walking the canonical root without following symlinks; this consumes macOS's terminal slash and
+`/var` compatibility spelling so the returned path works with retained-root APIs. It appends `-`
+plus 32 lowercase hexadecimal digits from 128 fresh OS-CSPRNG bits and atomically
 claims one absent leaf with mode `0700` (the umask may narrow it). It retries only an `EEXIST`
 collision, at most 128 candidates, and returns the owned absolute path. All result allocation
 precedes the first create, so no recoverable failure or terminal allocation failure can leave a
-directory or publish a partial path.
+directory or publish a partial path. Interrupted random reads retry, a negative random-source
+failure keeps the fixed native-error mapping, and an impossible zero-progress read is
+`Error.Invalid` without consulting stale `errno`.
 
 `fs.remove_empty_dir` is the non-recursive cleanup companion. It accepts one absolute strict path,
 retains and revalidates every ancestor and the final directory without following symlinks, then

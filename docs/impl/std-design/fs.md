@@ -141,8 +141,10 @@ rename and C6f2 pair publication.
 
 `create_private_temp_dir` accepts one 1..=64-byte ASCII prefix. The first byte is alphanumeric;
 remaining bytes are alphanumeric, `_`, or `-`. It reads no application path or environment
-variable. Linux selects `/tmp`; macOS selects `confstr(_CS_DARWIN_USER_TEMP_DIR)`. Retained
-no-follow descriptors walk that absolute platform root.
+variable. Linux starts from `/tmp`; macOS starts from `confstr(_CS_DARWIN_USER_TEMP_DIR)`, including
+its platform-provided terminal slash. Only that platform-owned spelling is canonicalized before
+strict validation and retained no-follow traversal, so macOS's `/var` compatibility symlink does
+not make the returned canonical absolute path unusable by retained-root APIs.
 
 Each candidate leaf is the prefix, `-`, and 32 lowercase hexadecimal digits from 128 fresh
 OS-CSPRNG bits. One `mkdirat` with mode `0700` atomically claims it; umask may narrow but never widen
@@ -302,7 +304,9 @@ The private-directory operations are also `Impure`. Prefix/path operands are bor
 path is an ordinary owned `string`, so move, return, branch/loop joins, `?`, replacement, and Drop
 use the existing string ownership path. Randomness failure and native creation/removal failures use
 the fixed error mapping; only `EEXIST` creation collisions retry. Removal leaves nonempty and
-mismatched entries observable for caller-owned cleanup.
+mismatched entries observable for caller-owned cleanup. An interrupted random read retries, a
+negative failure uses the fixed native-error mapping, and zero progress is `Invalid` rather than a
+stale `errno` value.
 
 ## Platform boundary and non-goals
 

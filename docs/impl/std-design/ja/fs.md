@@ -120,9 +120,10 @@ retained-parent constructor であり、no-replace rename と C6f2 pair publicat
 ### `create_private_temp_dir`
 
 `create_private_temp_dir` は 1..=64 byte の ASCII prefix を 1 つ受け取る。先頭 byte は英数字、残りは
-英数字、`_`、`-` に限る。application path や environment variable は読まない。Linux は `/tmp`、macOS は
-`confstr(_CS_DARWIN_USER_TEMP_DIR)` を選び、その absolute platform root を retained no-follow descriptor
-で走査する。
+英数字、`_`、`-` に限る。application path や environment variable は読まない。Linux は `/tmp` から、macOS は
+platform-provided terminal slash を含む `confstr(_CS_DARWIN_USER_TEMP_DIR)` から開始する。その platform-owned
+spelling だけを canonicalize してから strict validation と retained no-follow traversal を行うため、macOS の
+`/var` compatibility symlink でも returned canonical absolute path を retained-root API が利用できる。
 
 candidate leaf は prefix、`-`、128 fresh OS-CSPRNG bit を表す 32 桁 lowercase hex である。mode `0700` の
 `mkdirat` 1 回で atomically claim し、umask は permission を狭めるだけで広げない。`EEXIST` のときだけ fresh
@@ -265,7 +266,9 @@ traversal component、non-regular input、identity change を `Error.Invalid` �
 private-directory 操作も `Impure` で、prefix/path operand は借用である。created path は通常の owned `string`
 なので move、return、branch/loop join、`?`、replacement、Drop は既存経路を使う。randomness と native
 create/remove failure は固定 error mapping に従い、create collision の `EEXIST` だけを retry する。removal
-failure は nonempty/mismatched entry を caller-owned cleanup のため観測可能なまま残す。
+failure は nonempty/mismatched entry を caller-owned cleanup のため観測可能なまま残す。random read の
+interrupt は retry し、negative failure は固定 native-error mapping、zero progress は stale `errno` ではなく
+`Invalid` とする。
 
 ## platform 境界と non-goal
 

@@ -3147,8 +3147,9 @@ not reopen M9.
 `fs.create_private_temp_dir(prefix: str) -> Result<string, Error>` and
 `fs.remove_empty_dir(path: str) -> Result<(), Error>`. The constructor validates one bounded safe
 prefix, ignores application environment/path input, selects the Linux or macOS platform temporary
-root, and uses 128 OS-random bits plus one exclusive `0700` `mkdirat` claim to return an owned
-absolute path. It never reuses an occupant or creates parents, and its output allocation precedes
+root, canonicalizes only that platform-owned spelling before strict traversal, and uses 128
+OS-random bits plus one exclusive `0700` `mkdirat` claim to return an owned canonical absolute path.
+It never reuses an occupant or creates parents, and its output allocation precedes
 filesystem mutation.
 
 Removal accepts an absolute strict path, retains and revalidates all ancestors and the final
