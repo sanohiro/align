@@ -34417,11 +34417,13 @@ fn main() -> i32 = 0
         emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None)
             .unwrap_or_else(|error| panic!("direct lifted capture root must lower: {error}"));
 
-        let lifted = base
+        let Some(lifted) = base
             .fns
             .iter()
             .position(|function| function.name.as_str().contains("$lambda"))
-            .expect("mapped lambda must be lifted");
+        else {
+            panic!("mapped lambda must be lifted");
+        };
         assert_eq!(
             base.fns[lifted].return_borrow,
             hir::ReturnBorrowSummary::Roots {
