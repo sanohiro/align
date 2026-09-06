@@ -799,6 +799,21 @@ whole/per-unit declarations, and rt-LTO inventory update in the same capability.
 contract and closure matrix are in
 `docs/impl/29-fs-retained-root-plan.md` and `docs/impl/std-design/fs.md`.
 
+## Request 55 retained-root single-link open (design candidate)
+
+Request 55 proposes one keyed record using existing ABI shape A12:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `IoReaderOpenBeneathSingleLink` | `align_rt_io_reader_open_beneath_single_link` | A12: `i32 @SYM(ptr, i64, ptr, i64, ptr)` |
+
+The row keeps the existing reader output-slot and two-path validation order. It reuses retained-root
+traversal and regular-file descriptor revalidation, then consumes that opened descriptor's existing
+stat record and publishes the existing reader only when `st_nlink == 1`. The key is not included in
+the active inventory counts until implementation lands atomically with the exact declaration
+golden, key/symbol bijection, native export, whole/per-unit declaration, and rt-LTO inventory. The
+authoritative contract is `docs/impl/34-fs-single-link-plan.md`.
+
 ## Request 13 recursive owned JSON replacement (design accepted)
 
 Request 13 added no runtime key, symbol, LLVM function shape, C signature, or

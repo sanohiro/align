@@ -2,6 +2,10 @@
 
 Status: **IMPLEMENTED in Align for align-llm Request 18. Real-client adoption is pending.**
 
+Request 55's hard-link-rejecting sibling is specified separately in
+[`34-fs-single-link-plan.md`](34-fs-single-link-plan.md). It reuses this contract without changing
+either constructor defined here.
+
 This document is the authoritative public-contract ledger and implementation plan for two
 descriptor-relative filesystem constructors:
 

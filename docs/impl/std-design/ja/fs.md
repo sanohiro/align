@@ -1,6 +1,7 @@
 このファイルは、下記の `std.fs` 拡張を実装するための設計である。公開契約台帳は
 [`../27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) と
-[`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。
+[`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。Request 55 の single-link
+拡張は [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) が所有する。
 
 # std.fs — 明示的な trusted filesystem 境界
 
@@ -9,7 +10,8 @@
 > **ステータス:** Request 14 は 2026-08-19 に実装済み（設計 PR #859 は
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`、実装 PR #861 は
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
-> Request 18 の retained-root regular-file access は実装済みで、align-llm の adoption gate は未完了。
+> Request 18 の retained-root regular-file access は実装済みである。Request 55 の retained-root
+> single-link open は設計候補であり、まだ実装されていない。
 
 ## 概要
 
@@ -28,6 +30,7 @@ Request 18 は、1 つの retained root 配下の通常ファイルを扱う別�
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
@@ -81,6 +84,19 @@ owned `reader` を公開する。constructor は artifact byte を読まない�
 別 descriptor からの byte mutation は防がない。immutable input が必要な caller は明示的な single-writer
 precondition を維持する。
 
+### `open_beneath_single_link`
+
+`open_beneath_single_link` は hard link を拒否する別 constructor である。`open_beneath` の path
+grammar、retained-directory traversal、regular-file open、descriptor identity の再検査、error
+mapping、nonblocking-clear の全手順を変更せず実行する。reader を構築する直前に、同じ opened
+descriptor に対する既存の `fstat` 結果の `st_nlink` を検査する。`st_nlink == 1` のときだけ
+成功し、0 または 1 より大きい場合は `Error.Invalid` とする。
+
+返すのは同じ owned `reader` だけであり、descriptor や metadata は公開しない。失敗時は artifact
+byte も reader も公開しない。path の検査、directory enumeration、final name の reopen は opened
+descriptor identity を失うため代替実装にならない。その後の外部 link-count 変更や byte mutation
+は防がず、predicate は最後の descriptor 観測時点の opened inode だけを保証する。
+
 ### `create_exclusive_beneath`
 
 `create_exclusive_beneath` は同じ root/relative grammar と retained directory walk を使う。保持した final
@@ -128,6 +144,12 @@ retained-root 操作はそれぞれ 2 つの path view を借用し、A12 ABI sh
 
 ```text
 align_rt_io_reader_open_beneath(
+    root_ptr: ptr, root_len: i64,
+    relative_ptr: ptr, relative_len: i64,
+    out_reader: ptr,
+) -> i32
+
+align_rt_io_reader_open_beneath_single_link(
     root_ptr: ptr, root_len: i64,
     relative_ptr: ptr, relative_len: i64,
     out_reader: ptr,
@@ -183,6 +205,7 @@ path operand は借用された `str` view であり、move も保持もされ�
 
 retained-root 操作も `Impure` である。同じ固定 error model を使い、unsafe grammar、symlink/non-directory
 traversal component、non-regular input、identity change を `Error.Invalid` にする。2 つの path operand は借用で、
+`open_beneath_single_link` は descriptor の link count が正確に 1 でない場合も `Error.Invalid` にする。
 成功した reader/writer は既存の Move/Drop 経路をそのまま使う。同じ final の open/create pair に hidden exclusion
 や snapshot はない。open が不在を観測すれば `NotFound`、create 後なら writer が live の間に新しい regular inode
 を取得し得る。immutable input が必要な consumer はこの overlap を拒否しなければならない。
@@ -198,6 +221,9 @@ transaction、journal、recovery daemon、process-global lock、temporary-name g
 capability、sandbox、replacement/exchange operation、durability guarantee は提供しない。Request 14 の path-only
 操作は通常の parent resolution を維持し、Request 18 の 2 constructor だけが上記の明示的 no-symlink
 regular-file 境界を提供する。
+
+Request 55 は metadata surface や永続的な immutability guarantee を追加しない。hard link を意図的に
+許可する caller のために `open_beneath` は変更しない。
 
 ## 実装と acceptance の境界
 
@@ -218,6 +244,11 @@ owner evidence の境界は次のとおりである。
 
 完全な closure matrix、acceptance table、review finding の処理は
 [`27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) にある。
+
+Request 55 の確定契約と implementation closure matrix は
+[`34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) にある。既存の A12 lowering と reader identity
+を再利用し、別 operation/runtime key と既存 stat record に対する descriptor-only link-count
+predicate を追加する。
 
 Request 18 も同じ cross-stage 規則を使う。`ReaderOpenBeneath` と `CreateExclusiveBeneath` の別 node、完全な
 visitor/validator/replay/MIR closure、正確な A12 runtime row と export parity、既存 handle Drop、

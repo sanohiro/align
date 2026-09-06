@@ -1,7 +1,8 @@
 This file is the implementation-facing design for the `std.fs` extensions below.
 The public-contract ledgers are
 [`../27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) and
-[`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md).
+[`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md). Request 55's single-link
+extension is owned by [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md).
 
 # std.fs — explicit trusted filesystem boundaries
 
@@ -10,8 +11,8 @@ The public-contract ledgers are
 > **Status:** Request 14 IMPLEMENTED 2026-08-19 (design PR #859, merged as
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`; implementation PR #861, merged as
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
-> pending. Request 18 retained-root regular-file access is IMPLEMENTED; its align-llm adoption gate
-> is pending.
+> pending. Request 18 retained-root regular-file access is IMPLEMENTED. Request 55 retained-root
+> single-link open is a DESIGN CANDIDATE and is not yet implemented.
 
 ## Overview
 
@@ -32,6 +33,7 @@ Request 18 adds a separate two-operation boundary for regular files below one re
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
@@ -96,6 +98,20 @@ After success, later reads use the retained file descriptor; renaming or replaci
 does not retarget the reader. The API does not prevent byte mutation through another descriptor.
 Callers that need immutable input retain that explicit single-writer precondition.
 
+### `open_beneath_single_link`
+
+`open_beneath_single_link` is a distinct hard-link-rejecting constructor. It runs the complete
+`open_beneath` grammar, retained-directory traversal, regular-file open, descriptor identity
+revalidation, error mapping, and nonblocking-clear sequence unchanged. Immediately before reader
+construction, it checks `st_nlink` from the existing `fstat` of that same opened descriptor.
+Exactly `st_nlink == 1` succeeds; zero or more than one link is `Error.Invalid`.
+
+The operation returns the same owned `reader` and exposes no descriptor or metadata. It reads no
+artifact byte and publishes no reader on failure. Checking a pathname, enumerating a directory, or
+reopening the final name is not equivalent because that would lose the opened descriptor identity.
+A later external link-count or byte mutation is not prevented; the predicate certifies the opened
+inode only at the final descriptor observation.
+
 ### `create_exclusive_beneath`
 
 `create_exclusive_beneath` uses the same root/relative grammar and retained directory walk. At the
@@ -150,6 +166,12 @@ The retained-root operations each borrow two path views and use the A12 ABI shap
 
 ```text
 align_rt_io_reader_open_beneath(
+    root_ptr: ptr, root_len: i64,
+    relative_ptr: ptr, relative_len: i64,
+    out_reader: ptr,
+) -> i32
+
+align_rt_io_reader_open_beneath_single_link(
     root_ptr: ptr, root_len: i64,
     relative_ptr: ptr, relative_len: i64,
     out_reader: ptr,
@@ -212,7 +234,8 @@ performed after a partial write.
 
 The retained-root operations are also `Impure`. They use the same fixed error model while mapping
 an unsafe grammar, symlink/non-directory traversal component, non-regular input, or identity change
-to `Error.Invalid`. Their two path operands are borrowed, and their successful reader/writer uses
+to `Error.Invalid`; `open_beneath_single_link` additionally maps every descriptor link count other
+than exactly one to `Error.Invalid`. Their two path operands are borrowed, and their successful reader/writer uses
 the unchanged existing Move/Drop path. A same-final open/create pair has no hidden exclusion or
 snapshot: open returns `NotFound` if it observes absence, but may acquire the newly created regular
 inode while its writer is live. Consumers requiring immutable input must reject that overlap.
@@ -232,6 +255,9 @@ temporary-name generator, public directory-handle capability, sandbox,
 replacement or exchange operation, or durability guarantee. Request 14's path-only operations keep
 ordinary parent resolution; Request 18's two retained-root constructors supply only the explicit
 no-symlink regular-file boundary described above.
+
+Request 55 adds no metadata surface or persistent immutability promise. `open_beneath` remains
+unchanged for callers that intentionally permit hard links.
 
 ## Implementation and acceptance boundary
 
@@ -266,3 +292,8 @@ rows and export parity, existing handle Drop, whole/per-unit/cache parity, Linux
 descriptor-walk owners, and align-llm's real `c6d-request18-adoption` consumer. Its complete matrix
 is [`29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md). No benchmark is required because
 the new contract is safety and ownership, not throughput.
+
+Request 55 follows that established boundary with one distinct reader operation and runtime key,
+the same A12 lowering, and a descriptor-only link-count predicate over the existing stat record.
+Its complete contract and implementation closure matrix are in
+[`34-fs-single-link-plan.md`](../34-fs-single-link-plan.md).
