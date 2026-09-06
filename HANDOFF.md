@@ -17,8 +17,11 @@ compiler validation defect while warming the shipped cache, and v0.7.1 exposed
 drift between the expanded warm corpus and the release measurement corpus. PR
 #947 removed the duplicated corpus definitions, and
 [v0.7.2](https://github.com/sanohiro/align/releases/tag/v0.7.2) is published
-with all seven expected assets. Stop here; do not begin another capability
-without an owner instruction.
+with all seven expected assets. The owner resumed capability work on 2026-09-06.
+V0 qualified the fixed R0-R5 corpus and XML evidence against the published
+v0.7.2 distribution and its matching source checkout; it found no new
+correctness defect. Startup/resource observations remain unavailable for S0A,
+and current chunks representation decisions remain unavailable for S0B.
 
 ## Release-cycle timing handoff
 
@@ -58,15 +61,19 @@ Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
-**Paused next work (owner-selected 2026-09-05):** `std.xml` and its versioned
-release are complete. When the owner explicitly resumes capability work,
-execute V0 in
-[`docs/impl/33-consolidation-baseline-packet.md`](docs/impl/33-consolidation-baseline-packet.md).
+**Current next work (owner-resumed 2026-09-06):** `std.xml`, its versioned
+release, and V0 baseline qualification are complete. Author the exact S0A
+startup-observation design next, then the exact S0B current-decision observation
+design.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
-reassessment. `std.time` named formatters, cloud packages, and additional
-transports are paused during this phase. S1–S6 are not a mandatory backlog.
+reassessment. V0 proposes chunks representation selection as the conditional
+C0 boundary and retains additional nonescaping chunks virtualization as a
+conditional S1 candidate, but neither implementation is approved before its
+required observation and exact owning ledger. `std.time` named formatters,
+cloud packages, and additional transports are paused during this phase. S1–S6
+are not a mandatory backlog.
 
 _Last updated: 2026-09-06._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
