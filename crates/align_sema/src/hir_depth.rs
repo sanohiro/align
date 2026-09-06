@@ -546,6 +546,10 @@ fn walk_body_records<'a>(
                     root: lhs,
                     relative: rhs,
                 }
+                | ExprKind::ReaderOpenBeneathSingleLink {
+                    root: lhs,
+                    relative: rhs,
+                }
                 | ExprKind::CreateExclusiveBeneath {
                     root: lhs,
                     relative: rhs,

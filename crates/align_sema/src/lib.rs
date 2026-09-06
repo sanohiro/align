@@ -15827,6 +15827,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::ReaderOpenBeneathSingleLink { root, relative }
             | ExprKind::CreateExclusiveBeneath { root, relative } => {
                 walk!(root);
                 walk!(relative);
@@ -23710,6 +23711,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
+            | ExprKind::ReaderOpenBeneathSingleLink { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
             | ExprKind::CreateExclusive { .. }
@@ -24155,6 +24157,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
+            | ExprKind::ReaderOpenBeneathSingleLink { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
             | ExprKind::CreateExclusive { .. }
@@ -27458,6 +27461,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(destination, depth);
             }
             ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::ReaderOpenBeneathSingleLink { root, relative }
             | ExprKind::CreateExclusiveBeneath { root, relative } => {
                 self.walk(root, depth);
                 self.walk(relative, depth);
@@ -29888,6 +29892,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::ReaderStdin
         | ExprKind::ReaderOpen { .. }
         | ExprKind::ReaderOpenBeneath { .. }
+        | ExprKind::ReaderOpenBeneathSingleLink { .. }
         | ExprKind::WriterStd { .. }
         | ExprKind::WriterCreate { .. }
         | ExprKind::CreateExclusive { .. }
@@ -37258,6 +37263,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
+            | ExprKind::ReaderOpenBeneathSingleLink { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::CreateExclusive { .. }
             | ExprKind::CreateExclusiveBeneath { .. }
             | ExprKind::FsReadFileView { .. }
@@ -43653,6 +43659,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, destination, moved, false, false);
             }
             ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::ReaderOpenBeneathSingleLink { root, relative }
             | ExprKind::CreateExclusiveBeneath { root, relative } => {
                 move_expr!(self, root, moved, false, false);
                 move_expr!(self, relative, moved, false, false);
@@ -49863,10 +49870,14 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_fs_create_exclusive(args, span);
             }
             // Descriptor-relative regular-file constructors rooted at one retained directory.
-            if module == "fs" && (method == "open_beneath" || method == "create_exclusive_beneath")
+            if module == "fs"
+                && matches!(
+                    method,
+                    "open_beneath" | "open_beneath_single_link" | "create_exclusive_beneath"
+                )
             {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
-                return self.check_fs_beneath(method == "create_exclusive_beneath", args, span);
+                return self.check_fs_beneath(method, args, span);
             }
             // `fs.create_rw(path)` (O_RDWR|O_CREAT|O_TRUNC) / `fs.open_rw(path)` (O_RDWR, must exist)
             // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
@@ -58380,15 +58391,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `fs.open_beneath(root, relative)` / `fs.create_exclusive_beneath(root, relative)`.
+    /// The retained-root reader constructors and `fs.create_exclusive_beneath(root, relative)`.
     /// Both operands are checked in source order even when the first is invalid. A malformed
     /// operand never enters checked HIR as one of these operations.
-    fn check_fs_beneath(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
-        let name = if create {
-            "fs.create_exclusive_beneath"
-        } else {
-            "fs.open_beneath"
-        };
+    fn check_fs_beneath(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let name = format!("fs.{method}");
         if args.len() != 2 {
             self.diags.error(
                 format!(
@@ -58412,22 +58419,39 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
         }
-        let (kind, ok) = if create {
-            (
+        let (kind, ok) = match method {
+            "create_exclusive_beneath" => (
                 ExprKind::CreateExclusiveBeneath {
                     root: Box::new(root),
                     relative: Box::new(relative),
                 },
                 Scalar::Writer,
-            )
-        } else {
-            (
+            ),
+            "open_beneath_single_link" => (
+                ExprKind::ReaderOpenBeneathSingleLink {
+                    root: Box::new(root),
+                    relative: Box::new(relative),
+                },
+                Scalar::Reader,
+            ),
+            "open_beneath" => (
                 ExprKind::ReaderOpenBeneath {
                     root: Box::new(root),
                     relative: Box::new(relative),
                 },
                 Scalar::Reader,
-            )
+            ),
+            _ => {
+                self.diags.error(
+                    format!("unknown retained-root filesystem operation '{name}'"),
+                    span,
+                );
+                return Expr {
+                    kind: ExprKind::Bool(false),
+                    ty: Ty::Error,
+                    span,
+                };
+            }
         };
         Expr {
             kind,
@@ -64400,6 +64424,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(destination);
             }
             ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::ReaderOpenBeneathSingleLink { root, relative }
             | ExprKind::CreateExclusiveBeneath { root, relative } => {
                 self.finalize_expr(root);
                 self.finalize_expr(relative);

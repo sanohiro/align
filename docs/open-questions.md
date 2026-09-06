@@ -3123,7 +3123,7 @@ real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` a
 `docs/impl/std-design/fs.md`. The independently reviewed design and the complete compiler/runtime
 capability are shipped; real-client adoption remains next and M9 remains closed.
 
-### Request 55 — retained-root single-link regular-file open (DESIGN ACCEPTED)
+### Request 55 — retained-root single-link regular-file open (IMPLEMENTED)
 
 `std.fs` adds the distinct
 `fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>` constructor. It
@@ -3137,8 +3137,9 @@ The operation returns the existing Move `reader` and exposes no descriptor, devi
 size, or link count. It does not reopen a path, enumerate aliases, prevent a later link or content
 mutation, or change `fs.open_beneath` for callers that permit hard links. One distinct HIR/MIR
 operation and A12 runtime key make the stronger policy part of compiler/cache identity. The exact
-contract and closure matrix are authoritative in `docs/impl/34-fs-single-link-plan.md`; this is a
-post-M9 consumer capability and does not reopen M9.
+contract and closure matrix are authoritative in `docs/impl/34-fs-single-link-plan.md`; the Align
+capability is implemented, external consumer adoption remains pending, and this post-M9 work does
+not reopen M9.
 
 ### M10 scope decision (2026-07-04)
 

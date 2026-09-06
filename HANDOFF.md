@@ -26,8 +26,9 @@ and current chunks representation decisions remain unavailable for S0B.
 The later align-llm `runtime_bundle.verify` graph exposed a v0.7.2 MIR producer-certification
 regression for an owned indexed string field crossing a loop join into an Ok record. Align PR #950
 fixes the one-way owned-string-to-`str` source view without allowing a borrowed view to mint
-ownership. Request 55's retained-root single-link reader is the current blocking capability; its
-contract and closure matrix are in `docs/impl/34-fs-single-link-plan.md`.
+ownership. Request 55's retained-root single-link reader is implemented against the contract and
+closure matrix in `docs/impl/34-fs-single-link-plan.md`; its Align PR and fixed release are the
+remaining publication steps before external adoption.
 
 ## Release-cycle timing handoff
 

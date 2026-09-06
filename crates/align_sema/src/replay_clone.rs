@@ -922,6 +922,12 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             root: boxed!(root),
             relative: boxed!(relative),
         },
+        ExprKind::ReaderOpenBeneathSingleLink { root, relative } => {
+            ExprKind::ReaderOpenBeneathSingleLink {
+                root: boxed!(root),
+                relative: boxed!(relative),
+            }
+        }
         ExprKind::WriterCreate { path } => ExprKind::WriterCreate { path: boxed!(path) },
         ExprKind::CreateExclusive { path } => ExprKind::CreateExclusive { path: boxed!(path) },
         ExprKind::CreateExclusiveBeneath { root, relative } => ExprKind::CreateExclusiveBeneath {
@@ -2281,6 +2287,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             destination: rhs,
         }
         | ExprKind::ReaderOpenBeneath {
+            root: lhs,
+            relative: rhs,
+        }
+        | ExprKind::ReaderOpenBeneathSingleLink {
             root: lhs,
             relative: rhs,
         }
