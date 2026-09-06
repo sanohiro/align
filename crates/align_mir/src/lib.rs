@@ -4913,25 +4913,52 @@ enum ChunksConsumer {
     StoredOrBoundary,
 }
 
-fn chunks_plan(consumer: ChunksConsumer) -> PlanDecision {
-    let (strategy, reason) = match consumer {
-        ChunksConsumer::DirectLen => (PlanStrategy::VirtualCount, PlanReason::DirectLen),
-        ChunksConsumer::DirectIndex => (PlanStrategy::VirtualIndex, PlanReason::DirectIndex),
-        ChunksConsumer::Pipeline => {
-            (PlanStrategy::MaterializedHeaders, PlanReason::PipelineConsumer)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunksPlan {
+    VirtualCount(PlanDecision),
+    VirtualIndex(PlanDecision),
+    MaterializedHeaders(PlanDecision),
+}
+
+#[cfg(test)]
+impl ChunksPlan {
+    fn decision(self) -> PlanDecision {
+        match self {
+            Self::VirtualCount(decision)
+            | Self::VirtualIndex(decision)
+            | Self::MaterializedHeaders(decision) => decision,
         }
-        ChunksConsumer::Parallel => {
-            (PlanStrategy::MaterializedHeaders, PlanReason::ParallelConsumer)
-        }
-        ChunksConsumer::StoredOrBoundary => {
-            (PlanStrategy::MaterializedHeaders, PlanReason::StoredOrBoundary)
-        }
-    };
-    PlanDecision {
+    }
+}
+
+fn chunks_plan(consumer: ChunksConsumer) -> ChunksPlan {
+    let decision = |strategy, reason| PlanDecision {
         kind: PlanKind::Chunks,
         state: PlanState::Selected,
         strategy,
         reason,
+    };
+    match consumer {
+        ChunksConsumer::DirectLen => ChunksPlan::VirtualCount(decision(
+            PlanStrategy::VirtualCount,
+            PlanReason::DirectLen,
+        )),
+        ChunksConsumer::DirectIndex => ChunksPlan::VirtualIndex(decision(
+            PlanStrategy::VirtualIndex,
+            PlanReason::DirectIndex,
+        )),
+        ChunksConsumer::Pipeline => ChunksPlan::MaterializedHeaders(decision(
+            PlanStrategy::MaterializedHeaders,
+            PlanReason::PipelineConsumer,
+        )),
+        ChunksConsumer::Parallel => ChunksPlan::MaterializedHeaders(decision(
+            PlanStrategy::MaterializedHeaders,
+            PlanReason::ParallelConsumer,
+        )),
+        ChunksConsumer::StoredOrBoundary => ChunksPlan::MaterializedHeaders(decision(
+            PlanStrategy::MaterializedHeaders,
+            PlanReason::StoredOrBoundary,
+        )),
     }
 }
 
@@ -5906,7 +5933,7 @@ fn lower_borrowed_owned_with_chunks_consumer(
     {
         return match chunks {
             Some((source, n, elem, consumer)) => {
-                lower_materialized_chunks(b, e, source, n, elem, consumer)
+                lower_chunks(b, e, source, n, elem, consumer, None)
             }
             None => lower_expr(b, e),
         };
@@ -5915,7 +5942,7 @@ fn lower_borrowed_owned_with_chunks_consumer(
     let owner = b.new_synthetic_owner(e.ty);
     let operand = match chunks {
         Some((source, n, elem, consumer)) => {
-            lower_materialized_chunks(b, e, source, n, elem, consumer)
+            lower_chunks(b, e, source, n, elem, consumer, None)
         }
         None => lower_expr_for_borrow(b, e),
     };
@@ -9978,13 +10005,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 }
                 result
             }
-            hir::ExprKind::ArrayChunks { source, n, elem } => lower_materialized_chunks(
+            hir::ExprKind::ArrayChunks { source, n, elem } => lower_chunks(
                 b,
                 e,
                 source,
                 n,
                 *elem,
                 ChunksConsumer::StoredOrBoundary,
+                None,
             ),
             hir::ExprKind::ArrayToSlice(inner) => {
                 if matches!(
@@ -10010,19 +10038,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
                     // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
                     // materialized, but avoid allocating/filling headers for this scalar consumer.
-                    let decision = chunks_plan(ChunksConsumer::DirectLen);
-                    lower_required_binding!(
+                    return lower_chunks(
                         b,
-                        src = lower_chunks_source(b, source, *elem),
-                        Operand::Const(Const::Unit)
+                        inner,
+                        source,
+                        n,
+                        *elem,
+                        ChunksConsumer::DirectLen,
+                        None,
                     );
-                    lower_required_binding!(b, n = lower_expr(b, n), Operand::Const(Const::Unit));
-                    b.record_plan(inner, decision);
-                    let src_len = b.fresh_value(i64_ty());
-                    b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
-                    let count = lower_chunks_count(b, Operand::Value(src_len), n);
-                    drop_borrow_owners(b, &src);
-                    return count;
                 }
                 // `str`/`slice` carry the length in their `{ ptr, len }` view.
                 lower_required_binding!(
@@ -11647,20 +11671,19 @@ fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand
     }
 }
 
-/// Materialize one chunks expression after its consumer has supplied the final representation
-/// classification. The same selected tuple drives the existing MIR representation and located
-/// reporting; it is never repaired after publication.
-fn lower_materialized_chunks(
+/// Lower one chunks expression from the representation-specific plan selected for its final
+/// consumer. The selected variant drives both emitted MIR and located reporting; it is never
+/// repaired after publication.
+fn lower_chunks(
     b: &mut Builder,
     expression: &hir::Expr,
     source: &hir::Expr,
     n: &hir::Expr,
     elem: Ty,
     consumer: ChunksConsumer,
+    direct_index: Option<(&hir::Expr, Ty)>,
 ) -> Operand {
-    let decision = chunks_plan(consumer);
-    debug_assert_eq!(decision.strategy, PlanStrategy::MaterializedHeaders);
-
+    let plan = chunks_plan(consumer);
     let src = lower_chunks_source(b, source, elem);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -11669,18 +11692,85 @@ fn lower_materialized_chunks(
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    b.record_plan(expression, decision);
-    let value = b.fresh_value(expression.ty);
-    inherit_borrow_owners(b, value, [&src]);
-    b.push(Stmt::Let(
-        value,
-        Rvalue::Chunks {
-            src,
-            n: n_op,
-            elem,
-        },
-    ));
-    Operand::Value(value)
+    match plan {
+        ChunksPlan::VirtualCount(decision) => {
+            b.record_plan(expression, decision);
+            let src_len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
+            let count = lower_chunks_count(b, Operand::Value(src_len), n_op);
+            drop_borrow_owners(b, &src);
+            count
+        }
+        ChunksPlan::VirtualIndex(decision) => {
+            let Some((index, result_ty)) = direct_index else {
+                return Operand::Const(Const::Unit);
+            };
+            let idx = lower_expr(b, index);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
+            b.record_plan(expression, decision);
+            let src_len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
+            let count = lower_chunks_count(b, Operand::Value(src_len), n_op.clone());
+            emit_bounds_check(b, &idx, count);
+
+            let start = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(
+                start,
+                Rvalue::Bin(BinOp::Mul, idx, n_op.clone()),
+            ));
+            let remaining = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(
+                remaining,
+                Rvalue::Bin(
+                    BinOp::Sub,
+                    Operand::Value(src_len),
+                    Operand::Value(start),
+                ),
+            ));
+            let short = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(
+                short,
+                Rvalue::Bin(BinOp::Lt, Operand::Value(remaining), n_op.clone()),
+            ));
+            let chunk_len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(
+                chunk_len,
+                Rvalue::Select {
+                    cond: Operand::Value(short),
+                    a: Operand::Value(remaining),
+                    b: n_op,
+                },
+            ));
+            let chunk = b.fresh_value(result_ty);
+            b.push(Stmt::Let(
+                chunk,
+                Rvalue::SubSlice {
+                    base: src.clone(),
+                    start: Operand::Value(start),
+                    len: Operand::Value(chunk_len),
+                    elem,
+                },
+            ));
+            inherit_borrow_owners(b, chunk, [&src]);
+            Operand::Value(chunk)
+        }
+        ChunksPlan::MaterializedHeaders(decision) => {
+            b.record_plan(expression, decision);
+            let value = b.fresh_value(expression.ty);
+            inherit_borrow_owners(b, value, [&src]);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::Chunks {
+                    src,
+                    n: n_op,
+                    elem,
+                },
+            ));
+            Operand::Value(value)
+        }
+    }
 }
 
 /// Compute the runtime `chunks` count without materializing its header array. The CFG guard keeps
@@ -11803,53 +11893,15 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
         // A direct `.chunks(n)[i]` computes exactly one borrowed sub-view. Stored/escaping chunk
         // arrays and pipeline consumers retain the materialized representation.
-        let decision = chunks_plan(ChunksConsumer::DirectIndex);
-        let src = lower_required!(
+        return lower_chunks(
             b,
-            lower_chunks_source(b, source, *elem),
-            Operand::Const(Const::Unit)
+            recv,
+            source,
+            n,
+            *elem,
+            ChunksConsumer::DirectIndex,
+            Some((index, elem_ty)),
         );
-        let n = lower_required!(b, lower_expr(b, n), Operand::Const(Const::Unit));
-        let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
-        b.record_plan(recv, decision);
-        let src_len = b.fresh_value(i64_ty());
-        b.push(Stmt::Let(src_len, Rvalue::SliceLen(src.clone())));
-        let count = lower_chunks_count(b, Operand::Value(src_len), n.clone());
-        emit_bounds_check(b, &idx, count);
-
-        let start = b.fresh_value(i64_ty());
-        b.push(Stmt::Let(start, Rvalue::Bin(BinOp::Mul, idx, n.clone())));
-        let remaining = b.fresh_value(i64_ty());
-        b.push(Stmt::Let(
-            remaining,
-            Rvalue::Bin(BinOp::Sub, Operand::Value(src_len), Operand::Value(start)),
-        ));
-        let short = b.fresh_value(Ty::Bool);
-        b.push(Stmt::Let(
-            short,
-            Rvalue::Bin(BinOp::Lt, Operand::Value(remaining), n.clone()),
-        ));
-        let chunk_len = b.fresh_value(i64_ty());
-        b.push(Stmt::Let(
-            chunk_len,
-            Rvalue::Select {
-                cond: Operand::Value(short),
-                a: Operand::Value(remaining),
-                b: n,
-            },
-        ));
-        let chunk = b.fresh_value(elem_ty);
-        b.push(Stmt::Let(
-            chunk,
-            Rvalue::SubSlice {
-                base: src.clone(),
-                start: Operand::Value(start),
-                len: Operand::Value(chunk_len),
-                elem: *elem,
-            },
-        ));
-        inherit_borrow_owners(b, chunk, [&src]);
-        return Operand::Value(chunk);
     }
     // The length, and whether the element loads from a `{ptr,len}` value or a stack slot.
     enum Src {
@@ -22372,7 +22424,7 @@ mod tests {
         ];
         for (consumer, strategy, reason) in cases {
             assert_eq!(
-                chunks_plan(consumer),
+                chunks_plan(consumer).decision(),
                 PlanDecision {
                     kind: PlanKind::Chunks,
                     state: PlanState::Selected,

@@ -10374,11 +10374,10 @@ fn main() -> i32 = 0\n";
         let scratch = PlanScratch::new("generic");
         std::fs::write(
             scratch.path().join("dep.align"),
-            "module dep\npub fn rows<T>(value: T) -> array<T> = [value].to_array()\n",
+            "module dep\npub fn rows<T>(value: T) -> i64 = [value].to_array().len() + [1, 2, 3].chunks(2).len()\n",
         )
         .unwrap();
-        let entry_source =
-            "module main\nimport dep\nfn main() -> i32 = dep.rows(1).sum() as i32\n";
+        let entry_source = "module main\nimport dep\nfn main() -> i32 = dep.rows(1) as i32\n";
         let entry = scratch.path().join("main.align");
         std::fs::write(&entry, entry_source).unwrap();
 
@@ -10402,10 +10401,16 @@ fn main() -> i32 = 0\n";
             .mir
             .plan_records
             .iter()
-            .find(|record| record.function.as_str() == "dep$rows$i64")
+            .find(|record| {
+                record.function.as_str() == "dep$rows$i64"
+                    && record.kind == align_mir::PlanKind::Chunks
+            })
             .unwrap_or_else(|| panic!("imported generic plan: {:?}", main.mir.plan_records));
         assert_eq!(imported.function.as_str(), "dep$rows$i64");
         assert!(imported.source.is_none());
+        assert_eq!(imported.state, align_mir::PlanState::Selected);
+        assert_eq!(imported.strategy, align_mir::PlanStrategy::VirtualCount);
+        assert_eq!(imported.reason, align_mir::PlanReason::DirectLen);
         assert!(align_mir::current_plan_records_are_valid(&main.mir, &source_map));
     }
 
