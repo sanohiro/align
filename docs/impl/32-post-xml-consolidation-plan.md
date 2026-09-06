@@ -1,13 +1,11 @@
 # Post-XML consolidation plan
 
-> **Status:** SCHEDULED NEXT, conditional on the `std.xml` PR completing and
-> its implementation owner stopping. If the owner proceeds with the intended
-> release, qualification starts after that release completes.
+> **Status:** ACTIVE. V0 is complete and the exact S0A contract is accepted in
+> [`35-startup-observation-design.md`](35-startup-observation-design.md).
+> S0A implementation is next; S0B exact design follows.
 >
-> **First executable task:** V0 in
-> [`33-consolidation-baseline-packet.md`](33-consolidation-baseline-packet.md).
-> It uses shipped commands and existing fixtures. No compiler refactor or new
-> benchmark harness is authorized by a position in this plan.
+> **First executable task:** implement the accepted S0A benchmark harness and
+> its closure matrix. No compiler refactor is authorized by this position.
 
 ## 1. Purpose and authority
 
@@ -89,7 +87,7 @@ decisions, and bilingual library designs do not change for this scheduling work.
 | Step | Work and concrete output | Entry | Completion |
 |---|---|---|---|
 | V0 — baseline qualification | Bound release/source identities, existing corpus results, evidence gaps, and first AI pilot disposition using packet 33 | XML/release transition above | Each initial row has a supported result or an explicit blocker; no unmeasured cost is called a regression |
-| S0A — startup observation | Parent-observed launch-to-reap benchmark, with untimed size/dependency companions | V0 identifies current artifacts; complete plan 31's exact fixture, measurement, and lifecycle ledger and its required design review | Plan 31 S0A acceptance; no codegen change or probe in timed children |
+| S0A — startup observation | Parent-observed launch-to-reap benchmark, with untimed size/dependency companions | V0 is complete and plan 35 supplies the accepted exact fixture, measurement, and lifecycle ledger | Plan 31/35 S0A acceptance; no codegen change or probe in timed children |
 | S0B — current-decision observation | Exact records from existing selector owners through `explain-opt` | V0 names the decisions needed for the first consolidation; complete the exact `09-explain-opt.md` extension and closure matrix | Plan 31 S0B acceptance, including generated-code identity and located-mode isolation |
 | C0 — first consolidation | One useful decision boundary with implementation, removed duplication, and owner coverage | Baseline/observations relevant to that boundary exist; fill the matrix below | One authority per decision, necessary fallback/validation preserved, selected correctness and resource guards closed |
 | O0 — optional optimization | At most one admitted S1, S3, or S2 capability before reassessment | A named residual cost survives C0 and meets plan 31's admission gate | Adopt against preregistered evidence or record a measured deferral; an unprofitable candidate does not force a replacement project |
@@ -102,11 +100,9 @@ semantics-preserving deletion with sufficient existing evidence need not wait
 for unrelated observation work. Do not bundle either observation capability
 with the refactor or optimization it will later measure.
 
-Only V0 is ready to execute directly from this preparation. S0A/B implementation
-is not approved by this umbrella: their exact new harness/output contracts
-remain the next bounded design work, informed by V0 rather than guessed now.
-V0 can finish with a concrete missing-instrument finding; it need not implement
-the instrument to qualify that finding. Conversely, C0 cannot claim a resource
+S0A implementation is approved only within plan 35's exact harness/output
+contract and closure matrix. S0B implementation remains unapproved until its
+own exact `09-explain-opt.md` extension is reviewed. C0 cannot claim a resource
 improvement whose required observation is still unavailable.
 
 If V0 finds no justified consolidation or optimization boundary, record that
