@@ -73,9 +73,9 @@ verification design, and change the workflow boundary first.
 **Current next work (owner-resumed 2026-09-06):** Request 55 and the fixed v0.7.3 release are
 complete. S0A is implemented in PR #955 against
 [`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md).
-Author and independently review the exact S0B current-decision observation extension in
-[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md) next; implementation remains
-unapproved until that design gate closes.
+The exact S0B current-decision observation extension is accepted in
+[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md); implement that
+capability next without changing its source-provenance or decision-presence strategy.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->

@@ -230,8 +230,7 @@ behaviour-preserving robustness fix that helps every deep-lowering test, not jus
 
 ## S0B extension: current compiler decisions
 
-> **Status:** EXACT DESIGN CANDIDATE. Implementation remains unapproved until
-> one independent review closes every P0--P3 finding in this extension.
+> **Status:** EXACT DESIGN ACCEPTED; implementation is next.
 >
 > **Authority:** This section is the exact S0B public-output and implementation
 > ledger required by `31-execution-storage-startup-plan.md`. The earlier Slice
@@ -334,23 +333,32 @@ comparison.
 
 The source span is the `chunks` expression, the materializing terminal
 (`to_array`, `scan`, `sort`, `sort_by_key`, or sequential `par_map`), or the
-`par_map` expression, respectively. `line` and `column` are one-based byte
-locations resolved by the same located-lowering table used for LLVM debug
-locations. `file_id` and raw span offsets are not printed. `function` renders
-as the canonical concrete callable spelling, and the filename is the existing
-per-unit debug basename. No record contains source text, estimated speedup, a
-runtime result, or LLVM prose.
+`par_map` expression, respectively. `span_lo` and `span_hi` are byte offsets;
+`line` and `column` are the one-based values returned by
+`SourceFile::line_col(span_lo)`, the same projection used for diagnostics and
+LLVM debug locations. `file_id` and raw span offsets are not printed.
+`function` renders as the canonical concrete callable spelling, and the
+filename is the existing per-unit debug basename. No record contains source
+text, estimated speedup, a runtime result, or LLVM prose.
 
-The per-unit driver builds a private `LocatedPlanSourceCatalog` during the same
-load/tokenize walk that creates the checked HIR. Each file ID is classified as
-`User { source_name, exact_source }` or `SyntheticInterface`; the full
-source bytes are retained only for this located command. A `PlanSource` is
-present only when the HIR span names a `User` entry and that entry's name and
-source bytes still equal the current `SourceMap` entry byte-for-byte. A missing
-entry, out-of-bounds span, or name/content mismatch is a malformed internal
-record. `SyntheticInterface` deliberately yields `source = None`. This catalog
-is compiler-owned diagnostic provenance, is never serialized, and is absent
-from ordinary lowering, interfaces, hashes, and artifacts.
+The per-unit driver builds a private `LocatedPlanSourceCatalog` from the same
+load/tokenize walk that creates the checked HIR. Before each located lowering,
+it sizes the catalog to the current `SourceMap`, initializes every entry as
+`NonHirInput`, then replaces file IDs from the load-owned Align-unit registry
+with `User { source_name, exact_source }` and IDs from the compiler-owned
+interface registry with `SyntheticInterface`. Duplicate/conflicting
+classification is malformed. Later SourceMap additions extend the catalog with
+`NonHirInput` before any later unit lowers; this includes file-backed SQL and
+other static inputs interleaved before a subsequent interface source. The full
+Align source bytes are retained only for this located command.
+
+A `PlanSource` is present only when the HIR span names a `User` entry and that
+entry's name and source bytes still equal the current `SourceMap` entry
+byte-for-byte. `SyntheticInterface` deliberately yields `source = None`. A plan
+span that names `NonHirInput`, a missing entry, an out-of-bounds span, or a
+name/content mismatch is a malformed internal record. This catalog is
+compiler-owned diagnostic provenance, is never serialized, and is absent from
+ordinary lowering, interfaces, hashes, and artifacts.
 
 Its owned internal shape is exact:
 
@@ -362,6 +370,7 @@ LocatedPlanSourceCatalog {
 LocatedPlanSourceOrigin =
   User { source_name: Box<str>, exact_source: Box<str> }
   | SyntheticInterface
+  | NonHirInput
 ```
 
 The vector index is the `FileId`; a missing index is malformed. `Box<str>` owns
@@ -386,7 +395,8 @@ records never suppress LLVM remarks.
 After the complete per-unit walk and before any LLVM invocation or output, the
 driver validates every state/strategy/reason combination, the total sort and
 one-based ordinal sequence, the single-source-per-function rule, source-catalog
-provenance, and present source bounds. Input/read and compiler errors retain
+provenance, present source bounds, and exact `(line, column)` equality with
+`SourceFile::line_col(span_lo)`. Input/read and compiler errors retain
 their existing precedence and publish their existing diagnostics instead of
 inspecting partial plan tables; an otherwise successful empty walk retains the
 existing `alignc: no units to analyze` failure. On a successful nonempty walk,
@@ -552,7 +562,7 @@ Consecutive source-less records are one aggregate; an anchored record ends the
 aggregate. Verbose output replaces each aggregate with one line per record:
 
 ```text
-  [current plan `<function>` #<ordinal> <kind>] <state> `<strategy>` — source location is unavailable
+  [current plan `<function>` #<ordinal> <kind>] <state> `<strategy>` — <explanation>; source location is unavailable
 ```
 
 The absent-anchor rule does not alter the selected MIR strategy. Source-less
@@ -610,7 +620,7 @@ falling through to an optimistic record.
 
 | Axis | Exact implementation closure | Owner evidence |
 |---|---|---|
-| Formation and validation | Exhaustive enums admit only the three kind tables; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, source-catalog provenance, spans, and duplicates validate before LLVM or output | Unit-level invalid-record matrix plus an enum/selector coverage tripwire. |
+| Formation and validation | Exhaustive enums admit only the three kind tables; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Unit-level invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
 | Construction | Chunks, donation, and `par_map` helpers return the decision consumed by their existing lowering branch; located mode records that same value | MIR structural positives/negatives for every table row. |
 | Move-in / move-out / source nulling | No Align value or ownership bit enters a record. Donation still transfers/nulls the existing source owner only on `reuse-source-buffer` | Existing `buffer_donate` MIR and execution differential, including bound and escaping results. |
 | Replacement and return | General chunks materialization may be replaced only by the same site's more-specific consumer reason; returning/storing chunks remains materialized | Direct/stored/call/return/control-flow chunks rows and existing lifetime owners. |
@@ -625,7 +635,7 @@ falling through to an optimistic record.
 | Runtime ABI and ownership provenance | No runtime symbol or ABI row changes; records contain no pointer, owner, region, descriptor, or runtime observation | Runtime ABI inventory equality and no-new-key structural assertion. |
 | Allocation parity | Ordinary compilation has an empty, unallocated record buffer; the selected MIR allocation is identical with collection on/off | Normal/located MIR decision comparison and object-byte identity. |
 | Target/profile | Existing target CPU reaches LLVM remarks; current-plan rows are target-independent and `explain-opt` remains fixed at `default<O2>`; range rows name process-lifetime worker availability without reading it | Baseline/native named-target output parity for plan rows, plus one-worker/multi-worker runtime owners; LLVM rows may differ honestly. |
-| Explanation, order, and source absence | Exact one-line grammar, reason precedence, total source-option/ordinal order, override banner, duplicate rule, and absent-anchor aggregation | Golden default/verbose, repeat-run, multi-unit, collision, mixed anchored/source-less, and all-source-less fixtures. |
+| Explanation, order, and source absence | Exact one-line grammar, reason explanation in both anchored and source-less verbose rows, reason precedence, total source-option/ordinal order, override banner, duplicate rule, and absent-anchor aggregation | Golden default/verbose, repeat-run, multi-unit, collision, mixed anchored/source-less, and all-source-less fixtures. |
 
 ### Acceptance and proportional verification
 
@@ -639,7 +649,10 @@ The implementation owner must, at minimum:
    multi-unit order, single-unit header absence, total mixed-source ordering,
    imported-generic and replay source absence, and no partial output on
    malformed internal records. Cross malformed records with warnings and
-   codegen failure to pin the precedence above.
+   codegen failure to pin the precedence above. Corrupt zero/stale coordinates
+   and interleave a file-backed non-HIR static input before a later interface
+   file to close catalog indexing. Golden verbose source-less rows retain the
+   table's exact explanation.
 3. Compare whole-program and per-unit normalized decisions for all equal-input
    rows, compare authenticated anchors only where both routes own them, and
    separately prove conservative imported-body parallel work.

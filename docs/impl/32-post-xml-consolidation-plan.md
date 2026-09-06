@@ -2,11 +2,11 @@
 
 > **Status:** ACTIVE. V0 is complete and S0A is implemented in PR #955 against
 > [`35-startup-observation-design.md`](35-startup-observation-design.md).
-> The exact S0B extension is being authored in `09-explain-opt.md`.
+> The exact S0B extension is accepted in `09-explain-opt.md`.
 >
-> **First executable task:** finish and independently review the exact S0B
-> current-decision observation contract. No S0B code or compiler refactor is
-> authorized by this position.
+> **First executable task:** implement the accepted S0B current-decision
+> observation contract. No compiler refactor beyond that exact closure matrix
+> is authorized by this position.
 
 ## 1. Purpose and authority
 
@@ -71,7 +71,7 @@ This is an internal work plan, not a new public language contract.
 |---|---|---|
 | Language and library API | No new type, signature, default, syntax, or removed API | Existing specification and English library ledgers; source oracles remain unchanged |
 | Effects, errors, ownership, lifetime, allocation | Existing semantics, source-visible boundaries, and Drop rules remain authoritative | HIR/MIR and native-boundary owners; compare defined behavior, not all internal allocation counts |
-| CLI and reporting | Invoke existing commands; S0B extends `explain-opt` text rows but adds no JSON output or new flag | `09-explain-opt.md`; S0B still needs its exact reviewed extension |
+| CLI and reporting | Invoke existing commands; S0B extends `explain-opt` text rows but adds no JSON output or new flag | Accepted exact S0B extension in `09-explain-opt.md` |
 | Runtime, FFI, and native input | No new symbol, ABI, text/view boundary, process lifecycle, or global state | `20-runtime-abi-ledger.md`; new safety strategies require their own reviewed closure matrix |
 | Build, cache, artifacts, distribution | No new input, cache format, profile, sidecar, release variant, or target | Existing build/cache/distribution plans; bind actual artifact identities |
 | Evidence | Private Markdown notes and raw outputs from existing owners; no persisted interchange schema or automatic reader | Baseline packet; unavailable observations are explicit, not zero |
@@ -102,9 +102,9 @@ for unrelated observation work. Do not bundle either observation capability
 with the refactor or optimization it will later measure.
 
 S0A is implemented within plan 35's exact harness/output contract and closure
-matrix. S0B implementation remains unapproved until its
-own exact `09-explain-opt.md` extension is reviewed. C0 cannot claim a resource
-improvement whose required observation is still unavailable.
+matrix. S0B implementation is approved only within its accepted exact
+`09-explain-opt.md` extension. C0 cannot claim a resource improvement whose
+required observation is still unavailable.
 
 If V0 finds no justified consolidation or optimization boundary, record that
 result and close through V1's disposition review without inventing a refactor

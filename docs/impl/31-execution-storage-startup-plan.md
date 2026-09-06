@@ -1,8 +1,8 @@
 # Execution, Storage, and Startup Optimization Plan
 
 > **Status:** UMBRELLA DESIGNED; S0A is implemented in PR #955 and the exact
-> S0B extension is being authored in `09-explain-opt.md`. Later implementation
-> slices remain unapproved.
+> S0B extension is accepted in `09-explain-opt.md`. S0B implementation is next;
+> later slices remain unapproved.
 >
 > **Queue position:** `HANDOFF.md` remains the live work queue.
 > `32-post-xml-consolidation-plan.md` records the owner's 2026-09-05 scheduling
@@ -439,8 +439,8 @@ review before implementation.
 
 ### S0B — Current-decision observation
 
-**Status:** EXACT DESIGN IN PROGRESS in `09-explain-opt.md`; implementation
-unapproved.
+**Status:** EXACT DESIGN ACCEPTED in `09-explain-opt.md`; implementation is
+next.
 
 Instrument existing selectors at their actual decision points and collect
 only the facts they already use. Generated code must remain byte-for-byte
@@ -783,8 +783,8 @@ into a flaky timing gate.
    no language milestone and does not interrupt the XML owner's work.
 2. S0A and S0B are independently useful capabilities and may be promoted
    separately. Neither requires S1.
-3. S0B implementation cannot begin until the exact `09-explain-opt.md`
-   extension is reviewed.
+3. S0B implementation proceeds only within the accepted exact
+   `09-explain-opt.md` extension.
 4. S1 is the first structural candidate after current decisions are observable,
    but only for a still-materializing named consumer.
 5. S2 and S3 are independent. Schedule either only from its own evidence and

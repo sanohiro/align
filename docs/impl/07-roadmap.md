@@ -3844,7 +3844,7 @@ backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-m
                                 io_uring); no DB-specific frontend shortcut
 ```
 
-## Execution, storage, and startup optimization track (UMBRELLA DESIGNED; S0A implemented)
+## Execution, storage, and startup optimization track (S0A implemented; S0B design accepted)
 
 `31-execution-storage-startup-plan.md` is the plan of record for the separate
 measure-first optimization track. It approves the direction of reducing byte
@@ -3862,7 +3862,7 @@ No optimization implementation is approved by this scheduling decision.
 
 ```text
 S0A  parent-measured startup baseline       implemented in PR #955
-S0B  current-plan explanation               exact explain-opt design current
+S0B  current-plan explanation               exact design accepted; implementation next
 S1   extend shipped virtual chunks          first generated-code candidate; measure-first
 S2   straight-line fixed region frames      consumer/evidence-gated
 S3   runtime capability partition           existing deployment/closure trigger-gated
@@ -3872,12 +3872,12 @@ S6   shape input and hot/cold guidance       schema/corpus-gated
 S7+  multiversion/layout/I/O/minimal target  independently deferred
 ```
 
-S0A is implemented in PR #955; S0B's exact reporting extension is the current
-design task. Their benchmark and reporting failure domains remain independently
-mergeable. S0B still needs its exact contract and review before implementation.
-S1 and later do not become implementation work from their position in this
-list; each first closes the public/safety boundary, implementation closure
-matrix, owner tests, and any explicit evidence gate required by the plan.
+S0A is implemented in PR #955; S0B's exact reporting extension is accepted and
+its implementation is next. Their benchmark and reporting failure domains
+remain independently mergeable. S1 and later do not become implementation work
+from their position in this list; each first closes the public/safety boundary,
+implementation closure matrix, owner tests, and any explicit evidence gate
+required by the plan.
 
 ## Post-pkg.db library waves (planned; each item gated independently)
 
