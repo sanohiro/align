@@ -568,6 +568,21 @@ fn render_current_plan(records: &[PlanRecord], verbose: bool, file: &str) -> Str
 /// output is one aggregated report; when the program is more than one unit each section is preceded by
 /// a per-unit header naming the unit and its file. A single-unit program has no header — byte-identical
 /// to the pre-flip whole-program report.
+fn after_current_plan_validation<'a, T>(
+    programs: impl IntoIterator<Item = &'a align_mir::Program>,
+    source_map: &SourceMap,
+    on_valid: impl FnOnce() -> T,
+) -> Result<T, ()> {
+    if programs
+        .into_iter()
+        .any(|program| !align_mir::current_plan_records_are_valid(program, source_map))
+    {
+        Err(())
+    } else {
+        Ok(on_valid())
+    }
+}
+
 pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -589,43 +604,43 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
         eprintln!("alignc: no units to analyze");
         return ExitCode::FAILURE;
     }
-    if walk
-        .units
-        .iter()
-        .any(|unit| !align_mir::current_plan_records_are_valid(&unit.mir, &sm))
-    {
-        eprintln!("alignc: cannot explain current plan: malformed record");
-        return ExitCode::FAILURE;
-    }
-    if !walk.diags.is_empty() {
-        eprint!("{}", format_diagnostics(&sm, &walk.diags));
-    }
-
-    let multi = walk.units.len() > 1;
-    let mut out = String::new();
-    if std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref() == Some("off") {
-        out.push_str(
-            "current-plan measurement override: buffer donation is disabled; donation rows are not the default plan\n",
-        );
-    }
-    for unit in &walk.units {
-        let debug = unit_debug(&unit.file);
-        let remarks = match collect_opt_remarks(&unit.mir, target.clone(), &debug) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("alignc: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let report = Report::build(&remarks);
-        if multi {
-            let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
+    match after_current_plan_validation(walk.units.iter().map(|unit| &unit.mir), &sm, || {
+        if !walk.diags.is_empty() {
+            eprint!("{}", format_diagnostics(&sm, &walk.diags));
         }
-        out.push_str(&render_current_plan(&unit.mir.plan_records, verbose, &debug.file));
-        out.push_str(&report.render(verbose));
+
+        let multi = walk.units.len() > 1;
+        let mut out = String::new();
+        if std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref() == Some("off") {
+            out.push_str(
+                "current-plan measurement override: buffer donation is disabled; donation rows are not the default plan\n",
+            );
+        }
+        for unit in &walk.units {
+            let debug = unit_debug(&unit.file);
+            let remarks = match collect_opt_remarks(&unit.mir, target.clone(), &debug) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("alignc: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let report = Report::build(&remarks);
+            if multi {
+                let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
+            }
+            out.push_str(&render_current_plan(&unit.mir.plan_records, verbose, &debug.file));
+            out.push_str(&report.render(verbose));
+        }
+        print!("{out}");
+        ExitCode::SUCCESS
+    }) {
+        Ok(exit) => exit,
+        Err(()) => {
+            eprintln!("alignc: cannot explain current plan: malformed record");
+            ExitCode::FAILURE
+        }
     }
-    print!("{out}");
-    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -725,6 +740,29 @@ mod tests {
             assert_eq!(plan_strategy(strategy), strategy_text);
             assert_eq!(plan_explanation(reason), explanation);
         }
+    }
+
+    #[test]
+    fn malformed_current_plan_precedes_warnings_codegen_and_stdout() {
+        let mut program = align_mir::Program::default();
+        program.plan_records.push(plan_record(
+            1,
+            PlanKind::Chunks,
+            PlanState::Selected,
+            PlanStrategy::VirtualCount,
+            PlanReason::DirectLen,
+            None,
+        ));
+        let source_map = SourceMap::new();
+        let mut later_phase_reached = false;
+        let result = after_current_plan_validation([&program], &source_map, || {
+            later_phase_reached = true;
+        });
+        assert!(result.is_err());
+        assert!(
+            !later_phase_reached,
+            "warning emission, LLVM collection, and stdout assembly share this guarded continuation"
+        );
     }
 
     // Real LLVM remark strings captured from the probe kernels (`docs/impl/09-explain-opt.md`).

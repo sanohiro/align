@@ -10162,7 +10162,30 @@ mod walk_tests {
 
     #[test]
     fn current_plan_whole_and_per_unit_routes_choose_the_same_decisions() {
-        let source = "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn make() -> array<i64> = [1, 2].to_array()\nfn dbl(x: i64) -> i64 = x * 2\nfn collect() -> array<i64> = make().map(dbl).to_array()\nfn run() -> i64 = [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\nfn main() -> i32 = 0\n";
+        let measurement_disabled = std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref()
+            == Some("off");
+        let source = "Inner { value: i64 }\n\
+Outer { inner: Inner }\n\
+Row { value: i64 }\n\
+fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\n\
+fn make() -> array<i64> = [1, 2].to_array()\n\
+fn dbl(x: i64) -> i64 = x * 2\n\
+fn narrow(x: i64) -> i32 = x as i32\n\
+fn chunks_len(xs: slice<i64>) -> i64 = xs.chunks(2).len()\n\
+fn chunks_index(xs: slice<i64>) -> i64 = xs.chunks(2)[0].len()\n\
+fn chunks_parallel() -> i64 = [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n\
+fn chunks_pipeline(xs: slice<i64>) -> i64 = xs.chunks(2).map(chunk_sum).sum()\n\
+fn chunks_stored(xs: slice<i64>) -> i64 { cs := xs.chunks(2); return cs.len() }\n\
+fn donate_selected() -> array<i64> = make().map(dbl).to_array()\n\
+fn donate_live(xs: array<i64>) -> array<i64> = xs.map(dbl).to_array()\n\
+fn donate_layout() -> array<i32> = make().map(narrow).to_array()\n\
+fn donate_shape(xs: slice<i64>) -> array<i64> = xs.chunks(2).map(chunk_sum).to_array()\n\
+fn donate_arena() -> i64 = arena { make().map(dbl).to_array().sum() }\n\
+fn par_reduce() -> i64 = [1, 2].par_map(dbl).sum()\n\
+fn par_materialize() -> i64 = [1, 2].par_map(dbl).len()\n\
+fn par_stage() -> i64 = [Outer { inner: Inner { value: 1 } }].inner.value.par_map(dbl).sum()\n\
+fn par_source() -> i64 = arena { rows := [Row { value: 1 }].to_soa(); rows.value.par_map(dbl).sum() }\n\
+fn main() -> i32 = 0\n";
 
         let mut whole_map = SourceMap::new();
         let checked = check(&mut whole_map, "plan.align", source);
@@ -10196,6 +10219,64 @@ mod walk_tests {
         );
         assert!(align_mir::current_plan_records_are_valid(&whole, &whole_map));
         assert!(align_mir::current_plan_records_are_valid(per_unit, &per_unit_map));
+
+        let observed = whole
+            .plan_records
+            .iter()
+            .map(|record| (record.kind, record.state, record.strategy, record.reason))
+            .collect::<Vec<_>>();
+        let donation_toggle_row = if measurement_disabled {
+            (
+                align_mir::PlanKind::BufferDonation,
+                align_mir::PlanState::Unavailable,
+                align_mir::PlanStrategy::FreshOutput,
+                align_mir::PlanReason::MeasurementDisabled,
+            )
+        } else {
+            (
+                align_mir::PlanKind::BufferDonation,
+                align_mir::PlanState::Selected,
+                align_mir::PlanStrategy::ReuseSourceBuffer,
+                align_mir::PlanReason::EligibleUniqueSource,
+            )
+        };
+        let expected = [
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualCount, align_mir::PlanReason::DirectLen),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualIndex, align_mir::PlanReason::DirectIndex),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::ParallelConsumer),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::PipelineConsumer),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::StoredOrBoundary),
+            (align_mir::PlanKind::BufferDonation, align_mir::PlanState::NotApplicable, align_mir::PlanStrategy::ArenaOutput, align_mir::PlanReason::ArenaOwnedOutput),
+            (align_mir::PlanKind::BufferDonation, align_mir::PlanState::NotApplicable, align_mir::PlanStrategy::FreshOutput, align_mir::PlanReason::UnsupportedSourceOrStageShape),
+            (align_mir::PlanKind::BufferDonation, align_mir::PlanState::Rejected, align_mir::PlanStrategy::FreshOutput, align_mir::PlanReason::SourceNotUniqueDead),
+            (align_mir::PlanKind::BufferDonation, align_mir::PlanState::Rejected, align_mir::PlanStrategy::FreshOutput, align_mir::PlanReason::LayoutMismatch),
+            donation_toggle_row,
+            (align_mir::PlanKind::ParMap, align_mir::PlanState::RuntimeSelected, align_mir::PlanStrategy::RangeReduce, align_mir::PlanReason::DirectIntegerSum),
+            (align_mir::PlanKind::ParMap, align_mir::PlanState::RuntimeSelected, align_mir::PlanStrategy::RangeMaterialize, align_mir::PlanReason::SupportedRangeKernel),
+            (align_mir::PlanKind::ParMap, align_mir::PlanState::Rejected, align_mir::PlanStrategy::SequentialCollect, align_mir::PlanReason::UnsupportedSourceRepresentation),
+            (align_mir::PlanKind::ParMap, align_mir::PlanState::Rejected, align_mir::PlanStrategy::SequentialCollect, align_mir::PlanReason::UnsupportedStageOrValueShape),
+        ];
+        for row in expected {
+            assert!(observed.contains(&row), "missing whole/per-unit parity row: {row:?}");
+        }
+
+        if std::env::var_os("ALIGN_CURRENT_PLAN_MEASUREMENT_CHILD").is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "walk_tests::current_plan_whole_and_per_unit_routes_choose_the_same_decisions",
+                ])
+                .env("ALIGN_BUFFER_DONATE", "off")
+                .env("ALIGN_CURRENT_PLAN_MEASUREMENT_CHILD", "1")
+                .output()
+                .expect("spawn isolated measurement-row parity owner");
+            assert!(
+                child.status.success(),
+                "measurement-disabled whole/per-unit parity failed:\n{}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
     }
 
     #[test]
@@ -10291,6 +10372,53 @@ mod walk_tests {
             .unwrap_or_else(|| panic!("imported generic plan: {:?}", main.mir.plan_records));
         assert!(imported.source.is_none());
         assert!(align_mir::current_plan_records_are_valid(&main.mir, &source_map));
+    }
+
+    #[test]
+    fn current_plan_imported_parallel_body_keeps_the_conservative_work_hint() {
+        let scratch = PlanScratch::new("imported-work");
+        std::fs::write(
+            scratch.path().join("dep.align"),
+            "module dep\npub fn dbl(value: i64) -> i64 = value * 2\n",
+        )
+        .unwrap();
+        let entry_source = "module main\nimport dep\nfn run() -> array<i64> = [1, 2].par_map(dep.dbl)\nfn main() -> i32 = 0\n";
+        let entry = scratch.path().join("main.align");
+        std::fs::write(&entry, entry_source).unwrap();
+
+        let mut source_map = SourceMap::new();
+        let walk = build_per_unit_located(
+            &mut source_map,
+            &entry.display().to_string(),
+            entry_source,
+        );
+        assert!(
+            !walk.diags.has_errors(),
+            "imported parallel fixture rejected: {}",
+            format_diagnostics(&source_map, &walk.diags)
+        );
+        let main = walk
+            .units
+            .iter()
+            .find(|unit| unit.unit == "main")
+            .expect("main artifact");
+        let hint = main
+            .mir
+            .fns
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                align_mir::Stmt::Let(
+                    _,
+                    align_mir::Rvalue::ParMapParallel {
+                        func, work_weight, ..
+                    },
+                ) if func.as_str() == "dep$dbl" => Some(*work_weight),
+                _ => None,
+            })
+            .expect("imported par-map range kernel");
+        assert_eq!(hint, align_mir::PAR_MAP_DEFAULT_WORK_WEIGHT);
     }
 
     #[test]

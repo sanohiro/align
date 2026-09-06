@@ -1028,6 +1028,7 @@ fn resource_drop_hook_abi() -> Result<CanonicalFnAbi, CodegenError> {
     let program = Program {
         fns: Vec::new(),
         plan_records: Vec::new(),
+        plan_certification: Default::default(),
         plan_catalog_malformed: false,
         sqlite_callback_effects: std::collections::BTreeMap::new(),
         externs: Vec::new(),
@@ -1165,6 +1166,7 @@ pub fn emit_function_prelink_bc(
         fns: functions,
         // Located current-plan records are diagnostic-only and never enter a ThinLTO view.
         plan_records: Vec::new(),
+        plan_certification: Default::default(),
         plan_catalog_malformed: false,
         sqlite_callback_effects: shared.callback_effects.clone(),
         externs: shared.externs.to_vec(),
@@ -33213,6 +33215,9 @@ fn main() -> i32 = 0
         fns.extend(extra_fns);
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns,
             externs: vec![],
             imported_fns: vec![],
@@ -33316,6 +33321,9 @@ fn main() -> i32 = 0
         Program {
             fns: vec![html, write, raw, finish],
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             externs: vec![],
             imported_fns: vec![],
             link_libs: vec![],
@@ -36792,6 +36800,9 @@ fn main() -> i32 = 0
             emit_llvm_ir(
                 &Program {
                     sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
                     fns: std::iter::once(main)
                         .chain(descriptor_functions)
                         .collect(),
@@ -37100,6 +37111,9 @@ fn main() -> i32 = 0
             emit_llvm_ir(
                 &Program {
                     sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
                     fns: vec![function],
                     externs: Vec::new(),
                     imported_fns: Vec::new(),
@@ -37933,6 +37947,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -37977,6 +37994,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38035,6 +38055,9 @@ fn main() -> i32 = 0
         let zero = Operand::Const(Const::Int(0, i32_ty));
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38086,6 +38109,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |payload| Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38141,6 +38167,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |structs, enums, tagged_types| Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38293,6 +38322,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let base = || Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38551,6 +38583,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38595,6 +38630,9 @@ fn main() -> i32 = 0
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38637,6 +38675,9 @@ fn main() -> i32 = 0
 
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -38697,6 +38738,9 @@ fn main() -> i32 = 0
         let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
         let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -39554,6 +39598,9 @@ fn main() -> i32 = 0
     ) -> String {
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
@@ -39616,6 +39663,9 @@ fn main() -> i32 = 0
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call("arena_allocation_probe"),
                 params: vec![0],
@@ -39664,6 +39714,9 @@ fn main() -> i32 = 0
         let dynamic = matches!(len, Operand::Arg(0));
         let program = Program {
             sqlite_callback_effects: Default::default(),
+        plan_records: Vec::new(),
+        plan_certification: Default::default(),
+        plan_catalog_malformed: false,
             fns: vec![Function {
                 name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },

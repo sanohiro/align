@@ -326,6 +326,9 @@ invented exact counts here.
 | #958 | `6ffbba25` | P2 | `diagnostic-source-map-identity` | Represent interleaved non-HIR SourceMap entries instead of misclassifying them as user or interface source. |
 | #958 | `6ffbba25` | P2 | `public-surface-completeness` | Preserve the exact decision explanation in source-less verbose records. |
 | #958 | `6ffbba25` | P2 | `diagnostic-source-map-identity` | Validate rendered line and column against the authenticated source span. |
+| pending | `4cd96062` | P1 | `validation-phase-completeness` | Certify the complete produced diagnostic table so deletion, insertion, and source-provenance mutation fail before publication. |
+| pending | `4cd96062` | P2 | `analysis-control-path-completeness` | Mark a reached chunks consumer before later stage or terminal capture formation can terminate. |
+| pending | `4cd96062` | P1 | `owner-test-topology` | Close selector-to-MIR, capture termination, all-row route parity, imported opacity, malformed precedence, source-less output, and cache-identity cells before implementation review. |
 
 The rows above are the reviews whose logs are reachable from this checkout's
 `.git/`. Capabilities produced in agent worktrees (#777 and later, other than

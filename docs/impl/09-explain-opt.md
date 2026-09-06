@@ -387,10 +387,21 @@ One lowering-owned site may first receive a general chunks-materialization
 reason and then a more specific immediate-consumer reason. The collector keeps
 exactly one `(HIR-site, kind)` record by a lowering-private site token that is
 discarded before `PlanRecord` publication, and replaces the general reason with
-the specific reason. Separate kinds at one expression are not duplicates: for
-example, a materialized `chunks` source and the `par_map` consuming it each
+the specific reason. A duplicate record, missing replacement target, or
+incompatible replacement marks the table malformed. Separate kinds at one
+expression are not duplicates: for example, a materialized `chunks` source and
+the `par_map` consuming it each
 produce their own record. LLVM remarks never suppress plan records, and plan
 records never suppress LLVM remarks.
+
+Located construction also retains one compiler-private certification copy of
+the complete normalized record table. Final validation requires structural
+equality with that copy before checking individual records. The copy is
+allocated only beside located records and is erased with them from MIR text,
+implementation hashes, caches, interfaces, LLVM, objects, and runtime keys.
+This makes deletion, insertion, field mutation, or authenticated-`Some` to
+source-less-`None` stripping fail closed without reconstructing decisions from
+MIR or LLVM.
 
 After the complete per-unit walk and before any LLVM invocation or output, the
 driver validates every state/strategy/reason combination, the total sort and

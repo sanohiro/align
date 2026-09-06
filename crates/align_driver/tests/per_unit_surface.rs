@@ -454,6 +454,56 @@ fn explain_opt_single_file_has_no_section_header() {
     );
 }
 
+#[test]
+fn explain_opt_imported_generic_uses_the_source_less_default_and_verbose_grammar() {
+    if !backend() {
+        return;
+    }
+    let dep = "module dep\npub fn rows<T>(value: T) -> array<T> = [value].to_array()\n";
+    let main = "module main\nimport dep\nfn main() -> i32 = dep.rows(1).sum() as i32\n";
+    let proj = Proj::new(
+        "explain-source-less",
+        &[("dep.align", dep), ("main.align", main)],
+    );
+
+    let default = proj.run(&["explain-opt", "main.align"]);
+    assert!(
+        default.status.success(),
+        "default explain-opt failed: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_rows = String::from_utf8_lossy(&default.stdout)
+        .lines()
+        .filter(|line| line.contains("current-plan"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        default_rows,
+        ["+ 1 current-plan record(s) without user source (see --verbose)"]
+    );
+
+    let verbose = proj.run(&["explain-opt", "main.align", "--verbose"]);
+    assert!(
+        verbose.status.success(),
+        "verbose explain-opt failed: {}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    let verbose_rows = String::from_utf8_lossy(&verbose.stdout)
+        .lines()
+        .filter(|line| line.contains("[current plan"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(verbose_rows.len(), 1, "source-less verbose row: {verbose_rows:?}");
+    assert!(
+        verbose_rows[0].starts_with("  [current plan `dep$rows$")
+            && verbose_rows[0].ends_with(
+                "` #1 buffer-donation] not-applicable `fresh-output` — this source or stage shape cannot reuse the source buffer; source location is unavailable"
+            ),
+        "source-less verbose grammar changed: {}",
+        verbose_rows[0]
+    );
+}
+
 // ---- 6. size multi-file --------------------------------------------------------------------------
 
 #[test]

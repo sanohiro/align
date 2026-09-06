@@ -31,11 +31,15 @@ pub fn program_to_string(p: &Program) -> String {
 /// includes `stmt_lines`, because debug locations are codegen input; normal cached builds lower
 /// unlocated MIR and therefore keep comment/whitespace-only edits invisible.
 pub fn codegen_input_to_string(p: &Program) -> String {
-    if p.plan_records.is_empty() && !p.plan_catalog_malformed {
+    if p.plan_records.is_empty()
+        && p.plan_certification.is_empty()
+        && !p.plan_catalog_malformed
+    {
         return format!("{p:?}");
     }
     let mut codegen_input = p.clone();
     codegen_input.plan_records.clear();
+    codegen_input.plan_certification.clear();
     codegen_input.plan_catalog_malformed = false;
     format!("{codegen_input:?}")
 }

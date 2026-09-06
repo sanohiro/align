@@ -172,6 +172,32 @@ pub struct PlanRecord {
     pub source: Option<PlanSource>,
 }
 
+/// Opaque construction-time proof of the complete located record table.
+///
+/// The payload is deliberately inaccessible outside `align_mir`: downstream compiler stages may
+/// carry or replace the proof as a whole, but cannot edit it in parallel with `plan_records` and
+/// thereby turn a missing or rewritten observation into a valid table.
+#[derive(Clone, Debug, Default)]
+pub struct PlanCertification(Vec<PlanRecord>);
+
+impl PlanCertification {
+    fn from_records(records: &[PlanRecord]) -> Self {
+        Self(records.to_vec())
+    }
+
+    fn matches(&self, records: &[PlanRecord]) -> bool {
+        self.0 == records
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PlanFileOrigin {
     User(Box<str>),
@@ -299,6 +325,10 @@ pub struct Program {
     /// Located-only current-plan observations. This field is deliberately absent from canonical
     /// graph walks, hashes, MIR printing, runtime-key inventory, and codegen.
     pub plan_records: Vec<PlanRecord>,
+    /// Construction-time certification of the complete record table. Validation compares it with
+    /// the publishable copy so deletion, insertion, or source-provenance stripping fails closed.
+    /// It is located diagnostic data and is excluded from every artifact identity beside records.
+    pub plan_certification: PlanCertification,
     /// A private fail-closed bit for catalog shape/name/content failures that cannot be represented
     /// by a valid [`PlanRecord`]. Ordinary and unauthenticated replay lowering leave it false.
     pub plan_catalog_malformed: bool,
@@ -3549,9 +3579,11 @@ fn lower_program_unchecked_with_plans(
         .into_iter()
         .map(|(target, effect)| (ProgramCall::from_validated(&target), effect))
         .collect();
+    let plan_certification = PlanCertification::from_records(&plan_records);
     let mut mir = Program {
         fns,
         plan_records,
+        plan_certification,
         plan_catalog_malformed,
         sqlite_callback_effects,
         externs: program
@@ -3755,7 +3787,7 @@ fn published_plan_key(record: &PlanRecord) -> (u8, u32, u32, u32, u8) {
 /// Validate the complete located current-plan side table before a caller invokes LLVM or publishes
 /// any report bytes. This validation is deliberately outside codegen and canonical MIR identity.
 pub fn current_plan_records_are_valid(program: &Program, source_map: &SourceMap) -> bool {
-    if program.plan_catalog_malformed {
+    if program.plan_catalog_malformed || !program.plan_certification.matches(&program.plan_records) {
         return false;
     }
     let mut function_index = std::collections::HashMap::with_capacity(program.fns.len());
@@ -4886,6 +4918,7 @@ impl PlanCollector {
             .iter_mut()
             .find(|record| record.site == site && record.decision.kind == PlanKind::Chunks)
         else {
+            self.malformed = true;
             return;
         };
         if !matches!(reason, PlanReason::ParallelConsumer | PlanReason::PipelineConsumer)
@@ -9560,7 +9593,19 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 source,
                 stages,
                 elem,
-            } => lower_array_collect(b, source, stages, *elem, CollectKind::Collect, e, &[]).0,
+            } => lower_array_collect(
+                b,
+                source,
+                stages,
+                *elem,
+                CollectKind::Collect,
+                CollectPlanInputs {
+                    terminal: e,
+                    terminal_captures: &[],
+                    source_consumer_reason: PlanReason::PipelineConsumer,
+                },
+            )
+            .0,
             hir::ExprKind::ArrayToSoa { source, struct_id } => {
                 lower_array_to_soa(b, source, *struct_id)
             }
@@ -9588,8 +9633,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         init,
                         captures,
                     },
-                    e,
-                    &[],
+                    CollectPlanInputs {
+                        terminal: e,
+                        terminal_captures: &[],
+                        source_consumer_reason: PlanReason::PipelineConsumer,
+                    },
                 )
                 .0
             }
@@ -9738,6 +9786,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     if !lowering_continues(b) {
                         return Operand::Const(Const::Unit);
                     }
+                    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
                     let mut stage_records = Vec::with_capacity(stages.len());
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
@@ -9792,7 +9841,6 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                             return Operand::Const(Const::Unit);
                         }
                     }
-                    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
                     b.record_plan(e, form);
                     // Free the source buffer if it is an owned temporary the runtime just consumed.
                     // A call returning `slice<T>` is a borrow and must never be classified as one.
@@ -9831,12 +9879,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     &stages2,
                     *elem,
                     CollectKind::Collect,
-                    e,
-                    &[],
+                    CollectPlanInputs {
+                        terminal: e,
+                        terminal_captures: &[],
+                        source_consumer_reason: PlanReason::ParallelConsumer,
+                    },
                 )
                 .0;
                 if lowering_continues(b) {
-                    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
                     b.record_plan(e, form);
                 }
                 result
@@ -13097,6 +13147,7 @@ fn lower_array_par_map_reduce(
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
+    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
     let mut capture_ops = Vec::with_capacity(captures.len());
     for capture in captures {
@@ -13105,7 +13156,6 @@ fn lower_array_par_map_reduce(
             return Operand::Const(Const::Unit);
         }
     }
-    b.mark_chunks_consumer(source, PlanReason::ParallelConsumer);
     b.record_plan(
         plan_expression,
         PlanDecision {
@@ -13864,6 +13914,12 @@ enum PreparedCollectKind {
     },
 }
 
+struct CollectPlanInputs<'a> {
+    terminal: &'a hir::Expr,
+    terminal_captures: &'a [hir::Expr],
+    source_consumer_reason: PlanReason,
+}
+
 /// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
 /// appended to a freshly allocated buffer (arena-bump inside an arena, else heap) instead of
 /// folded into a scalar. Yields an owned `array<T>` value `{ ptr, len }` where `len` is the
@@ -13874,9 +13930,13 @@ fn lower_array_collect(
     stages: &[hir::Stage],
     elem: Ty,
     kind: CollectKind<'_>,
-    terminal: &hir::Expr,
-    terminal_captures: &[hir::Expr],
+    plan: CollectPlanInputs<'_>,
 ) -> (Operand, Vec<Operand>) {
+    let CollectPlanInputs {
+        terminal,
+        terminal_captures,
+        source_consumer_reason,
+    } = plan;
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
     // A collect source can itself be a fresh unbound owned temporary (`make().map(f).to_array()`
@@ -13895,6 +13955,7 @@ fn lower_array_collect(
     else {
         return (Operand::Const(Const::Unit), Vec::new());
     };
+    b.mark_chunks_consumer(source, source_consumer_reason);
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
         return (Operand::Const(Const::Unit), Vec::new());
     };
@@ -13942,16 +14003,17 @@ fn lower_array_collect(
     // value used after the call — which would keep `temp_free` clear) allocates and frees as before.
     // The `ALIGN_BUFFER_DONATE=off` measurement/regression toggle (mirrors `ALIGN_SORT_ADAPTIVE`;
     // `CacheContext::from_env` force-disables the object cache when it is set) reverts to allocate+free.
-    let donation = donation_decision(
-        arena.is_some(),
-        source.ty,
-        elem,
-        temp_free.is_some(),
-        struct_view.is_some(),
-        zip.is_some(),
+    let donation = donation_decision(DonationInputs {
+        arena_active: arena.is_some(),
+        source: source.ty,
+        output_element: elem,
+        source_is_unique_dead: temp_free.is_some(),
+        has_struct_view: struct_view.is_some(),
+        has_zip: zip.is_some(),
         stages,
-        std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref() == Some("off"),
-    );
+        measurement_disabled: std::env::var("ALIGN_BUFFER_DONATE").ok().as_deref()
+            == Some("off"),
+    });
     let donate = donation.strategy == PlanStrategy::ReuseSourceBuffer;
     b.record_plan(terminal, donation);
 
@@ -15942,8 +16004,11 @@ fn lower_array_sort(
         stages,
         elem,
         CollectKind::Collect,
-        terminal,
-        terminal_captures,
+        CollectPlanInputs {
+            terminal,
+            terminal_captures,
+            source_consumer_reason: PlanReason::PipelineConsumer,
+        },
     );
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -16614,16 +16679,28 @@ fn donation_scalar_bytes(s: align_sema::Scalar) -> Option<i64> {
     }
 }
 
-fn donation_decision(
+struct DonationInputs<'a> {
     arena_active: bool,
     source: Ty,
     output_element: Ty,
     source_is_unique_dead: bool,
     has_struct_view: bool,
     has_zip: bool,
-    stages: &[hir::Stage],
+    stages: &'a [hir::Stage],
     measurement_disabled: bool,
-) -> PlanDecision {
+}
+
+fn donation_decision(inputs: DonationInputs<'_>) -> PlanDecision {
+    let DonationInputs {
+        arena_active,
+        source,
+        output_element,
+        source_is_unique_dead,
+        has_struct_view,
+        has_zip,
+        stages,
+        measurement_disabled,
+    } = inputs;
     if arena_active {
         return PlanDecision {
             kind: PlanKind::BufferDonation,
@@ -22131,6 +22208,33 @@ mod tests {
         records[0]
     }
 
+    fn any_rvalue(program: &Program, predicate: impl Fn(&Rvalue) -> bool) -> bool {
+        program.fns.iter().flat_map(|function| &function.blocks).any(|block| {
+            block.stmts.iter().any(|statement| {
+                matches!(statement, Stmt::Let(_, rvalue) if predicate(rvalue))
+            })
+        })
+    }
+
+    fn any_rvalue_in(
+        program: &Program,
+        function: &str,
+        predicate: impl Fn(&Rvalue) -> bool,
+    ) -> bool {
+        program
+            .fns
+            .iter()
+            .find(|candidate| candidate.name.as_str() == function)
+            .expect("fixture function")
+            .blocks
+            .iter()
+            .any(|block| {
+                block.stmts.iter().any(|statement| {
+                    matches!(statement, Stmt::Let(_, rvalue) if predicate(rvalue))
+                })
+            })
+    }
+
     #[test]
     fn current_plan_chunks_rows_follow_the_consumed_representation() {
         let cases = [
@@ -22168,6 +22272,11 @@ mod tests {
                 (PlanState::Selected, strategy, reason),
                 "{source}"
             );
+            assert_eq!(
+                any_rvalue(&program, |rvalue| matches!(rvalue, Rvalue::Chunks { .. })),
+                strategy == PlanStrategy::MaterializedHeaders,
+                "the published chunks strategy must be the representation consumed by MIR: {source}"
+            );
         }
     }
 
@@ -22176,13 +22285,31 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_array = Ty::DynArray(align_sema::ty_to_scalar(i64_ty).unwrap());
+        let decide = |arena_active,
+                      source,
+                      output_element,
+                      source_is_unique_dead,
+                      has_struct_view,
+                      has_zip,
+                      measurement_disabled| {
+            donation_decision(DonationInputs {
+                arena_active,
+                source,
+                output_element,
+                source_is_unique_dead,
+                has_struct_view,
+                has_zip,
+                stages: &[],
+                measurement_disabled,
+            })
+        };
         let cases = [
             (
-                donation_decision(true, Ty::Unit, Ty::Unit, false, true, true, &[], false),
+                decide(true, Ty::Unit, Ty::Unit, false, true, true, false),
                 (PlanState::NotApplicable, PlanStrategy::ArenaOutput, PlanReason::ArenaOwnedOutput),
             ),
             (
-                donation_decision(
+                decide(
                     false,
                     Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy {
                         bits: 64,
@@ -22192,7 +22319,6 @@ mod tests {
                     true,
                     false,
                     false,
-                    &[],
                     false,
                 ),
                 (
@@ -22202,7 +22328,7 @@ mod tests {
                 ),
             ),
             (
-                donation_decision(false, i64_array, i64_ty, false, false, false, &[], false),
+                decide(false, i64_array, i64_ty, false, false, false, false),
                 (
                     PlanState::Rejected,
                     PlanStrategy::FreshOutput,
@@ -22210,11 +22336,11 @@ mod tests {
                 ),
             ),
             (
-                donation_decision(false, i64_array, i32_ty, true, false, false, &[], false),
+                decide(false, i64_array, i32_ty, true, false, false, false),
                 (PlanState::Rejected, PlanStrategy::FreshOutput, PlanReason::LayoutMismatch),
             ),
             (
-                donation_decision(false, i64_array, i64_ty, true, false, false, &[], true),
+                decide(false, i64_array, i64_ty, true, false, false, true),
                 (
                     PlanState::Unavailable,
                     PlanStrategy::FreshOutput,
@@ -22222,7 +22348,7 @@ mod tests {
                 ),
             ),
             (
-                donation_decision(false, i64_array, i64_ty, true, false, false, &[], false),
+                decide(false, i64_array, i64_ty, true, false, false, false),
                 (
                     PlanState::Selected,
                     PlanStrategy::ReuseSourceBuffer,
@@ -22269,6 +22395,18 @@ mod tests {
             let (program, _) = lower_current_plan(source);
             let record = one_kind_in(&program, "f", PlanKind::BufferDonation);
             assert_eq!((record.state, record.reason), (state, reason), "{source}");
+            assert_eq!(
+                any_rvalue_in(&program, "f", |rvalue| matches!(rvalue, Rvalue::SlicePtr(_))),
+                state == PlanState::Selected,
+                "the selected donation row must reuse the source pointer in MIR: {source}"
+            );
+            assert_eq!(
+                any_rvalue_in(&program, "f", |rvalue| {
+                    matches!(rvalue, Rvalue::HeapAllocBuf { .. })
+                }),
+                state != PlanState::Selected && reason != PlanReason::ArenaOwnedOutput,
+                "a non-arena fresh-output row must allocate its MIR buffer: {source}"
+            );
         }
     }
 
@@ -22329,7 +22467,128 @@ mod tests {
                 (state, strategy, reason),
                 "{source}"
             );
+            assert_eq!(
+                any_rvalue(&program, |rvalue| matches!(rvalue, Rvalue::ParMapReduce { .. })),
+                strategy == PlanStrategy::RangeReduce,
+                "the published par-map strategy must select the same MIR form: {source}"
+            );
+            assert_eq!(
+                any_rvalue(&program, |rvalue| matches!(rvalue, Rvalue::ParMapParallel { .. })),
+                strategy == PlanStrategy::RangeMaterialize,
+                "the published par-map strategy must select the same MIR form: {source}"
+            );
         }
+    }
+
+    fn lower_with_terminating_capture(
+        source: &str,
+        mutate: impl FnOnce(&mut hir::Expr),
+    ) -> Program {
+        let mut diagnostics = Diagnostics::new();
+        let mut source_map = SourceMap::new();
+        let file = source_map.add_file("plan.align", source);
+        let ast = parse_file(tokenize(file, source, &mut diagnostics), &mut diagnostics);
+        let mut hir = check_file(&ast, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "capture fixture failed to check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let terminal = hir
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "f")
+            .and_then(|function| function.body.value.as_deref_mut())
+            .expect("fixture function terminal");
+        mutate(terminal);
+
+        let catalog = LocatedPlanSourceCatalog {
+            files: vec![LocatedPlanSourceOrigin::User {
+                source_name: "plan.align".into(),
+                exact_source: source.into(),
+            }],
+        };
+        let (resolver, malformed) = PlanSourceResolver::from_map(&source_map, Some(&catalog));
+        lower_program_unchecked_with_plans(
+            &hir,
+            Some(Rc::new(SourceLines::from_map(&source_map))),
+            Some(Rc::new(resolver)),
+            malformed,
+            false,
+        )
+    }
+
+    fn replace_capture_with_return(capture: &mut hir::Expr, returned: hir::Expr) {
+        let value = capture.clone();
+        capture.kind = hir::ExprKind::Block(hir::Block {
+            stmts: vec![hir::Stmt::Return(Some(returned))],
+            value: Some(Box::new(value)),
+        });
+    }
+
+    #[test]
+    fn current_plan_capture_termination_preserves_only_reached_decisions() {
+        let stage = lower_with_terminating_capture(
+            "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.map(fn x { x + k }).to_array()\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArrayToArray { source, stages, .. } => {
+                    let returned = (**source).clone();
+                    let hir::StageKind::Map { captures, .. } = &mut stages[0].kind else {
+                        panic!("map stage");
+                    };
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("to-array terminal"),
+            },
+        );
+        assert!(stage.plan_records.is_empty(), "stage capture precedes donation");
+
+        let sort = lower_with_terminating_capture(
+            "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.sort_by_key(fn x { x + k })\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArraySortBy { source, captures, .. } => {
+                    let returned = (**source).clone();
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("sort-by-key terminal"),
+            },
+        );
+        assert!(sort.plan_records.is_empty(), "sort capture precedes donation");
+
+        let par_map = lower_with_terminating_capture(
+            "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.par_map(fn x { x + k })\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArrayParMap { source, captures, .. } => {
+                    let returned = (**source).clone();
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("par-map terminal"),
+            },
+        );
+        assert!(par_map.plan_records.is_empty(), "par-map capture precedes its decision");
+
+        let chunks = lower_with_terminating_capture(
+            "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.chunks(2).par_map(fn x { x.len() + k })\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArrayParMap { source, captures, .. } => {
+                    let hir::ExprKind::ArrayChunks { source: inner, .. } = &source.kind else {
+                        panic!("chunks source");
+                    };
+                    let returned = (**inner).clone();
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("par-map terminal"),
+            },
+        );
+        let record = one_kind(&chunks, PlanKind::Chunks);
+        assert_eq!(record.reason, PlanReason::ParallelConsumer);
+        assert!(
+            chunks.plan_records.iter().all(|record| record.kind == PlanKind::Chunks),
+            "the reached chunks decision remains, while the terminating capture prevents par-map"
+        );
     }
 
     #[test]
@@ -22497,6 +22756,16 @@ mod tests {
         collector.record(7, Span::new(0, 0, 1), duplicate);
         assert!(collector.malformed);
         assert_eq!(collector.records.len(), 1);
+
+        let mut missing = PlanCollector {
+            resolver: Rc::new(PlanSourceResolver {
+                files: vec![PlanFileOrigin::Unauthenticated],
+            }),
+            records: Vec::new(),
+            malformed: false,
+        };
+        missing.replace_chunks_reason(99, PlanReason::ParallelConsumer);
+        assert!(missing.malformed, "a missing replacement target must fail closed");
     }
 
     #[test]
@@ -22505,6 +22774,8 @@ mod tests {
         let (valid, source_map) = lower_current_plan(source);
         let mut mutations: Vec<Box<dyn Fn(&mut Program)>> = vec![
             Box::new(|program| program.plan_catalog_malformed = true),
+            Box::new(|program| program.plan_records.clear()),
+            Box::new(|program| program.plan_records[0].source = None),
             Box::new(|program| program.plan_records[0].construct_ordinal = 0),
             Box::new(|program| program.plan_records[0].state = PlanState::Rejected),
             Box::new(|program| program.plan_records[0].function = ProgramCall::from_validated("missing")),
@@ -24208,6 +24479,7 @@ fn main() -> i32 = 0
         let mut program = Program {
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             plan_records: Vec::new(),
+            plan_certification: Default::default(),
             plan_catalog_malformed: false,
             fns: vec![Function {
                 name: ProgramCall::from_validated("main"),
