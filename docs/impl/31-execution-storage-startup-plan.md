@@ -1,8 +1,7 @@
 # Execution, Storage, and Startup Optimization Plan
 
-> **Status:** UMBRELLA DESIGNED; implementation slices remain unapproved.
-> Post-XML qualification schedules S0A/S0B exact design first. No implementation
-> slice is active.
+> **Status:** UMBRELLA DESIGNED; S0A exact design is accepted and its
+> implementation is next. Later implementation slices remain unapproved.
 >
 > **Queue position:** `HANDOFF.md` remains the live work queue.
 > `32-post-xml-consolidation-plan.md` records the owner's 2026-09-05 scheduling
@@ -60,6 +59,7 @@ Read the narrow owner before scheduling a slice:
 23-friction-ledger.md
 32-post-xml-consolidation-plan.md
 33-consolidation-baseline-packet.md
+35-startup-observation-design.md
 ```
 
 This plan owns only:
@@ -346,7 +346,9 @@ their individual gates are met.
 
 ### S0A — Parent-measured startup baseline
 
-**Status:** EXACT DESIGN NEXT AFTER V0; implementation unapproved.
+**Status:** EXACT DESIGN ACCEPTED; implementation is next. The
+authoritative slice ledger is
+[`35-startup-observation-design.md`](35-startup-observation-design.md).
 
 Create a benchmark family that measures from the parent immediately before
 process creation through child observation/reap. An in-program clock is not a
@@ -436,7 +438,7 @@ independent design review before implementation.
 
 ### S0B — Current-decision observation
 
-**Status:** EXACT DESIGN NEXT AFTER V0; implementation unapproved.
+**Status:** EXACT DESIGN NEXT AFTER S0A; implementation unapproved.
 
 Instrument existing selectors at their actual decision points and collect
 only the facts they already use. Generated code must remain byte-for-byte

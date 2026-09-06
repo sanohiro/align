@@ -27,8 +27,10 @@ The later align-llm `runtime_bundle.verify` graph exposed a v0.7.2 MIR producer-
 regression for an owned indexed string field crossing a loop join into an Ok record. Align PR #950
 fixes the one-way owned-string-to-`str` source view without allowing a borrowed view to mint
 ownership. Request 55's retained-root single-link reader is implemented against the contract and
-closure matrix in `docs/impl/34-fs-single-link-plan.md`; its Align PR and fixed release are the
-remaining publication steps before external adoption.
+closure matrix in `docs/impl/34-fs-single-link-plan.md`; PR #952 and both compiler/runtime changes
+are published in [v0.7.3](https://github.com/sanohiro/align/releases/tag/v0.7.3) with all seven
+expected assets. Align-side Request 55 delivery is complete. align-llm adoption remains consumer
+work and is also blocked on its separate Request 56 private-directory lifecycle.
 
 ## Release-cycle timing handoff
 
@@ -68,9 +70,10 @@ Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
-**Current next work (owner-resumed 2026-09-06):** finish align-llm Request 55 and publish the fixed
-Align release, then resume the exact S0A startup-observation design followed by the exact S0B
-current-decision observation design.
+**Current next work (owner-resumed 2026-09-06):** Request 55 and the fixed v0.7.3 release are
+complete. The exact S0A startup-observation design is accepted in
+[`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md);
+implement that capability next, then author the exact S0B current-decision observation design.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
