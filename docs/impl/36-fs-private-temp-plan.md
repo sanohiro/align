@@ -1,6 +1,6 @@
 # `std.fs` private temporary-directory lifecycle
 
-Status: **PROPOSED for align-llm Request 56. Implementation has not started.**
+Status: **IMPLEMENTED for align-llm Request 56; release pending.**
 
 This document is the authoritative public-contract ledger and implementation closure matrix for:
 
@@ -12,6 +12,13 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 The pair supplies one application-owned staging root for consumers that must copy verified bytes
 before passing a pathname to a native library. It is not a general temporary-file framework,
 recursive removal API, directory handle, or sandbox.
+
+The capability exceeds roughly 1,000 changed hand-written lines because its two public operations
+form one strict lifecycle boundary across the HIR, replay validator, MIR producer/status paths,
+LLVM ABI inventory, Linux/macOS runtime, bilingual contract, and adversarial owner matrix. Splitting
+that dormant producer-to-cleanup chain would leave no useful stable consumer and would duplicate
+the owned-string, descriptor-cleanup, ABI, whole/per-unit, and platform proof. One atomic capability
+therefore has lower integration risk than separately mergeable constructor and remover PRs.
 
 ## 1. Public-contract ledger
 
@@ -127,7 +134,7 @@ passing evidence.
 
 | Axis | Implementation invariant | Exact owner evidence |
 | --- | --- | --- |
-| Formation and effects | Imported exact names, one argument, source-order `str` coercion, Impure results, exact `Result<string, Error>` / `Result<(), Error>`, no aliases or options. | `m9_fs::private_temp_formation_diagnostics_and_per_unit_generic_paths`, whole-program and imported generic checks. |
+| Formation and effects | Imported exact names, one argument, source-order `str` coercion, Impure results, exact `Result<string, Error>` / `Result<(), Error>`, no aliases or options. | `m9_fs::private_temp_directory_formation_and_per_unit_generic_paths`, whole-program and imported generic checks. |
 | Prefix and path validation | Prefix grammar and removal's absolute strict grammar reject every malformed and multi-invalid shape before root/random/filesystem work. | Runtime direct-ABI table plus driver diagnostics; failpoints prove no root/random/create call for an invalid prefix and no traversal for an invalid removal path. |
 | Platform root and randomness | Linux `/tmp`; macOS `_CS_DARWIN_USER_TEMP_DIR`; no environment lookup. Canonicalize only that platform-owned spelling before strict no-follow traversal and returning the root, including macOS's real terminal-slash and `/var`-compatibility form. Exactly 128 random bits and lowercase hex; `EINTR` retry, zero-progress `Invalid`, negative native-error mapping, and 128-attempt collision cap. | Platform runtime owner with injected root/random provider, real macOS spelling, first-name collision, terminal collision, short/zero/error random returns, retained-root composition, and source audit forbidding environment reads. |
 | Atomic creation and permissions | One `mkdirat` claims absence with `0700`; occupied file/dir/symlink is unchanged; sequential and concurrent results differ; no parents or reuse. | Linux/macOS runtime concurrent/collision owner, `fstat` mode owner, and pre-existing-type matrix. |

@@ -1664,6 +1664,12 @@ pub enum Rvalue {
         path: Operand,
         out: Slot,
     },
+    /// `fs.create_private_temp_dir(prefix)`: the runtime writes the owned canonical absolute path
+    /// into `out` and returns an errno-status.
+    FsCreatePrivateTempDir {
+        prefix: Operand,
+        out: Slot,
+    },
     /// `fs.open(path)`: open `path` for reading, writing the owned `reader` handle into `out`.
     /// Yields an `i32` errno-status (0 = ok; see [`make_error_from_status`]).
     ReaderOpen {
@@ -1941,6 +1947,10 @@ pub enum Rvalue {
     },
     /// `fs.remove(path)` — delete the file at `path`. Yields an `i32` errno-status (0 = ok).
     FsRemove {
+        path: Operand,
+    },
+    /// `fs.remove_empty_dir(path)` — retained, no-follow removal of exactly one empty directory.
+    FsRemoveEmptyDir {
         path: Operand,
     },
     /// `fs.rename_no_replace(source, destination)` — atomically move the source entry to an absent
@@ -7795,6 +7805,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
+            hir::ExprKind::FsCreatePrivateTempDir { prefix } => {
+                lower_owned_string_result(b, prefix, e.ty, |prefix, out| {
+                    Rvalue::FsCreatePrivateTempDir { prefix, out }
+                })
+            }
             // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
             // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
             hir::ExprKind::ReaderOpen { path } => {
@@ -8064,6 +8079,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
+                lower_status_result(b, code, e.ty)
+            }
+            hir::ExprKind::FsRemoveEmptyDir { path } => {
+                lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::FsRemoveEmptyDir { path: pop }));
                 lower_status_result(b, code, e.ty)
             }
             hir::ExprKind::RenameNoReplace {
@@ -17417,10 +17438,19 @@ fn make_http_client_error_from_status(b: &mut Builder, status: ValueId, result_t
 }
 
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
+    lower_owned_string_result(b, path, result_ty, |path, out| Rvalue::FsReadFile { path, out })
+}
+
+fn lower_owned_string_result(
+    b: &mut Builder,
+    input: &hir::Expr,
+    result_ty: Ty,
+    make: impl FnOnce(Operand, Slot) -> Rvalue,
+) -> Operand {
     let out = b.new_slot(Ty::String);
-    let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
+    let input = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::FsReadFile { path: p, out }));
+    b.push(Stmt::Let(code, make(input, out)));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(

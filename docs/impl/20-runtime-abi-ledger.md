@@ -815,10 +815,10 @@ whole/per-unit declaration, and rt-LTO inventory. It is part of the 356 keyed / 
 recorded above. The
 authoritative contract is `docs/impl/34-fs-single-link-plan.md`.
 
-## Request 56 private temporary-directory lifecycle (designed)
+## Request 56 private temporary-directory lifecycle (implemented)
 
-Request 56 reserves two keyed records on existing ABI shapes. They activate only with the complete
-HIR/MIR/runtime implementation and do not change a shape or optional probe:
+Request 56 activates two keyed records on existing ABI shapes with the complete HIR/MIR/runtime
+implementation and does not change a shape or optional probe:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
@@ -828,7 +828,7 @@ HIR/MIR/runtime implementation and do not change a shape or optional probe:
 The constructor keeps the existing owned-string output-slot convention: validate and zero the slot,
 allocate the exact absolute-path result before filesystem mutation, and publish it only after one
 successful `mkdirat`. Removal borrows one absolute strict path and returns only status. Activation
-moves the current 356 keyed / 374 base / 385 maximum-probe inventory to 358 / 376 / 387. Exact
+moves the prior 356 keyed / 374 base / 385 maximum-probe inventory to 358 / 376 / 387. Exact
 prefix/root/randomness semantics, removal race boundary, and closure matrix are authoritative in
 `docs/impl/36-fs-private-temp-plan.md`.
 

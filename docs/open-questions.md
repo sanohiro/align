@@ -3141,7 +3141,7 @@ contract and closure matrix are authoritative in `docs/impl/34-fs-single-link-pl
 capability is implemented, external consumer adoption remains pending, and this post-M9 work does
 not reopen M9.
 
-### Request 56 — private temporary-directory lifecycle (DESIGN PROPOSED)
+### Request 56 — private temporary-directory lifecycle (IMPLEMENTED; release pending)
 
 `std.fs` adds
 `fs.create_private_temp_dir(prefix: str) -> Result<string, Error>` and
@@ -3159,7 +3159,8 @@ final-name/type/emptiness linearization point; Linux/macOS have no portable unli
 descriptor, so the path-only API does not promise immunity to an empty-directory substitution by a
 hostile process with the same OS identity after the final check. That actor is outside Request 56's
 explicit threat boundary. The exact contract and closure matrix are authoritative in
-`docs/impl/36-fs-private-temp-plan.md`; implementation remains pending and M9 stays closed.
+`docs/impl/36-fs-private-temp-plan.md`; release and external consumer adoption remain pending, and
+M9 stays closed.
 
 ### M10 scope decision (2026-07-04)
 

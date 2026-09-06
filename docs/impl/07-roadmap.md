@@ -1541,10 +1541,10 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
   the existing retained-root reader boundary and requires a descriptor-only `st_nlink == 1`
   check without exposing metadata or changing `open_beneath`. The Align capability is complete and
   external consumer adoption remains; this post-M9 work does not reopen M9.
-- **Private temporary-directory lifecycle** — Request 56 is designed under
+- **Private temporary-directory lifecycle** — Request 56 is implemented under
   `docs/impl/36-fs-private-temp-plan.md`. It adds one platform-root/random/exclusive private
   directory constructor and one retained-parent, empty-only cleanup operation for align-llm G1.
-  Implementation and consumer adoption remain; this post-M9 work does not reopen M9.
+  Release and consumer adoption remain; this post-M9 work does not reopen M9.
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 

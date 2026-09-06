@@ -5163,6 +5163,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::JsonDecodeScalar { out, .. }
         | Rvalue::JsonDocAsScalar { out, .. }
         | Rvalue::FsReadFile { out, .. }
+        | Rvalue::FsCreatePrivateTempDir { out, .. }
         | Rvalue::ReaderOpen { out, .. }
         | Rvalue::ReaderOpenBeneath { out, .. }
         | Rvalue::ReaderOpenBeneathSingleLink { out, .. }
@@ -5244,6 +5245,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::JsonDecodeArray { input, .. }
         | Rvalue::JsonDecodeScalar { input, .. }
         | Rvalue::FsReadFile { path: input, .. }
+        | Rvalue::FsCreatePrivateTempDir { prefix: input, .. }
         | Rvalue::ReaderOpen { path: input, .. }
         | Rvalue::WriterCreate { path: input, .. }
         | Rvalue::WriterCreateExclusive { path: input, .. }
@@ -8327,7 +8329,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
-            Rvalue::FsReadFile { path: input, out } => {
+            Rvalue::FsReadFile { path: input, out }
+            | Rvalue::FsCreatePrivateTempDir { prefix: input, out } => {
                 let i32_ty = Ty::Int(IntTy {
                     bits: 32,
                     signed: true,
@@ -9077,6 +9080,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FsWriteFileBuilder { .. }
             | Rvalue::FsExists { .. }
             | Rvalue::FsRemove { .. }
+            | Rvalue::FsRemoveEmptyDir { .. }
             | Rvalue::RenameNoReplace { .. }
             | Rvalue::FsReadDir { .. }
             | Rvalue::DnsResolve { .. }
@@ -9495,7 +9499,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 self.check_operand(equation, scanner, Ty::JsonScanner(*struct_id));
                 (*row, XmlAccessProvenance::Shared)
             }
-            Rvalue::FsReadFile { path: input, out } => {
+            Rvalue::FsReadFile { path: input, out }
+            | Rvalue::FsCreatePrivateTempDir { prefix: input, out } => {
                 if slot_ty != Ty::String
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
                 {
@@ -22723,6 +22728,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.gen_json_scan_next(*struct_id, scanner, *cursor, *row)?
             }
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
+            Rvalue::FsCreatePrivateTempDir { prefix, out } => {
+                self.gen_owned_string_runtime(
+                    RuntimeKey::FsCreatePrivateTempDir,
+                    "fs_create_private_temp_dir",
+                    prefix,
+                    *out,
+                )?
+            }
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle(RuntimeKey::IoReaderOpen, path, *out)?,
             Rvalue::ReaderOpenBeneath {
@@ -22991,6 +23004,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::FsRemove), &[p_ptr.into(), p_len.into()], "frm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
+            }
+            Rvalue::FsRemoveEmptyDir { path } => {
+                let (p_ptr, p_len) = self.split_str(path)?;
+                let call = self.builder
+                    .build_call(self.runtime(RuntimeKey::FsRemoveEmptyDir), &[p_ptr.into(), p_len.into()], "fred")
+                    .map_err(|e| self.err(e))?;
+                call.try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("fs_remove_empty_dir runtime ABI returned void"))?
             }
             Rvalue::RenameNoReplace { source, destination } => {
                 let (s_ptr, s_len) = self.split_str(source)?;
@@ -27305,18 +27327,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     fn gen_fs_read_file(&mut self, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        self.gen_owned_string_runtime(RuntimeKey::FsReadFile, "fs_read_file", path, out)
+    }
+
+    fn gen_owned_string_runtime(
+        &mut self,
+        key: RuntimeKey,
+        label: &str,
+        input: &Operand,
+        out: Slot,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed read reads {null,0} (its Drop frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
 
-        let agg = self.operand(path)?.into_struct_value();
-        let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
-        let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
+        let agg = self.operand(input)?.into_struct_value();
+        let p_ptr = self.builder.build_extract_value(agg, 0, "owned_str_p").map_err(|e| self.err(e))?;
+        let p_len = self.builder.build_extract_value(agg, 1, "owned_str_l").map_err(|e| self.err(e))?;
         let cs = self
             .builder
-            .build_call(self.runtime(RuntimeKey::FsReadFile), &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
+            .build_call(self.runtime(key), &[p_ptr.into(), p_len.into(), out_ptr.into()], label)
             .map_err(|e| self.err(e))?;
-        Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
+        Ok(cs.try_as_basic_value().basic().expect("owned string runtime returns i32"))
     }
 
     /// The three A7 line-read rvalues off `gen_rvalue`'s hot path (the #296 expr-depth lesson): each
@@ -35693,6 +35725,15 @@ fn main() -> i32 = 0
                 Ty::String,
             ),
             (
+                "fs.create_private_temp_dir",
+                Rvalue::FsCreatePrivateTempDir {
+                    prefix: Operand::Arg(0),
+                    out: 1,
+                },
+                vec![Ty::Str],
+                Ty::String,
+            ),
+            (
                 "env.get",
                 Rvalue::EnvGet {
                     name: Operand::Arg(0),
@@ -35798,6 +35839,7 @@ fn main() -> i32 = 0
             match producer {
                 Rvalue::JsonEncodeBounded { out, .. }
                 | Rvalue::FsReadFile { out, .. }
+                | Rvalue::FsCreatePrivateTempDir { out, .. }
                 | Rvalue::FsReadDir { out, .. }
                 | Rvalue::EnvGet { out, .. }
                 | Rvalue::JsonDocAsStr { out, .. }

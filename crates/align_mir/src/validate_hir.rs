@@ -4517,6 +4517,7 @@ impl<'a> BodyValidator<'a> {
                 self.frame_inner_join_envelope_ok(expression, context, *kind)
             }
             hir::ExprKind::FsReadFile { .. }
+            | hir::ExprKind::FsCreatePrivateTempDir { .. }
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::ReaderOpenBeneath { .. }
@@ -4577,6 +4578,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsWriteFile { .. }
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
             | hir::ExprKind::DnsResolve { .. }
@@ -4897,6 +4899,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsWriteFile { .. }
             | hir::ExprKind::ArrayBuilderPush { .. }
             | hir::ExprKind::FsReadFile { .. }
+            | hir::ExprKind::FsCreatePrivateTempDir { .. }
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::ReaderOpenBeneath { .. }
@@ -4950,6 +4953,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayBuilderBuild(..)
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
             | hir::ExprKind::DnsResolve { .. }
@@ -8617,6 +8621,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::FsReadFile { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::String, &[path.as_ref()]))?
             }
+            hir::ExprKind::FsCreatePrivateTempDir { prefix } => {
+                (prefix.ty == Ty::Str).then(|| result(Ty::String, &[prefix.as_ref()]))?
+            }
             hir::ExprKind::ReaderStdin => (expression.ty == Ty::Reader).then_some((Ty::Reader, true, Vec::new())),
             hir::ExprKind::ReaderOpen { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
@@ -8974,6 +8981,9 @@ impl<'a> BodyValidator<'a> {
                 (path.ty == Ty::Str).then(|| strict(Ty::Bool, &[path]))?
             }
             hir::ExprKind::FsRemove { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
+            }
+            hir::ExprKind::FsRemoveEmptyDir { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
             }
             hir::ExprKind::RenameNoReplace { source, destination } => {

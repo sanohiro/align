@@ -917,6 +917,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             input: boxed!(input),
         },
         ExprKind::FsReadFile { path } => ExprKind::FsReadFile { path: boxed!(path) },
+        ExprKind::FsCreatePrivateTempDir { prefix } => {
+            ExprKind::FsCreatePrivateTempDir { prefix: boxed!(prefix) }
+        }
         ExprKind::ReaderOpen { path } => ExprKind::ReaderOpen { path: boxed!(path) },
         ExprKind::ReaderOpenBeneath { root, relative } => ExprKind::ReaderOpenBeneath {
             root: boxed!(root),
@@ -1134,6 +1137,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::FsExists { path } => ExprKind::FsExists { path: boxed!(path) },
         ExprKind::FsRemove { path } => ExprKind::FsRemove { path: boxed!(path) },
+        ExprKind::FsRemoveEmptyDir { path } => ExprKind::FsRemoveEmptyDir { path: boxed!(path) },
         ExprKind::RenameNoReplace { source, destination } => ExprKind::RenameNoReplace {
             source: boxed!(source),
             destination: boxed!(destination),
@@ -2657,6 +2661,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::JsonDocElems { doc: recv }
         | ExprKind::JsonScan { input: recv, .. }
         | ExprKind::FsReadFile { path: recv }
+        | ExprKind::FsCreatePrivateTempDir { prefix: recv }
         | ExprKind::ReaderOpen { path: recv }
         | ExprKind::WriterCreate { path: recv }
         | ExprKind::CreateExclusive { path: recv }
@@ -2684,6 +2689,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BufferLen { buffer: recv }
         | ExprKind::FsExists { path: recv }
         | ExprKind::FsRemove { path: recv }
+        | ExprKind::FsRemoveEmptyDir { path: recv }
         | ExprKind::FsReadDir { path: recv }
         | ExprKind::DnsResolve { host: recv }
         | ExprKind::ConnReader { conn: recv }
