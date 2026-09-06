@@ -168,3 +168,16 @@ one boundary correction before implementation:
 
 No HIR/MIR/ABI or owned-string strategy finding was reported. The targeted finding-closure check
 reviews only these corrected cells; it is not a second full-diff review.
+
+## 8. Implementation review closure
+
+The one independent full-diff review of implementation candidate `1d0d33b9` reported no P0 or P1
+finding. Four P2 findings were closed in one class-wide correction commit; the unchanged diff was
+not sent through repeated full review.
+
+| Finding | Finding-to-fix closure |
+|---|---|
+| Output overlap returned `Invalid` without restoring the promised canonical empty result. | Zero the valid output slot before returning from the overlap branch and initialize its direct owner with stale nonzero fields so both fields are observed cleared. |
+| macOS `confstr` failure/truncation consulted stale `errno` and did not retry a grown size. | Assign stable `Invalid` to a zero return, retry when the provider reports a larger requirement, and cover canonical root spellings through the extracted platform-root validator. |
+| Random-progress, occupied-type, allocation-order, removal-type/error, and injected cleanup cells lacked direct runtime owners. | Add short-read/EINTR/zero/error random owners, file/directory/symlink collision owners, allocation-before-mutation/free parity, missing/denied/FIFO/socket/device removal, and final-observe/open/revalidate descriptor failpoint coverage. |
+| The active ABI status, exact A04/A08 membership table, and machine-gate inventory retained pre-Request-55/56 totals. | Record both new symbols in their reused shapes and update the ledger plus `test-runtime-abi-exports.sh` current assertions to 358 keyed, 376 base, 383 alloc-count, 380 par-map, and 387 maximum records. Historical capability snapshots remain historical. |

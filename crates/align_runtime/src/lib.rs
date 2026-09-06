@@ -483,6 +483,7 @@ pub unsafe extern "C" fn align_rt_fs_create_private_temp_dir(
             return AL_INVALID;
         };
         if prefix.addr() < out_end && out.addr() < prefix_end {
+            unsafe { out.write(AlignStr { ptr: core::ptr::null_mut(), len: 0 }) };
             return AL_INVALID;
         }
     }
@@ -9388,25 +9389,45 @@ fn private_temp_root() -> Result<Vec<u8>, i32> {
     #[cfg(target_os = "linux")]
     let configured = std::path::PathBuf::from("/tmp");
     #[cfg(target_os = "macos")]
-    let configured = {
-        let needed = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, core::ptr::null_mut(), 0) };
-        if needed == 0 {
-            return Err(io_error_to_status(&std::io::Error::last_os_error()));
-        }
-        let mut bytes = vec![0u8; needed];
-        let written = unsafe {
-            libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, bytes.as_mut_ptr().cast(), bytes.len())
-        };
-        if written == 0 || written > bytes.len() {
-            return Err(io_error_to_status(&std::io::Error::last_os_error()));
-        }
-        let end = bytes[..written].iter().position(|byte| *byte == 0).unwrap_or(written);
-        bytes.truncate(end);
-        use std::os::unix::ffi::OsStringExt;
-        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
-    };
+    let configured = macos_private_temp_root_with(|buffer, len| unsafe {
+        libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buffer, len)
+    })?;
+    canonical_private_temp_root(configured)
+}
 
-    let canonical = std::fs::canonicalize(configured).map_err(|error| io_error_to_status(&error))?;
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_private_temp_root_with(
+    mut query: impl FnMut(*mut libc::c_char, usize) -> usize,
+) -> Result<std::path::PathBuf, i32> {
+    let mut needed = query(core::ptr::null_mut(), 0);
+    if needed == 0 {
+        return Err(AL_INVALID);
+    }
+    let bytes = loop {
+        let mut candidate = vec![0u8; needed];
+        let written = query(candidate.as_mut_ptr().cast(), candidate.len());
+        if written == 0 {
+            return Err(AL_INVALID);
+        }
+        if written > candidate.len() {
+            needed = written;
+            continue;
+        }
+        let end = candidate[..written]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(written);
+        candidate.truncate(end);
+        break candidate;
+    };
+    use std::os::unix::ffi::OsStringExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn canonical_private_temp_root(configured: std::path::PathBuf) -> Result<Vec<u8>, i32> {
+    let canonical =
+        std::fs::canonicalize(configured).map_err(|error| io_error_to_status(&error))?;
     use std::os::unix::ffi::OsStrExt;
     let bytes = canonical.as_os_str().as_bytes();
     if !canonical.is_absolute() || std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
@@ -9433,22 +9454,21 @@ fn validate_private_temp_prefix(bytes: &[u8]) -> Result<(), i32> {
 fn try_fill_os_random(buf: &mut [u8]) -> Result<(), i32> {
     #[cfg(target_os = "linux")]
     {
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let n = unsafe { getrandom(buf.as_mut_ptr().add(filled).cast(), buf.len() - filled, 0) };
+        fill_linux_random_with(buf, |remaining| {
+            let n = unsafe { getrandom(remaining.as_mut_ptr().cast(), remaining.len(), 0) };
             if n < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+                    LinuxRandomOutcome::Interrupted
+                } else {
+                    LinuxRandomOutcome::Failed(io_error_to_status(&error))
                 }
-                return Err(io_error_to_status(&error));
+            } else {
+                usize::try_from(n)
+                    .map(LinuxRandomOutcome::Bytes)
+                    .unwrap_or(LinuxRandomOutcome::Failed(AL_INVALID))
             }
-            if n == 0 {
-                return Err(AL_INVALID);
-            }
-            filled += usize::try_from(n).map_err(|_| AL_INVALID)?;
-        }
-        Ok(())
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -9459,6 +9479,31 @@ fn try_fill_os_random(buf: &mut [u8]) -> Result<(), i32> {
         }
         Ok(())
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+enum LinuxRandomOutcome {
+    Bytes(usize),
+    Interrupted,
+    Failed(i32),
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn fill_linux_random_with(
+    buf: &mut [u8],
+    mut call: impl FnMut(&mut [u8]) -> LinuxRandomOutcome,
+) -> Result<(), i32> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match call(&mut buf[filled..]) {
+            LinuxRandomOutcome::Bytes(0) => return Err(AL_INVALID),
+            LinuxRandomOutcome::Bytes(count) if count <= buf.len() - filled => filled += count,
+            LinuxRandomOutcome::Bytes(_) => return Err(AL_INVALID),
+            LinuxRandomOutcome::Interrupted => {}
+            LinuxRandomOutcome::Failed(status) => return Err(status),
+        }
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -9570,12 +9615,20 @@ unsafe fn native_remove_empty_dir(path_ptr: *const u8, path_len: i64) -> Result<
         parent = beneath_open_directory(parent.0, path.component_ptr(index))?;
     }
     let name = path.component_ptr(path.components.len() - 1);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalObserve) {
+        return Err(AL_CODE + libc::EIO);
+    }
     let observed = beneath_stat_at(parent.0, name)?;
     if !beneath_is_dir(&observed) {
         return Err(AL_INVALID);
     }
     #[cfg(test)]
     beneath_test_checkpoint(BeneathTestCheckpoint::FinalObserved, name);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalOpen) {
+        return Err(AL_CODE + libc::EIO);
+    }
     let raw_fd = unsafe {
         libc::openat(
             parent.0,
@@ -9589,6 +9642,10 @@ unsafe fn native_remove_empty_dir(path_ptr: *const u8, path_len: i64) -> Result<
     let fd = BeneathFd(raw_fd);
     #[cfg(test)]
     beneath_test_checkpoint(BeneathTestCheckpoint::FinalOpened, name);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalRevalidate) {
+        return Err(AL_CODE + libc::EIO);
+    }
     let opened = beneath_stat_fd(fd.0)?;
     if !beneath_is_dir(&opened) || !beneath_same_identity(&observed, &opened) {
         return Err(AL_INVALID);
@@ -35129,11 +35186,14 @@ mod tests {
             unsafe { align_rt_fs_create_private_temp_dir(b"x".as_ptr(), 1, unaligned) },
             AL_INVALID,
         );
-        let alias = storage.as_mut_ptr();
+        let mut alias_value = AlignStr { ptr: core::ptr::dangling_mut(), len: -1 };
+        let alias = &mut alias_value as *mut AlignStr;
         assert_eq!(
             unsafe { align_rt_fs_create_private_temp_dir(alias.cast(), 1, alias) },
             AL_INVALID,
         );
+        assert!(alias_value.ptr.is_null());
+        assert_eq!(alias_value.len, 0);
         let mut out = AlignStr { ptr: core::ptr::dangling(), len: -1 };
         assert_eq!(
             unsafe { align_rt_fs_create_private_temp_dir(core::ptr::null(), -1, &mut out) },
@@ -35164,6 +35224,98 @@ mod tests {
         assert!(directory.is_dir());
         std::fs::remove_file(child).unwrap();
         assert_eq!(unsafe { align_rt_fs_remove_empty_dir(text.as_ptr(), i64::try_from(text.len()).unwrap()) }, 0);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fs_private_temp_root_is_canonical_for_supported_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tmp_path("private-temp-root-canonical");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(parent.join("root")).unwrap();
+        symlink(parent.join("root"), parent.join("alias")).unwrap();
+
+        let expected = std::fs::canonicalize(parent.join("root")).unwrap();
+        for configured in [
+            parent.join("root"),
+            std::path::PathBuf::from(format!("{}/", parent.join("root").display())),
+            parent.join("alias"),
+        ] {
+            let bytes = canonical_private_temp_root(configured).unwrap();
+            assert_eq!(std::path::Path::new(std::str::from_utf8(&bytes).unwrap()), expected);
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fs_private_temp_macos_root_provider_retries_growth_and_stabilizes_empty_failures() {
+        let expected = b"/private/var/folders/example/T/";
+        let mut call = 0usize;
+        let configured = macos_private_temp_root_with(|buffer, len| {
+            call += 1;
+            match call {
+                1 => 4,
+                2 => expected.len() + 1,
+                3 => {
+                    assert_eq!(len, expected.len() + 1);
+                    unsafe { core::ptr::copy_nonoverlapping(expected.as_ptr(), buffer.cast(), expected.len()) };
+                    unsafe { buffer.add(expected.len()).write(0) };
+                    expected.len() + 1
+                }
+                _ => unreachable!(),
+            }
+        })
+        .unwrap();
+        assert_eq!(configured.as_os_str().as_encoded_bytes(), expected);
+        assert_eq!(call, 3);
+        assert_eq!(macos_private_temp_root_with(|_, _| 0), Err(AL_INVALID));
+        let mut call = 0usize;
+        assert_eq!(
+            macos_private_temp_root_with(|_, _| {
+                call += 1;
+                if call == 1 { 4 } else { 0 }
+            }),
+            Err(AL_INVALID),
+        );
+    }
+
+    #[test]
+    fn fs_private_temp_linux_random_contract_handles_progress_interrupts_and_errors() {
+        let mut output = [0u8; 5];
+        let mut step = 0usize;
+        fill_linux_random_with(&mut output, |remaining| {
+            step += 1;
+            match step {
+                1 => LinuxRandomOutcome::Interrupted,
+                2 => {
+                    remaining[..2].copy_from_slice(&[1, 2]);
+                    LinuxRandomOutcome::Bytes(2)
+                }
+                3 => {
+                    remaining.copy_from_slice(&[3, 4, 5]);
+                    LinuxRandomOutcome::Bytes(3)
+                }
+                _ => unreachable!(),
+            }
+        })
+        .unwrap();
+        assert_eq!(output, [1, 2, 3, 4, 5]);
+        assert_eq!(step, 3);
+
+        assert_eq!(
+            fill_linux_random_with(&mut [0u8; 1], |_| LinuxRandomOutcome::Bytes(0)),
+            Err(AL_INVALID),
+        );
+        assert_eq!(
+            fill_linux_random_with(&mut [0u8; 1], |_| LinuxRandomOutcome::Bytes(2)),
+            Err(AL_INVALID),
+        );
+        assert_eq!(
+            fill_linux_random_with(&mut [0u8; 1], |_| LinuxRandomOutcome::Failed(AL_DENIED)),
+            Err(AL_DENIED),
+        );
     }
 
     #[test]
@@ -35203,6 +35355,85 @@ mod tests {
         assert_eq!(status, AL_CODE + libc::EEXIST);
         assert!(occupied.is_dir());
         std::fs::remove_dir(occupied).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fs_private_temp_retries_every_occupied_entry_type_without_mutating_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_path("private-temp-occupied-types");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let root_bytes = root.to_str().unwrap().as_bytes().to_vec();
+
+        for kind in ["file", "directory", "symlink"] {
+            let prefix = format!("align_occupied_{kind}");
+            let occupied = root.join(format!("{prefix}-{}", "0".repeat(32)));
+            match kind {
+                "file" => std::fs::write(&occupied, b"occupied").unwrap(),
+                "directory" => std::fs::create_dir(&occupied).unwrap(),
+                "symlink" => symlink("missing-target", &occupied).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = std::fs::symlink_metadata(&occupied).unwrap().file_type();
+            let mut fills = 0usize;
+            let created = create_private_temp_dir_with(
+                prefix.as_bytes(),
+                root_bytes.clone(),
+                |random| {
+                    fills += 1;
+                    random.fill(if fills == 1 { 0 } else { 1 });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(fills, 2, "{kind}");
+            assert_eq!(
+                std::fs::symlink_metadata(&occupied).unwrap().file_type(),
+                before,
+                "{kind} collision must not mutate the occupied entry",
+            );
+            let created_bytes = unsafe {
+                std::slice::from_raw_parts(created.ptr, usize::try_from(created.len).unwrap())
+            };
+            let created_path = std::path::PathBuf::from(std::str::from_utf8(created_bytes).unwrap());
+            drop(created);
+            std::fs::remove_dir(created_path).unwrap();
+            match kind {
+                "directory" => std::fs::remove_dir(&occupied).unwrap(),
+                _ => std::fs::remove_file(&occupied).unwrap(),
+            }
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "alloc-count", any(target_os = "linux", target_os = "macos")))]
+    fn fs_private_temp_allocates_output_before_mutation_and_frees_it_on_failure() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tmp_path("private-temp-allocation-order");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let root_bytes = root.to_str().unwrap().as_bytes().to_vec();
+        let prefix = b"align_alloc_order";
+        let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
+        let status = match create_private_temp_dir_with(prefix, root_bytes, |_| {
+            assert_eq!(
+                align_rt_alloc_count() - alloc_before,
+                1,
+                "the owned result buffer exists before the first fallible mutation",
+            );
+            Err(AL_DENIED)
+        }) {
+            Ok(_) => panic!("injected random failure must not publish a path"),
+            Err(status) => status,
+        };
+        assert_eq!(status, AL_DENIED);
+        assert_eq!(align_rt_alloc_count() - alloc_before, 1);
+        assert_eq!(align_rt_free_count() - free_before, 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -35283,13 +35514,55 @@ mod tests {
                 0,
             );
         }
+        let root = tmp_path("private-temp-fd-failpoints");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("parent")).unwrap();
+        for (index, failpoint) in [
+            BeneathTestFailpoint::FinalObserve,
+            BeneathTestFailpoint::FinalOpen,
+            BeneathTestFailpoint::FinalRevalidate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = root.join("parent").join(format!("victim-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            *BENEATH_TEST_FAILPOINT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(failpoint);
+            let text = path.to_str().unwrap();
+            let status = unsafe {
+                align_rt_fs_remove_empty_dir(text.as_ptr(), i64::try_from(text.len()).unwrap())
+            };
+            *BENEATH_TEST_FAILPOINT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            assert_eq!(status, AL_CODE + libc::EIO);
+            assert!(path.is_dir());
+            std::fs::remove_dir(path).unwrap();
+            assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), baseline);
+        }
+        let root_bytes = root.to_str().unwrap().as_bytes().to_vec();
+        for _ in 0..64 {
+            let status = match create_private_temp_dir_with(b"align_random_error", root_bytes.clone(), |_| {
+                Err(AL_CODE + libc::EIO)
+            }) {
+                Ok(_) => panic!("injected random failure must not create a directory"),
+                Err(status) => status,
+            };
+            assert_eq!(status, AL_CODE + libc::EIO);
+            assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), baseline);
+        }
+        std::fs::remove_dir_all(root).unwrap();
         assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), baseline);
     }
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn fs_remove_empty_dir_rejects_non_directories_and_symlinks_without_removing_them() {
+    fn fs_remove_empty_dir_rejects_missing_denied_and_non_directory_types_without_removing_them() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt;
 
         let parent = tmp_path("remove-empty-types");
         let _ = std::fs::remove_dir_all(&parent);
@@ -35297,14 +35570,45 @@ mod tests {
         let target = parent.join("target");
         let file = parent.join("file");
         let link = parent.join("link");
+        let fifo = parent.join("fifo");
+        let socket_path = parent.join("socket");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(&file, b"x").unwrap();
         symlink(&target, &link).unwrap();
-        for path in [&file, &link] {
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let socket = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
+        for path in [&file, &link, &fifo, &socket_path, std::path::Path::new("/dev/null")] {
             let text = path.to_str().unwrap();
             assert_eq!(unsafe { align_rt_fs_remove_empty_dir(text.as_ptr(), i64::try_from(text.len()).unwrap()) }, AL_INVALID);
             assert!(std::fs::symlink_metadata(path).is_ok());
         }
+        let missing = parent.join("missing");
+        let text = missing.to_str().unwrap();
+        assert_eq!(
+            unsafe { align_rt_fs_remove_empty_dir(text.as_ptr(), i64::try_from(text.len()).unwrap()) },
+            AL_NOT_FOUND,
+        );
+
+        let denied = parent.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::create_dir(denied.join("victim")).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            let denied_path = denied.join("victim");
+            let text = denied_path.to_str().unwrap();
+            assert_eq!(
+                unsafe { align_rt_fs_remove_empty_dir(text.as_ptr(), i64::try_from(text.len()).unwrap()) },
+                AL_DENIED,
+            );
+        }
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(denied.join("victim")).unwrap();
+        std::fs::remove_dir(denied).unwrap();
+
+        drop(socket);
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_file(&fifo).unwrap();
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_file(&file).unwrap();
         std::fs::remove_dir(&target).unwrap();
