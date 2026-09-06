@@ -4715,7 +4715,7 @@ fn lower_lifted_borrow_summary(
             params.extend(
                 captures
                     .iter()
-                    .map(|capture| explicit.checked_add(*capture).unwrap_or(u32::MAX)),
+                    .map(|capture| explicit.saturating_add(*capture)),
             );
             params.sort_unstable();
             params.dedup();
@@ -4738,7 +4738,7 @@ fn lower_lifted_region_summary(
             params.extend(
                 captures
                     .iter()
-                    .map(|capture| explicit.checked_add(*capture).unwrap_or(u32::MAX)),
+                    .map(|capture| explicit.saturating_add(*capture)),
             );
             params.sort_unstable();
             params.dedup();
