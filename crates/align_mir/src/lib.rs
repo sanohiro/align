@@ -175,26 +175,30 @@ pub struct PlanRecord {
 /// Opaque construction-time proof of the complete located record table.
 ///
 /// The payload is deliberately inaccessible outside `align_mir`: downstream compiler stages may
-/// carry or replace the proof as a whole, but cannot edit it in parallel with `plan_records` and
-/// thereby turn a missing or rewritten observation into a valid table.
+/// carry it only by carrying the enclosing [`Program`], but cannot replace or edit it in parallel
+/// with `plan_records` and thereby turn a missing or rewritten observation into a valid table.
 #[derive(Clone, Debug, Default)]
-pub struct PlanCertification(Vec<PlanRecord>);
+enum PlanCertification {
+    #[default]
+    Uncertified,
+    Produced(Vec<PlanRecord>),
+}
 
 impl PlanCertification {
     fn from_records(records: &[PlanRecord]) -> Self {
-        Self(records.to_vec())
+        Self::Produced(records.to_vec())
     }
 
     fn matches(&self, records: &[PlanRecord]) -> bool {
-        self.0 == records
+        matches!(self, Self::Produced(certified) if certified == records)
     }
 
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    fn is_uncertified(&self) -> bool {
+        matches!(self, Self::Uncertified)
     }
 
     fn clear(&mut self) {
-        self.0.clear();
+        *self = Self::Uncertified;
     }
 }
 
@@ -328,10 +332,10 @@ pub struct Program {
     /// Construction-time certification of the complete record table. Validation compares it with
     /// the publishable copy so deletion, insertion, or source-provenance stripping fails closed.
     /// It is located diagnostic data and is excluded from every artifact identity beside records.
-    pub plan_certification: PlanCertification,
+    plan_certification: PlanCertification,
     /// A private fail-closed bit for catalog shape/name/content failures that cannot be represented
     /// by a valid [`PlanRecord`]. Ordinary and unauthenticated replay lowering leave it false.
-    pub plan_catalog_malformed: bool,
+    plan_catalog_malformed: bool,
     /// Target-owned effect facts for functions named by SQLite callback descriptors. This table is
     /// recomputed from checked HIR bodies independently of each descriptor's copied effect bit.
     pub sqlite_callback_effects: std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
@@ -363,6 +367,14 @@ pub struct Program {
     /// Tuple layouts, indexed by the id in [`Ty::Tuple`]; codegen builds an anonymous LLVM
     /// struct type from each element list.
     pub tuples: Vec<hir::TupleDef>,
+}
+
+impl Program {
+    /// Irreversibly reject publication after an enclosing source-catalog owner finds malformed
+    /// provenance that the per-unit HIR catalog cannot represent itself.
+    pub fn mark_current_plan_malformed(&mut self) {
+        self.plan_catalog_malformed = true;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3283,11 +3295,11 @@ fn lower_program_checked_with_catalog(
         function,
     };
     if let Err((pass, function)) = hir_program_validation_reason(program) {
-        // A genuinely empty input still lowers to the empty program; anything else vanished.
-        if program.fns.is_empty() && program.structs.is_empty() {
-            return Ok(empty_program());
+        // A genuinely empty input still follows the selected lowering route so located callers
+        // receive a certified empty plan table. Anything else must fail without publication.
+        if !(program.fns.is_empty() && program.structs.is_empty()) {
+            return Err(rejected(pass, function));
         }
-        return Err(rejected(pass, function));
     }
     if tests.is_some_and(|tests| !align_sema::checked_hir_test_catalog_is_valid(program, tests)) {
         return Err(rejected(ValidationPass::TestCatalog, None));
@@ -3338,7 +3350,9 @@ pub fn lower_program(program: &hir::Program) -> Program {
 
 /// Lower with source locations, so each MIR statement records the (line, col) it came from. Used by
 /// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
-/// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
+/// [`lower_program`]. In addition to populated `Block::stmt_lines`, this unauthenticated located
+/// route reconstructs current-plan decisions with source unavailable and certifies that table for
+/// validation before publication.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
     fail_closed(lower_program_checked(program, false, Some(sm)))
 }
@@ -3358,9 +3372,11 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// and per-unit ([`lower_program_per_unit`]) variants combined: each MIR statement records the
 /// (line, col) it came from (populating `Block::stmt_lines`) *and* the separate-compilation
 /// visibility bits are honored (non-entry `pub` fns external, public declarations from
-/// interface-only dependencies carried as external declares). Used by `alignc explain-opt`, which
-/// now compiles each unit in isolation and needs both the debug locations (for remark attribution)
-/// and the per-unit boundary (so a cross-unit call stays an opaque call).
+/// interface-only dependencies carried as external declares). Like the whole-program located route,
+/// it reconstructs and certifies source-less current-plan records; the catalog-taking sibling used
+/// by `alignc explain-opt` replaces source absence only where the loader authenticates user text.
+/// The command compiles each unit in isolation and needs both the debug locations (for remark
+/// attribution) and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
     fail_closed(lower_program_checked(program, true, Some(sm)))
 }
@@ -3451,6 +3467,7 @@ fn lower_program_unchecked_with_plans(
     mut plan_catalog_malformed: bool,
     per_unit: bool,
 ) -> Program {
+    let certify_plans = plan_resolver.is_some();
     // Function signature facts are immutable during MIR lowering. Materialize the shared table once
     // so lowering F functions does not deep-clone all T entries F times.
     let fn_types: Rc<[hir::FnTy]> = program.fn_types.clone().into();
@@ -3579,7 +3596,11 @@ fn lower_program_unchecked_with_plans(
         .into_iter()
         .map(|(target, effect)| (ProgramCall::from_validated(&target), effect))
         .collect();
-    let plan_certification = PlanCertification::from_records(&plan_records);
+    let plan_certification = if certify_plans {
+        PlanCertification::from_records(&plan_records)
+    } else {
+        PlanCertification::Uncertified
+    };
     let mut mir = Program {
         fns,
         plan_records,
@@ -9764,7 +9785,6 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 // SoA and unsupported aggregate layouts retain the sequential collect loop.
                 let (form, elem_in) = par_map_form_decision(b, source.ty, stages);
                 if form.strategy == PlanStrategy::RangeMaterialize {
-                    let elem_in = elem_in.expect("range materialization has an input element");
                     let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
                     let src = match source.ty {
                         Ty::Slice(_)
@@ -13078,23 +13098,29 @@ fn par_map_form_decision(
     b: &Builder,
     source: Ty,
     stages: &[hir::Stage],
-) -> (PlanDecision, Option<Ty>) {
+) -> (PlanDecision, Ty) {
     let elem_in = match source {
-        Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
-        Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
+        Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+        Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
         Ty::StructArray(id, _) | Ty::DynStructArray(id, align_sema::Layout::Aos) => {
-            Some(Ty::Struct(id))
+            Ty::Struct(id)
         }
-        _ => None,
+        _ => {
+            return (
+                PlanDecision {
+                    kind: PlanKind::ParMap,
+                    state: PlanState::Rejected,
+                    strategy: PlanStrategy::SequentialCollect,
+                    reason: PlanReason::UnsupportedSourceRepresentation,
+                },
+                // Sequential fallback never consumes this value. Returning a concrete sentinel
+                // keeps the selected RangeMaterialize state structurally inseparable from a real
+                // input element without a user-input-reachable unwrap.
+                Ty::Unit,
+            );
+        }
     };
-    let decision = if elem_in.is_none() {
-        PlanDecision {
-            kind: PlanKind::ParMap,
-            state: PlanState::Rejected,
-            strategy: PlanStrategy::SequentialCollect,
-            reason: PlanReason::UnsupportedSourceRepresentation,
-        }
-    } else if !align_sema::par_map_parallelizable(
+    let decision = if !align_sema::par_map_parallelizable(
         source,
         stages,
         &b.structs,
@@ -22178,7 +22204,7 @@ mod tests {
             }],
         };
         let program = lower_program_checked_with_plan_catalog(&hir, false, &source_map, &catalog)
-            .expect("checked current-plan source lowers");
+            .unwrap_or_else(|error| panic!("checked current-plan source must lower: {error:?}"));
         assert!(current_plan_records_are_valid(&program, &source_map));
         (program, source_map)
     }
@@ -22225,7 +22251,7 @@ mod tests {
             .fns
             .iter()
             .find(|candidate| candidate.name.as_str() == function)
-            .expect("fixture function")
+            .unwrap_or_else(|| panic!("fixture function {function} is missing"))
             .blocks
             .iter()
             .any(|block| {
@@ -22284,7 +22310,10 @@ mod tests {
     fn current_plan_donation_decision_table_is_first_match_complete() {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let i64_array = Ty::DynArray(align_sema::ty_to_scalar(i64_ty).unwrap());
+        let i64_array = Ty::DynArray(
+            align_sema::ty_to_scalar(i64_ty)
+                .unwrap_or_else(|| panic!("i64 must remain a scalar test type")),
+        );
         let decide = |arena_active,
                       source,
                       output_element,
@@ -22502,7 +22531,7 @@ mod tests {
             .iter_mut()
             .find(|function| function.name == "f")
             .and_then(|function| function.body.value.as_deref_mut())
-            .expect("fixture function terminal");
+            .unwrap_or_else(|| panic!("fixture function terminal is missing"));
         mutate(terminal);
 
         let catalog = LocatedPlanSourceCatalog {
@@ -22621,11 +22650,37 @@ mod tests {
         let hir = check_file(&ast, &mut diagnostics);
         assert!(!diagnostics.has_errors());
 
-        let normal = lower_program_checked(&hir, false, None).unwrap();
+        let normal = lower_program_checked(&hir, false, None)
+            .unwrap_or_else(|error| panic!("ordinary fixture lowering failed: {error:?}"));
         assert!(normal.plan_records.is_empty());
         assert_eq!(normal.plan_records.capacity(), 0);
+        assert!(
+            !current_plan_records_are_valid(&normal, &source_map),
+            "ordinary lowering is not a located-plan publication owner"
+        );
+        assert!(
+            !current_plan_records_are_valid(&Program::default(), &source_map),
+            "default construction must remain uncertified"
+        );
 
-        let replay = lower_program_checked(&hir, false, Some(&source_map)).unwrap();
+        let mut empty_diagnostics = Diagnostics::new();
+        let mut empty_source_map = SourceMap::new();
+        let empty_file = empty_source_map.add_file("empty.align", "");
+        let empty_ast = parse_file(
+            tokenize(empty_file, "", &mut empty_diagnostics),
+            &mut empty_diagnostics,
+        );
+        let empty_hir = check_file(&empty_ast, &mut empty_diagnostics);
+        assert!(!empty_diagnostics.has_errors());
+        let located_empty = lower_program_checked(&empty_hir, false, Some(&empty_source_map))
+            .unwrap_or_else(|error| panic!("empty located program must lower: {error:?}"));
+        assert!(
+            current_plan_records_are_valid(&located_empty, &empty_source_map),
+            "the located owner certifies an empty record table"
+        );
+
+        let replay = lower_program_checked(&hir, false, Some(&source_map))
+            .unwrap_or_else(|error| panic!("source-less replay lowering failed: {error:?}"));
         assert_eq!(replay.plan_records.len(), 1);
         assert!(replay.plan_records[0].source.is_none());
         assert!(current_plan_records_are_valid(&replay, &source_map));
@@ -22779,8 +22834,20 @@ mod tests {
             Box::new(|program| program.plan_records[0].construct_ordinal = 0),
             Box::new(|program| program.plan_records[0].state = PlanState::Rejected),
             Box::new(|program| program.plan_records[0].function = ProgramCall::from_validated("missing")),
-            Box::new(|program| program.plan_records[0].source.as_mut().unwrap().line = 0),
-            Box::new(|program| program.plan_records[0].source.as_mut().unwrap().span_hi = u32::MAX),
+            Box::new(|program| {
+                program.plan_records[0]
+                    .source
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("fixture source is missing"))
+                    .line = 0
+            }),
+            Box::new(|program| {
+                program.plan_records[0]
+                    .source
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("fixture source is missing"))
+                    .span_hi = u32::MAX
+            }),
             Box::new(|program| {
                 let name = ProgramCall::from_validated("bad`name");
                 program.fns[0].name = name.clone();
@@ -22810,7 +22877,7 @@ mod tests {
             &mismatched_map,
             &mismatched_catalog,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("mismatched catalog fixture failed to lower: {error:?}"));
         assert!(malformed.plan_catalog_malformed);
         assert!(!current_plan_records_are_valid(&malformed, &mismatched_map));
     }

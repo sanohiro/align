@@ -32,7 +32,7 @@ pub fn program_to_string(p: &Program) -> String {
 /// unlocated MIR and therefore keep comment/whitespace-only edits invisible.
 pub fn codegen_input_to_string(p: &Program) -> String {
     if p.plan_records.is_empty()
-        && p.plan_certification.is_empty()
+        && p.plan_certification.is_uncertified()
         && !p.plan_catalog_malformed
     {
         return format!("{p:?}");

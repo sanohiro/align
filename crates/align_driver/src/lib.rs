@@ -3559,7 +3559,9 @@ fn walk_inner(
                     &catalog,
                 )
                 .map(|mut mir| {
-                    mir.plan_catalog_malformed |= catalog_malformed;
+                    if catalog_malformed {
+                        mir.mark_current_plan_malformed();
+                    }
                     mir
                 })
             } else {
@@ -10026,6 +10028,38 @@ mod walk_tests {
         }
     }
 
+    struct BoundedTestChild(Option<std::process::Child>);
+
+    impl BoundedTestChild {
+        fn spawn(command: &mut std::process::Command) -> Self {
+            Self(Some(command.spawn().expect("spawn bounded current-plan child")))
+        }
+
+        fn wait(mut self, budget: std::time::Duration) -> std::process::ExitStatus {
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                let child = self.0.as_mut().expect("live bounded child");
+                if let Some(status) = child.try_wait().expect("poll bounded current-plan child") {
+                    self.0.take();
+                    return status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("current-plan measurement child exceeded its 10-second deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for BoundedTestChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     /// P32: the per-module closure memo. The key needs a closure for every closure MEMBER of every
     /// unit, so without memoization a fan-in DAG would recompute the same closure once per
     /// importer. `transitive` itself is unmemoized and stays the reference implementation.
@@ -10261,20 +10295,21 @@ fn main() -> i32 = 0\n";
         }
 
         if std::env::var_os("ALIGN_CURRENT_PLAN_MEASUREMENT_CHILD").is_none() {
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "walk_tests::current_plan_whole_and_per_unit_routes_choose_the_same_decisions",
                 ])
                 .env("ALIGN_BUFFER_DONATE", "off")
                 .env("ALIGN_CURRENT_PLAN_MEASUREMENT_CHILD", "1")
-                .output()
-                .expect("spawn isolated measurement-row parity owner");
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let status = BoundedTestChild::spawn(&mut command)
+                .wait(std::time::Duration::from_secs(10));
             assert!(
-                child.status.success(),
-                "measurement-disabled whole/per-unit parity failed:\n{}\n{}",
-                String::from_utf8_lossy(&child.stdout),
-                String::from_utf8_lossy(&child.stderr)
+                status.success(),
+                "measurement-disabled whole/per-unit parity child failed: {status}"
             );
         }
     }
@@ -10292,7 +10327,6 @@ fn main() -> i32 = 0\n";
         assert!(!located.plan_records.is_empty());
         let mut cleared = located.clone();
         cleared.plan_records.clear();
-        cleared.plan_catalog_malformed = false;
         assert_eq!(
             align_mir::print::program_to_string(&located),
             align_mir::print::program_to_string(&cleared),
@@ -10368,8 +10402,9 @@ fn main() -> i32 = 0\n";
             .mir
             .plan_records
             .iter()
-            .find(|record| record.function.as_str().starts_with("dep$rows$"))
+            .find(|record| record.function.as_str() == "dep$rows$i64")
             .unwrap_or_else(|| panic!("imported generic plan: {:?}", main.mir.plan_records));
+        assert_eq!(imported.function.as_str(), "dep$rows$i64");
         assert!(imported.source.is_none());
         assert!(align_mir::current_plan_records_are_valid(&main.mir, &source_map));
     }

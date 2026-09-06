@@ -493,14 +493,12 @@ fn explain_opt_imported_generic_uses_the_source_less_default_and_verbose_grammar
         .filter(|line| line.contains("[current plan"))
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    assert_eq!(verbose_rows.len(), 1, "source-less verbose row: {verbose_rows:?}");
-    assert!(
-        verbose_rows[0].starts_with("  [current plan `dep$rows$")
-            && verbose_rows[0].ends_with(
-                "` #1 buffer-donation] not-applicable `fresh-output` — this source or stage shape cannot reuse the source buffer; source location is unavailable"
-            ),
-        "source-less verbose grammar changed: {}",
-        verbose_rows[0]
+    assert_eq!(
+        verbose_rows,
+        [
+            "  [current plan `dep$rows$i64` #1 buffer-donation] not-applicable `fresh-output` — this source or stage shape cannot reuse the source buffer; source location is unavailable"
+        ],
+        "source-less verbose grammar or concrete monomorph identity changed"
     );
 }
 

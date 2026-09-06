@@ -394,14 +394,18 @@ the `par_map` consuming it each
 produce their own record. LLVM remarks never suppress plan records, and plan
 records never suppress LLVM remarks.
 
-Located construction also retains one compiler-private certification copy of
-the complete normalized record table. Final validation requires structural
-equality with that copy before checking individual records. The copy is
-allocated only beside located records and is erased with them from MIR text,
-implementation hashes, caches, interfaces, LLVM, objects, and runtime keys.
-This makes deletion, insertion, field mutation, or authenticated-`Some` to
-source-less-`None` stripping fail closed without reconstructing decisions from
-MIR or LLVM.
+Located construction also retains one `align_mir`-private certification copy
+of the complete normalized record table and the private catalog-malformed bit.
+`Program::default()` and ordinary unlocated lowering are uncertified; only a
+located lowering owner can construct the certified state, and downstream crates
+can neither replace it nor clear a malformed catalog result. Final validation
+requires that certified state and structural equality with its copy before
+checking individual records. The copy is allocated only beside located records
+and is erased with them from MIR text, implementation hashes, caches,
+interfaces, LLVM, objects, and runtime keys. This makes deletion, insertion,
+field mutation, authenticated-`Some` to source-less-`None` stripping, or
+rebuilding the public semantic fields on a default program fail closed without
+reconstructing decisions from MIR or LLVM.
 
 After the complete per-unit walk and before any LLVM invocation or output, the
 driver validates every state/strategy/reason combination, the total sort and
@@ -641,7 +645,7 @@ risk and leaves distinct LLVM-remark behavior unchanged.
 
 | Axis | Exact implementation closure | Owner evidence |
 |---|---|---|
-| Formation and validation | Exhaustive enums admit only the three kind tables; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Unit-level invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
+| Formation and validation | Exhaustive enums admit only the three kind tables; `align_mir` alone owns the private certification and catalog-malformed state, Default/unlocated programs are uncertified, located programs (including an empty program) are certified, and downstream crates cannot jointly replace records and proof; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Rust privacy is the compile-time tripwire for external Program construction; unit-level default/located-empty/deletion/field/catalog invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
 | Construction | Chunks, donation, and `par_map` helpers return the decision consumed by their existing lowering branch; located mode records that same value | MIR structural positives/negatives for every table row. |
 | Move-in / move-out / source nulling | No Align value or ownership bit enters a record. Donation still transfers/nulls the existing source owner only on `reuse-source-buffer` | Existing `buffer_donate` MIR and execution differential, including bound and escaping results. |
 | Replacement and return | General chunks materialization may be replaced only by the same site's more-specific consumer reason; returning/storing chunks remains materialized | Direct/stored/call/return/control-flow chunks rows and existing lifetime owners. |

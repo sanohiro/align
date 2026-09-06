@@ -1025,22 +1025,7 @@ fn valid_thin_symbol(value: &str) -> bool {
 }
 
 fn resource_drop_hook_abi() -> Result<CanonicalFnAbi, CodegenError> {
-    let program = Program {
-        fns: Vec::new(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-        sqlite_callback_effects: std::collections::BTreeMap::new(),
-        externs: Vec::new(),
-        imported_fns: Vec::new(),
-        link_libs: Vec::new(),
-        structs: Vec::new(),
-        enums: Vec::new(),
-        resources: Vec::new(),
-        tagged_types: Vec::new(),
-        fn_types: Vec::new(),
-        tuples: Vec::new(),
-    };
+    let program = Program::default();
     canonical_metadata(CanonicalFnAbi::from_parts(
         &[(align_ast::ParamMode::ByValue, Ty::Raw)],
         Ty::Unit,
@@ -1162,23 +1147,17 @@ pub fn emit_function_prelink_bc(
     let mut functions = Vec::with_capacity(1 + peer_functions.len());
     functions.push((*selected).clone());
     functions.extend(peer_functions.iter().map(|function| (*function).clone()));
-    let program = Program {
-        fns: functions,
-        // Located current-plan records are diagnostic-only and never enter a ThinLTO view.
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-        sqlite_callback_effects: shared.callback_effects.clone(),
-        externs: shared.externs.to_vec(),
-        imported_fns: shared.imported_fns.to_vec(),
-        link_libs: Vec::new(),
-        structs: shared.structs.to_vec(),
-        enums: shared.enums.to_vec(),
-        resources: shared.resources.to_vec(),
-        tagged_types: shared.tagged_types.to_vec(),
-        fn_types: shared.fn_types.to_vec(),
-        tuples: shared.tuples.to_vec(),
-    };
+    let mut program = Program::default();
+    program.fns = functions;
+    program.sqlite_callback_effects = shared.callback_effects.clone();
+    program.externs = shared.externs.to_vec();
+    program.imported_fns = shared.imported_fns.to_vec();
+    program.structs = shared.structs.to_vec();
+    program.enums = shared.enums.to_vec();
+    program.resources = shared.resources.to_vec();
+    program.tagged_types = shared.tagged_types.to_vec();
+    program.fn_types = shared.fn_types.to_vec();
+    program.tuples = shared.tuples.to_vec();
     if partition_function_abi(selected, &program)? != definition.abi
         || peers
             .iter()
@@ -33213,22 +33192,10 @@ fn main() -> i32 = 0
             exportable: false,
         }];
         fns.extend(extra_fns);
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns,
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs,
-            enums,
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+        let mut program = Program::default();
+        program.fns = fns;
+        program.structs = structs;
+        program.enums = enums;
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
     }
 
@@ -33318,18 +33285,9 @@ fn main() -> i32 = 0
             Operand::Value(0),
             Operand::Const(Const::Bool(true)),
         )));
-        Program {
-            fns: vec![html, write, raw, finish],
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: vec![hir::ResourceDef {
+        let mut program = Program::default();
+        program.fns = vec![html, write, raw, finish];
+        program.resources = vec![hir::ResourceDef {
                 name: "pkg.template$html_builder".into(),
                 source_name: "pkg.template$html_builder".into(),
                 declaring_module: "pkg.template".into(),
@@ -33338,11 +33296,8 @@ fn main() -> i32 = 0
                 drop_thunk: "__align_resource_drop$pkg.template$html_builder".into(),
                 representation_version: 1,
                 drop_abi_fingerprint: *b"align-res-drop-1",
-            }],
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        }
+            }];
+        program
     }
 
     #[test]
@@ -35559,8 +35514,8 @@ fn main() -> i32 = 0
         } else {
             Term::Return(Some(Operand::Value(1)))
         };
-        Program {
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("producer"),
                 params: (0..out).collect(),
                 param_modes: vec![align_ast::ParamMode::ByValue; params.len()],
@@ -35584,9 +35539,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            ..Program::default()
-        }
+            }];
+        program
     }
 
     #[test]
@@ -36797,17 +36751,11 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             };
-            emit_llvm_ir(
-                &Program {
-                    sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-                    fns: std::iter::once(main)
-                        .chain(descriptor_functions)
-                        .collect(),
-                    externs: Vec::new(),
-                    imported_fns: vec![align_mir::ImportedFn {
+            let mut program = Program::default();
+            program.fns = std::iter::once(main)
+                .chain(descriptor_functions)
+                .collect();
+            program.imported_fns = vec![align_mir::ImportedFn {
                         name: program_call("pkg.db.internal$read_i64_v2"),
                         params: vec![Ty::Raw, u32_ty],
                         param_modes: vec![align_ast::ParamMode::ByValue; 2],
@@ -36819,15 +36767,11 @@ fn main() -> i32 = 0
                         return_region: hir::ReturnRegionSummary::None,
                         return_cleanup: hir::ReturnCleanupAbi::None,
                         producer_certified: true,
-                    }],
-                    link_libs: Vec::new(),
-                    structs: vec![row.clone(), other.clone()],
-                    enums: Vec::new(),
-                    resources: vec![resource("rows"), resource("batch")],
-                    tagged_types: Vec::new(),
-                    fn_types: Vec::new(),
-                    tuples: Vec::new(),
-                },
+                    }];
+            program.structs = vec![row.clone(), other.clone()];
+            program.resources = vec![resource("rows"), resource("batch")];
+            emit_llvm_ir(
+                &program,
                 &BuildTarget::Baseline,
                 false,
                 &[],
@@ -37108,23 +37052,12 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             };
+            let mut program = Program::default();
+            program.fns = vec![function];
+            program.structs = vec![row];
+            program.resources = vec![resource];
             emit_llvm_ir(
-                &Program {
-                    sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-                    fns: vec![function],
-                    externs: Vec::new(),
-                    imported_fns: Vec::new(),
-                    link_libs: Vec::new(),
-                    structs: vec![row],
-                    enums: Vec::new(),
-                    resources: vec![resource],
-                    tagged_types: Vec::new(),
-                    fn_types: Vec::new(),
-                    tuples: Vec::new(),
-                },
+                &program,
                 &BuildTarget::Baseline,
                 false,
                 &[],
@@ -37945,12 +37878,8 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -37970,17 +37899,7 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a missing nested tagged id must fail closed");
         assert!(
@@ -37992,12 +37911,8 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_embedded_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38030,17 +37945,7 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("an embedded missing nested tagged id must fail closed");
         assert!(
@@ -38053,12 +37958,8 @@ fn main() -> i32 = 0
     fn malformed_raw_load_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let zero = Operand::Const(Const::Int(0, i32_ty));
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38085,17 +37986,7 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a RawLoad missing nested tagged id must fail closed");
         assert!(
@@ -38107,12 +37998,9 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_nested_tagged_nominal_ids_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = |payload| Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let program = |payload| {
+            let mut program = Program::default();
+            program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38132,16 +38020,9 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![hir::TaggedType::Option(payload)],
-            fn_types: vec![],
-            tuples: vec![],
+            }];
+            program.tagged_types = vec![hir::TaggedType::Option(payload)];
+            program
         };
         for (payload, expected) in [
             (Scalar::Struct(7), "tagged payload struct type id 7 is missing"),
@@ -38165,12 +38046,9 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_cross_table_tagged_cycles_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = |structs, enums, tagged_types| Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let program = |structs, enums, tagged_types| {
+            let mut program = Program::default();
+            program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38190,16 +38068,11 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs,
-            enums,
-            resources: vec![],
-            tagged_types,
-            fn_types: vec![],
-            tuples: vec![],
+            }];
+            program.structs = structs;
+            program.enums = enums;
+            program.tagged_types = tagged_types;
+            program
         };
         let struct_cycle = program(
             vec![StructDef {
@@ -38320,12 +38193,9 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_mir_type_graphs_fail_before_llvm_construction() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let base = || Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let base = || {
+            let mut program = Program::default();
+            program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38345,16 +38215,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
+            }];
+            program
         };
 
         for (name, ty, expected) in [
@@ -38581,12 +38443,8 @@ fn main() -> i32 = 0
     #[test]
     fn direct_tagged_slot_uses_its_recursive_drop_plan() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38606,17 +38464,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![hir::TaggedType::Option(Scalar::String)],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
+        program.tagged_types = vec![hir::TaggedType::Option(Scalar::String)];
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect("a valid direct nested-tagged slot must lower");
         assert!(
@@ -38628,12 +38477,8 @@ fn main() -> i32 = 0
     #[test]
     fn tuple_drop_uses_recursive_element_destructor() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38653,19 +38498,10 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![TupleDef {
+            }];
+        program.tuples = vec![TupleDef {
                 elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
-            }],
-        };
+            }];
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect("a tuple with an owned string array must lower");
         assert!(
@@ -38673,12 +38509,8 @@ fn main() -> i32 = 0
             "tuple Drop must use the deep string-array destructor:\n{ir}"
         );
 
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38698,11 +38530,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![StructDef {
+            }];
+        program.structs = vec![StructDef {
                 name: "MoveElem".to_string(),
                 source_name: "MoveElem".to_string(),
                 fields: vec![align_sema::FieldDef {
@@ -38711,15 +38540,10 @@ fn main() -> i32 = 0
                 }],
                 align: None,
                 c_repr: false,
-            }],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![TupleDef {
+            }];
+        program.tuples = vec![TupleDef {
                 elems: vec![Scalar::DynStructArray(0)],
-            }],
-        };
+            }];
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect("a tuple with an owned Move-struct array must lower");
         assert!(
@@ -38736,12 +38560,9 @@ fn main() -> i32 = 0
     fn noncanonical_nested_tagged_tables_fail_closed() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
-        let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| {
+            let mut program = Program::default();
+            program.fns = vec![Function {
                 name: program_call("main"),
                 params: vec![],
                 param_modes: vec![],
@@ -38761,16 +38582,9 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: vec![],
-            tagged_types,
-            fn_types: vec![],
-            tuples: vec![],
+            }];
+            program.tagged_types = tagged_types;
+            program
         };
         let cases = [
             (
@@ -39596,12 +39410,8 @@ fn main() -> i32 = 0
         optimized: bool,
         count_arg: bool,
     ) -> String {
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
                 param_modes: if count_arg { vec![align_ast::ParamMode::ByValue] } else { vec![] },
@@ -39624,17 +39434,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs,
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
+        program.structs = structs;
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
     }
 
@@ -39661,12 +39462,8 @@ fn main() -> i32 = 0
 
     fn arena_allocation_case_ir() -> String {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call("arena_allocation_probe"),
                 params: vec![0],
                 param_modes: vec![align_ast::ParamMode::ByValue],
@@ -39695,29 +39492,15 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
     }
 
     fn soa_allocation_case_ir(len: Operand, row: StructDef, optimized: bool) -> String {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let dynamic = matches!(len, Operand::Arg(0));
-        let program = Program {
-            sqlite_callback_effects: Default::default(),
-        plan_records: Vec::new(),
-        plan_certification: Default::default(),
-        plan_catalog_malformed: false,
-            fns: vec![Function {
+        let mut program = Program::default();
+        program.fns = vec![Function {
                 name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },
                 param_modes: if dynamic { vec![align_ast::ParamMode::ByValue] } else { vec![] },
@@ -39750,17 +39533,8 @@ fn main() -> i32 = 0
                 }],
                 entry: 0,
                 exportable: false,
-            }],
-            externs: vec![],
-            imported_fns: vec![],
-            link_libs: vec![],
-            structs: vec![row],
-            enums: vec![],
-            resources: Vec::new(),
-            tagged_types: vec![],
-            fn_types: vec![],
-            tuples: vec![],
-        };
+            }];
+        program.structs = vec![row];
         emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
     }
 
