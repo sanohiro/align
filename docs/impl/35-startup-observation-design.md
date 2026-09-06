@@ -1,6 +1,6 @@
 # S0A startup observation design
 
-> **Status:** EXACT DESIGN ACCEPTED; implementation is next.
+> **Status:** IMPLEMENTED in PR #955.
 >
 > **Authority:** This document is the exact S0A slice ledger required by
 > [`31-execution-storage-startup-plan.md`](31-execution-storage-startup-plan.md).
@@ -1574,6 +1574,6 @@ contracted cwd/`TMPDIR`/artifact output, but S0A is not a hostile-code sandbox:
 its digest-bound Align/compiler and system-tool arms must not deliberately write
 to unrelated absolute paths or escape the owned process group.
 
-S0B remains the next independent observation design. C0 chunks consolidation
-and any S1/S3 optimization remain unapproved until their own evidence and
-closure gates are met.
+S0B's exact independent observation design is accepted and its implementation
+is next. C0 chunks consolidation and any S1/S3 optimization remain unapproved
+until their own evidence and closure gates are met.

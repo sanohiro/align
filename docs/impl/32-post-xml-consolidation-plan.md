@@ -1,11 +1,12 @@
 # Post-XML consolidation plan
 
-> **Status:** ACTIVE. V0 is complete and the exact S0A contract is accepted in
+> **Status:** ACTIVE. V0 is complete and S0A is implemented in PR #955 against
 > [`35-startup-observation-design.md`](35-startup-observation-design.md).
-> S0A implementation is next; S0B exact design follows.
+> The exact S0B extension is accepted in `09-explain-opt.md`.
 >
-> **First executable task:** implement the accepted S0A benchmark harness and
-> its closure matrix. No compiler refactor is authorized by this position.
+> **First executable task:** implement the accepted S0B current-decision
+> observation contract. No compiler refactor beyond that exact closure matrix
+> is authorized by this position.
 
 ## 1. Purpose and authority
 
@@ -70,7 +71,7 @@ This is an internal work plan, not a new public language contract.
 |---|---|---|
 | Language and library API | No new type, signature, default, syntax, or removed API | Existing specification and English library ledgers; source oracles remain unchanged |
 | Effects, errors, ownership, lifetime, allocation | Existing semantics, source-visible boundaries, and Drop rules remain authoritative | HIR/MIR and native-boundary owners; compare defined behavior, not all internal allocation counts |
-| CLI and reporting | Invoke existing commands; no `explain-opt` extension, JSON output, or new flag | `09-explain-opt.md`; S0B still needs its exact reviewed extension |
+| CLI and reporting | Invoke existing commands; S0B extends `explain-opt` text rows but adds no JSON output or new flag | Accepted exact S0B extension in `09-explain-opt.md` |
 | Runtime, FFI, and native input | No new symbol, ABI, text/view boundary, process lifecycle, or global state | `20-runtime-abi-ledger.md`; new safety strategies require their own reviewed closure matrix |
 | Build, cache, artifacts, distribution | No new input, cache format, profile, sidecar, release variant, or target | Existing build/cache/distribution plans; bind actual artifact identities |
 | Evidence | Private Markdown notes and raw outputs from existing owners; no persisted interchange schema or automatic reader | Baseline packet; unavailable observations are explicit, not zero |
@@ -87,7 +88,7 @@ decisions, and bilingual library designs do not change for this scheduling work.
 | Step | Work and concrete output | Entry | Completion |
 |---|---|---|---|
 | V0 — baseline qualification | Bound release/source identities, existing corpus results, evidence gaps, and first AI pilot disposition using packet 33 | XML/release transition above | Each initial row has a supported result or an explicit blocker; no unmeasured cost is called a regression |
-| S0A — startup observation | Parent-observed launch-to-reap benchmark, with untimed size/dependency companions | V0 is complete and plan 35 supplies the accepted exact fixture, measurement, and lifecycle ledger | Plan 31/35 S0A acceptance; no codegen change or probe in timed children |
+| S0A — startup observation | Parent-observed launch-to-reap benchmark, with untimed size/dependency companions | Implemented in PR #955 against plan 35's accepted exact fixture, measurement, and lifecycle ledger | Plan 31/35 S0A acceptance; no codegen change or probe in timed children |
 | S0B — current-decision observation | Exact records from existing selector owners through `explain-opt` | V0 names the decisions needed for the first consolidation; complete the exact `09-explain-opt.md` extension and closure matrix | Plan 31 S0B acceptance, including generated-code identity and located-mode isolation |
 | C0 — first consolidation | One useful decision boundary with implementation, removed duplication, and owner coverage | Baseline/observations relevant to that boundary exist; fill the matrix below | One authority per decision, necessary fallback/validation preserved, selected correctness and resource guards closed |
 | O0 — optional optimization | At most one admitted S1, S3, or S2 capability before reassessment | A named residual cost survives C0 and meets plan 31's admission gate | Adopt against preregistered evidence or record a measured deferral; an unprofitable candidate does not force a replacement project |
@@ -100,10 +101,10 @@ semantics-preserving deletion with sufficient existing evidence need not wait
 for unrelated observation work. Do not bundle either observation capability
 with the refactor or optimization it will later measure.
 
-S0A implementation is approved only within plan 35's exact harness/output
-contract and closure matrix. S0B implementation remains unapproved until its
-own exact `09-explain-opt.md` extension is reviewed. C0 cannot claim a resource
-improvement whose required observation is still unavailable.
+S0A is implemented within plan 35's exact harness/output contract and closure
+matrix. S0B implementation is approved only within its accepted exact
+`09-explain-opt.md` extension. C0 cannot claim a resource improvement whose
+required observation is still unavailable.
 
 If V0 finds no justified consolidation or optimization boundary, record that
 result and close through V1's disposition review without inventing a refactor

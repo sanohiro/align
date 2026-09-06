@@ -20,8 +20,8 @@ drift between the expanded warm corpus and the release measurement corpus. PR
 with all seven expected assets. The owner resumed capability work on 2026-09-06.
 V0 qualified the fixed R0-R5 corpus and XML evidence against the published
 v0.7.2 distribution and its matching source checkout; it found no new
-correctness defect. Startup/resource observations remain unavailable for S0A,
-and current chunks representation decisions remain unavailable for S0B.
+correctness defect. PR #955 made the S0A startup/resource observation harness
+available; current chunks representation decisions remain unavailable for S0B.
 
 The later align-llm `runtime_bundle.verify` graph exposed a v0.7.2 MIR producer-certification
 regression for an owned indexed string field crossing a loop join into an Ok record. Align PR #950
@@ -71,9 +71,11 @@ patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
 **Current next work (owner-resumed 2026-09-06):** Request 55 and the fixed v0.7.3 release are
-complete. The exact S0A startup-observation design is accepted in
-[`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md);
-implement that capability next, then author the exact S0B current-decision observation design.
+complete. S0A is implemented in PR #955 against
+[`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md).
+The exact S0B current-decision observation extension is accepted in
+[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md); implement that
+capability next without changing its source-provenance or decision-presence strategy.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
@@ -84,7 +86,7 @@ required observation and exact owning ledger. `std.time` named formatters,
 cloud packages, and additional transports are paused during this phase. S1–S6
 are not a mandatory backlog.
 
-_Last updated: 2026-09-06._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-07._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
