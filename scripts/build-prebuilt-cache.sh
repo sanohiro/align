@@ -33,33 +33,7 @@ cleanup() {
 trap cleanup EXIT
 PROJECT="$WORK_ROOT/project"
 WARM_ROOT="$WORK_ROOT/writable"
-mkdir -p "$PROJECT/pkg"
-
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg apps/template/pkg; do
-  cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
-done
-
-cat > "$PROJECT/main.align" <<'ALIGN'
-module align_release_cache_warm
-
-import pkg.db
-import pkg.db.sqlite
-import pkg.db.postgres
-import pkg.db.pool
-import pkg.web
-import pkg.web.types
-import pkg.web.cookie
-import pkg.web.cors
-import pkg.web.multipart
-import pkg.frame
-import pkg.auth
-import pkg.kv
-import pkg.csv
-import pkg.ws
-import pkg.template
-
-fn main() -> i32 = 0
-ALIGN
+"$REPO_ROOT/scripts/prepare-prebuilt-cache-project.sh" "$PROJECT"
 
 EXPECTED="$WORK_ROOT/expected-units.txt"
 find "$PROJECT" -name '*.align' -type f -exec \

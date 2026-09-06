@@ -29,29 +29,9 @@ cleanup() {
 trap cleanup EXIT
 
 PROJECT="$WORK_ROOT/project"
-mkdir -p "$PROJECT/pkg" "$WORK_ROOT/off" "$WORK_ROOT/hit" "$WORK_ROOT/emit-off" \
+mkdir -p "$WORK_ROOT/off" "$WORK_ROOT/hit" "$WORK_ROOT/emit-off" \
   "$WORK_ROOT/emit-hit" "$WORK_ROOT/timing-off" "$WORK_ROOT/timing-hit"
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg; do
-  cp -R "$REPO_ROOT/$TREE/." "$PROJECT/pkg/"
-done
-cat > "$PROJECT/main.align" <<'ALIGN'
-module align_release_cache_warm
-
-import pkg.db
-import pkg.db.sqlite
-import pkg.db.postgres
-import pkg.db.pool
-import pkg.web
-import pkg.web.types
-import pkg.web.cookie
-import pkg.web.cors
-import pkg.web.multipart
-import pkg.frame
-import pkg.auth
-import pkg.kv
-
-fn main() -> i32 = 0
-ALIGN
+"$REPO_ROOT/scripts/prepare-prebuilt-cache-project.sh" "$PROJECT"
 
 run_build() {
   local directory="$1"
