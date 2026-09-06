@@ -70665,11 +70665,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // `pkg.ws` adds nine checked operation variants and `pkg.template` adds four. The
-        // wildcard-free policy above classifies them explicitly beside the existing package and
-        // core operations.
+        // Request 55 adds one retained-root reader operation. The wildcard-free policy above
+        // classifies it explicitly beside the existing package and core operations.
         assert_eq!(
-            variants, 322,
+            variants, 323,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
