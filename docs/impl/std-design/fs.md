@@ -2,7 +2,9 @@ This file is the implementation-facing design for the `std.fs` extensions below.
 The public-contract ledgers are
 [`../27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) and
 [`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md). Request 55's single-link
-extension is owned by [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md).
+extension is owned by [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md). Request 56's
+private temporary-directory lifecycle is owned by
+[`../36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md).
 
 # std.fs — explicit trusted filesystem boundaries
 
@@ -12,7 +14,8 @@ extension is owned by [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`; implementation PR #861, merged as
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
 > pending. Request 18 retained-root regular-file access is IMPLEMENTED. Request 55 retained-root
-> single-link open is IMPLEMENTED; align-llm adoption remains external.
+> single-link open is IMPLEMENTED; align-llm adoption remains external. Request 56 private
+> temporary-directory lifecycle is PROPOSED.
 
 ## Overview
 
@@ -29,7 +32,8 @@ The operations are independent and impure. They are not a pair transaction,
 do not add a new writer type, and do not change the existing `writer` Move or
 `Drop` contract.
 
-Request 18 adds a separate two-operation boundary for regular files below one retained root:
+Request 18 plus Request 55 add a separate three-operation boundary for regular files below one
+retained root:
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
@@ -40,6 +44,15 @@ fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 These operations reject root, intermediate, and final symlinks and traverse from retained directory
 descriptors. They add no directory-handle value, metadata API, canonical path, sandbox, or
 process-global root.
+
+Request 56's final pair creates one platform-selected private staging root and explicitly removes it only
+after the caller has removed every known child. It is separate from general directory creation and
+recursive cleanup.
+
+```text
+fs.create_private_temp_dir(prefix: str) -> Result<string, Error>
+fs.remove_empty_dir(path: str) -> Result<(), Error>
+```
 
 ## Public contract
 
@@ -124,6 +137,34 @@ The operation creates no parent, temporary name, transaction, rename, rollback, 
 state. It is the one-file retained-parent constructor; Request 14 remains the owner of no-replace
 rename and C6f2 pair publication.
 
+### `create_private_temp_dir`
+
+`create_private_temp_dir` accepts one 1..=64-byte ASCII prefix. The first byte is alphanumeric;
+remaining bytes are alphanumeric, `_`, or `-`. It reads no application path or environment
+variable. Linux selects `/tmp`; macOS selects `confstr(_CS_DARWIN_USER_TEMP_DIR)`. Retained
+no-follow descriptors walk that absolute platform root.
+
+Each candidate leaf is the prefix, `-`, and 32 lowercase hexadecimal digits from 128 fresh
+OS-CSPRNG bits. One `mkdirat` with mode `0700` atomically claims it; umask may narrow but never widen
+the permissions. `EEXIST` draws a fresh suffix, with an exact 128-attempt bound. The operation never
+reuses an occupant or creates a parent. It returns the owned absolute path. Its result allocation is
+complete before the first create, so failure publishes no path and leaves no created directory.
+
+### `remove_empty_dir`
+
+`remove_empty_dir` accepts one absolute strict path with no empty, `.`, `..`, or trailing-slash
+component. It retains and revalidates every ancestor and observes/opens the same final directory
+without following symlinks. With parent and final descriptors still live, one
+`unlinkat(..., AT_REMOVEDIR)` removes only the empty directory named at that syscall. It never
+recurses or removes a symlink, file, special entry, or nonempty directory.
+
+The native removal is the final namespace/type/emptiness linearization point. Linux and macOS do
+not offer portable unlink-by-open-directory descriptor semantics: an empty-directory substitution
+after final identity revalidation may be the name removed. For a path returned by the constructor,
+the platform root and `0700` exclude other users and accidental application sharing; a hostile
+same-OS-identity process is outside this capability. Arbitrary paths in shared non-sticky parents
+receive no stronger promise.
+
 ## Path and ABI rules
 
 The Request 14 operations borrow path views only for the call. A path must be non-empty,
@@ -184,12 +225,29 @@ align_rt_io_writer_create_exclusive_beneath(
 ) -> i32
 ```
 
+The private-directory lifecycle uses existing A08 and A04 shapes:
+
+```text
+align_rt_fs_create_private_temp_dir(
+    prefix_ptr: ptr, prefix_len: i64, out_path: ptr,
+) -> i32
+
+align_rt_fs_remove_empty_dir(
+    path_ptr: ptr, path_len: i64,
+) -> i32
+```
+
 Output-slot validation is first, then complete root validation/copy/grammar, complete relative
 validation/copy/grammar, root traversal, relative-parent traversal, and the final operation. Invalid
 root grammar therefore wins over every relative-view error. Both slots are null on recoverable failure. Checked copy-size overflow is
 `Error.Invalid`; actual OOM is terminal. Private full-path copies become NUL-delimited component
 storage only after complete grammar validation; caller bytes are unchanged. At most two traversal
 directory descriptors are live, and all path/component owners end with the call.
+
+The constructor's A08 output is the existing owned-string slot. The runtime checks and zeros it
+first, then allocates the exact output before any `mkdirat`. Removal's A04 input is absolute-only so
+the constructor's output is consumed without a current-directory race. Both operations have
+distinct HIR/MIR kinds and runtime keys.
 
 ## Pair-publication consumer
 
@@ -240,6 +298,12 @@ the unchanged existing Move/Drop path. A same-final open/create pair has no hidd
 snapshot: open returns `NotFound` if it observes absence, but may acquire the newly created regular
 inode while its writer is live. Consumers requiring immutable input must reject that overlap.
 
+The private-directory operations are also `Impure`. Prefix/path operands are borrowed. The created
+path is an ordinary owned `string`, so move, return, branch/loop joins, `?`, replacement, and Drop
+use the existing string ownership path. Randomness failure and native creation/removal failures use
+the fixed error mapping; only `EEXIST` creation collisions retry. Removal leaves nonempty and
+mismatched entries observable for caller-owned cleanup.
+
 ## Platform boundary and non-goals
 
 The accepted v1 adoption floor is a controlled local ext4/tmpfs filesystem on
@@ -250,7 +314,7 @@ The adoption fixture records its controlled filesystem environment before
 testing; an unqualified environment is excluded by the consumer gate, not
 silently classified by `std.fs`.
 
-There is no transaction, journal, recovery daemon, process-global lock,
+Request 14/18/55 add no transaction, journal, recovery daemon, process-global lock,
 temporary-name generator, public directory-handle capability, sandbox,
 replacement or exchange operation, or durability guarantee. Request 14's path-only operations keep
 ordinary parent resolution; Request 18's two retained-root constructors supply only the explicit
@@ -258,6 +322,10 @@ no-symlink regular-file boundary described above.
 
 Request 55 adds no metadata surface or persistent immutability promise. `open_beneath` remains
 unchanged for callers that intentionally permit hard links.
+
+Request 56 adds no environment-sensitive temp-root selection, caller root, directory handle,
+recursive creation/removal, hidden cleanup, exit hook, quarantine registry, or same-identity hostile
+process defense. General directory creation, listing, and type predicates remain Request 53.
 
 ## Implementation and acceptance boundary
 
@@ -297,3 +365,8 @@ Request 55 follows that established boundary with one distinct reader operation 
 the same A12 lowering, and a descriptor-only link-count predicate over the existing stat record.
 Its complete contract and implementation closure matrix are in
 [`34-fs-single-link-plan.md`](../34-fs-single-link-plan.md).
+
+Request 56 adds one A08 owned-string constructor and one A04 unit-result remover, each with distinct
+HIR/MIR/runtime identities and complete checked-HIR/whole/per-unit/export coverage. Its exact prefix,
+platform-root, randomness, allocation-before-mutation, no-follow removal, race boundary, and
+ownership matrix are in [`36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md).

@@ -1209,6 +1209,21 @@ metadata or asking the caller to inspect and reopen a pathname would split the p
 capability. The check is point-in-time, not an inode lease: later external linking or mutation stays
 outside the constructor's promise.
 
+Private native loading needs a path even after verification has correctly produced a reader. The
+staging root is therefore created by the narrow `fs.create_private_temp_dir` constructor, not by a
+caller-selected path, environment-sensitive generic temporary helper, native-library shim, or
+general directory API. The returned owned absolute string is deliberately compatible with the
+existing retained-root file constructors and pathname-only native registries. Random exclusive
+claim plus `0700` makes uniqueness and cross-user privacy one visible operation.
+
+Cleanup remains explicit through `fs.remove_empty_dir`: callers remove only the children they own,
+then request one non-recursive empty-directory removal. Retained parent/final descriptors close
+ancestor and pre-removal identity races, but POSIX Linux/macOS removal still names a directory
+entry rather than an open descriptor. The final `AT_REMOVEDIR` syscall is therefore the namespace
+linearization point, and the contract does not invent stronger descriptor-bound deletion against a
+hostile same-identity process. A new directory-handle type or hidden process registry would add
+ownership/global-state machinery without strengthening the supported G1 threat boundary.
+
 ---
 
 ## The package philosophy

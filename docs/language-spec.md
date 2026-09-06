@@ -1103,7 +1103,7 @@ require the buffer argument to be a bare local declared with `mut`; temporaries 
 are rejected before the operation is formed.
 
 `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`create_exclusive`/`rename_no_replace`/`open_beneath`/`open_beneath_single_link`/`create_exclusive_beneath`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
+`create_exclusive`/`rename_no_replace`/`open_beneath`/`open_beneath_single_link`/`create_exclusive_beneath`/`create_private_temp_dir`/`remove_empty_dir`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
 (the `file` constructors — `O_RDWR` fresh or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
 arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
 without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy).
@@ -1139,6 +1139,17 @@ opened-descriptor `fstat` record to accept exactly `st_nlink == 1`; every other 
 `Error.Invalid`. It adds no second syscall, returns the same reader, and exposes no metadata. The
 ordinary constructor keeps accepting hard-linked regular files, and neither operation prevents
 link-count or byte mutation after return.
+`fs.create_private_temp_dir(prefix: str) -> Result<string, Error>` accepts an exact 1..=64-byte
+ASCII alphanumeric/underscore/hyphen prefix (the first byte is alphanumeric), selects `/tmp` on
+Linux or `_CS_DARWIN_USER_TEMP_DIR` on macOS without environment input, and atomically creates a
+`0700`-or-narrower directory named by the prefix plus 128 random bits. It returns the owned absolute
+path, never reuses an occupant, and bounds collision retries at 128. Output allocation precedes
+filesystem mutation. `fs.remove_empty_dir(path: str) -> Result<(), Error>` accepts only an absolute
+strict path, retains and revalidates every ancestor and the final no-follow directory, and removes
+only the empty directory selected by one descriptor-relative `AT_REMOVEDIR` call. It does not
+recurse or remove a symlink/file/special entry. That syscall is the final namespace linearization
+point; the path-only API does not claim descriptor-bound deletion against a hostile process with
+the same OS identity.
 `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus

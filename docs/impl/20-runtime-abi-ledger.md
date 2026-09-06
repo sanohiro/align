@@ -815,6 +815,23 @@ whole/per-unit declaration, and rt-LTO inventory. It is part of the 356 keyed / 
 recorded above. The
 authoritative contract is `docs/impl/34-fs-single-link-plan.md`.
 
+## Request 56 private temporary-directory lifecycle (designed)
+
+Request 56 reserves two keyed records on existing ABI shapes. They activate only with the complete
+HIR/MIR/runtime implementation and do not change a shape or optional probe:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `FsCreatePrivateTempDir` | `align_rt_fs_create_private_temp_dir` | A08: `i32 @SYM(ptr, i64, ptr)` |
+| `FsRemoveEmptyDir` | `align_rt_fs_remove_empty_dir` | A04: `i32 @SYM(ptr, i64)` |
+
+The constructor keeps the existing owned-string output-slot convention: validate and zero the slot,
+allocate the exact absolute-path result before filesystem mutation, and publish it only after one
+successful `mkdirat`. Removal borrows one absolute strict path and returns only status. Activation
+moves the current 356 keyed / 374 base / 385 maximum-probe inventory to 358 / 376 / 387. Exact
+prefix/root/randomness semantics, removal race boundary, and closure matrix are authoritative in
+`docs/impl/36-fs-private-temp-plan.md`.
+
 ## Request 13 recursive owned JSON replacement (design accepted)
 
 Request 13 added no runtime key, symbol, LLVM function shape, C signature, or
