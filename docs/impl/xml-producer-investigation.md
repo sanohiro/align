@@ -1,10 +1,11 @@
 # XML producer validation: investigate, then repair
 
 Status: RESOLVED implementation investigation, recorded 2026-09-05 and closed
-2026-09-06 at the owner's request. This is an implementation issue register,
-not a new language contract. It records the complete finding set, classification,
-repair boundary, and owner evidence in one place rather than as isolated review
-rounds.
+2026-09-06 at the owner's request, then reopened and reclosed when the v0.7.0
+release archive exercised the complete shipped-package corpus. This is an
+implementation issue register, not a new language contract. It records the
+complete finding set, classification, repair boundary, and owner evidence in
+one place rather than as isolated review rounds.
 
 ## Scope and current evidence
 
@@ -35,6 +36,8 @@ redesign; this register does not claim those earlier fixes can be removed safely
 | X4 | Source regression plus type-class malformed-MIR gaps. | Numeric equations cover the source-admitted scalar and vector arithmetic, vector/scalar broadcasts, comparisons, lane masks, vector selection, scalar unary operators, and exact widths. Scalar-left arithmetic was rejected as an invalid fixture because sema does not admit it under the vector expectation; the validator was not widened to manufacture a new language rule. |
 | X5 | Malformed-MIR contract gap. | `MaybeAbsent` becomes present only with the exact discriminator guard. Statically inactive guarded payloads remain absent. Option, Result, enum, and optional-reader joins have positive and guard-removal/wrong-predicate mutations. |
 | X6 | Malformed-MIR allocation-safety gap. | Every caller-owned buffer passed to the direct group, dictionary, gather, and lookup runtime writers authenticates its `HeapAllocBuf` count against that writer's exact row, column, or explicit write bound. One parameterized mutation owner replaces each sibling allocation count with a smaller valid `i64`, for both whole-program and per-unit validation. |
+| X7 | Source regression exposed by the release package corpus. | The validator now recognizes the settled one-way `http_request_ctx` to `http_headers` zero-cost view retype used by `ctx.headers()`. The reverse direction remains rejected, so a detached view cannot mint an owning request handle. |
+| X8 | Source regression from a previously unconfirmed lowered shape. | Lifted-lambda capture roots become their exact trailing ABI parameter roots when HIR lowers the direct callable body. Closure construction reverses that representation using its checked capture inventory, preserving the existing environment-relative function-value contract. `pkg.web.group` and `group_with` own the source-reachable direct-call shape; malformed out-of-range roots still fail in whole-program and per-unit validation. |
 
 ## Consolidated DB and performance result
 
@@ -60,11 +63,10 @@ dormant producer/consumer chain and duplicate the same certification proof,
 preflight, and DB boundary verification. Keeping one coherent repair has less
 integration risk.
 
-Two observations remain explicitly unconfirmed and outside this repair:
+One observation remains explicitly unconfirmed and outside this repair:
 
 - whether forged unsigned scalar negation or Bool-conditioned vector selection
-  can be reached from source-admitted MIR; and
-- whether a legitimate lowered direct program call can carry capture roots.
+  can be reached from source-admitted MIR.
 
 No production surface is widened for either observation. If source reachability
 is later demonstrated, reopen this record as one follow-up investigation rather
@@ -82,10 +84,12 @@ align_driver std_xml: 14 passed
 pkg_db_q4b full_matrix_parity_is_exact_on_both_drivers: passed in 102.52s
 ```
 
-The exact committed SHA still requires the changed-slice review, full local DB
-verification, and `scripts/pre-pr.sh`. Merge and versioned release remain the
-terminal workflow; this record does not authorize another feature or consumer
-repository work.
+The release follow-up additionally passes the direct lifted-capture mutation
+owner, the one-way HTTP header-view owner, and the exact `pkg.web` prebuilt-cache
+corpus that failed on all three v0.7.0 release platforms. Its exact committed
+SHA still requires the changed-slice review and `scripts/pre-pr.sh`. Merge and
+the v0.7.1 patch release remain the terminal workflow; this record does not
+authorize another feature or consumer repository work.
 
 ## Evidence locations and focused commands
 
@@ -101,6 +105,7 @@ Focused commands:
 scripts/cargo.sh test -p align_codegen_llvm --lib producer_
 scripts/cargo.sh test -p align_driver --test std_xml producer_certification_
 scripts/cargo.sh test -p align_driver --test std_xml xml_parse_rejects_invalid_documents_without_partial_reader_publication -- --exact
+scripts/build-prebuilt-cache.sh target/release/alignc target/release/prebuilt-cache
 ```
 
 The required final DB gate uses `DOCKER_HOST=unix:///var/run/docker.sock` on this

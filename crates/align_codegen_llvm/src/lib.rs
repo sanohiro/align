@@ -3551,12 +3551,26 @@ fn build_module<'c>(
             .modes
             .get(..explicit)
             .ok_or_else(|| callable_target_error(lifted))?;
+        let explicit_u32 =
+            u32::try_from(explicit).map_err(|_| callable_target_error(lifted))?;
+        let capture_count = u32::try_from(capture_tys.len())
+            .map_err(|_| callable_target_error(lifted))?;
         let explicit_signature = ProgramSignature {
             params: explicit_params.to_vec(),
             modes: explicit_modes.to_vec(),
             ret: declaration.signature.ret,
-            borrow: declaration.signature.borrow.clone(),
-            region: declaration.signature.region.clone(),
+            borrow: xml_closure_borrow_summary(
+                &declaration.signature.borrow,
+                explicit_u32,
+                capture_count,
+            )
+            .ok_or_else(|| callable_target_error(lifted))?,
+            region: xml_closure_region_summary(
+                &declaration.signature.region,
+                explicit_u32,
+                capture_count,
+            )
+            .ok_or_else(|| callable_target_error(lifted))?,
             cleanup: declaration.signature.cleanup,
         };
         let id = GeneratedId::Closure {
@@ -4488,6 +4502,66 @@ fn xml_signature_matches_facts(
         && signature.return_cleanup == facts.cleanup
 }
 
+fn xml_closure_borrow_summary(
+    summary: &hir::ReturnBorrowSummary,
+    explicit: u32,
+    capture_count: u32,
+) -> Option<hir::ReturnBorrowSummary> {
+    match summary {
+        hir::ReturnBorrowSummary::None => Some(hir::ReturnBorrowSummary::None),
+        hir::ReturnBorrowSummary::Roots { params, captures } if captures.is_empty() => {
+            let mut direct = Vec::new();
+            let mut captured = Vec::new();
+            for root in params {
+                if *root < explicit {
+                    direct.push(*root);
+                } else {
+                    let capture = root.checked_sub(explicit)?;
+                    if capture >= capture_count {
+                        return None;
+                    }
+                    captured.push(capture);
+                }
+            }
+            Some(hir::ReturnBorrowSummary::Roots {
+                params: direct,
+                captures: captured,
+            })
+        }
+        hir::ReturnBorrowSummary::Roots { .. } => None,
+    }
+}
+
+fn xml_closure_region_summary(
+    summary: &hir::ReturnRegionSummary,
+    explicit: u32,
+    capture_count: u32,
+) -> Option<hir::ReturnRegionSummary> {
+    match summary {
+        hir::ReturnRegionSummary::None => Some(hir::ReturnRegionSummary::None),
+        hir::ReturnRegionSummary::Roots { params, captures } if captures.is_empty() => {
+            let mut direct = Vec::new();
+            let mut captured = Vec::new();
+            for root in params {
+                if *root < explicit {
+                    direct.push(*root);
+                } else {
+                    let capture = root.checked_sub(explicit)?;
+                    if capture >= capture_count {
+                        return None;
+                    }
+                    captured.push(capture);
+                }
+            }
+            Some(hir::ReturnRegionSummary::Roots {
+                params: direct,
+                captures: captured,
+            })
+        }
+        hir::ReturnRegionSummary::Roots { .. } => None,
+    }
+}
+
 struct XmlCallResult<'a> {
     result: ValueId,
     result_ty: Ty,
@@ -4583,6 +4657,10 @@ fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
         (Ty::String, Ty::Str) => true,
         (Ty::String | Ty::Str, Ty::Slice(element)) => element == bytes,
         (Ty::DynArray(actual), Ty::Slice(expected)) => actual == expected,
+        // `ctx.headers()` is the request-context pointer retyped as a detached,
+        // non-owning header-table view. MIR deliberately represents that zero-cost
+        // conversion as `Use`, just like the owned collection-to-view cases above.
+        (Ty::HttpRequestCtx, Ty::HttpHeaders) => true,
         (
             Ty::DynStructArray(actual, Layout::Aos),
             Ty::Slice(Scalar::Struct(expected)),
@@ -7762,14 +7840,29 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .iter()
                     .map(|slot| target.slots.get(*slot as usize).copied())
                     .collect::<Option<Vec<_>>>();
-                let facts = explicit_params.map(|params| XmlCallFacts {
-                    params,
-                    modes: explicit_modes.to_vec(),
-                    ret: target.ret,
-                    borrow: target.return_borrow.clone(),
-                    region: target.return_region.clone(),
-                    cleanup: target.return_cleanup,
-                });
+                let explicit = u32::try_from(explicit).ok();
+                let capture_count = u32::try_from(capture_tys.len()).ok();
+                let facts = explicit_params
+                    .zip(explicit)
+                    .zip(capture_count)
+                    .and_then(|((params, explicit), capture_count)| {
+                        Some(XmlCallFacts {
+                            params,
+                            modes: explicit_modes.to_vec(),
+                            ret: target.ret,
+                            borrow: xml_closure_borrow_summary(
+                                &target.return_borrow,
+                                explicit,
+                                capture_count,
+                            )?,
+                            region: xml_closure_region_summary(
+                                &target.return_region,
+                                explicit,
+                                capture_count,
+                            )?,
+                            cleanup: target.return_cleanup,
+                        })
+                    });
                 let captures_match = captures.len() == capture_tys.len()
                     && target_capture_tys.as_ref() == Some(&capture_tys)
                     && captures.iter().zip(&capture_tys).all(|(operand, expected)| {
@@ -12438,6 +12531,22 @@ fn validate_tagged_program_inner(
                             .param_modes
                             .get(..explicit)
                             .ok_or_else(|| callable_target_error(lifted))?;
+                        let explicit_u32 = u32::try_from(explicit)
+                            .map_err(|_| callable_target_error(lifted))?;
+                        let capture_count = u32::try_from(capture_tys.len())
+                            .map_err(|_| callable_target_error(lifted))?;
+                        let target_borrow = xml_closure_borrow_summary(
+                            &target.return_borrow,
+                            explicit_u32,
+                            capture_count,
+                        )
+                        .ok_or_else(|| callable_target_error(lifted))?;
+                        let target_region = xml_closure_region_summary(
+                            &target.return_region,
+                            explicit_u32,
+                            capture_count,
+                        )
+                        .ok_or_else(|| callable_target_error(lifted))?;
                         let capture_modes =
                             target.param_modes.get(explicit..).ok_or_else(|| callable_target_error(lifted))?;
                         if capture_modes
@@ -12494,8 +12603,8 @@ fn validate_tagged_program_inner(
                             &mut type_graph,
                         )?;
                         if signature.param_modes != target_modes
-                            || signature.return_borrow != target.return_borrow
-                            || signature.return_region != target.return_region
+                            || signature.return_borrow != target_borrow
+                            || signature.return_region != target_region
                             || signature.return_cleanup != target.return_cleanup
                         {
                             return Err(callable_target_error(lifted));
@@ -14016,13 +14125,29 @@ fn callable_preflight(
                             .modes
                             .get(explicit..)
                             .ok_or_else(|| callable_target_error(lifted))?;
+                        let explicit_u32 = u32::try_from(explicit)
+                            .map_err(|_| callable_target_error(lifted))?;
+                        let capture_count = u32::try_from(capture_tys.len())
+                            .map_err(|_| callable_target_error(lifted))?;
+                        let closure_borrow = xml_closure_borrow_summary(
+                            &declaration.signature.borrow,
+                            explicit_u32,
+                            capture_count,
+                        )
+                        .ok_or_else(|| callable_target_error(lifted))?;
+                        let closure_region = xml_closure_region_summary(
+                            &declaration.signature.region,
+                            explicit_u32,
+                            capture_count,
+                        )
+                        .ok_or_else(|| callable_target_error(lifted))?;
                         if captured_params != capture_tys
                             || captured_modes
                                 .iter()
                                 .any(|mode| *mode != align_ast::ParamMode::ByValue)
                             || signature.param_modes != explicit_modes
-                            || signature.return_borrow != declaration.signature.borrow
-                            || signature.return_region != declaration.signature.region
+                            || signature.return_borrow != closure_borrow
+                            || signature.return_region != closure_region
                             || signature.return_cleanup != declaration.signature.cleanup
                             || captures
                                 .iter()
@@ -14035,8 +14160,8 @@ fn callable_preflight(
                             params: explicit_params.to_vec(),
                             modes: explicit_modes.to_vec(),
                             ret: declaration.signature.ret,
-                            borrow: declaration.signature.borrow.clone(),
-                            region: declaration.signature.region.clone(),
+                            borrow: closure_borrow,
+                            region: closure_region,
                             cleanup: declaration.signature.cleanup,
                         };
                         generated.push(GeneratedId::Closure {
@@ -24763,12 +24888,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .modes
                     .get(..explicit)
                     .ok_or_else(|| callable_target_error(lifted))?;
+                let explicit_u32 =
+                    u32::try_from(explicit).map_err(|_| callable_target_error(lifted))?;
+                let capture_count = u32::try_from(capture_tys.len())
+                    .map_err(|_| callable_target_error(lifted))?;
                 let explicit_signature = ProgramSignature {
                     params: explicit_params.to_vec(),
                     modes: explicit_modes.to_vec(),
                     ret: declaration.signature.ret,
-                    borrow: declaration.signature.borrow.clone(),
-                    region: declaration.signature.region.clone(),
+                    borrow: xml_closure_borrow_summary(
+                        &declaration.signature.borrow,
+                        explicit_u32,
+                        capture_count,
+                    )
+                    .ok_or_else(|| callable_target_error(lifted))?,
+                    region: xml_closure_region_summary(
+                        &declaration.signature.region,
+                        explicit_u32,
+                        capture_count,
+                    )
+                    .ok_or_else(|| callable_target_error(lifted))?,
                     cleanup: declaration.signature.cleanup,
                 };
                 let id = GeneratedId::Closure {
@@ -34189,6 +34328,8 @@ fn main() -> i32 = 0
         assert!(validated.is_ok(), "captured callable producer roots: {validated:?}");
         let partition = validate_thin_partition_program(&base, &[]);
         assert!(partition.is_ok(), "per-unit captured callable roots: {partition:?}");
+        emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None)
+            .unwrap_or_else(|error| panic!("captured callable roots must lower: {error}"));
 
         let captured = xml_test_function(&base, "captured");
         let mutate_closure = |program: &mut Program, mutation: u8| {
@@ -34258,6 +34399,71 @@ fn main() -> i32 = 0
             forge_capture_index(&mut function.return_borrow, &mut function.return_region);
         }
         assert_xml_producer_rejected(&forged, "capture root beyond the validated environment");
+    }
+
+    #[test]
+    fn producer_direct_lifted_capture_roots_follow_trailing_abi_parameters() {
+        let base = mir(
+            r#"Item { value: str }
+fn prefixed(prefix: str, values: slice<Item>) -> array<Item> =
+  values.map(fn value { Item { value: prefix } }).to_array()
+fn main() -> i32 = 0
+"#,
+        );
+        let result = validate_mir_producers(&base);
+        assert!(result.is_ok(), "direct lifted capture root: {result:?}");
+        let result = validate_thin_partition_program(&base, &[]);
+        assert!(result.is_ok(), "per-unit direct lifted capture root: {result:?}");
+        emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None)
+            .unwrap_or_else(|error| panic!("direct lifted capture root must lower: {error}"));
+
+        let lifted = base
+            .fns
+            .iter()
+            .position(|function| function.name.as_str().contains("$lambda"))
+            .expect("mapped lambda must be lifted");
+        assert_eq!(
+            base.fns[lifted].return_borrow,
+            hir::ReturnBorrowSummary::Roots {
+                params: vec![1],
+                captures: vec![],
+            },
+            "the capture becomes the lifted function's trailing direct-ABI parameter"
+        );
+        assert_eq!(
+            base.fns[lifted].return_region,
+            hir::ReturnRegionSummary::Roots {
+                params: vec![1],
+                captures: vec![],
+            },
+            "the capture region becomes the lifted function's trailing direct-ABI parameter"
+        );
+
+        let mut malformed = base;
+        malformed.fns[lifted].return_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![u32::MAX],
+            captures: vec![],
+        };
+        malformed.fns[lifted].return_region = hir::ReturnRegionSummary::Roots {
+            params: vec![u32::MAX],
+            captures: vec![],
+        };
+        assert_xml_producer_rejected(
+            &malformed,
+            "direct lifted capture root beyond the trailing ABI parameters",
+        );
+    }
+
+    #[test]
+    fn producer_http_headers_retype_is_one_way() {
+        assert!(xml_ty_is_view_retype(
+            Ty::HttpRequestCtx,
+            Ty::HttpHeaders
+        ));
+        assert!(
+            !xml_ty_is_view_retype(Ty::HttpHeaders, Ty::HttpRequestCtx),
+            "a detached header view cannot mint an owning request context"
+        );
     }
 
     fn xml_test_function(program: &Program, name: &str) -> usize {
