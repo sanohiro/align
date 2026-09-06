@@ -113,3 +113,47 @@ The required final DB gate uses `DOCKER_HOST=unix:///var/run/docker.sock` on thi
 host and `scripts/db-verify-local.sh`. The failed discovery run is preserved in
 the evidence directory. Respect the existing thirty-minute run and fifteen-minute
 binary budgets rather than increasing them.
+
+## v0.7.2 owned `Result` loop-join regression
+
+Status: candidate implemented. This is a post-release correction inside
+the existing MIR producer-certification contract; it does not widen the Align
+language, JSON surface, interface ABI, or XML surface.
+
+Align v0.7.2 rejects an owned `string` moved through a loop-updated local into a
+record field and then into `Result.Ok`. The whole-program native build and the
+per-unit interface producer must accept the same source graph. Certification
+must still reject any reaching borrowed, mixed, unresolved, or malformed
+producer for that selected leaf.
+
+Implementation closure matrix:
+
+| Cell | Required closure | Owner |
+|---|---|---|
+| Formation and initial ownership | A recursively owned JSON manifest forms successfully; the selected local starts from an owned empty-string clone. | `producer_owned_result_loop_join.align` plus the driver regression owner |
+| Loop and branch joins | Zero or more loop replacements from owned clones preserve `Owned`; every reaching replacement is included, and an invalid reaching store still poisons the selected leaf. | Source regression plus the existing malformed producer mutation owners |
+| Record construction and move-in | Moving the local into `VerifiedBundle.backend_sha256` preserves the exact fourth-field path and does not certify sibling fields in its place. | MIR-shape assertion and whole-program native execution |
+| Result construction and return | `ResultOk -> StructField(3)` reaches the owned producer and retains the existing dynamic cleanup companion; the moved source is nulled and dropped exactly once. | Whole-program native execution and the existing returned-cleanup owners |
+| Interface publication | The exact source is accepted by both whole-program build and per-unit build/interface reconstruction. | One differential driver owner running both paths |
+| Negative closure | Borrowed strings, mixed/unknown joins, duplicate definitions, malformed selected paths, and detached cleanup remain rejected. | Existing `align_codegen_llvm` `producer_*` invalid fixtures; extend the selected-path mutation owner only if the fix creates a new bypass shape |
+
+The author-side matrix pass must trace every selected-path dependency added by
+the repair and confirm that no validation-only sibling edge can manufacture
+ownership. The reduced fixture must fail against v0.7.2 with the reported
+`[ResultOk, StructField(3)]` diagnostic so a passing test distinguishes the
+repair from a non-exercising fixture.
+
+The defect was the pointer-based AoS field equation: source lowering exposes an
+owned `string` field only as a borrowed `str`, while certification required the
+result type to equal the stored field type. The repair admits that one-way view,
+follows provenance using the stored `String` path, and rejects a forged
+`IndexFieldPtr` that tries to mint a new owned `String`. The sibling fixed-array,
+slice, SoA-column, and whole-element equations either already own their exact
+conversion or cannot carry this source shape.
+
+The published v0.7.2 compiler rejects the reduced fixture in both native build
+and per-unit checking with the exact reported path. The candidate compiler
+accepts `check`, `check-per-unit`, and native build/run; the zero-replacement and
+replacement executions both complete. All 13 `align_codegen_llvm` `producer_`
+owners and all three `align_driver` `std_xml` `producer_certification_` owners
+pass, including the new reverse owner-minting mutation.

@@ -1,0 +1,46 @@
+import core.json
+
+BackendPlugin {
+  kind: string,
+  sha256: string,
+}
+
+Manifest {
+  plugins: array<BackendPlugin>,
+}
+
+VerifiedBundle {
+  marker_a: i64,
+  marker_b: i64,
+  marker_c: i64,
+  backend_sha256: string,
+}
+
+fn verify(data: str) -> Result<VerifiedBundle, Error> {
+  manifest: Manifest := json.decode(data)?
+  mut digest := "".clone()
+  mut index := 0
+  loop {
+    if index >= manifest.plugins.len() { break }
+    if manifest.plugins[index].kind == "gpu" {
+      digest = manifest.plugins[index].sha256.clone()
+    }
+    index = index + 1
+  }
+  return Ok(VerifiedBundle {
+    marker_a: 1,
+    marker_b: 2,
+    marker_c: 3,
+    backend_sha256: digest,
+  })
+}
+
+fn main() -> i32 {
+  bundle := verify("{\"plugins\":[{\"kind\":\"gpu\",\"sha256\":\"manifest-digest\"}]}") else { return 1 }
+  print(bundle.backend_sha256)
+  empty := verify("{\"plugins\":[]}") else { return 2 }
+  print("[")
+  print(empty.backend_sha256)
+  print("]")
+  return 0
+}

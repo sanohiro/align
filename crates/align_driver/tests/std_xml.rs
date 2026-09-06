@@ -5,6 +5,50 @@ mod common;
 use common::*;
 
 #[test]
+fn producer_certification_accepts_owned_result_record_after_loop_join() {
+    if !backend_available() {
+        return;
+    }
+    let source = fixture(
+        "crates/align_driver/tests/fixtures/producer_owned_result_loop_join.align",
+    );
+    let files = &[("main.align", source)];
+    let mir = whole_mir_multi("producer-owned-result-loop-mir", files, "main.align");
+    assert!(
+        mir.contains("fn verify")
+            && mir.contains("str_clone")
+            && mir.contains("].1 (struct#0)")
+            && mir.contains("return_with_cleanup"),
+        "the fixture must retain the indexed owned-field view, clone, loop, and Result cleanup graph"
+    );
+
+    let whole = build_and_run_multi("producer-owned-result-loop-whole", files, "main.align");
+    assert_eq!(
+        whole.status.code(),
+        Some(0),
+        "whole-program stderr:\n{}",
+        String::from_utf8_lossy(&whole.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&whole.stdout),
+        "manifest-digest\n[\n\n]\n"
+    );
+    let per_unit =
+        build_per_unit_multi("producer-owned-result-loop-per-unit", files, "main.align")
+            .link_and_run();
+    assert_eq!(
+        per_unit.status.code(),
+        Some(0),
+        "per-unit stderr:\n{}",
+        String::from_utf8_lossy(&per_unit.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&per_unit.stdout),
+        "manifest-digest\n[\n\n]\n"
+    );
+}
+
+#[test]
 fn producer_certification_preserves_non_xml_container_interfaces() {
     if !backend_available() {
         return;
