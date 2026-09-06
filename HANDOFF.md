@@ -11,8 +11,8 @@ neither is a source of current status.
 investigate-then-repair record instead of further piecemeal fix rounds. Read
 [`docs/impl/xml-producer-investigation.md`](docs/impl/xml-producer-investigation.md)
 for the complete classification, coherent repair, explicit non-findings, and
-owner evidence. The remaining workflow is PR verification, merge, and versioned
-release; stop after that release.
+owner evidence. The implementation and repair are merged in PR #944. The
+v0.7.0 publication is the only remaining work; stop after that release.
 
 **Next after `std.xml` (owner-selected 2026-09-05):** finish its PR and stop new
 library work. If its owner proceeds with the intended release, complete that
@@ -25,7 +25,7 @@ owns the sequence: baseline qualification -> S0A/S0B exact design and observatio
 reassessment. `std.time` named formatters, cloud packages, and additional
 transports are paused during this phase. S1–S6 are not a mandatory backlog.
 
-_Last updated: 2026-09-05._ `core.test` is implemented against the accepted
+_Last updated: 2026-09-06._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in
 PR #915. align-llm Request 22's borrowed string-array indexing design is merged in PR #913, and its
 implementation merged in PR #916. Its retained-temporary repair merged in PR #920, completing the
@@ -381,12 +381,10 @@ facts must live in this repository.
 
 ## Current baseline
 
-- **Release:** v0.6.0 is the release checkpoint through the shipped AOT REPL,
-  in-language test runner, bounded data/protocol library wave (`core.codec`,
-  `pkg.frame`, and `pkg.auth`), and the post-v0.5.0 compiler and distribution
-  work. `RELEASE_NOTES_0.6.0.md` is the release record. `pkg.kv` was implemented after that
-  checkpoint; its shared timeout and generic TCP-writer/SIGPIPE prerequisites, package source, and
-  checked-timeout row are active together.
+- **Release:** v0.7.0 is the release checkpoint for the bounded `pkg.kv`,
+  `pkg.csv`, `pkg.ws`, `pkg.template`, and `std.xml` capability wave and the
+  post-v0.6.0 learning workflow. `RELEASE_NOTES_0.7.0.md` is the release
+  record.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
