@@ -6677,14 +6677,37 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     XmlAccessPathSegment::StructField(field),
                 ];
                 source_path.extend(path);
+                let Some(source_selected) =
+                    xml_selected_ty(self.graph.program, base_ty, &source_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
                 let i64_ty = Ty::Int(IntTy {
                     bits: 64,
                     signed: true,
                 });
-                if result_ty != field_ty
+                // Source indexing may read a Copy field as itself or borrow an owned `string`
+                // field as `str`; it can never load a recursively Move field as a new owner.
+                let result_matches = if field_ty == Ty::String {
+                    result_ty == Ty::Str
+                } else {
+                    result_ty == field_ty
+                        && !align_sema::ty_is_move(
+                            field_ty,
+                            &self.graph.program.structs,
+                            &self.graph.program.tuples,
+                            &self.graph.program.enums,
+                            &self.graph.program.tagged_types,
+                        )
+                };
+                if !result_matches
                     || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
-                    || xml_selected_ty(self.graph.program, base_ty, &source_path)
-                        != Some(selected_ty)
+                    || (!xml_ty_matches_tagged_body(
+                        self.graph.program,
+                        source_selected,
+                        selected_ty,
+                    ) && !xml_ty_is_view_retype(source_selected, selected_ty))
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
                     equation.invalid = true;
@@ -6694,7 +6717,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 self.add_operand(
                     &mut equation,
                     &base,
-                    selected_ty,
+                    source_selected,
                     source_path,
                 );
             }
@@ -34453,6 +34476,50 @@ fn main() -> i32 = 0
         assert_xml_producer_rejected(
             &malformed,
             "direct lifted capture root beyond the trailing ABI parameters",
+        );
+    }
+
+    #[test]
+    fn producer_owned_aos_string_field_is_a_one_way_view() {
+        let base = mir(
+            r#"import core.json
+Item { name: string }
+Envelope { items: array<Item> }
+fn selected(data: str) -> Result<string, Error> {
+  envelope: Envelope := json.decode(data)?
+  return Ok(envelope.items[0].name.clone())
+}
+fn main() -> i32 = 0
+"#,
+        );
+        let result = validate_mir_producers(&base);
+        assert!(result.is_ok(), "owned AoS string view: {result:?}");
+        let result = validate_thin_partition_program(&base, &[]);
+        assert!(result.is_ok(), "per-unit owned AoS string view: {result:?}");
+
+        let mut forged = base;
+        let mut changed = false;
+        for function in &mut forged.fns {
+            for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                let Stmt::Let(value, Rvalue::IndexFieldPtr { .. }) = statement else {
+                    continue;
+                };
+                let Some(result_ty) = function.value_tys.get_mut(*value as usize) else {
+                    panic!("IndexFieldPtr result value is absent");
+                };
+                assert_eq!(
+                    *result_ty,
+                    Ty::Str,
+                    "source lowering must expose the owned field only as a borrowed view"
+                );
+                *result_ty = Ty::String;
+                changed = true;
+            }
+        }
+        assert!(changed, "missing owned AoS string-field projection");
+        assert_xml_producer_rejected(
+            &forged,
+            "IndexFieldPtr cannot mint an owned string from borrowed array storage",
         );
     }
 
