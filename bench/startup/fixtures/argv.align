@@ -1,0 +1,6 @@
+fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() == 3 && args[1] == "alpha" && args[2] == "β" {
+    return Ok(())
+  }
+  return Err(error(73))
+}

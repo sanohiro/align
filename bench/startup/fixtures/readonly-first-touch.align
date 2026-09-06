@@ -1,0 +1,8 @@
+TABLE := [3, 1, 4, 1, 5, 9, 2, 6]
+
+fn main(args: array<str>) -> Result<(), Error> {
+  if TABLE[args.len()] == 4 {
+    return Ok(())
+  }
+  return Err(error(73))
+}

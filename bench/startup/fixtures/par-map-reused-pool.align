@@ -1,0 +1,18 @@
+fn add_one(x: i64) -> i64 = x + 1
+
+fn main() -> i32 {
+  mut builder: array_builder<i64> := array_builder()
+  mut i := 0
+  loop {
+    builder.push(i)
+    i = i + 1
+    if i >= 65537 { break }
+  }
+  xs := builder.build()
+  first := xs.par_map(add_one)
+  second := first.par_map(add_one)
+  if second[0] == 2 && second[65536] == 65538 {
+    return 0
+  }
+  return 73
+}
