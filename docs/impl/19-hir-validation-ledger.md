@@ -1237,6 +1237,7 @@ merely because its `Ty` matches.
 | `FsReadFile` | `env[]; child[path]`; `path Str; result ERR(String); new owned string; Impure`. |
 | `ReaderStdin` | `env[]; child[]; result Reader; owned handle with borrowed fd; Pure construction`. |
 | `ReaderOpen` | `env[]; child[path]`; `path Str; result ERR(Reader); successful owned fd; Impure`. |
+| `ReaderOpenBeneathSingleLink` | `env[]; child[root,relative]`; `root Str, relative Str; result ERR(Reader); path views borrowed for the call, successful result owns the exact checked fd; Impure`. |
 | `WriterStd` | `env[fd,buffered]`: fd exactly 1 or 2. `child[]; result Writer; owned handle with borrowed fd; Pure construction`. |
 | `WriterCreate` | `env[]; child[path]`; `path Str; result ERR(Writer); successful owned fd; Impure`. |
 | `ReaderRead` | `env[]; child[reader,buffer]`; `ReaderPlace(reader), SourceMutLocal(Buffer,buffer); result ERR(i64); both borrowed, buffer mutated; Impure`. |

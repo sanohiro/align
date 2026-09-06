@@ -1442,6 +1442,13 @@ pub enum Rvalue {
         relative: Operand,
         out: Slot,
     },
+    /// `fs.open_beneath_single_link(root, relative)`: the retained-root regular-file open with an
+    /// additional exact-one-link requirement on the opened descriptor.
+    ReaderOpenBeneathSingleLink {
+        root: Operand,
+        relative: Operand,
+        out: Slot,
+    },
     /// `fs.create(path)`: create/truncate `path` for writing, writing the owned `writer` handle into
     /// `out`. Yields an `i32` errno-status (0 = ok).
     WriterCreate {
@@ -7219,6 +7226,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::ReaderOpenBeneath { root, relative } => {
                 lower_beneath_handle(b, root, relative, Ty::Reader, e.ty, |r, p, out| {
                     Rvalue::ReaderOpenBeneath {
+                        root: r,
+                        relative: p,
+                        out,
+                    }
+                })
+            }
+            hir::ExprKind::ReaderOpenBeneathSingleLink { root, relative } => {
+                lower_beneath_handle(b, root, relative, Ty::Reader, e.ty, |r, p, out| {
+                    Rvalue::ReaderOpenBeneathSingleLink {
                         root: r,
                         relative: p,
                         out,

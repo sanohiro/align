@@ -1134,6 +1134,13 @@ pub enum ExprKind {
         root: Box<Expr>,
         relative: Box<Expr>,
     },
+    /// `fs.open_beneath_single_link(root, relative)` — the same retained-root regular-file open,
+    /// additionally requiring the opened descriptor's link count to be exactly one. Both paths
+    /// are borrowed; the `ty` and reader ownership are identical to [`Self::ReaderOpenBeneath`].
+    ReaderOpenBeneathSingleLink {
+        root: Box<Expr>,
+        relative: Box<Expr>,
+    },
     /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over a standard-stream fd
     /// (`fd`: 1 = stdout, 2 = stderr), `buffered` selecting the O(buffer) accumulator ("one type,
     /// many constructors"). The `ty` is [`crate::Ty::Writer`] (an owned Move handle; its fd is

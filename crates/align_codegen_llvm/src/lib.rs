@@ -5064,6 +5064,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::FsReadFile { out, .. }
         | Rvalue::ReaderOpen { out, .. }
         | Rvalue::ReaderOpenBeneath { out, .. }
+        | Rvalue::ReaderOpenBeneathSingleLink { out, .. }
         | Rvalue::WriterCreate { out, .. }
         | Rvalue::WriterCreateExclusive { out, .. }
         | Rvalue::WriterCreateExclusiveBeneath { out, .. }
@@ -5182,6 +5183,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         Rvalue::JsonDocElems { doc, arena, .. } => vec![doc, arena],
         Rvalue::JsonScanNext { scanner, .. } => vec![scanner],
         Rvalue::ReaderOpenBeneath { root, relative, .. }
+        | Rvalue::ReaderOpenBeneathSingleLink { root, relative, .. }
         | Rvalue::WriterCreateExclusiveBeneath { root, relative, .. } => vec![root, relative],
         Rvalue::CodecEncoderNew { rows, .. } => vec![rows],
         Rvalue::FrameInnerJoin {
@@ -8925,6 +8927,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::JsonScanNext { .. }
             | Rvalue::ReaderOpen { .. }
             | Rvalue::ReaderOpenBeneath { .. }
+            | Rvalue::ReaderOpenBeneathSingleLink { .. }
             | Rvalue::WriterCreate { .. }
             | Rvalue::WriterCreateExclusive { .. }
             | Rvalue::WriterCreateExclusiveBeneath { .. }
@@ -22728,6 +22731,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 relative,
                 out,
             } => self.gen_beneath_handle(RuntimeKey::IoReaderOpenBeneath, root, relative, *out)?,
+            Rvalue::ReaderOpenBeneathSingleLink {
+                root,
+                relative,
+                out,
+            } => self.gen_beneath_handle(
+                RuntimeKey::IoReaderOpenBeneathSingleLink,
+                root,
+                relative,
+                *out,
+            )?,
             Rvalue::WriterCreate { path, out } => self.gen_open_handle(RuntimeKey::IoWriterCreate, path, *out)?,
             Rvalue::WriterCreateExclusive { path, out } => {
                 self.gen_open_handle(RuntimeKey::IoWriterCreateExclusive, path, *out)?

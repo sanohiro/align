@@ -11756,11 +11756,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // pkg.ws adds nine checked operation variants and pkg.template adds four; keep this count
-        // synchronized with the exhaustive validation, source-shape, replay-clone, and
-        // canonical-graph matches.
+        // Request 55 adds one retained-root reader operation; keep this count synchronized with
+        // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        322,
+        323,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -11876,6 +11875,18 @@ fn hir_body_validator_native() {
         "native_reader_open_beneath",
         body_test_expr(
             hir::ExprKind::ReaderOpenBeneath {
+                root: Box::new(native_str()),
+                relative: Box::new(native_str()),
+            },
+            native_result(Ty::Reader, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Reader, error)
+    );
+    add!(
+        "native_reader_open_beneath_single_link",
+        body_test_expr(
+            hir::ExprKind::ReaderOpenBeneathSingleLink {
                 root: Box::new(native_str()),
                 relative: Box::new(native_str()),
             },
@@ -14398,12 +14409,14 @@ fn hir_body_validator_native() {
 
     for name in [
         "native_reader_open_beneath",
+        "native_reader_open_beneath_single_link",
         "native_writer_create_exclusive_beneath",
     ] {
         let mut reject = program.clone();
         let expression = body_value_expression_mut(&mut reject, name);
         match &mut expression.kind {
             hir::ExprKind::ReaderOpenBeneath { root, .. }
+            | hir::ExprKind::ReaderOpenBeneathSingleLink { root, .. }
             | hir::ExprKind::CreateExclusiveBeneath { root, .. } => root.ty = Ty::Bool,
             _ => panic!("{name}: retained-root fixture lost its discriminator"),
         }
@@ -14416,6 +14429,7 @@ fn hir_body_validator_native() {
         let expression = body_value_expression_mut(&mut reject, name);
         match &mut expression.kind {
             hir::ExprKind::ReaderOpenBeneath { relative, .. }
+            | hir::ExprKind::ReaderOpenBeneathSingleLink { relative, .. }
             | hir::ExprKind::CreateExclusiveBeneath { relative, .. } => relative.ty = Ty::Bool,
             _ => panic!("{name}: retained-root fixture lost its discriminator"),
         }

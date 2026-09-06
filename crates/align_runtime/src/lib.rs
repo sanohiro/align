@@ -9090,6 +9090,7 @@ fn beneath_open_directory(parent: i32, name: *const libc::c_char) -> Result<Bene
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 enum BeneathOperation {
     OpenRegular,
+    OpenRegularSingleLink,
     CreateExclusive,
 }
 
@@ -9126,6 +9127,8 @@ enum BeneathTestCheckpoint {
     DirectoryObserved,
     DirectoryOpened,
     FinalObserved,
+    FinalOpened,
+    SingleLinkAccepted,
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -9155,7 +9158,11 @@ fn beneath_test_checkpoint(checkpoint: BeneathTestCheckpoint, name: *const libc:
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn beneath_open_regular(parent: i32, name: *const libc::c_char) -> Result<BeneathFd, i32> {
+fn beneath_open_regular(
+    parent: i32,
+    name: *const libc::c_char,
+    require_single_link: bool,
+) -> Result<BeneathFd, i32> {
     #[cfg(test)]
     if beneath_test_fail(BeneathTestFailpoint::FinalObserve) {
         return Err(AL_CODE + libc::EIO);
@@ -9182,6 +9189,8 @@ fn beneath_open_regular(parent: i32, name: *const libc::c_char) -> Result<Beneat
     }
     let fd = BeneathFd(fd);
     #[cfg(test)]
+    beneath_test_checkpoint(BeneathTestCheckpoint::FinalOpened, name);
+    #[cfg(test)]
     if beneath_test_fail(BeneathTestFailpoint::FinalRevalidate) {
         return Err(AL_CODE + libc::EIO);
     }
@@ -9207,6 +9216,13 @@ fn beneath_open_regular(parent: i32, name: *const libc::c_char) -> Result<Beneat
         if rc < 0 {
             return Err(io_error_to_status(&std::io::Error::last_os_error()));
         }
+    }
+    if require_single_link && opened.st_nlink != 1 {
+        return Err(AL_INVALID);
+    }
+    #[cfg(test)]
+    if require_single_link {
+        beneath_test_checkpoint(BeneathTestCheckpoint::SingleLinkAccepted, name);
     }
     Ok(fd)
 }
@@ -9260,7 +9276,10 @@ unsafe fn native_open_beneath(
     }
     let final_name = relative.component_ptr(relative.components.len() - 1);
     match operation {
-        BeneathOperation::OpenRegular => beneath_open_regular(parent.0, final_name),
+        BeneathOperation::OpenRegular => beneath_open_regular(parent.0, final_name, false),
+        BeneathOperation::OpenRegularSingleLink => {
+            beneath_open_regular(parent.0, final_name, true)
+        }
         BeneathOperation::CreateExclusive => beneath_create_exclusive(parent.0, final_name),
     }
 }
@@ -9790,6 +9809,32 @@ pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64,
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn publish_beneath_reader(
+    root_ptr: *const u8,
+    root_len: i64,
+    relative_ptr: *const u8,
+    relative_len: i64,
+    operation: BeneathOperation,
+    out: *mut *mut Reader,
+) -> i32 {
+    match unsafe {
+        native_open_beneath(
+            root_ptr,
+            root_len,
+            relative_ptr,
+            relative_len,
+            operation,
+        )
+    } {
+        Ok(fd) => {
+            unsafe { *out = Box::into_raw(Box::new(Reader::unbuffered(fd.into_raw(), true))) };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
 /// `fs.open_beneath(root, relative)` — open one regular file below a retained directory without
 /// following root, intermediate, or final symlinks. Complete lexical validation precedes every
 /// descriptor operation; the final descriptor is identity-revalidated before publication.
@@ -9811,20 +9856,54 @@ pub unsafe extern "C" fn align_rt_io_reader_open_beneath(
     unsafe { *out = core::ptr::null_mut() };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        match unsafe {
-            native_open_beneath(
+        unsafe {
+            publish_beneath_reader(
                 root_ptr,
                 root_len,
                 relative_ptr,
                 relative_len,
                 BeneathOperation::OpenRegular,
+                out,
             )
-        } {
-            Ok(fd) => {
-                unsafe { *out = Box::into_raw(Box::new(Reader::unbuffered(fd.into_raw(), true))) };
-                0
-            }
-            Err(status) => status,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root_ptr, root_len, relative_ptr, relative_len);
+        AL_INVALID
+    }
+}
+
+/// `fs.open_beneath_single_link(root, relative)` — the retained-root regular-file constructor,
+/// additionally requiring the opened descriptor's existing stat record to report exactly one
+/// hard link. The descriptor is never reopened and no metadata is published.
+///
+/// # Safety
+/// Positive non-null path views must describe readable immutable byte ranges. `out` must point to
+/// one writable reader slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_open_beneath_single_link(
+    root_ptr: *const u8,
+    root_len: i64,
+    relative_ptr: *const u8,
+    relative_len: i64,
+    out: *mut *mut Reader,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unsafe {
+            publish_beneath_reader(
+                root_ptr,
+                root_len,
+                relative_ptr,
+                relative_len,
+                BeneathOperation::OpenRegularSingleLink,
+                out,
+            )
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -26886,6 +26965,7 @@ mod tests {
         runtime.extend(function_symbols(include_str!("str_prims.rs")));
         runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
         runtime.extend(function_symbols(include_str!("csv.rs")));
+        runtime.extend(function_symbols(include_str!("xml.rs")));
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
@@ -26930,8 +27010,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 365);
-        assert_eq!(registry.len(), 365);
+        assert_eq!(runtime.len(), 374);
+        assert_eq!(registry.len(), 374);
         assert_eq!(runtime, registry);
     }
 
@@ -34716,6 +34796,21 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn beneath_single_link_reader(root: &str, relative: &str) -> (i32, *mut Reader) {
+        let mut out = core::ptr::dangling_mut::<Reader>();
+        let status = unsafe {
+            align_rt_io_reader_open_beneath_single_link(
+                root.as_ptr(),
+                root.len() as i64,
+                relative.as_ptr(),
+                relative.len() as i64,
+                &mut out,
+            )
+        };
+        (status, out)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn beneath_writer(root: &str, relative: &str) -> (i32, *mut Writer) {
         let mut out = core::ptr::dangling_mut::<Writer>();
         let status = unsafe {
@@ -35103,15 +35198,49 @@ mod tests {
             },
             AL_INVALID,
         );
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath_single_link(
+                    root_s.as_ptr(),
+                    root_s.len() as i64,
+                    b"nested/input".as_ptr(),
+                    12,
+                    core::ptr::null_mut(),
+                )
+            },
+            AL_INVALID,
+        );
         for bad_root in ["", "a/", "a//b", "a/./b", "a/../b", "//a"] {
-            let (status, out) = beneath_reader(bad_root, "nested/input");
-            assert_eq!(status, AL_INVALID, "root grammar: {bad_root:?}");
-            assert!(out.is_null());
+            for (constructor, open) in [
+                (
+                    "ordinary",
+                    beneath_reader as fn(&str, &str) -> (i32, *mut Reader),
+                ),
+                ("single-link", beneath_single_link_reader),
+            ] {
+                let (status, out) = open(bad_root, "nested/input");
+                assert_eq!(
+                    status, AL_INVALID,
+                    "{constructor} root grammar: {bad_root:?}"
+                );
+                assert!(out.is_null());
+            }
         }
         for bad_relative in ["", "/a", "a/", "a//b", "a/./b", "a/../b", ".", ".."] {
-            let (status, out) = beneath_reader(root_s, bad_relative);
-            assert_eq!(status, AL_INVALID, "relative grammar: {bad_relative:?}");
-            assert!(out.is_null());
+            for (constructor, open) in [
+                (
+                    "ordinary",
+                    beneath_reader as fn(&str, &str) -> (i32, *mut Reader),
+                ),
+                ("single-link", beneath_single_link_reader),
+            ] {
+                let (status, out) = open(root_s, bad_relative);
+                assert_eq!(
+                    status, AL_INVALID,
+                    "{constructor} relative grammar: {bad_relative:?}"
+                );
+                assert!(out.is_null());
+            }
         }
         let mut out = core::ptr::dangling_mut::<Reader>();
         assert_eq!(
@@ -35126,6 +35255,21 @@ mod tests {
             },
             AL_INVALID,
             "complete root grammar is rejected before the malformed relative view",
+        );
+        assert!(out.is_null());
+        out = core::ptr::dangling_mut::<Reader>();
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath_single_link(
+                    b"bad//root".as_ptr(),
+                    9,
+                    core::ptr::null(),
+                    1,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+            "single-link complete root grammar is rejected before the malformed relative view",
         );
         assert!(out.is_null());
         assert_eq!(
@@ -35172,11 +35316,24 @@ mod tests {
         let (status, reader) = beneath_reader(root_s, "nested/input");
         assert_eq!(status, 0);
         assert_eq!(read_beneath_reader(reader), b"retained input");
+        let (status, reader) = beneath_single_link_reader(root_s, "nested/input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"retained input");
         let slash_input = root.join("nested/input");
         let from_slash = slash_input.strip_prefix("/").unwrap().to_str().unwrap();
         let (status, reader) = beneath_reader("/", from_slash);
         assert_eq!(status, 0);
         assert_eq!(read_beneath_reader(reader), b"retained input");
+        let (status, reader) = beneath_single_link_reader("/", from_slash);
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"retained input");
+        std::fs::hard_link(root.join("nested/input"), root.join("nested/input-alias")).unwrap();
+        assert_eq!(
+            beneath_single_link_reader(root_s, "nested/input").0,
+            AL_INVALID
+        );
+        assert_eq!(beneath_single_link_reader("/", from_slash).0, AL_INVALID);
+        std::fs::remove_file(root.join("nested/input-alias")).unwrap();
 
         let cwd_name = format!("align-rt-beneath-cwd-{}", std::process::id());
         let cwd_root = std::env::current_dir().unwrap().join(&cwd_name);
@@ -35186,9 +35343,24 @@ mod tests {
         let (status, reader) = beneath_reader(".", &format!("{cwd_name}/input"));
         assert_eq!(status, 0);
         assert_eq!(read_beneath_reader(reader), b"cwd input");
+        let (status, reader) = beneath_single_link_reader(".", &format!("{cwd_name}/input"));
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"cwd input");
         let (status, reader) = beneath_reader(&cwd_name, "input");
         assert_eq!(status, 0);
         assert_eq!(read_beneath_reader(reader), b"cwd input");
+        let (status, reader) = beneath_single_link_reader(&cwd_name, "input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"cwd input");
+        std::fs::hard_link(cwd_root.join("input"), cwd_root.join("input-alias")).unwrap();
+        assert_eq!(
+            beneath_single_link_reader(".", &format!("{cwd_name}/input")).0,
+            AL_INVALID
+        );
+        assert_eq!(
+            beneath_single_link_reader(&cwd_name, "input").0,
+            AL_INVALID
+        );
         std::fs::remove_dir_all(&cwd_root).unwrap();
 
         // Caller storage remains byte-for-byte unchanged while private copies are NUL-delimited.
@@ -35216,6 +35388,10 @@ mod tests {
         // Missing is NotFound. Every no-follow type rejection is Invalid and never publishes a
         // special descriptor. Exclusive create sees every occupied final kind as native EEXIST.
         assert_eq!(beneath_reader(root_s, "nested/missing").0, AL_NOT_FOUND);
+        assert_eq!(
+            beneath_single_link_reader(root_s, "nested/missing").0,
+            AL_NOT_FOUND
+        );
         std::fs::create_dir(root.join("nested/directory")).unwrap();
         symlink("input", root.join("nested/link")).unwrap();
         symlink("missing-target", root.join("nested/dangling-link")).unwrap();
@@ -35234,6 +35410,9 @@ mod tests {
             let (status, rejected) = beneath_reader(root_s, relative);
             assert_eq!(status, AL_INVALID, "input type: {relative}");
             assert!(rejected.is_null());
+            let (status, rejected) = beneath_single_link_reader(root_s, relative);
+            assert_eq!(status, AL_INVALID, "single-link input type: {relative}");
+            assert!(rejected.is_null());
             let (status, rejected) = beneath_writer(root_s, relative);
             assert_eq!(
                 status,
@@ -35243,12 +35422,24 @@ mod tests {
             assert!(rejected.is_null());
         }
         assert_eq!(beneath_reader(root_s, "plain-parent/input").0, AL_INVALID);
+        assert_eq!(
+            beneath_single_link_reader(root_s, "plain-parent/input").0,
+            AL_INVALID
+        );
         assert_eq!(beneath_writer(root_s, "plain-parent/input").0, AL_INVALID);
         assert_eq!(beneath_reader(root_s, "missing/input").0, AL_NOT_FOUND);
+        assert_eq!(
+            beneath_single_link_reader(root_s, "missing/input").0,
+            AL_NOT_FOUND
+        );
         assert_eq!(beneath_writer(root_s, "missing/output").0, AL_NOT_FOUND);
         let missing_root = root.join("missing-root");
         assert_eq!(
             beneath_reader(missing_root.to_str().unwrap(), "input").0,
+            AL_NOT_FOUND
+        );
+        assert_eq!(
+            beneath_single_link_reader(missing_root.to_str().unwrap(), "input").0,
             AL_NOT_FOUND
         );
         if unsafe { libc::geteuid() } != 0 {
@@ -35258,13 +35449,34 @@ mod tests {
             std::fs::write(denied.join("input"), b"denied").unwrap();
             std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
             assert_eq!(beneath_reader(root_s, "denied/input").0, AL_DENIED);
+            assert_eq!(
+                beneath_single_link_reader(root_s, "denied/input").0,
+                AL_DENIED
+            );
             assert_eq!(beneath_writer(root_s, "denied/output").0, AL_DENIED);
             std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         symlink("nested", root.join("dir-link")).unwrap();
         assert_eq!(beneath_reader(root_s, "dir-link/input").0, AL_INVALID);
+        assert_eq!(
+            beneath_single_link_reader(root_s, "dir-link/input").0,
+            AL_INVALID
+        );
         assert_eq!(beneath_writer(root_s, "dir-link/output").0, AL_INVALID);
+        let root_link = tmp_path("beneath-contract-root-link");
+        let _ = std::fs::remove_file(&root_link);
+        symlink(&root, &root_link).unwrap();
+        assert_eq!(
+            beneath_reader(root_link.to_str().unwrap(), "nested/input").0,
+            AL_INVALID
+        );
+        assert_eq!(
+            beneath_single_link_reader(root_link.to_str().unwrap(), "nested/input").0,
+            AL_INVALID
+        );
+        std::fs::remove_file(&root_link).unwrap();
         assert_eq!(beneath_reader("/", "dev/null").0, AL_INVALID);
+        assert_eq!(beneath_single_link_reader("/", "dev/null").0, AL_INVALID);
         assert_eq!(beneath_writer("/", "dev/null").0, AL_CODE + libc::EEXIST);
 
         // Same-final open/create outcomes: absent observation loses with NotFound; an installed
@@ -35297,6 +35509,37 @@ mod tests {
         assert_eq!(beneath_reader(root_s, "nested/directory").0, AL_INVALID);
 
         drop(socket);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_single_link_rejects_every_alias_until_one_name_remains() {
+        let root = tmp_path("beneath-single-link-alias");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("input"), b"single-link bytes").unwrap();
+        let root_s = root.to_str().unwrap();
+
+        let (status, reader) = beneath_single_link_reader(root_s, "input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"single-link bytes");
+
+        std::fs::hard_link(root.join("input"), root.join("alias")).unwrap();
+        for relative in ["input", "alias"] {
+            let (status, reader) = beneath_reader(root_s, relative);
+            assert_eq!(status, 0, "ordinary constructor still permits {relative}");
+            assert_eq!(read_beneath_reader(reader), b"single-link bytes");
+
+            let (status, rejected) = beneath_single_link_reader(root_s, relative);
+            assert_eq!(status, AL_INVALID, "single-link constructor rejects {relative}");
+            assert!(rejected.is_null());
+        }
+
+        std::fs::remove_file(root.join("alias")).unwrap();
+        let (status, reader) = beneath_single_link_reader(root_s, "input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"single-link bytes");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -35410,6 +35653,63 @@ mod tests {
         assert_eq!(status, 0);
         assert_eq!(bytes.as_deref(), Some(b"retained bytes".as_slice()));
 
+        // The single-link predicate consumes the opened descriptor's stat record. Removing the
+        // last name after open therefore produces a deterministic zero-link rejection.
+        std::fs::write(root.join("zero-link"), b"unlinked bytes").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::FinalOpened, "zero-link");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_single_link_reader(&worker_root, "zero-link");
+            (status, reader.is_null())
+        });
+        gate.entered.wait();
+        std::fs::remove_file(root.join("zero-link")).unwrap();
+        gate.release.wait();
+        let (status, rejected) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, AL_INVALID);
+        assert!(rejected);
+
+        // Adding an alias after open but before descriptor stat deterministically observes two
+        // links and rejects without publishing a reader.
+        std::fs::write(root.join("many-links"), b"aliased bytes").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::FinalOpened, "many-links");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_single_link_reader(&worker_root, "many-links");
+            (status, reader.is_null())
+        });
+        gate.entered.wait();
+        std::fs::hard_link(root.join("many-links"), root.join("many-links-alias")).unwrap();
+        gate.release.wait();
+        let (status, rejected) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, AL_INVALID);
+        assert!(rejected);
+
+        // Replacing the public name after the predicate cannot redirect the returned reader: the
+        // reader owns the exact descriptor whose retained stat record reported one link.
+        std::fs::write(root.join("single-link-held"), b"checked inode").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::SingleLinkAccepted, "single-link-held");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_single_link_reader(&worker_root, "single-link-held");
+            let bytes = (status == 0).then(|| read_beneath_reader(reader));
+            (status, bytes)
+        });
+        gate.entered.wait();
+        std::fs::rename(
+            root.join("single-link-held"),
+            root.join("single-link-held-old"),
+        )
+        .unwrap();
+        std::fs::write(root.join("single-link-held"), b"replacement inode").unwrap();
+        gate.release.wait();
+        let (status, bytes) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, 0);
+        assert_eq!(bytes.as_deref(), Some(b"checked inode".as_slice()));
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -35491,19 +35791,28 @@ mod tests {
             BeneathTestFailpoint::NonblockGet,
             BeneathTestFailpoint::NonblockSet,
         ] {
-            *BENEATH_TEST_FAILPOINT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(failpoint);
-            let (status, rejected) = beneath_reader(root_s, "a/b/input");
-            *BENEATH_TEST_FAILPOINT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            assert_eq!(status, AL_CODE + libc::EIO);
-            assert!(rejected.is_null());
-            assert_eq!(
-                std::fs::read_dir("/proc/self/fd").unwrap().count(),
-                baseline
-            );
+            for (constructor, open) in [
+                (
+                    "ordinary",
+                    beneath_reader as fn(&str, &str) -> (i32, *mut Reader),
+                ),
+                ("single-link", beneath_single_link_reader),
+            ] {
+                *BENEATH_TEST_FAILPOINT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(failpoint);
+                let (status, rejected) = open(root_s, "a/b/input");
+                *BENEATH_TEST_FAILPOINT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                assert_eq!(status, AL_CODE + libc::EIO, "{constructor} failpoint");
+                assert!(rejected.is_null());
+                assert_eq!(
+                    std::fs::read_dir("/proc/self/fd").unwrap().count(),
+                    baseline,
+                    "{constructor} failpoint leaked a descriptor"
+                );
+            }
         }
         *BENEATH_TEST_FAILPOINT
             .lock()
@@ -35525,12 +35834,32 @@ mod tests {
             let (status, reader) = beneath_reader(root_s, "a/b/input");
             assert_eq!(status, 0);
             unsafe { align_rt_io_reader_free(reader) };
+            let (status, reader) = beneath_single_link_reader(root_s, "a/b/input");
+            assert_eq!(status, 0);
+            unsafe { align_rt_io_reader_free(reader) };
             let (status, rejected) = beneath_reader(root_s, "a/b/missing");
+            assert_eq!(status, AL_NOT_FOUND);
+            assert!(rejected.is_null());
+            let (status, rejected) = beneath_single_link_reader(root_s, "a/b/missing");
             assert_eq!(status, AL_NOT_FOUND);
             assert!(rejected.is_null());
             let (status, rejected) = beneath_reader(root_s, "a/missing/input");
             assert_eq!(status, AL_NOT_FOUND);
             assert!(rejected.is_null());
+            let (status, rejected) = beneath_single_link_reader(root_s, "a/missing/input");
+            assert_eq!(status, AL_NOT_FOUND);
+            assert!(rejected.is_null());
+        }
+        std::fs::hard_link(root.join("a/b/input"), root.join("a/b/input-alias")).unwrap();
+        for relative in ["a/b/input", "a/b/input-alias"] {
+            let (status, rejected) = beneath_single_link_reader(root_s, relative);
+            assert_eq!(status, AL_INVALID);
+            assert!(rejected.is_null());
+            assert_eq!(
+                std::fs::read_dir("/proc/self/fd").unwrap().count(),
+                baseline,
+                "link-count rejection leaked a descriptor"
+            );
         }
         assert_eq!(
             std::fs::read_dir("/proc/self/fd").unwrap().count(),

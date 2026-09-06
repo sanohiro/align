@@ -238,15 +238,20 @@ fn retained_root_open_and_create_round_trip() {
 import std.fs
 import std.io
 fn open_for<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath(root, relative)
+fn open_single_for<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath_single_link(root, relative)
 pub fn main(args: array<str>) -> Result<(), Error> {
   root_owned := args[1].clone()
   relative_owned := \"nested/input\".clone()
   r := open_for(root_owned, relative_owned, 1)?
   mut data := buffer(64)
   n := r.read(data)?
+  single := open_single_for(root_owned, relative_owned, true)?
+  mut single_data := buffer(64)
+  single_n := single.read(single_data)?
   w := fs.create_exclusive_beneath(root_owned, \"nested/output\")?
   w.write(data.bytes())?
   print(n)
+  print(single_n)
   print(root_owned.len())
   print(relative_owned.len())
   return Ok(())
@@ -261,7 +266,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        format!("16\n{}\n12\n", root.str().len())
+        format!("16\n16\n{}\n12\n", root.str().len())
     );
     assert_eq!(
         std::fs::read(root.path.join("nested/output")).unwrap(),
@@ -274,8 +279,17 @@ fn retained_root_formation_diagnostics_and_per_unit_generic_paths() {
     let no_import =
         "fn main() -> Result<(), Error> { r := fs.open_beneath(\".\", \"x\")? return Ok(()) }\n";
     assert!(check_errs("m9fs-beneath-no-import", no_import));
+    let no_import_single = "fn main() -> Result<(), Error> { r := fs.open_beneath_single_link(\".\", \"x\")? return Ok(()) }\n";
+    assert!(check_errs(
+        "m9fs-beneath-single-link-no-import",
+        no_import_single
+    ));
     for (name, call) in [
         ("open", "fs.open_beneath(\".\")"),
+        (
+            "open-single-link",
+            "fs.open_beneath_single_link(\".\", \"x\", true)",
+        ),
         (
             "create",
             "fs.create_exclusive_beneath(\".\", \"x\", \"extra\")",
@@ -293,9 +307,16 @@ fn retained_root_formation_diagnostics_and_per_unit_generic_paths() {
         2,
         "both operands are checked in source order:\n{diagnostics}"
     );
+    let single_both_bad = "import std.fs\nfn main() -> Result<(), Error> {\n  r := fs.open_beneath_single_link(1, true)?\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("m9fs-beneath-single-link-both-types", single_both_bad);
+    assert_eq!(
+        diagnostics.matches(" vs str").count(),
+        2,
+        "both single-link operands are checked in source order:\n{diagnostics}"
+    );
 
-    let helper = "module helper\nimport std.fs\npub fn open<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath(root, relative)\npub fn create<T>(root: str, relative: str, marker: T) -> Result<writer, Error> = fs.create_exclusive_beneath(root, relative)\n";
-    let main = "module main\nimport helper\nfn main() -> Result<(), Error> {\n  r := helper.open(\".\", \"input\", 1)?\n  w := helper.create(\".\", \"output\", true)?\n  return Ok(())\n}\n";
+    let helper = "module helper\nimport std.fs\npub fn open<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath(root, relative)\npub fn open_single<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath_single_link(root, relative)\npub fn create<T>(root: str, relative: str, marker: T) -> Result<writer, Error> = fs.create_exclusive_beneath(root, relative)\n";
+    let main = "module main\nimport helper\nfn main() -> Result<(), Error> {\n  r := helper.open(\".\", \"input\", 1)?\n  single := helper.open_single(\".\", \"input\", true)?\n  w := helper.create(\".\", \"output\", true)?\n  return Ok(())\n}\n";
     let per_unit = check_per_unit_multi(
         "m9fs-beneath-per-unit",
         &[("helper.align", helper), ("main.align", main)],
@@ -316,6 +337,7 @@ fn retained_root_mir_and_llvm_abi_are_distinct() {
 import std.fs
 fn main() -> Result<(), Error> {
   r := fs.open_beneath(\".\", \"input\")?
+  single := fs.open_beneath_single_link(\".\", \"input\")?
   w := fs.create_exclusive_beneath(\".\", \"output\")?
   return Ok(())
 }
@@ -331,11 +353,19 @@ fn main() -> Result<(), Error> {
     let rendered = align_mir::print::program_to_string(&mir);
     assert!(rendered.contains("fs_open_beneath("), "{rendered}");
     assert!(
+        rendered.contains("fs_open_beneath_single_link("),
+        "{rendered}"
+    );
+    assert!(
         rendered.contains("fs_create_exclusive_beneath("),
         "{rendered}"
     );
     let identity = align_mir::print::codegen_input_to_string(&mir);
     assert!(identity.contains("ReaderOpenBeneath"), "{identity}");
+    assert!(
+        identity.contains("ReaderOpenBeneathSingleLink"),
+        "{identity}"
+    );
     assert!(
         identity.contains("WriterCreateExclusiveBeneath"),
         "{identity}"
@@ -344,6 +374,7 @@ fn main() -> Result<(), Error> {
     let llvm = emit_llvm(source);
     for symbol in [
         "align_rt_io_reader_open_beneath",
+        "align_rt_io_reader_open_beneath_single_link",
         "align_rt_io_writer_create_exclusive_beneath",
     ] {
         let declaration = llvm

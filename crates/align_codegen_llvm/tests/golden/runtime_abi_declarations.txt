@@ -214,6 +214,7 @@ key|IoReaderBuffered|io_reader_buffered|declare ptr @align_rt_io_reader_buffered
 key|IoReaderFree|io_reader_free|declare void @align_rt_io_reader_free(ptr)
 key|IoReaderOpen|io_reader_open|declare i32 @align_rt_io_reader_open(ptr, i64, ptr)
 key|IoReaderOpenBeneath|io_reader_open_beneath|declare i32 @align_rt_io_reader_open_beneath(ptr, i64, ptr, i64, ptr)
+key|IoReaderOpenBeneathSingleLink|io_reader_open_beneath_single_link|declare i32 @align_rt_io_reader_open_beneath_single_link(ptr, i64, ptr, i64, ptr)
 key|IoReaderRead|io_reader_read|declare i64 @align_rt_io_reader_read(ptr, ptr)
 key|IoReaderReadLine|io_reader_read_line|declare i64 @align_rt_io_reader_read_line(ptr, ptr)
 key|IoReaderStdin|io_reader_stdin|declare ptr @align_rt_io_reader_stdin()

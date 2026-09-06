@@ -638,8 +638,8 @@ invalid stored input pointer. The runtime does not authenticate an arbitrary dan
 
 No new shape is used: A124 remains the next unreserved shape. All eight keys, symbols,
 declarations, definitions, exports, collision identities, fingerprint rows, count assertions, and
-their type/Drop consumers activate atomically. The exact active totals are 355 keyed, 373 base, 380
-with `alloc-count`, 377 with `par-map-probe`, 373 with `task-probe`, and 384 with every probe. The
+their type/Drop consumers activate atomically. The exact active totals are 356 keyed, 374 base, 381
+with `alloc-count`, 378 with `par-map-probe`, 374 with `task-probe`, and 385 with every probe. The
 grammar, status mapping, ownership, validation order, allocation contract, and closure matrix are
 authoritative in `std-design/xml.md`.
 
@@ -799,9 +799,9 @@ whole/per-unit declarations, and rt-LTO inventory update in the same capability.
 contract and closure matrix are in
 `docs/impl/29-fs-retained-root-plan.md` and `docs/impl/std-design/fs.md`.
 
-## Request 55 retained-root single-link open (design accepted)
+## Request 55 retained-root single-link open (implemented)
 
-Request 55 reserves one keyed record using existing ABI shape A12:
+Request 55 activates one keyed record using existing ABI shape A12:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
@@ -809,9 +809,10 @@ Request 55 reserves one keyed record using existing ABI shape A12:
 
 The row keeps the existing reader output-slot and two-path validation order. It reuses retained-root
 traversal and regular-file descriptor revalidation, then consumes that opened descriptor's existing
-stat record and publishes the existing reader only when `st_nlink == 1`. The key is not included in
-the active inventory counts until implementation lands atomically with the exact declaration
-golden, key/symbol bijection, native export, whole/per-unit declaration, and rt-LTO inventory. The
+stat record and publishes the existing reader only when `st_nlink == 1`. Implementation activated
+the key atomically with the exact declaration golden, key/symbol bijection, native export,
+whole/per-unit declaration, and rt-LTO inventory. It is part of the 356 keyed / 374 base inventory
+recorded above. The
 authoritative contract is `docs/impl/34-fs-single-link-plan.md`.
 
 ## Request 13 recursive owned JSON replacement (design accepted)
@@ -875,7 +876,7 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A08 | `i32 @SYM(ptr, i64, ptr)` | `align_rt_json_doc_as_str`, `align_rt_json_doc_as_i64`, `align_rt_json_doc_as_f64`, `align_rt_json_doc_as_bool`, `align_rt_fs_read_file`, `align_rt_fs_write_file_builder`, `align_rt_fs_read_dir`, `align_rt_dns_resolve`, `align_rt_io_reader_open`, `align_rt_bytes_as_str`, `align_rt_io_writer_create`, `align_rt_io_file_create`, `align_rt_io_file_open`, `align_rt_base64_decode`, `align_rt_base64url_decode`, `align_rt_hex_decode`, `align_rt_percent_decode`, `align_rt_form_decode`, `align_rt_compress_gzip_decompress`, `align_rt_compress_zstd_decompress`, `align_rt_http_parse`, `align_rt_regex_compile`, `align_rt_regex_captures_group`, `align_rt_env_get` |
 | A09 | `i32 @SYM(ptr, i64, ptr, i64)` | `align_rt_fs_write_file`, `align_rt_process_exec`, `align_rt_crypto_ct_equal`, `align_rt_env_set` |
 | A10 | `i32 @SYM(ptr, i64, ptr, i64, i64, i64, i64, i64, ptr)` | `align_rt_crypto_argon2id` |
-| A12 | `i32 @SYM(ptr, i64, ptr, i64, ptr)` | `align_rt_process_spawn`, `align_rt_io_reader_open_beneath`, `align_rt_io_writer_create_exclusive_beneath` |
+| A12 | `i32 @SYM(ptr, i64, ptr, i64, ptr)` | `align_rt_process_spawn`, `align_rt_io_reader_open_beneath`, `align_rt_io_reader_open_beneath_single_link`, `align_rt_io_writer_create_exclusive_beneath` |
 | A13 | `i32 @SYM(ptr, i64, ptr, i64, ptr, i64, i64, ptr)` | `align_rt_crypto_hkdf_sha256` |
 | A15 | `i32 @SYM(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr)` | `align_rt_crypto_aes_gcm_seal`, `align_rt_crypto_aes_gcm_open`, `align_rt_crypto_chacha20_poly1305_seal`, `align_rt_crypto_chacha20_poly1305_open` |
 | A16 | `i32 @SYM(ptr, i64, ptr, i64, ptr, ptr, ptr, i64, i64)` | `align_rt_json_decode_soa` |

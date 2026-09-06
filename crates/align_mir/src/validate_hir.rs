@@ -4520,6 +4520,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::ReaderOpenBeneath { .. }
+            | hir::ExprKind::ReaderOpenBeneathSingleLink { .. }
             | hir::ExprKind::WriterStd { .. }
             | hir::ExprKind::WriterCreate { .. }
             | hir::ExprKind::CreateExclusive { .. }
@@ -4899,6 +4900,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::ReaderOpenBeneath { .. }
+            | hir::ExprKind::ReaderOpenBeneathSingleLink { .. }
             | hir::ExprKind::WriterCreate { .. }
             | hir::ExprKind::CreateExclusive { .. }
             | hir::ExprKind::CreateExclusiveBeneath { .. }
@@ -8620,6 +8622,9 @@ impl<'a> BodyValidator<'a> {
                 (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
             }
             hir::ExprKind::ReaderOpenBeneath { root, relative } => (root.ty == Ty::Str
+                && relative.ty == Ty::Str)
+                .then(|| result(Ty::Reader, &[root, relative]))?,
+            hir::ExprKind::ReaderOpenBeneathSingleLink { root, relative } => (root.ty == Ty::Str
                 && relative.ty == Ty::Str)
                 .then(|| result(Ty::Reader, &[root, relative]))?,
             hir::ExprKind::WriterStd { fd, .. } => {

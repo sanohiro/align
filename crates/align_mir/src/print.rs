@@ -738,6 +738,17 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(relative)
             )
         }
+        Rvalue::ReaderOpenBeneathSingleLink {
+            root,
+            relative,
+            out,
+        } => {
+            format!(
+                "fs_open_beneath_single_link({}, {}, -> _{out})",
+                operand_str(root),
+                operand_str(relative)
+            )
+        }
         Rvalue::WriterCreate { path, out } => format!("fs_create({}, -> _{out})", operand_str(path)),
         Rvalue::WriterCreateExclusive { path, out } => format!("fs_create_exclusive({}, -> _{out})", operand_str(path)),
         Rvalue::WriterCreateExclusiveBeneath {
