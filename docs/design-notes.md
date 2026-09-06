@@ -1201,6 +1201,14 @@ revalidates object identity, and releases all temporary owners on failure. Nativ
 the one settled `Error` mapping, so the safety boundary does not invent a filesystem-specific error
 model.
 
+A caller that must also exclude hard-link aliases uses the separate
+`fs.open_beneath_single_link` constructor. That name makes the stronger policy visible at the call
+site while leaving ordinary `open_beneath` useful for intentional aliases. The runtime checks
+`st_nlink` only from the existing `fstat` of the descriptor it will transfer to the reader; exposing
+metadata or asking the caller to inspect and reopen a pathname would split the proof from the usable
+capability. The check is point-in-time, not an inode lease: later external linking or mutation stays
+outside the constructor's promise.
+
 ---
 
 ## The package philosophy

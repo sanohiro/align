@@ -1536,6 +1536,11 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
   existing reader/writer after descriptor-relative no-follow traversal and add no directory-handle
   or metadata surface. The Align implementation is complete and the C6d adoption owner is next;
   this remains a post-M9 consumer capability and does not reopen M9.
+- **Retained-root single-link open** — Request 55 adds the distinct
+  `fs.open_beneath_single_link` constructor under `docs/impl/34-fs-single-link-plan.md`. It reuses
+  the existing retained-root reader boundary and requires a descriptor-only `st_nlink == 1`
+  check without exposing metadata or changing `open_beneath`. This remains a post-M9 consumer
+  capability and does not reopen M9.
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 

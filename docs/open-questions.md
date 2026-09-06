@@ -3123,6 +3123,23 @@ real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` a
 `docs/impl/std-design/fs.md`. The independently reviewed design and the complete compiler/runtime
 capability are shipped; real-client adoption remains next and M9 remains closed.
 
+### Request 55 — retained-root single-link regular-file open (DESIGN ACCEPTED)
+
+`std.fs` adds the distinct
+`fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>` constructor. It
+preserves the complete `open_beneath` grammar, validation precedence, retained descriptor walk,
+regular-file/device/inode revalidation, ownership, cleanup, and error behavior. After that existing
+sequence, the existing `fstat` record for the same descriptor that will back the reader must report
+exactly `st_nlink == 1`; zero or more than one link is `Error.Invalid`. Failure publishes no reader
+or artifact byte.
+
+The operation returns the existing Move `reader` and exposes no descriptor, device, inode, mode,
+size, or link count. It does not reopen a path, enumerate aliases, prevent a later link or content
+mutation, or change `fs.open_beneath` for callers that permit hard links. One distinct HIR/MIR
+operation and A12 runtime key make the stronger policy part of compiler/cache identity. The exact
+contract and closure matrix are authoritative in `docs/impl/34-fs-single-link-plan.md`; this is a
+post-M9 consumer capability and does not reopen M9.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

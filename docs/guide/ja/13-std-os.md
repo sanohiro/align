@@ -58,6 +58,7 @@ fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
@@ -75,6 +76,12 @@ fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 親ディレクトリの作成、ロールバック、永続性、トランザクションも提供しません。同じファイルの
 読み書きを同期する仕組みもないため、作成と同時に開こうとすると、まだ存在しないと判定される
 場合も、書き込み中の新しい通常ファイルを開ける場合もあります。
+
+opened regular file の hard-link 名も正確に1つでなければならない場合は
+`open_beneath_single_link` を使います。同じ retained-root 検査の後、返す reader と同じ opened
+descriptor に対する既存の `fstat` 結果から `st_nlink == 1` を確認します。複数の hard link がある場合は
+`Error.Invalid` となり、余分な link を削除した後の呼び出しは成功します。metadata は公開せず、
+返却後に新しい hard link が作られたり内容が変更されたりすることまでは防ぎません。
 
 ## ゼロコピー読み込み: `read_file_view`
 

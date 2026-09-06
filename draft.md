@@ -3012,6 +3012,7 @@ fs.create(path: str) -> Result<writer, Error>
 fs.create_exclusive(path: str) -> Result<writer, Error>
 fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
@@ -3070,6 +3071,15 @@ rollback, durability, or multi-file transaction. A same-final open/create pair h
 exclusion or snapshot: open returns `NotFound` if it observes absence, or may acquire the newly
 created regular inode while the writer is still live. An immutable-input consumer must reject that
 overlap itself.
+
+`fs.open_beneath_single_link` is a distinct retained-root reader constructor for callers that must
+also reject hard-link aliases. It preserves `open_beneath`'s complete grammar, validation order,
+no-follow traversal, regular-file and device/inode revalidation, ownership, cleanup, and error
+mapping. Immediately before constructing the reader, it checks `st_nlink` from the existing `fstat`
+of that same opened descriptor and succeeds only when it is one; zero or more than one link is
+`Error.Invalid`. It returns the existing owned `reader`, reads no byte, and exposes no descriptor or metadata. The
+predicate certifies that opened inode at that observation point; it does not prevent a later link or
+content mutation. `fs.open_beneath` remains unchanged and continues to permit multiply linked files.
 
 Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 

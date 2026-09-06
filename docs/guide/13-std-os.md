@@ -60,6 +60,7 @@ provides two explicit constructors:
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
@@ -76,6 +77,13 @@ errors keep the fixed errno mapping. These operations do not change cwd, retain 
 return directory handles or canonical paths, create parents, or provide rollback, durability, or a
 transaction. They also add no same-final reader/writer synchronization: an open racing an exclusive
 create may see absence or acquire the new regular inode while its writer remains live.
+
+Use `open_beneath_single_link` when the opened regular file must also have exactly one hard-link
+name. It performs the same retained-root checks, then checks `st_nlink == 1` from the existing
+`fstat` record for the final opened descriptor before returning the same owned `reader`. A multiply
+linked file returns `Error.Invalid`; removing the extra link allows a later call to succeed. The
+operation exposes no metadata and does not prevent a new hard link or content mutation after it
+returns.
 
 ## Zero-copy reads: `read_file_view`
 

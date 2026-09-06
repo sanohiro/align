@@ -23,6 +23,12 @@ v0.7.2 distribution and its matching source checkout; it found no new
 correctness defect. Startup/resource observations remain unavailable for S0A,
 and current chunks representation decisions remain unavailable for S0B.
 
+The later align-llm `runtime_bundle.verify` graph exposed a v0.7.2 MIR producer-certification
+regression for an owned indexed string field crossing a loop join into an Ok record. Align PR #950
+fixes the one-way owned-string-to-`str` source view without allowing a borrowed view to mint
+ownership. Request 55's retained-root single-link reader is the current blocking capability; its
+contract and closure matrix are in `docs/impl/34-fs-single-link-plan.md`.
+
 ## Release-cycle timing handoff
 
 The 2026-09-06 release cycle spent **91m27s in sequential GitHub automation**
@@ -61,10 +67,9 @@ Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
-**Current next work (owner-resumed 2026-09-06):** `std.xml`, its versioned
-release, and V0 baseline qualification are complete. Author the exact S0A
-startup-observation design next, then the exact S0B current-decision observation
-design.
+**Current next work (owner-resumed 2026-09-06):** finish align-llm Request 55 and publish the fixed
+Align release, then resume the exact S0A startup-observation design followed by the exact S0B
+current-decision observation design.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
