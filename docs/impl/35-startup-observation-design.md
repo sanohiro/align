@@ -1,6 +1,6 @@
 # S0A startup observation design
 
-> **Status:** EXACT DESIGN ACCEPTED; implementation is next.
+> **Status:** IMPLEMENTED in PR #955.
 >
 > **Authority:** This document is the exact S0A slice ledger required by
 > [`31-execution-storage-startup-plan.md`](31-execution-storage-startup-plan.md).

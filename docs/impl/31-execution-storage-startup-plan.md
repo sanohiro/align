@@ -1,7 +1,8 @@
 # Execution, Storage, and Startup Optimization Plan
 
-> **Status:** UMBRELLA DESIGNED; S0A exact design is accepted and its
-> implementation is next. Later implementation slices remain unapproved.
+> **Status:** UMBRELLA DESIGNED; S0A is implemented in PR #955 and the exact
+> S0B extension is being authored in `09-explain-opt.md`. Later implementation
+> slices remain unapproved.
 >
 > **Queue position:** `HANDOFF.md` remains the live work queue.
 > `32-post-xml-consolidation-plan.md` records the owner's 2026-09-05 scheduling
@@ -346,7 +347,7 @@ their individual gates are met.
 
 ### S0A — Parent-measured startup baseline
 
-**Status:** EXACT DESIGN ACCEPTED; implementation is next. The
+**Status:** IMPLEMENTED in PR #955. The
 authoritative slice ledger is
 [`35-startup-observation-design.md`](35-startup-observation-design.md).
 
@@ -432,13 +433,14 @@ Reuse parent-process lifecycle rules from the REPL or test harness only after
 the owner proves compatible descriptor, process-group, timeout, and cleanup
 semantics. Do not share mutable global harness state.
 
-No S0A implementation begins until its exact slice ledger and lifecycle
-closure matrix are complete. A new process-lifecycle strategy receives an
-independent design review before implementation.
+S0A implementation was gated on its exact slice ledger and lifecycle closure
+matrix. A new process-lifecycle strategy still receives an independent design
+review before implementation.
 
 ### S0B — Current-decision observation
 
-**Status:** EXACT DESIGN NEXT AFTER S0A; implementation unapproved.
+**Status:** EXACT DESIGN IN PROGRESS in `09-explain-opt.md`; implementation
+unapproved.
 
 Instrument existing selectors at their actual decision points and collect
 only the facts they already use. Generated code must remain byte-for-byte
@@ -781,7 +783,8 @@ into a flaky timing gate.
    no language milestone and does not interrupt the XML owner's work.
 2. S0A and S0B are independently useful capabilities and may be promoted
    separately. Neither requires S1.
-3. S0B cannot begin until the exact `09-explain-opt.md` extension is reviewed.
+3. S0B implementation cannot begin until the exact `09-explain-opt.md`
+   extension is reviewed.
 4. S1 is the first structural candidate after current decisions are observable,
    but only for a still-materializing named consumer.
 5. S2 and S3 are independent. Schedule either only from its own evidence and

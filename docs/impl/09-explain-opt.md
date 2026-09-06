@@ -228,6 +228,368 @@ stay pure extensions. A test-only note: `common::build_and_run`'s post-lowering 
 its own frame (`emit_link_run`) so the deep MIR lowering it drives keeps its 2 MB-thread margin — a
 behaviour-preserving robustness fix that helps every deep-lowering test, not just explain-opt.
 
+## S0B extension: current compiler decisions
+
+> **Status:** EXACT DESIGN CANDIDATE. Implementation remains unapproved until
+> one independent review closes every P0--P3 finding in this extension.
+>
+> **Authority:** This section is the exact S0B public-output and implementation
+> ledger required by `31-execution-storage-startup-plan.md`. The earlier Slice
+> 3a/3b contract continues to own LLVM remarks and optimized-IR emission.
+
+### Scope and public-contract ledger
+
+S0B reports three existing decision families needed by the first bounded
+consolidation candidate. It observes the selector at the point that already
+makes the decision; it does not reconstruct a plan from emitted MIR, LLVM IR,
+runtime behavior, or optimization remarks.
+
+```text
+chunks representation
+  direct count / direct indexed subview / owned header materialization
+
+materializing-pipeline output storage
+  reuse one eligible source buffer / allocate the existing output storage
+
+explicit par_map execution form
+  range materialization / direct integer range reduction / sequential collector
+```
+
+Fusion, LLVM vectorization, runtime pool initialization, the range chosen for a
+particular execution, physical traffic, allocation counts, elapsed time,
+runtime-capability linking, region-frame packing, blocking domains, and future
+S1--S6 strategies are not S0B records. LLVM decisions retain the existing
+remark owner and rendering below the new current-plan lines.
+
+| Surface | Exact S0B contract | Owner and acceptance |
+|---|---|---|
+| CLI | The only command remains `alignc explain-opt <file> [--verbose|-v] [--target-cpu baseline|native|CPU]`; S0B adds no command, option, environment input, profile, or ambient discovery | Existing argument parsing and exit rules remain unchanged. No otherwise-ignored token acquires S0B meaning. |
+| Output | English UTF-8 text on stdout, with the exact prefix, ordering, and fixed reason sentences below; diagnostics remain on stderr | `align_driver::explain`; exact golden rows cover every admitted state/reason and multi-unit order. |
+| Record model | One ephemeral `PlanRecord` per admitted selector invocation, with exact enums and field-presence rules below | `align_mir` located lowering. No public language type, JSON, wire format, persistence, or reader is added. |
+| Semantics | Observation never changes evaluation, errors, ownership, cleanup, allocation mode, explicit parallel semantics, or the selector result | Existing chunks, donation, and `par_map` owners plus MIR/object identity controls. |
+| Source | A record refers to the user-written selector expression. No synthetic source location is invented | Located lowering and `SourceMap`; absent anchors use the exact suppressed/default and verbose rules below. |
+| Whole/per-unit | The CLI keeps its shipped bottom-up per-unit walk. An internal whole-program located route must normalize to the same records for bodies whose selector inputs are equally visible | `per_unit_surface` plus a new current-plan parity owner. Imported bodies remain opaque in the per-unit MIR and retain their existing conservative work hint. |
+| Cache and artifact identity | Plan records are located diagnostic data. They never enter HIR/MIR implementation hashes, interfaces, frontend/object/ThinLTO keys, object bytes, link inputs, or runtime capability discovery | Existing cache namespaces plus explicit empty-cache and generated-object identity owners. |
+| Runtime and ABI | No runtime key, symbol, signature, argument, result, ownership rule, or global state changes | Runtime ABI inventory stays byte-for-byte unchanged. S0B never reports which runtime branch actually executed. |
+| Allocation | The record vector and rendered text allocate only in `explain-opt`; ordinary lowering/build paths construct no record storage | Located-mode allocation owner and normal-build no-record assertion. No performance promise is made. |
+| Errors | Missed/rejected optimizations are report rows and keep exit 0. Compile, codegen, bad-argument, and internal malformed-record failures keep exit 1 and publish no partial stdout | Existing `run_explain_opt` buffering plus the validation rule below. |
+
+There is no persisted or exchanged format, so scalar-width, byte-order, tag,
+and decoder-golden rules do not apply. The internal Rust enums are exhaustive;
+unknown or incompatible variants fail report validation rather than selecting
+an optimistic strategy.
+
+### Exact record model
+
+Located MIR carries a private side table. Unlocated lowering always carries an
+empty table and does not allocate a backing buffer for it. The conceptual
+record is exact:
+
+```text
+PlanRecord {
+  function: ProgramCall
+  construct_ordinal: u32
+  kind: PlanKind
+  state: PlanState
+  strategy: PlanStrategy
+  reason: PlanReason
+  source: Option<PlanSource>
+}
+
+PlanSource {
+  file_id: u32
+  span_lo: u32
+  span_hi: u32
+  line: u32
+  column: u32
+}
+```
+
+`PlanKind` is exactly `Chunks | BufferDonation | ParMap`.
+`PlanState` is exactly
+`Selected | Rejected | RuntimeSelected | NotApplicable | Unavailable`.
+`PlanStrategy` and `PlanReason` contain only the rows admitted by the three
+tables below. Source availability is the orthogonal `Option<PlanSource>` field,
+not a fabricated selector verdict. The enums do not reserve future planner
+strategies.
+
+`function` is the canonical concrete MIR callable. Generic monomorphs therefore
+remain distinct, and an imported declaration with no body emits no record.
+`construct_ordinal` is one-based within that concrete function across all three
+kinds. After collection, records are stably sorted within each function by
+`(file_id, span_lo, span_hi, kind-rank, collection-index)`, where kind rank is
+`Chunks`, `BufferDonation`, `ParMap`; ordinals are then assigned in that order.
+Functions retain MIR function order and units retain the existing dependency-
+first walk. The collection index only breaks an otherwise identical internal
+tie and is never rendered or hashed.
+
+All rows for one concrete HIR body must resolve to that body's one source file;
+mixed `file_id` values within one function are malformed. Route-local numeric
+file IDs are not cross-route identity: parity resolves them through each
+route's `SourceMap` to the same canonical source path before comparison.
+
+The source span is the `chunks` expression, the materializing terminal
+(`to_array`, `scan`, or sequential `par_map`), or the `par_map` expression,
+respectively. `line` and `column` are one-based byte locations resolved by the
+same located-lowering table used for LLVM debug locations. `file_id`, raw span
+offsets are not printed. `function` renders as the canonical concrete callable
+spelling, and the filename is the existing per-unit debug basename. No record
+contains source text, estimated speedup, a runtime result, or LLVM prose.
+
+S0B accepts no new text input and does not change path admission or source-file
+decoding. It renders only a debug basename that the existing command has
+already admitted, using the lossy and escaping projection fixed below; no text
+crosses a new native or persisted boundary before validation or output.
+
+One lowering-owned site may first receive a general chunks-materialization
+reason and then a more specific immediate-consumer reason. The collector keeps
+exactly one `(HIR-site, kind)` record by a lowering-private site token that is
+discarded before `PlanRecord` publication, and replaces the general reason with
+the specific reason. Separate kinds at one expression are not duplicates: for
+example, a materialized `chunks` source and the `par_map` consuming it each
+produce their own record. LLVM remarks never suppress plan records, and plan
+records never suppress LLVM remarks.
+
+Before rendering, the driver validates every state/strategy/reason combination,
+one-based ordinal sequence, the single-source-per-function rule, and present
+source bounds. Any incompatible internal record returns exit 1, writes exactly
+`alignc: cannot explain current plan: malformed record\n` to stderr, and
+publishes no stdout. This is an internal compiler failure, not a source
+diagnostic.
+
+### Chunks representation selector
+
+Every accepted `ArrayChunks` HIR expression produces exactly one record. The
+existing direct-parent special cases remain the complete virtual set; every
+other use constructs the existing owned `array<slice<T>>` header array.
+
+| State | Strategy | Reason | Exact condition and rendered explanation |
+|---|---|---|---|
+| `Selected` | `virtual-count` | `direct-len` | Direct receiver of `len`: “the direct `len` consumer needs only the chunk count” |
+| `Selected` | `virtual-index` | `direct-index` | Direct receiver of one index: “the direct index consumer needs only one borrowed subview” |
+| `Selected` | `materialized-headers` | `parallel-consumer` | Immediate source of `par_map`, including direct `par_map(...).sum()`: “the current explicit-parallel consumer reads an owned header array” |
+| `Selected` | `materialized-headers` | `pipeline-consumer` | Immediate source of any other synchronous pipeline stage or terminal: “the current synchronous pipeline consumer reads an owned header array” |
+| `Selected` | `materialized-headers` | `stored-or-boundary` | Every remaining use, including binding, return, call argument, control-flow value, or aggregate storage: “the chunks value crosses a stored, returned, call, or control-flow boundary” |
+
+Consumer-reason precedence is the table order. `direct-len` and `direct-index`
+are recognized before descending into the child and therefore never emit a
+materialization row. For a materialized expression, `parallel-consumer`
+precedes `pipeline-consumer`, which precedes `stored-or-boundary`. This
+classification changes only the explanation; the existing direct-parent test
+continues to choose representation.
+
+### Materializing-pipeline donation selector
+
+Every call to the existing materializing collector produces exactly one
+donation record. The decision helper returns the state/strategy/reason tuple and
+the existing allocation branch consumes that same tuple; reporting cannot
+reimplement the predicate. Reasons are tested in this exact first-match order:
+
+| Precedence | State | Strategy | Reason | Exact condition and rendered explanation |
+|---:|---|---|---|---|
+| 1 | `NotApplicable` | `arena-output` | `arena-owned-output` | An arena is active: “the output is arena-owned, so source-buffer reuse does not apply” |
+| 2 | `NotApplicable` | `fresh-output` | `unsupported-source-or-stage-shape` | Zip, struct view, chunks headers, Move/nonuniform scalar, another non-donatable source representation, or a stage outside the current in-place-safe set: “this source or stage shape cannot reuse the source buffer” |
+| 3 | `Rejected` | `fresh-output` | `source-not-unique-dead` | No individually owned, unbound, provably dead heap temporary is available: “the source is not a unique dead heap temporary” |
+| 4 | `Rejected` | `fresh-output` | `layout-mismatch` | Source and result scalar size/alignment are not identical: “source and result element layouts are not identical” |
+| 5 | `Unavailable` | `fresh-output` | `measurement-disabled` | The existing exact value `ALIGN_BUFFER_DONATE=off` disabled the otherwise eligible choice: “the measurement override disabled an otherwise eligible reuse; this is not the default plan” |
+| 6 | `Selected` | `reuse-source-buffer` | `eligible-unique-source` | Every existing eligibility check passed: “a unique dead heap source with an identical layout is reused as the result buffer” |
+
+`scan` remains eligible because the accumulator is the terminal rather than a
+pipeline stage; its output index equals its input index. The decision helper
+matches every currently admitted source and stage class exhaustively. A new
+class cannot compile until this contract gains its fail-closed row and the
+selector consumes that row; it cannot inherit the selected case.
+
+When `ALIGN_BUFFER_DONATE=off` is present, stdout begins with this exact line
+before any unit header or record, even if the current program has no eligible
+donation site:
+
+```text
+current-plan measurement override: buffer donation is disabled; donation rows are not the default plan
+```
+
+Other values retain the shipped default and emit no banner. Located lowering
+already bypasses frontend/MIR memoization, and the existing cache owner keeps
+the object cache disabled for this measurement override. S0B adds no toggle and
+does not change that cache rule.
+
+### Explicit `par_map` form selector
+
+Every accepted `ArrayParMap` expression produces exactly one record. The record
+describes the compile-time form and, for a range kernel, says that the runtime
+still chooses within its existing bounded caller-only/shared-pool policy. It
+never claims that a pool was initialized, a threshold was crossed, or a
+particular range executed.
+
+| State | Strategy | Reason | Exact condition and rendered explanation |
+|---|---|---|---|
+| `RuntimeSelected` | `range-reduce` | `direct-integer-sum` | The existing direct, unstaged integer `par_map(...).sum()` specialization fires: “the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, and conservative work hint” |
+| `RuntimeSelected` | `range-materialize` | `supported-range-kernel` | The existing `par_map_parallelizable` predicate and input-element formation accept the source/stages: “the runtime chooses caller-only or shared-pool range materialization from the input length, element layouts, and conservative work hint” |
+| `Rejected` | `sequential-collect` | `unsupported-source-representation` | The source cannot form the range-kernel input element: “the source representation has no current range-kernel form, so the explicit operation uses the sequential collector” |
+| `Rejected` | `sequential-collect` | `unsupported-stage-or-value-shape` | Input formation succeeds but the shared parallelizable predicate rejects a stage/value shape: “a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector” |
+
+The direct-reduction condition is evaluated first and is exactly the existing
+outer empty-stage `sum`, empty-stage `par_map`, integer result, and supported
+direct input test. The ordinary materializing path then tests input formation
+before the shared `par_map_parallelizable` predicate solely to select one of the
+two rejection explanations; either refusal uses the existing sequential
+collector. The helper that supplies the record also supplies the
+lowering branch, so reporting cannot drift from generated MIR.
+
+The compiler-generated work hint remains the shipped `1 | 2 | 4` value and is
+not printed as a runtime outcome. A missing imported callable body continues to
+contribute the conservative value `1`; S0B adds no interface field or cross-unit
+summary. Whole/per-unit parity compares the selected form. A separate owner
+asserts that the per-unit MIR keeps the conservative imported-body hint and
+that no report field claims otherwise.
+
+Curly quotation marks in the three selector tables delimit the exact
+explanation text; the quotation marks themselves are not emitted.
+
+### Rendering and deterministic order
+
+An anchored record is one physical line with this exact prefix:
+
+```text
+<file>:<line>:<column>: current plan `<function>` #<ordinal> <kind>: <state> `<strategy>` — <explanation>
+```
+
+`<kind>` is `chunks`, `buffer-donation`, or `par-map`; `<state>` is lowercase
+`selected`, `rejected`, `runtime-selected`, `not-applicable`, or `unavailable`.
+The strategy spelling and explanation are the exact table cells above. The
+canonical function spelling is made only from validated source identifiers and
+compiler-owned ASCII separators, none of which can contain a backtick, newline,
+or carriage return. The filename uses the existing lossy-UTF-8 debug basename
+and additionally escapes backslash, LF, and CR as `\\`, `\n`, and `\r`,
+respectively, so one record stays one physical line; colons remain literal and
+the two trailing numeric fields disambiguate them. Ordinals are unsigned
+decimal without leading zeroes.
+
+For each unit the output order is below. Current-plan functions retain MIR
+function order; records within each function use ascending
+`construct_ordinal`.
+
+```text
+existing unit header, when the walk has more than one unit
+current-plan records in normalized order, with anchored rows and source-less
+  default aggregates or verbose details at their normalized positions
+existing LLVM missed/actionable records
+existing verbose LLVM passed/raw records, when requested
+existing LLVM success summary and bucket output
+```
+
+The global donation-override banner, when required, precedes the first unit
+header. Planner records are identical under default and `--verbose`; verbose
+does not change their anchored wording or order. A program with no admitted
+record and no donation override preserves the existing stdout byte-for-byte.
+
+Every admitted selector originates in user HIR and therefore normally has an
+anchor. If a malformed/future internal path supplies no valid source file,
+line, or column, the render projection withholds an invented location without
+changing the selector's state, strategy, or reason. Default output
+emits one exact aggregate line in the record's normalized position:
+
+```text
++ <N> current-plan record(s) without user source (see --verbose)
+```
+
+Consecutive source-less records are one aggregate; an anchored record ends the
+aggregate. Verbose output replaces each aggregate with one line per record:
+
+```text
+  [current plan `<function>` #<ordinal> <kind>] <state> `<strategy>` — source location is unavailable
+```
+
+The absent-anchor rule does not alter the selected MIR strategy. A missing
+source map never becomes line 0 in the default diagnostic voice.
+
+### Whole-program, generic, cache, and generated-code identity
+
+The CLI remains per-unit because that is the linked-build truth. Owner tests
+also lower the same checked bodies through whole-program located mode. After
+normalizing away unit headers and per-unit callable linkage and resolving each
+route-local file ID to its canonical source path, records with the same visible
+selector inputs must agree exactly on source, concrete function, ordinal, kind,
+state, strategy, and reason. An imported body is not a visible
+input to its dependent unit: its existing conservative parallel work hint is
+tested as an explicit per-unit unavailable fact, not replaced with the body
+visible only to whole-program lowering.
+
+Generic instances emit one row per concrete callable. Imported generic bodies
+instantiate in the consuming unit under the existing source/interface rules;
+their rows use that concrete function identity and the template's real source
+anchor. No record is serialized into an interface or replayed from checked HIR.
+Checked-HIR replay instead runs located lowering again from the validated HIR
+and source map; absent/mismatched source material fails the existing replay
+boundary before plan publication.
+
+`Program`'s private located side table is deliberately excluded from every
+canonical graph walk, implementation/interface hash, MIR text printer, runtime
+key inventory, capability scan, and LLVM lowering match. Clearing only that
+table from a located program must leave raw LLVM, optimized LLVM after
+normalizing LLVM's existing diagnostic metadata, and emitted object bytes
+identical. Running `explain-opt` before a normal build must neither create a
+frontend/object/ThinLTO cache entry nor change the later build's hit/miss
+counters or artifact digest. Comment/whitespace changes may move located rows
+but retain their existing exclusion from ordinary codegen identity.
+
+Normal lowering installs no collector in `BuilderCtx`, performs no selector-
+record construction, and leaves the side-table vector empty. The selector
+helpers return the same decision enum in both modes; located mode alone copies
+that already-made decision into the table. This keeps report collection from
+becoming a second selector and prevents a new source/type/MIR variant from
+falling through to an optimistic record.
+
+### Implementation closure matrix
+
+| Axis | Exact implementation closure | Owner evidence |
+|---|---|---|
+| Formation and validation | Exhaustive enums admit only the three kind tables; state/strategy/reason compatibility, ordinals, spans, and duplicates validate before rendering | Unit-level invalid-record matrix plus an enum/selector coverage tripwire. |
+| Construction | Chunks, donation, and `par_map` helpers return the decision consumed by their existing lowering branch; located mode records that same value | MIR structural positives/negatives for every table row. |
+| Move-in / move-out / source nulling | No Align value or ownership bit enters a record. Donation still transfers/nulls the existing source owner only on `reuse-source-buffer` | Existing `buffer_donate` MIR and execution differential, including bound and escaping results. |
+| Replacement and return | General chunks materialization may be replaced only by the same site's more-specific consumer reason; returning/storing chunks remains materialized | Direct/stored/call/return/control-flow chunks rows and existing lifetime owners. |
+| Drop and cleanup | Record vectors are ordinary compiler-owned Rust values; generated cleanup, runtime drops, and early-exit cleanup are unchanged | MIR/object identity plus existing chunks/donation/parallel cleanup tests. |
+| `if`, `match`, `else`, `?`, `map_err`, loops, early exits | A selector nested on every supported control path receives one row; path structure does not duplicate it or change its existing cleanup | Parameterized located fixture spanning branch/loop/result forms and matching generated MIR. |
+| Malformed/future input | Unknown representation/stage/value shapes select the exact fail-closed rejection/not-applicable row; incompatible internal records fail before stdout | Hand-constructed HIR/MIR boundary owners and invalid-record renderer tests. |
+| Generic monomorphization | Each concrete body has independent canonical function identity and stable ordinal; no template-only phantom row | Imported/local generic formation fixture, whole/per-unit normalized comparison. |
+| Interface serialization | No plan field enters format-9 interfaces; missing imported bodies retain work hint 1 without a new summary | Interface byte identity and per-unit imported-callback owner. |
+| Whole-program/per-unit | Same-visible-input rows agree; per-unit section order remains dependency-first; single-unit header remains absent | Extended `per_unit_surface` owner and direct normalized record comparison. |
+| Checked-HIR replay | Located plans are reconstructed only from validated checked HIR plus its current `SourceMap`; no side table is serialized or trusted on replay | Replay parity and mismatched-source rejection owners. |
+| Cache and ThinLTO | Located mode remains ephemeral, bypasses lowering memoization and persistent caches, and changes no action identity or counters | Empty-cache explain-then-build sequence plus existing cache namespace owners. |
+| Runtime ABI and ownership provenance | No runtime symbol or ABI row changes; records contain no pointer, owner, region, descriptor, or runtime observation | Runtime ABI inventory equality and no-new-key structural assertion. |
+| Allocation parity | Ordinary compilation has an empty, unallocated record buffer; the selected MIR allocation is identical with collection on/off | Normal/located MIR decision comparison and object-byte identity. |
+| Target/profile | Existing target CPU reaches LLVM remarks; current-plan rows are target-independent and `explain-opt` remains fixed at `default<O2>` | Baseline/native named-target output parity for plan rows; LLVM rows may differ honestly. |
+| Explanation, order, and source absence | Exact one-line grammar, reason precedence, ordinal order, override banner, duplicate rule, and absent-anchor aggregation | Golden default/verbose, repeat-run, multi-unit, collision, and source-less fixtures. |
+
+### Acceptance and proportional verification
+
+The implementation owner must, at minimum:
+
+1. Add one reduced fixture per selector table row and mutation-check that each
+   selector's generated MIR changes if its decision helper is inverted.
+2. Prove exact default/verbose bytes, repeat determinism, generic identities,
+   multi-unit order, single-unit header absence, absent-source handling, and no
+   partial stdout on malformed internal records.
+3. Compare whole-program and per-unit normalized records for all equal-input
+   rows, and separately prove conservative imported-body parallel work.
+4. Prove located collection on/off produces the same selected MIR and object,
+   and that explain-then-build leaves cache entries, counters, interface bytes,
+   runtime keys, and executable/object digests unchanged.
+5. Reuse `direct_chunks_consumers_are_semantically_equivalent`,
+   `donation_on_and_off_execute_identically`, the structural chunks/donation
+   owners, `par_map_pure_function`, `par_map_cold_start`, and the existing
+   `explain_opt`/`per_unit_surface` owners where they would fail for this slice.
+6. Run the normal code-tier preflight. There is no timing benchmark because S0B
+   makes no performance or resource-improvement claim.
+
+S0B changes a public reporting contract and spans `align_mir` plus the driver,
+but adds no language, library, runtime, FFI, ownership, or persisted-format
+surface. `draft.md`, `language-spec.md`, runtime ABI ledgers, and bilingual
+library designs therefore do not change. On implementation, the English and
+Japanese toolchain guides must both say that `explain-opt` reports compiler
+storage/execution choices as well as LLVM optimization remarks; examples need
+not enumerate this internal schema.
+
 ## Deferrals (recorded)
 
 - The C++ remark shim (structured `(pass, RemarkName, args)` keying) — revisit at the LLVM
