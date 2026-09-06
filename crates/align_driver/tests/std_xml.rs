@@ -49,6 +49,70 @@ fn producer_certification_accepts_owned_result_record_after_loop_join() {
 }
 
 #[test]
+fn producer_certification_terminates_for_borrowed_reader_loop() {
+    if !backend_available() {
+        return;
+    }
+    let source = fixture(
+        "crates/align_driver/tests/fixtures/producer_borrowed_reader_loop.align",
+    );
+    let files = &[("main.align", source)];
+    let mir = whole_mir_multi("producer-borrowed-reader-loop-mir", files, "main.align");
+    assert!(
+        mir.contains("fn read_append")
+            && mir.contains("fn load_scalars")
+            && mir.contains("file_pread")
+            && mir.contains("buffer_append")
+            && mir.contains("return_with_cleanup"),
+        "the fixture must retain borrowed file/index/block inputs, mutable buffer/counter calls, owned scalar projection, loop, and fallible return graph"
+    );
+
+    let whole = build_and_run_multi("producer-borrowed-reader-loop-whole", files, "main.align");
+    assert_eq!(
+        whole.status.code(),
+        Some(0),
+        "whole-program stderr:\n{}",
+        String::from_utf8_lossy(&whole.stderr)
+    );
+    let per_unit =
+        build_per_unit_multi("producer-borrowed-reader-loop-per-unit", files, "main.align")
+            .link_and_run();
+    assert_eq!(
+        per_unit.status.code(),
+        Some(0),
+        "per-unit stderr:\n{}",
+        String::from_utf8_lossy(&per_unit.stderr)
+    );
+
+    let invalid = r#"State { view: slice<i64> }
+fn store(borrow mut state: State, view: slice<i64>) { state.view = view }
+fn retain(borrow f: file, borrow mut state: State) -> Result<(), Error> {
+  mut tail := buffer(1)
+  f.pread(tail, 0)?
+  values := [1, 2, 3]
+  store(state, values[..])
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let diagnostics = check_diagnostics("producer-borrowed-reader-short-view", invalid);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "the borrowed-reader negative must retain the lifetime diagnostic:\n{diagnostics}"
+    );
+    let per_unit_diagnostics = build_per_unit_multi_diagnostics(
+        "producer-borrowed-reader-short-view-per-unit",
+        &[("main.align", invalid)],
+        "main.align",
+    );
+    assert!(
+        per_unit_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "the per-unit borrowed-reader negative must retain the lifetime diagnostic:\n{per_unit_diagnostics}"
+    );
+}
+
+#[test]
 fn producer_certification_preserves_non_xml_container_interfaces() {
     if !backend_available() {
         return;
