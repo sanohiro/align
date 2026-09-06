@@ -1,0 +1,9 @@
+fn main() -> i32 {
+  arena {
+    xs := [1, 2, 3, 4].to_array()
+    if xs.sum() == 10 {
+      return 0
+    }
+    return 73
+  }
+}

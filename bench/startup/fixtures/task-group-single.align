@@ -1,0 +1,10 @@
+fn main() -> i32 {
+  task_group {
+    task := spawn(fn { 21 + 21 })
+    wait()
+    if task.get() == 42 {
+      return 0
+    }
+    return 73
+  }
+}

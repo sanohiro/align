@@ -1,0 +1,18 @@
+[package]
+name = "align-startup-observer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep the evidence observer independent from the compiler workspace graph.
+[workspace]
+
+[dependencies]
+align_hash = { path = "../../crates/align_hash" }
+libc = "0.2"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
