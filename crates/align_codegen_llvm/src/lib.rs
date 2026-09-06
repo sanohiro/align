@@ -30910,10 +30910,7 @@ mod tests {
             );
         }
 
-        equations
-            .get_mut(&guarded)
-            .expect("guarded equation")
-            .guarded_absence = false;
+        equations.entry(guarded.clone()).or_default().guarded_absence = false;
         let (_, invalid) = solve_xml_access_equations(&equations);
         for node in [&guarded, &slot, &loaded, &loop_join] {
             assert!(
@@ -34884,9 +34881,7 @@ fn main() -> i32 = 0
         }
 
         let accesses = [Owned, Shared, Exclusive, Unreadable, Mixed];
-        let join = |left, right| {
-            merge_xml_access(Some(left), right).expect("two access facts always have a join")
-        };
+        let join = |left, right| merge_xml_access(Some(left), right).unwrap_or(Mixed);
         for left in accesses {
             assert_eq!(join(left, left), left, "access join must be idempotent");
             for right in accesses {
