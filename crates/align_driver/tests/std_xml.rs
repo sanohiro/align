@@ -100,6 +100,16 @@ fn main() -> i32 = 0
         diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
         "the borrowed-reader negative must retain the lifetime diagnostic:\n{diagnostics}"
     );
+    let per_unit_diagnostics = build_per_unit_multi_diagnostics(
+        "producer-borrowed-reader-short-view-per-unit",
+        &[("main.align", invalid)],
+        "main.align",
+    );
+    assert!(
+        per_unit_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "the per-unit borrowed-reader negative must retain the lifetime diagnostic:\n{per_unit_diagnostics}"
+    );
 }
 
 #[test]

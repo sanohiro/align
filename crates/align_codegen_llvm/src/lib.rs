@@ -30833,7 +30833,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_fixed_point_separates_guarded_absence_from_seeded_cycles() {
+    fn producer_fixed_point_preserves_guarded_absence_in_seeded_cycles() {
         let absent = XmlAccessNode::Value(0, Vec::new());
         let present = XmlAccessNode::Value(1, Vec::new());
         let joined = XmlAccessNode::Value(2, Vec::new());
