@@ -157,3 +157,64 @@ accepts `check`, `check-per-unit`, and native build/run; the zero-replacement an
 replacement executions both complete. All 13 `align_codegen_llvm` `producer_`
 owners and all three `align_driver` `std_xml` `producer_certification_` owners
 pass, including the new reverse owner-minting mutation.
+
+## Request 58 producer fixed-point termination
+
+Status: candidate implemented and locally verified. This is an implementation
+scaling correction inside the existing MIR producer-certification contract. It
+adds no language, library, MIR, interface, or runtime ABI surface.
+
+The unchanged align-llm client at `acfdd3b` checks successfully but its native
+build does not finish in 60 seconds. A local 75-second run remained at 100% CPU.
+Two debugger samples five seconds apart found the same 25-node producer graph for
+`alignpack_read$read_append`, the same selected return root, and a nonempty
+two-to-three-node worklist. A bounded diagnostic then recorded 100 updates of the
+same `Value(87)` node; its last ten transitions alternate exactly between
+`Present(Owned)` and `MaybeAbsent(Owned)`. This is a non-convergent fixed point,
+not growth in the number of functions or graph nodes.
+
+The repair separates facts that the old single state map conflated. First, a
+monotone fixed point computes only reachable present producers and their access
+capability. `Unknown` and `Mixed`, which both grant no capability, collapse to one
+canonical rejecting lattice element so the access join is commutative,
+associative, and idempotent. Second, with present reachability fixed, a monotone
+boolean fixed point computes reachable absence. An authenticated discriminator
+projects `present + absent` to present only after those raw facts have converged;
+an unguarded presence requirement marks any reaching absence invalid. Explicit,
+unresolved, capability, and validation-only failures then flow through the
+existing fail-closed invalidity closure. Caching remains limited to capable
+`Present` results after every phase completes.
+
+Implementation closure matrix:
+
+| Cell | Required closure | Owner |
+|---|---|---|
+| Finite convergence | Present access and absence each grow in a finite-height lattice. Seeded cyclic value/slot equations terminate after bounded monotone widenings; unseeded cycles terminate as invalid. | A reduced `align_codegen_llvm` equation owner reproduces the exact `Present`/`MaybeAbsent` alternation and the existing seeded/unseeded cycle owner remains green. |
+| Presence joins | Loop, `if`, `match`, `else`, and `?` joins retain every reachable raw present and absent alternative. Guard projection runs only after raw present convergence, so an exact discriminator may select present without feeding a transient narrowing back into the producer graph. | Existing guarded-absence positive and guard-removal/wrong-predicate mutations plus reduced guarded-input and loop-join regressions. |
+| Capability joins | Owned, shared, exclusive, unreadable, and the canonical no-capability element form an explicit conservative semilattice; only an all-owned reaching set certifies a returned owned leaf. | Exhaustive commutativity, associativity, and idempotence owner plus existing owned/shared selected-alternative and malformed producer owners. |
+| Construction, move, replacement, and return | Value construction, slot store/load, replacement, source nulling, Drop, record/sum construction, and returned cleanup keep their current equations and exactly-once ownership result. | Existing owned `Result` loop fixture, returned-cleanup owners, and the reduced borrowed-reader pipeline. |
+| Calls and control exits | Direct/imported/generic calls, branch joins, loop backedges, early `return`, `break`, `else`, `?`, and `map_err` cannot erase a reaching invalid or shorter-lived producer. | Whole-program/per-unit reduced pipeline plus a shorter-lived-view negative; existing call-contract and Request 37 long-function/loop-`match` owners. |
+| Validation separation and cache | Check-only edges still validate total typed states and poison dependent nodes; absent, conditional, unresolved, and invalid results are not cached or published as certified access. | Existing check-cycle, detached cleanup, malformed type/path, and cache-sensitive producer mutations. |
+| End-to-end bound | The exact published align-llm `runtime_qwen_load_smoke.align` build completes below the requested 60-second owner limit without bypassing producer validation. | Align-owned reduced fixture locally; align-llm runs `gmake gpu-qwen-load-smoke` on the shipped release and records the named Apple M1 measurement. |
+
+The author-side matrix pass must show that each raw phase is inflationary in its
+own finite lattice, that no guard projection participates in present propagation,
+that lattice height bounds updates per node independently of graph cycles, and
+that all acceptance decisions occur only after present, absence, and
+validation-only invalidity propagation complete.
+
+The pre-implementation adversarial review found two P1 strategy gaps and one P2
+evidence gap. The two-phase raw solver closes the non-monotone guarded-presence
+gap; canonicalizing the rejecting access element plus the exhaustive algebra
+owner closes the non-semilattice gap; the recorded 100-update alternating trace
+closes the evidence gap. No public contract or producer capability is widened.
+
+The candidate passes all 138 `align_codegen_llvm` library owners, all 16
+`align_driver` `std_xml` owners, and all 23 `resource_ownership` owners. The
+exact published align-llm source at `acfdd3b` reaches native linking in 15.52
+seconds with the compiler cache disabled instead of remaining in MIR resource
+validation. Its `gmake gpu-qwen-load-smoke` invocation also completes compiler
+validation and linking, then the generated program independently exits with
+`Error` code 2 inside the client-owned runtime plan path. Release verification
+therefore remains with align-llm after it updates `.align-revision`; the Align
+regression owner is the reduced whole-program/per-unit pipeline above.

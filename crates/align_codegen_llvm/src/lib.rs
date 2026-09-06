@@ -4176,7 +4176,6 @@ enum XmlAccessProvenance {
     Exclusive,
     Unreadable,
     Mixed,
-    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4223,73 +4222,40 @@ fn merge_xml_access(
     current: Option<XmlAccessProvenance>,
     next: XmlAccessProvenance,
 ) -> Option<XmlAccessProvenance> {
-    Some(match current {
-        None => next,
-        Some(current) if current == next => current,
-        Some(current @ (XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed)) => current,
-        Some(_) if matches!(next, XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed) => next,
-        Some(XmlAccessProvenance::Owned) => next,
-        Some(XmlAccessProvenance::Shared) => match next {
-            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
-                XmlAccessProvenance::Shared
-            }
-            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Mixed,
-            current => current,
-        },
-        Some(XmlAccessProvenance::Exclusive) => match next {
-            XmlAccessProvenance::Owned => XmlAccessProvenance::Exclusive,
-            XmlAccessProvenance::Shared => XmlAccessProvenance::Shared,
-            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Unreadable,
-            current => current,
-        },
-        Some(XmlAccessProvenance::Unreadable) => match next {
-            XmlAccessProvenance::Owned | XmlAccessProvenance::Exclusive => {
-                XmlAccessProvenance::Unreadable
-            }
-            XmlAccessProvenance::Shared => XmlAccessProvenance::Mixed,
-            current => current,
-        },
-    })
-}
-
-fn merge_xml_state(
-    current: Option<XmlProducerState>,
-    next: XmlProducerState,
-) -> Option<XmlProducerState> {
-    use XmlProducerState::{Absent, Invalid, MaybeAbsent, Present};
     Some(match (current, next) {
         (None, next) => next,
-        (Some(Invalid), _) | (_, Invalid) => Invalid,
-        (Some(Absent), Absent) => Absent,
-        (Some(Absent), Present(access)) | (Some(Present(access)), Absent) => {
-            MaybeAbsent(access)
+        (Some(XmlAccessProvenance::Owned), XmlAccessProvenance::Owned) => {
+            XmlAccessProvenance::Owned
         }
-        (Some(Absent), MaybeAbsent(access)) | (Some(MaybeAbsent(access)), Absent) => {
-            MaybeAbsent(access)
+        (Some(XmlAccessProvenance::Shared), XmlAccessProvenance::Shared) => {
+            XmlAccessProvenance::Shared
         }
-        (Some(Present(current)), Present(next)) => {
-            Present(
-                merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
-            )
+        (Some(XmlAccessProvenance::Exclusive), XmlAccessProvenance::Exclusive) => {
+            XmlAccessProvenance::Exclusive
         }
-        (Some(Present(current)), MaybeAbsent(next))
-        | (Some(MaybeAbsent(current)), Present(next))
-        | (Some(MaybeAbsent(current)), MaybeAbsent(next)) => MaybeAbsent(
-            merge_xml_access(Some(current), next).unwrap_or(XmlAccessProvenance::Unknown),
-        ),
-    })
-}
-
-fn require_xml_presence(
-    state: Option<XmlProducerState>,
-    guarded: bool,
-) -> Option<XmlProducerState> {
-    state.map(|state| match state {
-        XmlProducerState::MaybeAbsent(access) if guarded => XmlProducerState::Present(access),
-        XmlProducerState::Absent if guarded => XmlProducerState::Absent,
-        XmlProducerState::MaybeAbsent(_) | XmlProducerState::Absent
-        | XmlProducerState::Invalid => XmlProducerState::Invalid,
-        present @ XmlProducerState::Present(_) => present,
+        (Some(XmlAccessProvenance::Unreadable), XmlAccessProvenance::Unreadable) => {
+            XmlAccessProvenance::Unreadable
+        }
+        (Some(XmlAccessProvenance::Mixed), XmlAccessProvenance::Mixed) => {
+            XmlAccessProvenance::Mixed
+        }
+        (Some(XmlAccessProvenance::Mixed), _) | (_, XmlAccessProvenance::Mixed) => {
+            XmlAccessProvenance::Mixed
+        }
+        (Some(XmlAccessProvenance::Owned), next)
+        | (Some(next), XmlAccessProvenance::Owned) => next,
+        (Some(XmlAccessProvenance::Shared), XmlAccessProvenance::Exclusive)
+        | (Some(XmlAccessProvenance::Exclusive), XmlAccessProvenance::Shared) => {
+            XmlAccessProvenance::Shared
+        }
+        (Some(XmlAccessProvenance::Shared), XmlAccessProvenance::Unreadable)
+        | (Some(XmlAccessProvenance::Unreadable), XmlAccessProvenance::Shared) => {
+            XmlAccessProvenance::Mixed
+        }
+        (Some(XmlAccessProvenance::Exclusive), XmlAccessProvenance::Unreadable)
+        | (Some(XmlAccessProvenance::Unreadable), XmlAccessProvenance::Exclusive) => {
+            XmlAccessProvenance::Unreadable
+        }
     })
 }
 
@@ -4326,7 +4292,7 @@ fn xml_argument_access(function: &align_mir::Function, index: u32) -> XmlAccessP
         Some(align_ast::ParamMode::Borrow) => XmlAccessProvenance::Shared,
         Some(align_ast::ParamMode::BorrowMut) => XmlAccessProvenance::Exclusive,
         Some(align_ast::ParamMode::Out) => XmlAccessProvenance::Unreadable,
-        None => XmlAccessProvenance::Unknown,
+        None => XmlAccessProvenance::Mixed,
     }
 }
 
@@ -4399,7 +4365,7 @@ impl OperandRequirement {
             XmlAccessProvenance::Shared => (true, false, false, false),
             XmlAccessProvenance::Exclusive => (true, true, true, false),
             XmlAccessProvenance::Unreadable => (false, true, true, false),
-            XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed => {
+            XmlAccessProvenance::Mixed => {
                 (false, false, false, false)
             }
         };
@@ -4412,9 +4378,158 @@ impl OperandRequirement {
             && (!self.callable
                 || !matches!(
                     access,
-                    XmlAccessProvenance::Unknown | XmlAccessProvenance::Mixed
+                    XmlAccessProvenance::Mixed
                 ))
     }
+}
+
+fn solve_xml_access_equations(
+    equations: &HashMap<XmlAccessNode, XmlAccessEquation>,
+) -> (
+    HashMap<XmlAccessNode, XmlProducerState>,
+    HashSet<XmlAccessNode>,
+) {
+    let mut validation_reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
+    let mut reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
+    for (node, equation) in equations {
+        for dependency in &equation.dependencies {
+            reverse
+                .entry(dependency.clone())
+                .or_default()
+                .push(node.clone());
+            validation_reverse
+                .entry(dependency.clone())
+                .or_default()
+                .push(node.clone());
+        }
+        for (dependency, _) in &equation.checks {
+            validation_reverse
+                .entry(dependency.clone())
+                .or_default()
+                .push(node.clone());
+        }
+    }
+
+    // Presence and access form one monotone finite-height lattice. Do not mix absence into this
+    // worklist: an authenticated discriminator projects MaybeAbsent to Present, so feeding a
+    // provisional absence through that projection made the former single-state solver oscillate.
+    let mut present = HashMap::<XmlAccessNode, XmlAccessProvenance>::new();
+    let mut present_ready = VecDeque::new();
+    for (node, equation) in equations {
+        if !equation.invalid
+            && let Some(seed) = equation.seed
+        {
+            present.insert(node.clone(), seed);
+            present_ready.push_back(node.clone());
+        }
+    }
+    while let Some(changed) = present_ready.pop_front() {
+        let Some(parents) = reverse.get(&changed) else {
+            continue;
+        };
+        for parent in parents {
+            let Some(equation) = equations.get(parent) else {
+                continue;
+            };
+            if equation.invalid {
+                continue;
+            }
+            let next = equation.dependencies.iter().fold(equation.seed, |current, dependency| {
+                present
+                    .get(dependency)
+                    .copied()
+                    .map_or(current, |access| merge_xml_access(current, access))
+            });
+            if let Some(next) = next
+                && present.get(parent) != Some(&next)
+            {
+                present.insert(parent.clone(), next);
+                present_ready.push_back(parent.clone());
+            }
+        }
+    }
+
+    // With present reachability fixed, absence is a separate monotone boolean fact. An exact
+    // guard suppresses absence only when the selected present alternative is known to exist.
+    let guarded_present = |node: &XmlAccessNode, equation: &XmlAccessEquation| {
+        equation.require_present && equation.guarded_absence && present.contains_key(node)
+    };
+    let mut absent = HashSet::<XmlAccessNode>::new();
+    let mut absent_ready = VecDeque::new();
+    for (node, equation) in equations {
+        if !equation.invalid && equation.absent && !guarded_present(node, equation) {
+            absent.insert(node.clone());
+            absent_ready.push_back(node.clone());
+        }
+    }
+    while let Some(changed) = absent_ready.pop_front() {
+        let Some(parents) = reverse.get(&changed) else {
+            continue;
+        };
+        for parent in parents {
+            let Some(equation) = equations.get(parent) else {
+                continue;
+            };
+            if equation.invalid
+                || guarded_present(parent, equation)
+                || !absent.insert(parent.clone())
+            {
+                continue;
+            }
+            absent_ready.push_back(parent.clone());
+        }
+    }
+
+    let mut values = HashMap::<XmlAccessNode, XmlProducerState>::new();
+    for (node, equation) in equations {
+        let state = if equation.invalid
+            || (equation.require_present && !equation.guarded_absence && absent.contains(node))
+        {
+            Some(XmlProducerState::Invalid)
+        } else {
+            match (present.get(node).copied(), absent.contains(node)) {
+                (Some(access), true) => Some(XmlProducerState::MaybeAbsent(access)),
+                (Some(access), false) => Some(XmlProducerState::Present(access)),
+                (None, true) => Some(XmlProducerState::Absent),
+                (None, false) => None,
+            }
+        };
+        if let Some(state) = state {
+            values.insert(node.clone(), state);
+        }
+    }
+
+    // Access propagation intentionally excludes validation-only dependencies. Once both raw
+    // reachability phases converge, every such dependency must have produced a total typed state.
+    // An unresolved check-only cycle is invalid, and invalidity flows through both edge classes.
+    let mut invalid = equations
+        .iter()
+        .filter(|(node, equation)| {
+            equation.invalid
+                || !values.contains_key(*node)
+                || values.get(*node) == Some(&XmlProducerState::Invalid)
+                || equation.checks.iter().any(|(dependency, requirement)| {
+                    values
+                        .get(dependency)
+                        .copied()
+                        .is_none_or(|state| !requirement.is_satisfied_by(state))
+                })
+        })
+        .map(|(node, _)| node)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut invalid_ready = invalid.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(changed) = invalid_ready.pop_front() {
+        let Some(parents) = validation_reverse.get(&changed) else {
+            continue;
+        };
+        for parent in parents {
+            if invalid.insert(parent.clone()) {
+                invalid_ready.push_back(parent.clone());
+            }
+        }
+    }
+    (values, invalid)
 }
 
 fn xml_mode_requirement(
@@ -9789,119 +9904,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
             self.equations.insert(node, equation);
         }
 
-        let mut validation_reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
-        for (node, equation) in &self.equations {
-            for dependency in &equation.dependencies {
-                validation_reverse
-                    .entry(dependency.clone())
-                    .or_default()
-                    .push(node.clone());
-            }
-            for (dependency, _) in &equation.checks {
-                validation_reverse
-                    .entry(dependency.clone())
-                    .or_default()
-                    .push(node.clone());
-            }
-        }
-
-        let mut values = HashMap::<XmlAccessNode, XmlProducerState>::new();
-        let mut reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
-        let mut ready = VecDeque::new();
-        for (node, equation) in &self.equations {
-            for dependency in &equation.dependencies {
-                reverse
-                    .entry(dependency.clone())
-                    .or_default()
-                    .push(node.clone());
-            }
-            let initial = if equation.invalid {
-                Some(XmlProducerState::Invalid)
-            } else if equation.absent {
-                Some(XmlProducerState::Absent)
-            } else {
-                equation.seed.map(XmlProducerState::Present)
-            };
-            if let Some(initial) = initial {
-                values.insert(node.clone(), initial);
-                ready.push_back(node.clone());
-            }
-        }
-        while let Some(changed) = ready.pop_front() {
-            let Some(parents) = reverse.get(&changed) else {
-                continue;
-            };
-            for parent in parents {
-                let Some(equation) = self.equations.get(parent) else {
-                    continue;
-                };
-                let next = equation.dependencies.iter().fold(
-                    equation.seed.map(XmlProducerState::Present),
-                    |current, dependency| {
-                        values
-                            .get(dependency)
-                            .copied()
-                            .map_or(current, |state| merge_xml_state(current, state))
-                    },
-                );
-                let next = if equation.invalid {
-                    Some(XmlProducerState::Invalid)
-                } else if equation.absent {
-                    merge_xml_state(next, XmlProducerState::Absent)
-                } else {
-                    next
-                };
-                let next = if equation.require_present {
-                    require_xml_presence(next, equation.guarded_absence)
-                } else {
-                    next
-                };
-                if let Some(next) = next
-                    && values.get(parent) != Some(&next)
-                {
-                    values.insert(parent.clone(), next);
-                    ready.push_back(parent.clone());
-                }
-            }
-        }
-
-        // Access propagation intentionally excludes validation-only dependencies. Once
-        // selected-path convergence is complete, however, every such dependency must have
-        // produced a total typed state. An unresolved check-only cycle is therefore invalid,
-        // and invalidity flows through both kinds of edge.
-        let mut invalid = self
-            .equations
-            .iter()
-            .filter(|(node, equation)| {
-                equation.invalid
-                    || !values.contains_key(*node)
-                    || values.get(*node) == Some(&XmlProducerState::Invalid)
-                    || equation.checks.iter().any(|(dependency, requirement)| {
-                        values
-                            .get(dependency)
-                            .copied()
-                            .is_none_or(|state| !requirement.is_satisfied_by(state))
-                    })
-            })
-            .map(|(node, _)| node)
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut invalid_ready = invalid.iter().cloned().collect::<VecDeque<_>>();
-        while let Some(changed) = invalid_ready.pop_front() {
-            let Some(parents) = validation_reverse.get(&changed) else {
-                continue;
-            };
-            for parent in parents {
-                if invalid.insert(parent.clone()) {
-                    invalid_ready.push_back(parent.clone());
-                }
-            }
-        }
+        let (values, invalid) = solve_xml_access_equations(&self.equations);
         if let Some(cache) = cache {
             let mut cache = cache.borrow_mut();
             for (node, state) in &values {
                 if !invalid.contains(node)
-                    && let XmlProducerState::Present(access) = state
+                    && let XmlProducerState::Present(
+                        access @ (XmlAccessProvenance::Owned
+                        | XmlAccessProvenance::Shared
+                        | XmlAccessProvenance::Exclusive
+                        | XmlAccessProvenance::Unreadable),
+                    ) = state
                 {
                     cache.insert(node.clone(), *access);
                 }
@@ -30820,6 +30833,97 @@ mod tests {
     }
 
     #[test]
+    fn producer_fixed_point_separates_guarded_absence_from_seeded_cycles() {
+        let absent = XmlAccessNode::Value(0, Vec::new());
+        let present = XmlAccessNode::Value(1, Vec::new());
+        let joined = XmlAccessNode::Value(2, Vec::new());
+        let guarded = XmlAccessNode::Value(3, Vec::new());
+        let slot = XmlAccessNode::Slot(0, Vec::new());
+        let loaded = XmlAccessNode::Value(4, Vec::new());
+        let loop_join = XmlAccessNode::Value(5, Vec::new());
+        let mut equations = HashMap::from([
+            (
+                absent.clone(),
+                XmlAccessEquation {
+                    absent: true,
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                present.clone(),
+                XmlAccessEquation {
+                    seed: Some(XmlAccessProvenance::Owned),
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                joined.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![absent, present],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                guarded.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![joined.clone()],
+                    require_present: true,
+                    guarded_absence: true,
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                slot.clone(),
+                XmlAccessEquation {
+                    seed: Some(XmlAccessProvenance::Owned),
+                    dependencies: vec![loop_join.clone()],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                loaded.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![slot.clone()],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                loop_join.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![loaded.clone(), guarded.clone()],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+        ]);
+
+        let (values, invalid) = solve_xml_access_equations(&equations);
+        assert!(invalid.is_empty(), "guarded cycle was rejected: {invalid:?}");
+        assert_eq!(
+            values.get(&joined),
+            Some(&XmlProducerState::MaybeAbsent(XmlAccessProvenance::Owned))
+        );
+        for node in [&guarded, &slot, &loaded, &loop_join] {
+            assert_eq!(
+                values.get(node),
+                Some(&XmlProducerState::Present(XmlAccessProvenance::Owned)),
+                "guarded present fact did not stabilize at {node:?}"
+            );
+        }
+
+        equations
+            .get_mut(&guarded)
+            .expect("guarded equation")
+            .guarded_absence = false;
+        let (_, invalid) = solve_xml_access_equations(&equations);
+        for node in [&guarded, &slot, &loaded, &loop_join] {
+            assert!(
+                invalid.contains(node),
+                "unguarded absence did not poison {node:?}"
+            );
+        }
+    }
+
+    #[test]
     fn producer_optional_owned_views_preserve_binder_access_without_minting_ownership() {
         for (owned, view) in [
             ("string", "str"),
@@ -34762,9 +34866,7 @@ fn main() -> i32 = 0
 
     #[test]
     fn xml_access_join_is_the_capability_intersection() {
-        use XmlAccessProvenance::{
-            Exclusive, Mixed, Owned, Shared, Unknown, Unreadable,
-        };
+        use XmlAccessProvenance::{Exclusive, Mixed, Owned, Shared, Unreadable};
 
         let cases = [
             (Owned, Shared, Shared),
@@ -34773,12 +34875,34 @@ fn main() -> i32 = 0
             (Shared, Exclusive, Shared),
             (Shared, Unreadable, Mixed),
             (Exclusive, Unreadable, Unreadable),
-            (Owned, Unknown, Unknown),
+            (Owned, Mixed, Mixed),
             (Shared, Mixed, Mixed),
         ];
         for (left, right, expected) in cases {
             assert_eq!(merge_xml_access(Some(left), right), Some(expected));
             assert_eq!(merge_xml_access(Some(right), left), Some(expected));
+        }
+
+        let accesses = [Owned, Shared, Exclusive, Unreadable, Mixed];
+        let join = |left, right| {
+            merge_xml_access(Some(left), right).expect("two access facts always have a join")
+        };
+        for left in accesses {
+            assert_eq!(join(left, left), left, "access join must be idempotent");
+            for right in accesses {
+                assert_eq!(
+                    join(left, right),
+                    join(right, left),
+                    "access join must be commutative for {left:?} and {right:?}"
+                );
+                for third in accesses {
+                    assert_eq!(
+                        join(join(left, right), third),
+                        join(left, join(right, third)),
+                        "access join must be associative for {left:?}, {right:?}, and {third:?}"
+                    );
+                }
+            }
         }
     }
 

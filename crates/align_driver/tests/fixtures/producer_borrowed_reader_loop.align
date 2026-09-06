@@ -1,0 +1,79 @@
+Fault {
+  code: string,
+  detail: string,
+}
+
+Counters {
+  pread_count: i64,
+  bytes_read: i64,
+  peak_window_bytes: i64,
+}
+
+PackIndex {
+  total_bytes: i64,
+}
+
+PackBlock {
+  offset: i64,
+  length: i64,
+  name: str,
+}
+
+BlockScalars {
+  offset: i64,
+  length: i64,
+}
+
+fn fault_at(code: str, at: i64) -> Fault = Fault {
+  code: code.clone(),
+  detail: "offset".clone(),
+}
+
+fn os_fault(code: str, failure: Error) -> Fault = Fault {
+  code: code.clone(),
+  detail: "io".clone(),
+}
+
+fn read_append(
+  borrow handle: file,
+  borrow mut window: buffer,
+  borrow mut counters: Counters,
+  code: str,
+  at: i64,
+  n: i64,
+) -> Result<(), Fault> {
+  if at < 0 || n < 0 { return Err(fault_at(code, at)) }
+  if n > counters.peak_window_bytes { counters.peak_window_bytes = n }
+  mut have := 0
+  loop {
+    if have >= n { break }
+    mut tail := buffer(n - have)
+    extra := match handle.pread(tail, at + have) {
+      Ok(value) => value,
+      Err(failure) => { return Err(os_fault(code, failure)) },
+    }
+    counters.pread_count = counters.pread_count + 1
+    counters.bytes_read = counters.bytes_read + extra
+    if extra > n - have { return Err(fault_at("unreadable", at + have)) }
+    if extra == 0 { return Err(fault_at("unavailable", at + have)) }
+    window.append(tail.bytes())
+    have = have + extra
+  }
+  return Ok(())
+}
+
+fn load_scalars(
+  borrow handle: file,
+  borrow index: PackIndex,
+  borrow block: PackBlock,
+  borrow mut counters: Counters,
+) -> Result<BlockScalars, Fault> {
+  if block.offset < 0 || block.length < 0 || block.length > index.total_bytes - block.offset {
+    return Err(fault_at("block", block.offset))
+  }
+  mut window := buffer(block.length)
+  read_append(handle, window, counters, "block", block.offset, block.length)?
+  return Ok(BlockScalars { offset: block.offset, length: block.length })
+}
+
+fn main() -> i32 = 0
