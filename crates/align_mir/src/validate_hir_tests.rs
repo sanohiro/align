@@ -2327,14 +2327,20 @@ fn valid_hir_declaration_header_preflight_is_mir_identity() {
         let source_map = SourceMap::new();
         let checked = lower_program_per_unit(&base);
         let unchecked = lower_program_unchecked(&base, None, true);
-        assert_eq!(format!("{checked:#?}"), format!("{unchecked:#?}"));
+        assert_eq!(
+            crate::print::codegen_input_to_string(&checked),
+            crate::print::codegen_input_to_string(&unchecked),
+        );
         let located = lower_program_per_unit_located(&base, &source_map);
         let located_unchecked = lower_program_unchecked(
             &base,
             Some(Rc::new(SourceLines::from_map(&source_map))),
             true,
         );
-        assert_eq!(format!("{located:#?}"), format!("{located_unchecked:#?}"));
+        assert_eq!(
+            crate::print::codegen_input_to_string(&located),
+            crate::print::codegen_input_to_string(&located_unchecked),
+        );
         assert_eq!(checked.imported_fns.len(), 1);
         assert_eq!(checked.imported_fns[0].name.as_str(), "dep$read");
     }
@@ -3321,7 +3327,10 @@ fn valid_hir_body_preflight_is_mir_identity() {
         ),
     ] {
         assert!(!is_empty(&checked), "valid body did not reach MIR");
-        assert_eq!(format!("{checked:#?}"), format!("{unchecked:#?}"));
+        assert_eq!(
+            crate::print::codegen_input_to_string(&checked),
+            crate::print::codegen_input_to_string(&unchecked),
+        );
     }
 }
 
@@ -17958,6 +17967,9 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
             ),
         ),
     ] {
-        assert_eq!(format!("{checked:#?}"), format!("{unchecked:#?}"));
+        assert_eq!(
+            crate::print::codegen_input_to_string(&checked),
+            crate::print::codegen_input_to_string(&unchecked),
+        );
     }
 }

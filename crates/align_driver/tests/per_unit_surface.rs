@@ -405,7 +405,7 @@ fn emit_llvm_optimized_leaves_cross_unit_call_opaque() {
 
 // ---- 5. explain-opt multi-file -------------------------------------------------------------------
 
-const SCALE_UNIT: &str = "module util.math\npub fn scale(xs: array<i64>) -> i64 = xs.map(dbl).sum()\nfn dbl(x: i64) -> i64 = x * 2\n";
+const SCALE_UNIT: &str = "module util.math\npub fn scale(xs: array<i64>) -> i64 = xs.map(dbl).sum()\npub fn planned(xs: array<i64>) -> array<i64> = xs.map(dbl).to_array()\nfn dbl(x: i64) -> i64 = x * 2\n";
 const SCALE_MAIN: &str = "module main\nimport util.math\nfn main() -> i32 {\n  return util.math.scale([1, 2, 3, 4, 5, 6, 7, 8].to_array()) as i32\n}\n";
 
 #[test]
@@ -421,6 +421,18 @@ fn explain_opt_multi_file_has_per_unit_sections() {
     let dep_at = text.find("==== unit: util.math (math.align) ====").expect("dep section");
     let main_at = text.find("==== unit: main (main.align) ====").expect("entry section");
     assert!(dep_at < main_at, "the dependency section must come first");
+    let plan = text
+        .lines()
+        .find(|line| {
+            line.starts_with("math.align:3:")
+                && line.contains("current plan `util.math$planned` #1 buffer-donation:")
+        })
+        .unwrap_or_else(|| panic!("dependency current-plan row:\n{text}"));
+    let plan_at = text.find(plan).unwrap();
+    assert!(
+        dep_at < plan_at && plan_at < main_at,
+        "the dependency plan must stay inside its bottom-up section:\n{text}"
+    );
 
     // Deterministic order across runs.
     let b = proj.run(&["explain-opt", "main.align"]);
@@ -439,6 +451,54 @@ fn explain_opt_single_file_has_no_section_header() {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("==== unit:"),
         "a single-unit explain-opt must have no section header"
+    );
+}
+
+#[test]
+fn explain_opt_imported_generic_uses_the_source_less_default_and_verbose_grammar() {
+    if !backend() {
+        return;
+    }
+    let dep = "module dep\npub fn rows<T>(value: T) -> array<T> = [value].to_array()\n";
+    let main = "module main\nimport dep\nfn main() -> i32 = dep.rows(1).sum() as i32\n";
+    let proj = Proj::new(
+        "explain-source-less",
+        &[("dep.align", dep), ("main.align", main)],
+    );
+
+    let default = proj.run(&["explain-opt", "main.align"]);
+    assert!(
+        default.status.success(),
+        "default explain-opt failed: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_rows = String::from_utf8_lossy(&default.stdout)
+        .lines()
+        .filter(|line| line.contains("current-plan"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        default_rows,
+        ["+ 1 current-plan record(s) without user source (see --verbose)"]
+    );
+
+    let verbose = proj.run(&["explain-opt", "main.align", "--verbose"]);
+    assert!(
+        verbose.status.success(),
+        "verbose explain-opt failed: {}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    let verbose_rows = String::from_utf8_lossy(&verbose.stdout)
+        .lines()
+        .filter(|line| line.contains("[current plan"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verbose_rows,
+        [
+            "  [current plan `dep$rows$i64` #1 buffer-donation] not-applicable `fresh-output` — this source or stage shape cannot reuse the source buffer; source location is unavailable"
+        ],
+        "source-less verbose grammar or concrete monomorph identity changed"
     );
 }
 

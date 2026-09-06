@@ -230,7 +230,7 @@ behaviour-preserving robustness fix that helps every deep-lowering test, not jus
 
 ## S0B extension: current compiler decisions
 
-> **Status:** EXACT DESIGN ACCEPTED; implementation is next.
+> **Status:** IMPLEMENTED against the accepted exact design.
 >
 > **Authority:** This section is the exact S0B public-output and implementation
 > ledger required by `31-execution-storage-startup-plan.md`. The earlier Slice
@@ -387,10 +387,25 @@ One lowering-owned site may first receive a general chunks-materialization
 reason and then a more specific immediate-consumer reason. The collector keeps
 exactly one `(HIR-site, kind)` record by a lowering-private site token that is
 discarded before `PlanRecord` publication, and replaces the general reason with
-the specific reason. Separate kinds at one expression are not duplicates: for
-example, a materialized `chunks` source and the `par_map` consuming it each
+the specific reason. A duplicate record, missing replacement target, or
+incompatible replacement marks the table malformed. Separate kinds at one
+expression are not duplicates: for example, a materialized `chunks` source and
+the `par_map` consuming it each
 produce their own record. LLVM remarks never suppress plan records, and plan
 records never suppress LLVM remarks.
+
+Located construction also retains one `align_mir`-private certification copy
+of the complete normalized record table and the private catalog-malformed bit.
+`Program::default()` and ordinary unlocated lowering are uncertified; only a
+located lowering owner can construct the certified state, and downstream crates
+can neither replace it nor clear a malformed catalog result. Final validation
+requires that certified state and structural equality with its copy before
+checking individual records. The copy is allocated only beside located records
+and is erased with them from MIR text, implementation hashes, caches,
+interfaces, LLVM, objects, and runtime keys. This makes deletion, insertion,
+field mutation, authenticated-`Some` to source-less-`None` stripping, or
+rebuilding the public semantic fields on a default program fail closed without
+reconstructing decisions from MIR or LLVM.
 
 After the complete per-unit walk and before any LLVM invocation or output, the
 driver validates every state/strategy/reason combination, the total sort and
@@ -618,9 +633,19 @@ falling through to an optimistic record.
 
 ### Implementation closure matrix
 
+S0B is intentionally one capability PR even though its hand-written diff is
+expected to exceed roughly 1,000 lines. The selector-owned decisions, located
+source catalog, fail-closed validation, renderer, and parity/identity owners
+form one proof boundary: none is a useful stable consumer without the others.
+Splitting that dormant producer-to-consumer chain would duplicate record-shape,
+source-authentication, and codegen-identity proof while allowing intermediate
+commits that can collect but not safely publish (or publish records they did
+not authenticate). Keeping the boundary whole therefore lowers integration
+risk and leaves distinct LLVM-remark behavior unchanged.
+
 | Axis | Exact implementation closure | Owner evidence |
 |---|---|---|
-| Formation and validation | Exhaustive enums admit only the three kind tables; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Unit-level invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
+| Formation and validation | Exhaustive enums admit only the three kind tables; `align_mir` alone owns the private certification and catalog-malformed state, Default/unlocated programs are uncertified, located programs (including an empty program) are certified, and downstream crates cannot jointly replace records and proof; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Rust privacy is the compile-time tripwire for external Program construction; unit-level default/located-empty/deletion/field/catalog invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
 | Construction | Chunks, donation, and `par_map` helpers return the decision consumed by their existing lowering branch; located mode records that same value | MIR structural positives/negatives for every table row. |
 | Move-in / move-out / source nulling | No Align value or ownership bit enters a record. Donation still transfers/nulls the existing source owner only on `reuse-source-buffer` | Existing `buffer_donate` MIR and execution differential, including bound and escaping results. |
 | Replacement and return | General chunks materialization may be replaced only by the same site's more-specific consumer reason; returning/storing chunks remains materialized | Direct/stored/call/return/control-flow chunks rows and existing lifetime owners. |

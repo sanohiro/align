@@ -69,8 +69,8 @@ fn deep_drop_program(depth: usize) -> Program {
         bits: 32,
         signed: true,
     });
-    Program {
-        fns: vec![Function {
+    let mut program = Program::default();
+    program.fns = vec![Function {
             name: ProgramCall::try_from_logical("main").expect("valid program call"),
             params: vec![],
             param_modes: vec![],
@@ -90,10 +90,9 @@ fn deep_drop_program(depth: usize) -> Program {
             }],
             entry: 0,
             exportable: false,
-        }],
-        structs,
-        ..Program::default()
-    }
+        }];
+    program.structs = structs;
+    program
 }
 
 #[test]

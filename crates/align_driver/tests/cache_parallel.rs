@@ -174,6 +174,55 @@ fn cache_stats_reports_hits_and_misses() {
     assert!(String::from_utf8_lossy(&off.stderr).contains("cache: disabled"), "off + --cache-stats ⇒ disabled note");
 }
 
+#[test]
+fn explain_current_plan_does_not_prime_or_change_the_later_build_cache() {
+    if !backend() || !cc_available() {
+        return;
+    }
+    let p = Proj::new("explain-before-build");
+    std::fs::write(
+        p.dir.join("b.align"),
+        "module b\nimport c\npub fn bval() -> i64 = c.cval() + 10\nfn dbl(x: i64) -> i64 = x * 2\nfn planned(xs: array<i64>) -> array<i64> = xs.map(dbl).to_array()\n",
+    )
+    .unwrap();
+    let cache = p.cache_dir();
+    let cache = cache.to_str().unwrap();
+
+    let explain = p.alignc(cache, &["explain-opt", "main.align"]);
+    assert!(
+        explain.status.success(),
+        "explain-opt failed: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    assert!(String::from_utf8_lossy(&explain.stdout).contains("current plan"));
+    assert!(
+        !p.cache_dir().join("actions").exists(),
+        "located observation must not publish frontend or object cache actions"
+    );
+
+    let cold = p.alignc(cache, &["build", "main.align", "--cache-stats"]);
+    assert!(cold.status.success());
+    assert!(
+        String::from_utf8_lossy(&cold.stderr).contains("0 hit, 3 miss"),
+        "the build after explain-opt must remain cold: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let cold_executable = p.exe_bytes();
+
+    let hot = p.alignc(cache, &["build", "main.align", "--cache-stats"]);
+    assert!(hot.status.success());
+    assert!(
+        String::from_utf8_lossy(&hot.stderr).contains("3 hit, 0 miss"),
+        "the second ordinary build must hit: {}",
+        String::from_utf8_lossy(&hot.stderr)
+    );
+    assert_eq!(
+        cold_executable,
+        p.exe_bytes(),
+        "located observation must not change the executable across cache miss/hit"
+    );
+}
+
 // ---- P5: cache clear removes the root, next build all-miss then all-hit -------------------------
 
 #[test]
