@@ -738,6 +738,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }
+        Rvalue::FsCreatePrivateTempDir { prefix, out } => {
+            format!("fs_create_private_temp_dir({}, -> _{out})", operand_str(prefix))
+        }
         Rvalue::ReaderOpen { path, out } => format!("fs_open({}, -> _{out})", operand_str(path)),
         Rvalue::ReaderOpenBeneath {
             root,
@@ -907,6 +910,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
+        Rvalue::FsRemoveEmptyDir { path } => {
+            format!("fs_remove_empty_dir({})", operand_str(path))
+        }
         Rvalue::RenameNoReplace { source, destination } => {
             format!("fs_rename_no_replace({}, {})", operand_str(source), operand_str(destination))
         }

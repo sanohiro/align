@@ -11765,10 +11765,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // Request 55 adds one retained-root reader operation; keep this count synchronized with
+        // Request 56 adds two private-directory lifecycle operations; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        323,
+        325,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -11857,6 +11857,17 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::FsReadFile {
                 path: Box::new(native_str()),
+            },
+            native_result(Ty::String, error),
+        ),
+        Vec::new(),
+        native_result(Ty::String, error)
+    );
+    add!(
+        "native_fs_create_private_temp_dir",
+        body_test_expr(
+            hir::ExprKind::FsCreatePrivateTempDir {
+                prefix: Box::new(native_str()),
             },
             native_result(Ty::String, error),
         ),
@@ -12471,6 +12482,17 @@ fn hir_body_validator_native() {
         "native_fs_remove",
         body_test_expr(
             hir::ExprKind::FsRemove {
+                path: Box::new(native_str()),
+            },
+            result_unit,
+        ),
+        Vec::new(),
+        result_unit
+    );
+    add!(
+        "native_fs_remove_empty_dir",
+        body_test_expr(
+            hir::ExprKind::FsRemoveEmptyDir {
                 path: Box::new(native_str()),
             },
             result_unit,

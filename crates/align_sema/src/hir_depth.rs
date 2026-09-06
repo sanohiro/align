@@ -886,6 +886,7 @@ fn walk_body_records<'a>(
                 | ExprKind::JsonDocElems { doc: recv }
                 | ExprKind::JsonScan { input: recv, .. }
                 | ExprKind::FsReadFile { path: recv }
+                | ExprKind::FsCreatePrivateTempDir { prefix: recv }
                 | ExprKind::ReaderOpen { path: recv }
                 | ExprKind::WriterCreate { path: recv }
                 | ExprKind::CreateExclusive { path: recv }
@@ -913,6 +914,7 @@ fn walk_body_records<'a>(
                 | ExprKind::BufferLen { buffer: recv }
                 | ExprKind::FsExists { path: recv }
                 | ExprKind::FsRemove { path: recv }
+                | ExprKind::FsRemoveEmptyDir { path: recv }
                 | ExprKind::FsReadDir { path: recv }
                 | ExprKind::DnsResolve { host: recv }
                 | ExprKind::ConnReader { conn: recv }

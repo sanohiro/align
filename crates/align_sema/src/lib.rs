@@ -15813,9 +15813,11 @@ impl EffectScan<'_> {
                 walk!(data);
             }
             ExprKind::ArrayBuilderBuild(builder) => walk!(builder),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
+            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
-            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
+            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
                 walk!(path);
@@ -23708,6 +23710,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDocAsScalar { .. }
             | ExprKind::JsonDocLen { .. }
             | ExprKind::FsReadFile { .. }
+            | ExprKind::FsCreatePrivateTempDir { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
@@ -23747,6 +23750,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
+            | ExprKind::FsRemoveEmptyDir { .. }
             | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
@@ -24154,6 +24158,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::FsReadFile { .. }
+            | ExprKind::FsCreatePrivateTempDir { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
@@ -24199,6 +24204,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
+            | ExprKind::FsRemoveEmptyDir { .. }
             | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
@@ -27451,9 +27457,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(doc, depth);
                 self.walk(index, depth);
             }
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
+            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
-            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
+            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.walk(path, depth),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -29889,6 +29897,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::JsonDocKey { .. }
         | ExprKind::JsonScan { .. }
         | ExprKind::FsReadFile { .. }
+        | ExprKind::FsCreatePrivateTempDir { .. }
         | ExprKind::ReaderStdin
         | ExprKind::ReaderOpen { .. }
         | ExprKind::ReaderOpenBeneath { .. }
@@ -29936,6 +29945,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FsWriteFile { .. }
         | ExprKind::FsExists { .. }
         | ExprKind::FsRemove { .. }
+        | ExprKind::FsRemoveEmptyDir { .. }
         | ExprKind::RenameNoReplace { .. }
         | ExprKind::FsReadDir { .. }
         | ExprKind::DnsResolve { .. }
@@ -37300,6 +37310,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayMinMax { .. } | ExprKind::ArrayDot { .. } | ExprKind::ArrayMapInto { .. }
             | ExprKind::Len(..) | ExprKind::JsonDecodeScalar { .. } | ExprKind::JsonDocKind { .. }
             | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
+            | ExprKind::FsCreatePrivateTempDir { .. }
             | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
             | ExprKind::WriterFlush { .. } | ExprKind::LogEnabled { .. } | ExprKind::LogLine { .. }
             | ExprKind::LogFlush { .. }
@@ -37315,7 +37326,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
             | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
-            | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. } | ExprKind::FsReadDir { .. }
+            | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. }
+            | ExprKind::FsRemoveEmptyDir { .. } | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
@@ -43649,9 +43661,11 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, doc, moved, false, false);
                 move_expr!(self, index, moved, false, false);
             }
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
+            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
-            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
+            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => move_expr!(self, path, moved, false, false),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -49859,6 +49873,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
+            if module == "fs" && method == "create_private_temp_dir" {
+                self.require_import("std.fs", "fs.create_private_temp_dir", span);
+                return self.check_fs_create_private_temp_dir(args, span);
+            }
             // `fs.open(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
             if module == "fs" && (method == "open" || method == "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
@@ -49892,7 +49910,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
             // — the single-path std.fs ops.
-            if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view" | "read_bytes_view") {
+            if module == "fs" && matches!(method, "exists" | "remove" | "remove_empty_dir" | "read_dir" | "read_file_view" | "read_bytes_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
@@ -58350,6 +58368,22 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn check_fs_create_private_temp_dir(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'fs.create_private_temp_dir' expects 1 argument (the prefix), got {}", args.len()),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let prefix = self.check_str_init(&args[0]);
+        Expr {
+            kind: ExprKind::FsCreatePrivateTempDir { prefix: Box::new(prefix) },
+            ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `fs.open(path)` -> `Result<reader, Error>` / `fs.create(path)` -> `Result<writer, Error>`.
     /// Open (`create` = create/truncate) `path` (a `str`, owned `string` auto-borrowed); the handle
     /// owns its fd (closed on `Drop`). A builtin, dispatched like `fs.read_file`.
@@ -58574,6 +58608,11 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Result(Scalar::Unit, err_enum),
                 span,
             },
+            "remove_empty_dir" => Expr {
+                kind: ExprKind::FsRemoveEmptyDir { path },
+                ty: Ty::Result(Scalar::Unit, err_enum),
+                span,
+            },
             "read_dir" => Expr {
                 kind: ExprKind::FsReadDir { path },
                 ty: Ty::Result(Scalar::DynArray(PrimScalar::String), err_enum),
@@ -58591,7 +58630,7 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Result(Scalar::Slice(PrimScalar::Int(IntTy { bits: 8, signed: false })), err_enum),
                 span,
             },
-            _ => unreachable!("check_fs_path_op is only dispatched for exists/remove/read_dir/read_file_view/read_bytes_view"),
+            _ => unreachable!("check_fs_path_op is only dispatched for exists/remove/remove_empty_dir/read_dir/read_file_view/read_bytes_view"),
         }
     }
 
@@ -64414,9 +64453,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(doc);
                 self.finalize_expr(index);
             }
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
+            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
-            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
+            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.finalize_expr(path),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -70665,10 +70706,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // Request 55 adds one retained-root reader operation. The wildcard-free policy above
-        // classifies it explicitly beside the existing package and core operations.
+        // Request 56 adds two private-directory lifecycle operations. The wildcard-free policy
+        // above classifies them explicitly beside the existing package and core operations.
         assert_eq!(
-            variants, 323,
+            variants, 325,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

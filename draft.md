@@ -3014,6 +3014,8 @@ fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
 fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
+fs.create_private_temp_dir(prefix: str) -> Result<string, Error>
+fs.remove_empty_dir(path: str) -> Result<(), Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.exists(path: str) -> bool
@@ -3080,6 +3082,30 @@ of that same opened descriptor and succeeds only when it is one; zero or more th
 `Error.Invalid`. It returns the existing owned `reader`, reads no byte, and exposes no descriptor or metadata. The
 predicate certifies that opened inode at that observation point; it does not prevent a later link or
 content mutation. `fs.open_beneath` remains unchanged and continues to permit multiply linked files.
+
+`fs.create_private_temp_dir` accepts a 1..=64-byte ASCII filename prefix whose first byte is
+alphanumeric and whose remaining bytes are alphanumeric, `_`, or `-`. It ignores application
+environment and path input: Linux uses `/tmp`, while macOS uses the platform
+`_CS_DARWIN_USER_TEMP_DIR`. It canonicalizes only that platform-owned spelling before validating
+and walking the canonical root without following symlinks; this consumes macOS's terminal slash and
+`/var` compatibility spelling so the returned path works with retained-root APIs. It appends `-`
+plus 32 lowercase hexadecimal digits from 128 fresh OS-CSPRNG bits and atomically
+claims one absent leaf with mode `0700` (the umask may narrow it). It retries only an `EEXIST`
+collision, at most 128 candidates, and returns the owned absolute path. All result allocation
+precedes the first create, so no recoverable failure or terminal allocation failure can leave a
+directory or publish a partial path. Interrupted random reads retry, a negative random-source
+failure keeps the fixed native-error mapping, and an impossible zero-progress read is
+`Error.Invalid` without consulting stale `errno`.
+
+`fs.remove_empty_dir` is the non-recursive cleanup companion. It accepts one absolute strict path,
+retains and revalidates every ancestor and the final directory without following symlinks, then
+uses one descriptor-relative `unlinkat(..., AT_REMOVEDIR)` while the parent and final descriptors
+remain live. Only the empty directory named at that syscall is removed; files, symlinks, special
+entries, and nonempty directories remain. The syscall is the final-name/type/emptiness
+linearization point. Linux and macOS cannot unlink an already-open directory by descriptor, so an
+empty-directory substitution after the last identity check is outside the descriptor-bound claim;
+for the intended constructor result, other users and accidental sharing are excluded by the
+platform root and `0700`, while a hostile same-OS-identity process is outside this boundary.
 
 Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 

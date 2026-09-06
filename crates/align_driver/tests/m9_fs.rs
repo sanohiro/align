@@ -406,6 +406,114 @@ fn main() -> Result<(), Error> {
     }
 }
 
+// --- private temporary-directory lifecycle ----------------------------------------------------
+
+#[test]
+fn private_temp_directory_composes_with_retained_root_artifact_io() {
+    if !backend_available() {
+        return;
+    }
+    let source = "\
+import std.fs
+import std.io
+import std.path
+pub fn main() -> Result<(), Error> {
+  directory := fs.create_private_temp_dir(\"align_g1\")?
+  w := fs.create_exclusive_beneath(directory, \"artifact\")?
+  w.write(\"gpu bundle\")?
+  w.flush()?
+  r := fs.open_beneath_single_link(directory, \"artifact\")?
+  mut data := buffer(32)
+  n := r.read(data)?
+  print(n)
+  artifact := path.join(directory, \"artifact\")
+  fs.remove(artifact)?
+  fs.remove_empty_dir(directory)?
+  return Ok(())
+}
+";
+    let output = build_and_run("m9fs-private-temp-roundtrip", source);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "10\n");
+}
+
+#[test]
+fn private_temp_directory_formation_and_per_unit_generic_paths() {
+    assert!(check_errs(
+        "m9fs-private-temp-no-import",
+        "fn main() -> Result<(), Error> { p := fs.create_private_temp_dir(\"x\")? return Ok(()) }\n"
+    ));
+    for (name, call) in [
+        ("create-arity", "fs.create_private_temp_dir()"),
+        ("create-type", "fs.create_private_temp_dir(1)"),
+        ("remove-arity", "fs.remove_empty_dir(\"/tmp\", true)"),
+        ("remove-type", "fs.remove_empty_dir(false)"),
+    ] {
+        let source = format!(
+            "import std.fs\nfn main() -> Result<(), Error> {{ value := {call}? return Ok(()) }}\n"
+        );
+        assert!(check_errs(&format!("m9fs-private-temp-{name}"), &source));
+    }
+
+    let helper = "module helper\nimport std.fs\npub fn create<T>(prefix: str, marker: T) -> Result<string, Error> = fs.create_private_temp_dir(prefix)\npub fn cleanup<T>(path: str, marker: T) -> Result<(), Error> = fs.remove_empty_dir(path)\n";
+    let main = "module main\nimport helper\nfn main() -> Result<(), Error> {\n  path := helper.create(\"align_generic\", 1)?\n  helper.cleanup(path, true)?\n  return Ok(())\n}\n";
+    let checked = check_per_unit_multi(
+        "m9fs-private-temp-per-unit",
+        &[("helper.align", helper), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        !checked.diags.has_errors(),
+        "imported generic private temp lifecycle must survive checked-HIR replay"
+    );
+}
+
+#[test]
+fn private_temp_directory_mir_and_runtime_abis_are_distinct() {
+    if !backend_available() {
+        return;
+    }
+    let source = "\
+import std.fs
+fn main() -> Result<(), Error> {
+  path := fs.create_private_temp_dir(\"align_abi\")?
+  fs.remove_empty_dir(path)?
+  return Ok(())
+}
+";
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, "m9fs-private-temp-mir", source);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors: {}",
+        align_driver::format_diagnostics(&sources, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let rendered = align_mir::print::program_to_string(&mir);
+    assert!(rendered.contains("fs_create_private_temp_dir("), "{rendered}");
+    assert!(rendered.contains("fs_remove_empty_dir("), "{rendered}");
+    let identity = align_mir::print::codegen_input_to_string(&mir);
+    assert!(identity.contains("FsCreatePrivateTempDir"), "{identity}");
+    assert!(identity.contains("FsRemoveEmptyDir"), "{identity}");
+
+    let llvm = emit_llvm(source);
+    let create = llvm
+        .lines()
+        .find(|line| line.starts_with("declare i32") && line.contains("@align_rt_fs_create_private_temp_dir("))
+        .unwrap_or_else(|| panic!("missing private-temp create declaration:\n{llvm}"));
+    assert!(create.contains("(ptr, i64, ptr)"), "wrong A08 declaration: {create}");
+    let remove = llvm
+        .lines()
+        .find(|line| line.starts_with("declare i32") && line.contains("@align_rt_fs_remove_empty_dir("))
+        .unwrap_or_else(|| panic!("missing empty-dir remove declaration:\n{llvm}"));
+    assert!(remove.contains("(ptr, i64)"), "wrong A04 declaration: {remove}");
+}
+
 // --- read_dir ---------------------------------------------------------------------------------
 
 /// `fs.read_dir` returns an owned `array<string>` of the directory's entry names; `.len()` reports

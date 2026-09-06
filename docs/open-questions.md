@@ -3141,6 +3141,27 @@ contract and closure matrix are authoritative in `docs/impl/34-fs-single-link-pl
 capability is implemented, external consumer adoption remains pending, and this post-M9 work does
 not reopen M9.
 
+### Request 56 — private temporary-directory lifecycle (IMPLEMENTED; release pending)
+
+`std.fs` adds
+`fs.create_private_temp_dir(prefix: str) -> Result<string, Error>` and
+`fs.remove_empty_dir(path: str) -> Result<(), Error>`. The constructor validates one bounded safe
+prefix, ignores application environment/path input, selects the Linux or macOS platform temporary
+root, canonicalizes only that platform-owned spelling before strict traversal, and uses 128
+OS-random bits plus one exclusive `0700` `mkdirat` claim to return an owned canonical absolute path.
+It never reuses an occupant or creates parents, and its output allocation precedes
+filesystem mutation.
+
+Removal accepts an absolute strict path, retains and revalidates all ancestors and the final
+no-follow directory, and issues exactly one `unlinkat(..., AT_REMOVEDIR)`. It is non-recursive and
+never removes a symlink, file, special entry, or nonempty directory. The native call is the
+final-name/type/emptiness linearization point; Linux/macOS have no portable unlink-by-open-directory
+descriptor, so the path-only API does not promise immunity to an empty-directory substitution by a
+hostile process with the same OS identity after the final check. That actor is outside Request 56's
+explicit threat boundary. The exact contract and closure matrix are authoritative in
+`docs/impl/36-fs-private-temp-plan.md`; release and external consumer adoption remain pending, and
+M9 stays closed.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

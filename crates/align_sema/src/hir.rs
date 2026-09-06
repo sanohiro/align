@@ -1120,6 +1120,9 @@ pub enum ExprKind {
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },
+    /// `fs.create_private_temp_dir(prefix)` — create a fresh mode-0700 directory below the
+    /// platform-owned temporary root and return its absolute canonical path as an owned string.
+    FsCreatePrivateTempDir { prefix: Box<Expr> },
     /// `io.stdin` — a `reader` over fd 0. The `ty` is [`crate::Ty::Reader`] (an owned Move handle;
     /// its fd is borrowed, not closed on `Drop`). Constructing it is allocation only (pure), like
     /// `BuilderNew`; the *reads* are what is Impure.
@@ -1350,6 +1353,9 @@ pub enum ExprKind {
     FsExists { path: Box<Expr> },
     /// `fs.remove(path)` — delete the file at `path`. The `ty` is `Result<(), Error>`. Impure.
     FsRemove { path: Box<Expr> },
+    /// `fs.remove_empty_dir(path)` — remove exactly one empty directory through retained,
+    /// no-follow descriptor traversal. The absolute path is borrowed for the call.
+    FsRemoveEmptyDir { path: Box<Expr> },
     /// `fs.rename_no_replace(source, destination)` — atomically move one directory entry to an
     /// absent destination; the `ty` is `Result<(), Error>`. Both paths are borrowed for the call.
     /// Impure.

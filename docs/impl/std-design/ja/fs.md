@@ -1,7 +1,8 @@
 このファイルは、下記の `std.fs` 拡張を実装するための設計である。公開契約台帳は
 [`../27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) と
 [`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。Request 55 の single-link
-拡張は [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) が所有する。
+拡張は [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) が所有する。Request 56 の private
+temporary-directory lifecycle は [`../36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md) が所有する。
 
 # std.fs — 明示的な trusted filesystem 境界
 
@@ -11,7 +12,8 @@
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`、実装 PR #861 は
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
 > Request 18 の retained-root regular-file access は実装済みである。Request 55 の retained-root
-> single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。
+> single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。Request 56 の
+> private temporary-directory lifecycle は実装済みであり、release と align-llm 側 adoption が残る。
 
 ## 概要
 
@@ -26,7 +28,7 @@ fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 操作は独立しており Impure である。2 ファイルのトランザクション、新しい writer 型、既存の `writer`
 Move/`Drop` 契約の変更は導入しない。
 
-Request 18 は、1 つの retained root 配下の通常ファイルを扱う別の 2 操作を追加する。
+Request 18 と Request 55 は、1 つの retained root 配下の通常ファイルを扱う別の 3 操作を追加する。
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
@@ -36,6 +38,14 @@ fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 
 これらは root、途中、末尾の symlink を拒否し、保持した directory descriptor から走査する。公開
 directory-handle 型、metadata API、canonical path、sandbox、process-global root は追加しない。
+
+Request 56 の最後の 2 操作は platform が選ぶ private staging root を 1 つ作成し、caller が既知の child をすべて
+削除した後にだけ明示的に root を削除する。general directory creation や recursive cleanup とは別である。
+
+```text
+fs.create_private_temp_dir(prefix: str) -> Result<string, Error>
+fs.remove_empty_dir(path: str) -> Result<(), Error>
+```
 
 ## 公開契約
 
@@ -107,6 +117,33 @@ parent で close-on-exec と final no-follow を伴う native exclusive create �
 parent、temporary name、transaction、rename、rollback、durability state は作らない。これは 1 ファイルの
 retained-parent constructor であり、no-replace rename と C6f2 pair publication は引き続き Request 14 が所有する。
 
+### `create_private_temp_dir`
+
+`create_private_temp_dir` は 1..=64 byte の ASCII prefix を 1 つ受け取る。先頭 byte は英数字、残りは
+英数字、`_`、`-` に限る。application path や environment variable は読まない。Linux は `/tmp` から、macOS は
+platform-provided terminal slash を含む `confstr(_CS_DARWIN_USER_TEMP_DIR)` から開始する。その platform-owned
+spelling だけを canonicalize してから strict validation と retained no-follow traversal を行うため、macOS の
+`/var` compatibility symlink でも returned canonical absolute path を retained-root API が利用できる。
+
+candidate leaf は prefix、`-`、128 fresh OS-CSPRNG bit を表す 32 桁 lowercase hex である。mode `0700` の
+`mkdirat` 1 回で atomically claim し、umask は permission を狭めるだけで広げない。`EEXIST` のときだけ fresh
+suffix を生成し、最大 128 回とする。occupant の再利用や parent 作成は行わない。owned absolute path を返し、
+最初の create より前に result allocation を完了するため、failure は path も directory も残さない。
+
+### `remove_empty_dir`
+
+`remove_empty_dir` は empty、`.`、`..`、trailing slash component のない absolute strict path を 1 つ受け取る。
+すべての ancestor を retain/revalidate し、final directory も symlink を follow せず同じ identity を
+observe/open する。parent/final descriptor が live のまま `unlinkat(..., AT_REMOVEDIR)` を 1 回実行し、その
+syscall が名指す empty directory だけを削除する。recursive delete は行わず、symlink、file、special entry、
+nonempty directory は削除しない。
+
+この native removal が final namespace/type/emptiness の linearization point である。Linux/macOS には portable
+な open-directory-descriptor 指定 unlink がないため、final identity revalidation 後に empty directory へ
+差し替えられた場合はその名前が削除され得る。constructor が返した path では platform root と `0700` が他 user
+と accidental sharing を除外し、同じ OS identity の hostile process は capability 外である。shared non-sticky
+parent の任意 path にそれ以上の保証はない。
+
 ## パスと ABI の規則
 
 Request 14 の両操作の path view は呼び出し中だけ借用される。path は空でなく、有効な UTF-8 で、NUL を含まず、呼び出し中
@@ -162,12 +199,28 @@ align_rt_io_writer_create_exclusive_beneath(
 ) -> i32
 ```
 
+private-directory lifecycle は既存の A08/A04 shape を使う。
+
+```text
+align_rt_fs_create_private_temp_dir(
+    prefix_ptr: ptr, prefix_len: i64, out_path: ptr,
+) -> i32
+
+align_rt_fs_remove_empty_dir(
+    path_ptr: ptr, path_len: i64,
+) -> i32
+```
+
 検査順は output slot、root 全体の validation/copy/grammar、relative 全体の validation/copy/grammar、
 root traversal、relative-parent traversal、final operation とする。したがって不正な root grammar はすべての
 relative-view error より先になる。recoverable failure では両 slot とも
 null のままである。checked copy-size overflow は `Error.Invalid`、実際の OOM は terminal とする。完全な grammar
 検証後にだけ private な full-path copy を NUL 区切りの component storage にし、caller の byte は変更しない。
 走査中に live な directory descriptor は最大 2 つで、すべての path/component owner は call とともに終了する。
+
+constructor の A08 output は既存の owned-string slot である。runtime は最初に slot を検査して zero にし、
+`mkdirat` より前に正確な output を allocate する。removal の A04 input は absolute-only なので、constructor の
+output を current-directory race なしで消費する。両操作は別 HIR/MIR kind と runtime key を持つ。
 
 ## pair 公開の consumer
 
@@ -210,6 +263,13 @@ traversal component、non-regular input、identity change を `Error.Invalid` �
 や snapshot はない。open が不在を観測すれば `NotFound`、create 後なら writer が live の間に新しい regular inode
 を取得し得る。immutable input が必要な consumer はこの overlap を拒否しなければならない。
 
+private-directory 操作も `Impure` で、prefix/path operand は借用である。created path は通常の owned `string`
+なので move、return、branch/loop join、`?`、replacement、Drop は既存経路を使う。randomness と native
+create/remove failure は固定 error mapping に従い、create collision の `EEXIST` だけを retry する。removal
+failure は nonempty/mismatched entry を caller-owned cleanup のため観測可能なまま残す。random read の
+interrupt は retry し、negative failure は固定 native-error mapping、zero progress は stale `errno` ではなく
+`Invalid` とする。
+
 ## platform 境界と non-goal
 
 v1 の adoption floor は Linux の controlled local ext4/tmpfs filesystem と macOS の controlled local APFS filesystem である。
@@ -217,13 +277,17 @@ runtime は filesystem type を分類しない。NFS、FUSE、overlay、その�
 portable emulation はこの capability の外にある。adoption fixture は検査前に制御された filesystem 環境を記録し、
 unqualified 環境は `std.fs` が暗黙分類するのではなく consumer gate で除外する。
 
-transaction、journal、recovery daemon、process-global lock、temporary-name generator、公開 directory-handle
+Request 14/18/55 は transaction、journal、recovery daemon、process-global lock、temporary-name generator、公開 directory-handle
 capability、sandbox、replacement/exchange operation、durability guarantee は提供しない。Request 14 の path-only
 操作は通常の parent resolution を維持し、Request 18 の 2 constructor だけが上記の明示的 no-symlink
 regular-file 境界を提供する。
 
 Request 55 は metadata surface や永続的な immutability guarantee を追加しない。hard link を意図的に
 許可する caller のために `open_beneath` は変更しない。
+
+Request 56 は environment-sensitive temp root、caller root、directory handle、recursive create/remove、hidden
+cleanup、exit hook、quarantine registry、same-identity hostile-process defense を追加しない。general directory
+creation/listing/type predicate は Request 53 のままである。
 
 ## 実装と acceptance の境界
 
@@ -249,6 +313,11 @@ Request 55 の確定契約と implementation closure matrix は
 [`34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) にある。既存の A12 lowering と reader identity
 を再利用し、別 operation/runtime key と既存 stat record に対する descriptor-only link-count
 predicate を追加する。
+
+Request 56 は A08 owned-string constructor と A04 unit-result remover を 1 つずつ追加し、別々の
+HIR/MIR/runtime identity と完全な checked-HIR/whole/per-unit/export coverage を要求する。prefix、platform
+root、randomness、allocation-before-mutation、no-follow removal、race boundary、ownership の正確な matrix は
+[`36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md) にある。
 
 Request 18 も同じ cross-stage 規則を使う。`ReaderOpenBeneath` と `CreateExclusiveBeneath` の別 node、完全な
 visitor/validator/replay/MIR closure、正確な A12 runtime row と export parity、既存 handle Drop、
