@@ -3123,7 +3123,7 @@ real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` a
 `docs/impl/std-design/fs.md`. The independently reviewed design and the complete compiler/runtime
 capability are shipped; real-client adoption remains next and M9 remains closed.
 
-### Request 55 — retained-root single-link regular-file open (DESIGN CANDIDATE)
+### Request 55 — retained-root single-link regular-file open (DESIGN ACCEPTED)
 
 `std.fs` adds the distinct
 `fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>` constructor. It

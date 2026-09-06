@@ -799,9 +799,9 @@ whole/per-unit declarations, and rt-LTO inventory update in the same capability.
 contract and closure matrix are in
 `docs/impl/29-fs-retained-root-plan.md` and `docs/impl/std-design/fs.md`.
 
-## Request 55 retained-root single-link open (design candidate)
+## Request 55 retained-root single-link open (design accepted)
 
-Request 55 proposes one keyed record using existing ABI shape A12:
+Request 55 reserves one keyed record using existing ABI shape A12:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|

@@ -11,7 +11,7 @@
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`、実装 PR #861 は
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
 > Request 18 の retained-root regular-file access は実装済みである。Request 55 の retained-root
-> single-link open は設計候補であり、まだ実装されていない。
+> single-link open は設計承認済みであり、まだ実装されていない。
 
 ## 概要
 

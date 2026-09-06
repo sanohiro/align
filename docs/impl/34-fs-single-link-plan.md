@@ -1,6 +1,6 @@
 # `std.fs` retained-root single-link regular-file open
 
-Status: **DESIGN CANDIDATE for align-llm Request 55. Implementation has not begun.**
+Status: **DESIGN ACCEPTED for align-llm Request 55. Implementation has not begun.**
 
 This document is the authoritative public-contract ledger and implementation closure matrix for:
 
