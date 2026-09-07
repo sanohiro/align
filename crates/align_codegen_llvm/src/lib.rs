@@ -4785,6 +4785,14 @@ fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
     }
 }
 
+fn xml_borrowed_place_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
+    xml_ty_is_view_retype(actual, expected)
+        || matches!(
+            (actual, expected),
+            (Ty::Array(element, _), Ty::Slice(view)) if element == view
+        )
+}
+
 fn xml_dict_field_ty(program: &Program, id: u32, key: u32, index: u32) -> Option<Ty> {
     if program.structs.get(id as usize)?.fields.get(key as usize)?.ty != Ty::Str {
         return None;
@@ -5571,6 +5579,42 @@ impl<'a> XmlAccessAnalyzer<'a> {
         Self::add_required_source(equation, source, OperandRequirement::READ);
     }
 
+    /// Authenticate a read through the ordinary SSA forms or an exact traversable borrowed
+    /// projection. Keep the projection on this worklist so later stores cannot be hidden by a
+    /// parameter-entry shortcut; the read itself never transfers storage ownership.
+    fn check_read_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        let Operand::BorrowedPlace(place) = operand else {
+            self.check_operand(equation, operand, expected);
+            return;
+        };
+        let projection = self.graph.function.slots.get(place.slot as usize)
+            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path));
+        let Some((stored, path)) = projection else {
+            equation.invalid = true;
+            return;
+        };
+        if place.ty != expected
+            || (stored != expected && !xml_ty_is_view_retype(stored, expected))
+            || place.cleanup.is_some_and(|cleanup| {
+                self.graph.function.slots.get(cleanup as usize) != Some(&Ty::Bool)
+            })
+        {
+            equation.invalid = true;
+            return;
+        }
+        let source = self.queue(XmlAccessNode::Slot(place.slot, path));
+        Self::add_required_source(equation, source, OperandRequirement::READ);
+        if let Some(cleanup) = place.cleanup {
+            let cleanup = self.queue(XmlAccessNode::Slot(cleanup, Vec::new()));
+            Self::add_required_source(equation, cleanup, OperandRequirement::READ);
+        }
+    }
+
     fn check_whole_operand(
         &mut self,
         equation: &mut XmlAccessEquation,
@@ -5967,11 +6011,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return Vec::new();
         };
-        let view_retype = matches!(
-            (stored, expected),
-            (Ty::Array(element, _), Ty::Slice(view))
-                | (Ty::DynArray(element), Ty::Slice(view)) if element == view
-        );
+        let view_retype = xml_borrowed_place_ty_is_view_retype(stored, expected);
         if place.cleanup.is_some()
             || place.ty != expected
             || (stored != expected && !view_retype)
@@ -8482,7 +8522,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    self.check_operand(&mut equation, &operand, source_ty);
+                    self.check_read_operand(&mut equation, &operand, source_ty);
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
@@ -9603,7 +9643,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return;
                 }
-                self.check_operand(equation, name, Ty::Str);
+                self.check_read_operand(equation, name, Ty::Str);
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::FsReadDir { path: input, out } | Rvalue::DnsResolve { host: input, out } => {
@@ -10146,12 +10186,7 @@ fn xml_borrowed_access(
             let Some((selected, path)) = xml_borrowed_path(graph.program, root, &place.path) else {
                 return XmlProducerState::Invalid;
             };
-            let view_retype = matches!(
-                (selected, place.ty),
-                (Ty::Array(element, _), Ty::Slice(view))
-                    | (Ty::DynArray(element), Ty::Slice(view))
-                    if element == view
-            );
+            let view_retype = xml_borrowed_place_ty_is_view_retype(selected, place.ty);
             if selected != place.ty && !view_retype {
                 return XmlProducerState::Invalid;
             }
@@ -31263,6 +31298,99 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn producer_borrowed_option_payload_clone_returns_owned_value() {
+        let base = mir(r#"
+Record { content: Option<string>, owned: string }
+fn clone_record(borrow value: Record) -> Record {
+  return Record {
+    content: match value.content {
+      None => None,
+      Some(text) => Some(text.clone()),
+    },
+    owned: value.owned.clone(),
+  }
+}
+fn main() -> i32 = 0
+"#);
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let clone = xml_test_function(&base, "clone_record");
+        for axis in ["unreadable", "missing-slot", "wrong-path", "wrong-cleanup"] {
+            let mut malformed = base.clone();
+            let function = &mut malformed.fns[clone];
+            if axis == "unreadable" {
+                function.param_modes[0] = align_ast::ParamMode::Out;
+            } else {
+                let place = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::StrClone(Operand::BorrowedPlace(place))) => {
+                            Some(place.as_mut())
+                        }
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing borrowed string clone"));
+                match axis {
+                    "missing-slot" => place.slot = u32::MAX,
+                    "wrong-path" => place.path[0] = hir::BorrowedPathSegment::StructField(1),
+                    "wrong-cleanup" => place.cleanup = Some(u32::MAX),
+                    _ => panic!("unknown mutation axis"),
+                }
+            }
+            assert!(validate_mir_producers(&malformed).is_err(), "publication: {axis}");
+            assert_xml_producer_rejected(&malformed, axis);
+        }
+    }
+
+    #[test]
+    fn producer_imported_owned_option_result_survives_borrowed_match() {
+        let base = mir(r#"
+import std.env
+Record { present: bool, value: string }
+fn length(borrow value: string) -> i64 = value.len()
+fn load(borrow name: Option<string>) -> Record {
+  return match name {
+    None => Record { present: true, value: "".clone() },
+    Some(variable) => match env.get(variable) {
+      None => Record { present: false, value: "".clone() },
+      Some(value) => if length(value) == 0 {
+        Record { present: false, value: "".clone() }
+      } else {
+        Record { present: true, value: value }
+      },
+    },
+  }
+}
+fn main() -> i32 = 0
+"#);
+        let load = xml_test_function(&base, "load");
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        for axis in ["unreadable", "missing-slot", "wrong-path"] {
+            let mut malformed = base.clone();
+            let function = &mut malformed.fns[load];
+            if axis == "unreadable" {
+                function.param_modes[0] = align_ast::ParamMode::Out;
+            } else {
+                let place = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::EnvGet { name: Operand::BorrowedPlace(place), .. }) => {
+                            Some(place.as_mut())
+                        }
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing borrowed env name"));
+                match axis {
+                    "missing-slot" => place.slot = u32::MAX,
+                    "wrong-path" => place.path.push(hir::BorrowedPathSegment::OptionSome),
+                    _ => panic!("unknown environment projection mutation axis"),
+                }
+            }
+            assert!(validate_mir_producers(&malformed).is_err(), "publication: {axis}");
+            assert_xml_producer_rejected(&malformed, axis);
+        }
+    }
+
+    #[test]
     fn producer_fixed_point_preserves_guarded_absence_in_seeded_cycles() {
         let absent = XmlAccessNode::Value(0, Vec::new());
         let present = XmlAccessNode::Value(1, Vec::new());
@@ -31379,6 +31507,67 @@ fn main() -> i32 = 0
             assert!(validate_thin_partition_program(&program, &[]).is_ok(), "per-unit binder {owned} -> {view}");
             assert!(!xml_ty_is_view_retype(view_ty, source_ty), "views cannot mint owners");
         }
+    }
+
+    #[test]
+    fn producer_fixed_array_use_cannot_forge_slice_representation() {
+        let mut forged = mir(
+            "fn consume(values: slice<i64>) -> string = \"ok\".clone()\n\
+             fn forged(values: slice<i64>) -> string = consume(values)\n\
+             fn main() -> i32 = 0\n",
+        );
+        let forged_index = xml_test_function(&forged, "forged");
+        let element = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let array = Ty::Array(element, 2);
+        let slice = Ty::Slice(element);
+        let function = &mut forged.fns[forged_index];
+        let slot = u32::try_from(function.slots.len())
+            .unwrap_or_else(|_| panic!("fixed-array owner slot inventory exceeds u32"));
+        function.slots.push(array);
+        function.slot_align.push(None);
+        let array_value = xml_test_value(function, array);
+        let slice_value = xml_test_value(function, slice);
+        let call_position = function.blocks[0]
+            .stmts
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::CallWithCleanup(call))
+                        if call.target.as_str() == "consume"
+                )
+            })
+            .unwrap_or_else(|| panic!("fixed-array owner fixture omitted its owned call"));
+        let Stmt::Let(_, Rvalue::CallWithCleanup(call)) =
+            &mut function.blocks[0].stmts[call_position]
+        else {
+            panic!("fixed-array owner call changed shape")
+        };
+        call.args[0] = Operand::Value(slice_value);
+        function.blocks[0].stmts.splice(
+            call_position..call_position,
+            [
+                Stmt::StoreConstArray {
+                    slot,
+                    elems: vec![ConstElem::Int(1), ConstElem::Int(2)],
+                    elem: scalar_to_ty(element),
+                },
+                Stmt::Let(array_value, Rvalue::Load(slot)),
+                Stmt::Let(slice_value, Rvalue::Use(Operand::Value(array_value))),
+            ],
+        );
+        assert!(
+            !xml_ty_is_view_retype(array, slice),
+            "fixed arrays need MakeSlice and cannot be zero-cost Use retypes"
+        );
+        assert!(
+            xml_borrowed_place_ty_is_view_retype(array, slice),
+            "borrowed fixed-array descriptors retain their established slice view"
+        );
+        assert_xml_producer_rejected(&forged, "fixed array represented as a slice through Use");
     }
 
     #[test]
@@ -35272,6 +35461,36 @@ fn main() -> i32 = 0
                 assert_xml_producer_rejected(&malformed, &format!("{label}/{axis}"));
             }
         }
+    }
+
+    #[test]
+    fn producer_copy_place_accepts_owned_string_to_borrowed_view() {
+        let base = mir(r#"
+fn valid(value: str) -> bool = value.len() > 0
+fn inspect(borrow value: Option<string>) -> bool {
+  return match value {
+    None => true,
+    Some(text) => valid(text),
+  }
+}
+fn main() -> i32 = 0
+"#);
+        let inspect = xml_test_function(&base, "inspect");
+        let argument = base.fns[inspect].blocks.iter().flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Call(_, arguments)) => arguments.iter().find_map(|argument| {
+                    match argument {
+                        Operand::BorrowedPlace(place) => Some(place.as_ref()),
+                        _ => None,
+                    }
+                }),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing borrowed string-view argument"));
+        assert_eq!(argument.ty, Ty::Str);
+        assert!(matches!(argument.path.last(), Some(hir::BorrowedPathSegment::OptionSome)));
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
     }
 
     #[test]
