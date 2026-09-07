@@ -31567,22 +31567,27 @@ impl BorrowState {
         ended: impl std::ops::Fn(&BorrowRoot) -> bool,
     ) {
         // View headers can carry fallback roots without an entry in the legacy source maps.
-        // Snapshot their resolved roots before invalidating: a later generation replacement must
-        // not retarget an already-created view (for example, buffer bytes in an owned record).
+        // Keep generation/observation invalidation in the storage directory: resolving those here
+        // would invalidate an XML reader's own header when it advances to its next observation.
+        let fallback_roots = |headers: &ProjectedHeaderFact| -> BorrowRoots {
+            headers.leaves.values().flat_map(|leaf| {
+                leaf.fallback_roots.iter().filter_map(BorrowRoot::live)
+            }).collect()
+        };
         let header_roots = self
             .headers
             .iter()
-            .map(|(&local, headers)| (local, self.resolve_headers(headers).non_storage.live_roots()))
+            .map(|(&local, headers)| (local, fallback_roots(headers)))
             .collect::<Vec<_>>();
         let value_header_roots = self
             .value_headers
             .iter()
-            .map(|(&key, headers)| (key, self.resolve_headers(headers).non_storage.live_roots()))
+            .map(|(&key, headers)| (key, fallback_roots(headers)))
             .collect::<Vec<_>>();
         let pipeline_header_roots = self
             .pipeline_headers
             .iter()
-            .map(|(&key, headers)| (key, self.resolve_headers(headers).non_storage.live_roots()))
+            .map(|(&key, headers)| (key, fallback_roots(headers)))
             .collect::<Vec<_>>();
         let state = &mut *self.0;
         for (borrower, roots) in state

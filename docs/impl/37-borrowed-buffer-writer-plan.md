@@ -87,7 +87,10 @@ receiver forms. `slice_is_local` distinguishes borrowed buffer owners from
 frame-owned buffers, consistently with `borrowed_storage_cap`. Investigation
 also found that a byte-view header could retain parameter fallback roots without
 a legacy source-map entry; `BorrowState::invalidate_matching` now observes the
-resolved header roots for locals, eager value snapshots and pipeline snapshots.
+explicit header fallback roots for locals, eager value snapshots and pipeline
+snapshots. Directory-owned generation and observation roots stay under their
+existing invalidation path; resolving them into this fallback sweep would
+incorrectly invalidate an XML reader when it advances its own observation.
 Borrowed handle match bindings retain an explicit map to their original scrutinee
 root; a binding never becomes an independent source owner. The parameterized invalidation owner covers `Option`, `Result` and user
 sums as well as returned, retained and indirectly returned views. Neither change
