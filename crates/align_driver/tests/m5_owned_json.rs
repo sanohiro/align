@@ -1,9 +1,107 @@
-//! Requests 9 and 13: recursive records whose text leaves are free-standing owners.
+//! Requests 9, 13, and 52: recursive owned JSON and live encoder sources.
 
 mod common;
 use common::*;
 use std::fmt::Write as _;
 use std::process::{Command, Stdio};
+
+#[test]
+fn owned_json_encoders_reject_moved_sources() {
+    let declarations =
+        "pub Item { text: string }\npub Row<T> { value: T, name: string, count: Option<i64> }\n";
+    for encoder in ["json.encode(row)", "json.encode_bounded(row, 1024)"] {
+        for (payload, input, action) in [
+            ("string", "\"one\"", "taken := row"),
+            ("string", "\"one\"", "taken := row.name"),
+            (
+                "string",
+                "\"one\"",
+                "match row.value { Some(value) => print(value), None => () }",
+            ),
+            (
+                "array<schema.Item>",
+                "[{\"text\":\"one\"}]",
+                "match row.value { Some(value) => print(value.len()), None => () }",
+            ),
+            ("string", "\"one\"", "if flag { taken := row.name }"),
+            ("string", "\"one\"", "loop { taken := row.name; break }"),
+            (
+                "string",
+                "\"one\"",
+                "taken := row.value else { return Ok(()) }",
+            ),
+        ] {
+            let json = format!("{{\"value\":{input},\"name\":\"label\",\"count\":42}}");
+            let source = format!(
+                "import core.json\nimport schema\nfn inspect(flag: bool) -> Result<(), Error> {{\n\
+                 row: schema.Row<Option<{payload}>> := json.decode({json:?})?\n\
+                 {action}\nencoded := {encoder}\nreturn Ok(())\n}}\n\
+                 fn main() -> Result<(), Error> = inspect(true)\n"
+            );
+            let checked = diff_check_multi(
+                "owned-json-moved-source",
+                &[("main.align", &source), ("schema.align", declarations)],
+                "main.align",
+            );
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(
+                    diagnostics.contains("use of moved value 'row'"),
+                    "{encoder} after {action} ({payload}) must reject the root read:\n{diagnostics}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn owned_json_encoders_preserve_live_sources() {
+    let source = r#"
+import core.json
+Item { text: string }
+Row { value: Option<array<Item>>, count: Option<i64> }
+fn inspect(borrow row: Row) -> i64 = match row.value {
+  Some(values) => values.len(), None => 0
+}
+fn main() -> Result<(), Error> {
+  mut row: Row := json.decode("{\"value\":[{\"text\":\"one\"}],\"count\":42}")?
+  print(inspect(row))
+  print(match row.count { Some(value) => value, None => 0 })
+  print(json.encode(row))
+  bounded := json.encode_bounded(row, 1024)?
+  print(bounded)
+  taken := row
+  row = Row { value: None, count: Some(7) }
+  print(json.encode(row))
+  replaced := json.encode_bounded(row, 1024)?
+  print(replaced)
+  return Ok(())
+}
+"#;
+    let checked = diff_check_multi(
+        "owned-json-live-source",
+        &[("main.align", source)],
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("owned-json-live-source", source);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n42\n{\"value\":[{\"text\":\"one\"}],\"count\":42}\n{\"value\":[{\"text\":\"one\"}],\"count\":42}\n{\"count\":7}\n{\"count\":7}\n"
+    );
+}
 
 #[test]
 fn recursive_owned_json_c6_graph_manifest() {

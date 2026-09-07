@@ -1343,3 +1343,40 @@ complete-manifest and authoritative-ledger findings:
 | P1: the C6 record-name list did not fix the complete field/type/order graph, omitted `PromptEvaluationTask` and `RegressionLimits`, and left two incompatible `ContextPolicy` forms | Pin the clean sibling commit, Git blob, and file digest; materialize the authoritative 50-record/543-field Align manifest; include every dependency; select the seven-field C6b-memory policy explicitly; and require generated field/type/order/dependency assertions and per-root goldens. |
 | P2: the runtime ABI summary and machine owners retained the pre-Request-9 293/306/314 counts | Synchronize the current ledger to 294/307/315, the feature totals to 311/315, the runtime source-inventory assertion to 307, and the export/signature gate to the same exact counts. No ABI row or runtime behavior changes. |
 | P2: the native-boundary plan still called Request 13 hypothetical and deferred its bounded parity owners | Link the accepted plan from the Request 12 ledger and matrix, preserve shipped flat behavior until implementation, and assign the atomic V2 `encode`/`encode_bounded` parity and limit owners to Request 13. |
+
+## 13. Request 52 — moved encoder source closure
+
+Current-source reproduction at `61f05b07` confirms the report: after consuming
+`row.value: Option<array<Item>>` with a Move `Item` payload, owned JSON encode
+accepts `row` and emits `{}`. Borrowed inspection preserves the field, and Copy
+`Option<i64>` inspection preserves its value. MoveCheck already records the
+partial move; both owned encoder nodes store a root local directly and check
+borrow validity without checking that root's moved state. This is a consumer
+of an existing ownership fact, not a new match or serialization contract.
+
+The repair is one semantic-checker capability. Both owned encoders must read
+their root through the ordinary whole/partial-move check before borrow checking;
+bounded encode must still check its limit. No HIR shape, ABI, allocation,
+source nulling, Drop, interface format, or runtime writer changes.
+
+| Closure axis | Implementation and owner evidence |
+|---|---|
+| Formation, construction, malformed graph | Existing V2 classifier and checked-HIR mutation owners remain authoritative; this repair operates on an already-formed root local. |
+| Whole move, field move, Option extraction, return and source nulling | Existing MoveCheck records remain authoritative; `owned_json_encoders_reject_moved_sources` crosses both encoders with whole-record transfer, string-field transfer, Option string/array extraction and control joins. Both whole-program and per-unit checking must reject at the encoder root. |
+| `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, early exits | The guard consumes the existing joined `MovedSet`; the same parameterized owner covers continuing moved branches and loop exits. Existing `owned_json_result_transfer_control_flow_replacement_and_drop_matrix` and tagged-payload owners retain the unchanged producer/cleanup paths; no control-flow join algorithm changes. |
+| Borrowed inspection, Copy fields, replacement and output return | `owned_json_encoders_preserve_live_sources` checks accepted borrowed and Copy inspection, reinitialization after a move, and both encoder outputs. Existing canonical round-trip/transfer owners retain allocation and cleanup parity. |
+| Generic/imported and whole/per-unit compilation | The negative owner uses an imported generic record declaration and both checkers; source ownership is checked before interface/codegen consumption. No serialized ownership fact changes. |
+| Runtime ownership, Drop, allocation and artifact identity | Unchanged runtime and MIR; existing owned JSON round-trip and transfer owners apply. Ordinary compiler-source cache identity invalidates affected artifacts. No performance claim or benchmark is introduced. |
+
+Author-side obligation mapping: §1's borrowed unchanged live source is enforced
+by the root moved-state guard and the live-source owner; §8's bounded limit
+checking remains after the root check; §9's whole/per-unit and control-path
+requirements are covered by the parameterized owner and the reused producer
+owners above. The preflight review checks this boundary with the implementation.
+
+The full `m5_owned_json` owner passes. The supporting `owned_tagged_payloads`
+suite passes 60/61: `origin_specific_generic_instances_share_one_tagged_llvm_type`
+fails producer-return certification in `pick`, without any JSON operation.
+The same fixture fails with the preserved pre-repair release compiler. This is
+an existing MIR producer/type-identity defect owned by that test, not evidence
+against the encoder guard; retain it for a separate investigation.
