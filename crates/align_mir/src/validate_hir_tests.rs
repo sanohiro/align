@@ -17997,7 +17997,7 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
 }
 
 #[test]
-fn borrowed_handle_receiver_hir_rejects_forged_places() {
+fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static str> {
     let program = checked_source_program(
         "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn main() {}\n",
     );
@@ -18009,8 +18009,8 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() {
                 .fns
                 .iter_mut()
                 .find(|f| f.name == name)
-                .expect("receiver function");
-            let value = function.body.value.as_mut().expect("receiver expression");
+                .ok_or("receiver function")?;
+            let value = function.body.value.as_mut().ok_or("receiver expression")?;
             let receiver = match &mut value.kind {
                 hir::ExprKind::BufferLen { buffer } => buffer,
                 hir::ExprKind::WriterFlush { writer } => writer,
@@ -18030,4 +18030,5 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() {
             );
         }
     }
+    Ok(())
 }
