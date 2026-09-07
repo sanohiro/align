@@ -43609,14 +43609,20 @@ impl<'a> MoveCheck<'a> {
                 }
                 move_expr!(self, max_bytes, moved, false, false);
             }
-            ExprKind::JsonOwnedEncode { base, .. } => {
-                self.check_borrow_use(*base, e.span);
-            }
-            ExprKind::JsonOwnedEncodeBounded {
-                base, max_bytes, ..
-            } => {
-                self.check_borrow_use(*base, e.span);
-                move_expr!(self, max_bytes, moved, false, false);
+            ExprKind::JsonOwnedEncode { base, .. }
+            | ExprKind::JsonOwnedEncodeBounded { base, .. } => {
+                // These nodes store their root directly, so no Local child checks the read.
+                // Encoding borrows the complete record, including every partially moved field.
+                if whole_moved(moved, *base) {
+                    let name = self.f.locals.get(*base as usize)
+                        .map_or("<unknown>", |local| local.name.as_str());
+                    self.diags.error(format!("use of moved value '{name}'"), e.span);
+                } else {
+                    self.check_borrow_use(*base, e.span);
+                }
+                if let ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } = &e.kind {
+                    move_expr!(self, max_bytes, moved, false, false);
+                }
             }
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonOwnedDecode { input, .. }
