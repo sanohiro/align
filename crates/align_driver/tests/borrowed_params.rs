@@ -153,6 +153,72 @@ fn borrowed_sum_match_imported_body_matches_whole_program() {
 }
 
 #[test]
+fn borrowed_sum_payload_clone_returns_owned_aggregate_whole_and_per_unit() {
+    if !backend_available() {
+        return;
+    }
+    let files = &[
+        (
+            "clones.align",
+            r#"module clones
+pub Record { content: Option<string>, owned: string }
+pub fn clone_record(borrow value: Record) -> Record {
+  return Record {
+    content: match value.content {
+      None => None,
+      Some(text) => Some(text.clone()),
+    },
+    owned: value.owned.clone(),
+  }
+}
+fn valid(value: str) -> bool = value.len() > 0
+pub fn inspect(borrow value: Option<string>) -> bool {
+  return match value {
+    None => true,
+    Some(text) => valid(text),
+  }
+}
+"#,
+        ),
+        (
+            "main.align",
+            r#"import clones
+fn main() -> i32 {
+  present := clones.Record { content: Some("payload".clone()), owned: "owner".clone() }
+  absent := clones.Record { content: None, owned: "empty".clone() }
+  first := clones.clone_record(present)
+  second := clones.clone_record(absent)
+  present_valid := clones.inspect(present.content)
+  absent_valid := clones.inspect(absent.content)
+  first_len := match first.content { Some(text) => text.len(), None => 0 }
+  second_len := match second.content { Some(text) => text.len(), None => 0 }
+  original_len := match present.content { Some(text) => text.len(), None => 0 }
+  if present_valid && absent_valid &&
+    first_len == 7 && second_len == 0 && original_len == 7 &&
+    first.owned.len() == 5 && second.owned.len() == 5 && present.owned.len() == 5 {
+    return 42
+  }
+  return 0
+}
+"#,
+        ),
+    ];
+    assert_eq!(
+        build_and_run_multi("borrowed-sum-clone-return-whole", files, "main.align")
+            .status
+            .code(),
+        Some(42),
+    );
+    assert_eq!(
+        build_per_unit_multi("borrowed-sum-clone-return-per-unit", files, "main.align")
+            .link_and_run()
+            .status
+            .code(),
+        Some(42),
+    );
+}
+
+#[test]
 fn borrowed_sum_match_uses_pointer_projections_without_move_cleanup() {
     let source = "\
 Content { Text(string), Empty }\n\
