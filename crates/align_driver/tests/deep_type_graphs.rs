@@ -73,7 +73,7 @@ fn emit_llvm_raw_optimized_and_run(
         false,
     )
     .expect("emit object file");
-    link_executable(&object, &executable, &mir.link_libs, Profile::Release)
+    link_executable(&align_driver::CDriver::default(), &object, &executable, &mir.link_libs, Profile::Release)
         .expect("link executable");
     let output = std::process::Command::new(&executable)
         .output()

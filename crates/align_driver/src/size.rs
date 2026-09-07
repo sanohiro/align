@@ -26,7 +26,7 @@ const TOP_SYMBOLS: usize = 10;
 
 /// `alignc size <file>`: build with `profile`, then print the size breakdown of the executable.
 #[allow(clippy::too_many_arguments)]
-pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
+pub fn run_size(cc: &align_driver::CDriver, path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
     // Keep the complete executable private through the report. Another `size` process cannot
     // replace or remove it while llvm-readobj/llvm-nm are inspecting it.
     let stage = match align_driver::ArtifactStage::temp("align-size") {
@@ -38,7 +38,7 @@ pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool,
     };
     let exe = stage.path().join("program");
     // Build via the per-unit path (M15 S2b), then report on the single final executable.
-    if let Err(code) = crate::build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
+    if let Err(code) = crate::build_per_unit_to(cc, path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
         return code;
     }
     let res = report(&exe, profile);

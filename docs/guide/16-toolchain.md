@@ -90,7 +90,19 @@ The compiler prints the actual raw-profile destination. Instrument and use modes
 
 ## The linker
 
-`alignc` links through the system C driver. On ELF targets it additionally asks that driver to run LLVM's `ld.lld`, which ships inside the LLVM toolchain `alignc` already requires, so nothing new needs installing. `ALIGNC_LINKER` pins the choice:
+Use `--cc /absolute/path/to/cc` (or `--cc=/absolute/path/to/cc`) to select an
+explicit C driver for `build`, `run`, `size`, or `test`. Specify it once, anywhere
+before `--`; only `run` accepts that delimiter, and arguments after it belong
+to the program. Other verbs reject the delimiter before doing work. The UTF-8 path must
+name an executable regular file; missing, relative, duplicate, and inapplicable
+selections fail before compilation. Spaces and symlinks are accepted without
+shell expansion. The selected path is used directly, without a `PATH` fallback,
+and is retained across `build --watch` revisions. Omission keeps normal `cc`
+lookup. This selects the driver only: its own linker/tool discovery, stripping,
+and size inspection still need their normal toolchain configuration. It does
+not authenticate executable bytes or prevent replacement after validation.
+
+By default, `alignc` links through the system C driver. On ELF targets it additionally asks the selected driver to run LLVM's `ld.lld`, which ships inside the LLVM toolchain `alignc` already requires, so nothing new needs installing. `ALIGNC_LINKER` pins the choice:
 
 ```text
 ALIGNC_LINKER=lld       ELF: use ld.lld, or fail loudly if none is found

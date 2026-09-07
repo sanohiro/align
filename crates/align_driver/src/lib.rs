@@ -8013,7 +8013,7 @@ impl FunctionThinLtoBuild {
         Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(argument)))
     }
 
-    pub fn link_and_publish(self, exe: &std::path::Path) -> Result<(), String> {
+    pub fn link_and_publish(self, cc: &crate::CDriver, exe: &std::path::Path) -> Result<(), String> {
         let response = self.response_argument()?;
         let parent = exe
             .parent()
@@ -8025,18 +8025,20 @@ impl FunctionThinLtoBuild {
             exe.file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("program")),
         );
-        link_objects(&[response.as_path()], &staged, &self.link_libs, self.profile)?;
+        link_objects(cc, &[response.as_path()], &staged, &self.link_libs, self.profile)?;
         std::fs::rename(&staged, exe)
             .map_err(|error| format!("cannot publish executable {}: {error}", exe.display()))
     }
 
     pub fn link_and_publish_with_output(
         self,
+        cc: &CDriver,
         exe: &std::path::Path,
         sink: &mut dyn LinkOutputSink,
     ) -> Result<(), String> {
         let response = self.response_argument()?;
         link_objects_with_output(
+            cc,
             &[response.as_path()],
             exe,
             &self.link_libs,
@@ -8234,6 +8236,7 @@ mod function_thin_unit_tests {
         let response_argument = PathBuf::from(std::ffi::OsString::from_vec(argument));
         let executable = stage.path().join("response-executable");
         link_objects(
+            &crate::CDriver::default(),
             &[response_argument.as_path()],
             &executable,
             &[],
@@ -8678,14 +8681,51 @@ pub fn unknown_exports<'a>(mir: &align_mir::Program, exports: &'a [String]) -> V
         .collect()
 }
 
-/// Link an object into an executable. Uses the system C compiler (`cc`); crt0 calls
+/// Immutable C-driver selection. Explicit paths are validated before compiler side effects;
+/// filesystem replacement after validation is still a normal launch failure, never a fallback.
+#[derive(Clone, Debug)]
+pub struct CDriver(std::path::PathBuf);
+
+impl Default for CDriver {
+    fn default() -> Self {
+        Self("cc".into())
+    }
+}
+
+impl CDriver {
+    pub fn explicit(path: std::path::PathBuf) -> Result<Self, String> {
+        let text = path.to_str().ok_or_else(|| "--cc requires a UTF-8 path".to_string())?;
+        if text.is_empty() || !path.is_absolute() || text.contains('\0') {
+            return Err("--cc requires a nonempty absolute path without NUL".into());
+        }
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("--cc cannot inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("--cc is not a regular file: {}", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(format!("--cc is not executable: {}", path.display()));
+            }
+        }
+        Ok(Self(path))
+    }
+
+    pub fn program(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Link an object into an executable using the selected C driver; crt0 calls
 /// the generated `main` as the entry point (`docs/impl/01-pipeline.md`: driver links).
 ///
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too. Being a
 /// Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m` on ELF; on Mach-O
 /// they are libSystem re-exports — see [`support_libs`]).
-pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
-    link_objects(&[obj], exe, link_libs, profile)
+pub fn link_executable(cc: &crate::CDriver, obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+    link_objects(cc, &[obj], exe, link_libs, profile)
 }
 
 /// Return the link-library list with an ordered supported libpq closure tail.
@@ -8716,8 +8756,8 @@ pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
-pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
-    link_objects_inner(objs, exe, link_libs, profile, None)
+pub fn link_objects(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+    link_objects_inner(cc, objs, exe, link_libs, profile, None)
 }
 
 /// [`link_objects`] for an instrument-PGO (`--pgo-instrument`) build: additionally links the clang
@@ -8728,13 +8768,14 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
 /// succeeds silently and no profile is ever written — exactly the flag clang's own driver injects
 /// (measured at PGO S0, `docs/impl/07-roadmap.md`).
 pub fn link_objects_instrumented(
+    cc: &crate::CDriver,
     objs: &[&std::path::Path],
     exe: &std::path::Path,
     link_libs: &[String],
     profile: Profile,
     profile_rt: &std::path::Path,
 ) -> Result<(), String> {
-    link_objects_inner(objs, exe, link_libs, profile, Some(profile_rt))
+    link_objects_inner(cc, objs, exe, link_libs, profile, Some(profile_rt))
 }
 
 /// Everything one link is made of — the complete input to [`link_command_args`].
@@ -8831,7 +8872,7 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     args
 }
 
-fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
+fn link_objects_inner(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
     let ordered_link_libs = order_link_libs(link_libs);
@@ -8839,7 +8880,7 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     // only, and optimization-neutral: `ld.lld` produces an equally optimized image, just faster.
     // Resolved before any argv is built so a requested-but-missing lld fails before the link starts.
     let linker = select_linker(format)?;
-    let mut cmd = std::process::Command::new("cc");
+    let mut cmd = std::process::Command::new(cc.program());
     cmd.args(link_command_args(&LinkPlan {
         objs,
         exe,
@@ -8852,7 +8893,7 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     }));
     let status = cmd
         .status()
-        .map_err(|e| format!("cannot launch cc: {e}"))?;
+        .map_err(|e| format!("cannot launch {}: {e}", cc.program().display()))?;
     if !status.success() {
         return Err(link_failure_message(status.code(), &ordered_link_libs, &linker));
     }

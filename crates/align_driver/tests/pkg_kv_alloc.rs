@@ -922,7 +922,7 @@ fn pkg_kv_allocation_link_child() {
     let executable = PathBuf::from(
         std::env::var_os(LINK_EXE_ENV).expect("missing allocation link-child executable"),
     );
-    link_objects(&object_refs, &executable, &libraries, Profile::Release)
+    link_objects(&align_driver::CDriver::default(), &object_refs, &executable, &libraries, Profile::Release)
         .expect("link pkg.kv allocation executable");
 }
 

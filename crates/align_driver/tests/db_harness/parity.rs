@@ -239,7 +239,7 @@ impl ParityProgram {
         let exe = proj
             .dir
             .join(format!("parity{}", std::env::consts::EXE_SUFFIX));
-        link_objects(&refs, &exe, &link_libs, Profile::Release).expect("link parity program");
+        link_objects(&align_driver::CDriver::default(), &refs, &exe, &link_libs, Profile::Release).expect("link parity program");
         ParityProgram {
             label: tag.to_string(),
             exe,

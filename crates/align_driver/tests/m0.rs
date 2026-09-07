@@ -63,7 +63,7 @@ fn m0_compiles_and_runs_with_exit_code() {
         false,
     )
     .expect("codegen");
-    align_driver::link_executable(&obj, &exe, &mir.link_libs, align_driver::Profile::Release)
+    align_driver::link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, align_driver::Profile::Release)
         .expect("link");
 
     let status = std::process::Command::new(&exe).status().expect("run");

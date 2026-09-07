@@ -126,7 +126,7 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
         .status()
         .expect("launch cc");
     assert!(cc_status.success(), "compiling the C helper failed");
-    link_objects(&[&a_obj, &c_obj], &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_objects(&align_driver::CDriver::default(), &[&a_obj, &c_obj], &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
 }
 
@@ -237,7 +237,7 @@ fn emit_link_run(
         false,
     )
     .expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let mut command = std::process::Command::new(&exe);
     command.args(prog_args);
     for (key, value) in envs {
@@ -283,7 +283,7 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
         false,
     )
     .expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExe {
         exe: exe.clone(),
         _artifacts: TempArtifacts { obj, exe },
@@ -475,7 +475,7 @@ pub fn build_and_run_multi_args_with_env(
         false,
     )
     .expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let mut command = std::process::Command::new(&exe);
     command.args(&prog_args);
     for &(key, value) in envs {
@@ -534,7 +534,7 @@ pub fn build_and_run_multi_with_static_descriptors_args_with_env(
         false,
     )
     .expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let mut command = std::process::Command::new(&exe);
     command.args(&prog_args);
     for &(key, value) in envs {
@@ -623,7 +623,7 @@ pub fn build_and_run_multi_with_c(
     );
     objects.push(c_obj);
     let object_refs: Vec<&std::path::Path> = objects.iter().map(PathBuf::as_path).collect();
-    link_objects(&object_refs, &exe, &link_libs, Profile::Release)
+    link_objects(&align_driver::CDriver::default(), &object_refs, &exe, &link_libs, Profile::Release)
         .expect("link Align and C fixture");
     std::process::Command::new(&exe).output().expect("run")
 }
@@ -684,7 +684,7 @@ pub fn build_exe_multi(name: &str, files: &[(&str, &str)], entry: &str) -> Built
         false,
     )
     .expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExeMulti { exe, _proj: proj }
 }
 
@@ -796,7 +796,7 @@ impl PerUnitBuilt {
         let objs = self.emit_objects(false);
         let obj_refs: Vec<&std::path::Path> = objs.iter().map(|p| p.as_path()).collect();
         let exe = self.dir.join(format!("a{}", std::env::consts::EXE_SUFFIX));
-        link_objects(&obj_refs, &exe, &self.link_libs_union(), Profile::Release).expect("link");
+        link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &self.link_libs_union(), Profile::Release).expect("link");
         std::process::Command::new(&exe).output().expect("run")
     }
 
@@ -1173,7 +1173,7 @@ impl ThinBuilt {
     fn link_to(&self, proj: &Proj) -> PathBuf {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
         let exe = proj.dir.join(format!("exe-{}", thin_nonce()));
-        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
+        link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
         exe
     }
     /// Link + read the exe bytes, at a FIXED per-project path rather than [`Self::link_to`]'s
@@ -1190,7 +1190,7 @@ impl ThinBuilt {
     pub fn exe_bytes(&self, proj: &Proj) -> Vec<u8> {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
         let exe = proj.dir.join("exe-byte-identity");
-        link_objects(&obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
+        link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &self.link_libs, Profile::Release).expect("link");
         std::fs::read(&exe).expect("read exe")
     }
     /// Link + run; returns stdout. Caller must have checked `cc_available()`.

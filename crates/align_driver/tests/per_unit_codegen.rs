@@ -335,7 +335,7 @@ fn gate_d_capability_union_is_libz_only() {
     // Lives inside `per.dir` (the project's temp dir), so it is removed automatically when `per`
     // drops — no separate cleanup guard needed.
     let exe = per.dir.join(format!("align-gd{}", std::env::consts::EXE_SUFFIX));
-    link_objects(&obj_refs, &exe, &libs, Profile::Release).expect("link");
+    link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &libs, Profile::Release).expect("link");
     if let Some(readobj) = align_driver::llvm_tool("llvm-readobj") {
         let needed = needed_libs(&readobj, &exe);
         assert!(needed.iter().any(|l| is_lib(l, "z")), "binary must need libz: {needed:?}");

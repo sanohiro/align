@@ -128,6 +128,7 @@ fn last_errno() -> i32 {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_watch_build(
+    cc: &align_driver::CDriver,
     path: &str,
     target: BuildTarget,
     profile: Profile,
@@ -191,6 +192,7 @@ pub(super) fn run_watch_build(
             return finish_transcript_failure(watcher.take(), error);
         }
         let attempt = match build_revision(
+            cc,
             &input,
             &output,
             target.clone(),
@@ -434,6 +436,7 @@ struct RevisionResult {
 
 #[allow(clippy::too_many_arguments)]
 fn build_revision(
+    cc: &align_driver::CDriver,
     input: &Path,
     output: &Path,
     target: BuildTarget,
@@ -448,6 +451,7 @@ fn build_revision(
 ) -> Result<RevisionResult, String> {
     if thin_lto {
         build_thin_revision(
+            cc,
             input,
             output,
             target,
@@ -460,6 +464,7 @@ fn build_revision(
         )
     } else {
         build_ordinary_revision(
+            cc,
             input,
             output,
             target,
@@ -476,6 +481,7 @@ fn build_revision(
 
 #[allow(clippy::too_many_arguments)]
 fn build_ordinary_revision(
+    cc: &align_driver::CDriver,
     input: &Path,
     output: &Path,
     target: BuildTarget,
@@ -555,6 +561,7 @@ fn build_ordinary_revision(
                     .map(align_driver::PipelinedBuiltUnit::object)
                     .collect();
                 return finalize_and_link(
+                    cc,
                     inputs, output, &objects, &link_libs, profile, pgo, &target, signal, transcript,
                 );
             }
@@ -587,6 +594,7 @@ fn merge_if_retry(
 
 #[allow(clippy::too_many_arguments)]
 fn build_thin_revision(
+    cc: &align_driver::CDriver,
     input: &Path,
     output: &Path,
     target: BuildTarget,
@@ -634,6 +642,7 @@ fn build_thin_revision(
         record_function_thin_cache_stats(transcript, &build, cache.codegen_is_enabled())?;
     }
     finalize_and_link_function_thin(
+        cc,
         inputs,
         output,
         build,
@@ -644,6 +653,7 @@ fn build_thin_revision(
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_and_link(
+    cc: &align_driver::CDriver,
     inputs: BuildInputSet,
     output: &Path,
     objects: &[&Path],
@@ -706,6 +716,7 @@ fn finalize_and_link(
                     )
                     .map_err(io_text)?;
                 align_driver::link_objects_instrumented_with_output(
+                    cc,
                     objects,
                     output,
                     link_libs,
@@ -717,7 +728,7 @@ fn finalize_and_link(
             Err(error) => Err(error),
         }
     } else {
-        align_driver::link_objects_with_output(objects, output, link_libs, profile, &mut sink)
+        align_driver::link_objects_with_output(cc, objects, output, link_libs, profile, &mut sink)
     };
     if let Some(error) = sink.first_error.take() {
         return Err(error);
@@ -757,7 +768,9 @@ fn finalize_and_link(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_and_link_function_thin(
+    cc: &align_driver::CDriver,
     inputs: BuildInputSet,
     output: &Path,
     build: align_driver::FunctionThinLtoBuild,
@@ -801,7 +814,7 @@ fn finalize_and_link_function_thin(
         signal,
         first_error: None,
     };
-    let link = build.link_and_publish_with_output(output, &mut sink);
+    let link = build.link_and_publish_with_output(cc, output, &mut sink);
     if let Some(error) = sink.first_error.take() {
         return Err(error);
     }

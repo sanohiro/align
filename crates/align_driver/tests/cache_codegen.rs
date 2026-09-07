@@ -152,7 +152,7 @@ impl Emitted {
     fn run(&self, proj: &Project, profile: Profile) -> String {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
         let exe = proj.dir.join(format!("exe-{}", nonce()));
-        link_objects(&obj_refs, &exe, &self.link_libs, profile).expect("link");
+        link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &self.link_libs, profile).expect("link");
         let out = std::process::Command::new(&exe).output().expect("run");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -168,7 +168,7 @@ impl Emitted {
     fn exe_bytes(&self, proj: &Project, profile: Profile) -> Vec<u8> {
         let obj_refs: Vec<&Path> = self.objs.iter().map(|p| p.as_path()).collect();
         let exe = proj.dir.join("exe-byte-identity");
-        link_objects(&obj_refs, &exe, &self.link_libs, profile).expect("link");
+        link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &self.link_libs, profile).expect("link");
         std::fs::read(&exe).expect("read exe")
     }
 }

@@ -258,16 +258,18 @@ impl ToolStage {
 }
 
 pub fn link_objects_with_output(
+    cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
     link_libs: &[String],
     profile: Profile,
     sink: &mut dyn LinkOutputSink,
 ) -> Result<(), String> {
-    link_captured(objs, exe, link_libs, profile, None, sink)
+    link_captured(cc, objs, exe, link_libs, profile, None, sink)
 }
 
 pub fn link_objects_instrumented_with_output(
+    cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
     link_libs: &[String],
@@ -275,10 +277,11 @@ pub fn link_objects_instrumented_with_output(
     profile_rt: &Path,
     sink: &mut dyn LinkOutputSink,
 ) -> Result<(), String> {
-    link_captured(objs, exe, link_libs, profile, Some(profile_rt), sink)
+    link_captured(cc, objs, exe, link_libs, profile, Some(profile_rt), sink)
 }
 
 fn link_captured(
+    cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
     link_libs: &[String],
@@ -306,7 +309,7 @@ fn link_captured(
         profile_rt,
         linker: &linker,
     });
-    let status = match run_captured("cc", &args, sink) {
+    let status = match run_captured(cc.program(), &args, sink) {
         Ok(status) => status,
         Err(error) => {
             drop(lease);
@@ -345,12 +348,13 @@ fn link_captured(
 }
 
 fn run_captured(
-    program: &str,
+    program: impl AsRef<std::ffi::OsStr>,
     args: &[std::ffi::OsString],
     sink: &mut dyn LinkOutputSink,
 ) -> Result<ExitStatus, String> {
     use std::os::unix::process::CommandExt;
 
+    let program = program.as_ref();
     let mut command = Command::new(program);
     let (stdout, child_stdout) =
         child_output_pipe().map_err(|error| format!("child wait setup: stdout pipe: {error}"))?;
@@ -369,7 +373,7 @@ fn run_captured(
     }
     let child = command
         .spawn()
-        .map_err(|error| format!("cannot launch {program}: {error}"))?;
+        .map_err(|error| format!("cannot launch {program:?}: {error}"))?;
     drop(command);
     let mut child = CapturedChildGuard::new(child, stdout, stderr)?;
     let pid = child.pid;
@@ -1298,6 +1302,7 @@ mod tests {
         assert!(status.success());
         let mut sink = Sink::default();
         link_objects_with_output(
+            &crate::CDriver::default(),
             &[object.as_path()],
             &executable,
             &[],

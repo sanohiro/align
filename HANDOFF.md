@@ -89,12 +89,14 @@ Request 54's ELF static-library link failure was also reproduced: automatic
 support libraries now follow every runtime, PGO, capability and user archive;
 the existing libpq closure and Mach-O support list are unchanged. Item 2 of
 `docs/impl/21-build-perf-plan.md` owns that repair (PR #971).
-The owner prioritizes align-llm's blocking issues #966 (Request 59) and #968
-(Request 60) next. Request 59's canonical Copy projection call repair follows
+Request 59's blocking issue #966 is fixed in PR #972. Its canonical Copy projection call repair follows
 `docs/impl/xml-producer-investigation.md`: retain the complete selected storage
 proof while accepting the existing by-value borrowed descriptor representation.
-Request 60 then owns an explicit absolute C-driver option for closed-environment
-builds. Deliver commit revisions and issue reports, not versioned releases.
+Request 60 (#968) owns an explicit absolute C-driver option for closed-environment
+builds across build/run/size/test, ThinLTO, PGO, and watch. Item 2 of
+`docs/impl/21-build-perf-plan.md` records its exact selection and validation
+contract; driver-internal tool discovery remains caller configuration.
+Deliver commit revisions and issue reports, not versioned releases.
 The existing `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
 producer-return failure recorded during Request 52 verification remains deferred
 behind those consumer blockers. align-llm consumer changes remain outside this work.

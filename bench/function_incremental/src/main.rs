@@ -359,7 +359,7 @@ fn run_parity() -> Result<(), String> {
         .iter()
         .map(PathBuf::as_path)
         .collect::<Vec<_>>();
-    link_objects(&unit_refs, &unit_exe, &libraries, Profile::Release)?;
+    link_objects(&align_driver::CDriver::default(), &unit_refs, &unit_exe, &libraries, Profile::Release)?;
 
     let function_cache = CacheContext::at(root.path().join("function-cache"));
     let function_exe = root.path().join("function");
@@ -372,7 +372,7 @@ fn run_parity() -> Result<(), String> {
         false,
         4,
     )?
-    .link_and_publish(&function_exe)?;
+    .link_and_publish(&align_driver::CDriver::default(), &function_exe)?;
 
     let off_exe = root.path().join("function-cache-off");
     build_function_thin_lto(
@@ -384,7 +384,7 @@ fn run_parity() -> Result<(), String> {
         false,
         4,
     )?
-    .link_and_publish(&off_exe)?;
+    .link_and_publish(&align_driver::CDriver::default(), &off_exe)?;
     let hot_exe = root.path().join("function-hot");
     build_function_thin_lto(
         &corpus.original.units,
@@ -395,7 +395,7 @@ fn run_parity() -> Result<(), String> {
         false,
         4,
     )?
-    .link_and_publish(&hot_exe)?;
+    .link_and_publish(&align_driver::CDriver::default(), &hot_exe)?;
 
     let unit_output = run_executable(&unit_exe)?;
     let function_output = run_executable(&function_exe)?;
