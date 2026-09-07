@@ -361,25 +361,31 @@ contract, with no language, MIR, ABI, allocation, or package-format change.
 
 | Cell | Required closure | Owner |
 |---|---|---|
-| Formation and transfer | A materialized local-record shell starts owned after every stored field is readable. Move fields contribute their owned/shared access to that shell; Copy fields validate their source but do not define shell ownership. | Reduced `std_xml` fixture with a borrowed-array calculation plus `array_builder.build()` fields, in whole/per-unit execution. |
+| Formation and transfer | A materialized local-record shell, including a selected nested record, starts owned only after the field-store graph completely initializes every declared field and every stored field is readable. A direct field store proves that subtree; descendant stores must recursively cover the complete selected record. Move fields contribute their owned/shared access to the shell; Copy fields validate their source but do not define shell ownership. | Reduced `std_xml` fixture with a borrowed-array calculation plus `array_builder.build()` fields, in whole/per-unit execution; the codegen owner also passes a recursively field-built Copy record to `BorrowMut`, while malformed-MIR removal of the Move-field store must fail publication/whole/per-unit validation. |
 | Branch, replacement, and return | Root stores preserve their source access; field stores, early returns, and joined replacements retain all reaching validation. A valid field store cannot hide an invalid sibling or later store. | Existing producer equation and record-return mutation owners, plus the unchanged align-llm `stats_for` consumer. |
-| Negative ownership | A shared Move field makes the aggregate shared rather than owned; unreadable, unresolved, duplicated, or malformed Move fields still poison it. Only Copy values are validation-only inputs. | Focused malformed-MIR mutation of the aggregate field-store graph and existing `producer_*` owners. |
+| Negative ownership | A missing Move field leaves the aggregate shell uninitialized, while a shared Move field makes it shared rather than owned; unreadable, unresolved, duplicated, or malformed Move fields still poison it. One present owned Move field cannot authenticate an incomplete sibling, and an exact Move aggregate store cannot ground its own source cycle. Only Copy values are validation-only inputs. Borrowed destination shells retain their entry authority only while every later Move-field store preserves it. | Focused malformed-MIR mutations remove the sole Move-field store, remove one of two owned Move-field stores, form an exact nested Move self-cycle, or replace the Move field of both an owning local and a `BorrowMut` destination with a shared argument, with publication/whole/per-unit rejection, beside existing `producer_*` owners. |
 | Drop and cleanup | Construction keeps current source nulling, hidden owners, recursive Drop, and return cleanup. The validator change neither synthesizes cleanup nor changes lowering. | Whole/per-unit runtime fixture and existing `resource_ownership` suite. |
 | Publication | Whole-program validation, per-unit interface publication, and imported consumption use the same aggregate rule. | Reduced differential driver owner and align-llm Request 59 targets. |
 
-The author pass must bind shell seeding to an actual valid aggregate field store,
+The author pass must bind shell seeding to a complete valid aggregate field-store cover relative to the queried local subobject,
 propagate only recursively Move field access into the shell, retain READ checks
 for every stored field, and preserve selected-field provenance unchanged. No
 benchmark is required because this follow-up makes no performance claim.
 
-Author-side closure: local field-store aggregates seed only their shell as
-`Owned`; recursively Move fields remain ordinary provenance dependencies and
-all fields retain their existing READ validation. Borrow/BorrowMut/Out parameter
-slots keep entry authority and every later store, while root stores continue to
-propagate their source access unchanged. The reduced fixture passes native
+Author-side closure: a complete Copy local field-store aggregate seeds only its
+shell as `Owned`; Move aggregates derive access from their ordinary recursively
+Move field dependencies, so an exact Move self-store cannot ground its own
+cycle. Incomplete descendant-only construction is explicitly invalid unless a
+whole root, out producer, or ancestor field store already initialized the
+selected value. All fields retain their existing READ validation. Borrow/BorrowMut/Out parameter
+slots manufacture no owned seed, but their recursively Move field stores remain
+provenance dependencies so entry authority cannot hide a weaker replacement;
+root stores continue to propagate their source access unchanged. The reduced fixture passes native
 whole/per-unit execution, and its malformed-MIR mutation replaces the owned
 array field with the borrowed input and is rejected in publication, whole, and
 per-unit modes. All 19 `producer_*`, 18 `std_xml`, and 23
 `resource_ownership` owners pass. The unchanged align-llm
 `verification_loop.align` and `alignpack.align` pass their five-unit and
-three-unit per-unit checks, respectively.
+three-unit per-unit checks, respectively. The comprehensive review found the
+borrowed-destination dependency gap; the correction and second mutation above
+close it without changing the aggregate-shell strategy.

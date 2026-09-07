@@ -94,10 +94,13 @@ align-llm `alignpack.align` consumer exposed a second aggregate-shell producer
 regression on `882ea5d1`. The candidate follow-up is active on
 `agent/request-59-array-builder-return`: local field-store aggregates retain an
 owned shell, Copy fields are validation-only inputs, and recursively Move fields
-still contribute their access. Its 19 producer, 18 XML, and 23 resource owners
-pass, as do align-llm's five-unit `verification_loop.align` and three-unit
-`alignpack.align` per-unit checks. Next: complete one review and preflight, merge
-the Align PR, then let align-llm adopt the merge commit.
+still contribute their access. The comprehensive review found one missing Move
+dependency for borrowed destinations; the independent repair audit additionally
+closed incomplete and selected nested field-store covers plus exact Move cycles.
+The repaired candidate's 19 producer, 18 XML, and 23 resource owners pass, as do
+align-llm's five-unit `verification_loop.align` and three-unit `alignpack.align`
+per-unit checks. The repair audit is clean. Next: commit the consolidated repair,
+run preflight, merge the Align PR, then let align-llm adopt the merge commit.
 Request 60 (#968), merged in PR #973, owns an explicit absolute C-driver option for closed-environment
 builds across build/run/size/test, ThinLTO, PGO, and watch. Item 2 of
 `docs/impl/21-build-perf-plan.md` records its exact selection and validation

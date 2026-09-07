@@ -5596,6 +5596,72 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
+    fn aggregate_field_stores_complete(
+        &self,
+        selected: Ty,
+        path: &[XmlAccessPathSegment],
+        stores: &[(Vec<u32>, Operand)],
+    ) -> bool {
+        fn complete(
+            program: &Program,
+            ty: Ty,
+            prefix: &mut Vec<u32>,
+            stores: &[(Vec<u32>, Operand)],
+            ancestors: &mut Vec<Ty>,
+        ) -> bool {
+            let id = match ty {
+                Ty::Struct(id) | Ty::Soa(id) => id,
+                _ => return false,
+            };
+            if ancestors.contains(&ty) {
+                return false;
+            }
+            let Some(definition) = program.structs.get(id as usize) else {
+                return false;
+            };
+            if definition.fields.is_empty() {
+                return false;
+            }
+            ancestors.push(ty);
+            let result = definition.fields.iter().enumerate().all(|(field, definition)| {
+                let Ok(field) = u32::try_from(field) else {
+                    return false;
+                };
+                prefix.push(field);
+                let directly_stored = stores
+                    .iter()
+                    .any(|(stored, _)| stored.as_slice() == prefix.as_slice());
+                let initialized = directly_stored
+                    || complete(program, definition.ty, prefix, stores, ancestors);
+                prefix.pop();
+                initialized
+            });
+            ancestors.pop();
+            result
+        }
+
+        let mut prefix = Vec::with_capacity(path.len());
+        for segment in path {
+            let XmlAccessPathSegment::StructField(field) = segment else {
+                return false;
+            };
+            prefix.push(*field);
+        }
+        if !matches!(selected, Ty::Struct(_) | Ty::Soa(_)) {
+            return false;
+        }
+        stores
+            .iter()
+            .any(|(stored, _)| stored.as_slice() == prefix.as_slice())
+            || complete(
+                self.graph.program,
+                selected,
+                &mut prefix,
+                stores,
+                &mut Vec::new(),
+            )
+    }
+
     fn check_template_piece(
         &mut self,
         equation: &mut XmlAccessEquation,
@@ -9772,10 +9838,30 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         let root_stores = root_stores.iter().map(|operand| (*operand).clone()).collect::<Vec<_>>();
+        let has_root_store = !root_stores.is_empty();
         let field_stores = field_stores
             .iter()
             .map(|(fields, operand)| ((*fields).to_vec(), (*operand).clone()))
             .collect::<Vec<_>>();
+        let selected_field_path = path
+            .iter()
+            .map(|segment| match segment {
+                XmlAccessPathSegment::StructField(field) => Some(*field),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let has_descendant_field_store = selected_field_path.as_ref().is_some_and(|selected| {
+            field_stores.iter().any(|(stored, _)| {
+                stored.len() > selected.len() && stored.starts_with(selected)
+            })
+        });
+        let has_ancestor_field_store = selected_field_path.as_ref().is_some_and(|selected| {
+            field_stores.iter().any(|(stored, _)| {
+                !stored.is_empty() && selected.starts_with(stored)
+            })
+        });
+        let complete_aggregate_shell = owns_aggregate_shell
+            && self.aggregate_field_stores_complete(selected_ty, &path, &field_stores);
         let Some(element_stores) = self.graph.slot_stores.elements.get(slot as usize) else {
             equation.invalid = true;
             return equation;
@@ -9829,6 +9915,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         let producers = producers.clone();
+        let has_out_producer = !producers.is_empty();
+        if owns_aggregate_shell
+            && matches!(selected_ty, Ty::Struct(_) | Ty::Soa(_))
+            && has_descendant_field_store
+            && !complete_aggregate_shell
+            && !has_root_store
+            && !has_out_producer
+            && !has_ancestor_field_store
+        {
+            equation.invalid = true;
+        }
         for (value, producer) in producers {
             self.add_out_producer(
                 &mut equation,
@@ -9847,6 +9944,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 self.add_operand(&mut equation, &operand, selected_ty, path.clone());
             }
         }
+        if complete_aggregate_shell
+            && !align_sema::ty_is_move(
+                selected_ty,
+                &self.graph.program.structs,
+                &self.graph.program.tuples,
+                &self.graph.program.enums,
+                &self.graph.program.tagged_types,
+            )
+        {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+        }
         for (fields, operand) in field_stores {
             let stored_path = fields
                 .iter()
@@ -9863,12 +9971,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
-            if path.is_empty() && owns_aggregate_shell {
+            if matches!(selected_ty, Ty::Struct(_) | Ty::Soa(_))
+                && stored_path.starts_with(&path)
+            {
                 self.check_aggregate_store(&mut equation, &operand, stored_ty);
-                equation.seed = merge_xml_access(
-                    equation.seed,
-                    XmlAccessProvenance::Owned,
-                );
             } else if path.starts_with(&stored_path) {
                 self.check_whole_operand(&mut equation, &operand, stored_ty);
                 self.add_operand(
@@ -35305,7 +35411,14 @@ fn main() -> i32 = 0
         let base = mir(
             "Cursor { total: i64 }\n\
              Summary { count: i64, values: array<i64> }\n\
+             TextSummary { count: i64, label: string }\n\
+             Pair { first: array<i64>, second: array<i64> }\n\
+             Wrapped { value: Summary }\n\
+             Inner { count: i64 }\n\
+             Outer { inner: Inner }\n\
              fn touch(borrow mut cursor: Cursor) { cursor.total = cursor.total + 1 }\n\
+             fn touch_text(borrow mut summary: TextSummary) { summary.count = summary.count + 1 }\n\
+             fn touch_inner(borrow mut inner: Inner) { inner.count = inner.count + 1 }\n\
              fn scan(borrow input: array<i64>) {\n\
                mut cursor := Cursor { total: 0 }\n\
                cursor.total = cursor.total + input[0]\n\
@@ -35318,13 +35431,122 @@ fn main() -> i32 = 0
                values.push(7)\n\
                return Summary { count: count, values: values.build() }\n\
              }\n\
+             fn rewrite(borrow mut summary: TextSummary, borrow input: string) {\n\
+               summary.label = \"updated\".clone()\n\
+               touch_text(summary)\n\
+             }\n\
+             fn make_pair() -> Pair {\n\
+               mut first: array_builder<i64> := array_builder()\n\
+               mut second: array_builder<i64> := array_builder()\n\
+               first.push(1)\n\
+               second.push(2)\n\
+               return Pair { first: first.build(), second: second.build() }\n\
+             }\n\
+             fn wrap(value: Summary) -> Wrapped = Wrapped { value: value }\n\
+             fn nested() {\n\
+               mut outer := Outer { inner: Inner { count: 0 } }\n\
+               touch_inner(outer.inner)\n\
+             }\n\
              fn main() -> i32 = 0\n",
         );
         assert!(validate_mir_producers(&base).is_ok(), "publication");
         assert!(validate_resource_rvalues(&base).is_ok(), "whole");
         assert!(validate_thin_partition_program(&base, &[]).is_ok(), "per-unit");
 
-        let mut shared_move_field = base;
+        let mut missing_move_field = base.clone();
+        let owner = xml_test_function(&missing_move_field, "summarize");
+        let function = &mut missing_move_field.fns[owner];
+        let mut changed = false;
+        for block in &mut function.blocks {
+            let Some(index) = block.stmts.iter().position(|statement| {
+                matches!(statement, Stmt::StoreField(_, path, _) if path.as_slice() == [1])
+            }) else {
+                continue;
+            };
+            block.stmts.remove(index);
+            if !block.stmt_lines.is_empty() {
+                block.stmt_lines.remove(index);
+            }
+            changed = true;
+            break;
+        }
+        assert!(changed, "aggregate owner fixture omitted its removable Move field store");
+        assert!(
+            validate_mir_producers(&missing_move_field).is_err(),
+            "publication accepted a missing Move field in an aggregate shell"
+        );
+        assert_xml_producer_rejected(
+            &missing_move_field,
+            "a partial field-store graph cannot authenticate an aggregate shell",
+        );
+
+        let mut missing_second_move_field = base.clone();
+        let owner = xml_test_function(&missing_second_move_field, "make_pair");
+        let function = &mut missing_second_move_field.fns[owner];
+        let mut changed = false;
+        for block in &mut function.blocks {
+            let Some(index) = block.stmts.iter().position(|statement| {
+                matches!(statement, Stmt::StoreField(_, path, _) if path.as_slice() == [1])
+            }) else {
+                continue;
+            };
+            block.stmts.remove(index);
+            if !block.stmt_lines.is_empty() {
+                block.stmt_lines.remove(index);
+            }
+            changed = true;
+            break;
+        }
+        assert!(
+            changed,
+            "aggregate owner fixture omitted its second removable Move field store"
+        );
+        assert!(
+            validate_mir_producers(&missing_second_move_field).is_err(),
+            "publication accepted a partial two-Move-field aggregate shell"
+        );
+        assert_xml_producer_rejected(
+            &missing_second_move_field,
+            "one owned Move field cannot authenticate a partial aggregate shell",
+        );
+
+        let mut exact_move_cycle = base.clone();
+        let owner = xml_test_function(&exact_move_cycle, "wrap");
+        let function = &mut exact_move_cycle.fns[owner];
+        let (destination, source) = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreField(slot, path, Operand::Value(value))
+                    if path.as_slice() == [0] =>
+                {
+                    Some((*slot, *value))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("aggregate owner fixture omitted its exact Move store"));
+        let mut changed = false;
+        for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+            if let Stmt::Let(value, runtime) = statement
+                && *value == source
+            {
+                *runtime = Rvalue::Field(destination, vec![0]);
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "aggregate owner fixture omitted its Move store source");
+        assert!(
+            validate_mir_producers(&exact_move_cycle).is_err(),
+            "publication accepted an exact Move aggregate self-cycle"
+        );
+        assert_xml_producer_rejected(
+            &exact_move_cycle,
+            "an exact Move aggregate store cannot ground its own source cycle",
+        );
+
+        let mut shared_move_field = base.clone();
         let owner = xml_test_function(&shared_move_field, "summarize");
         let function = &mut shared_move_field.fns[owner];
         let mut changed = false;
@@ -35337,9 +35559,81 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "aggregate owner fixture omitted its Move field store");
+        assert!(
+            validate_mir_producers(&shared_move_field).is_err(),
+            "publication accepted a shared Move field in an owned aggregate shell"
+        );
         assert_xml_producer_rejected(
             &shared_move_field,
             "shared Move field cannot authenticate an owned aggregate shell",
+        );
+
+        let mut shared_borrowed_move_field = base;
+        let owner = xml_test_function(&shared_borrowed_move_field, "rewrite");
+        let function = &mut shared_borrowed_move_field.fns[owner];
+        let destination = function.params[0];
+        let mut changed = false;
+        for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+            if let Stmt::StoreField(slot, path, operand) = statement
+                && *slot == destination
+                && path.as_slice() == [1]
+            {
+                *operand = Operand::Arg(1);
+                changed = true;
+            }
+        }
+        let destination_ty = function.slots[destination as usize];
+        let local = u32::try_from(function.slots.len())
+            .unwrap_or_else(|_| panic!("aggregate owner slot inventory exceeds u32"));
+        function.slots.push(destination_ty);
+        function.slot_align.push(None);
+        let loaded = xml_test_value(function, destination_ty);
+        let mut routed_through_load = false;
+        for block in &mut function.blocks {
+            let Some(index) = block.stmts.iter().position(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::Call(_, args))
+                        if matches!(args.first(), Some(Operand::BorrowedPlace(place)) if place.slot == destination)
+                )
+            }) else {
+                continue;
+            };
+            block
+                .stmts
+                .insert(index, Stmt::Let(loaded, Rvalue::Load(destination)));
+            block
+                .stmts
+                .insert(index + 1, Stmt::Store(local, Operand::Value(loaded)));
+            if !block.stmt_lines.is_empty() {
+                block.stmt_lines.insert(index, (1, 1));
+                block.stmt_lines.insert(index + 1, (1, 1));
+            }
+            let Stmt::Let(_, Rvalue::Call(_, args)) = &mut block.stmts[index + 2] else {
+                panic!("aggregate owner call shifted unexpectedly");
+            };
+            let Some(Operand::BorrowedPlace(place)) = args.first_mut() else {
+                panic!("aggregate owner call lost its borrowed aggregate argument");
+            };
+            place.slot = local;
+            routed_through_load = true;
+            break;
+        }
+        assert!(
+            changed,
+            "aggregate owner fixture omitted its borrowed-destination Move field store"
+        );
+        assert!(
+            routed_through_load,
+            "aggregate owner fixture omitted its loaded borrowed-destination consumer"
+        );
+        assert!(
+            validate_mir_producers(&shared_borrowed_move_field).is_err(),
+            "publication accepted a shared Move field in a borrowed aggregate shell"
+        );
+        assert_xml_producer_rejected(
+            &shared_borrowed_move_field,
+            "shared Move field cannot preserve borrowed aggregate authority",
         );
     }
 
