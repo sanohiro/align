@@ -3,6 +3,10 @@
 Status: **IMPLEMENTED; Request 17 adopted, Request 21 projection-view repair implemented with
 align-llm adoption pending.**
 
+Request 61 extends this historical grammar with `buffer` and `writer` leaves and
+non-consuming stable field receivers. Its current contract and owner matrix are
+in [plan 37](37-borrowed-buffer-writer-plan.md); other opaque handles stay excluded.
+
 This document extends the borrowed sum-payload projection shipped by
 `26-borrowed-sum-projection-plan.md`. The shipped capability intentionally rejects every dynamic
 array reachable from a projected payload and accepts shared-borrow call arguments only when they

@@ -17995,3 +17995,40 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
         );
     }
 }
+
+#[test]
+fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static str> {
+    let program = checked_source_program(
+        "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn main() {}\n",
+    );
+    assert!(validate_hir::body_only_metadata_is_valid(&program));
+    for name in ["inspect", "flush"] {
+        for mutation in 0..3 {
+            let mut forged = program.clone();
+            let function = forged
+                .fns
+                .iter_mut()
+                .find(|f| f.name == name)
+                .ok_or("receiver function")?;
+            let value = function.body.value.as_mut().ok_or("receiver expression")?;
+            let receiver = match &mut value.kind {
+                hir::ExprKind::BufferLen { buffer } => buffer,
+                hir::ExprKind::WriterFlush { writer } => writer,
+                _ => panic!("receiver operation"),
+            };
+            let hir::ExprKind::Field { root, path } = &mut receiver.kind else {
+                panic!("field receiver")
+            };
+            match mutation {
+                0 => *root = u32::MAX,
+                1 => path[0] = 1 - path[0],
+                _ => path.clear(),
+            }
+            assert!(
+                !validate_hir::body_only_metadata_is_valid(&forged),
+                "{name}/{mutation}"
+            );
+        }
+    }
+    Ok(())
+}

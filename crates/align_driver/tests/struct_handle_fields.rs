@@ -160,3 +160,716 @@ fn all_field_kinds_coexist_and_drop_cleanly() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "6\na\n");
 }
+
+fn handle_project(tag: &str, source: &str) -> Proj {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("align-handle-{}-{tag}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).expect("exclusively create fixture directory");
+    let project = Proj {
+        dir,
+        entry: "main.align".to_owned(),
+    };
+    project.write("main.align", source);
+    project
+}
+
+fn handle_command(
+    command: &mut std::process::Command,
+    project: &Proj,
+    label: &str,
+) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    // The child owns a fresh process group; an unwinding owner reaps its helpers.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let stdout = project.dir.join(format!("{label}.stdout"));
+    let stderr = project.dir.join(format!("{label}.stderr"));
+    command
+        .process_group(0)
+        .stdout(std::fs::File::create(&stdout).expect("stdout log"))
+        .stderr(std::fs::File::create(&stderr).expect("stderr log"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut child =
+        ChildGuard(Some(command.spawn().unwrap_or_else(|error| {
+            panic!("{label}: spawn fixture command: {error}")
+        })));
+    let status = loop {
+        if let Some(status) = child
+            .0
+            .as_mut()
+            .expect("armed child")
+            .try_wait()
+            .expect("poll child")
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} exceeded its execution budget"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    child.0.take();
+    std::process::Output {
+        status,
+        stdout: std::fs::read(stdout).expect("stdout"),
+        stderr: std::fs::read(stderr).expect("stderr"),
+    }
+}
+
+#[test]
+fn borrowed_handle_receivers_preserve_nested_and_optional_owners() {
+    let helper = r#"module handles
+pub Stream { data: buffer, sink: Option<writer> }
+pub Outer { stream: Stream }
+pub Direct { sink: writer }
+pub fn view(borrow owner: Outer) -> slice<u8> = owner.stream.data.bytes()
+pub fn emit(borrow owner: Outer) -> Result<(), Error> {
+  match owner.stream.sink {
+    Some(sink) => { sink.write(owner.stream.data.bytes())?; sink.flush()? },
+    None => {},
+  }
+  return Ok(())
+}
+pub fn encode(borrow mut owner: Outer) {
+  mut bytes := owner.stream.data.bytes()
+  bytes[0] = 66
+}
+pub fn direct(borrow owner: Direct) -> Result<(), Error> { owner.sink.write("!")?; owner.sink.flush()?; return Ok(()) }
+pub fn optional(borrow sink: Option<writer>) -> Result<(), Error> {
+  match sink { Some(active) => { active.write("?")? }, None => {} }
+  return Ok(())
+}
+"#;
+    let source = r#"module main
+import handles
+import std.io
+fn make() -> handles.Outer {
+  mut data := buffer(8)
+  data.put_u8(65)
+  return handles.Outer { stream: handles.Stream { data: data, sink: Some(io.stdout) } }
+}
+fn main() -> Result<(), Error> {
+  mut owner := make()
+  handles.emit(owner)?
+  handles.emit(owner)?
+  print(handles.view(owner).u8(0))
+  handles.encode(owner)
+  handles.emit(owner)?
+  handles.optional(owner.stream.sink)?
+  sink := handles.Direct { sink: io.stdout }
+  handles.direct(sink)?
+  return Ok(())
+}
+"#;
+    let files = [("main.align", source), ("handles.align", helper)];
+    let checked = diff_check_multi("borrowed-handle-receivers", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for out in [
+            build_and_run_multi("borrowed-handle-receivers-whole", &files, "main.align"),
+            build_per_unit_multi("borrowed-handle-receivers-unit", &files, "main.align")
+                .link_and_run(),
+        ] {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, b"AA65\nB?!");
+        }
+    }
+}
+
+#[test]
+fn borrowed_handle_projections_reject_consumption_and_escape() {
+    for mixed in [false, true] {
+        let prelude = r#"
+Holder { sink: Option<writer>, data: buffer }
+fn take(sink: writer) {}
+fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffer(1) } }
+"#;
+        for (name, body) in [
+            (
+                "return",
+                "fn bad(borrow holder: Holder) -> writer { match holder.sink { Some(sink) => { return sink }, None => {} }; loop {} }",
+            ),
+            (
+                "consume",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { take(sink) }, None => {} } }",
+            ),
+            (
+                "join",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := if true { sink } else { sink }; take(value) }, None => {} } }",
+            ),
+            (
+                "store",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := Holder { sink: Some(sink), data: buffer(1) } }, None => {} } }",
+            ),
+            (
+                "capture",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { callback := fn() { result := sink.flush() } }, None => {} } }",
+            ),
+            (
+                "alias",
+                "fn bad(borrow holder: Holder) { data := holder.data }",
+            ),
+            (
+                "replace",
+                "fn bad(borrow mut holder: Holder) { view := holder.data.bytes(); change(holder); print(view.u8(0)) }",
+            ),
+            (
+                "arg_replace",
+                "fn bad(borrow mut holder: Holder) -> Result<(), Error> { match holder.sink { Some(sink) => { sink.write({ change(holder); \"bad\" })? }, None => {} }; return Ok(()) }",
+            ),
+            (
+                "local_return",
+                "fn bad() -> slice<u8> { holder := Holder { sink: None, data: buffer(1) }; return holder.data.bytes() }",
+            ),
+            (
+                "exclusive_field",
+                "fn fill(borrow mut data: buffer) { data.put_u8(0) }\nfn bad(borrow mut holder: Holder) { fill(holder.data) }",
+            ),
+        ] {
+            let source = format!("{prelude}\n{body}\nfn main() {{}}\n");
+            let source = if mixed {
+                source
+                    .replace("data: buffer }", "data: buffer, extra: slice<u8> }")
+                    .replace("data: buffer(1) }", "data: buffer(1), extra: [] }")
+            } else {
+                source
+            };
+            let checked = diff_check_multi(
+                &format!("borrowed-handle-{name}"),
+                &[("main.align", source.as_str())],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{name} must reject on both paths; whole:\n{}\nper-unit:\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+    }
+}
+
+#[test]
+fn borrowed_buffer_views_follow_optional_array_and_generic_sources() {
+    for mixed in [false, true] {
+        let helper_template = r#"module views
+pub Item<T> { data: T, extra: slice<u8> }
+pub Outer { inner: Item<buffer> }
+pub Rows { items: Option<array<Item<buffer>>> }
+pub View { data: slice<u8> }
+pub fn bytes(borrow item: Item<buffer>) -> slice<u8> = item.data.bytes()
+pub fn text(borrow data: buffer) -> str = data.bytes().as_str() else ""
+pub fn optional(borrow data: Option<buffer>) -> slice<u8> = match data {
+  Some(active) => active.bytes(), None => { empty: slice<u8> := []; empty },
+}
+pub Data { Present(Item<buffer>), Absent }
+pub fn tagged(borrow data: Data) -> slice<u8> = match data {
+  Present(active) => active.data.bytes(), Absent => { empty: slice<u8> := []; empty },
+}
+pub fn result(borrow data: Result<buffer, i32>) -> slice<u8> = match data {
+  Ok(active) => active.bytes(), Err(_) => { empty: slice<u8> := []; empty },
+}
+pub fn first(borrow rows: Rows) -> slice<u8> = match rows.items {
+  Some(items) => bytes(items[0]), None => { empty: slice<u8> := []; empty },
+}
+pub fn retain(borrow item: Item<buffer>, borrow mut result: View) {
+  result = View { data: bytes(item) }
+}
+pub fn identity<T>(borrow item: Item<T>) -> i64 = 1
+"#;
+        let helper = if mixed {
+            helper_template.to_string()
+        } else {
+            helper_template.replace(", extra: slice<u8>", "")
+        };
+        let helper = helper.as_str();
+        for (name, body) in [
+            (
+                "returned",
+                "view := views.bytes(item); item = views.Item { data: buffer(8), extra: empty }; print(view.u8(0))",
+            ),
+            (
+                "retained",
+                "mut kept := views.View { data: [] }; views.retain(item, kept); item = views.Item { data: buffer(8), extra: empty }; print(kept.data.u8(0))",
+            ),
+            (
+                "indirect",
+                "reader := views.text; view := reader(item.data); item = views.Item { data: buffer(8), extra: empty }; print(view)",
+            ),
+            (
+                "optional",
+                "mut optional: Option<buffer> := Some(buffer(8)); view := views.optional(optional); optional = None; print(view.u8(0))",
+            ),
+            (
+                "result",
+                "mut result: Result<buffer, i32> := Ok(buffer(8)); view := views.result(result); result = Err(1); print(view.u8(0))",
+            ),
+            (
+                "tagged",
+                "mut tagged: views.Data := views.Present(views.Item { data: buffer(8), extra: empty }); view := views.tagged(tagged); tagged = views.Absent; print(view.u8(0))",
+            ),
+        ] {
+            let invalid = format!(
+                "module main\nimport views\nfn main() {{ empty: slice<u8> := []; mut item := views.Item {{ data: buffer(8), extra: empty }}; {body} }}\n"
+            );
+            for nested in [false, true] {
+                let invalid = if nested {
+                    invalid.replace("mut item := views.Item { data: buffer(8), extra: empty };", "mut outer := views.Outer { inner: views.Item { data: buffer(8), extra: empty } };")
+                    .replace("item = views.Item { data: buffer(8), extra: empty };", "outer = views.Outer { inner: views.Item { data: buffer(8), extra: empty } };")
+                    .replace("item", "outer.inner")
+                } else {
+                    invalid.clone()
+                };
+                let invalid = if mixed {
+                    invalid
+                } else {
+                    invalid.replace(", extra: empty", "")
+                };
+                let checked = diff_check_multi(
+                    &format!("borrowed-buffer-invalidated-{name}"),
+                    &[("main.align", invalid.as_str()), ("views.align", helper)],
+                    "main.align",
+                );
+                assert!(
+                    checked.whole_errors && checked.per_unit_errors,
+                    "{name} must reject after source replacement; whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags
+                );
+                assert!(
+                    checked.whole_diags.contains("use of invalidated borrow")
+                        && checked.per_unit_diags.contains("use of invalidated borrow"),
+                    "{name} must reject for borrowing; whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags
+                );
+            }
+        }
+        let source = r#"module main
+import views
+fn main() -> i32 {
+  empty: slice<u8> := []
+  mut data := buffer(8)
+  data.put_u8(65)
+  optional: Option<buffer> := Some(data)
+  if views.optional(optional).u8(0) != 65 { return 1 }
+  mut other := buffer(8)
+  other.put_u8(66)
+  item := views.Item { data: other, extra: empty }
+  if views.identity(item) != 1 { return 2 }
+  reader := views.text
+  if reader(item.data) != "B" { return 6 }
+  mut kept := views.View { data: [] }
+  views.retain(item, kept)
+  if kept.data.u8(0) != 66 { return 3 }
+  rows := views.Rows { items: None }
+  if views.first(rows).len() != 0 { return 4 }
+  return 0
+}
+"#;
+        let source = if mixed {
+            source.to_string()
+        } else {
+            source.replace(", extra: empty", "")
+        };
+        let files = [("main.align", source.as_str()), ("views.align", helper)];
+        let checked = diff_check_multi("borrowed-buffer-provenance", &files, "main.align");
+        assert!(
+            !checked.whole_errors && !checked.per_unit_errors,
+            "whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        if backend_available() {
+            for out in [
+                build_and_run_multi("borrowed-buffer-provenance-whole", &files, "main.align"),
+                build_per_unit_multi("borrowed-buffer-provenance-unit", &files, "main.align")
+                    .link_and_run(),
+            ] {
+                assert_eq!(
+                    out.status.code(),
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_handle_fields_keep_the_complete_owner() {
+    for (name, body) in [
+        (
+            "direct",
+            "mut holder := Holder { data: buffer(8), extra: [] }; view := holder.data.bytes(); holder = Holder { data: buffer(8), extra: [] }; print(view.u8(0))",
+        ),
+        (
+            "nested",
+            "mut outer := Outer { inner: Holder { data: buffer(8), extra: [] } }; view := outer.inner.data.bytes(); outer = Outer { inner: Holder { data: buffer(8), extra: [] } }; print(view.u8(0))",
+        ),
+        (
+            "writer",
+            "mut holder := Direct { sink: io.stdout, extra: [] }; holder.sink.write({ replace(holder); \"bad\" }) else ()",
+        ),
+    ] {
+        let source = format!(
+            r#"
+import std.io
+Holder {{ data: buffer, extra: slice<u8> }}
+Outer {{ inner: Holder }}
+Direct {{ sink: writer, extra: slice<u8> }}
+fn replace(borrow mut holder: Direct) {{ holder = Direct {{ sink: io.stdout, extra: [] }} }}
+fn main() {{ {body} }}
+"#
+        );
+        let checked = diff_check_multi(
+            &format!("mixed-handle-{name}"),
+            &[("main.align", source.as_str())],
+            "main.align",
+        );
+        assert!(
+            checked.whole_errors && checked.per_unit_errors,
+            "{name} must reject; whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        assert!(
+            checked.whole_diags.contains("invalidated")
+                && checked.per_unit_diags.contains("invalidated"),
+            "{name} must reject for owner invalidation; whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+    }
+    let tuple = r#"
+Holder { data: buffer, extra: slice<u8> }
+fn main() { value := (Holder { data: buffer(8), extra: [] }, 0) }
+"#;
+    let checked = diff_check_multi(
+        "mixed-handle-tuple-boundary",
+        &[("main.align", tuple)],
+        "main.align",
+    );
+    assert!(
+        checked.whole_diags.contains("tuple elements must")
+            && checked.per_unit_diags.contains("tuple elements must"),
+        "handle-owning tuple elements remain outside admission; whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let source = r#"
+Holder { data: buffer, extra: slice<u8> }
+fn main() -> i32 {
+  backing := [65 as u8].to_array()
+  mut holder := Holder { data: buffer(8), extra: backing }
+  sibling := holder.extra
+  holder = Holder { data: buffer(8), extra: [] }
+  if sibling.u8(0) != 65 { return 1 }
+  return 0
+}
+"#;
+    let files = [("main.align", source)];
+    let checked = diff_check_multi("mixed-handle-sibling", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "sibling header keeps its independent backing; whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("mixed-sibling-whole", &files, "main.align"),
+            build_per_unit_multi("mixed-sibling-unit", &files, "main.align").link_and_run(),
+        ] {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn borrowed_handle_io_failure_retires_the_containing_owner() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let Some(llc) = align_driver::llvm_tool("llc") else {
+        return;
+    };
+    let source = r#"
+import std.fs
+extern "C" {
+  fn probe_reset()
+  fn probe_counts() -> i32
+  fn probe_next_fd() -> i32
+  fn probe_open(fd: i32) -> i32
+  fn probe_readonly(fd: i32) -> i32
+  fn align_rt_requested_live_reset()
+  fn align_rt_requested_live_bytes() -> i64
+}
+Stream { data: buffer, sink: Option<writer> }
+fn emit(borrow stream: Stream) -> Result<(), Error> {
+  match stream.sink {
+    Some(sink) => { sink.write(stream.data.bytes()).map_err(fn error: Error { error })?; sink.flush()? },
+    None => {},
+  }
+  return Ok(())
+}
+fn skip(borrow stream: Stream) -> Result<(), Error> {
+  match stream.sink {
+    Some(sink) => { sink.write({ return Ok(()); "unreached" })? },
+    None => {},
+  }
+  return Ok(())
+}
+fn exercise(fd: i32, fail: bool) -> Result<(), Error> {
+  mut data := buffer(8)
+  data.put_u8(65)
+  sink := fs.create("/dev/null")?
+  stream := Stream { data: data, sink: Some(sink) }
+  if unsafe { probe_open(fd) } != 1 { print("missing descriptor") }
+  skip(stream)?
+  mut iteration := 0
+  loop { if iteration == 2 { break }; emit(stream)?; iteration = iteration + 1 }
+  emit(stream) else ()
+  if fail { if unsafe { probe_readonly(fd) } != 0 { print("failure setup") } }
+  emit(stream)?
+  if unsafe { probe_open(fd) } != 1 { print("premature close") }
+  return Ok(())
+}
+fn once(fail: bool) -> i32 {
+  unsafe { probe_reset() }
+  fd := unsafe { probe_next_fd() }
+  if fd < 0 { return 1 }
+  result := exercise(fd, fail)
+  match result { Ok(_) => { if fail { return 2 } }, Err(_) => { if !fail { return 3 } } }
+  if unsafe { probe_open(fd) } != 0 { return 4 }
+  if unsafe { probe_counts() } != 11 { return 6 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 5 }
+  return 0
+}
+fn main() -> i32 {
+  unsafe { align_rt_requested_live_reset() }
+  a := once(false)
+  if a != 0 { return a }
+  return once(true)
+}
+"#;
+    let native = r#"
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
+extern void align_rt_buffer_free(void *);
+extern void align_rt_io_writer_free(void *);
+extern int32_t align_rt_io_writer_write(void *, const uint8_t *, int64_t);
+static void *last_buffer, *last_writer;
+static int buffer_frees, writer_frees, writes, bad_bytes;
+void probe_reset(void) { last_buffer = last_writer = 0; buffer_frees = writer_frees = writes = bad_bytes = 0; }
+int32_t probe_counts(void) { return buffer_frees + 10 * writer_frees + 100 * (writes != 4 || bad_bytes); }
+int32_t probe_writer_write(void *p, const uint8_t *data, int64_t len) {
+    ++writes;
+    if (len != 1 || !data || data[0] != 65) bad_bytes = 1;
+    return align_rt_io_writer_write(p, data, len);
+}
+void probe_buffer_free(void *p) {
+    if (p) { ++buffer_frees; if (p == last_buffer) return; last_buffer = p; }
+    align_rt_buffer_free(p);
+}
+void probe_writer_free(void *p) {
+    if (p) { ++writer_frees; if (p == last_writer) return; last_writer = p; }
+    align_rt_io_writer_free(p);
+}
+int32_t probe_next_fd(void) {
+    int fd = dup(STDOUT_FILENO);
+    if (fd >= 0) close(fd);
+    return fd;
+}
+int32_t probe_open(int32_t fd) { return fcntl(fd, F_GETFD) >= 0; }
+int32_t probe_readonly(int32_t fd) {
+    int input = open("/dev/null", O_RDONLY);
+    if (input < 0) return -1;
+    int result = dup2(input, fd);
+    close(input);
+    return result == fd ? 0 : -1;
+}
+"#;
+    // Redirect only the generated program's free calls through counting delegates. The actual
+    // runtime implementations, handle layouts, I/O and error paths remain the linked production
+    // runtime. Counting non-null calls detects duplicate frees without invoking allocator UB.
+    for per_unit in [false, true] {
+        let project = handle_project("counted", source);
+        let entry = project.dir.join("main.align");
+        let name = entry.to_str().expect("UTF-8 fixture path");
+        let mut sm = SourceMap::new();
+        let programs = if per_unit {
+            let walked = build_per_unit(&mut sm, name, source);
+            assert!(
+                !walked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &walked.diags)
+            );
+            walked
+                .units
+                .into_iter()
+                .map(|unit| unit.mir)
+                .collect::<Vec<_>>()
+        } else {
+            let checked = check(&mut sm, name, source);
+            assert!(
+                !checked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &checked.diags)
+            );
+            vec![lower_to_mir(&checked.hir)]
+        };
+        let mut objects = Vec::new();
+        for (index, program) in programs.iter().enumerate() {
+            let ir = emit_llvm_ir(program, BuildTarget::Baseline, false, &[], false).expect("LLVM");
+            let ir = ir
+                .replace("@align_rt_buffer_free(", "@probe_buffer_free(")
+                .replace("@align_rt_io_writer_free(", "@probe_writer_free(")
+                .replace("@align_rt_io_writer_write(", "@probe_writer_write(");
+            let input = project.dir.join(format!("unit{index}.ll"));
+            let object = project.dir.join(format!("unit{index}.o"));
+            std::fs::write(&input, ir).expect("write counted LLVM");
+            let compiled = handle_command(
+                std::process::Command::new(&llc)
+                    .args(["-filetype=obj", "-relocation-model=pic"])
+                    .arg(&input)
+                    .arg("-o")
+                    .arg(&object),
+                &project,
+                &format!("llc{index}"),
+            );
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            objects.push(object);
+        }
+        let c_source = project.dir.join("probe.c");
+        let c_object = project.dir.join("probe.o");
+        std::fs::write(&c_source, native).expect("write native probe");
+        let compiled = handle_command(
+            std::process::Command::new("cc")
+                .args(["-std=c11", "-c"])
+                .arg(&c_source)
+                .arg("-o")
+                .arg(&c_object),
+            &project,
+            "cc",
+        );
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        objects.push(c_object);
+        let refs = objects
+            .iter()
+            .map(|object| object.as_path())
+            .collect::<Vec<_>>();
+        let exe = project.dir.join("probe");
+        link_objects(
+            &align_driver::CDriver::default(),
+            &refs,
+            &exe,
+            &[],
+            Profile::Release,
+        )
+        .expect("link");
+        let out = handle_command(&mut std::process::Command::new(exe), &project, "run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn borrowed_handle_receiver_cache_replays_and_invalidates_body_edits() {
+    if !backend_available() {
+        return;
+    }
+    let source = "import std.io\nHolder { sink: Option<writer> }\nfn emit(borrow holder: Holder) -> Result<(), Error> { match holder.sink { Some(sink) => { sink.write(\"A\")? }, None => {} }; return Ok(()) }\nfn main() -> Result<(), Error> { holder := Holder { sink: Some(io.stdout) }; emit(holder)?; return Ok(()) }\n";
+    let project = handle_project("cache", source);
+    for (index, text) in [
+        source.to_owned(),
+        source.to_owned(),
+        source.replace("\"A\"", "\"B\""),
+        source.to_owned(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        project.write("main.align", text);
+        let output = handle_command(
+            std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+                .current_dir(&project.dir)
+                .env("ALIGNC_CACHE", project.cache_root())
+                .args(["build", "main.align", "--cache-stats"]),
+            &project,
+            &format!("build{index}"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if index == 1 || index == 3 {
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                diagnostics.contains("main hit") && diagnostics.contains("main frontend hit"),
+                "unchanged/reverted frontend and object must use the cache: {diagnostics}"
+            );
+        }
+        let output = handle_command(
+            &mut std::process::Command::new(project.dir.join("main")),
+            &project,
+            &format!("run{index}"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, if index == 2 { b"B" } else { b"A" });
+    }
+}

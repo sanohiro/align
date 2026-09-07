@@ -2524,7 +2524,7 @@ mod tests {
                         borrow_fact_cache: std::cell::RefCell::new(None),
                         collecting_move_children: false,
                         move_children: Vec::new(),
-                        borrowed_projection_locals: crate::borrowed_projection_locals(&move_program.fns[0].body),
+                        borrowed_projection_owners: crate::borrowed_projection_owners(&move_program.fns[0].body),
                     }
                     .check();
                     assert!(
@@ -2559,7 +2559,7 @@ mod tests {
                         allocation_regions: Vec::new(),
                         allocation_region_by_expr: std::collections::HashMap::new(),
                         region_capabilities: std::collections::HashMap::new(),
-                        borrowed_projection_locals: crate::borrowed_projection_locals(&function.body),
+                        borrowed_projection_owners: crate::borrowed_projection_owners(&function.body),
                         flow: crate::EscapeFlowCfg::new(),
                         flow_current: 0,
                         loop_exit_blocks: Vec::new(),

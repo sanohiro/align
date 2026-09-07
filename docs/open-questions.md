@@ -4555,9 +4555,9 @@ The exact surface and compiler contract are in
 An exhaustive `match` over a stable place whose exact root/path pair has a direct `borrow` or
 `borrow mut` fact may inspect an owned `Option<T>`, `Result<T,E>`, or user sum without consuming it;
 a descendant field fact never promotes an owning parent or mixed-provenance local. Borrowed mode
-admits Copy scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 structs and tagged values built recursively from those forms. Array elements obey the same closed
-grammar. Fixed and specialized arrays, tuples, other collections, resources, opaque handles, and
+grammar. Fixed and specialized arrays, tuples, other collections, resources, other opaque handles, and
 other unsupported Move shapes retain the borrowed-place diagnostic. The tag and active admitted
 payload are read in place, and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
 type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields remain readable;
@@ -4569,6 +4569,13 @@ shallow-copied or nulled, and it remains usable after the match. Returning,
 storing, capturing, sending, or consuming the whole non-Copy/Move payload is rejected; existing
 Copy/view matching retains its current result behavior, and views derived from an admitted payload
 use the existing return-borrow and region checks.
+
+Stable `buffer` and `writer` fields, including nested fields and checked borrowed
+match projections, support their existing non-consuming receivers: buffer
+`.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
+the handle and its only cleanup; byte views retain that owner’s generation and
+lifetime. Plain field assignment still moves, and exclusive partial-Move-field
+arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
 
 Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
 region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,

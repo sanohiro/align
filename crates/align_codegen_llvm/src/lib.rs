@@ -33064,6 +33064,49 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn borrowed_handle_receivers_reject_forged_mir_projections() {
+        for (payload, observation) in [
+            ("buffer", "handle.len()"),
+            ("writer", "{ result := handle.write(\"x\"); 1 }"),
+        ] {
+            let source = format!(
+                "fn inspect(borrow value: Option<{payload}>) -> i64 = match value {{ Some(handle) => {observation}, None => 0 }}\nfn main() {{}}\n"
+            );
+            let program = mir(&source);
+            assert!(emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).is_ok());
+            for mutation in 0..3 {
+                let mut forged = program.clone();
+                let mut changed = false;
+                for function in &mut forged.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let operand = match statement {
+                                Stmt::Let(_, Rvalue::BufferLen(buffer)) => buffer,
+                                Stmt::Let(_, Rvalue::WriterWrite(writer, _)) => writer,
+                                _ => continue,
+                            };
+                            let Operand::BorrowedPlace(place) = operand else {
+                                continue;
+                            };
+                            match mutation {
+                                0 => place.slot = u32::MAX,
+                                1 => place.path.push(hir::BorrowedPathSegment::StructField(0)),
+                                _ => place.ty = Ty::Reader,
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                assert!(changed, "fixture must exercise the handle projection");
+                assert!(
+                    emit_llvm_ir(&forged, &BuildTarget::Baseline, false, &[], None).is_err(),
+                    "{payload}/{mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn malformed_borrowed_sum_path_fails_before_llvm_gep() {
         let mut program = mir(
             "Content { Text(string), Empty }\n\

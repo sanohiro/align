@@ -1612,9 +1612,9 @@ fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
-/// owned `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic structs/sums whose
-/// reachable payload graph stays within the same set. Fixed/specialized arrays, aggregate buffers,
-/// builders, boxes, resources, and opaque handles remain outside because their projection/drop/
+/// owned `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+/// structs/sums whose reachable payload graph stays within the same set. Fixed/specialized arrays, aggregate buffers,
+/// builders, boxes, resources, and other opaque handles remain outside because their projection/drop/
 /// escape contracts are not defined.
 pub fn borrowed_sum_payload_is_admissible(
     ty: Ty,
@@ -1633,7 +1633,7 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Raw | Ty::Rng => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -11161,7 +11161,7 @@ fn run_body_analysis_passes(
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&f.body),
+            borrowed_projection_owners: borrowed_projection_owners(&f.body),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -11181,7 +11181,7 @@ fn run_body_analysis_passes(
                 drop_individual: std::collections::HashMap::new(),
                 drop_individual_exprs: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
-                borrowed_projection_locals: borrowed_projection_locals(&f.body),
+                borrowed_projection_owners: borrowed_projection_owners(&f.body),
                 task_group_regions: Vec::new(),
                 allocation_regions: Vec::new(),
                 allocation_region_by_expr: std::collections::HashMap::new(),
@@ -12885,7 +12885,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -18490,7 +18490,7 @@ struct EscapeCheck<'a> {
     /// Locals introduced as read-only projections of a borrowed sum payload. They are aliases for
     /// caller-owned storage, not frame-owned bindings, so an auto-borrow of one must retain the
     /// borrowed root's returnable lifetime.
-    borrowed_projection_locals: std::collections::HashSet<LocalId>,
+    borrowed_projection_owners: HashMap<LocalId, LocalId>,
     /// Compact checked-HIR CFG built before solving escape state.
     flow: EscapeFlowCfg<'a>,
     /// Block currently receiving lowered escape operations.
@@ -18777,7 +18777,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::BorrowedIndex { base, .. } => base.root_local,
             _ => return false,
         };
-        if self.borrowed_projection_locals.contains(&root) {
+        if self.borrowed_projection_owners.contains_key(&root) {
             return true;
         }
         self.f
@@ -18804,8 +18804,8 @@ impl<'a> EscapeCheck<'a> {
     /// binding may itself produce a fresh owned value and still needs ordinary tracking.
     fn is_borrowed_projection_place(&self, expression: &Expr) -> bool {
         match &expression.kind {
-            ExprKind::Local(local) => self.borrowed_projection_locals.contains(local),
-            ExprKind::Field { root, .. } => self.borrowed_projection_locals.contains(root),
+            ExprKind::Local(local) => self.borrowed_projection_owners.contains_key(local),
+            ExprKind::Field { root, .. } => self.borrowed_projection_owners.contains_key(root),
             _ => false,
         }
     }
@@ -19999,6 +19999,7 @@ impl<'a> EscapeCheck<'a> {
 
     fn escape_place_fallback_roots(&self, expression: &Expr) -> BorrowRoots {
         let local_root = |local: LocalId| {
+            let local = self.borrowed_projection_owners.get(&local).copied().unwrap_or(local);
             self.f
                 .params
                 .iter()
@@ -20559,12 +20560,14 @@ impl<'a> EscapeCheck<'a> {
             && matched_projected_candidate
             && !generations.is_empty();
         if known {
-            fallback_roots.clear();
+            fallback_roots = opaque_handle_fallback_roots(
+                &fallback_roots, self.f, self.storage_type_context(),
+            );
         }
         StorageHeaderLeaf {
             generations,
             descriptor: Some(descriptor),
-            known,
+            known: known && fallback_roots.is_empty(),
             fallback_roots,
         }
     }
@@ -20855,7 +20858,9 @@ impl<'a> EscapeCheck<'a> {
                             source.content_ended.is_empty()
                                 && source.content_unknown.is_empty()
                         }) {
-                            fallback_roots.clear();
+                            fallback_roots = opaque_handle_fallback_roots(
+                                &fallback_roots, self.f, self.storage_type_context(),
+                            );
                             value.non_storage = value.non_storage.join(
                                 &EscapeRegionFact::at_path(
                                     &result.path,
@@ -23937,14 +23942,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayLit { elems, .. } if elems.is_empty() => {}
             ExprKind::ArrayToSlice(_)
             | ExprKind::ArrayLit { .. }
-            | ExprKind::BufferBytes { .. }
             | ExprKind::HttpRespBody { .. }
             | ExprKind::HttpCtxBody { .. } => return true,
-            // A byte view minted from a local or by-value `run_bytes` owner dies with this frame.
+            // A byte view minted from a local or by-value buffer/run_bytes owner dies with this frame.
             // A `borrow`/`borrow mut` parameter still belongs to the caller, however, so its view
             // may be returned with that caller-side provenance (the same distinction made by
             // `borrowed_storage_cap` in `region_of`).
-            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+            ExprKind::BufferBytes { buffer: out }
+            | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 if !self.borrowed_param_place(out) {
                     return true;
                 }
@@ -28407,7 +28412,7 @@ struct MoveCheck<'a> {
     /// Locals introduced as read-only projections of a borrowed sum payload. These locals are
     /// initialized per arm but never own an independent value, so any consuming use must be
     /// rejected and no Drop slot may be derived for them.
-    borrowed_projection_locals: std::collections::HashSet<LocalId>,
+    borrowed_projection_owners: HashMap<LocalId, LocalId>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -29138,6 +29143,75 @@ struct StorageTypeContext<'a> {
     tuples: &'a [hir::TupleDef],
     enums: &'a [hir::EnumDef],
     tagged_types: &'a [hir::TaggedType],
+}
+
+/// Inline handles own storage not described by slice/array generation headers. Do not walk
+/// through collection headers: their allocation generation already owns their elements.
+fn has_inline_handle_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    let mut work = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !seen.insert(ty) {
+            continue;
+        }
+        match expand_tagged_ty(ty, context.tagged_types) {
+            Ty::Buffer | Ty::Writer => return true,
+            Ty::Struct(id) => {
+                if let Some(definition) = context.structs.get(id as usize) {
+                    work.extend(definition.fields.iter().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) => {
+                if let Some(definition) = context.tuples.get(id as usize) {
+                    work.extend(definition.elems.iter().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Enum(id) => {
+                if let Some(definition) = context.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter().copied().map(scalar_to_ty)),
+                    );
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(ok));
+                work.push(scalar_to_ty(err));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+// Compatible sibling headers do not certify an opaque handle's allocation identity.
+fn opaque_handle_fallback_roots(
+    roots: &BorrowRoots,
+    function: &Fn,
+    context: StorageTypeContext<'_>,
+) -> BorrowRoots {
+    roots
+        .iter()
+        .filter(|root| {
+            let local = match root {
+                BorrowRoot::Local(local) | BorrowRoot::EndedLocal(local, _) => Some(*local),
+                BorrowRoot::Param(position)
+                | BorrowRoot::ParamStorage(position)
+                | BorrowRoot::EndedParam(position, _)
+                | BorrowRoot::EndedParamStorage(position, _) => {
+                    function.params.get(*position as usize).copied()
+                }
+                _ => None,
+            };
+            local
+                .and_then(|local| function.locals.get(local as usize))
+                .is_some_and(|local| has_inline_handle_storage(local.ty, context))
+        })
+        .cloned()
+        .collect()
 }
 
 fn storage_type_paths(root: Ty, context: StorageTypeContext<'_>) -> StorageTypePaths {
@@ -31492,8 +31566,36 @@ impl BorrowState {
         how: BorrowEnd,
         ended: impl std::ops::Fn(&BorrowRoot) -> bool,
     ) {
+        // View headers can carry fallback roots without an entry in the legacy source maps.
+        // Keep generation/observation invalidation in the storage directory: resolving those here
+        // would invalidate an XML reader's own header when it advances to its next observation.
+        let fallback_roots = |headers: &ProjectedHeaderFact| -> BorrowRoots {
+            headers.leaves.values().flat_map(|leaf| {
+                leaf.fallback_roots.iter().filter_map(BorrowRoot::live)
+            }).collect()
+        };
+        let header_roots = self
+            .headers
+            .iter()
+            .map(|(&local, headers)| (local, fallback_roots(headers)))
+            .collect::<Vec<_>>();
+        let value_header_roots = self
+            .value_headers
+            .iter()
+            .map(|(&key, headers)| (key, fallback_roots(headers)))
+            .collect::<Vec<_>>();
+        let pipeline_header_roots = self
+            .pipeline_headers
+            .iter()
+            .map(|(&key, headers)| (key, fallback_roots(headers)))
+            .collect::<Vec<_>>();
         let state = &mut *self.0;
-        for (&borrower, roots) in &state.sources {
+        for (borrower, roots) in state
+            .sources
+            .iter()
+            .map(|(&key, roots)| (key, roots))
+            .chain(header_roots.iter().map(|(key, roots)| (*key, roots)))
+        {
             for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid
@@ -31504,7 +31606,12 @@ impl BorrowState {
                 *entry = (*entry).min(how);
             }
         }
-        for (&snapshot, roots) in &state.pipeline_sources {
+        for (snapshot, roots) in state
+            .pipeline_sources
+            .iter()
+            .map(|(&key, roots)| (key, roots))
+            .chain(pipeline_header_roots.iter().map(|(key, roots)| (*key, roots)))
+        {
             for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid_pipeline_sources
@@ -31515,7 +31622,12 @@ impl BorrowState {
                 *entry = (*entry).min(how);
             }
         }
-        for (&snapshot, roots) in &state.value_sources {
+        for (snapshot, roots) in state
+            .value_sources
+            .iter()
+            .map(|(&key, roots)| (key, roots))
+            .chain(value_header_roots.iter().map(|(key, roots)| (*key, roots)))
+        {
             for root in roots.iter().filter(|root| ended(root)) {
                 let entry = state
                     .invalid_value_sources
@@ -31762,6 +31874,25 @@ fn clear_moved(moved: &mut MovedSet, id: LocalId) {
                 if *local == id
         )
     });
+}
+
+/// Checked borrowed bindings retain the complete source root even when their type has no header.
+fn borrowed_projection_owners(body: &hir::Block) -> HashMap<LocalId, LocalId> {
+    let mut owners = HashMap::new();
+    for event in hir_depth::body_events(body) {
+        if let hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } = event {
+            let root = match &scrutinee.kind {
+                ExprKind::Local(local) | ExprKind::Field { root: local, .. } => *local,
+                _ => continue,
+            };
+            owners.extend(
+                arm.borrowed_bindings
+                    .iter()
+                    .map(|projection| (projection.binding_local, root)),
+            );
+        }
+    }
+    owners
 }
 
 fn borrowed_projection_locals(body: &hir::Block) -> std::collections::HashSet<LocalId> {
@@ -34298,11 +34429,27 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn stable_owner_root(&self, local: LocalId) -> BorrowRoot {
+        let owner = self.borrowed_projection_owners.get(&local).copied().unwrap_or(local);
+        self.borrowed_param_position(owner)
+            .map_or(BorrowRoot::Local(owner), BorrowRoot::ParamStorage)
+    }
+
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         if let Some(headers) = self.borrows.headers.get(&id) {
-            return self.borrows.resolve_headers(headers).non_storage.live_roots();
+            let mut roots = self.borrows.resolve_headers(headers).non_storage.live_roots();
+            if self.f.locals.get(id as usize).is_some_and(|local| {
+                has_inline_handle_storage(local.ty, self.storage_type_context())
+            }) {
+                roots.insert(self.stable_owner_root(id));
+            }
+            return roots;
         }
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
+        if self.borrowed_projection_owners.contains_key(&id) {
+            roots.insert(self.stable_owner_root(id));
+            return roots;
+        }
         let region_param = self
             .f
             .params
@@ -34544,6 +34691,11 @@ impl<'a> MoveCheck<'a> {
                     roots.extend(self.local_storage_roots(*root));
                 } else {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
+                }
+                // Selecting a mixed aggregate has the same opaque ownership obligation as
+                // selecting its handle leaf. Header presence is independent of that obligation.
+                if has_inline_handle_storage(e.ty, self.storage_type_context()) {
+                    roots.insert(self.stable_owner_root(*root));
                 }
             }
             ExprKind::TupleIndex { recv, index } => {
@@ -35405,8 +35557,10 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.known = true;
-                        leaf.fallback_roots.clear();
+                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                            &leaf.fallback_roots, self.f, self.storage_type_context(),
+                        );
+                        leaf.known = leaf.fallback_roots.is_empty();
                     }
                     unknown.leaves.insert(header.path, leaf);
                     return None;
@@ -35582,8 +35736,10 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.known = true;
-                        leaf.fallback_roots.clear();
+                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                            &leaf.fallback_roots, self.f, self.storage_type_context(),
+                        );
+                        leaf.known = leaf.fallback_roots.is_empty();
                     }
                 }
                 unknown.leaves.insert(
@@ -39215,7 +39371,7 @@ impl<'a> MoveCheck<'a> {
         loop {
             match &expression.kind {
                 ExprKind::Local(id) if self.is_move(*id) => {
-                    if self.borrowed_projection_locals.contains(id) {
+                    if self.borrowed_projection_owners.contains_key(id) {
                         self.diags.error(
                             "cannot move a borrowed match payload projection".to_string(),
                             expression.span,
@@ -39274,7 +39430,7 @@ impl<'a> MoveCheck<'a> {
                                 )
                         )
                     {
-                        if self.borrowed_projection_locals.contains(root) {
+                        if self.borrowed_projection_owners.contains_key(root) {
                             self.diags.error(
                                 "cannot move a field out of a borrowed match payload projection"
                                     .to_string(),
@@ -42725,7 +42881,7 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     self.check_borrow_use(*id, e.span);
                     if consuming && self.is_move(*id) {
-                        if self.borrowed_projection_locals.contains(id) {
+                        if self.borrowed_projection_owners.contains_key(id) {
                             self.diags.error(
                                 "cannot move a borrowed match payload projection".to_string(),
                                 e.span,
@@ -42791,7 +42947,7 @@ impl<'a> MoveCheck<'a> {
                             || matches!(e.ty, Ty::Resource(_))
                             || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
-                        if self.borrowed_projection_locals.contains(base) {
+                        if self.borrowed_projection_owners.contains_key(base) {
                             self.diags.error(
                                 "cannot move a field out of a borrowed match payload projection"
                                     .to_string(),
@@ -58123,7 +58279,7 @@ impl<'a, 't> Checker<'a, 't> {
             // bound-receiver restriction as `.bytes()` (uniform across buffer methods, until Move
             // temporaries drop): reject `buffer(n).len()` on an unbound temporary.
             Ty::Buffer => {
-                if !matches!(r.kind, ExprKind::Local(_)) {
+                if !matches!(r.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
                     self.diags.error(
                         "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.len()`) — a temporary buffer handle is not dropped yet".to_string(),
                         span,
@@ -62226,7 +62382,7 @@ impl<'a, 't> Checker<'a, 't> {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
         // v1 restriction (until Move *temporaries* get a `Drop`): the receiver of a writer method
-        // must be a bound local — never an unbound owned-handle temporary. `fs.create(p)?.write(d)?`
+        // must be a stable local/field place — never an unbound owned-handle temporary. `fs.create(p)?.write(d)?`
         // would leave the temp writer un-`Drop`ped, so its buffered bytes are never flushed and its
         // fd never closed — silent data loss. Only an **unbuffered** borrowed std stream
         // (`io.stdout`/`io.stderr`) is exempt: it owns no fd and holds no buffer, so an un-`Drop`ped
@@ -62234,7 +62390,7 @@ impl<'a, 't> Checker<'a, 't> {
         // bytes that only reach the OS on `flush`/`Drop`, so it must be bound like any owned handle —
         // else its tail chunk (< the buffer size) is silently dropped. Lifted when dropping Move
         // temporaries lands (`draft.md` §18.2).
-        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::WriterStd { buffered: false, .. }) {
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::Field { .. } | ExprKind::WriterStd { buffered: false, .. }) {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
                     "bind the writer to a local first, then call the method (`w := <expr>` then `w.write(...)`) — a temporary owned/buffered writer handle is not dropped/flushed yet, so its output would be lost".to_string(),
@@ -62700,11 +62856,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// view of the buffer's current contents, borrowing it (region-tracked: must not outlive `b`).
     fn check_buffer_bytes(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        // v1 restriction (mirrors reader/writer): the receiver must be a bound local. On an unbound
+        // The receiver must be a stable local/field place. On an unbound
         // `buffer` temporary (`buffer(4).bytes()`), `.bytes()` returns a `slice<u8>` viewing the
         // temp's storage — leaked-but-valid today, but a dangling slice (UAF) the moment Move
         // temporaries get a `Drop`. Bind the buffer first. Lifted with Move-temporary drop.
-        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
                     "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.bytes()`) — a temporary buffer handle is not dropped yet, and `.bytes()` returns a slice into it".to_string(),
@@ -71475,7 +71631,7 @@ fn main() -> i32 = 0
                     borrow_fact_cache: std::cell::RefCell::new(None),
                     collecting_move_children: false,
                     move_children: Vec::new(),
-                    borrowed_projection_locals: borrowed_projection_locals(&function.body),
+                    borrowed_projection_owners: borrowed_projection_owners(&function.body),
                 }
             }};
         }
@@ -73875,7 +74031,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
@@ -74211,7 +74367,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         };
         assert!(
             checker.intentional_action_snapshot(call, MoveCheck::expr_key(&args[0])),
@@ -76075,6 +76231,8 @@ fn exit_branch(flag: bool) -> i64 {
             }],
         }];
         for admitted in [
+            Ty::Buffer,
+            Ty::Writer,
             Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })),
             Ty::DynArray(Scalar::String),
             Ty::DynStructArray(0, Layout::Aos),
@@ -76101,7 +76259,6 @@ fn exit_branch(flag: bool) -> i64 {
             Ty::DynFixedStructArray(0, 4),
             Ty::DynSliceArray(PrimScalar::Int(IntTy { bits: 64, signed: true })),
             Ty::DynResponseArray,
-            Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Int(IntTy { bits: 64, signed: true })),
             Ty::DynArray(Scalar::DynArray(PrimScalar::Int(IntTy {
                 bits: 64,
@@ -76511,65 +76668,82 @@ fn exit_branch(flag: bool) -> i64 {
 
     #[test]
     fn borrowed_sum_match_metadata_rejects_forged_records() {
-        let source = "fn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\nfn main() -> i32 = 0\n";
-        let (program, diagnostics) = check(source);
-        assert!(!diagnostics.has_errors(), "fixture must check before metadata mutation");
-        assert!(checked_hir_body_facts_are_valid(&program));
+        for (payload, observation) in [
+            ("string", "text.len()"),
+            ("buffer", "text.len()"),
+            ("writer", "{ result := text.write(\"x\"); 1 }"),
+        ] {
+            let source = format!(
+                "fn inspect(borrow value: Option<{payload}>) -> i64 = match value {{\n  Some(text) => {observation}\n  None => 0\n}}\nfn main() -> i32 = 0\n"
+            );
+            let (program, diagnostics) = check(&source);
+            assert!(
+                !diagnostics.has_errors(),
+                "fixture must check before metadata mutation"
+            );
+            assert!(checked_hir_body_facts_are_valid(&program));
 
-        let mut forged_owner = program.clone();
-        let inspect = forged_owner
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "inspect")
-            .expect("inspect function");
-        let ExprKind::Match {
-            borrowed_place: Some(place),
-            ..
-        } = &mut inspect
-            .body
-            .value
-            .as_mut()
-            .expect("inspect body value")
-            .kind
-        else {
-            panic!("borrowed match metadata missing");
-        };
-        place.owner_fact[0].ordinal = 99;
-        assert!(!checked_hir_body_facts_are_valid(&forged_owner));
+            let mut forged_owner = program.clone();
+            let inspect = forged_owner
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "inspect")
+                .expect("inspect function");
+            let ExprKind::Match {
+                borrowed_place: Some(place),
+                ..
+            } = &mut inspect
+                .body
+                .value
+                .as_mut()
+                .expect("inspect body value")
+                .kind
+            else {
+                panic!("borrowed match metadata missing");
+            };
+            place.owner_fact[0].ordinal = 99;
+            assert!(!checked_hir_body_facts_are_valid(&forged_owner));
 
-        let mut forged_projection = program.clone();
-        let inspect = forged_projection
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "inspect")
-            .expect("inspect function");
-        let ExprKind::Match { arms, .. } = &mut inspect
-            .body
-            .value
-            .as_mut()
-            .expect("inspect body value")
-            .kind
-        else {
-            panic!("match metadata missing");
-        };
-        arms[0].borrowed_bindings[0].static_ty = Ty::Int(IntTy {
-            bits: 64,
-            signed: true,
-        });
-        assert!(!checked_hir_body_facts_are_valid(&forged_projection));
+            let mut forged_projection = program.clone();
+            let inspect = forged_projection
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "inspect")
+                .expect("inspect function");
+            let ExprKind::Match { arms, .. } = &mut inspect
+                .body
+                .value
+                .as_mut()
+                .expect("inspect body value")
+                .kind
+            else {
+                panic!("match metadata missing");
+            };
+            arms[0].borrowed_bindings[0].static_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            assert!(!checked_hir_body_facts_are_valid(&forged_projection));
 
-        let mut forged_cleanup = program;
-        let inspect = forged_cleanup
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "inspect")
-            .expect("inspect function");
-        let binding = match &inspect.body.value.as_ref().expect("inspect body value").kind {
-            ExprKind::Match { arms, .. } => arms[0].borrowed_bindings[0].binding_local,
-            _ => panic!("match metadata missing"),
-        };
-        inspect.drop_locals.push(binding);
-        assert!(!checked_hir_body_facts_are_valid(&forged_cleanup));
+            let mut forged_cleanup = program;
+            let inspect = forged_cleanup
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "inspect")
+                .expect("inspect function");
+            let binding = match &inspect
+                .body
+                .value
+                .as_ref()
+                .expect("inspect body value")
+                .kind
+            {
+                ExprKind::Match { arms, .. } => arms[0].borrowed_bindings[0].binding_local,
+                _ => panic!("match metadata missing"),
+            };
+            inspect.drop_locals.push(binding);
+            assert!(!checked_hir_body_facts_are_valid(&forged_cleanup));
+        }
     }
 
     #[test]
