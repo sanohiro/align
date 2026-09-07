@@ -10,10 +10,12 @@
 > milestone; scheduling does not approve another slice's missing contract.
 >
 > **Contract boundary:** plan 32 §11 and `09-explain-opt.md` approve one new
-> current-plan strategy tuple. They approve no syntax, language semantic,
-> library API, CLI flag, runtime ABI, environment variable, persisted profile,
-> or distribution change. A later slice that needs one must first amend its
-> authoritative owner with an exact public-contract ledger.
+> current-plan strategy tuple and one compiler-private interpretation of the
+> existing A39/A46 parallel input arguments. They approve no syntax, language
+> semantic, library API, CLI flag, new runtime symbol/signature, environment
+> variable, persisted profile, or distribution change. A later slice that
+> needs one must first amend its authoritative owner with an exact public-
+> contract ledger.
 
 This plan adopts one direction from the 2026-08-31 execution/storage/startup
 proposal:
@@ -529,7 +531,11 @@ stored chunk arrays, returns, calls, captures, and aggregate/control-flow
 carriers retain materialization. The shipped direct lowering and the C0-bound
 compiler artifact are the baseline. S1 must demonstrate incremental benefit on
 this still-materializing consumer rather than claim invention of virtual
-chunks.
+chunks. For this slice only, A39/A46 retain their signatures and logical
+16-byte scheduling stride while `in_buf` names compiler-certified immutable
+source storage rather than a materialized logical-element array; plan 32 §11
+and the runtime ABI ledger own the exact safety rule. A89 and every ordinary
+parallel source retain the shipped physical `count * in_stride` contract.
 
 ### S2 — Straight-line fixed region frames
 

@@ -587,6 +587,30 @@ production allocation-removal change by itself. Any such design must preserve th
 ownership and synchronous cleanup contract and measure chunk-body, scheduler, and consumer costs
 together.
 
+### 7.6 Virtual chunks range source — DESIGN ACCEPTED 2026-09-07
+
+Plan 32 §11 admits one next slice: an immediate, stage-free `chunks(...).par_map(...)` whose
+existing selector chooses range materialization or direct integer reduction may pass the borrowed
+element buffer directly and derive each logical chunk view in the generated range kernel. No
+source-level collection value escapes, and all other consumers retain the shipped header array.
+
+A39 `align_rt_par_map_reduce` and A46 `align_rt_par_map` retain their exact declarations. For these
+two entries, `in_buf` is generalized from a physical `count * in_stride` array to a
+compiler-certified immutable source identity that remains live until the synchronous join.
+`in_stride` remains the logical scheduling width; O0 supplies the positive 16-byte slice-header
+width, and its product with `count` must fit `isize`. The runtime does not dereference `in_buf`.
+The certified kernel alone interprets the source and may read only bounds-checked immutable
+regions derived from its assigned logical range. Its disjoint-output obligation and the capture-
+context lifetime rule do not change. Ordinary A39/A46 calls continue to satisfy the stronger
+physical-array form. A89 `align_rt_par_map_filter` is not generalized and continues to require
+`count * in_stride` readable input bytes.
+
+The implementation must update both Rust `# Safety` clauses and treat the existing input-product
+check as logical-work-span validation. Runtime and optimized-LLVM owners cover an opaque source
+whose physical extent is smaller than that logical product, plus malformed and empty controls.
+The full MIR, cleanup, reporting, and preregistered performance boundary is authoritative in plan
+32 §11.
+
 ---
 
 ## 8. Low-lock runtime direction

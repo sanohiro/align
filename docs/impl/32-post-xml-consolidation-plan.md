@@ -72,7 +72,7 @@ This is an internal work plan, not a new public language contract.
 | Language and library API | No new type, signature, default, syntax, or removed API | Existing specification and English library ledgers; source oracles remain unchanged |
 | Effects, errors, ownership, lifetime, allocation | Existing semantics, source-visible boundaries, and Drop rules remain authoritative | HIR/MIR and native-boundary owners; compare defined behavior, not all internal allocation counts |
 | CLI and reporting | Invoke existing commands; S0B supplies the current-plan surface and O0 adds one exact selected chunks strategy tuple, with no JSON output or new flag | Exact tables in `09-explain-opt.md` |
-| Runtime, FFI, and native input | No new symbol, ABI, text/view boundary, process lifecycle, or global state | `20-runtime-abi-ledger.md`; new safety strategies require their own reviewed closure matrix |
+| Runtime, FFI, and native input | No new symbol, signature, text/view boundary, process lifecycle, or global state. O0 revises only A39/A46 so `in_buf` may name a compiler-certified immutable source whose kernel-owned extent differs from logical `count * in_stride`; A89 and ordinary sources retain the physical-span rule | `20-runtime-abi-ledger.md`, parallel plan §7.6, and the reviewed §11 matrix |
 | Build, cache, artifacts, distribution | No new input, cache format, profile, sidecar, release variant, or target | Existing build/cache/distribution plans; bind actual artifact identities |
 | Evidence | Private Markdown notes and raw outputs from existing owners; no persisted interchange schema or automatic reader | Baseline packet; unavailable observations are explicit, not zero |
 | Performance | No global speed, allocation, size, or compilation-time guarantee; O0 has only the local adopt-or-revert threshold in §11.4 | A selected optimization preregisters its own benefit and guard thresholds under plan 31 |
@@ -337,8 +337,11 @@ An immediate `par_map` with prior stages, a rejected form using the sequential
 collector, and every synchronous non-parallel pipeline remain materialized.
 So do chunks values bound to a name, returned, passed, captured, stored in an
 aggregate, or carried through control flow. O0 adds no source syntax or type,
-no implicit parallelism, no new runtime call, and no runtime ABI row. It does
-not admit the remaining S1 consumers or any S2–S7 capability.
+no implicit parallelism, and no new runtime call, symbol, signature, or
+declaration row. It does revise the compiler-private safety interpretation of
+the existing A39/A46 `in_buf` and `in_stride` arguments as specified below; A89
+is outside this slice. It does not admit the remaining S1 consumers or any
+S2–S7 capability.
 
 ### 11.2 Exact MIR and LLVM boundary
 
@@ -363,9 +366,13 @@ terminal captures in the existing order. After source and width succeed it
 records `selected / virtual-range-views / parallel-consumer`; a later
 terminating capture preserves that reached chunks row while suppressing the
 unreached `par_map` row. The base view inherits the same hidden owner used by
-direct virtual length/index. The synchronous runtime call consumes all borrowed
-views before returning, after which lowering releases a fresh hidden base owner
-exactly once. Bound, arena, and static bases remain borrowed and are not freed.
+direct virtual length/index. Every edge after that owner becomes live either
+reaches the synchronous runtime call or transfers it to the existing
+error/return cleanup path. The call consumes all borrowed views before
+returning, after which normal cleanup releases a fresh hidden base owner
+exactly once. A terminating callable or terminal capture releases that owner
+once without publishing a call or output. Bound, arena, and static bases remain
+borrowed and are not freed.
 
 Codegen validates the source variant before generated-kernel lookup. For
 `VirtualChunks`, `base` must be `slice<elem>`, `width` must be `i64`, logical
@@ -381,10 +388,25 @@ The caller extracts the base pointer and element count, then derives the chunk
 count with the runtime materializer's exact precedence: null base, nonpositive
 element count, or nonpositive width selects zero before division; otherwise
 `(element_count - 1) / width + 1`. It passes that count and the logical
-16-byte slice-header stride to the unchanged `align_rt_par_map` or
-`align_rt_par_map_reduce` ABI. The runtime does not dereference the input
-pointer; it schedules the same logical range count and retains its byte/work
-floor.
+16-byte slice-header stride to the signature-unchanged `align_rt_par_map` or
+`align_rt_par_map_reduce` ABI, preserving the materialized control's scheduling
+input and byte/work floor.
+
+For A39/A46 only, O0 makes `in_buf` a compiler-certified immutable source
+identity passed through unchanged to the generated kernel. It need not cover
+`count * in_stride` bytes. It must remain valid for every source byte the
+certified kernel can derive until the synchronous call joins. `in_stride`
+remains the logical scheduling width; O0 supplies the positive 16-byte slice-
+header width, and `count * in_stride` must be representable in `isize`. The
+runtime never dereferences `in_buf`; its existing multiplication becomes a
+logical-work-span validation rather than a physical-extent proof. The generated
+kernel may read only the base element ranges derived from its assigned logical
+chunk indices after checking them against the context's `element_count`, and
+retains nothing. Output-range and context validity rules remain unchanged.
+Ordinary A39/A46 sources still
+satisfy the stronger physical-span form, and A89 retains it as a requirement.
+The implementation updates the Rust safety comments, the parallel plan, and
+the runtime ABI ledger together; there is no unrecorded unsafe-call exception.
 
 The synchronous call-scoped context prefixes the existing Copy captures with
 `width` and `element_count`. A generated kernel derives each borrowed slice in
@@ -409,12 +431,12 @@ the same `ParallelSource`; reporting adds no second legality predicate.
 |---|---|---|
 | Formation, validation, unknown variants | One exhaustive `ParallelSource` is visited by embedded-type collection, tagged-type remapping, operand/value sweeps, canonical hashing, generated-callable preflight, and LLVM lowering. Virtual source/type/stage mismatches fail before kernel lookup or output. | MIR selector table and variant tripwire; malformed virtual base, width, element, logical input, stage, result, callable, and capture matrix; existing malformed materialized nodes remain rejected. |
 | Construction and move-in/out | Only a syntactically immediate, stage-free chunks expression reaches `VirtualChunks`; its base/width are moved into the two existing parallel rvalues without constructing an `array<slice<T>>`. No source-level chunks value exists to move, return, or store. | Range-materialize and range-reduce MIR positives; bound/source-stage/rejected-form negatives retaining `Rvalue::Chunks`. |
-| Source nulling, replacement, return, and Drop | The virtual source inherits and consumes only the base's hidden temporary owner. A fresh heap base is freed once after the synchronous call; named/arena/static bases are never freed there. Materialized header ownership and every escaping fallback are unchanged. | Alloc/free owner over fresh, bound, arena, static, and returned bases; existing chunks replacement, return-provenance, and borrowed-liveness owners. |
-| Evaluation and control exits | Source, width, prior-stage operands, and terminal captures retain order. Source/width termination emits no chunks row; a later capture termination retains only the reached chunks row. Zero/negative width and empty/null base produce the canonical empty source before division or pointer work. | Side-effect/termination fixtures for both parallel rvalues, nonpositive/empty cases, current-plan reached-row owners, and unchanged fallback diagnostics. |
+| Source nulling, replacement, return, and Drop | The virtual source inherits and consumes only the base's hidden temporary owner. A fresh heap base is freed once after the synchronous call or by the existing exit cleanup when a later capture terminates first; named/arena/static bases are never freed there. Materialized header ownership and every escaping fallback are unchanged. | Alloc/free owner crossing fresh, bound, arena, static, and returned bases with normal completion; fresh-base post-width terminating callable/terminal-capture owners for both parallel rvalues; existing chunks replacement, return-provenance, and borrowed-liveness owners. |
+| Evaluation and control exits | Source, width, prior-stage operands, and terminal captures retain order. Source/width termination emits no chunks row; a later capture termination retains only the reached chunks row and runs hidden-owner cleanup before propagating. Zero/negative width and empty/null base produce the canonical empty source before division or pointer work. | Side-effect/termination fixtures for both parallel rvalues, the paired fresh-base alloc/free exit owners, nonpositive/empty cases, current-plan reached-row owners, and unchanged fallback diagnostics. |
 | Parallel correctness | Caller-only and shared-pool range materialization/reduction derive identical exact-multiple and partial-tail slices, preserve stable output order and wrapping integer reduction, and never retain base/context/views. | `chunk_parallel`, materializing and direct-sum owners at below-floor and pooled sizes, one-worker/multi-worker runs, partial-tail and captured callable fixtures. |
 | Generics, imports, whole/per-unit, checked-HIR replay | Concrete local/imported callables reconstruct the private source variant from checked HIR; no interface summary is added. Equal visible routes select the same tuple; unavailable imported source anchors remain unavailable. | Generic imported callable, whole/per-unit current-plan parity, replay/catalog owners, and `per_unit_surface`. |
 | MIR identity, cache, and generated functions | The changed semantic MIR changes implementation hashes and object/cache identity normally. Kernel identity distinguishes physical base from logical chunk-view input without changing the canonical generated-id format. Located collection remains identity-neutral. | Canonical MIR/hash delta, cache miss-then-hit, two virtual element types with no kernel collision, materialized/virtual collision negative, normal/located LLVM/object identity. |
-| Runtime ABI and safety | Existing par-map symbols and signatures are unchanged. Runtime sees logical count/stride only; generated code alone derives views. Checked count/start/byte-offset arithmetic precedes all pointer formation and malformed MIR cannot supply a forged count. | Runtime ABI inventory equality, optimized-LLVM structural owner, maximum count/width/stride malformed matrix, and no-call/no-pointer empty controls. |
+| Runtime ABI and safety | Existing par-map symbols and signatures are unchanged, but A39/A46 explicitly accept a compiler-certified opaque immutable source. Runtime validates a logical work span and never dereferences it; generated code proves and derives every source view. A89 and ordinary-source physical-span safety remain unchanged. Checked count/start/byte-offset arithmetic precedes all pointer formation and malformed MIR cannot supply a forged count. | Runtime ABI inventory equality; Rust ABI owner passing a source smaller than logical `count * in_stride` through A39 and A46 to certified range kernels; optimized-LLVM structural owner; maximum count/width/stride malformed matrix; and no-call/no-pointer empty controls. |
 | Allocation and fallback | Selected routes contain no `Rvalue::Chunks`, `align_rt_chunks`, header allocation, or header free. Every ineligible route retains all four. Output/partial allocations remain balanced. | LLVM symbol absence/presence, `alloc-count` candidate/control probe, and materialized fallback structural owner. |
 | Reporting | Selected virtual rows use the one new valid tuple and exact explanation; staged/rejected forms retain the materialized parallel row. Row order, source anchoring, and no-partial-output validation remain unchanged. | Updated selector table covering both parallel outcomes, default/verbose golden, whole/per-unit and normal/located owners. |
 
@@ -434,18 +456,20 @@ The candidate is the final reviewed O0 commit built by the same Rust 1.96,
 LLVM 22.1.8, system linker, release profile, and native target on the V1 host.
 
 Add one manual `bench/par_map` source-consumer mode. It compiles one source
-template with distinct baseline/candidate export prefixes, co-links both
-objects with one `alloc-count` runtime, and calls them in one process over the
-same runtime-generated `slice<i64>`. The source exports both direct
-`chunks(width).par_map(chunk_sum)` materialization with a full-output checksum
-and direct `.sum()` reduction. Input length is 1,048,579 to cover partial tails;
+template with distinct equal-length baseline/candidate export prefixes,
+co-links both objects with one `alloc-count` runtime, and calls them in one
+process over the same runtime-generated `slice<i64>`. The source exports both
+direct `chunks(width).par_map(chunk_sum)` materialization with a full-output
+checksum and direct `.sum()` reduction. Input length is 1,048,579 to cover partial tails;
 widths are 1, 8, 64, and 1,024. Each arm warms once, then runs 21 paired samples
 in alternating AB/BA order. Retain every sample; report median candidate/base
 ratio and p10–p90 without post-hoc outlier deletion.
 
-The primary resource gate is exact: for each invocation the candidate removes
-one successful allocation and one non-null free, remains balanced, and reduces
-peak requested live bytes by exactly
+Resource-probe invocations are serialized: after warmup and with no parallel
+call active, reset the requested-live probe and sample counter deltas around
+exactly one synchronous exported call. The primary resource gate is exact: for
+each invocation the candidate removes one successful allocation and one non-
+null free, remains balanced, and reduces peak requested live bytes by exactly
 `16 * ceil(input_length / width)` relative to the matching baseline arm.
 Results must be byte/value identical for every row. The primary timing gate is
 the width-1 reduction median candidate/base ratio at most 0.90. Guard timing
