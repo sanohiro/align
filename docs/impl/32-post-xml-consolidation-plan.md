@@ -1,12 +1,12 @@
 # Post-XML consolidation plan
 
-> **Status:** ACTIVE. V0 is complete and S0A is implemented in PR #955 against
-> [`35-startup-observation-design.md`](35-startup-observation-design.md).
-> The exact S0B extension is accepted in `09-explain-opt.md`.
+> **Status:** ACTIVE. V0 is complete, S0A is implemented in PR #955, and S0B is
+> implemented in PR #959. C0 is selected and closed as an exact implementation
+> boundary in §10 below.
 >
-> **First executable task:** implement the accepted S0B current-decision
-> observation contract. No compiler refactor beyond that exact closure matrix
-> is authorized by this position.
+> **First executable task:** implement the §10 chunks-representation decision
+> consolidation. It changes no source semantics, public report row, MIR shape,
+> runtime ABI, or optimization strategy.
 
 ## 1. Purpose and authority
 
@@ -245,3 +245,68 @@ the first paused library candidate if cloud work is selected; they do not
 automatically start because this phase ended. A new request can change that
 selection explicitly. Internal architecture remains changeable under the same
 semantic and evidence rules.
+
+## 10. C0 — chunks-representation decision consolidation
+
+### 10.1 Evidence and exact boundary
+
+V0 selected chunks representation as the conditional C0 candidate. S0B now
+reports all five shipped outcomes from the selector owner. The fixed examples
+confirm both materializing corpus routes: `examples/chunks.align` reports
+`materialized-headers / stored-or-boundary`, while
+`examples/chunk_parallel.align` reports
+`materialized-headers / parallel-consumer`. The complete S0B owner additionally
+pins `virtual-count / direct-len`, `virtual-index / direct-index`, and
+`materialized-headers / pipeline-consumer`, with the selected representation
+matched against the generated MIR.
+
+The implementation audit found one bounded repeated-rule class in
+`align_mir`: direct length, direct index, and ordinary materialization construct
+their own decision tuples, while pipeline and parallel consumers first publish
+the ordinary materialization tuple and then mutate its reason through
+`mark_chunks_consumer` and `PlanCollector::replace_chunks_reason`. A sequential
+`par_map` fallback may pass through two such rewrites. That mutable reporting
+repair is a second account of a representation decision already implied by the
+consumer lowering path and can drift from the MIR it describes.
+
+C0 introduces one private exhaustive `ChunksConsumer` classification with
+exactly `DirectLen`, `DirectIndex`, `Pipeline`, `Parallel`, and
+`StoredOrBoundary`, and one private selector that maps it to the existing
+`PlanDecision`. Each existing lowering consumer supplies its classification
+before lowering the chunks expression. The selected tuple is consumed both by
+the existing virtual/materialized lowering path and by located reporting.
+Materialized source lowering receives its final classification up front and
+records exactly once. Delete `mark_chunks_consumer`,
+`replace_chunks_reason`, and the default-then-rewrite path.
+
+This is consolidation only. It does not admit another nonescaping consumer,
+virtualize a currently materialized header array, add a HIR/MIR variant, alter
+evaluation order, change ownership or cleanup, or move a decision across a
+module/interface boundary. S1 remains measure-first and unscheduled. There is
+no public-contract or safety-strategy change, so this exact matrix is folded
+into the normal single implementation review rather than receiving a separate
+design-review loop.
+
+### 10.2 Implementation closure matrix
+
+| Axis | Exact C0 closure | Owner evidence |
+|---|---|---|
+| Formation and validation | `ChunksConsumer` is private and exhaustive; its selector is the only state/strategy/reason mapping; existing plan-tuple validation remains fail-closed | Unit table over all five classifications; existing current-plan enum/selector tripwire and malformed-record matrix |
+| Construction and consumption | Direct length/index and materialized boundary/pipeline/parallel paths obtain one decision before emission; located mode records that same decision once; unlocated mode allocates no report table | `current_plan_chunks_rows_follow_the_consumed_representation`; normal/located plan-storage owner |
+| Move-in/out, source nulling, replacement, return, and Drop | Existing `lower_chunks_source`, synthetic-owner creation, borrow-owner inheritance, temporary release, and stored/returned materialized ownership remain unchanged; C0 removes only plan-record replacement | `direct_chunks_consumers_are_semantically_equivalent`, owned-source chunks, borrowed-liveness replacement/loop owners, resource ownership owners |
+| Evaluation and control exits | Source, width, then index order remains exact; nonpositive width preserves the canonical empty result and direct-index bounds failure; termination before a selector publishes no row, while a reached chunks decision survives a later terminating pipeline/parallel capture | `index_receivers_evaluate_before_indices`, `direct_chunks_zero_size_index_aborts`, `current_plan_emits_no_row_before_a_selector_decision_is_reached`, `current_plan_capture_termination_preserves_only_reached_decisions` |
+| Pipelines and explicit parallelism | Synchronous pipeline, direct range reduction, range materialization, and sequential `par_map` fallback all classify the chunks source before lowering without changing their current algorithms or par-map decision | Current-plan five-row fixture, `chunks`, `par_map`, and `direct_chunks_consumers_are_semantically_equivalent` owners |
+| Generics, imports, whole-program, per-unit, and checked-HIR replay | The private classification is reconstructed from each concrete checked HIR body; no interface field is added; equal visible routes retain identical tuples and imported source unavailability | Current-plan generic/import fixture, whole/per-unit parity, replay/catalog owners, `per_unit_surface` |
+| MIR, LLVM, cache, and artifact identity | Ordinary MIR statements, runtime keys, implementation hashes, LLVM IR, objects, and cache eligibility remain unchanged; located records stay ephemeral | Current-plan normal-versus-located MIR comparison, existing side-table implementation-hash/LLVM/object identity owner, cache owner |
+| Runtime ABI and allocation | Materialized paths retain `Rvalue::Chunks` and the existing runtime materializer; virtual paths retain no header allocation; no runtime symbol or ABI row changes | LLVM direct-versus-stored structural owner, runtime ABI inventory equality, allocation balance owner |
+
+### 10.3 Acceptance and continuation
+
+C0 is complete when the code contains one exhaustive selector and no post-hoc
+chunks plan mutation, every matrix owner above passes, the normal code-tier gate
+and independent review close, and the existing examples produce the same S0B
+rows. Because C0 makes no performance or resource-improvement promise, it adds
+no benchmark threshold. After merge, perform V1 against the preserved V0 corpus,
+decide whether any residual cost admits one O0 candidate, and either execute
+that one bounded candidate or record its measured deferral before closing this
+phase.
