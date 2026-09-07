@@ -105,7 +105,7 @@ fn function_partition_cache_edit_revert_and_completion() {
         .collect()
     );
     let executable = proj.dir.join("function-thin");
-    cold.link_and_publish(&executable).expect("link cold build");
+    cold.link_and_publish(&align_driver::CDriver::default(), &executable).expect("link cold build");
     let output = std::process::Command::new(&executable)
         .output()
         .expect("run cold build");
@@ -386,7 +386,7 @@ fn resource_owner_forms_one_support_partition_and_runs_once() {
         2,
     )
     .expect("resource function ThinLTO build");
-    build.link_and_publish(&executable).expect("resource link");
+    build.link_and_publish(&align_driver::CDriver::default(), &executable).expect("resource link");
     let output = std::process::Command::new(&executable)
         .output()
         .expect("resource run");

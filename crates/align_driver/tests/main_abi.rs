@@ -84,6 +84,7 @@ fn argv_result_entry_is_exact_in_both_build_paths() {
         .dir
         .join(format!("argv{}", std::env::consts::EXE_SUFFIX));
     link_objects(
+        &align_driver::CDriver::default(),
         &object_refs,
         &exe,
         &built.link_libs_union(),

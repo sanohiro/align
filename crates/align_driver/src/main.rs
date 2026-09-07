@@ -54,6 +54,12 @@ mod watch_native;
 fn main() -> ExitCode {
     let raw_os = std::env::args_os().collect::<Vec<_>>();
     if raw_os.get(1).is_some_and(|value| value == "db") {
+        if raw_os.iter().take_while(|value| *value != "--").any(|value| {
+            value == "--cc" || value.to_str().is_some_and(|text| text.starts_with("--cc="))
+        }) {
+            eprintln!("alignc: --cc is only valid for build/run/size/test (got `db`)");
+            return ExitCode::FAILURE;
+        }
         if raw_os.iter().skip(2).any(|value| value == "--watch") {
             eprintln!("alignc: --watch is only valid for `build` (got `db`)");
             return ExitCode::FAILURE;
@@ -74,7 +80,13 @@ fn main() -> ExitCode {
             }
         };
     }
-    let raw: Vec<String> = std::env::args().collect();
+    let raw: Vec<String> = match raw_os.into_iter().map(OsString::into_string).collect() {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("alignc: CLI arguments must be UTF-8");
+            return ExitCode::FAILURE;
+        }
+    };
     // Package-manager smoke tests and bug reports need a cheap, source-free way to identify the
     // compiler. Keep this before flag parsing: `--version` is a complete invocation, not a build
     // flag, and must not be mistaken for a subcommand.
@@ -87,7 +99,23 @@ fn main() -> ExitCode {
     // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
     // …) still present — otherwise that flag would already be removed and the guard would consume the
     // verb as the profile value. Cached/parallel per unit, release/fast only.
-    let (pgo, args) = match parse_pgo(&raw) {
+    let delimiter = raw.iter().position(|arg| arg == "--").unwrap_or(raw.len());
+    let compiler_args = &raw[..delimiter];
+    let program_suffix = &raw[delimiter..];
+    // Validate PGO on the original prefix without stripping a token that could be a missing
+    // --cc value. The compiler never parses flags in the program suffix.
+    if let Err(error) = parse_pgo(compiler_args) {
+        eprintln!("alignc: {error}");
+        return ExitCode::FAILURE;
+    }
+    let (cc_path, args) = match parse_cc(compiler_args) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (pgo, args) = match parse_pgo(&args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("alignc: {e}");
@@ -144,15 +172,35 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (test_limits, args) = match parse_test_limits(&args) {
+    let (test_limits, mut args) = match parse_test_limits(&args) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("alignc: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let mut run_args = args.get(3..).unwrap_or(&[]).to_vec();
+    run_args.extend_from_slice(program_suffix.get(1..).unwrap_or(&[]));
+    args.extend_from_slice(program_suffix);
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    let cc = match cc_path {
+        Some(path) => {
+            if !matches!(cmd, Some("build" | "run" | "size" | "test")) {
+                eprintln!("alignc: --cc is only valid for build/run/size/test (got `{}`)", cmd.unwrap_or("<none>"));
+                return ExitCode::FAILURE;
+            }
+            match align_driver::CDriver::explicit(path.into()) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    eprintln!("alignc: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => align_driver::CDriver::default(),
+    };
 
     if cmd == Some("test") && !profile_was_explicit {
         profile = Profile::Dev;
@@ -316,7 +364,7 @@ fn main() -> ExitCode {
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
-        (Some("size"), Some(p)) => size::run_size(p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
+        (Some("size"), Some(p)) => size::run_size(&cc, p, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         // `cache clear` — remove the cache-owned subtrees under the resolved cache root (S3b).
         (Some("cache"), Some(sub)) if sub == "clear" => run_cache_clear(),
         (Some("cache"), other) => {
@@ -332,6 +380,7 @@ fn main() -> ExitCode {
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
         (Some("build"), Some(p)) if watch => watch::run_watch_build(
+            &cc,
             p,
             target,
             profile,
@@ -342,6 +391,7 @@ fn main() -> ExitCode {
             cache_stats,
         ),
         (Some("build"), Some(p)) => run_build(
+            &cc,
             p,
             target,
             profile,
@@ -352,6 +402,7 @@ fn main() -> ExitCode {
             cache_stats,
         ),
         (Some("test"), Some(p)) if args.len() == 3 => run_test(
+            &cc,
             p,
             target,
             profile,
@@ -365,7 +416,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
+        (Some("run"), Some(p)) => run_run(&cc, p, &run_args, target, profile, rt_lto, thin_lto, &pgo, jobs, cache_stats),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -377,6 +428,37 @@ fn main() -> ExitCode {
 struct ParsedTestLimits {
     limits: test_runner::Limits,
     used: bool,
+}
+
+/// Parse only the original compiler prefix, before any other flag stripper removes tokens.
+fn parse_cc(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut selected = None;
+    let mut rest = Vec::new();
+    let mut iter = args.iter();
+    while let Some(argument) = iter.next() {
+        let value = if argument == "--cc" {
+            if selected.is_some() {
+                return Err("--cc may be specified only once".into());
+            }
+            match iter.next() {
+                Some(value) if !value.is_empty() && !value.starts_with('-') => value.as_str(),
+                _ => return Err("--cc requires an absolute executable path".into()),
+            }
+        } else if let Some(value) = argument.strip_prefix("--cc=") {
+            if selected.is_some() {
+                return Err("--cc may be specified only once".into());
+            }
+            if value.is_empty() {
+                return Err("--cc requires an absolute executable path".into());
+            }
+            value
+        } else {
+            rest.push(argument.clone());
+            continue;
+        };
+        selected = Some(value.to_owned());
+    }
+    Ok((selected, rest))
 }
 
 fn parse_test_limits(args: &[String]) -> Result<(ParsedTestLimits, Vec<String>), String> {
@@ -1449,6 +1531,7 @@ fn usage() {
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
          --profile     dev (O0; test default), release (O2; other default), fast (O3), small (Os), tiny (Oz)\n  \
+         --cc PATH     (build/run/size/test) one absolute executable C-driver path; no PATH fallback\n  \
          --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
                        name's linkage external instead of the default internal, so a no-`main`\n  \
                        library/benchmark object exposes it to the linker\n  \
@@ -1481,6 +1564,7 @@ fn build_usage() {
     eprintln!(
         "usage: alignc build <file.align> [build options] [--watch]\n\
          \n\
+         --cc PATH  absolute executable C-driver path (also --cc=PATH); fixed across revisions\n\
          --watch  rebuild on compiler-observed file changes; other toolchain/library changes need another observed change or restart"
     );
 }
@@ -1828,12 +1912,12 @@ fn stem(path: &str) -> String {
 /// deterministically first-seen across units; the executable is published to `exe` by same-directory
 /// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
 #[allow(clippy::too_many_arguments)]
-fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
+fn build_per_unit_to(cc: &align_driver::CDriver, path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
     // The persistent unit-frontend cache is consulted only on the ordinary per-unit path. A
     // `--thin-lto` build needs every unit's MIR for its prelink phase, so reuse there would
     // rehydrate all of them and buy nothing; it takes the unchanged `build_per_unit` route below.
     if !thin_lto {
-        return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Allowed);
+        return build_package_to(cc, path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Allowed);
     }
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
     // Opt-in codegen cache (ALIGNC_CACHE), default-ON; disabled ⇒ each unit emits verbatim.
@@ -1856,7 +1940,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     if cache_stats {
         render_function_thin_cache_stats(&build, cache.codegen_is_enabled());
     }
-    build.link_and_publish(exe).map_err(|error| {
+    build.link_and_publish(cc, exe).map_err(|error| {
         eprintln!("alignc: {error}");
         ExitCode::FAILURE
     })
@@ -1899,7 +1983,7 @@ fn report_pgo_use(pgo: &align_driver::PgoMode, build: &align_driver::UnitCodegen
 /// that has just been shown untrustworthy. A `Forbidden` build never rehydrates, so the retry cannot
 /// loop.
 #[allow(clippy::too_many_arguments)]
-fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool, reuse: UnitReuse) -> Result<(), ExitCode> {
+fn build_package_to(cc: &align_driver::CDriver, path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool, reuse: UnitReuse) -> Result<(), ExitCode> {
     // Only the retry pass forbids reuse here, and it re-derives what the first pass already
     // printed. (`UnitReuse` is `#[non_exhaustive]`, so this is a first-attempt-vs-retry test rather
     // than an exhaustive match.)
@@ -1951,7 +2035,7 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
             eprintln!(
                 "alignc: cached unit `{unit}`: {failure}; rebuilding this package without cache reuse"
             );
-            return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Forbidden);
+            return build_package_to(cc, path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Forbidden);
         }
         align_driver::PipelinedPackageBuild::CodegenFailed { diags, error } => {
             render(&diags);
@@ -1966,13 +2050,13 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
     report_pgo_use(pgo, &build.codegen);
     let link_libs = link_lib_union(build.units.iter().map(|u| u.link_libs.as_slice()));
     let obj_paths: Vec<PathBuf> = build.units.iter().map(|unit| unit.object().to_path_buf()).collect();
-    finish_link(&link_libs, &obj_paths, exe, profile, &target, pgo)
+    finish_link(cc, &link_libs, &obj_paths, exe, profile, &target, pgo)
 }
 
 /// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in
 /// DAG order) + link + atomic-rename publish. Shared by the normal cached path and the `--thin-lto`
 /// path (the objects differ; the link step is identical).
-fn finish_link(link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
+fn finish_link(cc: &align_driver::CDriver, link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
 
     let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let publish_stage = align_driver::ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
@@ -2001,9 +2085,9 @@ fn finish_link(link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile:
              (set LLVM_PROFILE_FILE to redirect); then `llvm-profdata-22 merge` it and rebuild with \
              `--pgo-use <file.profdata>`"
         );
-        align_driver::link_objects_instrumented(&obj_refs, &staged_exe, link_libs, profile, &profile_rt)
+        align_driver::link_objects_instrumented(cc, &obj_refs, &staged_exe, link_libs, profile, &profile_rt)
     } else {
-        link_objects(&obj_refs, &staged_exe, link_libs, profile)
+        link_objects(cc, &obj_refs, &staged_exe, link_libs, profile)
     };
     if let Err(e) = link_result {
         eprintln!("alignc: {e}");
@@ -2017,9 +2101,9 @@ fn finish_link(link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_build(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
+fn run_build(cc: &align_driver::CDriver, path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
     let exe = PathBuf::from(stem(path));
-    match build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
+    match build_per_unit_to(cc, path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -2167,6 +2251,7 @@ fn run_cache_clear() -> ExitCode {
 
 #[allow(clippy::too_many_arguments)]
 fn run_test(
+    cc: &align_driver::CDriver,
     path: &str,
     target: BuildTarget,
     profile: Profile,
@@ -2186,7 +2271,7 @@ fn run_test(
             return ExitCode::FAILURE;
         }
     };
-    let formation = form_test_artifact(path, target, profile, rt_lto, jobs, cache_stats);
+    let formation = form_test_artifact(cc, path, target, profile, rt_lto, jobs, cache_stats);
     let (executable, executable_stage, catalog, cache_report) = match formation {
         Ok(formed) => formed,
         Err(code) => return code,
@@ -2203,6 +2288,7 @@ fn run_test(
 
 #[allow(clippy::too_many_arguments)]
 fn form_test_artifact(
+    cc: &align_driver::CDriver,
     path: &str,
     target: BuildTarget,
     profile: Profile,
@@ -2338,7 +2424,7 @@ fn form_test_artifact(
             }
         }
     }
-    if let Err(error) = link_objects(&link_objects_list, &executable, &link_libs, profile) {
+    if let Err(error) = link_objects(cc, &link_objects_list, &executable, &link_libs, profile) {
         eprintln!("alignc: {error}");
         return Err(ExitCode::FAILURE);
     }
@@ -2359,6 +2445,7 @@ fn form_test_artifact(
 
 #[allow(clippy::too_many_arguments)]
 fn run_run(
+    cc: &align_driver::CDriver,
     path: &str,
     prog_args: &[String],
     target: BuildTarget,
@@ -2377,7 +2464,7 @@ fn run_run(
         }
     };
     let exe = stage.path().join("program");
-    if let Err(code) = build_per_unit_to(path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
+    if let Err(code) = build_per_unit_to(cc, path, &exe, target, profile, rt_lto, thin_lto, pgo, jobs, cache_stats) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the

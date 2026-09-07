@@ -599,7 +599,7 @@ fn pkg_kv_fault_link_child() {
         .collect::<Vec<_>>();
     let executable =
         PathBuf::from(std::env::var_os(LINK_EXE_ENV).expect("missing fault link-child executable"));
-    link_objects(&object_refs, &executable, &libraries, Profile::Release)
+    link_objects(&align_driver::CDriver::default(), &object_refs, &executable, &libraries, Profile::Release)
         .expect("link pkg.kv fault executable");
 }
 

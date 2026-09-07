@@ -236,7 +236,7 @@ pub fn main() -> Result<(), Error> {
     }
     let _g = Cleanup(vec![obj.clone(), exe.clone()]);
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let mut child = std::process::Command::new(&exe)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -603,7 +603,7 @@ pub fn main() -> Result<(), Error> {
     }
     let _g = Cleanup(vec![obj.clone(), exe.clone()]);
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let payload = b"a cat program: bytes in == bytes out, unbuffered stdout\n0123456789";
     let mut child = std::process::Command::new(&exe)
         .stdin(std::process::Stdio::piped())
@@ -653,7 +653,7 @@ pub fn main() -> Result<(), Error> {
     }
     let _g = Cleanup(vec![obj.clone(), exe.clone()]);
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     let payload = b"a short tail chunk that must survive buffering\n";
     let mut child = std::process::Command::new(&exe)
         .stdin(std::process::Stdio::piped())
@@ -720,7 +720,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     }
     let _g = Cleanup(vec![obj.clone(), exe.clone()]);
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
 
     let mut child = std::process::Command::new(&exe)
         .args([src.str(), dst.str()])

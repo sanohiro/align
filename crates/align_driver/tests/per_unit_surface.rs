@@ -162,8 +162,8 @@ fn n1_object_and_exe_identical_across_all_profiles() {
             std::fs::create_dir_all(&pu_dir).expect("pu exe dir");
             let wp_exe = wp_dir.join("n1");
             let pu_exe = pu_dir.join("n1");
-            link_objects(&[wp.as_path()], &wp_exe, &wp_mir.link_libs, profile).expect("wp link");
-            link_objects(&[pu.as_path()], &pu_exe, &pu_mir.link_libs, profile).expect("pu link");
+            link_objects(&align_driver::CDriver::default(), &[wp.as_path()], &wp_exe, &wp_mir.link_libs, profile).expect("wp link");
+            link_objects(&align_driver::CDriver::default(), &[pu.as_path()], &pu_exe, &pu_mir.link_libs, profile).expect("pu link");
             assert_eq!(
                 std::fs::read(&wp_exe).unwrap(),
                 std::fs::read(&pu_exe).unwrap(),
@@ -198,7 +198,7 @@ fn cli_build_run_size_match_library_reference() {
     emit_object_file(&ref_mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false)
         .expect("reference emit");
     let ref_obj_bytes = std::fs::read(&obj).expect("read reference object");
-    link_objects(&[obj.as_path()], &exe, &ref_mir.link_libs, Profile::Release).expect("reference link");
+    link_objects(&align_driver::CDriver::default(), &[obj.as_path()], &exe, &ref_mir.link_libs, Profile::Release).expect("reference link");
     let ref_exe_bytes = std::fs::read(&exe).expect("read reference exe");
 
     // The OBJECT is the portable form of this gate, and the stronger one: it is the compiler's
@@ -560,7 +560,7 @@ fn multi_unit_dag_builds_byte_identically_twice() {
     let link = |b: &PerUnitBuilt, objs: &[PathBuf]| -> Vec<u8> {
         let refs: Vec<&Path> = objs.iter().map(|p| p.as_path()).collect();
         let exe = b.dir.join(format!("dag-exe{}", std::env::consts::EXE_SUFFIX));
-        link_objects(&refs, &exe, &b.link_libs_union(), Profile::Release).expect("link");
+        link_objects(&align_driver::CDriver::default(), &refs, &exe, &b.link_libs_union(), Profile::Release).expect("link");
         std::fs::read(&exe).expect("read exe")
     };
     assert_eq!(link(&x, &ox), link(&y, &oy), "the linked executable must be byte-identical across builds");

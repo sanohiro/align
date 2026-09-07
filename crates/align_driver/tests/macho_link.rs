@@ -55,7 +55,7 @@ fn tiny_profile_strips_and_stays_runnable() {
     let obj = dir.join(format!("align-macho-tiny-{pid}.o"));
     let exe = dir.join(format!("align-macho-tiny-{pid}"));
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Tiny, &[], false).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs, Profile::Tiny).expect("link + strip");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Tiny).expect("link + strip");
     let out = std::process::Command::new(&exe).output().expect("run stripped binary");
     let _ = std::fs::remove_file(&obj);
     let nm_out = std::process::Command::new(&nm)

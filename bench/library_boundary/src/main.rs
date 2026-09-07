@@ -563,7 +563,7 @@ fn compile_call_fixture(
         false,
     )
     .unwrap_or_else(|error| panic!("{row} object emission failed: {error}"));
-    align_driver::link_executable(
+    align_driver::link_executable(cc,
         &object,
         &executable,
         &mir.link_libs,

@@ -2191,6 +2191,61 @@ a generic-named, marker-free helper edit remains in service scope by path.
 
 ## Item 2: lld linking on ELF
 
+### Request 60: explicit C link driver
+
+Issue #968 requires a caller-authenticated driver without an ambient `PATH`
+lookup. This is one driver capability, delivered across all executable-producing
+entrypoints together. It changes neither linker selection nor the language,
+runtime ABI, library ordering, or object compilation strategy.
+
+| Public contract | Exact rule and owner |
+|---|---|
+| CLI | `--cc PATH` and `--cc=PATH`, at most once before the first `--`, on `build`, `run`, `size`, and `test`. The flag may precede the verb or follow the source. After `--`, it is program input, not compiler configuration. All other verbs, including `db`, reject the compiler flag before source reads or external operations. |
+| Value | One nonempty UTF-8 absolute path, with no embedded NUL. No shell parsing, argument splitting, tilde expansion, canonicalization, or relative-path resolution. Spaces and symlinks are accepted. A following option is a missing separated value. A duplicate is an error even when both paths agree. |
+| Validation | Split the original argument vector once at the first `--`; all compiler parsing operates only on the prefix, and the program suffix is retained unchanged. Existing PGO syntax validation retains precedence on non-DB invocations, but it must not delete tokens before the C-driver lexical scan. Next, that scan diagnoses the first missing/duplicate value against the original prefix in argument order. Existing flag parsers establish the verb; C-driver applicability then precedes path validation. Validate nonempty/absolute/NUL-free shape, metadata availability, regular-file type, and Unix execute bits before source reads, code generation, cache publication, staging, watcher creation, or C-driver execution. Invalid explicit configuration is not bypassed by `build --help`. Non-UTF-8 CLI input produces a diagnostic, not a Rust argument-decoding panic. |
+| Driver ownership | `align_driver::CDriver` owns one private `PathBuf`; `Default` selects the existing `cc` name. `CDriver::explicit(PathBuf) -> Result<CDriver, String>` validates the explicit path; `program(&self) -> &Path` lends its unchanged spelling. Link APIs take `&CDriver`; callers cannot mutate the stored path. Ordinary CLI operation allocates this configuration once and watch lends it to every revision. |
+| Execution and failure | Every C-driver invocation uses the selected program directly through `Command`, including captured watch links. An explicit selection never falls back to `cc`, `CC`, `PATH`, or an OS default search. Launch failure identifies the selected path and fails the attempt. Later replacement, removal, or loss of permission can still fail execution: startup metadata is not an inode lock or executable digest authentication. Caller-side authentication remains the consumer's responsibility. |
+| Defaults and scope | Omission preserves normal `cc` lookup. `ALIGNC_LINKER` and lld discovery, runtime/profile archive discovery, size inspection tools, and Mach-O stripping retain their contracts. This option selects only the C driver, not an entire hermetic native toolchain or the driver's own subprocesses. No new environment variable or implicit `CC` support. |
+| Watch | Selection is fixed at invocation entry and retained across successful and failed revisions. Driver replacement alone is trigger-excluded under W1/W10; the next observed revision uses the same configured path. Existing trusted-tool descendant-writer and publication contracts remain required. |
+| Artifact identity | Final linking executes even on object/ThinLTO cache hits. The driver does not produce cached compiler objects, so no interface, object, ThinLTO key, persisted format, or cache namespace changes. The output is still privately staged and published under existing rules. No performance/resource improvement is promised and no benchmark is required. |
+| Sources of truth | This record owns the CLI/toolchain boundary; `docs/guide/16-toolchain.md` and its `ja/` mirror describe the same option. CLI usage agrees. The external request register records delivery and consumer-owned adoption separately. No language specification change is needed. |
+
+| Implementation closure axis | Acceptance owner |
+|---|---|
+| Lexical placement, missing/empty/duplicate, `--`, applicability, path shape, missing file, directory, execute bits, non-UTF-8, help, multiple invalid inputs | Parameterized CLI/parser owners pin each error class and precedence; real-binary rejection owners use an invalid source, private cache/output roots, and a recording driver to prove rejection precedes compilation or execution. |
+| Default and explicit execution | A real-binary owner runs with only `HOME`, `LC_ALL`, `TMPDIR`, and `TZ`, selecting an absolute recording driver. A separate child-scoped `PATH` trap proves explicit selection cannot run a different `cc`. The selected path contains spaces. Existing default-path owners remain applicable. |
+| Ordinary whole/per-unit, test harness, run, size | All link APIs require the same `CDriver` argument; a parameterized process owner exercises all four linking verbs. No old/new API compatibility wrappers. |
+| ThinLTO and instrumented PGO | Thread the selection through both `link_and_publish` methods and both instrumented link entrypoints. Focused owner coverage proves the selected executable receives the established response-file/profile argv without changing argument order. |
+| Watch, failure, retry, publication | Captured links receive the immutable selection; a multi-revision real-binary owner observes the same recording driver on two revisions. Existing captured-tool interruption, failure, cleanup, and atomic-publication owners retain responsibility for lifecycle behavior. |
+| Moves, construction, nulling, Drop, branch/loop joins, early returns, generics, malformed HIR, runtime allocation/provenance and ABI | Not changed: this is host-side immutable tool configuration after compiler lowering. Rust borrows carry selection through all entrypoints; no language value, IR variant, native ABI, or ownership strategy is added. |
+
+Author-side ledger pass: the public CLI spelling, validation order, exact
+program selection, watch lifetime, and cache exclusions above each have an
+explicit closure row. A fresh independent boundary review must close the plan
+before production changes; the final matrix-to-diff pass binds these rows to
+the implemented owner names before code review.
+
+Independent plan review found one parser-order gap: stripping PGO first could
+turn `--cc --pgo-instrument /usr/bin/cc` into an admitted driver value, while
+parsing PGO beyond `--` could reject program arguments. The original-prefix
+rule above closes both witnesses; the parser owner must retain both cases.
+The reviewer found the remaining capability boundaries coherent.
+
+Author-side implementation closure: `main` splits the original prefix and
+validates `parse_cc` before dispatch; `CDriver::explicit` owns path admission.
+`c_driver::invalid_driver_rejects_before_source_cache_output_or_execution`
+owns invalid/precedence cells, and `program_suffix_is_not_parsed_as_compiler_configuration`
+owns the delimiter witness. `selection_retains_symlink_spelling_and_never_recovers_a_vanished_driver`
+owns exact spelling and late launch failure. `explicit_driver_links_every_verb_without_path_and_relinks_cache_hits`
+owns all four verbs, both ordinary and ThinLTO cache reuse, instrumented linking,
+explicit/default PATH selection, and path spaces. `watch_reuses_the_selected_driver_for_each_revision`
+owns two ready revisions in ordinary, ThinLTO, and PGO modes. Ordinary links and
+captured links both call `Command` with `CDriver::program`; existing link argv,
+test-harness, FunctionThinLTO, and watch lifecycle owners retain their unchanged
+contracts. REPL and benchmark library callers explicitly choose the default.
+The extracted must/exact/every/before/reject/required obligations map to these
+implementation sites and owners; no applicable cell is deferred.
+
 ### Request 54: support-library ordering closure
 
 The current source reproduces an unresolved `expf` when a user C static archive
@@ -2216,7 +2271,8 @@ review includes this boundary; no separate public-contract review is required.
 
 ### Linker selection
 
-`alignc` links through the system C driver (`cc`). On ELF it now additionally
+By default, `alignc` links through the system C driver (`cc`); `--cc` explicitly
+selects its replacement as specified above. On ELF it additionally
 tells that driver to run LLVM's `ld.lld`; on Mach-O nothing changed.
 
 **lld, not mold.** `ld.lld` ships inside the LLVM 22 toolchain `alignc`

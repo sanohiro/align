@@ -971,7 +971,7 @@ fn pkg_kv_control_link_child() {
     let executable = PathBuf::from(
         std::env::var_os(LINK_EXE_ENV).expect("missing pkg.kv control link-child executable"),
     );
-    link_objects(&object_refs, &executable, &libraries, Profile::Release)
+    link_objects(&align_driver::CDriver::default(), &object_refs, &executable, &libraries, Profile::Release)
         .unwrap_or_else(|error| panic!("production pkg.kv control link failed: {error}"));
 }
 

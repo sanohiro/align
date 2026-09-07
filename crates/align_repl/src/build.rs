@@ -165,7 +165,7 @@ fn build_from_path(
     }
     let obj_refs: Vec<&std::path::Path> = obj_paths.iter().map(|p| p.as_path()).collect();
     let staged_exe = stage.path().join("session.pending");
-    align_driver::link_objects(&obj_refs, &staged_exe, &link_libs, profile)?;
+    align_driver::link_objects(&align_driver::CDriver::default(), &obj_refs, &staged_exe, &link_libs, profile)?;
     std::fs::rename(&staged_exe, exe).map_err(|e| format!("cannot publish executable {}: {e}", exe.display()))
 }
 

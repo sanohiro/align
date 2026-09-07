@@ -42,7 +42,7 @@ fn per_unit_unit_main_exit_code_is_deterministic_across_runs() {
     let objs = built.emit_objects(false);
     let obj_refs: Vec<&std::path::Path> = objs.iter().map(|p| p.as_path()).collect();
     let exe = built.dir.join(format!("a{}", std::env::consts::EXE_SUFFIX));
-    link_objects(&obj_refs, &exe, &built.link_libs_union(), Profile::Release).expect("link");
+    link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &built.link_libs_union(), Profile::Release).expect("link");
     for run in 0..5 {
         let status = Command::new(&exe).status().expect("run");
         assert_eq!(status.code(), Some(0), "run {run}: per-unit Unit main must exit 0, got {status:?}");

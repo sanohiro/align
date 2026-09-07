@@ -44,7 +44,7 @@ fn bogus_library_fails_to_link() {
     let obj = dir.join(format!("align-link-{pid}.o"));
     let exe = dir.join(format!("align-link-{pid}"));
     emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
-    let linked = link_executable(&obj, &exe, &mir.link_libs, Profile::Release);
+    let linked = link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release);
     let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&exe);
     assert!(linked.is_err(), "linking against a nonexistent library must fail");

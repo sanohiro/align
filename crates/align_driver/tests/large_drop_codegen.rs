@@ -160,7 +160,7 @@ fn deep_finite_drop_graph_executes_with_one_helper_frame() {
         false,
     )
     .expect("deep Drop object emission");
-    link_objects(&[object.as_path()], &executable, &[], Profile::Release)
+    link_objects(&align_driver::CDriver::default(), &[object.as_path()], &executable, &[], Profile::Release)
         .expect("deep Drop executable link");
     let status = run_bounded(&executable);
     assert_eq!(status.code(), Some(0), "deep Drop executable must finish normally");

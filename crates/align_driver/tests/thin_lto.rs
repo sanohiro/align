@@ -123,7 +123,7 @@ fn gate_cross_unit_inline_mutation_checked() {
     // And the ThinLTO-built program runs with the expected output.
     let obj_refs: Vec<&std::path::Path> = thin.iter().map(|p| p.as_path()).collect();
     let exe = per.dir.join(format!("tl-inline{}", std::env::consts::EXE_SUFFIX));
-    align_driver::link_objects(&obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
+    align_driver::link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
     let out = std::process::Command::new(&exe).output().expect("run");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "84\n", "thin-lto program output");
 }
@@ -179,7 +179,7 @@ fn gate_wide_tuple_sret_vanishes_when_inlined() {
     // Run-parity: the ThinLTO build produces the same result as the whole-program build.
     let obj_refs: Vec<&std::path::Path> = thin.iter().map(|p| p.as_path()).collect();
     let exe = per.dir.join(format!("tl-tuple{}", std::env::consts::EXE_SUFFIX));
-    align_driver::link_objects(&obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
+    align_driver::link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
     let thin_out = std::process::Command::new(&exe).output().expect("run");
     let whole = build_and_run_multi("tl-tuple-wp", &[("lib.align", LIB2), ("main.align", MAIN2)], "main.align");
     assert_eq!(thin_out.stdout, whole.stdout, "thin-lto vs whole-program output");
@@ -306,7 +306,7 @@ fn main(args: array<str>) -> Result<(), Error> {
         let thin = thin_objects(&per);
         let obj_refs: Vec<&std::path::Path> = thin.iter().map(|p| p.as_path()).collect();
         let exe = per.dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        align_driver::link_objects(&obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
+        align_driver::link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
         let thin_out = std::process::Command::new(&exe).output().expect("run");
         assert_eq!(
             whole.stdout, thin_out.stdout,
@@ -354,7 +354,7 @@ fn gate_preserve_main_and_pub_survive() {
     // The linked program still runs correctly.
     let obj_refs: Vec<&std::path::Path> = thin.iter().map(|p| p.as_path()).collect();
     let exe = per.dir.join(format!("tl-preserve{}", std::env::consts::EXE_SUFFIX));
-    align_driver::link_objects(&obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
+    align_driver::link_objects(&align_driver::CDriver::default(), &obj_refs, &exe, &per.link_libs_union(), Profile::Release).expect("link");
     let out = std::process::Command::new(&exe).output().expect("run");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
