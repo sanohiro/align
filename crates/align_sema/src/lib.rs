@@ -34684,12 +34684,13 @@ impl<'a> MoveCheck<'a> {
                 let headers = self.local_headers(*root).project_path(&projection);
                 if headers.leaves.is_empty() {
                     roots.extend(self.local_storage_roots(*root));
-                    // Sibling headers cannot represent an opaque handle field's own storage.
-                    if self.is_move_ty(e.ty) {
-                        roots.insert(self.stable_owner_root(*root));
-                    }
                 } else {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
+                }
+                // Selecting a mixed aggregate has the same opaque ownership obligation as
+                // selecting its handle leaf. Header presence is independent of that obligation.
+                if has_inline_handle_storage(e.ty, self.storage_type_context()) {
+                    roots.insert(self.stable_owner_root(*root));
                 }
             }
             ExprKind::TupleIndex { recv, index } => {

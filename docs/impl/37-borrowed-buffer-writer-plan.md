@@ -150,10 +150,46 @@ This changes no HIR/interface/runtime record.
 | Direct and nested buffer plus static slice sibling | Stable opaque field owner root; returned view rejects after containing-owner replacement. |
 | Borrowed match buffer/record with slice sibling | Checked projection root map, never a match-local owner; Option/Result/user-sum positive and invalidation twins. |
 | Writer plus slice sibling, eager mutation | Same stable receiver root survives later argument evaluation; owner replacement rejects before the I/O action. |
-| Dynamic-header sibling precision | Existing field-specific headers keep their own generations; the fallback applies only when the selected Move field has no header. |
+| Dynamic-header sibling precision | Existing field-specific headers keep their own generations; this preliminary condition is superseded by the selected-type rule below. |
 
 `mixed_handle_fields_keep_the_complete_owner` and the parameterized
 `borrowed_buffer_views_follow_optional_array_and_generic_sources` /
 `borrowed_handle_projections_reject_consumption_and_escape` owners cover these mixed layouts on
 whole-program and per-unit paths. The review's P1 is repaired as one ownership
 root class; one fresh review of this redesigned fallback axis is required.
+
+## Reopened axis: selected-place ownership is independent of selected headers
+
+The redesign review found the same ownership obligation missing when a call
+selects `outer.inner` as a mixed aggregate, rather than selecting its final buffer
+field. Stop treating header absence as the discriminator for opaque ownership.
+One source rule applies to both complete and projected values: if the selected
+inline type contains buffer/writer storage, carry its authenticated stable owner
+alongside any selected generation headers. A tuple projection would carry the same inline-owner obligation from its receiver,
+but current tuple formation rejects buffer/writer and handle-owning record
+elements, and shared call arguments reject tuple-element places. That source
+cell is deferred without changing `TupleIndex` admission or analysis here. Index/element projections continue to
+use the collection's generation, which owns their elements; the inline traversal
+stops at the collection header and does not replace that generation with a local.
+
+| Selected source | Handle leaf | Inline mixed record/sum/tuple | Collection header |
+|---|---|---|---|
+| Local or borrowed binding | Original stable owner | Original stable owner plus headers | Existing generation |
+| Struct field at any depth | Original complete root | Original complete root plus selected headers | Selected generation |
+| Tuple projection | Deferred: tuple element formation rejects handles | Deferred: formation rejects handle-owning records | Existing selected generation |
+| Indexed shared argument/element | Collection generation | Collection generation | Existing selected/content generations |
+| Returned/retained/indirect result | Substitute completed source fact | Substitute completed source fact; compatible sibling header cannot erase opaque root | Existing header-specific summary behavior |
+
+Source snapshots, later eager operands, owner mutation, returns, retained views
+and caller substitution all consume this same rule. Parameterized source owners
+cross mixed/unmixed layout with local/nested helper actuals; direct field reads
+and writer actions retain their separate negative owners. This closure replaces
+line-specific fixes with one selected-type obligation at every inline place.
+
+Plan reinspection accepted the selected-type strategy and requested concrete tuple
+admission and sibling-header evidence. `mixed_handle_fields_keep_the_complete_owner`
+now pins the tuple construction rejection and executes a view-field projection
+whose independent array backing remains live after replacement of the buffer-owning
+record. No tuple surface is widened. The fix preserves the previously reviewed
+root-map/fallback strategy and changes its field predicate to inspect the selected
+type independently from header presence.

@@ -379,6 +379,7 @@ fn borrowed_buffer_views_follow_optional_array_and_generic_sources() {
     for mixed in [false, true] {
         let helper_template = r#"module views
 pub Item<T> { data: T, extra: slice<u8> }
+pub Outer { inner: Item<buffer> }
 pub Rows { items: Option<array<Item<buffer>>> }
 pub View { data: slice<u8> }
 pub fn bytes(borrow item: Item<buffer>) -> slice<u8> = item.data.bytes()
@@ -433,37 +434,41 @@ pub fn identity<T>(borrow item: Item<T>) -> i64 = 1
                 "mut tagged: views.Data := views.Present(views.Item { data: buffer(8), extra: empty }); view := views.tagged(tagged); tagged = views.Absent; print(view.u8(0))",
             ),
         ] {
-            let body = if mixed {
-                body.to_string()
-            } else {
-                body.replace(", extra: empty", "")
-            };
             let invalid = format!(
                 "module main\nimport views\nfn main() {{ empty: slice<u8> := []; mut item := views.Item {{ data: buffer(8), extra: empty }}; {body} }}\n"
             );
-            let invalid = if mixed {
-                invalid
-            } else {
-                invalid.replace(", extra: empty", "")
-            };
-            let checked = diff_check_multi(
-                &format!("borrowed-buffer-invalidated-{name}"),
-                &[("main.align", invalid.as_str()), ("views.align", helper)],
-                "main.align",
-            );
-            assert!(
-                checked.whole_errors && checked.per_unit_errors,
-                "{name} must reject after source replacement; whole:\n{}\nper-unit:\n{}",
-                checked.whole_diags,
-                checked.per_unit_diags
-            );
-            assert!(
-                checked.whole_diags.contains("use of invalidated borrow")
-                    && checked.per_unit_diags.contains("use of invalidated borrow"),
-                "{name} must reject for borrowing; whole:\n{}\nper-unit:\n{}",
-                checked.whole_diags,
-                checked.per_unit_diags
-            );
+            for nested in [false, true] {
+                let invalid = if nested {
+                    invalid.replace("mut item := views.Item { data: buffer(8), extra: empty };", "mut outer := views.Outer { inner: views.Item { data: buffer(8), extra: empty } };")
+                    .replace("item = views.Item { data: buffer(8), extra: empty };", "outer = views.Outer { inner: views.Item { data: buffer(8), extra: empty } };")
+                    .replace("item", "outer.inner")
+                } else {
+                    invalid.clone()
+                };
+                let invalid = if mixed {
+                    invalid
+                } else {
+                    invalid.replace(", extra: empty", "")
+                };
+                let checked = diff_check_multi(
+                    &format!("borrowed-buffer-invalidated-{name}"),
+                    &[("main.align", invalid.as_str()), ("views.align", helper)],
+                    "main.align",
+                );
+                assert!(
+                    checked.whole_errors && checked.per_unit_errors,
+                    "{name} must reject after source replacement; whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags
+                );
+                assert!(
+                    checked.whole_diags.contains("use of invalidated borrow")
+                        && checked.per_unit_diags.contains("use of invalidated borrow"),
+                    "{name} must reject for borrowing; whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags
+                );
+            }
         }
         let source = r#"module main
 import views
@@ -561,6 +566,54 @@ fn main() {{ {body} }}
             checked.whole_diags,
             checked.per_unit_diags
         );
+    }
+    let tuple = r#"
+Holder { data: buffer, extra: slice<u8> }
+fn main() { value := (Holder { data: buffer(8), extra: [] }, 0) }
+"#;
+    let checked = diff_check_multi(
+        "mixed-handle-tuple-boundary",
+        &[("main.align", tuple)],
+        "main.align",
+    );
+    assert!(
+        checked.whole_diags.contains("tuple elements must")
+            && checked.per_unit_diags.contains("tuple elements must"),
+        "handle-owning tuple elements remain outside admission; whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let source = r#"
+Holder { data: buffer, extra: slice<u8> }
+fn main() -> i32 {
+  backing := [65 as u8].to_array()
+  mut holder := Holder { data: buffer(8), extra: backing }
+  sibling := holder.extra
+  holder = Holder { data: buffer(8), extra: [] }
+  if sibling.u8(0) != 65 { return 1 }
+  return 0
+}
+"#;
+    let files = [("main.align", source)];
+    let checked = diff_check_multi("mixed-handle-sibling", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "sibling header keeps its independent backing; whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("mixed-sibling-whole", &files, "main.align"),
+            build_per_unit_multi("mixed-sibling-unit", &files, "main.align").link_and_run(),
+        ] {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 
