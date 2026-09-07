@@ -2072,65 +2072,66 @@ fn origin_specific_generic_instances_share_one_tagged_llvm_type() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "10\n");
 }
 
-/// Canonical source identity survives origin-specific construction across imported returns.
-#[test]
-fn origin_specific_return_types_preserve_imported_copy_and_owned_values() {
-    fn assert_execution(executable: &std::path::Path, label: &str, expected: i32) {
-        struct ChildGuard {
-            child: Option<std::process::Child>,
-            deadline: std::time::Instant,
-        }
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                if let Some(child) = self.child.as_mut() {
-                    let mut killed = false;
-                    while std::time::Instant::now() < self.deadline {
-                        if !killed {
-                            match child.kill() {
-                                Ok(()) => killed = true,
-                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                                Err(_) => killed = true,
-                            }
-                        }
-                        match child.try_wait() {
-                            Ok(Some(_)) => break,
-                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+fn assert_owned_return_execution(executable: &std::path::Path, label: &str, expected: i32, stdout_expected: &str) {
+    struct ChildGuard {
+        child: Option<std::process::Child>,
+        deadline: std::time::Instant,
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let mut killed = false;
+                while std::time::Instant::now() < self.deadline {
+                    if !killed {
+                        match child.kill() {
+                            Ok(()) => killed = true,
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(_) => break,
+                            Err(_) => killed = true,
                         }
+                    }
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
                     }
                 }
             }
         }
-        let output = align_driver::ArtifactStage::temp("origin-return-output").unwrap();
-        let stdout = output.path().join("stdout");
-        let stderr = output.path().join("stderr");
-        let child = std::process::Command::new(executable)
-            .stdout(std::fs::File::create(&stdout).unwrap())
-            .stderr(std::fs::File::create(&stderr).unwrap())
-            .spawn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut child = ChildGuard { child: Some(child), deadline };
-        // Reserve cleanup inside the same post-spawn budget; the fixture has no subprocesses.
-        let execution_deadline = deadline - std::time::Duration::from_secs(5);
-        let status = loop {
-            assert!(std::time::Instant::now() < execution_deadline, "{label}: execution deadline");
-            for path in [&stdout, &stderr] {
-                assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: unexpected output volume");
-            }
-            match child.child.as_mut().unwrap().try_wait() {
-                Ok(Some(status)) => { child.child.take(); break status; }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("{label}: child wait: {error}"),
-            }
-        };
-        for path in [&stdout, &stderr] {
-            assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: final output volume");
-        }
-        assert_eq!(status.code(), Some(expected), "{label}: {}", std::fs::read_to_string(stderr).unwrap());
-        assert_eq!(std::fs::read_to_string(stdout).unwrap(), "10\n", "{label}");
     }
+    let output = align_driver::ArtifactStage::temp("origin-return-output").unwrap();
+    let stdout = output.path().join("stdout");
+    let stderr = output.path().join("stderr");
+    let child = std::process::Command::new(executable)
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut child = ChildGuard { child: Some(child), deadline };
+    // Reserve cleanup inside the same post-spawn budget; the fixture has no subprocesses.
+    let execution_deadline = deadline - std::time::Duration::from_secs(5);
+    let status = loop {
+        assert!(std::time::Instant::now() < execution_deadline, "{label}: execution deadline");
+        for path in [&stdout, &stderr] {
+            assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: unexpected output volume");
+        }
+        match child.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => { child.child.take(); break status; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("{label}: child wait: {error}"),
+        }
+    };
+    for path in [&stdout, &stderr] {
+        assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: final output volume");
+    }
+    assert_eq!(status.code(), Some(expected), "{label}: {}", std::fs::read_to_string(stderr).unwrap());
+    assert_eq!(std::fs::read_to_string(stdout).unwrap(), stdout_expected, "{label}");
+}
+
+/// Canonical source identity survives origin-specific construction across imported returns.
+#[test]
+fn origin_specific_return_types_preserve_imported_copy_and_owned_values() {
     if !backend_available() {
         return;
     }
@@ -2166,14 +2167,14 @@ fn origin_specific_return_types_preserve_imported_copy_and_owned_values() {
             let label = format!("origin-return-{owned}-{tagged}");
             let expected = 23 + if owned { 8 } else { 0 } + if tagged { 3 } else { 0 };
             let whole = build_exe_multi(&label, &files, "main.align");
-            assert_execution(&whole.exe, &format!("{label}/whole"), expected);
+            assert_owned_return_execution(&whole.exe, &format!("{label}/whole"), expected, "10\n");
             let per_unit = build_per_unit_multi(&label, &files, "main.align");
             let objects = per_unit.emit_objects(false);
             let object_refs: Vec<_> = objects.iter().map(|object| object.as_path()).collect();
             let executable = per_unit.dir.join("origin-return-program");
             align_driver::link_objects(&align_driver::CDriver::default(), &object_refs,
                 &executable, &per_unit.link_libs_union(), Profile::Release).unwrap();
-            assert_execution(&executable, &format!("{label}/per-unit"), expected);
+            assert_owned_return_execution(&executable, &format!("{label}/per-unit"), expected, "10\n");
         }
     }
 }
@@ -2225,4 +2226,77 @@ fn tagged_shapes_with_one_body_share_one_identified_struct() {
         build_and_run("tagged-one-body-one-type", src).status.code(),
         Some(8)
     );
+}
+
+#[test]
+fn copied_scalars_accompany_owned_aggregate_returns() {
+    if !backend_available() { return; }
+    let factory = r#"module factory
+pub Stats { count: i64, values: array<i64> }
+pub Choice { Data(i64, array<i64>), Empty }
+pub Input { count: i64 }
+pub Nested { value: Stats }
+fn values() -> array<i64> {
+  mut b: array_builder<i64> := array_builder()
+  b.push(11)
+  return b.build()
+}
+pub fn record(borrow input: array<i64>, borrow field: Input, mode: i64) -> Stats {
+  mut total := 0
+  mut at := 0
+  loop {
+    if at >= input.len() { break }
+    total = total + input[at]
+    at = at + 1
+  }
+  if mode == 0 { return Stats { count: input[0], values: values() } }
+  if mode == 1 { return Stats { count: field.count, values: values() } }
+  if mode == 2 { return Stats { count: input[0] + 0, values: values() } }
+  if mode == 3 {
+    n := if input[0] > 0 { input[0] } else { field.count }
+    return Stats { count: n, values: values() }
+  }
+  return Stats { count: total, values: values() }
+}
+pub fn nested(borrow input: array<i64>) -> Nested = Nested { value: Stats { count: input[0], values: values() } }
+pub fn tuple(borrow input: array<i64>) -> (i64, array<i64>) = (input[0], values())
+pub fn choice(borrow input: array<i64>) -> Choice = Choice.Data(input[0], values())
+pub fn make_input() -> array<i64> {
+  mut b: array_builder<i64> := array_builder()
+  b.push(7)
+  return b.build()
+}
+"#;
+    let entry = r#"import factory
+fn main() -> i32 {
+  input := factory.make_input()
+  field := factory.Input { count: 7 }
+  mut mode := 0
+  mut sum := 0
+  loop {
+    if mode >= 5 { break }
+    mut s := factory.record(input, field, mode)
+    sum = sum + s.count + s.values[0]
+    s = factory.record(input, field, mode)
+    sum = sum + s.count + s.values[0]
+    mode = mode + 1
+  }
+  nested := factory.nested(input)
+  sum = sum + nested.value.count + nested.value.values[0]
+  pair := factory.tuple(input)
+  sum = sum + pair.0 + pair.1[0]
+  match factory.choice(input) { Data(n, a) => { sum = sum + n + a[0] }, Empty => () }
+  return sum as i32
+}
+"#;
+    let files = [("factory.align", factory), ("main.align", entry)];
+    let whole = build_exe_multi("copied-scalar-owned-return", &files, "main.align");
+    assert_owned_return_execution(&whole.exe, "copied-scalar/whole", 234, "");
+    let per_unit = build_per_unit_multi("copied-scalar-owned-return-per-unit", &files, "main.align");
+    let objects = per_unit.emit_objects(false);
+    let refs = objects.iter().map(|object| object.as_path()).collect::<Vec<_>>();
+    let exe = per_unit.dir.join("copied-scalar-program");
+    align_driver::link_objects(&align_driver::CDriver::default(), &refs, &exe,
+        &per_unit.link_libs_union(), Profile::Release).unwrap();
+    assert_owned_return_execution(&exe, "copied-scalar/per-unit", 234, "");
 }

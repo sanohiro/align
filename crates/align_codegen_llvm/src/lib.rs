@@ -4324,6 +4324,7 @@ enum XmlAccessSource {
 
 #[derive(Debug, Default)]
 struct XmlAccessEquation {
+    copied_scalar: bool,
     seed: Option<XmlAccessProvenance>,
     dependencies: Vec<XmlAccessNode>,
     checks: Vec<(XmlAccessNode, OperandRequirement)>,
@@ -4331,6 +4332,18 @@ struct XmlAccessEquation {
     absent: bool,
     require_present: bool,
     guarded_absence: bool,
+}
+
+impl XmlAccessEquation {
+    fn produced_access(&self, access: XmlAccessProvenance) -> XmlAccessProvenance {
+        if self.copied_scalar && matches!(access,
+            XmlAccessProvenance::Owned | XmlAccessProvenance::Shared | XmlAccessProvenance::Exclusive)
+        {
+            XmlAccessProvenance::Owned
+        } else {
+            access
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -4419,7 +4432,7 @@ fn solve_xml_access_equations(
         if !equation.invalid
             && let Some(seed) = equation.seed
         {
-            present.insert(node.clone(), seed);
+            present.insert(node.clone(), equation.produced_access(seed));
             present_ready.push_back(node.clone());
         }
     }
@@ -4440,7 +4453,7 @@ fn solve_xml_access_equations(
                     .copied()
                     .map_or(current, |access| merge_xml_access(current, access))
             });
-            if let Some(next) = next
+            if let Some(next) = next.map(|access| equation.produced_access(access))
                 && present.get(parent) != Some(&next)
             {
                 present.insert(parent.clone(), next);
@@ -4508,6 +4521,8 @@ fn solve_xml_access_equations(
             equation.invalid
                 || !values.contains_key(*node)
                 || values.get(*node) == Some(&XmlProducerState::Invalid)
+                || (equation.copied_scalar && values.get(*node).copied()
+                    .is_none_or(|state| !OperandRequirement::READ.is_satisfied_by(state)))
                 || equation.checks.iter().any(|(dependency, requirement)| {
                     values
                         .get(dependency)
@@ -9968,7 +9983,21 @@ impl<'a> XmlAccessAnalyzer<'a> {
             self.equations
                 .insert(node.clone(), XmlAccessEquation::default());
             let equation = match &node {
-                XmlAccessNode::Value(value, path) => self.value_equation(*value, path.clone()),
+                XmlAccessNode::Value(value, path) => {
+                    let mut equation = self.value_equation(*value, path.clone());
+                    // A scalar SSA result copies bits out of storage; it does not inherit the
+                    // storage's borrow authority. Retain every grounding/check edge and absence
+                    // fact, and never apply this transform to storage or aggregate projections.
+                    equation.copied_scalar = path.is_empty()
+                        && self.graph.function.value_tys.get(*value as usize).is_some_and(|ty| {
+                            matches!(ty, Ty::Unit | Ty::Bool | Ty::Char)
+                                || xml_numeric_scalar_ty(*ty)
+                                || xml_numeric_vector_shape(*ty).is_some()
+                                || matches!(*ty, Ty::Mask(element, lanes @ (2 | 4 | 8 | 16))
+                                    if xml_numeric_vector_shape(Ty::Vec(element, lanes)).is_some())
+                        });
+                    equation
+                },
                 XmlAccessNode::Slot(slot, path) => self.slot_equation(*slot, path.clone()),
                 XmlAccessNode::CaptureValue(value, path, capture) => {
                     self.capture_equation(XmlAccessNode::Value(*value, path.clone()), *capture)
@@ -31154,6 +31183,83 @@ mod tests {
 
     fn program_call(name: &str) -> ProgramCall {
         ProgramCall::try_from_logical(name).expect("valid test program call")
+    }
+
+    #[test]
+    fn producer_copied_scalar_preserves_grounding_and_readability() {
+        use XmlAccessProvenance::{Owned, Shared, Exclusive, Unreadable, Mixed};
+        for seed in [None, Some(Owned), Some(Shared), Some(Exclusive), Some(Unreadable), Some(Mixed)] {
+            for absent in [false, true] {
+                let storage = XmlAccessNode::Slot(0, vec![]);
+                let copied = XmlAccessNode::Value(0, vec![]);
+                let mut equations = HashMap::from([
+                    (storage.clone(), XmlAccessEquation { seed, dependencies: vec![copied.clone()],
+                        ..XmlAccessEquation::default() }),
+                    (copied.clone(), XmlAccessEquation { copied_scalar: true, absent,
+                        dependencies: vec![storage.clone()], ..XmlAccessEquation::default() }),
+                ]);
+                let (values, invalid) = solve_xml_access_equations(&equations);
+                let readable = matches!(seed, Some(Owned | Shared | Exclusive));
+                // An explicitly absent alternative is vacuous; an unseeded present cycle is not.
+                let valid = readable || (seed.is_none() && absent);
+                assert_eq!(invalid.is_empty(), valid, "{seed:?}/{absent}: {invalid:?}");
+                if readable {
+                    let expected = if absent { XmlProducerState::MaybeAbsent(Owned) }
+                        else { XmlProducerState::Present(Owned) };
+                    assert_eq!(values.get(&copied), Some(&expected));
+                }
+                // A malformed validation dependency must poison the copied result and its cycle.
+                let bad = XmlAccessNode::Value(1, vec![]);
+                equations.insert(bad.clone(), XmlAccessEquation { invalid: true, ..XmlAccessEquation::default() });
+                equations.get_mut(&copied).unwrap().checks.push((bad, OperandRequirement::READ));
+                let (_, invalid) = solve_xml_access_equations(&equations);
+                assert!(invalid.contains(&copied) && invalid.contains(&storage));
+            }
+        }
+    }
+
+    #[test]
+    fn producer_copied_scalar_rejects_invalid_sources_and_owned_siblings() {
+        let base = mir(r#"
+Stats { count: i64, values: array<i64> }
+fn make(borrow input: array<i64>) -> Stats {
+  mut builder: array_builder<i64> := array_builder()
+  builder.push(7)
+  return Stats { count: input[0], values: builder.build() }
+}
+fn main() -> i32 = 0
+"#);
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let make = xml_test_function(&base, "make");
+        for axis in ["unreadable", "wrong-type", "duplicate", "borrowed-array"] {
+            let mut malformed = base.clone();
+            let function = &mut malformed.fns[make];
+            match axis {
+                "unreadable" => function.param_modes[0] = align_ast::ParamMode::Out,
+                "wrong-type" | "duplicate" => {
+                    let (value, definition) = function.blocks.iter().flat_map(|block| &block.stmts)
+                        .find_map(|stmt| match stmt {
+                            Stmt::Let(value, rv @ Rvalue::SliceIndex { .. }) => Some((*value, rv.clone())),
+                            _ => None,
+                        }).expect("indexed scalar producer");
+                    if axis == "wrong-type" { function.value_tys[value as usize] = Ty::Bool; }
+                    else { function.blocks[0].stmts.push(Stmt::Let(value, definition)); }
+                }
+                "borrowed-array" => {
+                    let stored = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                        .find_map(|stmt| match stmt {
+                            Stmt::StoreField(_, path, value) if path == &[1] => Some(value),
+                            _ => None,
+                        }).expect("owned array field");
+                    *stored = Operand::Arg(0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(validate_mir_producers(&malformed).is_err(), "publication: {axis}");
+            assert_xml_producer_rejected(&malformed, axis);
+        }
     }
 
     #[test]
