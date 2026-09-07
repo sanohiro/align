@@ -486,3 +486,86 @@ inputs, imported generic forwarding, short final chunks, and zero/negative sizes
 `storage_generation_interprocedural_allocation_parity_matrix` now passes unchanged.
 The existing `producer_*` owners retain guarded presence, callable identity,
 mutable descriptor authority, and sibling whole-result checks.
+
+## Writable backing for protected Out slices
+
+Status: grounded Out storage proof implemented. On `6fc2f56`, the existing
+`borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases` and
+`out_str_retention_matches_whole_and_per_unit_checking` owners reach a contradictory
+call gate: `operands_match_modes` admits ordinary SSA operands for Out, while
+`xml_call_arguments_valid` requires borrowed descriptors that the former rejects.
+A sema-clean reduced forwarding function also passes its Out slice through a
+Load and ordinary SSA call operand. These are physical buffer headers, not
+borrowed-place descriptors for replacing a header.
+
+The repair must distinguish pointed-to buffer authority from contained payload
+provenance and from the local header slot's authority. A writable fixed local's
+`MakeSlice` intentionally has Shared ordinary view provenance; a local slice
+header copied from `ConstArray` also has Shared provenance but points at read-only
+storage. Neither ordinary view provenance nor a writable local header alone
+proves writable elements. An Out parameter guarantees writable buffer storage
+without readable old elements. ByValue/BorrowMut on a Copy slice does not supply
+that guarantee: a sema-clean `borrow mut slice<str>` wrapper can receive a local
+header pointing at a constant table. Treating that parameter's Exclusive header
+authority as writable buffer authority would newly admit a read-only write.
+
+The capability adds a distinct buffer-storage projection to the existing typed
+producer worklist, without changing MIR, HIR, interfaces, or the solver. Storage
+facts are never used as element-read or ownership facts. Ordinary source checks
+remain on every equation; only propagation of the selected buffer authority uses
+storage nodes. Exact Out parameter headers may propagate write/exclusive authority
+without old-payload READ. Both call-site validation and call-result argument
+validation use the same storage proof for protected Out operands.
+
+| Axis | Exact obligation and owner |
+|---|---|
+| Physical Out form | Accept only ordinary Value/Arg operands with the exact declared Slice type. Keep all borrowed Out descriptor forms rejected by the existing callable-shape owner. No ByValue/Borrow/BorrowMut mode widening. |
+| Grounded writable backing | Accept an exact fixed local/owned fixed parameter MakeSlice, an authenticated owning dynamic-array backing, and an Out parameter's buffer guarantee. Preserve source and selected-path types through Use, Load/Store, field/tuple/tagged projections, and SubSlice. Shared fixed/owning parameters and read-only constants remain non-writable. The malformed-MIR owner crosses root storage, mode, source type, result type, and forwarded aliases. |
+| Header versus elements | Fixed-array producer validity still checks its initialized element producers; changing the storage projection must not erase those checks. Out-to-Out header forwarding requires no old-element read. A local header pointing to static storage remains read-only after copying, projection, replacement, or a branch join. Source fixtures execute fixed/dynamic destinations and Out forwarding; mutations distinguish a writable fixed local from a static table with the same slice type. |
+| Joins and malformed graphs | Every reaching store and selected source contributes to the same total fixed point. Missing, duplicate, wrong-path/type, raw, unresolved, and unseeded-cycle sources fail; a shared alternative prevents writable authority. Keep validation-only dependencies and sibling producer checks. Existing producer cycle/presence owners plus the parameterized Out owner close this axis. |
+| Calls and capability boundary | Out mode itself supplies the parameter-entry buffer guarantee, and each caller must prove that guarantee. Owning array results may use their existing certified Move ownership. A Copy slice parameter in another mode and any Copy slice returned by a call have no serialized writable-backing proof and remain conservatively unavailable for this new projection. ReturnBorrow/ReturnRegion roots cannot substitute: a returning function may also choose static storage. Supporting those forms requires a separately reviewed interprocedural writable-storage contract; this repair must not invent that authority from header mutability or returned lifetime roots. |
+| Lifecycle and publication | No allocation, move, source nulling, cleanup, Drop, interface byte, or runtime ABI change. Existing return-provenance owners execute fixed/dynamic stores and the ignored-input case in whole/per-unit builds; direct, imported, and generic-instantiated Out signatures share the callable gate. Function values with Out parameters retain their existing unsupported-ABI rejection; this capability does not widen indirect calls. Existing mutable-retention owners continue to reject retained short-lived elements. |
+
+This boundary repairs the independently useful, fully grounded caller-buffer
+forms without a dormant producer/consumer split. Opaque Copy-view writability is
+explicitly deferred because the current interface contract does not encode it;
+loosening that boundary would turn a false refusal into a read-only write. Numeric
+Copy-only calls retain their existing gate in this capability; the new projection
+closes protected-element Out calls and does not claim a complete writable-view
+analysis for every language write operation. Target-relative closure joins and
+Request 42's diagnostic-phase documentation remain separate work. No new
+performance promise or benchmark gate is introduced.
+
+### Out implementation closure and owner bindings
+
+`XmlAccessNode::BufferValue`/`BufferSlot` and the `buffer_*` equations implement
+this separate storage projection. `xml_call_arguments_valid` and
+`add_call_result` consume it with write/exclusive requirements. Parameter-entry
+facts require an unambiguous slot binding; duplicate Out/shared bindings fail.
+The author-side matrix-to-diff pass retains ordinary typed producer checks,
+validation-only dependencies, and the total fixed-point solver. No storage fact
+feeds element READ or Move certification.
+
+- `align_codegen_llvm::tests::producer_out_slices_authenticate_backing_without_reading_forwarded_elements`
+  crosses fixed/dynamic backing with static alternatives, wrong header stores,
+  raw element producers, seeded/unseeded cycles, opaque Copy returns, borrowed
+  descriptors, non-Out Copy parameters, and duplicate parameter bindings. All
+  malformed cases are rejected at publication, emission validation, and ThinLTO
+  partition validation. The existing `producer_` owners retain type/path,
+  presence, sibling, and cycle coverage.
+- `return_provenance::grounded_out_slices_execute_across_call_forms_and_storage_joins`
+  checks and executes both build modes for direct/imported/generic calls,
+  Out forwarding and owned call results, owning borrowed arrays, record views,
+  tuple-owned-array views, Option/Result views, SubSlice, both branch outcomes,
+  and an ignored short-lived input. Tuple-contained Copy slices are outside the
+  existing tuple type formation contract; the tuple owner uses an owning array.
+- `return_provenance::borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases`
+  and `out_str_retention_matches_whole_and_per_unit_checking` now pass unchanged
+  storage behavior and exact retention requirements. The latter still rejects
+  actually retained short-lived elements. The full return-provenance target
+  excludes only the separately tracked target-relative closure-join defect.
+
+Opaque Copy-view parameters/results, indirect Out function-value ABI support,
+and target-relative closure joins remain the explicit boundaries above, not
+sources of inferred writable authority. No specification or interface record
+changes are required for this implementation of the existing source contract.
