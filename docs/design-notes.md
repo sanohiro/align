@@ -292,9 +292,9 @@ not a package exemption, and it still rejects temporaries.
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag
 and active payload in place; a descendant field fact never promotes an owning parent. The new path
-admits Copy scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 structs and tagged values built recursively from those forms; an array element obeys the same
-closed grammar. Fixed and specialized arrays, other collections, resources, opaque handles, and
+closed grammar. Fixed and specialized arrays, other collections, resources, other opaque handles, and
 other unsupported Move shapes remain on the existing borrowed-place diagnostic. The arm binding is
 a read-only projection with the original static payload type, source generation, and no independent cleanup bit. Copy fields and
 borrowed text leaves remain cheap reads, while an owned text leaf can use the existing explicit
@@ -306,6 +306,13 @@ compiler projection over the existing flattened tagged layout preserves **Nothin
 a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
 the language capability is the correct boundary.
+
+Stable `buffer` and `writer` fields, including nested fields and checked borrowed
+match projections, support their existing non-consuming receivers: buffer
+`.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
+the handle and its only cleanup; byte views retain that owner’s generation and
+lifetime. Plain field assignment still moves, and exclusive partial-Move-field
+arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
 
 **A Copy view read through a borrowed array projection keeps the projection roots.** Widening the
 payload grammar to `array<str>` and AoS arrays of Copy records is unsafe if ordinary `Index` or

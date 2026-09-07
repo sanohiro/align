@@ -2,6 +2,10 @@
 
 Status: **IMPLEMENTED; owner regressions complete; merged in Align PR #857; align-llm adoption pending.**
 
+Request 61 extends this historical grammar with `buffer` and `writer` leaves and
+non-consuming stable field receivers. Its current contract and owner matrix are
+in [plan 37](37-borrowed-buffer-writer-plan.md); other opaque handles stay excluded.
+
 This document is the design and implementation plan for read-only matching of an owned
 `Option<T>`, `Result<T, E>`, or user sum through a stable borrowed place. It closes the general
 language gap recorded as align-llm Request 16. The plan is deliberately compiler-wide: an admitted

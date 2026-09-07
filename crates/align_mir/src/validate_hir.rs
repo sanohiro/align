@@ -5437,6 +5437,14 @@ impl<'a> BodyValidator<'a> {
             ) && expression.ty == Ty::Writer
     }
 
+    /// A method may inspect a stable handle field without moving the field. The expression
+    /// flow validator independently checks every field segment and its resolved type.
+    fn handle_receiver_place(&self, expression: &hir::Expr, context: &BodyContext, ty: Ty) -> bool {
+        expression.ty == ty
+            && (self.local_handle_place(context, expression, ty)
+                || matches!(&expression.kind, hir::ExprKind::Field { path, .. } if !path.is_empty()))
+    }
+
     fn logger_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
         self.local_handle_place(context, expression, Ty::Logger)
     }
@@ -8678,7 +8686,10 @@ impl<'a> BodyValidator<'a> {
                 (bytes.ty == Ty::Slice(u8_scalar)).then(|| result(Ty::Str, &[bytes]))?
             }
             hir::ExprKind::WriterWrite { writer, arg, builder } => {
-                if !self.writer_place(writer, context) || writer.ty != Ty::Writer {
+                if !(self.writer_place(writer, context)
+                    || self.handle_receiver_place(writer, context, Ty::Writer))
+                    || writer.ty != Ty::Writer
+                {
                     return None;
                 }
                 if (*builder && arg.ty != Ty::Builder) || (!*builder && !byte_view(arg.ty)) {
@@ -8687,7 +8698,9 @@ impl<'a> BodyValidator<'a> {
                 result(Ty::Unit, &[writer, arg])
             }
             hir::ExprKind::WriterFlush { writer } => {
-                (self.writer_place(writer, context) && writer.ty == Ty::Writer)
+                ((self.writer_place(writer, context)
+                    || self.handle_receiver_place(writer, context, Ty::Writer))
+                    && writer.ty == Ty::Writer)
                     .then(|| result(Ty::Unit, &[writer]))?
             }
             hir::ExprKind::LogNew { output, minimum } => {
@@ -8878,14 +8891,14 @@ impl<'a> BodyValidator<'a> {
                 (capacity.ty == i64).then(|| strict(Ty::Buffer, &[capacity]))?
             }
             hir::ExprKind::BufferBytes { buffer } => {
-                (local(buffer, Ty::Buffer) && buffer.ty == Ty::Buffer)
+                (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)
                     .then(|| strict(Ty::Slice(u8_scalar), &[buffer]))?
             }
             hir::ExprKind::StrBytes { inner } => {
                 (inner.ty == Ty::Str).then(|| strict(Ty::Slice(u8_scalar), &[inner]))?
             }
             hir::ExprKind::BufferLen { buffer } => {
-                (local(buffer, Ty::Buffer) && buffer.ty == Ty::Buffer)
+                (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)
                     .then(|| strict(i64, &[buffer]))?
             }
             hir::ExprKind::BytesRead { bytes, offset, be } => {

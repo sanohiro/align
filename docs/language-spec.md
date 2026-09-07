@@ -181,10 +181,10 @@ types; `match` works on them, with `else`-unwrap and `?` as the common-case shor
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — the borrowed parameter itself or a checked struct-field path below it — `match` reads
 the tag and active payload in place. A descendant field fact does not promote an owning parent or a
-mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, ordinary dynamic scalar
+mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar
 and AoS record arrays, and finite acyclic structs and tagged values built recursively from those
 forms; array elements obey the same closed grammar. Fixed and specialized arrays, tuples, other
-collections, resources, opaque handles, and other unsupported Move shapes retain the borrowed-place
+collections, resources, other opaque handles, and other unsupported Move shapes retain the borrowed-place
 diagnostic. An admitted non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's static type
 for field and method checking, but has no independent `Drop` or cleanup bit, does not move or null
 the source, and does not trigger a hidden aggregate copy. Copy fields remain readable, owned
@@ -197,6 +197,13 @@ payload is rejected by the ordinary borrowed-place diagnostics; existing Copy/vi
 its current result behavior. Views derived from an admitted payload follow the existing inferred
 owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
 existing consuming match behavior.
+
+Stable `buffer` and `writer` fields, including nested fields and checked borrowed
+match projections, support their existing non-consuming receivers: buffer
+`.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
+the handle and its only cleanup; byte views retain that owner’s generation and
+lifetime. Plain field assignment still moves, and exclusive partial-Move-field
+arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
 
 Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
 region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,

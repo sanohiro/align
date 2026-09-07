@@ -2058,3 +2058,16 @@ parameterized owners in `std-design/xml.md` fail on a missing form, wrong reader
 duplicate or aliased cleanup definition, lost mutable receiver or cursor generation, owned/view
 result confusion, unknown canonical tag, forged access provenance, or unchecked status/event
 decode in either whole-program or per-unit emission.
+
+
+## Request 61 receiver extension
+
+`WriterWrite`/`WriterFlush` and `BufferBytes`/`BufferLen` accept an exact typed
+stable local or nonempty struct-field path, including checked borrowed-match
+roots. Expression-flow validation still authenticates every path segment and
+receiver type; `IoCopy` retains its prior local/std-stream gate. Borrowed match
+metadata admits the buffer/writer leaves specified by
+[plan 37](37-borrowed-buffer-writer-plan.md), with the same owner/path/type and
+no-independent-cleanup replay checks. View-header fallback roots participate in
+local and eager-snapshot invalidation even when no legacy source-map entry
+exists. There is no new HIR record or serialized representation.
