@@ -348,3 +348,52 @@ imported builds with bounded child execution. All 62 owned-tagged, 18 producer,
 23 resource-ownership and 17 XML owners pass. This maps the extracted canonical,
 exact, every-leaf and malformed-graph obligations to executable owners without
 a new safety strategy or a performance claim.
+
+## Request 59 continuation: copied scalar producer authority
+
+The unchanged `alignpack.align` client still fails at `stats_for` on `882ea5d1`.
+A reduced record containing an owned `array<i64>` and `count: input[0]` from a
+borrowed array reproduces the exact Move-return rejection; replacing the count
+with a constant passes. Whole-record field authority incorrectly carries the
+borrowed scalar's storage authority into its copied value. Tuple and enum
+construction share this dependency shape.
+
+The repair authenticates scalar SSA producers through the existing equations,
+then maps grounded readable scalar value authority to Owned. It preserves every
+dependency and absence fact and introduces no seed. Only whole scalar SSA values
+(unit, bool, char, numeric scalars and numeric vectors/masks) qualify. Storage,
+capture, projected aggregate paths, strings, raw pointers, callables, views and
+Move values retain their existing authority. Unreadable or mixed scalar sources
+remain invalid. No language, MIR shape, cleanup, runtime ABI or allocation
+contract changes.
+
+| Closure axis | Required implementation and owner |
+|---|---|
+| Formation and copied values | Normalize only authenticated whole scalar Value equations, including early-return equation arms; preserve invalid types, duplicate definitions and producer input checks. Parameterized codegen producer mutations own unreadable and malformed inputs. |
+| Construction and siblings | Borrowed indexed, field/load, arithmetic and branch-joined scalar copies may accompany owned arrays in records, tuples and enum payloads. Source execution owners cover these forms and nested records. |
+| Move, nulling, replacement, Drop and return | Existing lowering and cleanup remain unchanged; source owners execute the returned arrays, replacement and normal/early returns. Existing resource ownership owners retain exactly-once lifecycle coverage. |
+| Control and grounding | Preserve all provenance and validation edges, if/match/else/?/map_err and loop joins, and the separate absence fixed point. Parameterized equation owners cross readable/unreadable seeds, no seed, cycles and absent alternatives; no copied value can seed its own cycle. |
+| Protected siblings | Borrowed arrays, strings, callables, storage and captures cannot acquire ownership through scalar normalization. Malformed producer owners and existing protected-leaf mutation owners retain rejection. |
+| Publication and consumers | Shared validation covers generic publication, whole-program and per-unit emission. Imported source execution owners and both unchanged Request 59 client modules close the delivery boundary; consumer adoption/build remains consumer-owned. |
+| Performance and artifacts | No performance/resource promise, runtime allocation change or serialized format change. Compiler-source identity remains the cache invalidator; no benchmark is required. |
+
+An independent inspection of this boundary accepted dependency-preserving scalar
+normalization and rejected unconditional aggregate seeds. The implementation must
+apply the transform to both seed publication and worklist updates, without
+normalizing storage/capture nodes or selected paths within an aggregate.
+
+Author-side closure: `XmlAccessEquation::produced_access` normalizes only the
+whole scalar Value equations selected by `XmlAccessAnalyzer::build`; solver
+grounding, absence and invalid-dependency propagation remain intact.
+`producer_copied_scalar_preserves_grounding_and_readability` owns seeded and
+unseeded cycles, absence and invalid dependencies.
+`producer_copied_scalar_rejects_invalid_sources_and_owned_siblings` owns
+unreadable input, wrong types, duplicate producers and borrowed-array rejection
+through publication and whole/per-unit validation.
+`copied_scalars_accompany_owned_aggregate_returns` executes indexed, field,
+arithmetic, branch and loop copies beside owned arrays in direct/nested records,
+tuples and enums, including replacement, through both compilation modes.
+All 20 producer, 63 owned-tagged, 23 resource-ownership and 17 XML owners pass.
+Both unchanged Request 59 client modules pass per-unit checking: `alignpack`
+has three units and `verification_loop` five. Client executable build and pin
+adoption remain consumer-owned acceptance work.
