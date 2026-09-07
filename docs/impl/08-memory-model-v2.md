@@ -874,9 +874,10 @@ retention.” The memory-model consequences are:
   `borrow mut`, including unknown/non-retaining sources; an indexed
   `borrow mut` additionally validates and joins its possible backing contents,
   while `out` uses only the non-invalidating backing/observer join; and
-- same-program bodies provide exact roots while missing imported bodies keep
-  the existing all-compatible-input fallback. No new serialized interface fact
-  or function-value representation is introduced.
+- same-program bodies and validated imported mutable-retention records provide exact roots;
+  imports without that record and indirect calls keep
+  the existing all-compatible-input fallback. Request 43/49 transports this
+  exact fact in interface format 10; function-value representation is unchanged.
 
 These rules apply to the shared `AssignIndex`/`AssignElemField`/`AssignElem`
 analysis arm even where the current source classifier admits only a subset of

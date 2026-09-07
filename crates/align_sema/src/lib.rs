@@ -7215,6 +7215,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         hir::ReturnCleanupAbi,
         Vec<u32>,
         bool,
+        hir::MutableRetentionSummary,
     ),
 >;
 
@@ -9605,7 +9606,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _, _)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _, _, _)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -9983,14 +9984,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         external_return_provenance.contains_key(&mangled);
                     let producer_certified = external_return_provenance
                         .get(&mangled)
-                        .is_some_and(|(_, _, _, _, certified)| *certified);
+                        .is_some_and(|(_, _, _, _, certified, _)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots, _)| roots.clone())
+                        .map(|(_, _, _, roots, _, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10011,6 +10012,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                                 })
                                 .collect()
                         });
+                    let mutable_retention = external_return_provenance.get(&mangled)
+                        .and_then(|(_, _, _, _, _, summary)| summary.clone());
+                    if mutable_retention.is_some() && !producer_certified {
+                        diags.error("mutable-retention summary requires producer certification".to_string(), f.span);
+                    }
+                    if let Err(message) = hir::validate_mutable_retention(&mutable_retention, &sig.param_modes, false) {
+                        diags.error(message.to_string(), f.span);
+                    }
                     imported_fns.push(hir::ImportedFn {
                         name: mangled,
                         params: sig.params.clone(),
@@ -10023,6 +10032,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         producer_certified,
                         effect,
                         parallel_transfer_params,
+                        mutable_retention,
                     });
                 }
             }
@@ -11354,6 +11364,12 @@ pub fn sqlite_callback_target_effects(
 /// depth rejection, but non-panicking malformed header/type metadata remains outside this API's
 /// contract.
 pub fn checked_hir_body_facts_are_valid(program: &hir::Program) -> bool {
+    if program.imported_fns.iter().any(|function| {
+        (function.mutable_retention.is_some() && !function.producer_certified)
+            || hir::validate_mutable_retention(&function.mutable_retention, &function.param_modes, false).is_err()
+    }) {
+        return false;
+    }
     // The MIR gate normally proves all local/type ordinals before reaching this predicate. Keep
     // the public sema boundary fail-closed for direct malformed-HIR callers too: the legacy
     // producer analyses still contain indexing assumptions that are valid only after that gate.
@@ -12150,6 +12166,7 @@ fn reset_body_analysis_facts(program: &mut Program) {
         function.return_borrow = hir::ReturnBorrowSummary::None;
         function.return_region = hir::ReturnRegionSummary::None;
         function.parallel_transfer = hir::ReturnBorrowSummary::None;
+        function.mutable_retention = None;
         function.drop_locals.clear();
         function.drop_individual_locals.clear();
         function.drop_individual_exprs.clear();
@@ -12221,6 +12238,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.return_borrow != actual.return_borrow
             || expected.return_region != actual.return_region
             || expected.return_cleanup != actual.return_cleanup
+            || expected.mutable_retention != actual.mutable_retention
             || expected.parallel_transfer != actual.parallel_transfer
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
@@ -12821,6 +12839,17 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 vec![BorrowRoots::new(); function.params.len()],
             )
         })
+        .chain(program.imported_fns.iter().filter_map(|function| {
+            if !function.producer_certified { return None; }
+            hir::validate_mutable_retention(&function.mutable_retention, &function.param_modes, false).ok()?;
+            let destinations = function.mutable_retention.as_ref()?;
+            Some((function.name.clone(), destinations.iter().map(|roots| {
+                roots.iter().map(|root| match *root {
+                    hir::MutableRetentionRoot::Contained(index) => BorrowRoot::Param(index),
+                    hir::MutableRetentionRoot::Storage(index) => BorrowRoot::ParamStorage(index),
+                }).collect()
+            }).collect()))
+        }))
         .collect::<BorrowMutRetentionMap>();
     let mut callable = infer_fn_value_return_provenance(program, &named);
     loop {
@@ -12966,6 +12995,14 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             .get(&function.name)
             .cloned()
             .unwrap_or(hir::ReturnBorrowSummary::None);
+        function.mutable_retention = named_borrow_mut_retention.get(&function.name)
+            .and_then(|destinations| destinations.iter().map(|roots| {
+                roots.iter().map(|root| match *root {
+                    BorrowRoot::Param(index) => Some(hir::MutableRetentionRoot::Contained(index)),
+                    BorrowRoot::ParamStorage(index) => Some(hir::MutableRetentionRoot::Storage(index)),
+                    _ => None,
+                }).collect::<Option<Vec<_>>>().map(|mut roots| { roots.sort(); roots })
+            }).collect::<Option<Vec<_>>>());
         function.return_region = borrow_to_region_summary(&summary);
         function.return_borrow = summary;
         function.parallel_transfer = named_parallel
@@ -28486,9 +28523,9 @@ type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 
 /// Analysis-local roots that may remain stored in each parameter after a returning `borrow mut` or
 /// `out` call. Entries are indexed by destination parameter; every root is relative to a source
-/// parameter of the same function. The fact is deliberately not serialized: a checked-HIR replay
-/// recomputes it from available same-program bodies, while unavailable bodies use the conservative
-/// all-compatible-input fallback at their call sites. The historical type name remains internal so
+/// parameter of the same function. Checked-HIR replay recomputes local bodies; validated imported
+/// records supply the same fact. Unavailable bodies retain the conservative fallback.
+/// The historical type name remains internal so
 /// the one summary path is extended rather than shadowed by an `out`-only fact.
 type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
@@ -45343,6 +45380,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_region: sig.return_region.clone(),
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
+            mutable_retention: None,
             locals,
             body,
             span: f.span,
@@ -54371,6 +54409,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
+            mutable_retention: None,
             locals,
             body: body_fin,
             span,

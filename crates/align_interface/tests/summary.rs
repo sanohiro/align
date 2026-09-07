@@ -2585,7 +2585,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "09000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000001000000000000000000000000000000000000000000000000000000"
+        "0a000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2602,22 +2602,23 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     );
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
-    // producer certificate, effect, empty parallel-transfer sequence, resource-hook-body bit,
+    // producer certificate, effect, empty parallel-transfer sequence, the 14-byte
+    // Some([[Storage(0)]]) mutable-retention record, resource-hook-body bit,
     // generic body option, then the empty top-level sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 31] = 0xff;
+    bad_borrow[surface.len() - 45] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 30] = 0xff;
+    bad_region[surface.len() - 44] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 29] = 0xff;
+    bad_cleanup[surface.len() - 43] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {
@@ -2626,7 +2627,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
         })
     );
     let mut bad_certificate = serialize(&summary);
-    bad_certificate[surface.len() - 28] = 0xff;
+    bad_certificate[surface.len() - 42] = 0xff;
     assert_eq!(
         deserialize(&bad_certificate),
         Err(DecodeError::BadTag {
@@ -2657,4 +2658,51 @@ fn capabilities_captured_per_unit() {
     let sums = summaries(&[unit("main", true, main), unit("zip", false, zip)]);
     assert_eq!(find(&sums, "zip").capabilities, vec!["Zlib".to_string()], "compress unit shows Zlib");
     assert!(find(&sums, "main").capabilities.is_empty(), "pure-numeric entry unit has no capabilities");
+}
+
+#[test]
+fn mutable_retention_private_body_changes_reach_public_interface_hashes() {
+    use align_sema::hir::MutableRetentionRoot::Contained;
+    let produce = |body: &str| {
+        one(format!("fn inner(borrow mut dst: str, a: str, b: str) {{ {body} }}\npub fn forward(borrow mut dst: str, a: str, b: str) {{ inner(dst, a, b) }}\nfn main() -> i32 = 0\n")).remove(0)
+    };
+    let first = produce("dst = a");
+    let same = produce("print(1); dst = a");
+    let changed = produce("dst = b");
+    assert_eq!(first.fns[0].mutable_retention, Some(vec![vec![Contained(1)], vec![], vec![]]));
+    assert_eq!(changed.fns[0].mutable_retention, Some(vec![vec![Contained(2)], vec![], vec![]]));
+    // Effect also belongs to the interface; use a pure implementation edit for the stable case.
+    let equivalent = produce("n := 1 + 2; dst = a");
+    assert_eq!(first.interface_hash, equivalent.interface_hash);
+    assert_ne!(first.interface_hash, changed.interface_hash);
+    assert_ne!(first.interface_hash, same.interface_hash);
+    for summary in [first, equivalent, changed] {
+        assert_eq!(deserialize(&serialize(&summary)), Ok(summary.clone()));
+        assert_eq!(validate_for_import(&summary), Ok(()));
+    }
+}
+
+#[test]
+fn mutable_retention_in_memory_imports_reject_malformed_records() {
+    use align_sema::hir::MutableRetentionRoot::{Contained, Storage};
+    let base = one("pub fn set(borrow mut dst: str, value: str) { dst = value }\nfn main() -> i32 = 0\n").remove(0);
+    for record in [
+        Some(vec![]),
+        Some(vec![vec![Contained(2)], vec![]]),
+        Some(vec![vec![Contained(1), Contained(1)], vec![]]),
+        Some(vec![vec![Storage(1), Contained(0)], vec![]]),
+        Some(vec![vec![], vec![Contained(0)]]),
+    ] {
+        let mut bad = base.clone();
+        bad.fns[0].mutable_retention = record;
+        rehash(&mut bad);
+        assert!(matches!(validate_for_import(&bad), Err(ImportCompatibilityError::InvalidMutableRetention(_))));
+        assert!(matches!(deserialize(&serialize(&bad)), Err(DecodeError::InvalidSummary(_))));
+    }
+    let mut generic = one("pub fn identity<T>(value: T) -> T = value\nfn main() -> i32 = 0\n").remove(0);
+    assert_eq!(generic.fns[0].mutable_retention, None);
+    generic.fns[0].mutable_retention = Some(vec![vec![]]);
+    rehash(&mut generic);
+    assert!(matches!(validate_for_import(&generic), Err(ImportCompatibilityError::InvalidMutableRetention(_))));
+    assert!(matches!(deserialize(&serialize(&generic)), Err(DecodeError::InvalidSummary(_))));
 }
