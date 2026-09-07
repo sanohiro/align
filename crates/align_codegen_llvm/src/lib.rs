@@ -10743,7 +10743,11 @@ fn validate_resource_rvalues_component(
             };
             if let Some(returned) = returned
             {
-                if xml_operand_base_ty(function, returned) != Some(function.ret) {
+                let return_type_matches = match xml_operand_base_ty(function, returned) {
+                    Some(actual) => source_ty_matches(actual, function.ret, program)?,
+                    None => false,
+                };
+                if !return_type_matches {
                     return Err(fail(
                         function,
                         "producer return operand disagrees with its declared result type",
@@ -35030,6 +35034,62 @@ fn main() -> i32 = 0
             validate_thin_partition_program(program, &[]).is_err(),
             "per-unit XML producer mutation was accepted: {label}"
         );
+    }
+
+    #[test]
+    fn producer_canonical_return_types_preserve_nominal_and_callable_checks() {
+        let base = mir(
+            "Holder<T> { f: T }\n\
+             fn one(x: i64) -> i64 = x + 1\n\
+             fn make() -> Holder<fn(i64) -> i64> = Holder { f: one }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let make = xml_test_function(&base, "make");
+        let Ty::Struct(expected) = base.fns[make].ret else {
+            panic!("canonical return fixture must return a record");
+        };
+        let returned = base.fns[make].blocks.iter().find_map(|block| match &block.term {
+            Term::Return(Some(value)) => Some(value),
+            _ => None,
+        }).unwrap_or_else(|| panic!("canonical return fixture omitted its value"));
+        let actual = xml_operand_base_ty(&base.fns[make], returned)
+            .unwrap_or_else(|| panic!("canonical return fixture has no operand type"));
+        assert_ne!(actual, base.fns[make].ret, "owner must cross distinct origin IDs");
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let Ty::Fn(signature) = base.structs[expected as usize].fields[0].ty else {
+            panic!("canonical return fixture must contain a callable");
+        };
+        for axis in ["nominal", "field", "table", "actual-table", "signature", "mode", "cleanup", "producer"] {
+            let mut malformed = base.clone();
+            match axis {
+                "nominal" => malformed.structs[expected as usize].source_name = "Other".into(),
+                "field" => malformed.structs[expected as usize].fields[0].ty = Ty::Bool,
+                "table" => malformed.fns[make].ret = Ty::Struct(u32::MAX),
+                "actual-table" => {
+                    let Operand::Value(value) = returned else {
+                        panic!("canonical return fixture must return an SSA value");
+                    };
+                    malformed.fns[make].value_tys[*value as usize] = Ty::Struct(u32::MAX);
+                }
+                "signature" => malformed.fn_types[signature as usize].ret = Ty::Bool,
+                "mode" => malformed.fn_types[signature as usize].params[0].0 = align_ast::ParamMode::Borrow,
+                "cleanup" => malformed.fns[make].return_cleanup = hir::ReturnCleanupAbi::DynamicBit,
+                "producer" => {
+                    let value = malformed.fns[make].blocks.iter_mut()
+                        .flat_map(|block| &mut block.stmts)
+                        .find_map(|statement| match statement {
+                            Stmt::Let(_, rvalue @ Rvalue::FnAddr { .. }) => Some(rvalue),
+                            _ => None,
+                        }).unwrap_or_else(|| panic!("canonical return fixture omitted its callable"));
+                    *value = Rvalue::RawNull;
+                }
+                _ => panic!("unknown canonical return owner axis"),
+            }
+            assert!(validate_mir_producers(&malformed).is_err(), "{axis}: publication");
+            assert_xml_producer_rejected(&malformed, axis);
+        }
     }
 
     #[test]

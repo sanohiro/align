@@ -92,14 +92,16 @@ the existing libpq closure and Mach-O support list are unchanged. Item 2 of
 Request 59's blocking issue #966 is fixed in PR #972. Its canonical Copy projection call repair follows
 `docs/impl/xml-producer-investigation.md`: retain the complete selected storage
 proof while accepting the existing by-value borrowed descriptor representation.
-Request 60 (#968) owns an explicit absolute C-driver option for closed-environment
+Request 60 (#968), merged in PR #973, owns an explicit absolute C-driver option for closed-environment
 builds across build/run/size/test, ThinLTO, PGO, and watch. Item 2 of
 `docs/impl/21-build-perf-plan.md` records its exact selection and validation
 contract; driver-internal tool discovery remains caller configuration.
 Deliver commit revisions and issue reports, not versioned releases.
-The existing `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
-producer-return failure recorded during Request 52 verification remains deferred
-behind those consumer blockers. align-llm consumer changes remain outside this work.
+The `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
+producer-return failure recorded during Request 52 follows the canonical source-type
+identity closure in `docs/impl/xml-producer-investigation.md`; it must not equate
+different nominal types merely because their layouts agree. align-llm consumer
+changes remain outside this work.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
