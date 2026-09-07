@@ -218,3 +218,83 @@ validation and linking, then the generated program independently exits with
 `Error` code 2 inside the client-owned runtime plan path. Release verification
 therefore remains with align-llm after it updates `.align-revision`; the Align
 regression owner is the reduced whole-program/per-unit pipeline above.
+
+## Request 59 canonical Copy call operands
+
+Status: implemented and owner-verified; closure prepared before repair. Issue #966's
+unchanged client at align-llm `1a37b5b` fails on Align `f291700f`. The failing
+return field is not the original invalid equation: a sibling prompt depends on
+`run_spec` called with `BorrowedPlace` projections through an optional borrowed
+record. Those projections are the settled physical representation of Copy
+arguments (`str`, `slice<str>`, and `i64`) passed by value. `add_call_result`
+defers canonical Borrow/BorrowMut/Out arguments to the complete call validator,
+but mistakenly sends their ByValue Copy siblings through an operand equation
+that rejects every borrowed descriptor. Whole-result validation then propagates
+that failure to the builder-owned string field.
+
+The repair follows the existing validation split, not a new ownership rule:
+only the already-admitted `BorrowedPlace` Copy-by-value descriptors gain a typed
+READ requirement on their translated storage path in the existing producer
+worklist, in addition to call-site validation. `operands_match_modes`
+still requires absent cleanup and excludes Move-by-value descriptors; ByValue
+`BorrowedElementPlace` and `BorrowedFixedElementPlace` remain rejected. The latter
+families must not be admitted by this repair: their element/index/guard validation
+is not the same publication boundary as a traversable `BorrowedPlace` path.
+A returned Copy view rooted in such an argument propagates the grounded storage
+provenance, exactly like the existing ByValue SSA representation;
+the worklist must authenticate every later store and selected/sibling producer,
+and the call validator must authenticate its descriptor and declared mode before
+producer certification succeeds. Do not use `xml_borrowed_access`'s parameter
+shortcut for this new producer edge: entry authority alone omits later stores.
+Exact same-element array-to-slice retyping retains the actual storage path/type.
+No equation constructor may invoke a nested producer analysis. Owned return leaves still
+require the existing certified callee and dynamic cleanup contract.
+
+Implementation closure matrix:
+
+| Cell | Required closure | Owner |
+|---|---|---|
+| Source discriminator | Optional borrowed record fields passed as Copy values feed an owned prompt beside an initialized/replaced builder string and multiple early record returns. The reduced fixture must fail on `f291700f`, not merely resemble the source. | New `std_xml` whole/per-unit producer fixture; unchanged public `verification_loop.align` check-per-unit. |
+| Call forms and projections | Direct/imported/generic and indirect calls share `add_call_result`; already-admitted root/tagged `BorrowedPlace` Copy projections retain exact type/mode/cleanup checks. ByValue element/fixed-element descriptors remain rejected. Returned Copy views propagate existing source authority and presence without a new seed. | Parameterized codegen producer owner plus existing indexed-call and callable-fact mutation owners. |
+| Negative admission | ByValue Move descriptors, wrong slots/paths/types, unreadable Out sources, shared mutable arguments, uncertified callees, and detached cleanup remain rejected before publication and emission. | Parameterized malformed-MIR owner in whole/per-unit modes and existing `producer_*` owners. |
+| Construction, replacement, move, Drop, return | Empty owned initialization, builder replacement, record move-in, source nulling, early exits and returned cleanup retain the unchanged lowering and exactly-once lifecycle. | New source fixture executes each return branch in whole/per-unit builds; existing `resource_ownership` suite. |
+| Control joins and graph termination | `if`, `match`, loop, `else`, `?`, and `map_err` keep existing equations. Canonical call arguments do not initiate a recursive solver or seed a new intra-function cycle. | Existing guarded/seeded/unseeded/check-cycle `producer_*` owners and Request 58 fixture. |
+| Publication and allocation | Whole-program, per-unit interface publication, and instantiated generic bodies use the same validator. No serialized record, runtime ABI, allocation, or language contract changes. | `std_xml` producer owners, codegen mutation parity, local PostgreSQL owner gate if classified in scope. |
+
+The author-side extraction binds the existing obligations for every actual call
+edge, exact types/modes/cleanup, selected-path provenance, whole-result validity,
+and same-worklist dependencies to this matrix. No performance promise is added,
+so a benchmark is not a correctness gate. Consumer revision adoption and its
+build/smoke commands remain align-llm-owned; no versioned release is requested.
+
+The independent pre-implementation review found two boundary gaps: admitting
+indexed/fixed ByValue descriptors, and trusting parameter entry authority without
+later-store proof. The matrix now keeps those descriptor modes rejected and
+requires same-worklist storage dependencies. The malformed owner must include
+a wrong callable stored after parameter entry beside indexed/fixed rejection.
+
+Author-side closure: `check_copy_place` validates the precise stored projection
+and attaches its leaf READ requirements; `add_call_result` retains them for
+owned results and propagates those same source dependencies for rooted views.
+`producer_copy_place_calls_preserve_storage_proof`
+crosses direct/indirect/generic/view calls with bad slot/path/type/cleanup/Out
+and unsupported descriptor mutations in publication, whole, and per-unit modes.
+`producer_copy_place_checks_callable_stores_after_parameter_entry` rejects the
+bad later callable store; deleting the new READ requirement makes that owner
+fail, so parameter-entry authority cannot silently replace this proof.
+`producer_certification_accepts_owned_builder_record_after_copy_projection_call`
+reproduces field 7 on the pre-fix compiler, executes all four return paths in
+whole/per-unit builds, and rejects a borrowed `str` in the same owned field.
+All 17 `producer_*`, 17 `std_xml`, and 23 `resource_ownership` owners pass.
+The unchanged client at `1a37b5b` now passes all five per-unit modules.
+
+The one full-diff code review found a P2 malformed-MIR gap in the candidate's
+rooted-view seed: a call with a check-only input edge could seed its own otherwise
+uninitialized slot cycle. The correction uses the translated storage nodes as
+ordinary provenance dependencies, matching the existing ByValue SSA path without
+changing the solver or admitting any new descriptor. The READ checks remain.
+`producer_copy_place_return_cycles_require_a_grounded_source` owns both the
+unseeded rejection and seeded acceptance in publication and whole/per-unit modes;
+restoring the candidate's unconditional seed makes its publication negative fail.
+This closes the finding with a local producer-edge correction and does not
+change the language, IR shape, capability boundary, or existing solver strategy.

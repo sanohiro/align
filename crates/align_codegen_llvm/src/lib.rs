@@ -5938,6 +5938,60 @@ impl<'a> XmlAccessAnalyzer<'a> {
         equation
     }
 
+    /// Copy projections are value arguments, but their canonical descriptor is not an SSA value.
+    /// Keep their complete storage proof in this worklist, including writes after parameter entry.
+    fn check_copy_place(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        place: &align_mir::BorrowedPlace,
+        expected: Ty,
+    ) -> Vec<XmlAccessNode> {
+        let projection = self.graph.function.slots.get(place.slot as usize)
+            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path));
+        let Some((stored, storage_path)) = projection else {
+            equation.invalid = true;
+            return Vec::new();
+        };
+        let view_retype = matches!(
+            (stored, expected),
+            (Ty::Array(element, _), Ty::Slice(view))
+                | (Ty::DynArray(element), Ty::Slice(view)) if element == view
+        );
+        if place.cleanup.is_some()
+            || place.ty != expected
+            || (stored != expected && !view_retype)
+            || align_sema::ty_is_move(
+                expected,
+                &self.graph.program.structs,
+                &self.graph.program.tuples,
+                &self.graph.program.enums,
+                &self.graph.program.tagged_types,
+            )
+        {
+            equation.invalid = true;
+            return Vec::new();
+        }
+        let Some(leaves) = xml_owned_leaf_paths(self.graph.program, stored) else {
+            equation.invalid = true;
+            return Vec::new();
+        };
+        let paths = if leaves.is_empty() {
+            vec![Vec::new()]
+        } else {
+            leaves.into_iter().map(|(_, path)| path).collect()
+        };
+        let mut sources = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut selected = storage_path.clone();
+            selected.extend(path);
+            let node = XmlAccessNode::Slot(place.slot, selected);
+            let source = self.queue(node.clone());
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+            sources.push(node);
+        }
+        sources
+    }
+
     fn add_call_result(
         &mut self,
         equation: &mut XmlAccessEquation,
@@ -5982,7 +6036,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return;
         }
-        for ((argument, expected), mode) in args.iter().zip(&facts.params).zip(&facts.modes) {
+        let mut copy_place_sources = HashMap::new();
+        for (index, ((argument, expected), mode)) in args.iter().zip(&facts.params).zip(&facts.modes).enumerate() {
+            if let (Operand::BorrowedPlace(place), align_ast::ParamMode::ByValue) = (argument, mode) {
+                let sources = self.check_copy_place(equation, place, *expected);
+                copy_place_sources.insert(index, sources);
+                continue;
+            }
             let canonical_borrow = matches!(
                 argument,
                 Operand::BorrowedPlace(_)
@@ -6053,7 +6113,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     XmlAccessSource::Seed(XmlAccessProvenance::Unreadable),
                 ),
                 Some(align_ast::ParamMode::ByValue) => {
-                    self.add_operand(equation, operand, *expected, Vec::new());
+                    if matches!(operand, Operand::BorrowedPlace(_)) {
+                        // A rooted view must have an independently founded source, exactly like
+                        // an ordinary ByValue SSA argument. A check-only edge plus a new seed
+                        // would let an uninitialized call/slot cycle authenticate itself.
+                        if let Some(sources) = copy_place_sources.get(&(root as usize)) {
+                            equation.dependencies.extend(sources.iter().cloned());
+                        } else {
+                            equation.invalid = true;
+                        }
+                    } else {
+                        self.add_operand(equation, operand, *expected, Vec::new());
+                    }
                 }
                 None => equation.invalid = true,
             }
@@ -34959,6 +35030,172 @@ fn main() -> i32 = 0
             validate_thin_partition_program(program, &[]).is_err(),
             "per-unit XML producer mutation was accepted: {label}"
         );
+    }
+
+    #[test]
+    fn producer_copy_place_calls_preserve_storage_proof() {
+        fn argument(program: &mut Program) -> &mut Operand {
+            let function = program.fns.iter_mut()
+                .find(|function| function.name.as_str() == "forward")
+                .unwrap_or_else(|| panic!("missing forward owner fixture"));
+            function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                .find_map(|statement| {
+                    let args = match statement {
+                        Stmt::Let(_, Rvalue::Call(_, args)) => args,
+                        Stmt::Let(_, Rvalue::CallWithCleanup(call)) => &mut call.args,
+                        Stmt::Let(_, Rvalue::CallIndirect { args, .. }) => args,
+                        Stmt::Let(_, Rvalue::CallIndirectWithCleanup(call)) => &mut call.args,
+                        _ => return None,
+                    };
+                    args.iter_mut().find(|argument| matches!(argument, Operand::BorrowedPlace(_)))
+                }).unwrap_or_else(|| panic!("owner fixture has no canonical Copy argument"))
+        }
+        for (label, declaration, call) in [
+            ("direct", "fn own(text: str) -> string = text.clone()", "own(spec.text)"),
+            ("indirect", "fn own(text: str) -> string = text.clone()", "{ callback := own; callback(spec.text) }"),
+            ("generic", "fn own<T>(text: T) -> string = \"owned\".clone()", "own(spec.text)"),
+            ("view", "fn view(text: str) -> str = text", "view(spec.text).clone()"),
+        ] {
+            let source = format!(
+                "Spec {{ text: str, args: array<str> }}\nTask {{ spec: Option<Spec> }}\n\
+                 {declaration}\nfn forward(borrow task: Task) -> string {{\n\
+                 match task.spec {{ Some(spec) => {{ return {call} }}, None => {{}} }}\n\
+                 return \"absent\".clone()\n}}\nfn main() -> i32 = 0\n"
+            );
+            let base = mir(&source);
+            assert!(validate_mir_producers(&base).is_ok(), "{label} publication");
+            assert!(validate_resource_rvalues(&base).is_ok(), "{label} whole");
+            assert!(validate_thin_partition_program(&base, &[]).is_ok(), "{label} per-unit");
+            let Operand::BorrowedPlace(original) = argument(&mut base.clone()).clone() else {
+                panic!("Copy descriptor shape");
+            };
+            for axis in ["slot", "path", "type", "cleanup", "out", "element", "fixed"] {
+                let mut malformed = base.clone();
+                if axis == "out" {
+                    let function = malformed.fns.iter_mut()
+                        .find(|function| function.name.as_str() == "forward")
+                        .unwrap_or_else(|| panic!("missing forward owner fixture"));
+                    function.param_modes[0] = align_ast::ParamMode::Out;
+                } else {
+                    let mut place = original.clone();
+                    match axis {
+                        "slot" => place.slot = u32::MAX,
+                        "path" => place.path.push(hir::BorrowedPathSegment::StructField(u32::MAX)),
+                        "type" => place.ty = Ty::Raw,
+                        "cleanup" => place.cleanup = Some(0),
+                        "element" | "fixed" => {},
+                        _ => panic!("unknown Copy projection mutation axis"),
+                    }
+                    *argument(&mut malformed) = match axis {
+                        "element" => Operand::BorrowedElementPlace(Box::new(align_mir::BorrowedElementPlace {
+                            base: *place,
+                            index: Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true }))),
+                            element_ty: Ty::Str,
+                            guard: align_mir::BorrowedElementGuard {
+                                reservation: 0,
+                                len: Operand::Const(Const::Int(1, Ty::Int(IntTy { bits: 64, signed: true }))),
+                            },
+                        })),
+                        "fixed" => Operand::BorrowedFixedElementPlace(Box::new(align_mir::BorrowedFixedElementPlace {
+                            base: place.slot, index: 0, path: Vec::new(), ty: Ty::Str, cleanup: None,
+                        })),
+                        _ => Operand::BorrowedPlace(place),
+                    };
+                }
+                assert!(validate_mir_producers(&malformed).is_err(), "{label}/{axis} publication");
+                assert_xml_producer_rejected(&malformed, &format!("{label}/{axis}"));
+            }
+        }
+    }
+
+    #[test]
+    fn producer_copy_place_checks_callable_stores_after_parameter_entry() {
+        let mut base = mir(r#"Holder { callback: fn(str) -> string }
+fn owned(text: str) -> string = text.clone()
+fn consume(callback: fn(str) -> string) -> string = callback("owned")
+fn forward(borrow mut holder: Holder) -> string {
+  holder.callback = owned
+  return consume(holder.callback)
+}
+fn main() -> i32 = 0
+"#);
+        let index = xml_test_function(&base, "forward");
+        let function = &mut base.fns[index];
+        let slot = function.params[0];
+        let ty = match function.slots[slot as usize] {
+            Ty::Struct(id) => base.structs[id as usize].fields[0].ty,
+            _ => panic!("holder shape"),
+        };
+        let args = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::CallWithCleanup(call))
+                    if call.target.as_str() == "consume" => Some(&mut call.args),
+                _ => None,
+            }).unwrap_or_else(|| panic!("owner fixture has no owned result call"));
+        args[0] = Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+            slot, path: vec![hir::BorrowedPathSegment::StructField(0)], ty, cleanup: None,
+        }));
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let mut malformed = base;
+        let address = malformed.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, value @ Rvalue::FnAddr { .. }) => Some(value),
+                _ => None,
+            }).unwrap_or_else(|| panic!("owner fixture has no post-entry callable store"));
+        *address = Rvalue::RawNull;
+        assert!(validate_mir_producers(&malformed).is_err(), "parameter entry cannot hide a bad later store");
+        assert_xml_producer_rejected(&malformed, "Copy callable overwritten after parameter entry");
+    }
+
+    #[test]
+    fn producer_copy_place_return_cycles_require_a_grounded_source() {
+        let base = mir("fn view(text: str) -> str = text\n\
+            fn forward(text: str) -> string = view(text).clone()\nfn main() -> i32 = 0\n");
+        for seeded in [false, true] {
+            let mut program = base.clone();
+            let function = &mut program.fns[xml_test_function(&base, "forward")];
+            let slot = u32::try_from(function.slots.len())
+                .unwrap_or_else(|_| panic!("owner fixture slot inventory exceeds u32"));
+            function.slots.push(Ty::Str);
+            function.slot_align.push(None);
+            let mut changed = false;
+            for block in &mut function.blocks {
+                let Some(index) = block.stmts.iter().position(|statement| matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), _))
+                        if target.as_str() == "view"
+                )) else { continue };
+                let Stmt::Let(value, Rvalue::Call(_, args)) = &mut block.stmts[index] else {
+                    panic!("view call shape");
+                };
+                let value = *value;
+                args[0] = Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+                    slot, path: Vec::new(), ty: Ty::Str, cleanup: None,
+                }));
+                block.stmts.insert(index + 1, Stmt::Store(slot, Operand::Value(value)));
+                if !block.stmt_lines.is_empty() {
+                    block.stmt_lines.insert(index + 1, (1, 1));
+                }
+                if seeded {
+                    block.stmts.insert(index, Stmt::Store(slot, Operand::Arg(0)));
+                    if !block.stmt_lines.is_empty() {
+                        block.stmt_lines.insert(index, (1, 1));
+                    }
+                }
+                changed = true;
+                break;
+            }
+            assert!(changed, "the owner must form a returned-view/call/slot cycle");
+            if seeded {
+                assert!(validate_mir_producers(&program).is_ok(), "seeded publication");
+                assert!(validate_resource_rvalues(&program).is_ok(), "seeded whole");
+                assert!(validate_thin_partition_program(&program, &[]).is_ok(), "seeded per-unit");
+            } else {
+                assert!(validate_mir_producers(&program).is_err(), "unseeded publication");
+                assert_xml_producer_rejected(&program, "unseeded Copy-view/call/slot cycle");
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,77 @@
+module producer_support
+
+Spec { text: str, args: array<str>, code: i64 }
+Task { spec: Option<Spec> }
+Status { Passed, Failed }
+Attempt {
+  status: string,
+  final_status: Status,
+  code: i64,
+  applied: bool,
+  repaired: bool,
+  repair_count: i64,
+  prompt: string,
+  stages: string,
+}
+
+fn produce(text: str, args: slice<str>, code: i64) -> string {
+  if args.len() > code { return text.clone() }
+  return "fallback".clone()
+}
+
+fn attempt(borrow task: Task, branch: i32) -> Attempt {
+  mut stages := builder()
+  mut document := "".clone()
+  stages.write("start")
+  if branch == 0 {
+    document = stages.to_string()
+    return Attempt {
+      status: "early".clone(), final_status: Status.Passed, code: 0,
+      applied: false, repaired: false, repair_count: 0,
+      prompt: "initial".clone(), stages: document,
+    }
+  }
+  match task.spec {
+    Some(spec) => {
+      prompt := produce(spec.text, spec.args, spec.code)
+      stages.write(":some")
+      if branch == 1 {
+        document = stages.to_string()
+        return Attempt {
+          status: "selected".clone(), final_status: Status.Passed, code: 1,
+          applied: true, repaired: false, repair_count: 0,
+          prompt: prompt, stages: document,
+        }
+      }
+      stages.write(":later")
+      document = stages.to_string()
+      return Attempt {
+        status: "later".clone(), final_status: Status.Passed, code: 2,
+        applied: true, repaired: true, repair_count: 1,
+        prompt: prompt, stages: document,
+      }
+    },
+    None => {},
+  }
+  stages.write(":none")
+  document = stages.to_string()
+  return Attempt {
+    status: "absent".clone(), final_status: Status.Failed, code: 3,
+    applied: false, repaired: false, repair_count: 0,
+    prompt: "absent".clone(), stages: document,
+  }
+}
+
+pub fn exercise() -> i32 {
+  present := Task { spec: Some(Spec { text: "prompt", args: ["arg"].to_array(), code: 0 }) }
+  absent := Task { spec: None }
+  mut branch: i32 := 0
+  loop {
+    if branch == 4 { break }
+    result := if branch == 3 { attempt(absent, branch) } else { attempt(present, branch) }
+    print(result.stages)
+    print(result.prompt)
+    branch = branch + 1
+  }
+  return 0
+}

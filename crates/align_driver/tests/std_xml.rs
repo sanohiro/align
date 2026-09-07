@@ -5,6 +5,37 @@ mod common;
 use common::*;
 
 #[test]
+fn producer_certification_accepts_owned_builder_record_after_copy_projection_call() {
+    if !backend_available() {
+        return;
+    }
+    let source = fixture(
+        "crates/align_driver/tests/fixtures/producer_owned_builder_record_return.align",
+    );
+    let entry = "import producer_support\nfn main() -> i32 = producer_support.exercise()\n";
+    let invalid = source.replace("stages: document", "stages: \"borrowed\"");
+    assert_ne!(source, invalid, "the negative must replace the owned return field");
+    let invalid_files = &[("producer_support.align", invalid.as_str()), ("main.align", entry)];
+    for diagnostics in [
+        check_multi_diagnostics("producer-owned-builder-borrowed", invalid_files, "main.align"),
+        build_per_unit_multi_diagnostics(
+            "producer-owned-builder-borrowed-per-unit", invalid_files, "main.align",
+        ),
+    ] {
+        assert!(diagnostics.contains("type mismatch: str vs string"), "{diagnostics}");
+    }
+    let files = &[("producer_support.align", source), ("main.align", entry)];
+    let expected = "start\ninitial\nstart:some\nprompt\nstart:some:later\nprompt\nstart:none\nabsent\n";
+    let whole = build_and_run_multi("producer-owned-builder-whole", files, "main.align");
+    assert_eq!(whole.status.code(), Some(0), "{}", String::from_utf8_lossy(&whole.stderr));
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
+    let per_unit = build_per_unit_multi("producer-owned-builder-per-unit", files, "main.align")
+        .link_and_run();
+    assert_eq!(per_unit.status.code(), Some(0), "{}", String::from_utf8_lossy(&per_unit.stderr));
+    assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
+}
+
+#[test]
 fn producer_certification_accepts_owned_result_record_after_loop_join() {
     if !backend_available() {
         return;

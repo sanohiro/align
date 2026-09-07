@@ -88,10 +88,16 @@ of `docs/impl/25-recursive-owned-json-plan.md` owns its closure (PR #970).
 Request 54's ELF static-library link failure was also reproduced: automatic
 support libraries now follow every runtime, PGO, capability and user archive;
 the existing libpq closure and Mach-O support list are unchanged. Item 2 of
-`docs/impl/21-build-perf-plan.md` owns that repair. After delivery, investigate
-the existing `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
-producer-return certification failure recorded during Request 52 verification.
-align-llm consumer changes remain outside this work.
+`docs/impl/21-build-perf-plan.md` owns that repair (PR #971).
+The owner prioritizes align-llm's blocking issues #966 (Request 59) and #968
+(Request 60) next. Request 59's canonical Copy projection call repair follows
+`docs/impl/xml-producer-investigation.md`: retain the complete selected storage
+proof while accepting the existing by-value borrowed descriptor representation.
+Request 60 then owns an explicit absolute C-driver option for closed-environment
+builds. Deliver commit revisions and issue reports, not versioned releases.
+The existing `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
+producer-return failure recorded during Request 52 verification remains deferred
+behind those consumer blockers. align-llm consumer changes remain outside this work.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
