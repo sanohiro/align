@@ -298,6 +298,43 @@ fn watch_reuses_the_selected_driver_for_each_revision() {
 }
 
 #[test]
+fn nonrunning_verbs_reject_the_program_suffix_without_side_effects() {
+    let stage = align_driver::ArtifactStage::temp("cc-nonrun-suffix").unwrap();
+    let root = stage.path();
+    let original = "fn main() {     print(1) }\n";
+    fs::write(root.join("main.align"), original).unwrap();
+    for arguments in [
+        vec!["fmt", "main.align", "--", "--write"],
+        vec!["fmt", "main.align", "--", "-w"],
+        vec!["emit-llvm", "main.align", "--", "--stage", "optimized"],
+        vec!["emit-obj", "main.align", "--", "out.o"],
+        vec!["explain-opt", "main.align", "--", "--verbose"],
+        vec!["build", "main.align", "--", "--cc=/not/a/compiler"],
+        vec!["size", "main.align", "--"],
+        vec!["test", "main.align", "--", "extra"],
+        vec!["cache", "clear", "--"],
+        vec!["db", "prepare", "main.align", "--", "--cc=/not/a/compiler"],
+    ] {
+        let (status, stdout, stderr) = run(root, &arguments);
+        assert!(
+            !status.success() && stdout.is_empty(),
+            "{arguments:?}: {stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("delimiter -- is only valid for `run`"),
+            "{arguments:?}: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("main.align")).unwrap(),
+            original
+        );
+        assert!(!root.join("main").exists());
+        assert!(!root.join("out.o").exists());
+        assert!(!root.join(".cache").exists());
+    }
+}
+
+#[test]
 fn selection_retains_symlink_spelling_and_never_recovers_a_vanished_driver() {
     let stage = align_driver::ArtifactStage::temp("cc-identity").unwrap();
     let root = stage.path();

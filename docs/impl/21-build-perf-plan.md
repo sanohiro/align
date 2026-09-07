@@ -2229,7 +2229,9 @@ Independent plan review found one parser-order gap: stripping PGO first could
 turn `--cc --pgo-instrument /usr/bin/cc` into an admitted driver value, while
 parsing PGO beyond `--` could reject program arguments. The original-prefix
 rule above closes both witnesses; the parser owner must retain both cases.
-The reviewer found the remaining capability boundaries coherent.
+The reviewer found the remaining capability boundaries coherent. Only `run`
+admits the program-argument delimiter; other verbs reject `--` and its suffix
+before dispatch, including source-writing and database operations.
 
 Author-side implementation closure: `main` splits the original prefix and
 validates `parse_cc` before dispatch; `CDriver::explicit` owns path admission.
@@ -2245,6 +2247,18 @@ test-harness, FunctionThinLTO, and watch lifecycle owners retain their unchanged
 contracts. REPL and benchmark library callers explicitly choose the default.
 The extracted must/exact/every/before/reject/required obligations map to these
 implementation sites and owners; no applicable cell is deferred.
+
+The one code review found two P2 corrections, closed together: migrate the
+standalone library-boundary benchmark to `CDriver::default()` and check its
+own manifest (refresh its existing interface fixtures and both affected
+standalone lockfiles for the current workspace dependencies); keep the program suffix separate through every verb-specific
+parser instead of reattaching it before dispatch.
+`nonrunning_verbs_reject_the_program_suffix_without_side_effects` directly
+checks fmt no-write, emit-LLVM stage, emit-object output, explain verbosity,
+build/size/test, cache clear, and DB rejection. The run suffix owner retains
+both program tokens unchanged. These corrections retain the reviewed driver
+selection and prefix-only strategy; no re-review of the unchanged diff is
+required.
 
 ### Request 54: support-library ordering closure
 

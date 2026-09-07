@@ -46,6 +46,7 @@ fn interface_fixture() -> InterfaceSummary {
             return_borrow: ReturnBorrowSummary::None,
             return_region: ReturnRegionSummary::None,
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
+            producer_certification: align_interface::ProducerCertification::ValidatedBody,
             effect: Effect::Pure,
             parallel_transfer_params: Vec::new(),
             generic_body: None,
@@ -218,6 +219,7 @@ fn import_validation_fixture() -> InterfaceSummary {
                 captures: Vec::new(),
             },
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
+            producer_certification: align_interface::ProducerCertification::ValidatedBody,
             effect: Effect::Pure,
             parallel_transfer_params: Vec::new(),
             generic_body: None,
@@ -563,7 +565,8 @@ fn compile_call_fixture(
         false,
     )
     .unwrap_or_else(|error| panic!("{row} object emission failed: {error}"));
-    align_driver::link_executable(cc,
+    align_driver::link_executable(
+        &align_driver::CDriver::default(),
         &object,
         &executable,
         &mir.link_libs,

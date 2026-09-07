@@ -60,6 +60,10 @@ fn main() -> ExitCode {
             eprintln!("alignc: --cc is only valid for build/run/size/test (got `db`)");
             return ExitCode::FAILURE;
         }
+        if raw_os.iter().any(|value| value == "--") {
+            eprintln!("alignc: program argument delimiter -- is only valid for `run`");
+            return ExitCode::FAILURE;
+        }
         if raw_os.iter().skip(2).any(|value| value == "--watch") {
             eprintln!("alignc: --watch is only valid for `build` (got `db`)");
             return ExitCode::FAILURE;
@@ -172,7 +176,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (test_limits, mut args) = match parse_test_limits(&args) {
+    let (test_limits, args) = match parse_test_limits(&args) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("alignc: {error}");
@@ -181,7 +185,6 @@ fn main() -> ExitCode {
     };
     let mut run_args = args.get(3..).unwrap_or(&[]).to_vec();
     run_args.extend_from_slice(program_suffix.get(1..).unwrap_or(&[]));
-    args.extend_from_slice(program_suffix);
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
 
@@ -201,6 +204,11 @@ fn main() -> ExitCode {
         }
         None => align_driver::CDriver::default(),
     };
+
+    if !program_suffix.is_empty() && cmd != Some("run") {
+        eprintln!("alignc: program argument delimiter -- is only valid for `run`");
+        return ExitCode::FAILURE;
+    }
 
     if cmd == Some("test") && !profile_was_explicit {
         profile = Profile::Dev;

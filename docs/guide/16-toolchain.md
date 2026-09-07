@@ -92,7 +92,8 @@ The compiler prints the actual raw-profile destination. Instrument and use modes
 
 Use `--cc /absolute/path/to/cc` (or `--cc=/absolute/path/to/cc`) to select an
 explicit C driver for `build`, `run`, `size`, or `test`. Specify it once, anywhere
-before `--`; arguments after `--` belong to the program. The UTF-8 path must
+before `--`; only `run` accepts that delimiter, and arguments after it belong
+to the program. Other verbs reject the delimiter before doing work. The UTF-8 path must
 name an executable regular file; missing, relative, duplicate, and inapplicable
 selections fail before compilation. Spaces and symlinks are accepted without
 shell expansion. The selected path is used directly, without a `PATH` fallback,
