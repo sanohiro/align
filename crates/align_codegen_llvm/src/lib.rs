@@ -8354,6 +8354,33 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     ),
                 });
             }
+            Rvalue::Chunks { src, n, elem } => {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let Some(primitive) = align_sema::ty_to_scalar(elem)
+                    .and_then(align_sema::scalar_to_prim)
+                    .filter(|_| xml_numeric_scalar_ty(elem) || matches!(elem, Ty::Bool | Ty::Char | Ty::Str))
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let source_ty = Ty::Slice(align_sema::prim_to_scalar(primitive));
+                if result_ty != Ty::DynSliceArray(primitive)
+                    || xml_operand_base_ty(self.graph.function, &src) != Some(source_ty)
+                    || xml_operand_base_ty(self.graph.function, &n) != Some(i64_ty)
+                    || !(path.is_empty() || path.as_slice() == [XmlAccessPathSegment::Element])
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &n, i64_ty);
+                self.check_whole_operand(&mut equation, &src, source_ty);
+                if path.is_empty() {
+                    // Only the new array of headers is owned. Its views retain their source.
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else {
+                    self.add_operand(&mut equation, &src, elem, path);
+                }
+            }
             Rvalue::SubSlice {
                 base,
                 start,
@@ -9120,7 +9147,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::VecSum { .. }
             | Rvalue::MaskAny { .. }
             | Rvalue::VecLoad { .. }
-            | Rvalue::Chunks { .. }
             | Rvalue::ParMapParallel { .. }
             | Rvalue::ParMapReduce { .. }
             | Rvalue::SlicePtr(..)
@@ -36734,6 +36760,65 @@ fn main() -> i32 = 0
                 _ => panic!("out producer inventory changed shape"),
             }
             assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
+        }
+    }
+
+    #[test]
+    fn producer_materialized_chunks_preserve_source_element_proofs() {
+        let base = mir(
+            "fn chunked(values: slice<str>, size: i64) -> array<slice<str>> = values.chunks(size)\n\
+             fn main() -> i32 = 0\n",
+        );
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let function = xml_test_function(&base, "chunked");
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+            let mut borrowed = base.clone();
+            borrowed.fns[function].param_modes[0] = mode;
+            assert!(validate_mir_producers(&borrowed).is_ok(), "{mode:?}");
+            assert!(validate_resource_rvalues(&borrowed).is_ok(), "{mode:?}");
+            assert!(validate_thin_partition_program(&borrowed, &[]).is_ok(), "{mode:?}");
+        }
+        for mutation in ["element", "result", "source", "size", "unreadable", "raw", "cycle"] {
+            let mut bad = base.clone();
+            let body = &mut bad.fns[function];
+            let (value, source) = body.blocks.iter_mut()
+                .flat_map(|block| &mut block.stmts)
+                .find_map(|statement| match statement {
+                    Stmt::Let(value, Rvalue::Chunks { src, n, elem }) => {
+                        let source = src.clone();
+                        match mutation {
+                            "element" => *elem = Ty::String,
+                            "source" => *src = Operand::Const(Const::Bool(false)),
+                            "size" => *n = Operand::Const(Const::Bool(false)),
+                            _ => {}
+                        }
+                        Some((*value, source))
+                    }
+                    _ => None,
+                }).unwrap_or_else(|| panic!("missing materialized chunks producer"));
+            match mutation {
+                "result" => body.value_tys[value as usize] = Ty::Str,
+                "unreadable" => body.param_modes[0] = align_ast::ParamMode::Out,
+                "raw" | "cycle" => {
+                    let Operand::Value(source) = source else { panic!("expected loaded source") };
+                    let definition = body.blocks.iter_mut()
+                        .flat_map(|block| &mut block.stmts)
+                        .find_map(|statement| match statement {
+                            Stmt::Let(value, definition) if *value == source => Some(definition),
+                            _ => None,
+                        }).unwrap_or_else(|| panic!("missing source producer"));
+                    *definition = if mutation == "raw" {
+                        Rvalue::RawNull
+                    } else {
+                        Rvalue::Use(Operand::Value(source))
+                    };
+                }
+                _ => {}
+            }
+            assert!(validate_mir_producers(&bad).is_err(), "published {mutation}");
+            assert_xml_producer_rejected(&bad, mutation);
         }
     }
 

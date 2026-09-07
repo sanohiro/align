@@ -5133,10 +5133,12 @@ fixture now passes mutable-retention analysis and reaches the pre-existing
 does not repair that independent MIR call-argument proof. Its owner pins the
 remaining diagnostic and absence of the obsolete shorter-lived-input refusal.
 The `borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases`,
-`closure_target_joins_keep_capture_slots_target_relative`, and
-`storage_generation_interprocedural_allocation_parity_matrix` owner failures were
+and `closure_target_joins_keep_capture_slots_target_relative` owner failures were
 independently reproduced on the unchanged Request 61 merge, `3fbb74fe`. They remain
 separate follow-up work; imported mutable-retention transport adds no MIR authority.
+The separately reproduced `storage_generation_interprocedural_allocation_parity_matrix`
+failure is closed by the materialized-chunks producer equation in
+`xml-producer-investigation.md`.
 
 ### Owner bindings
 

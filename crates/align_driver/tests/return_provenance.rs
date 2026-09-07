@@ -5,6 +5,47 @@ use common::*;
 
 use align_interface::{ReturnBorrowSummary, ReturnRegionSummary};
 
+#[test]
+fn materialized_string_chunks_retain_views_across_modules() {
+    let files = [
+        ("views.align", r#"module views
+pub fn chunked(values: slice<str>, size: i64) -> array<slice<str>> = values.chunks(size)
+pub fn identity<T>(value: T) -> T = value
+"#),
+        ("main.align", r#"import views
+fn main() -> i32 {
+  owner := "retained".clone()
+  text: str := owner
+  fixed := [text, "second", "third"]
+  chunks := views.identity(views.chunked(fixed, 2))
+  if chunks.len() != 2 { return 1 }
+  if chunks[0][0] != "retained" { return 2 }
+  if chunks[1][0] != "third" { return 3 }
+  dynamic := [text, "tail"].to_array()
+  headers := views.chunked(dynamic, 1)
+  if headers[1][0] != "tail" { return 4 }
+  empty := views.chunked(dynamic, 0)
+  if empty.len() != 0 { return 5 }
+  negative := views.chunked(dynamic, -1)
+  if negative.len() != 0 { return 6 }
+  return 0
+}
+"#),
+    ];
+    let checked = diff_check_multi("materialized-string-chunks", &files, "main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}", checked.whole_diags, checked.per_unit_diags);
+    if backend_available() {
+        for output in [
+            build_and_run_multi("string-chunks-whole", &files, "main.align"),
+            build_per_unit_multi("string-chunks-units", &files, "main.align").link_and_run(),
+        ] {
+            assert!(output.status.success(), "status {:?}: {}", output.status.code(),
+                String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
 fn roots(params: &[u32], captures: &[u32]) -> ReturnBorrowSummary {
     ReturnBorrowSummary::Roots {
         params: params.to_vec(),

@@ -437,3 +437,52 @@ manufacture a storage seed, reverse a view into an owner, or widen Move consumpt
 | Malformed input | Unreadable parameter authority, a missing slot, a mismatched projection path, and a missing cleanup slot fail publication and whole/per-unit validation. `producer_borrowed_option_payload_clone_returns_owned_value` and `producer_imported_owned_option_result_survives_borrowed_match` own these mutations; the existing copy-place mutation owner retains malformed descriptors and storage. `producer_fixed_array_use_cannot_forge_slice_representation` keeps the descriptor-only fixed-array view out of zero-cost `Use`. |
 | Unchanged boundaries | Borrowed element places, reverse view-to-owner conversion, direct payload moves, call modes, and runtime ABI remain unchanged. Existing borrowed-parameter and producer owners retain those boundaries. |
 | Consumer closure | The unchanged align-llm `prompt_artifacts.align`, then `gmake build`, distinguish the fix from the two earlier focused Request 59 repairs. No application workaround is accepted. |
+
+
+## Materialized chunks retain protected element proofs
+
+The normal Request 42 investigation reproduces a source rejection on `57caf803`:
+`fn chunked(values: slice<str>) -> array<slice<str>> = values.chunks(1)`
+fails producer certification at the returned `Str` leaf `[Element]`.
+`Rvalue::Chunks` is incorrectly classified as a non-protected producer. Its
+settled representation allocates an owning array of slice headers while each
+header borrows the input elements. The source and chunk size already have
+concrete MIR operands; no HIR, interface, runtime, or language change is needed.
+
+This capability follows the existing typed producer-equation strategy. Validate
+the exact primitive element, lowered slice representation, materialized
+result type, and `i64` chunk-size operand in the same producer worklist. Check
+source readability and authenticate the size producer. The whole result owns
+its newly allocated header array; a selected protected element must depend on
+the corresponding input element proof, without a new ownership seed. Empty and
+nonpositive-size results keep the existing runtime behavior and conservatively
+retain the same static source dependency.
+
+| Closure cell | Implementation obligation and owner |
+|---|---|
+| Formation and producer identity | Require the source-admitted materializable Copy primitive domain and scalar widths, exact source/element/result relation, canonical operands, and `i64` size. A parameterized codegen owner mutates source, element, result, size type, and producer identity; publication and whole/per-unit validation reject every mutation. |
+| Construction and contained views | The header array is owned; its protected `[Element]` leaf follows the input leaf. A borrowed source remains borrowed and an unreadable source fails. The codegen owner covers both source authority and a forged source producer, including a cyclic source without an independent seed. |
+| Move, Drop, replacement, return | Existing MIR lowering, borrow roots, cleanup and runtime allocation remain unchanged. The existing interprocedural allocation parity matrix and a focused whole/per-unit execution fixture cover returned headers, retained source views, replacement, and cleanup. |
+| Control and generic paths | Existing source allocation parity covers branch/loop and interprocedural provenance. The focused fixture includes generic forwarding; existing guarded and seeded/unseeded producer owners retain the solver invariants. No new recursive solver or cache rule is introduced. |
+| Publication and scope | Whole and per-unit compilation share this equation. No serialized facts or runtime ABI change. The `out slice<str>` descriptor disagreement and target-relative closure joins are separate remaining defects and are deferred to their own useful capability boundaries. |
+
+The author-side pass binds the owning XML contract's exact producer identity,
+operand type and authority, source-dependent views, cleanup, and shared-worklist
+requirements to these cells. Materialized chunks are an independently useful
+consumer surface; separating this equation from call-descriptor authority and
+closure-target joins avoids changing three distinct proof rules in one repair.
+There is no new performance promise and no benchmark gate. This does not claim
+that Request 42's complete check/build diagnostic contract is resolved.
+
+
+Author-side closure: `XmlAccessAnalyzer::value_equation` now has a typed
+`Chunks` arm with source/size READ checks, an owned whole-header result, and
+source-dependent selected elements. `producer_materialized_chunks_preserve_source_element_proofs`
+accepts ByValue/Borrow/BorrowMut inputs and rejects wrong element/result/source/size,
+unreadable Out inputs, raw source forgery, and an unseeded source cycle at
+publication and whole/per-unit boundaries. The source owner
+`materialized_string_chunks_retain_views_across_modules` executes fixed/dynamic
+inputs, imported generic forwarding, short final chunks, and zero/negative sizes.
+`storage_generation_interprocedural_allocation_parity_matrix` now passes unchanged.
+The existing `producer_*` owners retain guarded presence, callable identity,
+mutable descriptor authority, and sibling whole-result checks.
