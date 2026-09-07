@@ -122,6 +122,7 @@ pub enum PlanState {
 pub enum PlanStrategy {
     VirtualCount,
     VirtualIndex,
+    VirtualRangeViews,
     MaterializedHeaders,
     ArenaOutput,
     FreshOutput,
@@ -730,6 +731,22 @@ pub struct ParMapStage {
     pub elem_out: Ty,
 }
 
+/// Physical input retained by one synchronous parallel range operation. A materialized source is
+/// the ordinary `{ptr,len}` collection whose elements are loaded by index. A virtual chunks source
+/// carries the borrowed base slice and evaluated chunk width; codegen derives the logical count and
+/// each ephemeral `slice<T>` inside the generated kernel without publishing a collection value.
+/// Parallel rvalues box this record so its larger virtual arm does not enlarge every recursive
+/// lowering frame through the containing `Rvalue` enum.
+#[derive(Clone, Debug)]
+pub enum ParallelSource {
+    Materialized(Operand),
+    VirtualChunks {
+        base: Operand,
+        width: Operand,
+        elem: Ty,
+    },
+}
+
 /// Non-type signature facts attached to function values and indirect calls. The parameter and
 /// return types remain in their existing MIR fields; these facts make the complete logical
 /// signature explicit without relying on a sema-local function-type interner id.
@@ -1321,11 +1338,12 @@ pub enum Rvalue {
         n: Operand,
         elem: Ty,
     },
-    /// `par_map(f)` over a `{ptr,len}` source `src` — apply the Pure `func` to each element in
-    /// parallel (runtime `align_rt_par_map` + a generated whole-range kernel), materializing an
-    /// owned `array<elem_out>` `{ out_buf, count }`. A chunk source is an `array<slice<T>>` view;
-    /// its borrowed slice headers are loaded as range elements and the chunk header buffer is
-    /// released after the synchronous runtime call. `stages` holds prior admitted scalar/AoS
+    /// `par_map(f)` over a classified parallel source — apply the Pure `func` to each logical
+    /// element in parallel (runtime `align_rt_par_map` + a generated whole-range kernel),
+    /// materializing an owned `array<elem_out>` `{ out_buf, count }`. A materialized chunk source
+    /// loads owned slice headers as range elements. An immediate stage-free virtual chunk source
+    /// instead derives each borrowed slice header from its base inside the kernel. `stages` holds
+    /// prior admitted scalar/AoS
     /// map, filter, projection, field-filter, and invariant string-filter stages that are fused
     /// into the same kernel; it is empty for a direct source. `Filter`, `FilterField`, and
     /// `FilterStrContains` stages preserve the current element and use a stable two-pass
@@ -1336,7 +1354,7 @@ pub enum Rvalue {
     /// generated kernel loads and forwards each stage and terminal value. `work_weight` is a
     /// small post-lowering cost hint (1/2/4) combined with element byte width by the runtime.
     ParMapParallel {
-        src: Operand,
+        src: Box<ParallelSource>,
         func: ProgramCall,
         /// Prior admitted length-preserving scalar/AoS stages. Empty for a direct `par_map`.
         stages: Vec<ParMapStage>,
@@ -1348,13 +1366,13 @@ pub enum Rvalue {
     },
     /// `par_map(f).sum()` over a direct, stage-free scalar or chunk source whose result is an
     /// integer: apply the Pure `func` in parallel and combine one wrapping partial sum per claimed
-    /// range, without materializing the transformed array. For a chunk source, only the
-    /// `array<slice<T>>` header array remains materialized by `chunks`; it is dropped after the
-    /// reduction. `elem_in` is the function parameter type and `elem_out` is the integer
-    /// result/fold type. The generated range kernel writes one partial value to the per-range
-    /// output slot supplied by the runtime.
+    /// range, without materializing the transformed array. A materialized chunk source retains its
+    /// owned header array through the synchronous reduction; an immediate virtual chunk source
+    /// derives borrowed slice headers inside the kernel and constructs no collection. `elem_in` is
+    /// the function parameter type and `elem_out` is the integer result/fold type. The generated
+    /// range kernel writes one partial value to the per-range output slot supplied by the runtime.
     ParMapReduce {
-        src: Operand,
+        src: Box<ParallelSource>,
         func: ProgramCall,
         captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
@@ -3755,6 +3773,11 @@ fn plan_tuple_is_valid(record: &PlanRecord) -> bool {
         ) | (
             PlanKind::Chunks,
             PlanState::Selected,
+            PlanStrategy::VirtualRangeViews,
+            PlanReason::ParallelConsumer
+        ) | (
+            PlanKind::Chunks,
+            PlanState::Selected,
             PlanStrategy::MaterializedHeaders,
             PlanReason::ParallelConsumer | PlanReason::PipelineConsumer | PlanReason::StoredOrBoundary
         ) | (
@@ -3964,12 +3987,16 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     | Rvalue::ArrayBuilderPush { scalar: elem, .. } => types.push(*elem),
                     Rvalue::ArrayBuilderNew { elem, .. } => types.push(*elem),
                     Rvalue::ParMapParallel {
+                        src,
                         stages,
                         capture_tys,
                         elem_in,
                         elem_out,
                         ..
                     } => {
+                        if let ParallelSource::VirtualChunks { elem, .. } = src.as_ref() {
+                            types.push(*elem);
+                        }
                         for stage in stages {
                             push_stage(&mut types, stage);
                         }
@@ -3978,11 +4005,15 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                         types.push(*elem_out);
                     }
                     Rvalue::ParMapReduce {
+                        src,
                         capture_tys,
                         elem_in,
                         elem_out,
                         ..
                     } => {
+                        if let ParallelSource::VirtualChunks { elem, .. } = src.as_ref() {
+                            types.push(*elem);
+                        }
                         types.extend(capture_tys.iter().copied());
                         types.push(*elem_in);
                         types.push(*elem_out);
@@ -4395,12 +4426,16 @@ fn remap_function_embedded_types(
                     | Rvalue::ArrayBuilderPush { scalar, .. } => remap_ty(scalar, remap),
                     Rvalue::ArrayBuilderNew { elem, .. } => remap_ty(elem, remap),
                     Rvalue::ParMapParallel {
+                        src,
                         stages,
                         capture_tys,
                         elem_in,
                         elem_out,
                         ..
                     } => {
+                        if let ParallelSource::VirtualChunks { elem, .. } = src.as_mut() {
+                            remap_ty(elem, remap);
+                        }
                         for stage in stages {
                             remap_stage(stage);
                         }
@@ -4409,11 +4444,15 @@ fn remap_function_embedded_types(
                         remap_ty(elem_out, remap);
                     }
                     Rvalue::ParMapReduce {
+                        src,
                         capture_tys,
                         elem_in,
                         elem_out,
                         ..
                     } => {
+                        if let ParallelSource::VirtualChunks { elem, .. } = src.as_mut() {
+                            remap_ty(elem, remap);
+                        }
                         remap_vec(capture_tys);
                         remap_ty(elem_in, remap);
                         remap_ty(elem_out, remap);
@@ -4910,6 +4949,7 @@ enum ChunksConsumer {
     DirectIndex,
     Pipeline,
     Parallel,
+    ParallelVirtual,
     StoredOrBoundary,
 }
 
@@ -4917,15 +4957,16 @@ enum ChunksConsumer {
 enum ChunksPlan {
     VirtualCount(PlanDecision),
     VirtualIndex(PlanDecision),
+    VirtualRangeViews(PlanDecision),
     MaterializedHeaders(PlanDecision),
 }
 
-#[cfg(test)]
 impl ChunksPlan {
     fn decision(self) -> PlanDecision {
         match self {
             Self::VirtualCount(decision)
             | Self::VirtualIndex(decision)
+            | Self::VirtualRangeViews(decision)
             | Self::MaterializedHeaders(decision) => decision,
         }
     }
@@ -4953,6 +4994,10 @@ fn chunks_plan(consumer: ChunksConsumer) -> ChunksPlan {
         )),
         ChunksConsumer::Parallel => ChunksPlan::MaterializedHeaders(decision(
             PlanStrategy::MaterializedHeaders,
+            PlanReason::ParallelConsumer,
+        )),
+        ChunksConsumer::ParallelVirtual => ChunksPlan::VirtualRangeViews(decision(
+            PlanStrategy::VirtualRangeViews,
             PlanReason::ParallelConsumer,
         )),
         ChunksConsumer::StoredOrBoundary => ChunksPlan::MaterializedHeaders(decision(
@@ -5983,6 +6028,72 @@ fn lower_chunks_pipeline_source(
         )
     } else {
         lower_borrowed_owned(b, source)
+    }
+}
+
+/// Lower the physical source of a selected range-kernel operation. The one admitted virtual form
+/// consumes a direct chunks expression without constructing its owned header array; every other
+/// form retains the existing materialized source and cleanup decision.
+fn lower_parallel_source(
+    b: &mut Builder,
+    source: &hir::Expr,
+    elem_in: Ty,
+    allow_virtual_chunks: bool,
+) -> Option<(Box<ParallelSource>, bool)> {
+    if allow_virtual_chunks
+        && let hir::ExprKind::ArrayChunks {
+            source: base,
+            n,
+            elem,
+        } = &source.kind
+    {
+        let base = lower_chunks_source(b, base, *elem);
+        if !lowering_continues(b) {
+            return None;
+        }
+        let width = lower_expr(b, n);
+        if !lowering_continues(b) {
+            return None;
+        }
+        let plan = chunks_plan(ChunksConsumer::ParallelVirtual);
+        debug_assert!(matches!(plan, ChunksPlan::VirtualRangeViews(_)));
+        b.record_plan(source, plan.decision());
+        return Some((
+            Box::new(ParallelSource::VirtualChunks {
+                base,
+                width,
+                elem: *elem,
+            }),
+            true,
+        ));
+    }
+
+    let release_after = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+    let source = match source.ty {
+        Ty::Slice(_)
+        | Ty::DynArray(_)
+        | Ty::DynSliceArray(_)
+        | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
+            lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
+        }
+        _ => {
+            let (slot, n) = array_source_slot(b, source);
+            if !lowering_continues(b) {
+                return None;
+            }
+            let value = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
+            b.push(Stmt::Let(value, Rvalue::MakeSlice(slot, n)));
+            Operand::Value(value)
+        }
+    };
+    lowering_continues(b)
+        .then_some((Box::new(ParallelSource::Materialized(source)), release_after))
+}
+
+fn parallel_source_borrowed_operand(source: &ParallelSource) -> &Operand {
+    match source {
+        ParallelSource::Materialized(source) => source,
+        ParallelSource::VirtualChunks { base, .. } => base,
     }
 }
 
@@ -9880,27 +9991,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 // SoA and unsupported aggregate layouts retain the sequential collect loop.
                 let (form, elem_in) = par_map_form_decision(b, source.ty, stages);
                 if form.strategy == PlanStrategy::RangeMaterialize {
-                    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
-                    let src = match source.ty {
-                        Ty::Slice(_)
-                        | Ty::DynArray(_)
-                        | Ty::DynSliceArray(_)
-                        | Ty::DynStructArray(_, align_sema::Layout::Aos) => {
-                            lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
-                        }
-                        _ => {
-                            let (slot, n) = array_source_slot(b, source);
-                            if !lowering_continues(b) {
-                                return Operand::Const(Const::Unit);
-                            }
-                            let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
-                            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
-                            Operand::Value(sv)
-                        }
-                    };
-                    if !lowering_continues(b) {
+                    let Some((src, release_src)) =
+                        lower_parallel_source(b, source, elem_in, stages.is_empty())
+                    else {
                         return Operand::Const(Const::Unit);
-                    }
+                    };
                     let mut stage_records = Vec::with_capacity(stages.len());
                     let mut stage_elem_in = elem_in;
                     for stage in stages {
@@ -9972,8 +10067,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                             work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
                         },
                     ));
-                    if free_src {
-                        drop_borrow_owners(b, &src);
+                    if release_src {
+                        drop_borrow_owners(b, parallel_source_borrowed_operand(&src));
                     }
                     return Operand::Value(v);
                 }
@@ -11658,7 +11753,10 @@ fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) ->
 fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand {
     match source.ty {
         Ty::Slice(_) => lower_expr(b, source),
-        Ty::DynArray(_) => lower_borrowed_owned(b, source),
+        Ty::DynArray(_) => {
+            let source = lower_borrowed_owned(b, source);
+            lower_view_retype(b, source, Ty::Slice(scalar_of(elem)))
+        }
         _ => {
             let (slot, len) = array_source_slot(b, source);
             if !lowering_continues(b) {
@@ -11755,6 +11853,9 @@ fn lower_chunks(
             ));
             inherit_borrow_owners(b, chunk, [&src]);
             Operand::Value(chunk)
+        }
+        ChunksPlan::VirtualRangeViews(_) => {
+            unreachable!("virtual range chunks must be lowered by its parallel consumer")
         }
         ChunksPlan::MaterializedHeaders(decision) => {
             b.record_plan(expression, decision);
@@ -13279,25 +13380,9 @@ fn lower_array_par_map_reduce(
     elem_in: Ty,
     elem_out: Ty,
 ) -> Operand {
-    let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
-    let src = match source.ty {
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
-            lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
-        }
-        Ty::Array(_, _) => {
-            let (slot, n) = array_source_slot(b, source);
-            if !lowering_continues(b) {
-                return Operand::Const(Const::Unit);
-            }
-            let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
-            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
-            Operand::Value(sv)
-        }
-        other => unreachable!("direct par_map reduction source has unsupported type {other:?}"),
-    };
-    if !lowering_continues(b) {
+    let Some((src, release_src)) = lower_parallel_source(b, source, elem_in, true) else {
         return Operand::Const(Const::Unit);
-    }
+    };
     let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
     let mut capture_ops = Vec::with_capacity(captures.len());
     for capture in captures {
@@ -13319,18 +13404,18 @@ fn lower_array_par_map_reduce(
     b.push(Stmt::Let(
         v,
         Rvalue::ParMapReduce {
-        src: src.clone(),
-        func: ProgramCall::from_validated(func),
-        captures: capture_ops,
-        capture_tys,
-        elem_in,
-        elem_out,
-        work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
+            src: src.clone(),
+            func: ProgramCall::from_validated(func),
+            captures: capture_ops,
+            capture_tys,
+            elem_in,
+            elem_out,
+            work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
         },
     ));
-    if free_src {
+    if release_src {
         // The reduction has consumed the source bytes before returning its scalar result.
-        drop_borrow_owners(b, &src);
+        drop_borrow_owners(b, parallel_source_borrowed_operand(&src));
     }
     Operand::Value(v)
 }
@@ -22417,6 +22502,11 @@ mod tests {
                 PlanReason::ParallelConsumer,
             ),
             (
+                ChunksConsumer::ParallelVirtual,
+                PlanStrategy::VirtualRangeViews,
+                PlanReason::ParallelConsumer,
+            ),
+            (
                 ChunksConsumer::StoredOrBoundary,
                 PlanStrategy::MaterializedHeaders,
                 PlanReason::StoredOrBoundary,
@@ -22450,7 +22540,7 @@ mod tests {
             ),
             (
                 "fn size(xs: slice<i64>) -> i64 = xs.len()\nfn f(xs: slice<i64>) -> i64 = xs.chunks(2).par_map(size).sum()\n",
-                PlanStrategy::MaterializedHeaders,
+                PlanStrategy::VirtualRangeViews,
                 PlanReason::ParallelConsumer,
             ),
             (
@@ -22798,6 +22888,63 @@ mod tests {
             chunks.plan_records.iter().all(|record| record.kind == PlanKind::Chunks),
             "the reached chunks decision remains, while the terminating capture prevents par-map"
         );
+
+        let fresh_materialize = lower_with_terminating_capture(
+            "fn make() -> array<i64> = [1, 2].to_array()\nfn f(k: i64) -> array<i64> = make().chunks(1).par_map(fn x { x.len() + k })\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArrayParMap { source, captures, .. } => {
+                    let hir::ExprKind::ArrayChunks { source: inner, .. } = &source.kind else {
+                        panic!("chunks source");
+                    };
+                    replace_capture_with_return(&mut captures[0], (**inner).clone());
+                }
+                _ => panic!("par-map terminal"),
+            },
+        );
+        let fresh_reduce = lower_with_terminating_capture(
+            "fn make() -> array<i64> = [1, 2].to_array()\nfn chunk_sum(x: slice<i64>, k: i64) -> i64 = x.sum() + k\nfn f(k: i64) -> i64 = make().chunks(1).par_map(fn x { chunk_sum(x, k) }).sum()\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArraySum { source, .. } => {
+                    let hir::ExprKind::ArrayParMap { captures, .. } = &mut source.kind else {
+                        panic!("par-map reduction source");
+                    };
+                    let returned = captures[0].clone();
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("sum terminal"),
+            },
+        );
+        for (name, program) in [
+            ("range-materialize", fresh_materialize),
+            ("range-reduce", fresh_reduce),
+        ] {
+            assert!(
+                program.plan_records.iter().any(|record| {
+                    record.kind == PlanKind::Chunks
+                        && record.strategy == PlanStrategy::VirtualRangeViews
+                }),
+                "{name} must retain the reached virtual chunks decision"
+            );
+            assert!(
+                !any_rvalue(&program, |rvalue| matches!(
+                    rvalue,
+                    Rvalue::ParMapParallel { .. } | Rvalue::ParMapReduce { .. }
+                )),
+                "{name} must not publish a parallel call after capture termination"
+            );
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == "f")
+                .expect("fresh-owner fixture function");
+            let drops = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter(|statement| matches!(statement, Stmt::Drop(_)))
+                .count();
+            assert_eq!(drops, 1, "{name} must release the live hidden base owner exactly once");
+        }
     }
 
     #[test]

@@ -33,7 +33,7 @@ use align_ast::{BinOp, UnOp};
 use align_interface::Hash128;
 use align_mir::{
     Block, CanonicalFnAbi, CanonicalTy, ColumnBatchInput, Const, ConstElem, DirectCall, Function, GeneratedId,
-    Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode,
+    Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode, ParallelSource,
     ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, StaticData, StaticDataTarget,
     Stmt, Term, ValueId,
 };
@@ -13126,13 +13126,50 @@ fn parallel_capture_ty_is_valid(ty: Ty, program: &Program) -> bool {
     )
 }
 
+/// Return the physical source type used for generated identity and the logical element delivered
+/// to the terminal. A virtual chunks source is well formed only when its base/width/element record
+/// is internally exact; callers separately reject stages on that variant.
+fn preflight_parallel_source(
+    function: &Function,
+    source: &ParallelSource,
+) -> Option<(Ty, Ty)> {
+    match source {
+        ParallelSource::Materialized(source) => {
+            let physical = preflight_operand_ty(function, source)?;
+            let logical = match physical {
+                Ty::Slice(scalar) | Ty::DynArray(scalar) => align_sema::scalar_to_ty(scalar),
+                Ty::DynSliceArray(primitive) => {
+                    Ty::Slice(align_sema::prim_to_scalar(primitive))
+                }
+                Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                _ => return None,
+            };
+            Some((physical, logical))
+        }
+        ParallelSource::VirtualChunks { base, width, elem } => {
+            let scalar = ty_to_scalar(*elem)
+                .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some())?;
+            let physical = Ty::Slice(scalar);
+            if preflight_operand_ty(function, base) != Some(physical)
+                || preflight_operand_ty(function, width) != Some(Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }))
+            {
+                return None;
+            }
+            Some((physical, Ty::Slice(scalar)))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_parallel_request(
     program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,
     function: &Function,
     result: Ty,
-    src: &Operand,
+    src: &ParallelSource,
     terminal: &ProgramCall,
     stages: &[ParMapStage],
     terminal_captures: &[Operand],
@@ -13156,16 +13193,12 @@ fn validate_parallel_request(
     {
         return Err(callable_metadata_error());
     }
-    let Some(source_ty) = preflight_operand_ty(function, src) else {
+    let Some((_physical_source, source_elem)) = preflight_parallel_source(function, src) else {
         return Err(callable_metadata_error());
     };
-    let source_elem = match source_ty {
-        Ty::Slice(scalar) | Ty::DynArray(scalar) => align_sema::scalar_to_ty(scalar),
-        Ty::DynSliceArray(primitive) => Ty::Slice(align_sema::prim_to_scalar(primitive)),
-        Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-        _ => return Err(callable_metadata_error()),
-    };
-    if source_elem != elem_in {
+    if source_elem != elem_in
+        || matches!(src, ParallelSource::VirtualChunks { .. }) && !stages.is_empty()
+    {
         return Err(callable_metadata_error());
     }
 
@@ -13276,7 +13309,7 @@ fn parallel_generated_ids(
     program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,
     function: &Function,
-    src: &Operand,
+    src: &ParallelSource,
     terminal: &ProgramCall,
     stages: &[ParMapStage],
     terminal_capture_tys: &[Ty],
@@ -13294,7 +13327,7 @@ fn parallel_generated_ids(
     {
         return Err(callable_target_error(terminal));
     }
-    let source = preflight_operand_ty(function, src)
+    let (source, _) = preflight_parallel_source(function, src)
         .ok_or_else(|| callable_target_error(terminal))?;
     let mut stage_ids = Vec::with_capacity(stages.len());
     for stage in stages {
@@ -17642,8 +17675,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// in a fresh success block. The runtime allocator ABI takes a signed i64 byte count, so every
     /// checked size operation must fit `0..=i64::MAX`, not merely the full unsigned i64 domain.
     fn guard_allocation_size(&self, invalid: inkwell::values::IntValue<'c>) -> Result<(), CodegenError> {
-        let fail = self.ctx.append_basic_block(self.func, "alloc.size.fail");
-        let ok = self.ctx.append_basic_block(self.func, "alloc.size.ok");
+        self.guard_allocation_size_in(self.func, invalid)
+    }
+
+    /// The allocation-size guard for a specific generated function. Range kernels are emitted
+    /// while `self.func` still names the outer MIR function, so their checked pointer arithmetic
+    /// must supply the generated kernel explicitly.
+    fn guard_allocation_size_in(
+        &self,
+        function: FunctionValue<'c>,
+        invalid: inkwell::values::IntValue<'c>,
+    ) -> Result<(), CodegenError> {
+        let fail = self.ctx.append_basic_block(function, "alloc.size.fail");
+        let ok = self.ctx.append_basic_block(function, "alloc.size.ok");
         self.builder.build_conditional_branch(invalid, fail, ok).map_err(|e| self.err(e))?;
         self.builder.position_at_end(fail);
         self.builder
@@ -17652,6 +17696,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_unreachable().map_err(|e| self.err(e))?;
         self.builder.position_at_end(ok);
         Ok(())
+    }
+
+    /// Derive the logical chunk count without division by zero or signed overflow. A null base,
+    /// non-positive element count, or non-positive width is the canonical empty source. Positive
+    /// inputs use `((len - 1) / width) + 1`, which cannot overflow signed i64.
+    fn virtual_chunks_count(
+        &self,
+        base: inkwell::values::PointerValue<'c>,
+        len: inkwell::values::IntValue<'c>,
+        width: inkwell::values::IntValue<'c>,
+    ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
+        let i64t = self.ctx.i64_type();
+        let zero = i64t.const_zero();
+        let one = i64t.const_int(1, false);
+        let base_live = self.builder.build_is_not_null(base, "chunks.base.live").map_err(|e| self.err(e))?;
+        let len_positive = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, len, zero, "chunks.len.positive")
+            .map_err(|e| self.err(e))?;
+        let width_positive = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, width, zero, "chunks.width.positive")
+            .map_err(|e| self.err(e))?;
+        let valid = self.builder.build_and(base_live, len_positive, "chunks.source.valid").map_err(|e| self.err(e))?;
+        let valid = self.builder.build_and(valid, width_positive, "chunks.source.valid").map_err(|e| self.err(e))?;
+        let numerator = self.builder.build_int_sub(len, one, "chunks.count.numerator").map_err(|e| self.err(e))?;
+        let denominator = self
+            .builder
+            .build_select(width_positive, width, one, "chunks.count.denominator")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let quotient = self.builder.build_int_unsigned_div(numerator, denominator, "chunks.count.quotient").map_err(|e| self.err(e))?;
+        let count = self.builder.build_int_add(quotient, one, "chunks.count").map_err(|e| self.err(e))?;
+        Ok(self.builder.build_select(valid, count, zero, "chunks.count.selected").map_err(|e| self.err(e))?.into_int_value())
     }
 
     /// Checked non-negative `a * b` for an allocator byte count. `umul.with.overflow` catches the
@@ -18953,6 +19031,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         &self,
         generated_id: &GeneratedId,
         func: &ProgramCall,
+        source: &ParallelSource,
         in_ty: BasicTypeEnum<'c>,
         out_ty: BasicTypeEnum<'c>,
         elem_in: Ty,
@@ -19084,8 +19163,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
-        let capture_fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
-        let capture_struct = self.ctx.struct_type(&capture_fields, false);
+        let virtual_source = matches!(source, ParallelSource::VirtualChunks { .. });
+        let mut context_fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(capture_tys.len() + usize::from(virtual_source) * 2);
+        if virtual_source {
+            context_fields.push(i64t.into());
+            context_fields.push(i64t.into());
+        }
+        context_fields.extend(capture_tys.iter().map(|ty| self.llvm_type(*ty)));
+        let context_struct = self.ctx.struct_type(&context_fields, false);
         let kernel = self.module.add_function(
             name,
             self.ctx
@@ -19145,6 +19230,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_base = kernel.get_nth_param(2).unwrap().into_pointer_value();
         let start = kernel.get_nth_param(3).unwrap().into_int_value();
         let end = kernel.get_nth_param(4).unwrap().into_int_value();
+        let (virtual_width, virtual_element_count) = if virtual_source {
+            let width_field = self.builder.build_struct_gep(context_struct, context, 0, "chunks.width.ptr").map_err(|e| self.err(e))?;
+            let count_field = self.builder.build_struct_gep(context_struct, context, 1, "chunks.elem.count.ptr").map_err(|e| self.err(e))?;
+            let width = self.builder.build_load(i64t, width_field, "chunks.width").map_err(|e| self.err(e))?.into_int_value();
+            let count = self.builder.build_load(i64t, count_field, "chunks.elem.count").map_err(|e| self.err(e))?.into_int_value();
+            (Some(width), Some(count))
+        } else {
+            (None, None)
+        };
+        let capture_offset = if virtual_source { 2 } else { 0 };
         let capture_values = if capture_tys.is_empty() {
             Vec::new()
         } else {
@@ -19154,7 +19249,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map(|(i, ty)| {
                     let field = self
                         .builder
-                        .build_struct_gep(capture_struct, context, i as u32, "parcap")
+                        .build_struct_gep(context_struct, context, (i + capture_offset) as u32, "parcap")
                         .map_err(|e| self.err(e))?;
                     self.builder
                         .build_load(self.llvm_type(*ty), field, "parcapv")
@@ -19201,10 +19296,51 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_conditional_branch(more, body, done).map_err(|e| self.err(e))?;
 
         self.builder.position_at_end(body);
-        let in_p = unsafe {
-            self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
+        let x = match source {
+            ParallelSource::Materialized(_) => {
+                let in_p = unsafe {
+                    self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
+                };
+                self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?
+            }
+            ParallelSource::VirtualChunks { elem, .. } => {
+                let width = virtual_width.ok_or_else(|| self.err("virtual chunks kernel is missing its width"))?;
+                let element_count = virtual_element_count.ok_or_else(|| self.err("virtual chunks kernel is missing its element count"))?;
+                let physical_ty = self.llvm_type(*elem);
+                let product = self
+                    .call_overflow_intrinsic("llvm.umul.with.overflow", i64t, i, width)?
+                    .into_struct_value();
+                let chunk_start = self.builder.build_extract_value(product, 0, "chunks.start").map_err(|e| self.err(e))?.into_int_value();
+                let start_overflow = self.builder.build_extract_value(product, 1, "chunks.start.overflow").map_err(|e| self.err(e))?.into_int_value();
+                let start_negative = self.builder.build_int_compare(IntPredicate::SLT, chunk_start, i64t.const_zero(), "chunks.start.negative").map_err(|e| self.err(e))?;
+                let start_past_end = self.builder.build_int_compare(IntPredicate::UGT, chunk_start, element_count, "chunks.start.past.end").map_err(|e| self.err(e))?;
+                let invalid = self.builder.build_or(start_overflow, start_negative, "chunks.start.invalid").map_err(|e| self.err(e))?;
+                let invalid = self.builder.build_or(invalid, start_past_end, "chunks.start.invalid").map_err(|e| self.err(e))?;
+                self.guard_allocation_size_in(kernel, invalid)?;
+
+                let remaining = self.builder.build_int_sub(element_count, chunk_start, "chunks.remaining").map_err(|e| self.err(e))?;
+                let short = self.builder.build_int_compare(IntPredicate::ULT, remaining, width, "chunks.short").map_err(|e| self.err(e))?;
+                let chunk_len = self.builder.build_select(short, remaining, width, "chunks.len").map_err(|e| self.err(e))?.into_int_value();
+                let elem_size = i64t.const_int(self.element_allocation_size(physical_ty), false);
+                let byte_product = self
+                    .call_overflow_intrinsic("llvm.umul.with.overflow", i64t, chunk_start, elem_size)?
+                    .into_struct_value();
+                let byte_offset = self.builder.build_extract_value(byte_product, 0, "chunks.byte.offset").map_err(|e| self.err(e))?.into_int_value();
+                let byte_overflow = self.builder.build_extract_value(byte_product, 1, "chunks.byte.overflow").map_err(|e| self.err(e))?.into_int_value();
+                let byte_negative = self.builder.build_int_compare(IntPredicate::SLT, byte_offset, i64t.const_zero(), "chunks.byte.negative").map_err(|e| self.err(e))?;
+                let invalid = self.builder.build_or(byte_overflow, byte_negative, "chunks.byte.invalid").map_err(|e| self.err(e))?;
+                self.guard_allocation_size_in(kernel, invalid)?;
+                let chunk_ptr = unsafe {
+                    self.builder.build_gep(self.ctx.i8_type(), in_base, &[byte_offset], "chunks.ptr").map_err(|e| self.err(e))?
+                };
+                let slice_ty = match in_ty {
+                    BasicTypeEnum::StructType(ty) => ty,
+                    _ => return Err(self.err("virtual chunks logical input is not a slice aggregate")),
+                };
+                let slice = self.builder.build_insert_value(slice_ty.get_poison(), chunk_ptr, 0, "chunk.ptr").map_err(|e| self.err(e))?.into_struct_value();
+                self.builder.build_insert_value(slice, chunk_len, 1, "chunk.len").map_err(|e| self.err(e))?.into_struct_value().into()
+            }
         };
-        let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
         let mut current = x;
         let mut capture_start = 0usize;
         for (stage_idx, stage) in stages.iter().enumerate() {
@@ -19385,6 +19521,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| self.err("par_map function must return a value"))?;
+            let body_end = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("par_map body predecessor is absent"))?;
             if let Some(acc_phi) = &acc_phi {
                 let r = match r {
                     BasicValueEnum::IntValue(v) => v,
@@ -19394,7 +19534,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_int_add(acc_phi.as_basic_value().into_int_value(), r, "acc.next")
                     .map_err(|e| self.err(e))?;
-                acc_phi.add_incoming(&[(&next_acc, body)]);
+                acc_phi.add_incoming(&[(&next_acc, body_end)]);
             } else {
                 let out_p = unsafe {
                     self.builder.build_in_bounds_gep(out_ty, out_base, &[i], "out.elem").map_err(|e| self.err(e))?
@@ -19402,7 +19542,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
             }
             let next = self.builder.build_int_add(i, i64t.const_int(1, false), "next").map_err(|e| self.err(e))?;
-            phi.add_incoming(&[(&next, body)]);
+            phi.add_incoming(&[(&next, body_end)]);
             self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
         }
 
@@ -21903,15 +22043,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // then run the complete scalar chain in one range kernel. The runtime call is
                 // synchronous, so the entry alloca remains live until every worker has stopped
                 // reading it.
-                let src_ty = self.checked_operand_ty(src)?;
-                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
-                    return Err(self.err(format!("par_map source must be a slice, chunk array, or AoS array view, got {src_ty:?}")));
-                }
-                let source_elem_ty = match src_ty {
-                    Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
-                    Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
-                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-                    _ => return Err(self.err("par_map source shape could not be resolved")),
+                let Some((_physical_source_ty, source_elem_ty)) = preflight_parallel_source(self.f, src) else {
+                    return Err(self.err("par_map source shape could not be resolved"));
                 };
                 if source_elem_ty != *elem_in {
                     return Err(self.err(format!(
@@ -21998,14 +22131,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     all_captures.push(self.operand(op)?);
                     all_capture_tys.push(*ty);
                 }
-                let agg = match self.operand(src)? {
-                    BasicValueEnum::StructValue(value) => value,
-                    _ => return Err(self.err("par_map source view is not an LLVM aggregate")),
+                let (agg, virtual_width) = match src.as_ref() {
+                    ParallelSource::Materialized(source) => {
+                        let agg = match self.operand(source)? {
+                            BasicValueEnum::StructValue(value) => value,
+                            _ => return Err(self.err("par_map source view is not an LLVM aggregate")),
+                        };
+                        (agg, None)
+                    }
+                    ParallelSource::VirtualChunks { base, width, .. } => {
+                        if !stages.is_empty() {
+                            return Err(self.err("virtual chunks par_map source cannot contain prior stages"));
+                        }
+                        let agg = match self.operand(base)? {
+                            BasicValueEnum::StructValue(value) => value,
+                            _ => return Err(self.err("virtual chunks base view is not an LLVM aggregate")),
+                        };
+                        let width = match self.operand(width)? {
+                            BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 64 => value,
+                            _ => return Err(self.err("virtual chunks width is not i64")),
+                        };
+                        (agg, Some(width))
+                    }
                 };
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
-                let count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
+                let source_count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
                     BasicValueEnum::IntValue(value) => value,
                     _ => return Err(self.err("par_map source view length is not an integer")),
+                };
+                let in_ptr = match in_ptr {
+                    BasicValueEnum::PointerValue(value) => value,
+                    _ => return Err(self.err("par_map source view pointer is not a pointer")),
+                };
+                let count = if let Some(width) = virtual_width {
+                    self.virtual_chunks_count(in_ptr, source_count, width)?
+                } else {
+                    source_count
                 };
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
@@ -22013,16 +22174,35 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
                 let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight_value = i64t.const_int(u64::from(*work_weight), false);
-                let context = if all_capture_tys.is_empty() {
+                let context = if all_capture_tys.is_empty() && virtual_width.is_none() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
-                    let fields: Vec<BasicTypeEnum<'c>> = all_capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+                    let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(all_capture_tys.len() + usize::from(virtual_width.is_some()) * 2);
+                    if virtual_width.is_some() {
+                        fields.push(i64t.into());
+                        fields.push(i64t.into());
+                    }
+                    fields.extend(all_capture_tys.iter().map(|ty| self.llvm_type(*ty)));
                     let context_ty = self.ctx.struct_type(&fields, false);
                     let context = self.alloca_at_entry(context_ty.into(), "par_map_context")?;
+                    let mut context_index = 0usize;
+                    if let Some(width) = virtual_width {
+                        for value in [
+                            BasicValueEnum::IntValue(width),
+                            BasicValueEnum::IntValue(source_count),
+                        ] {
+                            let field = self
+                                .builder
+                                .build_struct_gep(context_ty, context, context_index as u32, "chunks.context")
+                                .map_err(|e| self.err(e))?;
+                            self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                            context_index += 1;
+                        }
+                    }
                     for (i, value) in all_captures.iter().enumerate() {
                         let field = self
                             .builder
-                            .build_struct_gep(context_ty, context, i as u32, "parcap")
+                            .build_struct_gep(context_ty, context, (i + context_index) as u32, "parcap")
                             .map_err(|e| self.err(e))?;
                         self.builder.build_store(field, *value).map_err(|e| self.err(e))?;
                     }
@@ -22069,6 +22249,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let count_kernel = self.par_map_range_kernel(
                         count_id,
                         func,
+                        src,
                         in_ty,
                         out_ty,
                         *elem_in,
@@ -22080,6 +22261,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let scatter_kernel = self.par_map_range_kernel(
                         scatter_id,
                         func,
+                        src,
                         in_ty,
                         out_ty,
                         *elem_in,
@@ -22116,6 +22298,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let kernel = self.par_map_range_kernel(
                         materialize_id,
                         func,
+                        src,
                         in_ty,
                         out_ty,
                         *elem_in,
@@ -22177,33 +22360,47 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     self.validate_par_map_capture_type(*ty)?;
                 }
-                let src_ty = self.checked_operand_ty(src)?;
-                if !matches!(src_ty, Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(_, Layout::Aos)) {
-                    return Err(self.err(format!("par_map reduction source must be a slice, chunk array, or AoS array view, got {src_ty:?}")));
-                }
-                let source_elem_ty = match src_ty {
-                    Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
-                    Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
-                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-                    _ => {
-                        return Err(
-                            self.err("par_map reduction source shape could not be resolved")
-                        );
-                    }
+                let Some((_physical_source_ty, source_elem_ty)) = preflight_parallel_source(self.f, src) else {
+                    return Err(self.err("par_map reduction source shape could not be resolved"));
                 };
                 if source_elem_ty != *elem_in {
                     return Err(self.err(format!(
                         "par_map reduction source element type {source_elem_ty:?} does not match declared input {elem_in:?}"
                     )));
                 }
-                let agg = match self.operand(src)? {
-                    BasicValueEnum::StructValue(value) => value,
-                    _ => return Err(self.err("par_map reduction source view is not an LLVM aggregate")),
+                let (agg, virtual_width) = match src.as_ref() {
+                    ParallelSource::Materialized(source) => {
+                        let agg = match self.operand(source)? {
+                            BasicValueEnum::StructValue(value) => value,
+                            _ => return Err(self.err("par_map reduction source view is not an LLVM aggregate")),
+                        };
+                        (agg, None)
+                    }
+                    ParallelSource::VirtualChunks { base, width, .. } => {
+                        let agg = match self.operand(base)? {
+                            BasicValueEnum::StructValue(value) => value,
+                            _ => return Err(self.err("virtual chunks reduction base view is not an LLVM aggregate")),
+                        };
+                        let width = match self.operand(width)? {
+                            BasicValueEnum::IntValue(value) if value.get_type().get_bit_width() == 64 => value,
+                            _ => return Err(self.err("virtual chunks reduction width is not i64")),
+                        };
+                        (agg, Some(width))
+                    }
                 };
                 let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
-                let count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
+                let source_count = match self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))? {
                     BasicValueEnum::IntValue(value) => value,
                     _ => return Err(self.err("par_map reduction source view length is not an integer")),
+                };
+                let in_ptr = match in_ptr {
+                    BasicValueEnum::PointerValue(value) => value,
+                    _ => return Err(self.err("par_map reduction source view pointer is not a pointer")),
+                };
+                let count = if let Some(width) = virtual_width {
+                    self.virtual_chunks_count(in_ptr, source_count, width)?
+                } else {
+                    source_count
                 };
                 let in_ty = self.llvm_type(*elem_in);
                 let out_ty = self.llvm_type(*elem_out);
@@ -22215,17 +22412,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let in_stride = i64t.const_int(self.element_allocation_size(in_ty), false);
                 let out_stride = i64t.const_int(self.element_allocation_size(out_ty), false);
                 let work_weight_value = i64t.const_int(u64::from(*work_weight), false);
-                let context = if capture_tys.is_empty() {
+                let context = if capture_tys.is_empty() && virtual_width.is_none() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 } else {
-                    let fields: Vec<BasicTypeEnum<'c>> = capture_tys.iter().map(|ty| self.llvm_type(*ty)).collect();
+                    let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(capture_tys.len() + usize::from(virtual_width.is_some()) * 2);
+                    if virtual_width.is_some() {
+                        fields.push(i64t.into());
+                        fields.push(i64t.into());
+                    }
+                    fields.extend(capture_tys.iter().map(|ty| self.llvm_type(*ty)));
                     let context_ty = self.ctx.struct_type(&fields, false);
                     let context = self.alloca_at_entry(context_ty.into(), "par_map_reduce_context")?;
+                    let mut context_index = 0usize;
+                    if let Some(width) = virtual_width {
+                        for value in [
+                            BasicValueEnum::IntValue(width),
+                            BasicValueEnum::IntValue(source_count),
+                        ] {
+                            let field = self
+                                .builder
+                                .build_struct_gep(context_ty, context, context_index as u32, "chunks.context")
+                                .map_err(|e| self.err(e))?;
+                            self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                            context_index += 1;
+                        }
+                    }
                     for (i, op) in captures.iter().enumerate() {
                         let value = self.operand(op)?;
                         let field = self
                             .builder
-                            .build_struct_gep(context_ty, context, i as u32, "parcap")
+                            .build_struct_gep(context_ty, context, (i + context_index) as u32, "parcap")
                             .map_err(|e| self.err(e))?;
                         self.builder.build_store(field, value).map_err(|e| self.err(e))?;
                     }
@@ -22249,6 +22465,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .next()
                     .ok_or_else(|| self.err("parallel reduce identity was not collected"))?,
                     func,
+                    src,
                     in_ty,
                     out_ty,
                     *elem_in,
@@ -38909,7 +39126,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     2,
                     Rvalue::ParMapReduce {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("unreachable_worker"),
                         captures: vec![Operand::Value(1)],
                         capture_tys: vec![Ty::ArenaHandle],
@@ -38927,6 +39144,164 @@ fn main() -> i32 = 0
         )
         .expect_err("par_map metadata must reject a direct region capability before publication");
         assert_lowering(par_error, "callable metadata invalid:InvalidGraph");
+    }
+
+    #[test]
+    fn malformed_virtual_chunks_matrix_fails_before_llvm() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let f64_ty = Ty::Float(FloatTy { bits: 64 });
+        let slice_i64 = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let slice_i32 = Ty::Slice(Scalar::Int(IntTy { bits: 32, signed: true }));
+        let output_i64 = Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }));
+        let worker = Function {
+            name: program_call("chunk_sum"),
+            params: vec![0],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![],
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            ret: i64_ty,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![slice_i64],
+            slot_align: vec![None],
+            value_tys: vec![],
+            blocks: vec![Block {
+                id: 0,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        };
+        let valid_source = ParallelSource::VirtualChunks {
+            base: Operand::Value(0),
+            width: Operand::Const(Const::Int(2, i64_ty)),
+            elem: i64_ty,
+        };
+        let rvalue = |src, func: &str, stages, captures, capture_tys, elem_in| {
+            Rvalue::ParMapParallel {
+                src: Box::new(src),
+                func: program_call(func),
+                stages,
+                captures,
+                capture_tys,
+                elem_in,
+                elem_out: i64_ty,
+                work_weight: 1,
+            }
+        };
+        let valid = rvalue(valid_source.clone(), "chunk_sum", vec![], vec![], vec![], slice_i64);
+        codegen_program(
+            vec![Stmt::Let(0, Rvalue::Load(0)), Stmt::Let(1, valid.clone())],
+            vec![slice_i64, output_i64],
+            vec![slice_i64],
+            vec![],
+            vec![],
+            vec![worker.clone()],
+        )
+        .expect("the valid virtual source control must reach LLVM");
+
+        let cases = [
+            (
+                "base",
+                rvalue(
+                    ParallelSource::VirtualChunks {
+                        base: Operand::Const(Const::Int(0, i64_ty)),
+                        width: Operand::Const(Const::Int(2, i64_ty)),
+                        elem: i64_ty,
+                    },
+                    "chunk_sum", vec![], vec![], vec![], slice_i64,
+                ),
+                output_i64,
+            ),
+            (
+                "width",
+                rvalue(
+                    ParallelSource::VirtualChunks {
+                        base: Operand::Value(0),
+                        width: Operand::Const(Const::Float(2.0, f64_ty)),
+                        elem: i64_ty,
+                    },
+                    "chunk_sum", vec![], vec![], vec![], slice_i64,
+                ),
+                output_i64,
+            ),
+            (
+                "element",
+                rvalue(
+                    ParallelSource::VirtualChunks {
+                        base: Operand::Value(0),
+                        width: Operand::Const(Const::Int(2, i64_ty)),
+                        elem: i32_ty,
+                    },
+                    "chunk_sum", vec![], vec![], vec![], slice_i64,
+                ),
+                output_i64,
+            ),
+            (
+                "logical-input",
+                rvalue(valid_source.clone(), "chunk_sum", vec![], vec![], vec![], slice_i32),
+                output_i64,
+            ),
+            (
+                "stage",
+                rvalue(
+                    valid_source.clone(),
+                    "chunk_sum",
+                    vec![ParMapStage {
+                        kind: ParMapStageKind::Project { field: 0 },
+                        func: None,
+                        captures: vec![],
+                        capture_tys: vec![],
+                        elem_in: slice_i64,
+                        elem_out: slice_i64,
+                    }],
+                    vec![], vec![], slice_i64,
+                ),
+                output_i64,
+            ),
+            (
+                "result",
+                valid.clone(),
+                Ty::DynArray(Scalar::Bool),
+            ),
+            (
+                "callable",
+                rvalue(valid_source.clone(), "missing", vec![], vec![], vec![], slice_i64),
+                output_i64,
+            ),
+            (
+                "capture",
+                rvalue(
+                    valid_source,
+                    "chunk_sum",
+                    vec![],
+                    vec![Operand::Const(Const::Float(1.0, f64_ty))],
+                    vec![i64_ty],
+                    slice_i64,
+                ),
+                output_i64,
+            ),
+        ];
+        for (name, rvalue, result_ty) in cases {
+            let error = codegen_program(
+                vec![Stmt::Let(0, Rvalue::Load(0)), Stmt::Let(1, rvalue)],
+                vec![slice_i64, result_ty],
+                vec![slice_i64],
+                vec![],
+                vec![],
+                vec![worker.clone()],
+            )
+            .expect_err("malformed virtual chunks MIR must fail before LLVM publication");
+            let expected = if name == "callable" {
+                "callable target invalid:6d697373696e67"
+            } else {
+                "callable metadata invalid:InvalidGraph"
+            };
+            assert_lowering(error, expected);
+        }
     }
 
     #[test]
@@ -38959,7 +39334,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapParallel {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_str"),
                         stages: vec![],
                         captures: vec![],
@@ -39013,7 +39388,7 @@ fn main() -> i32 = 0
                     Stmt::Let(
                         1,
                         Rvalue::ParMapParallel {
-                            src: Operand::Value(0),
+                            src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                             func: program_call("return_i64"),
                             stages: vec![],
                             captures: vec![],
@@ -39067,7 +39442,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapParallel {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_i64"),
                         stages: vec![],
                         captures: vec![],
@@ -39114,7 +39489,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapParallel {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_i64"),
                         stages: vec![],
                         captures: vec![],
@@ -39161,7 +39536,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapReduce {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_i64"),
                         captures: vec![],
                         capture_tys: vec![],
@@ -39225,7 +39600,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapParallel {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("finish"),
                         stages: vec![ParMapStage {
                             kind: ParMapStageKind::Filter,
@@ -39286,7 +39661,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     2,
                     Rvalue::ParMapParallel {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("finish"),
                         stages: vec![ParMapStage {
                             kind: ParMapStageKind::FilterStrContains,
@@ -39337,7 +39712,7 @@ fn main() -> i32 = 0
             vec![Stmt::Let(
                 0,
                 Rvalue::ParMapReduce {
-                    src: Operand::Const(Const::Int(0, i64_ty)),
+                    src: Box::new(ParallelSource::Materialized(Operand::Const(Const::Int(0, i64_ty)))),
                     func: program_call("return_i64"),
                     captures: vec![],
                     capture_tys: vec![],
@@ -39383,7 +39758,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapReduce {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_i64"),
                         captures: vec![Operand::Const(Const::Float(0.0, f64_ty))],
                         capture_tys: vec![i64_ty],
@@ -39430,7 +39805,7 @@ fn main() -> i32 = 0
                 Stmt::Let(
                     1,
                     Rvalue::ParMapReduce {
-                        src: Operand::Value(0),
+                        src: Box::new(ParallelSource::Materialized(Operand::Value(0))),
                         func: program_call("return_u64"),
                         captures: vec![],
                         capture_tys: vec![],
@@ -41136,6 +41511,56 @@ fn main() -> i32 = 0
              fn main() -> i32 {\n  values := [1, 2].par_map(twice)\n  return values[0] as i32\n}\n",
         );
         assert!(materialize.contains("align_gen$par$0$"), "{materialize}");
+
+        let chunks_program = mir(
+            "fn sum64(value: slice<i64>) -> i64 = value.sum()\n\
+             fn sum32(value: slice<i32>) -> i32 = value.sum()\n\
+             fn twice(value: i64) -> i64 = value * 2\n\
+             fn main() -> i32 {\n  \
+               a := [1, 2].chunks(1).par_map(sum64)\n  \
+               b := [1 as i32, 2 as i32].chunks(1).par_map(sum32)\n  \
+               c := [1, 2].chunks(1).map(sum64).par_map(twice)\n  \
+               return (a.len() + (b.len() as i64) + c.len()) as i32\n\
+             }\n",
+        );
+        let declarations = callable_declarations(&chunks_program).unwrap();
+        let chunks_preflight = callable_preflight(
+            &chunks_program,
+            &[],
+            declarations,
+            ModuleScope::Whole,
+        )
+        .unwrap();
+        let chunk_ids = chunks_preflight
+            .generated_names
+            .iter()
+            .filter_map(|(id, name)| match id {
+                GeneratedId::Parallel(parallel) => Some((parallel, name)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunk_ids.len(), 3, "two virtual element types and one materialized fallback need distinct kernels");
+        let slice_i64 = canonical_ty(
+            Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true })),
+            &chunks_program,
+        )
+        .unwrap();
+        let slice_i32 = canonical_ty(
+            Ty::Slice(Scalar::Int(IntTy { bits: 32, signed: true })),
+            &chunks_program,
+        )
+        .unwrap();
+        let i64_ty = canonical_ty(Ty::Int(IntTy { bits: 64, signed: true }), &chunks_program).unwrap();
+        let materialized_chunks = canonical_ty(
+            Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true })),
+            &chunks_program,
+        )
+        .unwrap();
+        assert!(chunk_ids.iter().any(|(id, _)| id.source == slice_i64 && id.terminal_input == slice_i64));
+        assert!(chunk_ids.iter().any(|(id, _)| id.source == slice_i32 && id.terminal_input == slice_i32));
+        assert!(chunk_ids.iter().any(|(id, _)| id.source == materialized_chunks && id.terminal_input == i64_ty));
+        let names = chunk_ids.iter().map(|(_, name)| name.as_str()).collect::<HashSet<_>>();
+        assert_eq!(names.len(), 3, "virtual/materialized generated identities must not collide");
 
         let filtered_program = mir(
             "fn keep(value: i64) -> bool = value > 0\n\

@@ -10208,6 +10208,7 @@ fn narrow(x: i64) -> i32 = x as i32\n\
 fn chunks_len(xs: slice<i64>) -> i64 = xs.chunks(2).len()\n\
 fn chunks_index(xs: slice<i64>) -> i64 = xs.chunks(2)[0].len()\n\
 fn chunks_parallel() -> i64 = [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n\
+fn chunks_parallel_staged(xs: slice<i64>) -> i64 = xs.chunks(2).map(chunk_sum).par_map(dbl).sum()\n\
 fn chunks_pipeline(xs: slice<i64>) -> i64 = xs.chunks(2).map(chunk_sum).sum()\n\
 fn chunks_stored(xs: slice<i64>) -> i64 { cs := xs.chunks(2); return cs.len() }\n\
 fn donate_selected() -> array<i64> = make().map(dbl).to_array()\n\
@@ -10277,6 +10278,7 @@ fn main() -> i32 = 0\n";
         let expected = [
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualCount, align_mir::PlanReason::DirectLen),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualIndex, align_mir::PlanReason::DirectIndex),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualRangeViews, align_mir::PlanReason::ParallelConsumer),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::ParallelConsumer),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::PipelineConsumer),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::StoredOrBoundary),

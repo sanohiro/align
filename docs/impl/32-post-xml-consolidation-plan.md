@@ -427,6 +427,13 @@ the same `ParallelSource`; reporting adds no second legality predicate.
 
 ### 11.3 Implementation closure matrix
 
+The implementation exceeds roughly 1,000 changed hand-written lines because
+the MIR classification, generated-callable preflight, LLVM range kernel,
+ownership owners, and measurement gate form one strict producer-to-consumer
+chain. Splitting that chain would leave a dormant safety-sensitive MIR shape
+without a useful consumer and would duplicate the source-identity, ownership,
+and unchanged-ABI proof across capability boundaries.
+
 | Axis | Exact O0 closure | Owner evidence |
 |---|---|---|
 | Formation, validation, unknown variants | One exhaustive `ParallelSource` is visited by embedded-type collection, tagged-type remapping, operand/value sweeps, canonical hashing, generated-callable preflight, and LLVM lowering. Virtual source/type/stage mismatches fail before kernel lookup or output. | MIR selector table and variant tripwire; malformed virtual base, width, element, logical input, stage, result, callable, and capture matrix; existing malformed materialized nodes remain rejected. |
@@ -485,3 +492,29 @@ Adopt O0 only if the exact resource gate, primary timing gate, all timing/size
 guards, semantic owners, and structural no-materializer proof pass. Any miss
 reverts the optimization, preserves the raw evidence, records measured
 deferral, and closes the phase without choosing a replacement project.
+
+#### Disposition — adopted 2026-09-07
+
+`bench/par_map/run.sh source-consumer` passed on the V1 Linux x86-64 host with
+the pinned baseline identities above. The harness printed all 21 sorted ratios
+for every row; the summary was:
+
+| Consumer | Width | Median candidate/base | p10–p90 | Limit |
+|---|---:|---:|---:|---:|
+| materialize | 1 | 0.3763 | 0.3317–0.4060 | 1.05 |
+| reduce | 1 | 0.3284 | 0.2949–0.3570 | 0.90 |
+| materialize | 8 | 0.7819 | 0.6480–0.8837 | 1.05 |
+| reduce | 8 | 0.7710 | 0.6673–0.8764 | 1.05 |
+| materialize | 64 | 0.9104 | 0.8426–0.9336 | 1.05 |
+| reduce | 64 | 0.9178 | 0.8367–1.0172 | 1.05 |
+| materialize | 1,024 | 0.9847 | 0.9811–0.9914 | 1.05 |
+| reduce | 1,024 | 0.9896 | 0.8825–1.0045 | 1.05 |
+
+All eight resource rows were value-identical and balanced at zero requested
+live bytes. Each candidate removed exactly one allocation and one free. Peak
+requested-live reductions were 16,777,264, 2,097,168, 262,160, and 16,400
+bytes at widths 1, 8, 64, and 1,024 respectively, exactly
+`16 * ceil(1,048,579 / width)`. The candidate object was 3,624 bytes versus
+3,176 bytes for the baseline, a 448-byte increase within the 65,536-byte
+guard. Semantic owners and the optimized-LLVM no-materializer proof also
+passed, so O0 is adopted; no replacement optimization is selected.

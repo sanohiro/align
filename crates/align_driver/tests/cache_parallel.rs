@@ -175,6 +175,30 @@ fn cache_stats_reports_hits_and_misses() {
 }
 
 #[test]
+fn virtual_chunks_codegen_cache_misses_then_hits() {
+    if !backend() || !cc_available() {
+        return;
+    }
+    let p = Proj::new("virtual-chunks");
+    std::fs::write(
+        p.dir.join("main.align"),
+        "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn main() {\n  print([1, 2, 3, 4, 5].chunks(2).par_map(chunk_sum).sum())\n}\n",
+    )
+    .unwrap();
+    let cache = p.cache_dir();
+    let cache = cache.to_str().unwrap();
+    let cold = p.alignc(cache, &["build", "main.align", "--cache-stats"]);
+    assert!(cold.status.success(), "cold virtual build: {}", String::from_utf8_lossy(&cold.stderr));
+    assert!(String::from_utf8_lossy(&cold.stderr).contains("0 hit, 1 miss"));
+    let hot = p.alignc(cache, &["build", "main.align", "--cache-stats"]);
+    assert!(hot.status.success(), "hot virtual build: {}", String::from_utf8_lossy(&hot.stderr));
+    assert!(String::from_utf8_lossy(&hot.stderr).contains("1 hit, 0 miss"));
+    let output = Command::new(p.dir.join("main")).output().expect("run virtual chunks executable");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "15\n");
+}
+
+#[test]
 fn explain_current_plan_does_not_prime_or_change_the_later_build_cache() {
     if !backend() || !cc_available() {
         return;

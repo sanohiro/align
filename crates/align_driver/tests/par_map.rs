@@ -447,30 +447,126 @@ fn main() -> i32 = 0
 
 #[test]
 fn chunks_par_map_chunk_function() {
-    // `chunks(n).par_map(f)` loads each borrowed chunk view as a range-kernel element.
+    // `chunks(n).par_map(f)` derives each borrowed chunk view inside the range kernel.
     // [1..5].chunks(2) → [1,2],[3,4],[5]; chunk_sum → [3, 7, 5].
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3, 4, 5].chunks(2).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[2])\n  return Ok(())\n}\n";
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "pm-chunks", src).hir);
     let text = align_mir::print::program_to_string(&mir);
     assert!(text.contains("par_map[chunk_sum]("), "chunks should use the range-kernel path:\n{text}");
+    assert!(text.contains("virtual_chunks("), "the immediate stage-free source must be virtual:\n{text}");
+    assert!(!text.contains(" = chunks("), "the selected path must not construct chunk headers:\n{text}");
     if !backend_available() {
         return;
     }
     let out = build_and_run("pm-chunks", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n");
+
+    let ir = emit_llvm_optimized(src, &[]);
+    assert!(!ir.contains("@align_rt_chunks("), "the selected path must not retain the runtime materializer:\n{ir}");
+    let kernel = parallel_kernel(&ir, 0)
+        .unwrap_or_else(|| panic!("the virtual chunks range kernel is missing:\n{ir}"));
+    assert!(
+        kernel.matches("@llvm.umul.with.overflow.i64").count() >= 2,
+        "chunk start and byte offset must both use checked multiplication:\n{kernel}"
+    );
+    let chunk_gep = kernel
+        .lines()
+        .find(|line| line.contains("chunks.ptr") && line.contains("getelementptr"))
+        .unwrap_or_else(|| panic!("the checked chunk byte GEP is missing:\n{kernel}"));
+    assert!(!chunk_gep.contains("inbounds"), "the base extent is not an LLVM inbounds proof:\n{chunk_gep}");
+}
+
+#[test]
+fn virtual_chunks_empty_and_nonpositive_width_schedule_no_work() {
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  empty := b.build()\n  zero := 0\n  negative := -1\n  huge := 9223372036854775807\n  a := [1, 2].chunks(zero).par_map(chunk_sum)\n  bsum := [1, 2].chunks(negative).par_map(chunk_sum).sum()\n  c := empty.chunks(1).par_map(chunk_sum)\n  d := [1, 2].chunks(huge).par_map(chunk_sum)\n  print(a.len())\n  print(bsum)\n  print(c.len())\n  print(d.len())\n  print(d[0])\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "pm-chunks-empty", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert_eq!(text.matches("virtual_chunks(").count(), 4, "all direct sources must select the same virtual form:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n0\n1\n3\n");
+}
+
+#[test]
+fn virtual_chunks_preserve_fresh_and_returned_base_ownership() {
+    let src = "fn make() -> array<i64> = [1, 2, 3, 4].to_array()\nfn borrow(xs: slice<i64>) -> slice<i64> = xs\nfn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn fresh_materialize() -> i64 {\n  ys := make().chunks(2).par_map(chunk_sum)\n  return ys.sum()\n}\nfn fresh_reduce() -> i64 = make().chunks(2).par_map(chunk_sum).sum()\nfn returned_borrow(xs: slice<i64>) -> i64 = borrow(xs).chunks(2).par_map(chunk_sum).sum()\nfn main() -> Result<(), Error> {\n  print(fresh_materialize())\n  print(fresh_reduce())\n  print(returned_borrow([1, 2, 3, 4]))\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "pm-chunks-base-ownership", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let text = align_mir::print::program_to_string(&mir);
+    // A fresh returned owner has one call-success drop edge plus the existing guarded exit edge;
+    // the materializing function also drops its owned result. The shared live flag makes the two
+    // source-owner sites mutually exclusive at runtime. A returned borrowed slice adds no Drop.
+    for (name, expected_drop_sites) in [
+        ("fresh_materialize", 3),
+        ("fresh_reduce", 2),
+        ("returned_borrow", 0),
+    ] {
+        let function = mir
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == name)
+            .unwrap_or_else(|| panic!("missing ownership fixture function `{name}`"));
+        let drops = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|statement| matches!(statement, align_mir::Stmt::Drop(_)))
+            .count();
+        assert_eq!(drops, expected_drop_sites, "{name} guarded owner/drop topology:\n{text}");
+    }
+    assert_eq!(text.matches("virtual_chunks(").count(), 3, "every direct base form must stay virtual:\n{text}");
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run("pm-chunks-base-ownership", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n10\n10\n");
+}
+
+#[test]
+fn virtual_chunks_imported_generic_callable_matches_whole_and_per_unit() {
+    let library = "module chunks\nfn size<T>(xs: slice<T>) -> i64 = xs.len()\npub fn size_i64(xs: slice<i64>) -> i64 = size(xs)\n";
+    let main = "module main\nimport chunks\nfn main() -> Result<(), Error> {\n  print([1, 2, 3, 4, 5].chunks(2).par_map(chunks.size_i64).sum())\n  return Ok(())\n}\n";
+    let files = &[("chunks.align", library), ("main.align", main)];
+    let whole_mir = whole_mir_multi("pm-chunks-generic-whole", files, "main.align");
+    assert!(whole_mir.contains("virtual_chunks("), "whole-program lowering must select the virtual source:\n{whole_mir}");
+    let per_unit = build_per_unit_multi("pm-chunks-generic-per-unit", files, "main.align");
+    let per_unit_mir = align_mir::print::program_to_string(&per_unit.unit("main").mir);
+    assert!(per_unit_mir.contains("virtual_chunks("), "per-unit lowering must reconstruct the virtual source:\n{per_unit_mir}");
+    if !backend_available() {
+        return;
+    }
+    let whole = build_and_run_multi("pm-chunks-generic-whole", files, "main.align");
+    let per = per_unit.link_and_run();
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(per.status.code(), Some(0));
+    assert_eq!(whole.stdout, per.stdout);
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), "5\n");
 }
 
 #[test]
 fn chunks_par_map_materialization_crosses_runtime_floor() {
-    // Keep the materializing path separate from the reduction test: 65,537 one-element chunks
-    // force worker ranges while loading borrowed slice headers and writing an owned result array.
+    // Keep the output-materializing path separate from the reduction test: 65,537 one-element
+    // virtual chunks force worker ranges while deriving borrowed views and writing an owned result.
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  sums := xs.chunks(1).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[65536])\n  return Ok(())\n}\n";
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "pm-chunks-large", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    assert!(text.contains("par_map[chunk_sum]("), "large chunks map should use the materializing range kernel:\n{text}");
+    assert!(text.contains("par_map[chunk_sum]("), "large chunks map should use the output-materializing range kernel:\n{text}");
+    assert!(text.contains("virtual_chunks("), "large chunks map should derive its input views in the kernel:\n{text}");
+    assert!(!text.contains(" = chunks("), "large chunks map must not materialize input headers:\n{text}");
     if !backend_available() {
         return;
     }
@@ -498,13 +594,15 @@ fn chunks_par_map_then_reduce() {
 
 #[test]
 fn chunks_par_map_reduction_crosses_runtime_floor() {
-    // 65,537 one-element chunks cross the caller-only floor, so this exercises the slice-header
-    // input ABI on worker ranges as well as the direct chunk reduction. The sum is 0..=65,536.
+    // 65,537 one-element chunks cross the caller-only floor, so this exercises virtual slice-view
+    // derivation on worker ranges as well as the direct chunk reduction. The sum is 0..=65,536.
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<i64> := array_builder()\n  mut i := 0\n  loop {\n    b.push(i)\n    i = i + 1\n    if i >= 65537 { break }\n  }\n  xs := b.build()\n  total := xs.chunks(1).par_map(chunk_sum).sum()\n  print(total)\n  return Ok(())\n}\n";
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "pm-chunks-reduce-large", src).hir);
     let text = align_mir::print::program_to_string(&mir);
     assert!(text.contains("par_map_reduce[chunk_sum]("), "large chunk reduction should use the partial reducer:\n{text}");
+    assert!(text.contains("virtual_chunks("), "large chunk reduction should derive its input views in the kernel:\n{text}");
+    assert!(!text.contains(" = chunks("), "large chunk reduction must not materialize input headers:\n{text}");
     if !backend_available() {
         return;
     }
@@ -520,6 +618,7 @@ fn chunks_par_map_filter_preserves_slice_inputs() {
     let mir = lower_to_mir(&check(&mut sm, "pm-chunks-filter", src).hir);
     let text = align_mir::print::program_to_string(&mir);
     assert!(text.contains("par_map[where keep -> chunk_sum]("), "chunk filter should stay in one range kernel:\n{text}");
+    assert!(text.contains(" = chunks("), "a prior chunk filter must retain materialized headers:\n{text}");
     if !backend_available() {
         return;
     }
@@ -556,27 +655,26 @@ fn chunks_par_map_reduction_preserves_integer_wrap_across_workers() {
 }
 
 #[test]
-fn chunks_par_map_inside_arena_frees_chunk_buffer() {
+fn chunks_par_map_inside_arena_uses_no_chunk_buffer() {
     if !backend_available() {
         return;
     }
-    // Inside an `arena {}`, the `chunks` header buffer is heap-allocated (not arena), so it must
-    // still be dropped before `arena_end` — the arena's bulk-free doesn't cover it. (1+2)+(3+4) = 10.
+    // The direct stage-free range reduction derives slice views in its kernel, so no heap-backed
+    // chunk-header array exists to release before `arena_end`. (1+2)+(3+4) = 10.
     let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  arena {\n    total := [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n    print(total)\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("pm-chunks-arena", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
-    // The always-heap chunks buffer is freed even inside the arena.
     let mut sm = SourceMap::new();
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
-    let drop = text
-        .find("drop _1")
-        .unwrap_or_else(|| panic!("the chunks buffer must be dropped inside the arena:\n{text}"));
-    let arena_end = text
-        .find("arena_end")
-        .unwrap_or_else(|| panic!("the arena must have an explicit end marker:\n{text}"));
-    assert!(drop < arena_end, "the chunks buffer must be dropped before arena_end:\n{text}");
+    assert!(text.contains("virtual_chunks("), "the direct chunks source must be virtual:\n{text}");
+    assert!(!text.contains(" = chunks("), "the virtual source must not construct chunk headers:\n{text}");
+    let ir = emit_llvm(src);
+    assert!(
+        !ir.contains("call { ptr, i64 } @align_rt_chunks("),
+        "the virtual source must not call the materializer:\n{ir}"
+    );
 }
 
 #[test]

@@ -1,0 +1,18 @@
+// O0 source-consumer probe. `run.sh source-consumer` compiles this baseline spelling with the
+// preserved C0 compiler, then rewrites only the equal-length `base` export prefix to `cand` and
+// compiles that spelling with the candidate compiler. Both objects use the same runtime.
+fn chunk_sum(c: slice<i64>) -> i64 = c.sum()
+
+pub fn base_materialize(s: slice<i64>, width: i64) -> i64 {
+  out := s.chunks(width).par_map(chunk_sum)
+  mut index := 0
+  mut checksum := 0
+  return loop {
+    if index >= out.len() { break checksum }
+    checksum = checksum + out[index] * (index + 1)
+    index = index + 1
+  }
+}
+
+pub fn base_reduce(s: slice<i64>, width: i64) -> i64 =
+  s.chunks(width).par_map(chunk_sum).sum()
