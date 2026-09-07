@@ -4772,7 +4772,6 @@ fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
         }
         (Ty::String, Ty::Str) => true,
         (Ty::String | Ty::Str, Ty::Slice(element)) => element == bytes,
-        (Ty::Array(actual, _), Ty::Slice(expected)) => actual == expected,
         (Ty::DynArray(actual), Ty::Slice(expected)) => actual == expected,
         // `ctx.headers()` is the request-context pointer retyped as a detached,
         // non-owning header-table view. MIR deliberately represents that zero-cost
@@ -4784,6 +4783,14 @@ fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
         ) => actual == expected,
         _ => false,
     }
+}
+
+fn xml_borrowed_place_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
+    xml_ty_is_view_retype(actual, expected)
+        || matches!(
+            (actual, expected),
+            (Ty::Array(element, _), Ty::Slice(view)) if element == view
+        )
 }
 
 fn xml_dict_field_ty(program: &Program, id: u32, key: u32, index: u32) -> Option<Ty> {
@@ -6004,7 +6011,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return Vec::new();
         };
-        let view_retype = xml_ty_is_view_retype(stored, expected);
+        let view_retype = xml_borrowed_place_ty_is_view_retype(stored, expected);
         if place.cleanup.is_some()
             || place.ty != expected
             || (stored != expected && !view_retype)
@@ -10179,7 +10186,7 @@ fn xml_borrowed_access(
             let Some((selected, path)) = xml_borrowed_path(graph.program, root, &place.path) else {
                 return XmlProducerState::Invalid;
             };
-            let view_retype = xml_ty_is_view_retype(selected, place.ty);
+            let view_retype = xml_borrowed_place_ty_is_view_retype(selected, place.ty);
             if selected != place.ty && !view_retype {
                 return XmlProducerState::Invalid;
             }
@@ -31500,6 +31507,67 @@ fn main() -> i32 = 0
             assert!(validate_thin_partition_program(&program, &[]).is_ok(), "per-unit binder {owned} -> {view}");
             assert!(!xml_ty_is_view_retype(view_ty, source_ty), "views cannot mint owners");
         }
+    }
+
+    #[test]
+    fn producer_fixed_array_use_cannot_forge_slice_representation() {
+        let mut forged = mir(
+            "fn consume(values: slice<i64>) -> string = \"ok\".clone()\n\
+             fn forged(values: slice<i64>) -> string = consume(values)\n\
+             fn main() -> i32 = 0\n",
+        );
+        let forged_index = xml_test_function(&forged, "forged");
+        let element = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let array = Ty::Array(element, 2);
+        let slice = Ty::Slice(element);
+        let function = &mut forged.fns[forged_index];
+        let slot = u32::try_from(function.slots.len())
+            .unwrap_or_else(|_| panic!("fixed-array owner slot inventory exceeds u32"));
+        function.slots.push(array);
+        function.slot_align.push(None);
+        let array_value = xml_test_value(function, array);
+        let slice_value = xml_test_value(function, slice);
+        let call_position = function.blocks[0]
+            .stmts
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::CallWithCleanup(call))
+                        if call.target.as_str() == "consume"
+                )
+            })
+            .unwrap_or_else(|| panic!("fixed-array owner fixture omitted its owned call"));
+        let Stmt::Let(_, Rvalue::CallWithCleanup(call)) =
+            &mut function.blocks[0].stmts[call_position]
+        else {
+            panic!("fixed-array owner call changed shape")
+        };
+        call.args[0] = Operand::Value(slice_value);
+        function.blocks[0].stmts.splice(
+            call_position..call_position,
+            [
+                Stmt::StoreConstArray {
+                    slot,
+                    elems: vec![ConstElem::Int(1), ConstElem::Int(2)],
+                    elem: scalar_to_ty(element),
+                },
+                Stmt::Let(array_value, Rvalue::Load(slot)),
+                Stmt::Let(slice_value, Rvalue::Use(Operand::Value(array_value))),
+            ],
+        );
+        assert!(
+            !xml_ty_is_view_retype(array, slice),
+            "fixed arrays need MakeSlice and cannot be zero-cost Use retypes"
+        );
+        assert!(
+            xml_borrowed_place_ty_is_view_retype(array, slice),
+            "borrowed fixed-array descriptors retain their established slice view"
+        );
+        assert_xml_producer_rejected(&forged, "fixed array represented as a slice through Use");
     }
 
     #[test]

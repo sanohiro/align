@@ -420,19 +420,20 @@ this repair.
 The repair follows the canonical borrowed projection back to its exact slot and
 typed path on the existing producer worklist. It requires readable provenance for
 that storage and for any dynamic cleanup flag. Copy-place calls use the existing
-one-way view-retype classifier rather than a second incomplete list; the classifier
-retains both fixed and dynamic array-to-slice cases while adding the established
-string-to-`str` view. The clone and `EnvGet` inputs use the same tracked read. The
-existing call-mode parameter shortcut remains unchanged. Ownership is still granted
-only through the existing `StrClone` result and out-slot producer. The repair does
-not admit borrowed element descriptors, manufacture a storage seed, reverse a view
-into an owner, or widen Move consumption.
+one-way view-retype classifier rather than a second incomplete list. A descriptor-only
+wrapper retains the established fixed-array-to-slice case without admitting that
+representation-changing conversion through ordinary zero-cost `Use`; dynamic arrays
+and the established string-to-`str` view use the shared classifier. The clone and
+`EnvGet` inputs use the same tracked read. The existing call-mode parameter shortcut
+remains unchanged. Ownership is still granted only through the existing `StrClone`
+result and out-slot producer. The repair does not admit borrowed element descriptors,
+manufacture a storage seed, reverse a view into an owner, or widen Move consumption.
 
 | Closure axis | Required implementation and owner |
 |---|---|
 | Formation and success | A borrowed `Option<string>` match clones both the present payload and an independent string field into a returned record, passes the payload to a `str` parameter, and uses it as the name of an owned environment lookup. `borrowed_sum_payload_clone_returns_owned_aggregate_whole_and_per_unit` executes present and absent calls in both compilation modes. |
 | Storage and control | The selected projection queues its exact slot/path, so parameter entry and every later whole/field store remain part of the proof. The source regression exercises the canonical `OptionSome` branch shape. |
 | Ownership and cleanup | `StrClone` and the existing `EnvGet` out slot remain the only owned seeds. The original borrowed record stays readable after both calls; returned strings drop through the existing dynamic-cleanup path. Whole/per-unit execution owns the positive lifecycle. |
-| Malformed input | Unreadable parameter authority, a missing slot, a mismatched projection path, and a missing cleanup slot fail publication and whole/per-unit validation. `producer_borrowed_option_payload_clone_returns_owned_value` and `producer_imported_owned_option_result_survives_borrowed_match` own these mutations; the existing copy-place mutation owner retains malformed descriptors and storage. |
+| Malformed input | Unreadable parameter authority, a missing slot, a mismatched projection path, and a missing cleanup slot fail publication and whole/per-unit validation. `producer_borrowed_option_payload_clone_returns_owned_value` and `producer_imported_owned_option_result_survives_borrowed_match` own these mutations; the existing copy-place mutation owner retains malformed descriptors and storage. `producer_fixed_array_use_cannot_forge_slice_representation` keeps the descriptor-only fixed-array view out of zero-cost `Use`. |
 | Unchanged boundaries | Borrowed element places, reverse view-to-owner conversion, direct payload moves, call modes, and runtime ABI remain unchanged. Existing borrowed-parameter and producer owners retain those boundaries. |
 | Consumer closure | The unchanged align-llm `prompt_artifacts.align`, then `gmake build`, distinguish the fix from the two earlier focused Request 59 repairs. No application workaround is accepted. |
