@@ -298,3 +298,53 @@ unseeded rejection and seeded acceptance in publication and whole/per-unit modes
 restoring the candidate's unconditional seed makes its publication negative fail.
 This closes the finding with a local producer-edge correction and does not
 change the language, IR shape, capability boundary, or existing solver strategy.
+
+## Canonical producer return type identity
+
+Current-source reproduction at `3051b98c` confirms the deferred Request 52
+supporting-owner failure: `origin_specific_generic_instances_share_one_tagged_llvm_type`
+fails in `pick` before LLVM emission with `producer return operand disagrees
+with its declared result type`. The program returns `Result<Option<Holder<fn(i64)
+-> i64>>, Error>` from branches containing distinct pure/impure noncapturing
+function origins. These are one source type, but origin-specific internal table
+IDs differ. The source and existing canonical type machinery already permit
+that representation; producer return validation must not redefine identity as
+raw table-ID equality.
+
+The repair reuses the existing `source_ty_matches`/`CanonicalTy` authority.
+It does not equate arbitrary equal-layout types, loosen callable contracts,
+invent provenance, change an IR variant, or alter the worklist solver. Every
+returned protected leaf still needs its own complete producer proof and every
+cleanup relation stays exact. An invalid canonical graph must fail closed.
+
+| Closure axis | Implementation requirement and owner |
+|---|---|
+| Formation, generic origins and source identity | Compare actual and declared return types through the existing canonical source-type authority, not raw origin IDs or LLVM body layout. The existing source regression must discriminate the pre-fix gate and keep its single tagged LLVM type and runtime result assertions. |
+| Construction, move-in/out, nulling, Drop, replacement, returned cleanup | No lowering or lifecycle changes. Cross Copy callable records and an owned-string sibling with both direct and nested tagged returns; retain existing `resource_ownership` owners and malformed cleanup owners. |
+| Branches and control joins | The source owner executes pure/impure/absent branches. Existing producer owners retain if/match/else/?/map_err, loop joins, guards and early-exit equations. Inspect sibling producer type comparisons for this same canonical-identity defect rather than changing unrelated exact slot/index/descriptor comparisons. |
+| Whole-program, per-unit and generic publication | The shared validator must accept canonical aliases before both interface publication and executable emission. Add imported whole/per-unit execution coverage to the existing source witness; generic source instantiation retains existing owner coverage. |
+| Malformed types and producers | A parameterized codegen owner must reject different nominal types with equal layout, changed fields, malformed table IDs, wrong callable signatures/modes, and invalid return cleanup in publication and whole/per-unit emission. Canonical identity never substitutes for protected-leaf provenance or actual producer construction validation. |
+| Allocation, runtime ABI, artifacts and performance | Unchanged ownership, allocation strategy, cache formats and ABI. Compiler-source identity remains the cache invalidator. No performance/resource claim and no benchmark requirement. |
+
+The author-side matrix follows the existing reviewed validation strategy; its
+boundary check belongs in the one fresh preflight review. Before requesting
+that review, map the exact/canonical identity, every protected leaf, malformed
+graph rejection and whole/per-unit obligations above to the diff and owner
+results. Do not claim closure from accepting the original positive alone.
+
+Author-side closure: `validate_resource_rvalues_component` uses the existing
+`source_ty_matches` authority for the value/declared return pair. Raw-call and
+direct/indirect callable return consumers already use that authority; exact
+slot, descriptor, discriminator and cleanup-SSA relations remain unchanged.
+`producer_canonical_return_types_preserve_nominal_and_callable_checks` proves
+the accepted pair has distinct internal IDs, then mutates nominal identity,
+fields, both declared and actual table IDs, signature, mode, cleanup and the
+callable producer across publication and whole/per-unit validation. Restoring
+the old raw-ID guard makes this owner's positive publication assertion fail.
+The existing tagged-type source owner retains its exact single-LLVM-type and
+runtime assertions. `origin_specific_return_types_preserve_imported_copy_and_owned_values`
+crosses direct/nested-tagged and Copy/owned-string returns in whole/per-unit
+imported builds with bounded child execution. All 62 owned-tagged, 18 producer,
+23 resource-ownership and 17 XML owners pass. This maps the extracted canonical,
+exact, every-leaf and malformed-graph obligations to executable owners without
+a new safety strategy or a performance claim.

@@ -2072,6 +2072,112 @@ fn origin_specific_generic_instances_share_one_tagged_llvm_type() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "10\n");
 }
 
+/// Canonical source identity survives origin-specific construction across imported returns.
+#[test]
+fn origin_specific_return_types_preserve_imported_copy_and_owned_values() {
+    fn assert_execution(executable: &std::path::Path, label: &str, expected: i32) {
+        struct ChildGuard {
+            child: Option<std::process::Child>,
+            deadline: std::time::Instant,
+        }
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = self.child.as_mut() {
+                    let mut killed = false;
+                    while std::time::Instant::now() < self.deadline {
+                        if !killed {
+                            match child.kill() {
+                                Ok(()) => killed = true,
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(_) => killed = true,
+                            }
+                        }
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        let output = align_driver::ArtifactStage::temp("origin-return-output").unwrap();
+        let stdout = output.path().join("stdout");
+        let stderr = output.path().join("stderr");
+        let child = std::process::Command::new(executable)
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut child = ChildGuard { child: Some(child), deadline };
+        // Reserve cleanup inside the same post-spawn budget; the fixture has no subprocesses.
+        let execution_deadline = deadline - std::time::Duration::from_secs(5);
+        let status = loop {
+            assert!(std::time::Instant::now() < execution_deadline, "{label}: execution deadline");
+            for path in [&stdout, &stderr] {
+                assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: unexpected output volume");
+            }
+            match child.child.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => { child.child.take(); break status; }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("{label}: child wait: {error}"),
+            }
+        };
+        for path in [&stdout, &stderr] {
+            assert!(std::fs::metadata(path).unwrap().len() <= 4096, "{label}: final output volume");
+        }
+        assert_eq!(status.code(), Some(expected), "{label}: {}", std::fs::read_to_string(stderr).unwrap());
+        assert_eq!(std::fs::read_to_string(stdout).unwrap(), "10\n", "{label}");
+    }
+    if !backend_available() {
+        return;
+    }
+    for owned in [false, true] {
+        for tagged in [false, true] {
+            let field = if owned { ", note: string" } else { "" };
+            let initializer = if owned { ", note: \"kept\".clone()" } else { "" };
+            let value = if owned { "h.f(10) + h.note.len()" } else { "h.f(10)" };
+            let holder = "Holder<fn(i64) -> i64>";
+            let result = if tagged { format!("Result<Option<{holder}>, Error>") } else { holder.to_owned() };
+            let wrap = |name: &str| {
+                let record = format!("Holder {{ f: {name}{initializer} }}");
+                if tagged { format!("Ok(Some({record}))") } else { record }
+            };
+            let tail = if tagged { "return Ok(None)".to_owned() } else { format!("return {}", wrap("loud_one")) };
+            let factory = format!(
+                "module factory\npub Holder<T> {{ f: T{field} }}\n\
+                 fn pure_one(x: i64) -> i64 = x + 1\n\
+                 fn loud_one(x: i64) -> i64 {{ print(x); return x + 2 }}\n\
+                 pub fn pick(k: i32) -> {result} {{\n\
+                 if k == 0 {{ return {} }}\n\
+                 if k == 1 {{ return {} }}\n{tail}\n}}\n",
+                wrap("pure_one"), wrap("loud_one"),
+            );
+            let apply = if tagged {
+                format!("match factory.pick(k) {{ Ok(v) => match v {{ Some(h) => {value}, None => 3 }}, Err(e) => 90 }}")
+            } else {
+                format!("{{ h := factory.pick(k); {value} }}")
+            };
+            let absent = if tagged { " + apply(2)" } else { "" };
+            let entry = format!("import factory\nfn apply(k: i32) -> i64 = {apply}\nfn main() -> i32 = (apply(0) + apply(1){absent}) as i32\n");
+            let files = [("factory.align", factory.as_str()), ("main.align", entry.as_str())];
+            let label = format!("origin-return-{owned}-{tagged}");
+            let expected = 23 + if owned { 8 } else { 0 } + if tagged { 3 } else { 0 };
+            let whole = build_exe_multi(&label, &files, "main.align");
+            assert_execution(&whole.exe, &format!("{label}/whole"), expected);
+            let per_unit = build_per_unit_multi(&label, &files, "main.align");
+            let objects = per_unit.emit_objects(false);
+            let object_refs: Vec<_> = objects.iter().map(|object| object.as_path()).collect();
+            let executable = per_unit.dir.join("origin-return-program");
+            align_driver::link_objects(&align_driver::CDriver::default(), &object_refs,
+                &executable, &per_unit.link_libs_union(), Profile::Release).unwrap();
+            assert_execution(&executable, &format!("{label}/per-unit"), expected);
+        }
+    }
+}
+
 /// Tagged identity is the LLVM body, not membership in the tagged table.
 ///
 /// `Option<string>` and `Option<str>` are distinct Align types that lower to one

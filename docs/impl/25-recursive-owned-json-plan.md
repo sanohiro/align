@@ -1374,9 +1374,9 @@ checking remains after the root check; §9's whole/per-unit and control-path
 requirements are covered by the parameterized owner and the reused producer
 owners above. The preflight review checks this boundary with the implementation.
 
-The full `m5_owned_json` owner passes. The supporting `owned_tagged_payloads`
-suite passes 60/61: `origin_specific_generic_instances_share_one_tagged_llvm_type`
-fails producer-return certification in `pick`, without any JSON operation.
-The same fixture fails with the preserved pre-repair release compiler. This is
-an existing MIR producer/type-identity defect owned by that test, not evidence
-against the encoder guard; retain it for a separate investigation.
+The full `m5_owned_json` owner passes. Request 52's supporting
+`owned_tagged_payloads` run passed 60/61: the origin-specific generic-instance
+owner failed producer-return certification in `pick`, without any JSON operation,
+including with the preserved pre-repair release compiler. The separate canonical
+producer return type-identity closure in `xml-producer-investigation.md` owns
+that defect; it is not evidence against the encoder guard.
