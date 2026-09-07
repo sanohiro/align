@@ -6437,14 +6437,18 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             drop_old,
             drop_new,
         } => {
-            // Compute the new value first (the RHS may read the old). Then, if reassigning an owned
-            // local whose old value the RHS did not move out (`drop_old`, set by sema's move
-            // analysis), conditionally free the buffer being overwritten — else it leaks. The
-            // runtime flag distinguishes an individually owned old value from arena-owned, moved,
-            // or uninitialised paths.
+            // Compute the new value first (the RHS may read the old). Sema's `drop_old` excludes
+            // an old value moved out by the RHS. The cleanup flag distinguishes individually owned
+            // old values from arena-owned, moved, or uninitialised paths.
             let op = lower_required!(b, lower_expr(b, value), ());
             let inherited_flag = lowered_drop_flag(b, value, &op);
-            if drop_old.get() && b.drop_locals.contains(local) {
+            // Mutable borrowed slots carry the caller's cleanup bit even though they are absent
+            // from this function's exit-cleanup list. Replacement must drop their old value too.
+            let has_cleanup = usize::try_from(*local)
+                .ok()
+                .and_then(|slot| b.drop_flags.get(slot))
+                .is_some_and(Option::is_some);
+            if drop_old.get() && has_cleanup {
                 b.emit_drop_if_live(*local);
             }
             // Clear a moved RHS source while its value is already captured in `op`, then install

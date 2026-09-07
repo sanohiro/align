@@ -1060,3 +1060,49 @@ The V2 graph descriptor replaces V1 and records every reachable layout/Drop fact
 to pass a null arena to A103, so the runtime's leaf allocation kinds remain free-standing. A80 reads
 the same validated table for encode without consuming the source. Implementation is pending; §19
 remains the exact shipped flat behavior until the V2 capability lands atomically.
+
+## 21. Request 39 — borrowed replacement cleanup
+
+The all-request audit at `b947b5d9` measures retained storage when a caller
+repeatedly replaces a buffer through a `borrow mut` parameter. Section 14.2
+already requires old-value Drop at replacement, independently of whether the
+callee owns function-exit cleanup. MIR gives mutable borrowed Move parameters
+the caller's dynamic cleanup flag, but whole-slot assignment only emits old
+Drop for the callee's exit-cleanup list. The repair must use the existing
+per-slot cleanup capability without adding borrowed parameters to that list.
+
+| Closure axis | Implementation and owner |
+|---|---|
+| Formation, construction, replacement, source nulling | Keep `needs_drop_flag`, checked `drop_old`, RHS evaluation, inherited replacement bit, and store order. `borrowed_replacement_reclaims_buffer_storage` uses the existing requested-live-byte probe to require one live buffer after each replacement, at most old-plus-new at construction, and none after caller exit. |
+| Move classes and borrowing modes | A parameterized MIR owner covers admitted mutable Move parameters and owned locals; shared borrows and Copy values must gain no cleanup. The caller flag remains authoritative; no borrowed parameter gains scope-exit Drop. |
+| Nested/direct/imported calls, generic types, whole/per-unit | The buffer owner forwards the mutable parameter across an imported helper and runs both compilation modes. `borrowed_replacement_preserves_drop_order` exercises a package-defined resource and aggregate wrapper through generic replacement, proving old cleanup before the following observable action and final cleanup only in the caller. |
+| `if`, `match`, `else`, `?`, `map_err`, joins, loops, early exits | Reuse the existing return-provenance/owned-tagged control and dynamic cleanup-bit owners. The new resource owner covers replacement on success/error and no replacement on a control path; the buffer owner covers repeated loop calls. No join or retention-summary changes. |
+| Allocation provenance, arena/individual, Drop and return | Existing flags distinguish individually owned, arena-owned, moved, and uninitialized values. The conditional old-value Drop must consult that flag, then install the replacement bit. `borrowed_replacement_preserves_arena_cleanup` runs arena-to-heap-to-arena-to-heap transitions in both check/build modes; foreign region-argument summary rejection remains the separate R49 gap, so this control keeps its helper in the same unit. The new live-byte owner measures the concrete buffer resource promise. |
+| Runtime/ABI/interface/malformed input | No new symbol, flag, type, IR variant, or interface format. Existing checked-HIR/MIR validation remains authoritative. The change uses an already-allocated flag and the ordinary Drop plan; no LLVM-specific semantics. |
+
+This follows the existing section 14.2 strategy. The author-side matrix pass
+and the independent preflight review cover the boundary together. The current
+capability is replacement cleanup; unrelated mutable-argument retention and
+check/build parity requests remain separate.
+
+Author-side closure pass: replacement consults the already-established slot flag;
+function-exit cleanup membership is unchanged. The two behavioral owners fail on
+`a03c6233` (retained buffer bytes and absent old-resource Drop events) and pass
+with the repair. The class owner covers buffer, reader, writer, string, dynamic
+array, array builder, owned Option and record, with Copy and shared-borrow controls.
+The arena owner proves false old bits survive heap/arena transitions.
+
+Local Linux release observation for the original 2 MiB filled-window probe:
+one versus 32 replacements measured 11,876 versus 66,908 KiB peak RSS before
+repair, and 11,896 versus 11,880 KiB afterward. This is local corroboration,
+not a portable allocator/RSS guarantee; the exact requested-live-byte owner is
+the regression gate for reclaiming the old allocation.
+
+The broader `return_provenance` suite reports the same 87 passes and three
+failures on both `a03c6233` and the repaired tree:
+`borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases`,
+`closure_target_joins_keep_capture_slots_target_relative`, and
+`storage_generation_interprocedural_allocation_parity_matrix`. These fail
+producer/foreign-call certification independently of this cleanup change.
+They remain separate investigation work, not a claimed full-suite pass or a
+reason to broaden this repair into the R42/R43/R49 analysis boundary.
