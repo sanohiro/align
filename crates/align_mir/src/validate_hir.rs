@@ -617,6 +617,10 @@ impl<'a> DeclarationValidator<'a> {
                     &function.return_borrow,
                     &function.return_region,
                 )
+                || (function.mutable_retention.is_some() && !function.producer_certified)
+                || align_sema::hir::validate_mutable_retention(
+                    &function.mutable_retention, &function.param_modes, false,
+                ).is_err()
                 || !self.return_cleanup_valid(function.ret, function.return_cleanup)
                 || !transfer_params_valid(
                     self.program,

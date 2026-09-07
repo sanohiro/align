@@ -1185,7 +1185,7 @@ fn main() -> i32 {
     let checked = assert_same_verdict("l2b-a2-out-str-whole-per-unit", files, "main.align");
     assert!(
         checked.diags.has_errors(),
-        "both exact whole-program and conservative imported retention must reject the inner-arena source"
+        "both whole-program and imported retention must reject the inner-arena source"
     );
 
     let exact_vs_fallback = diff_check_multi(
@@ -1216,10 +1216,12 @@ fn main() -> i32 {
     );
     assert!(
         !exact_vs_fallback.whole_errors && exact_vs_fallback.per_unit_errors,
-        "the available body must select only the stored source while the interface-only fallback retains every compatible argument:\nwhole:\n{}\nper-unit:\n{}",
+        "semantic inference accepts the unused local view; the existing MIR call-argument certification boundary still rejects this slice<str> fixture:\nwhole:\n{}\nper-unit:\n{}",
         exact_vs_fallback.whole_diags,
         exact_vs_fallback.per_unit_diags,
     );
+    assert!(exact_vs_fallback.per_unit_diags.contains("XML-capable call argument provenance mismatch"));
+    assert!(!exact_vs_fallback.per_unit_diags.contains("shorter-lived"));
 }
 
 #[test]

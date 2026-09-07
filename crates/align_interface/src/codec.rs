@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -176,6 +176,62 @@ fn write_producer_certification(w: &mut Writer, value: crate::ProducerCertificat
     });
 }
 
+fn write_mutable_retention(w: &mut Writer, summary: &align_sema::hir::MutableRetentionSummary) {
+    use align_sema::hir::MutableRetentionRoot;
+    match summary {
+        None => w.u8(0),
+        Some(destinations) => {
+            w.u8(1);
+            w.seq(destinations, |w, roots| {
+                w.seq(roots, |w, root| {
+                    w.u8(match root {
+                        MutableRetentionRoot::Contained(_) => 0,
+                        MutableRetentionRoot::Storage(_) => 1,
+                    });
+                    w.u32(root.index());
+                })
+            });
+        }
+    }
+}
+
+fn read_mutable_retention(
+    r: &mut Reader<'_>,
+    params: &[IParam],
+    generic: bool,
+) -> Result<align_sema::hir::MutableRetentionSummary, DecodeError> {
+    use align_sema::hir::MutableRetentionRoot;
+    let summary = match r.u8()? {
+        0 => None,
+        1 => Some(r.seq(|r| {
+            r.seq(|r| {
+                let tag = r.u8()?;
+                match tag {
+                    0 => Ok(MutableRetentionRoot::Contained(r.u32()?)),
+                    1 => Ok(MutableRetentionRoot::Storage(r.u32()?)),
+                    tag => Err(DecodeError::BadTag {
+                        what: "mutable-retention root",
+                        tag,
+                    }),
+                }
+            })
+        })?),
+        tag => {
+            return Err(DecodeError::BadTag {
+                what: "mutable-retention option",
+                tag,
+            });
+        }
+    };
+    align_sema::hir::validate_mutable_retention(
+        &summary,
+        &params.iter().map(|param| param.mode).collect::<Vec<_>>(),
+        generic,
+    )
+    .map_err(DecodeError::InvalidSummary)?;
+    Ok(summary)
+}
+
 fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.str(&f.name);
     write_type_params(w, &f.type_params);
@@ -187,6 +243,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_producer_certification(w, f.producer_certification);
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
+    write_mutable_retention(w, &f.mutable_retention);
     w.bool(f.resource_hook_body);
     w.opt_str(&f.generic_body);
 }
@@ -547,6 +604,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let effect = read_effect(r)?;
     let parallel_transfer_params = r.seq(|r| r.u32())?;
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
+    let mutable_retention = read_mutable_retention(r, &params, !type_params.is_empty())?;
     let resource_hook_body = r.bool()?;
     let generic_body = r.opt_str()?;
     let certification_matches_body = match producer_certification {
@@ -573,6 +631,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         producer_certification,
         effect,
         parallel_transfer_params,
+        mutable_retention,
         resource_hook_body,
         generic_body,
     })
@@ -703,6 +762,50 @@ fn deserialize_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_retention_has_independent_byte_goldens_and_rejects_malformed_records() {
+        use align_sema::hir::MutableRetentionRoot::{Contained, Storage};
+        let mutable = IParam { mode: ParamMode::BorrowMut, ty: IType::Named { path: "str".into(), args: Vec::new() } };
+        let value = IParam { mode: ParamMode::ByValue, ty: mutable.ty.clone() };
+        let params = vec![mutable, value];
+        let cases = [
+            (None, vec![0], params.clone()),
+            (Some(vec![]), vec![1, 0, 0, 0, 0], vec![]),
+            (Some(vec![vec![], vec![]]), vec![1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+            (Some(vec![vec![Contained(1)], vec![]]), vec![1, 2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+            (Some(vec![vec![Storage(1)], vec![]]), vec![1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+        ];
+        for (record, literal, parameters) in cases {
+            let mut writer = Writer::new();
+            write_mutable_retention(&mut writer, &record);
+            assert_eq!(writer.buf, literal);
+            let mut reader = Reader::new(&literal);
+            assert_eq!(read_mutable_retention(&mut reader, &parameters, false), Ok(record));
+            assert_eq!(reader.finish(), Ok(()));
+            for end in 0..literal.len() {
+                assert!(read_mutable_retention(&mut Reader::new(&literal[..end]), &parameters, false).is_err());
+            }
+        }
+        for record in [
+            Some(vec![]),
+            Some(vec![vec![Contained(2)], vec![]]),
+            Some(vec![vec![Contained(1), Contained(1)], vec![]]),
+            Some(vec![vec![Storage(1), Contained(0)], vec![]]),
+            Some(vec![vec![], vec![Contained(0)]]),
+        ] {
+            let mut writer = Writer::new();
+            write_mutable_retention(&mut writer, &record);
+            let modes = params.iter().map(|p| p.mode).collect::<Vec<_>>();
+            let expected = align_sema::hir::validate_mutable_retention(&record, &modes, false).map_err(DecodeError::InvalidSummary);
+            assert!(expected.is_err());
+            assert_eq!(read_mutable_retention(&mut Reader::new(&writer.buf), &params, false).map(|_| ()), expected);
+        }
+        assert!(matches!(read_mutable_retention(&mut Reader::new(&[2]), &params, false), Err(DecodeError::BadTag { what: "mutable-retention option", tag: 2 })));
+        let bad_root = [1, 2, 0, 0, 0, 1, 0, 0, 0, 2];
+        assert!(matches!(read_mutable_retention(&mut Reader::new(&bad_root), &params, false), Err(DecodeError::BadTag { what: "mutable-retention root", tag: 2 })));
+        assert!(read_mutable_retention(&mut Reader::new(&[1, 0, 0, 0, 0]), &[], true).is_err());
+    }
 
     #[test]
     fn invalid_effect_tag_is_rejected_before_sema() {

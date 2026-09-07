@@ -2071,3 +2071,15 @@ metadata admits the buffer/writer leaves specified by
 no-independent-cleanup replay checks. View-header fallback roots participate in
 local and eager-snapshot invalidation even when no legacy source-map entry
 exists. There is no new HIR record or serialized representation.
+
+## Imported mutable-retention records (Request 43/49)
+
+The authoritative record and closure matrix are in
+`17-library-boundary-prerequisites.md`, Request 43/49. Interface format 10 retains
+all format-9 fields and inserts `mutable_retention` immediately after
+`parallel_transfer_params`. The HIR stored-function record holds the exact local
+inference result; body replay resets, re-infers, and compares that result. Imported
+records preserve the producer result and pass the shared arity, root-order, index,
+and destination-mode validator before either body analysis or MIR header validation.
+Generic templates carry no record. Missing records preserve conservative handling.
+The fact is removed before MIR and adds no runtime ABI field.

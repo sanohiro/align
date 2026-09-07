@@ -1659,6 +1659,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_retention: Some(vec![vec![]; 0]),
                 locals: Vec::new(),
                 body: Block {
                     stmts: Vec::new(),
@@ -1720,6 +1721,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_retention: Some(vec![vec![]; 1]),
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1791,6 +1793,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_retention: Some(vec![vec![]; 1]),
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1868,6 +1871,7 @@ mod tests {
                     hir::ReturnCleanupAbi::None
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_retention: Some(vec![vec![]; 1]),
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2306,6 +2310,7 @@ mod tests {
                     hir::ReturnCleanupAbi::None
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_retention: Some(vec![vec![]; 1]),
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),

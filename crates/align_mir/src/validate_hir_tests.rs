@@ -113,6 +113,7 @@ fn declaration_header_program() -> hir::Program {
         producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     let span = align_span::Span::new(0, 0, 0);
     program.fns.push(hir::Fn {
@@ -134,6 +135,7 @@ fn declaration_header_program() -> hir::Program {
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 1]),
         locals: vec![
             hir::Local {
                 id: 0,
@@ -356,6 +358,7 @@ fn template_html_checked_hir_gate_rejects_every_owned_record_class() {
         producer_certified: true,
         effect: align_sema::FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     assert_eq!(
         validate_hir::template_html_validation_reason(&imported),
@@ -1501,6 +1504,7 @@ fn checked_interface_program(
                 hir::ReturnCleanupAbi::None,
                 Vec::new(),
                 true,
+                None,
             ),
         );
     }
@@ -1575,6 +1579,7 @@ fn fn_type_header_program() -> hir::Program {
 fn summary_header_program() -> hir::Program {
     let mut program = declaration_header_program();
     program.fns[0].params = vec![0, 1];
+    program.fns[0].mutable_retention = Some(vec![vec![], vec![]]);
     program.fns[0].param_modes = vec![
         align_ast::ParamMode::ByValue,
         align_ast::ParamMode::ByValue,
@@ -1622,6 +1627,7 @@ fn main_header_program(params: Vec<Ty>, param_modes: Vec<align_ast::ParamMode>, 
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; params.len()]),
         locals: local_params,
         body: hir::Block {
             stmts: Vec::new(),
@@ -1731,6 +1737,24 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
             params: vec![0],
             captures: Vec::new(),
         };
+    });
+    for (label, roots) in [
+        ("import-retention-arity", vec![]),
+        ("import-retention-range", vec![vec![hir::MutableRetentionRoot::Contained(1)]]),
+        ("import-retention-duplicate", vec![vec![hir::MutableRetentionRoot::Contained(0), hir::MutableRetentionRoot::Contained(0)]]),
+        ("import-retention-order", vec![vec![hir::MutableRetentionRoot::Storage(0), hir::MutableRetentionRoot::Contained(0)]]),
+    ] {
+        assert_one_header_mutation(label, &base, |program| {
+            program.imported_fns[0].mutable_retention = Some(roots);
+        });
+    }
+    assert_one_header_mutation("import-retention-uncertified", &base, |program| {
+        program.imported_fns[0].producer_certified = false;
+        program.imported_fns[0].mutable_retention = Some(vec![vec![]]);
+    });
+    assert_one_header_mutation("import-retention-nonmutable", &base, |program| {
+        program.imported_fns[0].param_modes[0] = align_ast::ParamMode::Borrow;
+        program.imported_fns[0].mutable_retention = Some(vec![vec![hir::MutableRetentionRoot::Contained(0)]]);
     });
     assert_one_header_mutation("import-transfer-order", &base, |program| {
         program.imported_fns[0].parallel_transfer_params = vec![0, 0];
@@ -3754,6 +3778,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         producer_certified: true,
         effect: FnEffect::Unknown,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     assert!(validate_hir::declaration_header_metadata_is_valid(&program));
     assert!(!is_empty(&lower_program_per_unit(&program)));
@@ -3771,6 +3796,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         producer_certified: true,
         effect: FnEffect::Impure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     assert_header_rejected("deep-header-later-sibling", &malformed);
 }
@@ -3991,6 +4017,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     }
 }
 
@@ -4060,6 +4087,7 @@ fn with_return(ty: Ty) -> hir::Program {
         producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     program
 }
@@ -4665,6 +4693,7 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4751,6 +4780,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4779,6 +4809,7 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4880,6 +4911,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4923,6 +4955,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5004,6 +5037,7 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5100,6 +5134,7 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 1]),
         locals: vec![hir::Local {
             id: 0,
             name: "regex".to_string(),
@@ -5171,6 +5206,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5212,6 +5248,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5259,6 +5296,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 1]),
         locals: vec![hir::Local {
             id: 0,
             name: "builder".to_string(),
@@ -5314,6 +5352,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 1]),
         locals: vec![hir::Local {
             id: 0,
             name: "argv".to_string(),
@@ -5368,6 +5407,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: vec![hir::Stmt::Expr(expr)],
@@ -5435,6 +5475,7 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5509,6 +5550,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5596,6 +5638,7 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5692,6 +5735,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5759,6 +5803,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5828,6 +5873,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5891,6 +5937,7 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -5963,6 +6010,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 1]),
         locals: vec![hir::Local {
             id: 0,
             name: "xs".to_string(),
@@ -6730,6 +6778,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
+            mutable_retention: None,
         });
         assert!(
             validate_hir::type_placement_metadata_is_valid(&program),
@@ -6768,6 +6817,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             producer_certified: true,
             effect: FnEffect::Pure,
             parallel_transfer_params: Vec::new(),
+            mutable_retention: None,
         });
         assert_placement_rejected(label, &program);
     }
@@ -6787,6 +6837,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
         producer_certified: true,
         effect: FnEffect::Pure,
         parallel_transfer_params: Vec::new(),
+        mutable_retention: None,
     });
     assert_rejected("unknown_fixed_struct_array", &unknown_struct);
 }
@@ -7361,6 +7412,7 @@ fn body_test_named_function(
         return_region: ReturnRegionSummary::None,
         return_cleanup: body_test_return_cleanup(ret),
         parallel_transfer: hir::ReturnBorrowSummary::None,
+        mutable_retention: Some(vec![vec![]; 0]),
         locals,
         body,
         span: align_span::Span::new(0, 0, 0),
@@ -18031,4 +18083,15 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static s
         }
     }
     Ok(())
+}
+
+#[test]
+fn mutable_retention_replay_rejects_stale_local_facts() {
+    let base = checked_source_program("fn set(borrow mut dst: str, value: str) { dst = value }\nfn main() -> i32 = 0\n");
+    assert!(align_sema::checked_hir_body_facts_are_valid(&base));
+    for replacement in [None, Some(vec![vec![], vec![]])] {
+        let mut bad = base.clone();
+        bad.fns[0].mutable_retention = replacement;
+        assert_replay_rejects_without_mutating(bad, "mutable-retention facts must match the actual body");
+    }
 }

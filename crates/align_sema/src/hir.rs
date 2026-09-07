@@ -143,6 +143,62 @@ pub enum TaggedType {
 /// body. Codegen turns each into an external LLVM `declare` under the same Align ABI a defining unit
 /// would emit for the function, so the linker resolves the call against the unit that owns the
 /// definition. See [`Program::imported_fns`].
+/// Parameter-relative mutable-retention edge. Ordering is the canonical wire ordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum MutableRetentionRoot {
+    Contained(u32),
+    Storage(u32),
+}
+
+impl MutableRetentionRoot {
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Contained(index) | Self::Storage(index) => index,
+        }
+    }
+}
+
+/// Exact body-analysis record, including the destination-self transition convention.
+/// `None` is unavailable; `Some` has one entry for every logical parameter.
+pub type MutableRetentionSummary = Option<Vec<Vec<MutableRetentionRoot>>>;
+
+/// Shared shape authority for interface decoding, in-memory imports, and checked HIR.
+pub fn validate_mutable_retention(
+    summary: &MutableRetentionSummary,
+    modes: &[align_ast::ParamMode],
+    generic: bool,
+) -> Result<(), &'static str> {
+    let Some(destinations) = summary else {
+        return Ok(());
+    };
+    if destinations.len() != modes.len() {
+        return Err("mutable-retention destination arity mismatch");
+    }
+    for (roots, mode) in destinations.iter().zip(modes) {
+        if roots
+            .iter()
+            .any(|root| usize::try_from(root.index()).map_or(true, |index| index >= modes.len()))
+        {
+            return Err("mutable-retention source index out of range");
+        }
+        if roots.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("mutable-retention roots are not strictly ordered");
+        }
+        if !roots.is_empty()
+            && !matches!(
+                mode,
+                align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out
+            )
+        {
+            return Err("mutable-retention roots require a mutable destination");
+        }
+    }
+    if generic {
+        return Err("generic templates cannot carry mutable-retention summaries");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ImportedFn {
     /// The already-mangled `module$name` symbol (collision-free across units).
@@ -168,6 +224,7 @@ pub struct ImportedFn {
     /// Canonical parameter roots whose contained views may be transferred to a worker by the
     /// imported body. This validation-only interface fact is stripped before MIR construction.
     pub parallel_transfer_params: Vec<u32>,
+    pub mutable_retention: MutableRetentionSummary,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -400,6 +457,8 @@ pub struct Fn {
     /// Parameter/capture roots whose contained views may reach `spawn` or `par_map` workers.
     /// Source functions have no capture roots; lifted functions retain capture-relative roots.
     pub parallel_transfer: ReturnBorrowSummary,
+    /// Re-inferred from the checked body; imported interfaces consume this exact result.
+    pub mutable_retention: MutableRetentionSummary,
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,

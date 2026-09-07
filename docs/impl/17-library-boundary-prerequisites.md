@@ -4277,7 +4277,7 @@ current type restrictions admit that form.
 | Shared-borrow calls/results | L2d | all call forms pass non-null caller storage without ownership transfer; caller owner remains usable; completed summaries attach returned views to the exact owner generation | use after owner move/drop, wrong indirect mode, stale returned view, corrupt imported summary, any ByValue peer that moves/consumes the same root, and any overlapping existing `Out` peer reject identically in either argument order, including rooted fields and aggregate holders | none |
 | Exclusive-borrow formation | L2e | contextual `borrow mut`, existing `Out`, writable Copy/Move local and field places, and function-value modes share one place classifier | immutable, temporary/rvalue, moved, overlapping field/whole-place, unbound storage, wrong mode, and unsupported partial Move leaf reject | L3 admits resource owners |
 | Exclusive alias/invalidation | L2e | recursively scan every `ByValue`/`Borrow`/`BorrowMut`/`Out` peer, including distinct aggregate holders; end the old generation at the call; preserve branch/loop state | any direct or nested overlap and any older view use reject before callee effects, with identical local/imported diagnostics | L3 adds resource/dependent overlap classes |
-| Exclusive replacement/effect | L2e | changed owned pointee runs guarded drop-old once, stores value and cleanup bit, and later caller Drop sees only the replacement; unchanged pointee emits no callee-exit cleanup; exclusive-input-only mutation is Pure. A reverse direct-call worklist computes a least fixed point from each same-program `borrow mut` destination to only the parameter roots stored by reachable whole/field/element replacement, builder push/append, or transitive direct calls; `clone_in(out)` contributes `out`, not its source. This fact is analysis-local and is recomputed for checked-HIR replay | imported, indirect, missing-body, malformed, and unresolved calls retain all compatible view-bearing arguments; a malformed destination/source index fails closed; no exact summary is serialized into HIR, MIR, interfaces, or ABI | none |
+| Exclusive replacement/effect | L2e | changed owned pointee runs guarded drop-old once, stores value and cleanup bit, and later caller Drop sees only the replacement; unchanged pointee emits no callee-exit cleanup; exclusive-input-only mutation is Pure. A reverse direct-call worklist computes a least fixed point from each same-program `borrow mut` destination to only the parameter roots stored by reachable whole/field/element replacement, builder push/append, or transitive direct calls; `clone_in(out)` contributes `out`, not its source. This fact is recomputed for local checked-HIR replay and transported for validated direct imports by the Request 43/49 record below | indirect, missing-metadata, malformed, and unresolved calls retain all compatible view-bearing arguments; malformed imported records reject before use; no new MIR or runtime ABI field | none |
 | End-to-end parity | each slice | focused owner tests, whole/per-unit builds, direct/indirect/imported behavior, generic/interface/cache identity, runtime provenance, Drop/allocation counts, and the slice benchmark agree | malformed interfaces/MIR fail closed and no disabled later mode is accepted | later rows add cases without weakening earlier gates |
 
 Each closure-matrix row is owned by the following exact focused targets. New targets are created by
@@ -4997,3 +4997,170 @@ before code; an implementation that follows it gets the ordinary single prefligh
 The generated declarations keep the reused shapes' empty curated function-attribute sets; Rust C
 exports do not unwind across C, but the capability adds no LLVM `nounwind` attribute and changes no
 shared shape fingerprint.
+
+## Request 43/49: imported mutable-retention transport
+
+Status: proposed implementation boundary (2026-09-08). Request 42's observed
+check/build discrepancy is partly the same missing information: whole-program
+checking has bodies, whereas per-unit checking and the default build consume
+interfaces. The registered independent-output reproduction still passes the
+former and fails the latter on `3fbb74fe` (the Request 61 merge). This boundary transports the existing
+analysis; it does not weaken lifetime or generation checks or promise that every
+backend diagnostic runs in semantic-only `check`.
+
+### Authoritative record
+
+Extend the existing L2e same-program fact to producer-validated direct imports.
+A mutable-retention summary is `Option<Vec<Vec<MutableRetentionRoot>>>`;
+`MutableRetentionRoot` is `Contained(u32)` or `Storage(u32)`. Outer positions are
+logical parameter ordinals in declaration order, including nonmutable parameters.
+Each inner sequence is strictly sorted by `(tag, ordinal)` with no duplicates;
+Contained has tag 0 and Storage tag 1. A root denotes exactly the existing
+`BorrowRoot::Param` or `BorrowRoot::ParamStorage` edge. Contained selects the
+argument's embedded provenance; Storage selects its caller-owned storage.
+The record transports the exact output of the existing returning-path analysis,
+including its destination-self convention; it is not an arbitrary overapproximation
+of ordinary retained provenance. For a `borrow mut` destination, a nonempty set
+containing only that destination's Contained/Storage roots selects the existing
+unchanged-destination transition. An empty set selects the borrow-free replacement
+transition. Other sets select the existing source-substitution transition. `out`
+never uses the unchanged sentinel. Adding or removing a self root can change the
+transition and is not authorized as a conservative normalization. Every exclusive
+call still invalidates pre-call dependent views and checks live resource dependents,
+including the unchanged transition. The record neither guarantees that a write
+executes nor supplies a return-value borrow summary.
+
+Conditional unchanged/fresh replacement is a mandatory safety cell: whole-program,
+imported, and replay checking must reject returning a view of possible fresh local
+heap storage even when the destination originally used a caller-provided region.
+They must also preserve reads of unchanged owners and valid caller-region replacements.
+An unchanged exclusive call still invalidates old views; this boundary does not
+newly promise that returning a region-backed view after that call is accepted. If
+transporting the current exact fact loses that distinction, separate backing or
+mutation authority in this record before implementation; do not compensate by
+inventing a root or silently treating unavailable analysis as unchanged.
+
+`None` means unavailable and selects the existing all-compatible-input fallback.
+`Some` has exactly the logical parameter count, even if every inner set is empty.
+Only `borrow mut` and `out` destinations may have nonempty sets. Sources must be
+in range. A source may be any parameter mode: by-value arguments can contain
+views, and their storage can still require accounting. No type-based removal or
+root insertion is authorized. A local, ended,
+observation, or temporary root is not serializable: producer checking must reject
+an actual escape, and unavailable analysis must never become known-empty.
+
+The checked HIR carries the record on imported declarations. Local records are
+computed from actual checked bodies by the existing least-fixed-point analysis;
+interface construction obtains those same results. Importers use only validated
+records, never dependency bodies. Missing external metadata keeps `None`.
+Generic interface templates carry `None`; instantiated bodies infer concrete
+facts through the existing local worklist. Function-value types and indirect
+calls retain their existing conservative handling. Extern C declarations acquire
+no new authority. No new runtime ABI, source syntax, type ownership, allocation,
+Drop, or lifetime rule is introduced.
+
+Interface format 10 adds this field immediately after `parallel_transfer_params`
+in every top-level function record. All existing fields retain their version-9
+order and encoding. Integers below are little-endian. The field encodes `None`
+as u8 0, or `Some` as u8 1 followed by outer u32 length, then each destination's
+u32 root count followed by `(u8 tag, u32 ordinal)` records. Other option/root tags,
+truncation, wrong outer arity, duplicate/unsorted/out-of-range roots, nonmutable
+destination roots, and `Some` on generic templates reject. Decode structural
+errors follow byte order; validate arity before destination entries and each
+entry's tag/range/order before its destination-mode restriction. Existing header
+version rejection precedes every record. Direct in-memory interface validation
+and imported checked-HIR validation enforce the same shape before use. Checked
+HIR replay re-infers local body facts and retains only validated imported facts.
+No old-version fallback is permitted.
+
+The canonical function bytes, hence `interface_hash`, include this field. A
+private helper edit that changes a public function's inferred retention roots
+invalidates consumers; an edit that preserves that public fact retains the
+ordinary implementation-only cache behavior. Root ordinals are nominal logical
+parameter identities, not layout fingerprints. The existing nominal type graph,
+implementation hash, compiler namespace, and cache identities are otherwise
+unchanged. Host-side vectors own their memory; no runtime allocation is added
+and no performance promise is made. There are no new text/native boundaries,
+ambient options, error variants exposed to Align programs, or platform APIs.
+
+Independent field golden vectors (hex, before embedding in a function record):
+
+```text
+None:                         00
+Some([]):                     01 00000000
+Some([[], []]):               01 02000000 00000000 00000000
+Some([[Contained(1)], []]):    01 02000000 01000000 00 01000000 00000000
+Some([[Storage(1)], []]):      01 02000000 01000000 01 01000000 00000000
+```
+
+The two nonempty vectors require destination 0 to be mutable and two logical
+parameters. Owners construct semantic records and compare their bytes, then
+independently decode literal bytes and compare semantic records; a roundtrip
+alone is insufficient. Full-interface owners cover format 10 and hash changes.
+
+### Implementation closure matrix
+
+| Axis | Implementation obligation | Owner evidence |
+|---|---|---|
+| Formation and malformed input | One canonical root validator for arity, ordered roots, modes, and generic absence; enforce at codec, in-memory import, and checked HIR ingress. Invalid/unavailable never implies empty. | Interface codec literal goldens and parameterized tag/order/range/mode/arity mutations; checked-HIR imported-record mutations. |
+| Construction, move-in/out, source nulling, Drop, replacement, return | Transport existing contained/storage roots into the one current mutable-call transfer; preserve all local inference and cleanup code. No new runtime or MIR field. | Existing mutable-retention, resource ownership and replacement-cleanup owners; positive independent-output build and execution. |
+| `if`, `match`, `else`, `?`, `map_err`, early exits and loop joins | Existing body inference remains authoritative for each returning path; imported callers consume its fixed point without path reinterpretation. | Existing mutable-retention control-flow owners plus direct-import twins of retained versus cloned input and transitive forwarding. |
+| Unchanged/replacement distinction | Preserve the exact self-root convention and exclusive invalidation; prove unchanged-only, fresh-only, and conditional unchanged/fresh paths retain all possible backing lifetimes. | Local/imported/replay variants of `borrow_mut_dynamic_array_heap_replacement_re_marks_storage`, conditional early return and branch joins, unchanged region-backed owner read, and pre-call view/live-dependent rejection. |
+| Lifetime and storage generations | Retained local views and caller storage still reject on escape or stale use. Known-empty removes only false dependencies; it does not skip eager operand aliasing or replacement invalidation. | Imported contained-view and storage-view negative twins, sibling-output positive, actual overlapping-borrow negative, unavailable/indirect fallback owners. |
+| Generics and recursion | Generic templates omit the fact; concrete instantiations and recursive public/private forwarding converge through existing monotone inference. No capture ordinal may escape as a public parameter. | Imported generic body and mutually recursive forwarding owners; generic-record malformed owner. |
+| Whole program, per unit, replay | Same typed root meaning on all paths; imported metadata is validated before either MoveCheck or EscapeCheck; no body rediscovery. | Request 43 independent-output and Request 49 cloned-local-string consumers checked whole/per-unit, built and executed; retained-view twins reject; checked HIR replay owner. |
+| Serialization and cache | Format 10, independently checked bytes, public fact hashed; producer-only implementation changes preserving the fact keep prior cache semantics. | Interface goldens, incompatible version rejection, public-retention-change and unchanged-root private-body hash owners, transitive interface owner. |
+| Runtime provenance and allocation parity | No new runtime symbol, storage transfer, cleanup flag or allocation. Existing all-compatible fallback remains for absent metadata and indirect calls. | Existing resource/ABI owners; no benchmark because no new resource claim. |
+
+The implementation, codec, producer and both consumer analyses land in one
+capability PR: a serialized producer without a consumer cannot fix either
+request. A diff above 1,000 handwritten lines is justified only by this one
+inseparable safety boundary and its malformed-record/cache proof; separating
+dormant stages duplicates that proof and leaves no useful consumer.
+
+The author-side matrix pass must map these owner descriptions to exact test
+names before preflight. Required agreement is this L2e record, the imported-body
+fallback qualification in `08-memory-model-v2.md`, the checked-HIR imported record
+contract in `19-hir-validation-ledger.md`, and the interface version inventory.
+No language specification or Japanese mirror changes are required because the
+source-level ownership contract is unchanged. Completion is Align delivery;
+align-llm source deduplication and pin/smoke adoption remain consumer-owned.
+
+Known separate producer-certification boundary: the existing
+`out_str_retention_matches_whole_and_per_unit_checking` temporary ignored-input
+fixture now passes mutable-retention analysis and reaches the pre-existing
+`XML-capable call argument provenance mismatch` rejection in MIR. This capability
+does not repair that independent MIR call-argument proof. Its owner pins the
+remaining diagnostic and absence of the obsolete shorter-lived-input refusal.
+The `borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases`,
+`closure_target_joins_keep_capture_slots_target_relative`, and
+`storage_generation_interprocedural_allocation_parity_matrix` owner failures were
+independently reproduced on the unchanged Request 61 merge, `3fbb74fe`. They remain
+separate follow-up work; imported mutable-retention transport adds no MIR authority.
+
+### Owner bindings
+
+The matrix above is closed by these concrete owners:
+
+- `align_interface` unit owner
+  `mutable_retention_has_independent_byte_goldens_and_rejects_malformed_records`
+  checks both byte directions, all truncation points, root tags/order/range,
+  destination modes, arity, and generic absence. Its `summary` target adds
+  `mutable_retention_in_memory_imports_reject_malformed_records`,
+  `mutable_retention_private_body_changes_reach_public_interface_hashes`, and
+  the updated full-function byte golden.
+- `align_mir` owners `malformed_hir_declaration_header_metadata_fails_closed`
+  and `mutable_retention_replay_rejects_stale_local_facts` check imported shape,
+  certification, and local replay authority. Imported positive driver programs
+  also pass the same replay gate before producer certification.
+- The driver `imported_mutable_retention` target owns the two registered
+  reproductions, native whole/per-unit execution, returning control paths,
+  unchanged/fresh/conditional backing, generic instantiation, recursive private
+  forwarding, and conservative indirect calls. Its positive and negative
+  witnesses discriminate the missing import fact without widening source rules.
+- The existing `return_provenance` target owns eager operand snapshots,
+  `if`/`match`/`else`/`?`/`map_err`/loop joins, storage/contained roots, borrowed
+  replacement, and `out` observation; the three independently reproduced
+  producer-certification failures above are excluded from this capability's
+  focused bundle. `borrowed_replacement` supplies native cleanup/allocation
+  parity. The normal bounded gate supplies HIR/MIR/ABI structural regressions.

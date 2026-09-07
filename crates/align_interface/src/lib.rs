@@ -160,6 +160,7 @@ pub struct IFnSig {
     pub effect: Effect,
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
     pub parallel_transfer_params: Vec<u32>,
+    pub mutable_retention: align_sema::hir::MutableRetentionSummary,
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
     /// resource Drop hook. This is semantic validation metadata, not an importable hook path.
     pub resource_hook_body: bool,
@@ -540,6 +541,10 @@ pub fn build_summaries_with_effects(
             )
         }))
         .collect();
+    let mutable_retention: HashMap<&str, _> = program.fns.iter()
+        .map(|function| (function.name.as_str(), function.mutable_retention.clone()))
+        .chain(program.imported_fns.iter().map(|function| (function.name.as_str(), function.mutable_retention.clone())))
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
 
@@ -648,6 +653,9 @@ pub fn build_summaries_with_effects(
                             },
                             effect,
                             parallel_transfer_params,
+                            mutable_retention: if is_generic { None } else {
+                                mutable_retention.get(canonical.as_str()).cloned().flatten()
+                            },
                             resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -1102,6 +1110,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryOnUnsupportedSignature,
     ReturnSummaryGenerativeCapabilityGraph,
     ParallelTransferRootsNonCanonical,
+    InvalidMutableRetention(&'static str),
     ReturnCleanupMismatch,
 }
 
@@ -1208,6 +1217,7 @@ impl std::fmt::Display for ImportCompatibilityError {
                     "return provenance capability validation found a generative recursive type graph"
                 )
             }
+            ImportCompatibilityError::InvalidMutableRetention(message) => write!(f, "{message}"),
             ImportCompatibilityError::ParallelTransferRootsNonCanonical => {
                 write!(f, "interface parallel-transfer roots are not strictly increasing")
             }
@@ -2523,6 +2533,11 @@ pub fn validate_for_import(
     let analysis = CapabilityAnalysis::new(index)?;
 
     for function in &summary.fns {
+        align_sema::hir::validate_mutable_retention(
+            &function.mutable_retention,
+            &function.params.iter().map(|param| param.mode).collect::<Vec<_>>(),
+            !function.type_params.is_empty() || function.generic_body.is_some(),
+        ).map_err(ImportCompatibilityError::InvalidMutableRetention)?;
         if function.params.iter().any(|parameter| {
             matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
                 && matches!(&parameter.ty, IType::Named { path, args }
@@ -2805,6 +2820,7 @@ pub fn summary_return_provenance(
                 function.return_cleanup,
                 function.parallel_transfer_params.clone(),
                 function.producer_certification == ProducerCertification::ValidatedBody,
+                function.mutable_retention.clone(),
             ),
         );
     }
@@ -2951,6 +2967,7 @@ mod builtin_spelling_tests {
                 producer_certification: ProducerCertification::ValidatedBody,
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),
+                mutable_retention: None,
                 resource_hook_body: false,
                 generic_body: None,
             }],
