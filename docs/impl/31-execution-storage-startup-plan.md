@@ -1,19 +1,21 @@
 # Execution, Storage, and Startup Optimization Plan
 
-> **Status:** UMBRELLA DESIGNED; S0A is implemented in PR #955 and the exact
-> S0B extension is accepted in `09-explain-opt.md`. S0B implementation is next;
-> later slices remain unapproved.
+> **Status:** UMBRELLA DESIGNED; S0A, S0B, and C0 are implemented. V1 selects
+> the exact first S1 slice in plan 32 §11; later S1 consumers and S2–S7 remain
+> unapproved.
 >
 > **Queue position:** `HANDOFF.md` remains the live work queue.
-> `32-post-xml-consolidation-plan.md` records the owner's 2026-09-05 scheduling
-> decision: finish `std.xml` and its intended release if pursued, qualify the
-> baseline with packet 33, then design S0A/S0B. This track consumes no language
-> milestone; scheduling does not approve a slice's missing contract.
+> `32-post-xml-consolidation-plan.md` records the completed V0/S0/C0 sequence
+> and owns the selected O0 implementation. This track consumes no language
+> milestone; scheduling does not approve another slice's missing contract.
 >
-> **Contract boundary:** this document approves no syntax, language semantic,
-> library API, CLI, runtime ABI, environment variable, persisted profile, or
-> distribution change. A later slice that needs one must first amend its
-> authoritative owner with an exact public-contract ledger.
+> **Contract boundary:** plan 32 §11 and `09-explain-opt.md` approve one new
+> current-plan strategy tuple and one compiler-private interpretation of the
+> existing A39/A46 parallel input arguments. They approve no syntax, language
+> semantic, library API, CLI flag, new runtime symbol/signature, environment
+> variable, persisted profile, or distribution change. A later slice that
+> needs one must first amend its authoritative owner with an exact public-
+> contract ledger.
 
 This plan adopts one direction from the 2026-08-31 execution/storage/startup
 proposal:
@@ -481,7 +483,8 @@ untouched.
 
 ### S1 — Extend the shipped virtual `chunks` source
 
-**Status:** MEASURE-FIRST; not scheduled.
+**Status:** FIRST SLICE SELECTED; exact boundary and evidence gate in plan 32
+§11. Other consumers remain measure-first and unscheduled.
 
 Extend existing direct virtualization to additional nonescaping synchronous
 pipeline and explicit-parallel consumers that still materialize
@@ -521,9 +524,18 @@ exits, whole/per-unit parity, and maximum count/chunk/stride arithmetic. The
 positive owner checks absence of the header-array allocation/runtime
 materializer; the fallback owner checks unchanged escape and lifetime behavior.
 
-The shipped direct lowering and its prior measurement are the baseline. S1
-must demonstrate incremental benefit on a still-materializing consumer rather
-than claim invention of virtual chunks.
+The first slice is restricted to an immediate, stage-free `chunks(...).par_map`
+range source, including its direct integer-sum specialization. Synchronous
+pipelines, prior-stage parallel forms, rejected/sequential `par_map`, bound or
+stored chunk arrays, returns, calls, captures, and aggregate/control-flow
+carriers retain materialization. The shipped direct lowering and the C0-bound
+compiler artifact are the baseline. S1 must demonstrate incremental benefit on
+this still-materializing consumer rather than claim invention of virtual
+chunks. For this slice only, A39/A46 retain their signatures and logical
+16-byte scheduling stride while `in_buf` names compiler-certified immutable
+source storage rather than a materialized logical-element array; plan 32 §11
+and the runtime ABI ledger own the exact safety rule. A89 and every ordinary
+parallel source retain the shipped physical `count * in_stride` contract.
 
 ### S2 — Straight-line fixed region frames
 

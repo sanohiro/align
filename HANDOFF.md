@@ -71,21 +71,20 @@ Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
-**Current next work (owner-resumed 2026-09-06):** Request 55 and the fixed v0.7.3 release are
-complete. S0A is implemented in PR #955 against
-[`docs/impl/35-startup-observation-design.md`](docs/impl/35-startup-observation-design.md).
-The exact S0B current-decision observation extension is implemented against
-[`docs/impl/09-explain-opt.md`](docs/impl/09-explain-opt.md). The next boundary
-is the one bounded consolidation owned by the post-XML sequence below.
+**Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are
+complete. S0A is implemented in PR #955, S0B in PR #959, and the C0 chunks
+decision consolidation in PR #964. V1 replayed the fixed corpus and AI task set
+without a compiler-attributable behavior change and selected exactly one O0
+candidate: direct, stage-free `chunks(...).par_map(...)` virtual range views.
+Its exact safety/ownership matrix, report tuple, and preregistered candidate/
+control gate are in §11 of the post-XML plan. The next boundary is that one O0
+implementation and measured adopt-or-revert decision.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
-reassessment. V0 proposes chunks representation selection as the conditional
-C0 boundary and retains additional nonescaping chunks virtualization as a
-conditional S1 candidate, but neither implementation is approved before its
-required observation and exact owning ledger. `std.time` named formatters,
-cloud packages, and additional transports are paused during this phase. S1–S6
-are not a mandatory backlog.
+reassessment. `std.time` named formatters, cloud packages, additional
+transports, the remaining S1 consumers, and S2–S6 are paused; they are not a
+mandatory backlog.
 
 _Last updated: 2026-09-07._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in

@@ -383,16 +383,14 @@ decoding. It renders only a debug basename that the existing command has
 already admitted, using the lossy and escaping projection fixed below; no text
 crosses a new native or persisted boundary before validation or output.
 
-One lowering-owned site may first receive a general chunks-materialization
-reason and then a more specific immediate-consumer reason. The collector keeps
-exactly one `(HIR-site, kind)` record by a lowering-private site token that is
-discarded before `PlanRecord` publication, and replaces the general reason with
-the specific reason. A duplicate record, missing replacement target, or
-incompatible replacement marks the table malformed. Separate kinds at one
-expression are not duplicates: for example, a materialized `chunks` source and
-the `par_map` consuming it each
-produce their own record. LLVM remarks never suppress plan records, and plan
-records never suppress LLVM remarks.
+Each lowering consumer supplies one exhaustive chunks classification before
+the chunks expression emits MIR. One selector maps that classification to the
+representation and report tuple, which are consumed together; the collector
+never replaces a published decision. A duplicate `(HIR-site, kind)` record
+marks the table malformed. Separate kinds at one expression are not duplicates:
+for example, a materialized or virtual chunks source and the `par_map`
+consuming it each produce their own record. LLVM remarks never suppress plan
+records, and plan records never suppress LLVM remarks.
 
 Located construction also retains one `align_mir`-private certification copy
 of the complete normalized record table and the private catalog-malformed bit.
@@ -429,23 +427,28 @@ diagnostic.
 Every `ArrayChunks` HIR expression whose lowering reaches and consumes its
 representation decision produces exactly one record. A source, chunk-size, or
 enclosing eager operand that terminates before that point produces no record.
-The existing direct-parent special cases remain the complete virtual set; every
-other reached use constructs the existing owned `array<slice<T>>` header array.
+Direct length, direct index, and the selected stage-free explicit-parallel form
+are the complete virtual set; every other reached use constructs the existing
+owned `array<slice<T>>` header array.
 
 | State | Strategy | Reason | Exact condition and rendered explanation |
 |---|---|---|---|
 | `Selected` | `virtual-count` | `direct-len` | Direct receiver of `len`: “the direct `len` consumer needs only the chunk count” |
 | `Selected` | `virtual-index` | `direct-index` | Direct receiver of one index: “the direct index consumer needs only one borrowed subview” |
-| `Selected` | `materialized-headers` | `parallel-consumer` | Immediate source of `par_map`, including direct `par_map(...).sum()`: “the current explicit-parallel consumer reads an owned header array” |
+| `Selected` | `virtual-range-views` | `parallel-consumer` | Immediate, stage-free source of a selected range-kernel `par_map`, including direct `par_map(...).sum()`: “the direct explicit-parallel consumer derives borrowed chunk views in its range kernel” |
+| `Selected` | `materialized-headers` | `parallel-consumer` | Any other immediate source of `par_map`, including a rejected sequential fallback or an admitted prior stage: “this explicit-parallel form still reads an owned header array” |
 | `Selected` | `materialized-headers` | `pipeline-consumer` | Immediate source of any other synchronous pipeline stage or terminal: “the current synchronous pipeline consumer reads an owned header array” |
 | `Selected` | `materialized-headers` | `stored-or-boundary` | Every remaining use, including binding, return, call argument, control-flow value, or aggregate storage: “the chunks value crosses a stored, returned, call, or control-flow boundary” |
 
 Consumer-reason precedence is the table order. `direct-len` and `direct-index`
 are recognized before descending into the child and therefore never emit a
-materialization row. For a materialized expression, `parallel-consumer`
-precedes `pipeline-consumer`, which precedes `stored-or-boundary`. This
-classification changes only the explanation; the existing direct-parent test
-continues to choose representation.
+materialization row. For an immediate `par_map`, its existing form selector
+runs before chunks lowering. Only a selected range form with no prior stage
+chooses `virtual-range-views`; every rejected, sequential, or staged form keeps
+`materialized-headers`. For other materialized expressions,
+`pipeline-consumer` precedes `stored-or-boundary`. The chunks decision returned
+by this table drives both representation and reporting; no consumer repairs a
+published row.
 
 ### Materializing-pipeline donation selector
 
@@ -648,7 +651,7 @@ risk and leaves distinct LLVM-remark behavior unchanged.
 | Formation and validation | Exhaustive enums admit only the three kind tables; `align_mir` alone owns the private certification and catalog-malformed state, Default/unlocated programs are uncertified, located programs (including an empty program) are certified, and downstream crates cannot jointly replace records and proof; state/strategy/reason compatibility, reached-decision presence, total ordering, ordinals, exhaustive source-catalog provenance, spans, derived coordinates, and duplicates validate before LLVM or output | Rust privacy is the compile-time tripwire for external Program construction; unit-level default/located-empty/deletion/field/catalog invalid-record matrix, user/interface/non-HIR interleaving owner, coordinate-corruption matrix, plus an enum/selector coverage tripwire. |
 | Construction | Chunks, donation, and `par_map` helpers return the decision consumed by their existing lowering branch; located mode records that same value | MIR structural positives/negatives for every table row. |
 | Move-in / move-out / source nulling | No Align value or ownership bit enters a record. Donation still transfers/nulls the existing source owner only on `reuse-source-buffer` | Existing `buffer_donate` MIR and execution differential, including bound and escaping results. |
-| Replacement and return | General chunks materialization may be replaced only by the same site's more-specific consumer reason; returning/storing chunks remains materialized | Direct/stored/call/return/control-flow chunks rows and existing lifetime owners. |
+| Replacement and return | The consumer supplies the final chunks classification before emission and no later pass may replace it; returning/storing chunks selects `stored-or-boundary` and remains materialized | Direct/stored/call/return/control-flow chunks rows, a no-replacement structural owner, and existing lifetime owners. |
 | Drop and cleanup | Record vectors are ordinary compiler-owned Rust values; generated cleanup, runtime drops, and early-exit cleanup are unchanged | MIR/object identity plus existing chunks/donation/parallel cleanup tests. |
 | `if`, `match`, `else`, `?`, `map_err`, loops, early exits | A selector whose decision point is reached on any supported control path receives one row; termination during source/stage/terminal formation receives none, and path structure does not duplicate a reached decision or change cleanup | Parameterized located fixture spanning branch/loop/result forms, pre-decision termination at every formation phase, and matching generated MIR. |
 | Malformed/future input | Unknown representation/stage/value shapes select the exact fail-closed rejection/not-applicable row; incompatible internal records fail before stdout | Hand-constructed HIR/MIR boundary owners and invalid-record renderer tests. |

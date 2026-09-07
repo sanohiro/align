@@ -67,6 +67,28 @@ No new probe category was introduced. The implemented `pkg.kv` row reuses an exi
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
+## O0 parallel range-source safety contract (design accepted)
+
+O0 changes no symbol, `RuntimeKey`, declaration shape, attribute, count, or
+fingerprint row. It revises only the compiler-private safety interpretation of
+A39 `align_rt_par_map_reduce` and A46 `align_rt_par_map`. For those two rows,
+`in_buf` may name a compiler-certified immutable source whose physical extent
+is not `count * in_stride`; the pointer and every byte the generated kernel can
+derive from it remain valid until the synchronous call joins. `in_stride` is a
+logical scheduling width; O0 supplies the positive 16-byte slice-header width,
+and the runtime validates that `count * in_stride` fits `isize` as a work-span
+bound without dereferencing the source. The generated kernel must bounds-check
+its source-specific derivation, read only immutable source regions assigned by
+the supplied logical range, write only its disjoint output range, and retain
+neither source nor context.
+
+Ordinary A39/A46 callers continue to satisfy the stronger physical
+`count * in_stride` input-array form. A89 `align_rt_par_map_filter` is outside
+O0 and retains that physical-span requirement. The implementation activates
+this contract by updating both Rust `# Safety` clauses and the input-product
+validation name, with direct ABI owners for opaque A39/A46 sources. Until that
+implementation lands, the shipped Rust safety clauses remain authoritative.
+
 ## core.test child-control extension
 
 The `core.test` design added four compiler-private unkeyed rows while leaving the then-current keyed
