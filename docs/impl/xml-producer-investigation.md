@@ -348,3 +348,38 @@ imported builds with bounded child execution. All 62 owned-tagged, 18 producer,
 23 resource-ownership and 17 XML owners pass. This maps the extracted canonical,
 exact, every-leaf and malformed-graph obligations to executable owners without
 a new safety strategy or a performance claim.
+
+## Request 59 aggregate shell ownership follow-up
+
+Status: candidate implemented and owner-verified. The unchanged align-llm client on Align
+`882ea5d1` passes the original Copy-call regression but rejects `stats_for` when
+it returns a Move record containing owned arrays beside Copy scalar fields read
+from a borrowed input. The scalar reads are valid `Shared` producers; merging
+that access into the record shell incorrectly downgrades the shell from
+`Owned`. This is an implementation correction inside the existing producer
+contract, with no language, MIR, ABI, allocation, or package-format change.
+
+| Cell | Required closure | Owner |
+|---|---|---|
+| Formation and transfer | A materialized local-record shell starts owned after every stored field is readable. Move fields contribute their owned/shared access to that shell; Copy fields validate their source but do not define shell ownership. | Reduced `std_xml` fixture with a borrowed-array calculation plus `array_builder.build()` fields, in whole/per-unit execution. |
+| Branch, replacement, and return | Root stores preserve their source access; field stores, early returns, and joined replacements retain all reaching validation. A valid field store cannot hide an invalid sibling or later store. | Existing producer equation and record-return mutation owners, plus the unchanged align-llm `stats_for` consumer. |
+| Negative ownership | A shared Move field makes the aggregate shared rather than owned; unreadable, unresolved, duplicated, or malformed Move fields still poison it. Only Copy values are validation-only inputs. | Focused malformed-MIR mutation of the aggregate field-store graph and existing `producer_*` owners. |
+| Drop and cleanup | Construction keeps current source nulling, hidden owners, recursive Drop, and return cleanup. The validator change neither synthesizes cleanup nor changes lowering. | Whole/per-unit runtime fixture and existing `resource_ownership` suite. |
+| Publication | Whole-program validation, per-unit interface publication, and imported consumption use the same aggregate rule. | Reduced differential driver owner and align-llm Request 59 targets. |
+
+The author pass must bind shell seeding to an actual valid aggregate field store,
+propagate only recursively Move field access into the shell, retain READ checks
+for every stored field, and preserve selected-field provenance unchanged. No
+benchmark is required because this follow-up makes no performance claim.
+
+Author-side closure: local field-store aggregates seed only their shell as
+`Owned`; recursively Move fields remain ordinary provenance dependencies and
+all fields retain their existing READ validation. Borrow/BorrowMut/Out parameter
+slots keep entry authority and every later store, while root stores continue to
+propagate their source access unchanged. The reduced fixture passes native
+whole/per-unit execution, and its malformed-MIR mutation replaces the owned
+array field with the borrowed input and is rejected in publication, whole, and
+per-unit modes. All 19 `producer_*`, 18 `std_xml`, and 23
+`resource_ownership` owners pass. The unchanged align-llm
+`verification_loop.align` and `alignpack.align` pass their five-unit and
+three-unit per-unit checks, respectively.

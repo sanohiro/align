@@ -89,9 +89,15 @@ Request 54's ELF static-library link failure was also reproduced: automatic
 support libraries now follow every runtime, PGO, capability and user archive;
 the existing libpq closure and Mach-O support list are unchanged. Item 2 of
 `docs/impl/21-build-perf-plan.md` owns that repair (PR #971).
-Request 59's blocking issue #966 is fixed in PR #972. Its canonical Copy projection call repair follows
-`docs/impl/xml-producer-investigation.md`: retain the complete selected storage
-proof while accepting the existing by-value borrowed descriptor representation.
+Request 59's blocking issue #966 was reopened after PR #972 because the unchanged
+align-llm `alignpack.align` consumer exposed a second aggregate-shell producer
+regression on `882ea5d1`. The candidate follow-up is active on
+`agent/request-59-array-builder-return`: local field-store aggregates retain an
+owned shell, Copy fields are validation-only inputs, and recursively Move fields
+still contribute their access. Its 19 producer, 18 XML, and 23 resource owners
+pass, as do align-llm's five-unit `verification_loop.align` and three-unit
+`alignpack.align` per-unit checks. Next: complete one review and preflight, merge
+the Align PR, then let align-llm adopt the merge commit.
 Request 60 (#968), merged in PR #973, owns an explicit absolute C-driver option for closed-environment
 builds across build/run/size/test, ThinLTO, PGO, and watch. Item 2 of
 `docs/impl/21-build-perf-plan.md` records its exact selection and validation

@@ -1,0 +1,20 @@
+module producer_copy_field
+
+Summary { count: i64, values: array<i64> }
+
+fn summarize(borrow input: array<i64>) -> Summary {
+  mut values: array_builder<i64> := array_builder()
+  mut count := 0
+  count = count + input[0]
+  values.push(7)
+  return Summary { count: count, values: values.build() }
+}
+
+pub fn exercise() -> i32 {
+  input := [1, 2, 3].to_array()
+  summary := summarize(input)
+  if summary.count != 1 { return 1 }
+  if summary.values.len() != 1 { return 2 }
+  if summary.values[0] != 7 { return 3 }
+  return 0
+}

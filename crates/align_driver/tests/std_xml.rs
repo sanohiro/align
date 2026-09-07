@@ -5,6 +5,34 @@ mod common;
 use common::*;
 
 #[test]
+fn producer_certification_accepts_owned_record_with_borrowed_copy_field() {
+    if !backend_available() {
+        return;
+    }
+    let source = fixture(
+        "crates/align_driver/tests/fixtures/producer_owned_record_with_borrowed_copy_field.align",
+    );
+    let entry = "import producer_copy_field\nfn main() -> i32 = producer_copy_field.exercise()\n";
+    let files = &[("producer_copy_field.align", source), ("main.align", entry)];
+
+    let whole = build_and_run_multi("producer-copy-field-whole", files, "main.align");
+    assert_eq!(
+        whole.status.code(),
+        Some(0),
+        "whole-program stderr:\n{}",
+        String::from_utf8_lossy(&whole.stderr)
+    );
+    let per_unit = build_per_unit_multi("producer-copy-field-per-unit", files, "main.align")
+        .link_and_run();
+    assert_eq!(
+        per_unit.status.code(),
+        Some(0),
+        "per-unit stderr:\n{}",
+        String::from_utf8_lossy(&per_unit.stderr)
+    );
+}
+
+#[test]
 fn producer_certification_accepts_owned_builder_record_after_copy_projection_call() {
     if !backend_available() {
         return;

@@ -5576,6 +5576,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
+    /// Validate a value stored into an owning aggregate. Copy members need only be readable;
+    /// recursively Move members contribute their access to the destination shell.
+    fn check_aggregate_store(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        self.check_whole_operand(equation, operand, expected);
+        if align_sema::ty_is_move(
+            expected,
+            &self.graph.program.structs,
+            &self.graph.program.tuples,
+            &self.graph.program.enums,
+            &self.graph.program.tagged_types,
+        ) {
+            self.add_operand(equation, operand, expected, Vec::new());
+        }
+    }
+
     fn check_template_piece(
         &mut self,
         equation: &mut XmlAccessEquation,
@@ -9721,13 +9741,29 @@ impl<'a> XmlAccessAnalyzer<'a> {
         // Borrow parameters alias caller storage at function entry; unlike by-value
         // locals, LLVM does not wait for an explicit MIR Store to initialize them.
         // Keep every later store as a dependency so this seed cannot hide corruption.
-        if let Some(parameter) = self.graph.function.params.iter().position(|candidate| *candidate == slot)
-            && matches!(self.graph.function.param_modes.get(parameter),
-                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut))
-            && let Ok(parameter) = u32::try_from(parameter)
+        let parameter = self
+            .graph
+            .function
+            .params
+            .iter()
+            .position(|candidate| *candidate == slot);
+        let parameter_mode =
+            parameter.and_then(|parameter| self.graph.function.param_modes.get(parameter).copied());
+        if matches!(
+            parameter_mode,
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        ) && let Some(parameter) = parameter.and_then(|parameter| u32::try_from(parameter).ok())
         {
             equation.seed = Some(xml_argument_access(self.graph.function, parameter));
         }
+        let owns_aggregate_shell = !matches!(
+            parameter_mode,
+            Some(
+                align_ast::ParamMode::Borrow
+                    | align_ast::ParamMode::BorrowMut
+                    | align_ast::ParamMode::Out
+            )
+        );
         let (Some(root_stores), Some(field_stores)) = (
             self.graph.slot_stores.roots.get(slot as usize),
             self.graph.slot_stores.fields.get(slot as usize),
@@ -9827,16 +9863,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
-            self.check_whole_operand(&mut equation, &operand, stored_ty);
-            if path.is_empty() {
-                self.add_operand(&mut equation, &operand, stored_ty, Vec::new());
+            if path.is_empty() && owns_aggregate_shell {
+                self.check_aggregate_store(&mut equation, &operand, stored_ty);
+                equation.seed = merge_xml_access(
+                    equation.seed,
+                    XmlAccessProvenance::Owned,
+                );
             } else if path.starts_with(&stored_path) {
+                self.check_whole_operand(&mut equation, &operand, stored_ty);
                 self.add_operand(
                     &mut equation,
                     &operand,
                     selected_ty,
                     path[stored_path.len()..].to_vec(),
                 );
+            } else {
+                self.check_whole_operand(&mut equation, &operand, stored_ty);
             }
         }
         let element_path = path
@@ -35256,6 +35298,49 @@ fn main() -> i32 = 0
                 assert_xml_producer_rejected(&program, "unseeded Copy-view/call/slot cycle");
             }
         }
+    }
+
+    #[test]
+    fn producer_aggregate_shell_requires_owned_move_fields() {
+        let base = mir(
+            "Cursor { total: i64 }\n\
+             Summary { count: i64, values: array<i64> }\n\
+             fn touch(borrow mut cursor: Cursor) { cursor.total = cursor.total + 1 }\n\
+             fn scan(borrow input: array<i64>) {\n\
+               mut cursor := Cursor { total: 0 }\n\
+               cursor.total = cursor.total + input[0]\n\
+               touch(cursor)\n\
+             }\n\
+             fn summarize(borrow input: array<i64>) -> Summary {\n\
+               mut values: array_builder<i64> := array_builder()\n\
+               mut count := 0\n\
+               count = count + input[0]\n\
+               values.push(7)\n\
+               return Summary { count: count, values: values.build() }\n\
+             }\n\
+             fn main() -> i32 = 0\n",
+        );
+        assert!(validate_mir_producers(&base).is_ok(), "publication");
+        assert!(validate_resource_rvalues(&base).is_ok(), "whole");
+        assert!(validate_thin_partition_program(&base, &[]).is_ok(), "per-unit");
+
+        let mut shared_move_field = base;
+        let owner = xml_test_function(&shared_move_field, "summarize");
+        let function = &mut shared_move_field.fns[owner];
+        let mut changed = false;
+        for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+            if let Stmt::StoreField(_, path, operand) = statement
+                && path.as_slice() == [1]
+            {
+                *operand = Operand::Arg(0);
+                changed = true;
+            }
+        }
+        assert!(changed, "aggregate owner fixture omitted its Move field store");
+        assert_xml_producer_rejected(
+            &shared_move_field,
+            "shared Move field cannot authenticate an owned aggregate shell",
+        );
     }
 
     #[test]
