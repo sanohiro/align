@@ -460,16 +460,20 @@ template with distinct equal-length baseline/candidate export prefixes,
 co-links both objects with one `alloc-count` runtime, and calls them in one
 process over the same runtime-generated `slice<i64>`. The source exports both
 direct `chunks(width).par_map(chunk_sum)` materialization with a full-output
-checksum and direct `.sum()` reduction. Input length is 1,048,579 to cover partial tails;
-widths are 1, 8, 64, and 1,024. Each arm warms once, then runs 21 paired samples
-in alternating AB/BA order. Retain every sample; report median candidate/base
-ratio and p10–p90 without post-hoc outlier deletion.
+checksum and direct `.sum()` reduction. Input length is 1,048,579 to cover
+partial tails; widths are 1, 8, 64, and 1,024. The driver uses two fresh
+subprocess modes over the same executable and co-linked runtime. The timing
+process never calls
+`align_rt_requested_live_reset`: each arm warms once, then runs 21 paired
+samples in alternating AB/BA order. Retain every sample; report median
+candidate/base ratio and p10–p90 without post-hoc outlier deletion.
 
-Resource-probe invocations are serialized: after warmup and with no parallel
-call active, reset the requested-live probe and sample counter deltas around
-exactly one synchronous exported call. The primary resource gate is exact: for
-each invocation the candidate removes one successful allocation and one non-
-null free, remains balanced, and reduces peak requested live bytes by exactly
+The separate resource process performs no timed sample. Its probe invocations
+are serialized: after warmup and with no parallel call active, reset the
+requested-live probe and sample counter deltas around exactly one synchronous
+exported call. The primary resource gate is exact: for each invocation the
+candidate removes one successful allocation and one non-null free, remains
+balanced, and reduces peak requested live bytes by exactly
 `16 * ceil(input_length / width)` relative to the matching baseline arm.
 Results must be byte/value identical for every row. The primary timing gate is
 the width-1 reduction median candidate/base ratio at most 0.90. Guard timing
