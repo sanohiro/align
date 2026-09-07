@@ -78,8 +78,13 @@ without a compiler-attributable behavior change and selected exactly one O0
 candidate: direct, stage-free `chunks(...).par_map(...)` virtual range views.
 Its implementation follows the exact safety/ownership matrix and adds no
 runtime ABI symbol. The preregistered semantic, allocation, object-size, and
-timing gates passed, so §11 records O0 as adopted. The next boundary is the V1
-phase-close reassessment against §9; it does not select another optimization.
+timing gates passed, so §11 records O0 as adopted in PR #967. V1's §12
+phase-close reassessment satisfies §9 and closes the post-XML wave. The next
+task is to reproduce align-llm Request 52's owned-record Option `match` followed
+by re-encoding on current Align, compare borrowed inspection and Copy/Move
+payloads against the existing ownership contract, and select a repair only
+from the result. Its historical persisted-field-loss report is not yet a
+confirmed current defect; align-llm consumer changes remain outside this work.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->

@@ -1,12 +1,12 @@
 # Post-XML consolidation plan
 
-> **Status:** ACTIVE. V0, S0A (PR #955), S0B (PR #959), C0 (PR #964), and the
-> V1 corpus/AI replay are complete. V1 selects one bounded O0 implementation in
-> §11; the phase closes after its evidence disposition.
+> **Status:** COMPLETE. V0, S0A (PR #955), S0B (PR #959), C0 (PR #964), and
+> V1 are complete. O0 is adopted in PR #967 against §11's preregistered gates.
+> Section 12 records the phase-close reassessment.
 >
-> **First executable task:** implement §11's direct explicit-parallel virtual
-> chunks source, run its preregistered candidate/control probe, and adopt it or
-> revert it from the measured result.
+> **Next task:** reproduce align-llm Request 52's owned-record Option inspection
+> and re-encoding report on current Align, then classify it against the existing
+> ownership contract before selecting a repair.
 
 ## 1. Purpose and authority
 
@@ -520,3 +520,34 @@ guard. Timing used the production runtime without `alloc-count`; resource
 measurement used a separate instrumented binary. Semantic owners and the
 optimized-LLVM no-materializer proof also passed, so O0 is adopted; no
 replacement optimization is selected.
+
+## 12. V1 phase-close reassessment — 2026-09-07
+
+The wave satisfies §9. This disposition reuses completed evidence; it does not
+claim a new corpus replay on the O0 merge or a new distribution qualification.
+
+| Exit condition | Evidence and disposition |
+|---|---|
+| Preserved identities and comparisons | `/home/hiro/prj/align-v0-20260906/V0.md` and `/home/hiro/prj/align-v1-20260907/V1.md` retain release/source identities, R0–R5 raw results, and comparison limits. V1's corpus candidate is C0 merge `6a645c413b6dabdd04682620de3db2d6da43ed97`; O0 merge is `c2bb765554ffa4e1bf06ec26e97fa1c2d971c21f`. |
+| C0 authority and closure | PR #964 closes §10's chunks decision producer and its consumers while preserving validators and materialization fallbacks. Its owner checks and required CI passed. |
+| Changed-boundary correctness | V1's R0–R5 replay passed. O0's semantic and structural owners and required Linux x86-64, Linux ARM64, and macOS CI passed in PR #967. No new unresolved defect was identified in these changed boundaries. |
+| Resource guards and O0 disposition | All eight §11.4 resource and timing rows and the object-size guard passed; O0 is adopted. The result is local Linux source-build evidence, not a cross-platform speed guarantee. |
+| AI pilot | All 16 saved V0 attempts have identical outcomes on baseline and C0. Fresh sources also have identical outcomes when cross-replayed; the fresh 1/6 versus 5/6 score is model variation, not a compiler improvement. |
+| Remaining work | The owner/action table below records deferred candidates and the next concrete consumer. No additional optimization is selected. |
+
+| Candidate | Owner | Evidence-based next action |
+|---|---|---|
+| Remaining S1 consumers | Plan 31 S1 and the MIR chunks selector | Retain current fallbacks; admit another consumer only after a distinct residual materialization cost and its ownership boundary are demonstrated. |
+| S2 scratch frames | Plan 31 S2 and allocation owners | Await a measured eligible fixed-scratch allocation cluster. |
+| S3 runtime partition | Plan 31 S3 and build/runtime ABI owners | Use S0A dependency/startup observations to establish a concrete unnecessary closure before selecting a partition. |
+| S4 scheduling domains | Plan 31 S4 and parallel runtime owners | Await a real mixed CPU/blocking workload and transitive blocking evidence. |
+| S5 mapped artifacts | Plan 31 S5 and the first repeated-parse consumer | Specify the consumer's artifact and lifetime contract when that consumer is selected. |
+| S6 profile selection | Plan 31 S6 and selector owners | Await a measured decision that static facts cannot choose adequately. |
+| Named time formatters, cloud packages, additional transports | Their library/package design owners | Remain paused; phase completion alone supplies no consumer selection. |
+| Owned-record Option inspection | Align semantic/MIR ownership owners; align-llm Request 52 supplies the report | Reproduce direct owned-field `match` followed by `json.encode` on current Align, compare borrowed inspection, and classify Copy and Move payload behavior against the settled ownership rules. Consumer adoption remains align-llm-owned. |
+
+Request 52 reports persisted-field loss in real artifact rewriting and therefore
+takes priority over another speculative optimization or library expansion. Its
+historical report is not evidence of a current defect until reproduced. The
+investigation must preserve the current partial-move and borrow rules; any
+repair follows its own owner matrix and normal review/verification flow.
