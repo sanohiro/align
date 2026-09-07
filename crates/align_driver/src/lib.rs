@@ -8801,11 +8801,6 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     if profile.strip() && format == ObjectFormat::Elf {
         args.push("-Wl,--strip-all".into());
     }
-    // The always-linked support libraries, per format (`support_libs`): on ELF,
-    // `libpthread`/`libdl`/`libm` are Rust-std support libraries the runtime *core* may reference
-    // (threads, dlopen, math) independent of any Align feature — NOT capability-gated. On Mach-O
-    // all three are libSystem re-exports, so the list is empty.
-    args.extend(support_libs(format).iter().map(std::ffi::OsString::from));
     // Instrument-PGO (`--pgo-instrument`): append the clang profile runtime archive and force the
     // `__llvm_profile_runtime` anchor undefined so its atexit `.profraw` writer is pulled from the
     // archive (see [`link_objects_instrumented`]). Placed AFTER the objects/archive that (indirectly)
@@ -8829,6 +8824,10 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     // by `order_link_libs` before this call. Each name is a single `-l<name>` argv (no
     // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
     args.extend(ordered_link_libs.iter().map(|lib| std::ffi::OsString::from(format!("-l{lib}"))));
+    // Runtime, PGO, capability, and user archives can all introduce support-library references.
+    // Resolve them after every archive, including the libpq closure tail. On Mach-O these are
+    // libSystem re-exports, so the automatic list remains empty.
+    args.extend(support_libs(format).iter().map(std::ffi::OsString::from));
     args
 }
 
@@ -9915,10 +9914,10 @@ mod tests {
                 "/tmp/prog",
                 "-Wl,--gc-sections",
                 "-Wl,--as-needed",
+                "-lz",
                 "-lpthread",
                 "-ldl",
                 "-lm",
-                "-lz",
             ]
         );
 
@@ -9955,12 +9954,12 @@ mod tests {
                 "-Wl,--gc-sections",
                 "-Wl,--as-needed",
                 "-Wl,--strip-all",
-                "-lpthread",
-                "-ldl",
-                "-lm",
                 "/tmp/libclang_rt.profile.a",
                 "-Wl,--undefined=__llvm_profile_runtime",
                 "-lz",
+                "-lpthread",
+                "-ldl",
+                "-lm",
             ]
         );
     }
