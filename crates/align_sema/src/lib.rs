@@ -39302,6 +39302,18 @@ impl<'a> MoveCheck<'a> {
                     }
                     return;
                 }
+                ExprKind::Field { path, .. }
+                    if path.len() > 1 && self.is_move_ty(expression.ty) =>
+                {
+                    // Deferred constructor/call operands obey the same nested-field restriction
+                    // as immediate consuming expressions. No supported source-nulling operation
+                    // exists for this path, so a completed action must not silently accept it.
+                    self.diags.error(
+                        "moving an owned field out through a nested path is not supported yet — clone it".to_string(),
+                        expression.span,
+                    );
+                    return;
+                }
                 ExprKind::ElemField {
                     recv, index, path, ..
                 } if !path.is_empty() => {
