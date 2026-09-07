@@ -11161,7 +11161,7 @@ fn run_body_analysis_passes(
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&f.body),
+            borrowed_projection_owners: borrowed_projection_owners(&f.body),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -11181,7 +11181,7 @@ fn run_body_analysis_passes(
                 drop_individual: std::collections::HashMap::new(),
                 drop_individual_exprs: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
-                borrowed_projection_locals: borrowed_projection_locals(&f.body),
+                borrowed_projection_owners: borrowed_projection_owners(&f.body),
                 task_group_regions: Vec::new(),
                 allocation_regions: Vec::new(),
                 allocation_region_by_expr: std::collections::HashMap::new(),
@@ -12885,7 +12885,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -18490,7 +18490,7 @@ struct EscapeCheck<'a> {
     /// Locals introduced as read-only projections of a borrowed sum payload. They are aliases for
     /// caller-owned storage, not frame-owned bindings, so an auto-borrow of one must retain the
     /// borrowed root's returnable lifetime.
-    borrowed_projection_locals: std::collections::HashSet<LocalId>,
+    borrowed_projection_owners: HashMap<LocalId, LocalId>,
     /// Compact checked-HIR CFG built before solving escape state.
     flow: EscapeFlowCfg<'a>,
     /// Block currently receiving lowered escape operations.
@@ -18777,7 +18777,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::BorrowedIndex { base, .. } => base.root_local,
             _ => return false,
         };
-        if self.borrowed_projection_locals.contains(&root) {
+        if self.borrowed_projection_owners.contains_key(&root) {
             return true;
         }
         self.f
@@ -18804,8 +18804,8 @@ impl<'a> EscapeCheck<'a> {
     /// binding may itself produce a fresh owned value and still needs ordinary tracking.
     fn is_borrowed_projection_place(&self, expression: &Expr) -> bool {
         match &expression.kind {
-            ExprKind::Local(local) => self.borrowed_projection_locals.contains(local),
-            ExprKind::Field { root, .. } => self.borrowed_projection_locals.contains(root),
+            ExprKind::Local(local) => self.borrowed_projection_owners.contains_key(local),
+            ExprKind::Field { root, .. } => self.borrowed_projection_owners.contains_key(root),
             _ => false,
         }
     }
@@ -19999,6 +19999,7 @@ impl<'a> EscapeCheck<'a> {
 
     fn escape_place_fallback_roots(&self, expression: &Expr) -> BorrowRoots {
         let local_root = |local: LocalId| {
+            let local = self.borrowed_projection_owners.get(&local).copied().unwrap_or(local);
             self.f
                 .params
                 .iter()
@@ -20559,12 +20560,14 @@ impl<'a> EscapeCheck<'a> {
             && matched_projected_candidate
             && !generations.is_empty();
         if known {
-            fallback_roots.clear();
+            fallback_roots = opaque_handle_fallback_roots(
+                &fallback_roots, self.f, self.storage_type_context(),
+            );
         }
         StorageHeaderLeaf {
             generations,
             descriptor: Some(descriptor),
-            known,
+            known: known && fallback_roots.is_empty(),
             fallback_roots,
         }
     }
@@ -20855,7 +20858,9 @@ impl<'a> EscapeCheck<'a> {
                             source.content_ended.is_empty()
                                 && source.content_unknown.is_empty()
                         }) {
-                            fallback_roots.clear();
+                            fallback_roots = opaque_handle_fallback_roots(
+                                &fallback_roots, self.f, self.storage_type_context(),
+                            );
                             value.non_storage = value.non_storage.join(
                                 &EscapeRegionFact::at_path(
                                     &result.path,
@@ -28407,7 +28412,7 @@ struct MoveCheck<'a> {
     /// Locals introduced as read-only projections of a borrowed sum payload. These locals are
     /// initialized per arm but never own an independent value, so any consuming use must be
     /// rejected and no Drop slot may be derived for them.
-    borrowed_projection_locals: std::collections::HashSet<LocalId>,
+    borrowed_projection_owners: HashMap<LocalId, LocalId>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -29138,6 +29143,75 @@ struct StorageTypeContext<'a> {
     tuples: &'a [hir::TupleDef],
     enums: &'a [hir::EnumDef],
     tagged_types: &'a [hir::TaggedType],
+}
+
+/// Inline handles own storage not described by slice/array generation headers. Do not walk
+/// through collection headers: their allocation generation already owns their elements.
+fn has_inline_handle_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    let mut work = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !seen.insert(ty) {
+            continue;
+        }
+        match expand_tagged_ty(ty, context.tagged_types) {
+            Ty::Buffer | Ty::Writer => return true,
+            Ty::Struct(id) => {
+                if let Some(definition) = context.structs.get(id as usize) {
+                    work.extend(definition.fields.iter().map(|field| field.ty));
+                }
+            }
+            Ty::Tuple(id) => {
+                if let Some(definition) = context.tuples.get(id as usize) {
+                    work.extend(definition.elems.iter().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Enum(id) => {
+                if let Some(definition) = context.enums.get(id as usize) {
+                    work.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .flat_map(|variant| variant.payload.iter().copied().map(scalar_to_ty)),
+                    );
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(ok));
+                work.push(scalar_to_ty(err));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+// Compatible sibling headers do not certify an opaque handle's allocation identity.
+fn opaque_handle_fallback_roots(
+    roots: &BorrowRoots,
+    function: &Fn,
+    context: StorageTypeContext<'_>,
+) -> BorrowRoots {
+    roots
+        .iter()
+        .filter(|root| {
+            let local = match root {
+                BorrowRoot::Local(local) | BorrowRoot::EndedLocal(local, _) => Some(*local),
+                BorrowRoot::Param(position)
+                | BorrowRoot::ParamStorage(position)
+                | BorrowRoot::EndedParam(position, _)
+                | BorrowRoot::EndedParamStorage(position, _) => {
+                    function.params.get(*position as usize).copied()
+                }
+                _ => None,
+            };
+            local
+                .and_then(|local| function.locals.get(local as usize))
+                .is_some_and(|local| has_inline_handle_storage(local.ty, context))
+        })
+        .cloned()
+        .collect()
 }
 
 fn storage_type_paths(root: Ty, context: StorageTypeContext<'_>) -> StorageTypePaths {
@@ -31797,6 +31871,25 @@ fn clear_moved(moved: &mut MovedSet, id: LocalId) {
     });
 }
 
+/// Checked borrowed bindings retain the complete source root even when their type has no header.
+fn borrowed_projection_owners(body: &hir::Block) -> HashMap<LocalId, LocalId> {
+    let mut owners = HashMap::new();
+    for event in hir_depth::body_events(body) {
+        if let hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } = event {
+            let root = match &scrutinee.kind {
+                ExprKind::Local(local) | ExprKind::Field { root: local, .. } => *local,
+                _ => continue,
+            };
+            owners.extend(
+                arm.borrowed_bindings
+                    .iter()
+                    .map(|projection| (projection.binding_local, root)),
+            );
+        }
+    }
+    owners
+}
+
 fn borrowed_projection_locals(body: &hir::Block) -> std::collections::HashSet<LocalId> {
     let mut locals = std::collections::HashSet::new();
     for event in hir_depth::body_events(body) {
@@ -34331,12 +34424,25 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn stable_owner_root(&self, local: LocalId) -> BorrowRoot {
+        let owner = self.borrowed_projection_owners.get(&local).copied().unwrap_or(local);
+        self.borrowed_param_position(owner)
+            .map_or(BorrowRoot::Local(owner), BorrowRoot::ParamStorage)
+    }
+
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         if let Some(headers) = self.borrows.headers.get(&id) {
-            return self.borrows.resolve_headers(headers).non_storage.live_roots();
+            let mut roots = self.borrows.resolve_headers(headers).non_storage.live_roots();
+            if self.f.locals.get(id as usize).is_some_and(|local| {
+                has_inline_handle_storage(local.ty, self.storage_type_context())
+            }) {
+                roots.insert(self.stable_owner_root(id));
+            }
+            return roots;
         }
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
-        if self.borrowed_projection_locals.contains(&id) {
+        if self.borrowed_projection_owners.contains_key(&id) {
+            roots.insert(self.stable_owner_root(id));
             return roots;
         }
         let region_param = self
@@ -34578,6 +34684,10 @@ impl<'a> MoveCheck<'a> {
                 let headers = self.local_headers(*root).project_path(&projection);
                 if headers.leaves.is_empty() {
                     roots.extend(self.local_storage_roots(*root));
+                    // Sibling headers cannot represent an opaque handle field's own storage.
+                    if self.is_move_ty(e.ty) {
+                        roots.insert(self.stable_owner_root(*root));
+                    }
                 } else {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
                 }
@@ -35441,8 +35551,10 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.known = true;
-                        leaf.fallback_roots.clear();
+                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                            &leaf.fallback_roots, self.f, self.storage_type_context(),
+                        );
+                        leaf.known = leaf.fallback_roots.is_empty();
                     }
                     unknown.leaves.insert(header.path, leaf);
                     return None;
@@ -35618,8 +35730,10 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.known = true;
-                        leaf.fallback_roots.clear();
+                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                            &leaf.fallback_roots, self.f, self.storage_type_context(),
+                        );
+                        leaf.known = leaf.fallback_roots.is_empty();
                     }
                 }
                 unknown.leaves.insert(
@@ -39251,7 +39365,7 @@ impl<'a> MoveCheck<'a> {
         loop {
             match &expression.kind {
                 ExprKind::Local(id) if self.is_move(*id) => {
-                    if self.borrowed_projection_locals.contains(id) {
+                    if self.borrowed_projection_owners.contains_key(id) {
                         self.diags.error(
                             "cannot move a borrowed match payload projection".to_string(),
                             expression.span,
@@ -39310,7 +39424,7 @@ impl<'a> MoveCheck<'a> {
                                 )
                         )
                     {
-                        if self.borrowed_projection_locals.contains(root) {
+                        if self.borrowed_projection_owners.contains_key(root) {
                             self.diags.error(
                                 "cannot move a field out of a borrowed match payload projection"
                                     .to_string(),
@@ -42700,18 +42814,13 @@ impl<'a> MoveCheck<'a> {
                     false,
                     arm_moves_payload && !borrowed,
                 );
-                let mut fact = self.match_binding_fact(
+                let fact = self.match_binding_fact(
                     scrutinee.ty,
                     &scrutinee_fact,
                     arm,
                     binding_index,
                     *binding,
                 );
-                // Opaque borrowed handles have no storage-header leaf. Their views still borrow
-                // the scrutinee's storage, never an independent match-binding owner.
-                if borrowed && !self.borrows.headers.contains_key(binding) {
-                    fact.direct.extend(scrutinee_storage_roots.iter().cloned());
-                }
                 self.assign_completed_borrow_fact(
                     *binding,
                     fact,
@@ -42766,7 +42875,7 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     self.check_borrow_use(*id, e.span);
                     if consuming && self.is_move(*id) {
-                        if self.borrowed_projection_locals.contains(id) {
+                        if self.borrowed_projection_owners.contains_key(id) {
                             self.diags.error(
                                 "cannot move a borrowed match payload projection".to_string(),
                                 e.span,
@@ -42832,7 +42941,7 @@ impl<'a> MoveCheck<'a> {
                             || matches!(e.ty, Ty::Resource(_))
                             || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
-                        if self.borrowed_projection_locals.contains(base) {
+                        if self.borrowed_projection_owners.contains_key(base) {
                             self.diags.error(
                                 "cannot move a field out of a borrowed match payload projection"
                                     .to_string(),
@@ -71516,7 +71625,7 @@ fn main() -> i32 = 0
                     borrow_fact_cache: std::cell::RefCell::new(None),
                     collecting_move_children: false,
                     move_children: Vec::new(),
-                    borrowed_projection_locals: borrowed_projection_locals(&function.body),
+                    borrowed_projection_owners: borrowed_projection_owners(&function.body),
                 }
             }};
         }
@@ -73916,7 +74025,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
@@ -74252,7 +74361,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
-            borrowed_projection_locals: borrowed_projection_locals(&function.body),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
         };
         assert!(
             checker.intentional_action_snapshot(call, MoveCheck::expr_key(&args[0])),

@@ -88,9 +88,8 @@ frame-owned buffers, consistently with `borrowed_storage_cap`. Investigation
 also found that a byte-view header could retain parameter fallback roots without
 a legacy source-map entry; `BorrowState::invalidate_matching` now observes the
 resolved header roots for locals, eager value snapshots and pipeline snapshots.
-Borrowed handle match bindings also retain scrutinee storage fallback roots when
-there is no storage-header leaf; a binding never becomes an independent source
-owner. The parameterized invalidation owner covers `Option`, `Result` and user
+Borrowed handle match bindings retain an explicit map to their original scrutinee
+root; a binding never becomes an independent source owner. The parameterized invalidation owner covers `Option`, `Result` and user
 sums as well as returned, retained and indirectly returned views. Neither change
 invents ownership, mutates generation identity or skips root exclusions.
 
@@ -131,3 +130,30 @@ resource provenance coverage. The pre-change release compiler separately
 reproduces `borrowed_params::owned_string_array_index_is_a_non_consuming_str_view`'s
 `projected` producer-certification failure; this unrelated existing failure is
 not claimed fixed by Request 61.
+
+## Reopened axis: mixed header and opaque-handle ownership
+
+The preflight review found that a sibling slice header could hide the complete
+owner of a buffer/writer field. Header identity and opaque-handle ownership are
+orthogonal: an absent field header cannot inherit only its siblings' headers.
+Preserve an explicit checked match-binding-to-source-root map in both semantic
+analyses. A headerless Move receiver uses its original stable owner in addition
+to existing contained provenance; projected storage headers retain their existing
+path-specific generation tracking. Inline buffer/writer fields are identified
+through a cycle-safe struct/tuple/sum traversal that stops at collection headers.
+Returned-view candidate matching in both analyses retains opaque owner fallback
+roots: a compatible sibling slice is not a proof of the handle's identity.
+This changes no HIR/interface/runtime record.
+
+| Mixed-owner cell | Implementation and owner |
+|---|---|
+| Direct and nested buffer plus static slice sibling | Stable opaque field owner root; returned view rejects after containing-owner replacement. |
+| Borrowed match buffer/record with slice sibling | Checked projection root map, never a match-local owner; Option/Result/user-sum positive and invalidation twins. |
+| Writer plus slice sibling, eager mutation | Same stable receiver root survives later argument evaluation; owner replacement rejects before the I/O action. |
+| Dynamic-header sibling precision | Existing field-specific headers keep their own generations; the fallback applies only when the selected Move field has no header. |
+
+`mixed_handle_fields_keep_the_complete_owner` and the parameterized
+`borrowed_buffer_views_follow_optional_array_and_generic_sources` /
+`borrowed_handle_projections_reject_consumption_and_escape` owners cover these mixed layouts on
+whole-program and per-unit paths. The review's P1 is repaired as one ownership
+root class; one fresh review of this redesigned fallback axis is required.

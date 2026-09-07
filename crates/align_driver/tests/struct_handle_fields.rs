@@ -303,72 +303,82 @@ fn main() -> Result<(), Error> {
 
 #[test]
 fn borrowed_handle_projections_reject_consumption_and_escape() {
-    let prelude = r#"
+    for mixed in [false, true] {
+        let prelude = r#"
 Holder { sink: Option<writer>, data: buffer }
 fn take(sink: writer) {}
 fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffer(1) } }
 "#;
-    for (name, body) in [
-        (
-            "return",
-            "fn bad(borrow holder: Holder) -> writer { match holder.sink { Some(sink) => { return sink }, None => {} }; loop {} }",
-        ),
-        (
-            "consume",
-            "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { take(sink) }, None => {} } }",
-        ),
-        (
-            "join",
-            "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := if true { sink } else { sink }; take(value) }, None => {} } }",
-        ),
-        (
-            "store",
-            "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := Holder { sink: Some(sink), data: buffer(1) } }, None => {} } }",
-        ),
-        (
-            "capture",
-            "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { callback := fn() { result := sink.flush() } }, None => {} } }",
-        ),
-        (
-            "alias",
-            "fn bad(borrow holder: Holder) { data := holder.data }",
-        ),
-        (
-            "replace",
-            "fn bad(borrow mut holder: Holder) { view := holder.data.bytes(); change(holder); print(view.u8(0)) }",
-        ),
-        (
-            "arg_replace",
-            "fn bad(borrow mut holder: Holder) -> Result<(), Error> { match holder.sink { Some(sink) => { sink.write({ change(holder); \"bad\" })? }, None => {} }; return Ok(()) }",
-        ),
-        (
-            "local_return",
-            "fn bad() -> slice<u8> { holder := Holder { sink: None, data: buffer(1) }; return holder.data.bytes() }",
-        ),
-        (
-            "exclusive_field",
-            "fn fill(borrow mut data: buffer) { data.put_u8(0) }\nfn bad(borrow mut holder: Holder) { fill(holder.data) }",
-        ),
-    ] {
-        let source = format!("{prelude}\n{body}\nfn main() {{}}\n");
-        let checked = diff_check_multi(
-            &format!("borrowed-handle-{name}"),
-            &[("main.align", source.as_str())],
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{name} must reject on both paths; whole:\n{}\nper-unit:\n{}",
-            checked.whole_diags,
-            checked.per_unit_diags
-        );
+        for (name, body) in [
+            (
+                "return",
+                "fn bad(borrow holder: Holder) -> writer { match holder.sink { Some(sink) => { return sink }, None => {} }; loop {} }",
+            ),
+            (
+                "consume",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { take(sink) }, None => {} } }",
+            ),
+            (
+                "join",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := if true { sink } else { sink }; take(value) }, None => {} } }",
+            ),
+            (
+                "store",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { value := Holder { sink: Some(sink), data: buffer(1) } }, None => {} } }",
+            ),
+            (
+                "capture",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { callback := fn() { result := sink.flush() } }, None => {} } }",
+            ),
+            (
+                "alias",
+                "fn bad(borrow holder: Holder) { data := holder.data }",
+            ),
+            (
+                "replace",
+                "fn bad(borrow mut holder: Holder) { view := holder.data.bytes(); change(holder); print(view.u8(0)) }",
+            ),
+            (
+                "arg_replace",
+                "fn bad(borrow mut holder: Holder) -> Result<(), Error> { match holder.sink { Some(sink) => { sink.write({ change(holder); \"bad\" })? }, None => {} }; return Ok(()) }",
+            ),
+            (
+                "local_return",
+                "fn bad() -> slice<u8> { holder := Holder { sink: None, data: buffer(1) }; return holder.data.bytes() }",
+            ),
+            (
+                "exclusive_field",
+                "fn fill(borrow mut data: buffer) { data.put_u8(0) }\nfn bad(borrow mut holder: Holder) { fill(holder.data) }",
+            ),
+        ] {
+            let source = format!("{prelude}\n{body}\nfn main() {{}}\n");
+            let source = if mixed {
+                source
+                    .replace("data: buffer }", "data: buffer, extra: slice<u8> }")
+                    .replace("data: buffer(1) }", "data: buffer(1), extra: [] }")
+            } else {
+                source
+            };
+            let checked = diff_check_multi(
+                &format!("borrowed-handle-{name}"),
+                &[("main.align", source.as_str())],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{name} must reject on both paths; whole:\n{}\nper-unit:\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
     }
 }
 
 #[test]
 fn borrowed_buffer_views_follow_optional_array_and_generic_sources() {
-    let helper = r#"module views
-pub Item<T> { data: T }
+    for mixed in [false, true] {
+        let helper_template = r#"module views
+pub Item<T> { data: T, extra: slice<u8> }
 pub Rows { items: Option<array<Item<buffer>>> }
 pub View { data: slice<u8> }
 pub fn bytes(borrow item: Item<buffer>) -> slice<u8> = item.data.bytes()
@@ -391,63 +401,81 @@ pub fn retain(borrow item: Item<buffer>, borrow mut result: View) {
 }
 pub fn identity<T>(borrow item: Item<T>) -> i64 = 1
 "#;
-    for (name, body) in [
-        (
-            "returned",
-            "view := views.bytes(item); item = views.Item { data: buffer(8) }; print(view.u8(0))",
-        ),
-        (
-            "retained",
-            "mut kept := views.View { data: [] }; views.retain(item, kept); item = views.Item { data: buffer(8) }; print(kept.data.u8(0))",
-        ),
-        (
-            "indirect",
-            "reader := views.text; view := reader(item.data); item = views.Item { data: buffer(8) }; print(view)",
-        ),
-        (
-            "optional",
-            "mut optional: Option<buffer> := Some(buffer(8)); view := views.optional(optional); optional = None; print(view.u8(0))",
-        ),
-        (
-            "result",
-            "mut result: Result<buffer, i32> := Ok(buffer(8)); view := views.result(result); result = Err(1); print(view.u8(0))",
-        ),
-        (
-            "tagged",
-            "mut tagged: views.Data := views.Present(views.Item { data: buffer(8) }); view := views.tagged(tagged); tagged = views.Absent; print(view.u8(0))",
-        ),
-    ] {
-        let invalid = format!(
-            "module main\nimport views\nfn main() {{ mut item := views.Item {{ data: buffer(8) }}; {body} }}\n"
-        );
-        let checked = diff_check_multi(
-            &format!("borrowed-buffer-invalidated-{name}"),
-            &[("main.align", invalid.as_str()), ("views.align", helper)],
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{name} must reject after source replacement; whole:\n{}\nper-unit:\n{}",
-            checked.whole_diags,
-            checked.per_unit_diags
-        );
-        assert!(
-            checked.whole_diags.contains("use of invalidated borrow") && checked.per_unit_diags.contains("use of invalidated borrow"),
-            "{name} must reject for borrowing; whole:\n{}\nper-unit:\n{}",
-            checked.whole_diags,
-            checked.per_unit_diags
-        );
-    }
-    let source = r#"module main
+        let helper = if mixed {
+            helper_template.to_string()
+        } else {
+            helper_template.replace(", extra: slice<u8>", "")
+        };
+        let helper = helper.as_str();
+        for (name, body) in [
+            (
+                "returned",
+                "view := views.bytes(item); item = views.Item { data: buffer(8), extra: empty }; print(view.u8(0))",
+            ),
+            (
+                "retained",
+                "mut kept := views.View { data: [] }; views.retain(item, kept); item = views.Item { data: buffer(8), extra: empty }; print(kept.data.u8(0))",
+            ),
+            (
+                "indirect",
+                "reader := views.text; view := reader(item.data); item = views.Item { data: buffer(8), extra: empty }; print(view)",
+            ),
+            (
+                "optional",
+                "mut optional: Option<buffer> := Some(buffer(8)); view := views.optional(optional); optional = None; print(view.u8(0))",
+            ),
+            (
+                "result",
+                "mut result: Result<buffer, i32> := Ok(buffer(8)); view := views.result(result); result = Err(1); print(view.u8(0))",
+            ),
+            (
+                "tagged",
+                "mut tagged: views.Data := views.Present(views.Item { data: buffer(8), extra: empty }); view := views.tagged(tagged); tagged = views.Absent; print(view.u8(0))",
+            ),
+        ] {
+            let body = if mixed {
+                body.to_string()
+            } else {
+                body.replace(", extra: empty", "")
+            };
+            let invalid = format!(
+                "module main\nimport views\nfn main() {{ empty: slice<u8> := []; mut item := views.Item {{ data: buffer(8), extra: empty }}; {body} }}\n"
+            );
+            let invalid = if mixed {
+                invalid
+            } else {
+                invalid.replace(", extra: empty", "")
+            };
+            let checked = diff_check_multi(
+                &format!("borrowed-buffer-invalidated-{name}"),
+                &[("main.align", invalid.as_str()), ("views.align", helper)],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{name} must reject after source replacement; whole:\n{}\nper-unit:\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+            assert!(
+                checked.whole_diags.contains("use of invalidated borrow")
+                    && checked.per_unit_diags.contains("use of invalidated borrow"),
+                "{name} must reject for borrowing; whole:\n{}\nper-unit:\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+        let source = r#"module main
 import views
 fn main() -> i32 {
+  empty: slice<u8> := []
   mut data := buffer(8)
   data.put_u8(65)
   optional: Option<buffer> := Some(data)
   if views.optional(optional).u8(0) != 65 { return 1 }
   mut other := buffer(8)
   other.put_u8(66)
-  item := views.Item { data: other }
+  item := views.Item { data: other, extra: empty }
   if views.identity(item) != 1 { return 2 }
   reader := views.text
   if reader(item.data) != "B" { return 6 }
@@ -459,27 +487,80 @@ fn main() -> i32 {
   return 0
 }
 "#;
-    let files = [("main.align", source), ("views.align", helper)];
-    let checked = diff_check_multi("borrowed-buffer-provenance", &files, "main.align");
-    assert!(
-        !checked.whole_errors && !checked.per_unit_errors,
-        "whole:\n{}\nper-unit:\n{}",
-        checked.whole_diags,
-        checked.per_unit_diags
-    );
-    if backend_available() {
-        for out in [
-            build_and_run_multi("borrowed-buffer-provenance-whole", &files, "main.align"),
-            build_per_unit_multi("borrowed-buffer-provenance-unit", &files, "main.align")
-                .link_and_run(),
-        ] {
-            assert_eq!(
-                out.status.code(),
-                Some(0),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+        let source = if mixed {
+            source.to_string()
+        } else {
+            source.replace(", extra: empty", "")
+        };
+        let files = [("main.align", source.as_str()), ("views.align", helper)];
+        let checked = diff_check_multi("borrowed-buffer-provenance", &files, "main.align");
+        assert!(
+            !checked.whole_errors && !checked.per_unit_errors,
+            "whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        if backend_available() {
+            for out in [
+                build_and_run_multi("borrowed-buffer-provenance-whole", &files, "main.align"),
+                build_per_unit_multi("borrowed-buffer-provenance-unit", &files, "main.align")
+                    .link_and_run(),
+            ] {
+                assert_eq!(
+                    out.status.code(),
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn mixed_handle_fields_keep_the_complete_owner() {
+    for (name, body) in [
+        (
+            "direct",
+            "mut holder := Holder { data: buffer(8), extra: [] }; view := holder.data.bytes(); holder = Holder { data: buffer(8), extra: [] }; print(view.u8(0))",
+        ),
+        (
+            "nested",
+            "mut outer := Outer { inner: Holder { data: buffer(8), extra: [] } }; view := outer.inner.data.bytes(); outer = Outer { inner: Holder { data: buffer(8), extra: [] } }; print(view.u8(0))",
+        ),
+        (
+            "writer",
+            "mut holder := Direct { sink: io.stdout, extra: [] }; holder.sink.write({ replace(holder); \"bad\" }) else ()",
+        ),
+    ] {
+        let source = format!(
+            r#"
+import std.io
+Holder {{ data: buffer, extra: slice<u8> }}
+Outer {{ inner: Holder }}
+Direct {{ sink: writer, extra: slice<u8> }}
+fn replace(borrow mut holder: Direct) {{ holder = Direct {{ sink: io.stdout, extra: [] }} }}
+fn main() {{ {body} }}
+"#
+        );
+        let checked = diff_check_multi(
+            &format!("mixed-handle-{name}"),
+            &[("main.align", source.as_str())],
+            "main.align",
+        );
+        assert!(
+            checked.whole_errors && checked.per_unit_errors,
+            "{name} must reject; whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        assert!(
+            checked.whole_diags.contains("invalidated")
+                && checked.per_unit_diags.contains("invalidated"),
+            "{name} must reject for owner invalidation; whole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
     }
 }
 
