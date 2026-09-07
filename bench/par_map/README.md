@@ -5,12 +5,13 @@ the `filter` mode measures stable count/prefix/scatter compaction separately. Th
 a persistent worker pool and one generated typed kernel per claimed range.
 
 ```sh
-bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate|chunks] # headline or threshold probe
+bench/par_map/run.sh [baseline|v3|native|threshold|width|aggregate|chunks|source-consumer]
 bench/par_map/run.sh filter                  # stable filter compaction probe
 bench/par_map/run.sh threshold              # threshold probe on the native target
 bench/par_map/run.sh width                  # input/output width and stride probe
 bench/par_map/run.sh aggregate              # runtime aggregate-like record-stride probe
 bench/par_map/run.sh chunks                 # runtime chunk-header allocation probe
+bench/par_map/run.sh source-consumer        # O0 materialized-versus-virtual chunks gate
 ```
 
 The runtime is linked as a cdylib and the harness supplies runtime-generated input. The Align and
@@ -218,6 +219,26 @@ The producer was consistently slower in the symmetric probe: the two final invoc
 1.249x to 1.336x of the cursor control. This earns an end-to-end no-header chunk-range design
 measurement, but not a production allocation-removal change by itself: chunk-body cost, scheduler
 cost, consumer layout, and the ownership contract still need to be measured together.
+
+## Virtual chunks source-consumer gate
+
+`run.sh source-consumer` is the O0 adopt-or-revert gate for direct, stage-free
+`chunks(width).par_map(...)` consumers. It verifies the checksums of both materialization and direct
+integer reduction over 1,048,579 `i64` elements at widths 1, 8, 64, and 1,024. The script validates
+the preserved C0 compiler/runtime hashes, compiles equal-length baseline and candidate export names,
+co-links both objects with the ordinary production runtime, warms each arm, and records 21 paired
+AB/BA timing samples without deleting outliers. Only after timing completes does the script build
+the `alloc-count` runtime and link a separate resource binary for one serialized call per arm. Thus
+neither the counter atomics nor the requested-live mutex can bias the baseline's deliberately
+retained allocation. The exact thresholds and baseline identities are owned by
+`docs/impl/32-post-xml-consolidation-plan.md` §11.4.
+
+The adopted 2026-09-07 Linux x86-64 run passed every gate. Width-1 median
+candidate/baseline ratios were 0.3527 for materialization and 0.3081 for the
+primary reduction. The remaining medians ranged from 0.7695 to 0.9852, within
+the 1.05 guards. Every resource row removed exactly one allocation and one
+free, stayed balanced at zero requested-live bytes, and saved the exact
+16-byte header array. The candidate object grew from 3,176 to 3,624 bytes.
 
 ## Stable filter compaction probe
 

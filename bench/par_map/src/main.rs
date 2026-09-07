@@ -140,6 +140,203 @@ extern "C" {
     /// and is released through `align_rt_free`; the element pointers borrow the input slice.
     #[cfg(feature = "probe")]
     fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, elem_size: i64) -> ChunkHeader;
+    #[cfg(feature = "source-consumer")]
+    fn base_materialize(s: Slice, width: i64) -> i64;
+    #[cfg(feature = "source-consumer")]
+    fn base_reduce(s: Slice, width: i64) -> i64;
+    #[cfg(feature = "source-consumer")]
+    fn cand_materialize(s: Slice, width: i64) -> i64;
+    #[cfg(feature = "source-consumer")]
+    fn cand_reduce(s: Slice, width: i64) -> i64;
+    #[cfg(feature = "source-consumer-resource")]
+    fn align_rt_requested_live_reset();
+    #[cfg(feature = "source-consumer-resource")]
+    fn align_rt_requested_live_bytes() -> i64;
+    #[cfg(feature = "source-consumer-resource")]
+    fn align_rt_requested_live_peak() -> i64;
+    #[cfg(feature = "source-consumer-resource")]
+    fn align_rt_alloc_count() -> i64;
+    #[cfg(feature = "source-consumer-resource")]
+    fn align_rt_free_count() -> i64;
+}
+
+#[cfg(feature = "source-consumer")]
+type SourceConsumerKernel = unsafe extern "C" fn(Slice, i64) -> i64;
+
+#[cfg(feature = "source-consumer")]
+#[derive(Clone, Copy)]
+struct SourceConsumerCase {
+    name: &'static str,
+    width: i64,
+    baseline: SourceConsumerKernel,
+    candidate: SourceConsumerKernel,
+    primary: bool,
+}
+
+#[cfg(feature = "source-consumer")]
+fn source_consumer_cases() -> [SourceConsumerCase; 8] {
+    let materialize = |width| SourceConsumerCase {
+        name: "materialize",
+        width,
+        baseline: base_materialize,
+        candidate: cand_materialize,
+        primary: false,
+    };
+    let reduce = |width| SourceConsumerCase {
+        name: "reduce",
+        width,
+        baseline: base_reduce,
+        candidate: cand_reduce,
+        primary: width == 1,
+    };
+    [
+        materialize(1),
+        reduce(1),
+        materialize(8),
+        reduce(8),
+        materialize(64),
+        reduce(64),
+        materialize(1024),
+        reduce(1024),
+    ]
+}
+
+#[cfg(feature = "source-consumer")]
+fn run_source_consumer_timing() {
+    const SOURCE_LEN: usize = 1_048_579;
+    const SAMPLES: usize = 21;
+    let data = gen(SOURCE_LEN);
+    let source = Slice {
+        ptr: data.as_ptr(),
+        len: SOURCE_LEN as i64,
+    };
+    let mut failures = 0;
+    println!(
+        "O0 source-consumer timing: {SOURCE_LEN} i64 elements, {SAMPLES} paired AB/BA samples"
+    );
+    for case in source_consumer_cases() {
+        let baseline_warm = unsafe { (case.baseline)(source, case.width) };
+        let candidate_warm = unsafe { (case.candidate)(source, case.width) };
+        assert_eq!(
+            candidate_warm, baseline_warm,
+            "{} width={} warm result",
+            case.name, case.width
+        );
+        let mut ratios = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let mut elapsed = [0_u128; 2];
+            let mut results = [0_i64; 2];
+            for arm in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let started = Instant::now();
+                results[arm] = std::hint::black_box(unsafe {
+                    if arm == 0 {
+                        (case.baseline)(source, case.width)
+                    } else {
+                        (case.candidate)(source, case.width)
+                    }
+                });
+                elapsed[arm] = started.elapsed().as_nanos();
+            }
+            assert_eq!(
+                results[0], results[1],
+                "{} width={} sample={sample}",
+                case.name, case.width
+            );
+            ratios.push(elapsed[1] as f64 / elapsed[0] as f64);
+        }
+        ratios.sort_by(f64::total_cmp);
+        let p10 = percentile(&ratios, 0.1);
+        let median = percentile(&ratios, 0.5);
+        let p90 = percentile(&ratios, 0.9);
+        let limit = if case.primary { 0.90 } else { 1.05 };
+        let passed = median <= limit;
+        println!(
+            "  {:>11} width={:>4}: median={median:.4} p10={p10:.4} p90={p90:.4} limit={limit:.2} {} samples={ratios:?}",
+            case.name,
+            case.width,
+            if passed { "PASS" } else { "FAIL" },
+        );
+        if !passed {
+            failures += 1;
+        }
+    }
+    if failures != 0 {
+        eprintln!("O0 TIMING GATE: FAIL ({failures} row(s))");
+        std::process::exit(1);
+    }
+    println!("O0 TIMING GATE: PASS");
+}
+
+#[cfg(feature = "source-consumer-resource")]
+#[derive(Debug)]
+struct SourceConsumerResource {
+    result: i64,
+    allocations: i64,
+    frees: i64,
+    live: i64,
+    peak: i64,
+}
+
+#[cfg(feature = "source-consumer-resource")]
+fn source_consumer_resource(
+    kernel: SourceConsumerKernel,
+    source: Slice,
+    width: i64,
+) -> SourceConsumerResource {
+    unsafe { align_rt_requested_live_reset() };
+    let before_alloc = unsafe { align_rt_alloc_count() };
+    let before_free = unsafe { align_rt_free_count() };
+    let result = unsafe { kernel(source, width) };
+    SourceConsumerResource {
+        result,
+        allocations: unsafe { align_rt_alloc_count() } - before_alloc,
+        frees: unsafe { align_rt_free_count() } - before_free,
+        live: unsafe { align_rt_requested_live_bytes() },
+        peak: unsafe { align_rt_requested_live_peak() },
+    }
+}
+
+#[cfg(feature = "source-consumer-resource")]
+fn run_source_consumer_resource() {
+    const SOURCE_LEN: usize = 1_048_579;
+    let data = gen(SOURCE_LEN);
+    let source = Slice {
+        ptr: data.as_ptr(),
+        len: SOURCE_LEN as i64,
+    };
+    println!("O0 source-consumer resources: {SOURCE_LEN} i64 elements");
+    for case in source_consumer_cases() {
+        let baseline_warm = unsafe { (case.baseline)(source, case.width) };
+        let candidate_warm = unsafe { (case.candidate)(source, case.width) };
+        assert_eq!(
+            candidate_warm, baseline_warm,
+            "{} width={} warm result",
+            case.name, case.width
+        );
+        let baseline = source_consumer_resource(case.baseline, source, case.width);
+        let candidate = source_consumer_resource(case.candidate, source, case.width);
+        let chunks = SOURCE_LEN.div_ceil(case.width as usize) as i64;
+        let expected_peak_reduction = 16_i64 * chunks;
+        let passed = baseline.result == candidate.result
+            && baseline.allocations == baseline.frees
+            && candidate.allocations == candidate.frees
+            && baseline.live == 0
+            && candidate.live == 0
+            && baseline.allocations == candidate.allocations + 1
+            && baseline.frees == candidate.frees + 1
+            && baseline.peak == candidate.peak + expected_peak_reduction;
+        println!(
+            "  {:>11} width={:>4}: base={baseline:?} cand={candidate:?} peak_saved={expected_peak_reduction} {}",
+            case.name,
+            case.width,
+            if passed { "PASS" } else { "FAIL" },
+        );
+        if !passed {
+            eprintln!("O0 RESOURCE GATE: FAIL");
+            std::process::exit(1);
+        }
+    }
+    println!("O0 RESOURCE GATE: PASS");
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -1358,6 +1555,33 @@ fn run_filter() {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("source-consumer") {
+        #[cfg(feature = "source-consumer")]
+        {
+            match std::env::args().nth(2).as_deref() {
+                Some("timing") => run_source_consumer_timing(),
+                Some("resource") => {
+                    #[cfg(feature = "source-consumer-resource")]
+                    run_source_consumer_resource();
+                    #[cfg(not(feature = "source-consumer-resource"))]
+                    {
+                        eprintln!("source-consumer resource mode requires the source-consumer-resource feature");
+                        std::process::exit(2);
+                    }
+                }
+                _ => {
+                    eprintln!("source-consumer requires `timing` or `resource`");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(not(feature = "source-consumer"))]
+        {
+            eprintln!("source-consumer mode requires the source-consumer feature");
+            std::process::exit(2);
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("threshold") {
         #[cfg(feature = "probe")]
         {

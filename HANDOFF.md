@@ -76,9 +76,10 @@ complete. S0A is implemented in PR #955, S0B in PR #959, and the C0 chunks
 decision consolidation in PR #964. V1 replayed the fixed corpus and AI task set
 without a compiler-attributable behavior change and selected exactly one O0
 candidate: direct, stage-free `chunks(...).par_map(...)` virtual range views.
-Its exact safety/ownership matrix, report tuple, and preregistered candidate/
-control gate are in §11 of the post-XML plan. The next boundary is that one O0
-implementation and measured adopt-or-revert decision.
+Its implementation follows the exact safety/ownership matrix and adds no
+runtime ABI symbol. The preregistered semantic, allocation, object-size, and
+timing gates passed, so §11 records O0 as adopted. The next boundary is the V1
+phase-close reassessment against §9; it does not select another optimization.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->

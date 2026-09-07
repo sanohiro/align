@@ -1,7 +1,10 @@
 //! Textual output of MIR (`alignc emit-mir`, `docs/impl/04-mir.md` §8).
 //! Used to inspect the CFG and confirm lowering / optimizations (predictability).
 
-use crate::{ty_name, Block, Const, Function, Operand, ParMapStageKind, Program, Rvalue, Stmt, Term};
+use crate::{
+    ty_name, Block, Const, Function, Operand, ParMapStageKind, ParallelSource, Program, Rvalue,
+    Stmt, Term,
+};
 use align_ast::{BinOp, UnOp};
 use align_sema::hir;
 use std::fmt::Write;
@@ -542,17 +545,17 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 format!("{prefix} -> {func}")
             };
             if caps.is_empty() {
-                format!("par_map[{chain}]({}: {} -> {}; work={work_weight})", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+                format!("par_map[{chain}]({}: {} -> {}; work={work_weight})", parallel_source_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
             } else {
-                format!("par_map[{chain}]({}: {} -> {}; work={work_weight}; captures=[{}])", operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+                format!("par_map[{chain}]({}: {} -> {}; work={work_weight}; captures=[{}])", parallel_source_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
         Rvalue::ParMapReduce { src, func, captures, elem_in, elem_out, work_weight, .. } => {
             let caps = captures.iter().map(operand_str).collect::<Vec<_>>().join(", ");
             if caps.is_empty() {
-                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight})", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
+                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight})", func, parallel_source_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out))
             } else {
-                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight}; captures=[{}])", func, operand_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
+                format!("par_map_reduce[{}]({}: {} -> {}; work={work_weight}; captures=[{}])", func, parallel_source_str(src), crate::ty_name(*elem_in), crate::ty_name(*elem_out), caps)
             }
         }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
@@ -1266,6 +1269,18 @@ fn const_elems_str(elems: &[crate::ConstElem]) -> String {
         })
         .collect();
     format!("[{}]", parts.join(", "))
+}
+
+fn parallel_source_str(source: &ParallelSource) -> String {
+    match source {
+        ParallelSource::Materialized(source) => operand_str(source),
+        ParallelSource::VirtualChunks { base, width, elem } => format!(
+            "virtual_chunks(base={}, width={}, elem={})",
+            operand_str(base),
+            operand_str(width),
+            ty_name(*elem)
+        ),
+    }
 }
 
 fn operand_str(op: &Operand) -> String {

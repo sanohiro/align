@@ -427,12 +427,19 @@ the same `ParallelSource`; reporting adds no second legality predicate.
 
 ### 11.3 Implementation closure matrix
 
+The implementation exceeds roughly 1,000 changed hand-written lines because
+the MIR classification, generated-callable preflight, LLVM range kernel,
+ownership owners, and measurement gate form one strict producer-to-consumer
+chain. Splitting that chain would leave a dormant safety-sensitive MIR shape
+without a useful consumer and would duplicate the source-identity, ownership,
+and unchanged-ABI proof across capability boundaries.
+
 | Axis | Exact O0 closure | Owner evidence |
 |---|---|---|
 | Formation, validation, unknown variants | One exhaustive `ParallelSource` is visited by embedded-type collection, tagged-type remapping, operand/value sweeps, canonical hashing, generated-callable preflight, and LLVM lowering. Virtual source/type/stage mismatches fail before kernel lookup or output. | MIR selector table and variant tripwire; malformed virtual base, width, element, logical input, stage, result, callable, and capture matrix; existing malformed materialized nodes remain rejected. |
 | Construction and move-in/out | Only a syntactically immediate, stage-free chunks expression reaches `VirtualChunks`; its base/width are moved into the two existing parallel rvalues without constructing an `array<slice<T>>`. No source-level chunks value exists to move, return, or store. | Range-materialize and range-reduce MIR positives; bound/source-stage/rejected-form negatives retaining `Rvalue::Chunks`. |
-| Source nulling, replacement, return, and Drop | The virtual source inherits and consumes only the base's hidden temporary owner. A fresh heap base is freed once after the synchronous call or by the existing exit cleanup when a later capture terminates first; named/arena/static bases are never freed there. Materialized header ownership and every escaping fallback are unchanged. | Alloc/free owner crossing fresh, bound, arena, static, and returned bases with normal completion; fresh-base post-width terminating callable/terminal-capture owners for both parallel rvalues; existing chunks replacement, return-provenance, and borrowed-liveness owners. |
-| Evaluation and control exits | Source, width, prior-stage operands, and terminal captures retain order. Source/width termination emits no chunks row; a later capture termination retains only the reached chunks row and runs hidden-owner cleanup before propagating. Zero/negative width and empty/null base produce the canonical empty source before division or pointer work. | Side-effect/termination fixtures for both parallel rvalues, the paired fresh-base alloc/free exit owners, nonpositive/empty cases, current-plan reached-row owners, and unchanged fallback diagnostics. |
+| Source nulling, replacement, return, and Drop | The virtual source inherits and consumes only the base's hidden temporary owner. A fresh heap base is freed once after the synchronous call or by the existing exit cleanup when a later capture terminates first; named/arena/static bases are never freed there. Materialized header ownership and every escaping fallback are unchanged. | Exact guarded MIR Drop topology for fresh and returned bases; distinct named, arena-owned, and static execution owners; fresh-base width- and later-capture-termination Drop owners for both parallel rvalues; existing chunks replacement, return-provenance, and borrowed-liveness owners. |
+| Evaluation and control exits | Source, width, prior-stage operands, and terminal captures retain order. Source/width termination emits no chunks row; a later capture termination retains only the reached chunks row and runs hidden-owner cleanup before propagating. Zero/negative width and empty/null base produce the canonical empty source before division or pointer work. | Direct virtual-source and width termination fixtures for both parallel rvalues, paired fresh-base width/later-capture cleanup topology, nonpositive/empty cases, current-plan reached-row owners, and unchanged fallback diagnostics. |
 | Parallel correctness | Caller-only and shared-pool range materialization/reduction derive identical exact-multiple and partial-tail slices, preserve stable output order and wrapping integer reduction, and never retain base/context/views. | `chunk_parallel`, materializing and direct-sum owners at below-floor and pooled sizes, one-worker/multi-worker runs, partial-tail and captured callable fixtures. |
 | Generics, imports, whole/per-unit, checked-HIR replay | Concrete local/imported callables reconstruct the private source variant from checked HIR; no interface summary is added. Equal visible routes select the same tuple; unavailable imported source anchors remain unavailable. | Generic imported callable, whole/per-unit current-plan parity, replay/catalog owners, and `per_unit_surface`. |
 | MIR identity, cache, and generated functions | The changed semantic MIR changes implementation hashes and object/cache identity normally. Kernel identity distinguishes physical base from logical chunk-view input without changing the canonical generated-id format. Located collection remains identity-neutral. | Canonical MIR/hash delta, cache miss-then-hit, two virtual element types with no kernel collision, materialized/virtual collision negative, normal/located LLVM/object identity. |
@@ -456,15 +463,15 @@ The candidate is the final reviewed O0 commit built by the same Rust 1.96,
 LLVM 22.1.8, system linker, release profile, and native target on the V1 host.
 
 Add one manual `bench/par_map` source-consumer mode. It compiles one source
-template with distinct equal-length baseline/candidate export prefixes,
-co-links both objects with one `alloc-count` runtime, and calls them in one
-process over the same runtime-generated `slice<i64>`. The source exports both
+template with distinct equal-length baseline/candidate export prefixes and
+co-links both objects into each measurement binary. The source exports both
 direct `chunks(width).par_map(chunk_sum)` materialization with a full-output
 checksum and direct `.sum()` reduction. Input length is 1,048,579 to cover
-partial tails; widths are 1, 8, 64, and 1,024. The driver uses two fresh
-subprocess modes over the same executable and co-linked runtime. The timing
-process never calls
-`align_rt_requested_live_reset`: each arm warms once, then runs 21 paired
+partial tails; widths are 1, 8, 64, and 1,024. The driver links the timing
+binary against the ordinary production runtime, completes it, then links a
+separate resource binary against a freshly built `alloc-count` runtime. Thus
+the baseline's extra allocation/free cannot receive instrumentation overhead
+in the timing comparison. Each timing arm warms once, then runs 21 paired
 samples in alternating AB/BA order. Retain every sample; report median
 candidate/base ratio and p10–p90 without post-hoc outlier deletion.
 
@@ -485,3 +492,31 @@ Adopt O0 only if the exact resource gate, primary timing gate, all timing/size
 guards, semantic owners, and structural no-materializer proof pass. Any miss
 reverts the optimization, preserves the raw evidence, records measured
 deferral, and closes the phase without choosing a replacement project.
+
+#### Disposition — adopted 2026-09-07
+
+`bench/par_map/run.sh source-consumer` passed on the V1 Linux x86-64 host with
+the pinned baseline identities above. The harness printed all 21 sorted ratios
+for every row; the summary was:
+
+| Consumer | Width | Median candidate/base | p10–p90 | Limit |
+|---|---:|---:|---:|---:|
+| materialize | 1 | 0.3527 | 0.2998–0.4095 | 1.05 |
+| reduce | 1 | 0.3081 | 0.2839–0.3530 | 0.90 |
+| materialize | 8 | 0.7824 | 0.7159–0.8513 | 1.05 |
+| reduce | 8 | 0.7695 | 0.6926–0.8900 | 1.05 |
+| materialize | 64 | 0.9004 | 0.8157–0.9160 | 1.05 |
+| reduce | 64 | 0.8992 | 0.8014–0.9268 | 1.05 |
+| materialize | 1,024 | 0.9670 | 0.8787–1.0548 | 1.05 |
+| reduce | 1,024 | 0.9852 | 0.9361–1.0969 | 1.05 |
+
+All eight resource rows were value-identical and balanced at zero requested
+live bytes. Each candidate removed exactly one allocation and one free. Peak
+requested-live reductions were 16,777,264, 2,097,168, 262,160, and 16,400
+bytes at widths 1, 8, 64, and 1,024 respectively, exactly
+`16 * ceil(1,048,579 / width)`. The candidate object was 3,624 bytes versus
+3,176 bytes for the baseline, a 448-byte increase within the 65,536-byte
+guard. Timing used the production runtime without `alloc-count`; resource
+measurement used a separate instrumented binary. Semantic owners and the
+optimized-LLVM no-materializer proof also passed, so O0 is adopted; no
+replacement optimization is selected.

@@ -438,6 +438,7 @@ fn plan_strategy(strategy: PlanStrategy) -> &'static str {
     match strategy {
         PlanStrategy::VirtualCount => "virtual-count",
         PlanStrategy::VirtualIndex => "virtual-index",
+        PlanStrategy::VirtualRangeViews => "virtual-range-views",
         PlanStrategy::MaterializedHeaders => "materialized-headers",
         PlanStrategy::ArenaOutput => "arena-output",
         PlanStrategy::FreshOutput => "fresh-output",
@@ -448,43 +449,46 @@ fn plan_strategy(strategy: PlanStrategy) -> &'static str {
     }
 }
 
-fn plan_explanation(reason: PlanReason) -> &'static str {
-    match reason {
-        PlanReason::DirectLen => "the direct `len` consumer needs only the chunk count",
-        PlanReason::DirectIndex => "the direct index consumer needs only one borrowed subview",
-        PlanReason::ParallelConsumer => {
+fn plan_explanation(strategy: PlanStrategy, reason: PlanReason) -> &'static str {
+    match (strategy, reason) {
+        (PlanStrategy::VirtualRangeViews, PlanReason::ParallelConsumer) => {
+            "the direct explicit-parallel consumer derives borrowed chunk views in its range kernel"
+        }
+        (_, PlanReason::DirectLen) => "the direct `len` consumer needs only the chunk count",
+        (_, PlanReason::DirectIndex) => "the direct index consumer needs only one borrowed subview",
+        (_, PlanReason::ParallelConsumer) => {
             "the current explicit-parallel consumer reads an owned header array"
         }
-        PlanReason::PipelineConsumer => {
+        (_, PlanReason::PipelineConsumer) => {
             "the current synchronous pipeline consumer reads an owned header array"
         }
-        PlanReason::StoredOrBoundary => {
+        (_, PlanReason::StoredOrBoundary) => {
             "the chunks value crosses a stored, returned, call, or control-flow boundary"
         }
-        PlanReason::ArenaOwnedOutput => {
+        (_, PlanReason::ArenaOwnedOutput) => {
             "the output is arena-owned, so source-buffer reuse does not apply"
         }
-        PlanReason::UnsupportedSourceOrStageShape => {
+        (_, PlanReason::UnsupportedSourceOrStageShape) => {
             "this source or stage shape cannot reuse the source buffer"
         }
-        PlanReason::SourceNotUniqueDead => "the source is not a unique dead heap temporary",
-        PlanReason::LayoutMismatch => "source and result element layouts are not identical",
-        PlanReason::MeasurementDisabled => {
+        (_, PlanReason::SourceNotUniqueDead) => "the source is not a unique dead heap temporary",
+        (_, PlanReason::LayoutMismatch) => "source and result element layouts are not identical",
+        (_, PlanReason::MeasurementDisabled) => {
             "the measurement override disabled an otherwise eligible reuse; this is not the default plan"
         }
-        PlanReason::EligibleUniqueSource => {
+        (_, PlanReason::EligibleUniqueSource) => {
             "a unique dead heap source with an identical layout is reused as the result buffer"
         }
-        PlanReason::DirectIntegerSum => {
+        (_, PlanReason::DirectIntegerSum) => {
             "the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, conservative work hint, and process-lifetime worker availability"
         }
-        PlanReason::SupportedRangeKernel => {
+        (_, PlanReason::SupportedRangeKernel) => {
             "the runtime chooses caller-only or shared-pool range materialization from the input length, element layouts, conservative work hint, and process-lifetime worker availability"
         }
-        PlanReason::UnsupportedSourceRepresentation => {
+        (_, PlanReason::UnsupportedSourceRepresentation) => {
             "the source representation has no current range-kernel form, so the explicit operation uses the sequential collector"
         }
-        PlanReason::UnsupportedStageOrValueShape => {
+        (_, PlanReason::UnsupportedStageOrValueShape) => {
             "a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector"
         }
     }
@@ -512,7 +516,7 @@ fn write_source_less_plan(out: &mut String, record: &PlanRecord) {
         plan_kind(record.kind),
         plan_state(record.state),
         plan_strategy(record.strategy),
-        plan_explanation(record.reason),
+        plan_explanation(record.strategy, record.reason),
     );
 }
 
@@ -534,7 +538,7 @@ fn render_current_plan(records: &[PlanRecord], verbose: bool, file: &str) -> Str
                 plan_kind(record.kind),
                 plan_state(record.state),
                 plan_strategy(record.strategy),
-                plan_explanation(record.reason),
+                plan_explanation(record.strategy, record.reason),
             );
             index += 1;
             continue;
@@ -720,6 +724,7 @@ mod tests {
         let rows = [
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualCount, PlanReason::DirectLen, "chunks", "selected", "virtual-count", "the direct `len` consumer needs only the chunk count"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualIndex, PlanReason::DirectIndex, "chunks", "selected", "virtual-index", "the direct index consumer needs only one borrowed subview"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualRangeViews, PlanReason::ParallelConsumer, "chunks", "selected", "virtual-range-views", "the direct explicit-parallel consumer derives borrowed chunk views in its range kernel"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::ParallelConsumer, "chunks", "selected", "materialized-headers", "the current explicit-parallel consumer reads an owned header array"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::PipelineConsumer, "chunks", "selected", "materialized-headers", "the current synchronous pipeline consumer reads an owned header array"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::StoredOrBoundary, "chunks", "selected", "materialized-headers", "the chunks value crosses a stored, returned, call, or control-flow boundary"),
@@ -738,7 +743,7 @@ mod tests {
             assert_eq!(plan_kind(kind), kind_text);
             assert_eq!(plan_state(state), state_text);
             assert_eq!(plan_strategy(strategy), strategy_text);
-            assert_eq!(plan_explanation(reason), explanation);
+            assert_eq!(plan_explanation(strategy, reason), explanation);
         }
     }
 

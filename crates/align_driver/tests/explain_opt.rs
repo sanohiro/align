@@ -169,7 +169,7 @@ fn current_plan_rows_precede_llvm_and_do_not_change_under_verbose() {
     );
     assert_eq!(default_plan.len(), 2);
     assert!(default_plan[0].contains(
-        "current plan `run` #1 chunks: selected `materialized-headers` — the current explicit-parallel consumer reads an owned header array"
+        "current plan `run` #1 chunks: selected `virtual-range-views` — the direct explicit-parallel consumer derives borrowed chunk views in its range kernel"
     ));
     assert!(default_plan[1].contains(
         "current plan `run` #2 par-map: runtime-selected `range-reduce` — the runtime chooses caller-only or shared-pool range reduction from the input length, element layouts, conservative work hint, and process-lifetime worker availability"

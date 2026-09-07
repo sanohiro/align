@@ -6,6 +6,8 @@ publish = false
 
 [features]
 probe = []
+source-consumer = []
+source-consumer-resource = ["source-consumer"]
 
 [workspace]
 

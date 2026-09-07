@@ -2681,8 +2681,12 @@ fn run_par_map_ranges_with_output(
 /// then heap-overflow the write loop).
 ///
 /// # Safety
-/// `in_buf` must point to `count` elements of `in_stride` bytes for the call; `kernel` must read and
-/// write only indices in the supplied half-open range. `work_weight` is an internal compiler hint.
+/// `in_buf` names an immutable compiler-certified source that remains live through the synchronous
+/// join. It may be physically smaller than `count * in_stride`: `in_stride` is the logical
+/// scheduling width, and the generated `kernel` owns every bounds check and source-byte derivation.
+/// The runtime never dereferences or retains `in_buf`; `kernel` must read and write only indices in
+/// the supplied half-open range. Ordinary callers certify the stronger physical-span form.
+/// `work_weight` is an internal compiler hint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map(
     context: *const u8,
@@ -2704,12 +2708,13 @@ pub unsafe extern "C" fn align_rt_par_map(
         .filter(|&b| isize::try_from(b).is_ok())
         .and_then(|b| i64::try_from(b).ok())
         .unwrap_or_else(|| panic_abort("par_map output size overflow"));
-    
-    // Check input size overflow
-    let _in_bytes = count
+
+    // The scheduler consumes this logical work span; it is not a physical-extent proof for the
+    // compiler-certified opaque source.
+    let _logical_work_span = count
         .checked_mul(in_stride)
         .and_then(|b| isize::try_from(b).ok())
-        .unwrap_or_else(|| panic_abort("par_map input size overflow"));
+        .unwrap_or_else(|| panic_abort("par_map logical work span overflow"));
 
     let out_buf = align_rt_alloc(bytes);
     let plan = par_map_execution_plan(count, in_stride, out_stride, work_weight);
@@ -2827,10 +2832,13 @@ pub unsafe extern "C" fn align_rt_par_map_filter(
 /// integer type. No `count * result_stride` output buffer is allocated.
 ///
 /// # Safety
-/// `in_buf` must point to `count` elements of `in_stride` bytes for the call's duration; `kernel`
-/// must read only the supplied input range and store one `result_stride`-wide integer at its output
-/// pointer. The runtime passes each range a distinct output slot. `work_weight` is an internal
-/// compiler hint.
+/// `in_buf` names an immutable compiler-certified source that remains live through the synchronous
+/// join. It may be physically smaller than `count * in_stride`: `in_stride` is the logical
+/// scheduling width, and the generated `kernel` owns every bounds check and source-byte derivation.
+/// The runtime never dereferences or retains `in_buf`; `kernel` must read only the supplied logical
+/// range and store one `result_stride`-wide integer at its output pointer. Ordinary callers certify
+/// the stronger physical-span form. The runtime passes each range a distinct output slot.
+/// `work_weight` is an internal compiler hint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_par_map_reduce(
     context: *const u8,
@@ -2854,10 +2862,10 @@ pub unsafe extern "C" fn align_rt_par_map_reduce(
     if !matches!(result_stride, 1 | 2 | 4 | 8) {
         panic_abort("par_map reduction result stride unsupported");
     }
-    let _in_bytes = count
+    let _logical_work_span = count
         .checked_mul(in_stride)
         .and_then(|b| isize::try_from(b).ok())
-        .unwrap_or_else(|| panic_abort("par_map reduction input size overflow"));
+        .unwrap_or_else(|| panic_abort("par_map reduction logical work span overflow"));
 
     let plan = par_map_execution_plan(count, in_stride, result_stride, work_weight);
     let ranges = plan.map_or(1, |(nchunks, _)| nchunks);
@@ -34802,6 +34810,49 @@ mod tests {
         unsafe { output.cast::<i64>().write(total) };
     }
 
+    /// Compiler-certified opaque-source stand-in: the one-byte physical source is deliberately
+    /// unrelated to the logical i64 slice-header stride used by the scheduler.
+    extern "C" fn par_map_opaque_source(
+        _context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let seed = i64::from(unsafe { input.read() });
+        for index in start..end {
+            let index_usize = usize::try_from(index)
+                .unwrap_or_else(|_| panic!("test range index must be nonnegative and representable"));
+            unsafe {
+                output
+                    .cast::<i64>()
+                    .add(index_usize)
+                    .write(seed.wrapping_add(index))
+            };
+        }
+    }
+
+    extern "C" fn par_map_reduce_opaque_source(
+        _context: *const u8,
+        input: *const u8,
+        output: *mut u8,
+        start: i64,
+        end: i64,
+    ) {
+        let seed = i64::from(unsafe { input.read() });
+        let width = end.wrapping_sub(start);
+        unsafe { output.cast::<i64>().write(seed.wrapping_mul(width)) };
+    }
+
+    extern "C" fn par_map_noop(
+        _context: *const u8,
+        _input: *const u8,
+        _output: *mut u8,
+        _start: i64,
+        _end: i64,
+    ) {
+    }
+
     extern "C" fn par_map_filter_count(
         _context: *const u8,
         input: *const u8,
@@ -34911,6 +34962,111 @@ mod tests {
             };
             let want = input.iter().copied().fold(0_i64, i64::wrapping_add);
             assert_eq!(got, want, "count={count}");
+        }
+    }
+
+    #[test]
+    fn par_map_and_reduce_treat_certified_input_as_opaque() {
+        const COUNT: i64 = 65_537;
+        const LOGICAL_SLICE_HEADER_STRIDE: i64 = 16;
+        let physical_source = [7_u8];
+        let output = unsafe {
+            align_rt_par_map(
+                core::ptr::null(),
+                physical_source.as_ptr(),
+                COUNT,
+                LOGICAL_SLICE_HEADER_STRIDE,
+                size_of::<i64>() as i64,
+                1,
+                par_map_opaque_source,
+            )
+        };
+        let count = usize::try_from(COUNT)
+            .unwrap_or_else(|_| panic!("test count must be positive and representable"));
+        let values = unsafe { std::slice::from_raw_parts(output.cast::<i64>(), count) };
+        assert_eq!(values.first(), Some(&7));
+        assert_eq!(values.last(), Some(&(7 + COUNT - 1)));
+        unsafe { align_rt_free(output) };
+
+        let reduced = unsafe {
+            align_rt_par_map_reduce(
+                core::ptr::null(),
+                physical_source.as_ptr(),
+                COUNT,
+                LOGICAL_SLICE_HEADER_STRIDE,
+                size_of::<i64>() as i64,
+                1,
+                par_map_reduce_opaque_source,
+            )
+        };
+        assert_eq!(reduced, 7 * COUNT);
+    }
+
+    #[test]
+    fn par_map_and_reduce_reject_unrepresentable_logical_work_spans() {
+        const MODE: &str = "ALIGN_PAR_MAP_LOGICAL_SPAN_CHILD";
+        if let Some(mode) = std::env::var_os(MODE) {
+            let source = [0_u8];
+            match mode.to_str() {
+                Some("map") => {
+                    let output = unsafe {
+                        align_rt_par_map(
+                            core::ptr::null(),
+                            source.as_ptr(),
+                            2,
+                            i64::MAX,
+                            1,
+                            1,
+                            par_map_noop,
+                        )
+                    };
+                    unsafe { align_rt_free(output) };
+                }
+                Some("reduce") => {
+                    let _ = unsafe {
+                        align_rt_par_map_reduce(
+                            core::ptr::null(),
+                            source.as_ptr(),
+                            2,
+                            i64::MAX,
+                            8,
+                            1,
+                            par_map_noop,
+                        )
+                    };
+                }
+                _ => panic!("unknown logical-span child mode"),
+            }
+            return;
+        }
+
+        for mode in ["map", "reduce"] {
+            let mut child = std::process::Command::new(
+                std::env::current_exe().expect("runtime test executable"),
+            )
+            .args([
+                "--exact",
+                "tests::par_map_and_reduce_reject_unrepresentable_logical_work_spans",
+                "--nocapture",
+            ])
+            .env(MODE, mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn logical-span child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll logical-span child") {
+                    assert!(!status.success(), "{mode} must reject the overflowing logical span");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("kill stalled logical-span child");
+                    child.wait().expect("reap stalled logical-span child");
+                    panic!("{mode} logical-span child exceeded watchdog");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 
