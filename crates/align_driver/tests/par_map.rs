@@ -495,7 +495,7 @@ fn virtual_chunks_empty_and_nonpositive_width_schedule_no_work() {
 
 #[test]
 fn virtual_chunks_preserve_fresh_and_returned_base_ownership() {
-    let src = "fn make() -> array<i64> = [1, 2, 3, 4].to_array()\nfn borrow(xs: slice<i64>) -> slice<i64> = xs\nfn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn fresh_materialize() -> i64 {\n  ys := make().chunks(2).par_map(chunk_sum)\n  return ys.sum()\n}\nfn fresh_reduce() -> i64 = make().chunks(2).par_map(chunk_sum).sum()\nfn returned_borrow(xs: slice<i64>) -> i64 = borrow(xs).chunks(2).par_map(chunk_sum).sum()\nfn main() -> Result<(), Error> {\n  print(fresh_materialize())\n  print(fresh_reduce())\n  print(returned_borrow([1, 2, 3, 4]))\n  return Ok(())\n}\n";
+    let src = "VALUES := [1, 2, 3, 4]\nfn make() -> array<i64> = [1, 2, 3, 4].to_array()\nfn borrow(xs: slice<i64>) -> slice<i64> = xs\nfn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn fresh_materialize() -> i64 {\n  ys := make().chunks(2).par_map(chunk_sum)\n  return ys.sum()\n}\nfn fresh_reduce() -> i64 = make().chunks(2).par_map(chunk_sum).sum()\nfn named_reduce() -> i64 {\n  xs := make()\n  return xs.chunks(2).par_map(chunk_sum).sum()\n}\nfn arena_reduce() -> i64 = arena {\n  xs := [1, 2, 3, 4].to_array()\n  xs.chunks(2).par_map(chunk_sum).sum()\n}\nfn static_reduce() -> i64 = VALUES.chunks(2).par_map(chunk_sum).sum()\nfn returned_borrow(xs: slice<i64>) -> i64 = borrow(xs).chunks(2).par_map(chunk_sum).sum()\nfn main() -> Result<(), Error> {\n  print(fresh_materialize())\n  print(fresh_reduce())\n  print(named_reduce())\n  print(arena_reduce())\n  print(static_reduce())\n  print(returned_borrow(VALUES))\n  return Ok(())\n}\n";
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "pm-chunks-base-ownership", src);
     assert!(
@@ -526,13 +526,14 @@ fn virtual_chunks_preserve_fresh_and_returned_base_ownership() {
             .count();
         assert_eq!(drops, expected_drop_sites, "{name} guarded owner/drop topology:\n{text}");
     }
-    assert_eq!(text.matches("virtual_chunks(").count(), 3, "every direct base form must stay virtual:\n{text}");
+    assert_eq!(text.matches("virtual_chunks(").count(), 6, "every direct base form must stay virtual:\n{text}");
+    assert!(!text.contains(" = chunks("), "no ownership class may reintroduce the header materializer:\n{text}");
     if !backend_available() {
         return;
     }
     let out = build_and_run("pm-chunks-base-ownership", src);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n10\n10\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n10\n10\n10\n10\n10\n");
 }
 
 #[test]

@@ -38,9 +38,6 @@ if [ "$mode" = source-consumer ]; then
   [ "$(sha256sum "$BASELINE_ALIGNC" | cut -d ' ' -f 1)" = "$BASELINE_HASH" ] || { echo "O0 baseline compiler hash mismatch" >&2; exit 1; }
   [ "$(sha256sum "$BASELINE_DIR/libalign_runtime.a" | cut -d ' ' -f 1)" = "$RUNTIME_HASH" ] || { echo "O0 baseline runtime hash mismatch" >&2; exit 1; }
 
-  ( cd "$REPO" && scripts/cargo.sh build -q --release -p align_runtime --features alloc-count )
-  [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing alloc-count runtime dynamic library in $RT_DIR" >&2; exit 1; }
-
   SOURCE_CONSUMER_TMP="$(mktemp -d "$PWD/.source-consumer.XXXXXX")"
   case "$SOURCE_CONSUMER_TMP" in "$PWD"/.source-consumer.*) ;; *) echo "invalid source-consumer temp directory" >&2; exit 1 ;; esac
   BASELINE_OBJ="$SOURCE_CONSUMER_TMP/base.o"
@@ -70,10 +67,19 @@ if [ "$mode" = source-consumer ]; then
   fi
 
   export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=$rust_tgt"
+  # Timing must use the production runtime. Even an inactive alloc-count probe adds one-sided
+  # atomic/mutex work to the baseline's deliberately retained chunk-header allocation.
+  ( cd "$REPO" && scripts/cargo.sh build -q --release -p align_runtime )
+  [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing production runtime dynamic library in $RT_DIR" >&2; exit 1; }
   ALIGN_KERNEL_BASELINE="$BASELINE_OBJ" ALIGN_KERNEL_CANDIDATE="$CANDIDATE_OBJ" ALIGN_KERNEL_OBJ="$STANDARD_OBJ" \
     ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release --features source-consumer -- source-consumer timing
+
+  # Resource accounting runs in its own binary after replacing the dynamic runtime with the
+  # instrumented build. The feature split keeps counter symbols out of the production timing link.
+  ( cd "$REPO" && scripts/cargo.sh build -q --release -p align_runtime --features alloc-count )
+  [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing alloc-count runtime dynamic library in $RT_DIR" >&2; exit 1; }
   ALIGN_KERNEL_BASELINE="$BASELINE_OBJ" ALIGN_KERNEL_CANDIDATE="$CANDIDATE_OBJ" ALIGN_KERNEL_OBJ="$STANDARD_OBJ" \
-    ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release --features source-consumer -- source-consumer resource
+    ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release --features source-consumer-resource -- source-consumer resource
   exit 0
 fi
 

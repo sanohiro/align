@@ -148,15 +148,15 @@ extern "C" {
     fn cand_materialize(s: Slice, width: i64) -> i64;
     #[cfg(feature = "source-consumer")]
     fn cand_reduce(s: Slice, width: i64) -> i64;
-    #[cfg(feature = "source-consumer")]
+    #[cfg(feature = "source-consumer-resource")]
     fn align_rt_requested_live_reset();
-    #[cfg(feature = "source-consumer")]
+    #[cfg(feature = "source-consumer-resource")]
     fn align_rt_requested_live_bytes() -> i64;
-    #[cfg(feature = "source-consumer")]
+    #[cfg(feature = "source-consumer-resource")]
     fn align_rt_requested_live_peak() -> i64;
-    #[cfg(feature = "source-consumer")]
+    #[cfg(feature = "source-consumer-resource")]
     fn align_rt_alloc_count() -> i64;
-    #[cfg(feature = "source-consumer")]
+    #[cfg(feature = "source-consumer-resource")]
     fn align_rt_free_count() -> i64;
 }
 
@@ -267,7 +267,7 @@ fn run_source_consumer_timing() {
     println!("O0 TIMING GATE: PASS");
 }
 
-#[cfg(feature = "source-consumer")]
+#[cfg(feature = "source-consumer-resource")]
 #[derive(Debug)]
 struct SourceConsumerResource {
     result: i64,
@@ -277,7 +277,7 @@ struct SourceConsumerResource {
     peak: i64,
 }
 
-#[cfg(feature = "source-consumer")]
+#[cfg(feature = "source-consumer-resource")]
 fn source_consumer_resource(
     kernel: SourceConsumerKernel,
     source: Slice,
@@ -296,7 +296,7 @@ fn source_consumer_resource(
     }
 }
 
-#[cfg(feature = "source-consumer")]
+#[cfg(feature = "source-consumer-resource")]
 fn run_source_consumer_resource() {
     const SOURCE_LEN: usize = 1_048_579;
     let data = gen(SOURCE_LEN);
@@ -1560,7 +1560,15 @@ fn main() {
         {
             match std::env::args().nth(2).as_deref() {
                 Some("timing") => run_source_consumer_timing(),
-                Some("resource") => run_source_consumer_resource(),
+                Some("resource") => {
+                    #[cfg(feature = "source-consumer-resource")]
+                    run_source_consumer_resource();
+                    #[cfg(not(feature = "source-consumer-resource"))]
+                    {
+                        eprintln!("source-consumer resource mode requires the source-consumer-resource feature");
+                        std::process::exit(2);
+                    }
+                }
                 _ => {
                     eprintln!("source-consumer requires `timing` or `resource`");
                     std::process::exit(2);

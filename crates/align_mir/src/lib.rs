@@ -4962,6 +4962,7 @@ enum ChunksPlan {
 }
 
 impl ChunksPlan {
+    #[cfg(test)]
     fn decision(self) -> PlanDecision {
         match self {
             Self::VirtualCount(decision)
@@ -5960,15 +5961,15 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// owner; bound places remain borrowed. The returned operand carries the hidden owner so view
 /// producers can extend it and scalar consumers can end it immediately.
 fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
-    lower_borrowed_owned_with_chunks_consumer(b, e, None)
+    lower_borrowed_owned_with_chunks_plan(b, e, None)
 }
 
-/// Lower a borrowed use while supplying the final materializing chunks consumer before the
-/// chunks expression is lowered. Other expressions use the ordinary borrow-mode lowering.
-fn lower_borrowed_owned_with_chunks_consumer(
+/// Lower a borrowed use while supplying the authoritative final chunks plan before the chunks
+/// expression is lowered. Other expressions use the ordinary borrow-mode lowering.
+fn lower_borrowed_owned_with_chunks_plan(
     b: &mut Builder,
     e: &hir::Expr,
-    chunks: Option<(&hir::Expr, &hir::Expr, Ty, ChunksConsumer)>,
+    chunks: Option<(&hir::Expr, &hir::Expr, Ty, ChunksPlan)>,
 ) -> Operand {
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -5977,8 +5978,8 @@ fn lower_borrowed_owned_with_chunks_consumer(
         || !may_need_synthetic_owner(e)
     {
         return match chunks {
-            Some((source, n, elem, consumer)) => {
-                lower_chunks(b, e, source, n, elem, consumer, None)
+            Some((source, n, elem, plan)) => {
+                lower_chunks_with_plan(b, e, source, n, elem, plan, None)
             }
             None => lower_expr(b, e),
         };
@@ -5986,8 +5987,8 @@ fn lower_borrowed_owned_with_chunks_consumer(
     // Register before lowering: an inner `?`/return may emit cleanup before the value is stored.
     let owner = b.new_synthetic_owner(e.ty);
     let operand = match chunks {
-        Some((source, n, elem, consumer)) => {
-            lower_chunks(b, e, source, n, elem, consumer, None)
+        Some((source, n, elem, plan)) => {
+            lower_chunks_with_plan(b, e, source, n, elem, plan, None)
         }
         None => lower_expr_for_borrow(b, e),
     };
@@ -6021,10 +6022,10 @@ fn lower_chunks_pipeline_source(
         elem,
     } = &source.kind
     {
-        lower_borrowed_owned_with_chunks_consumer(
+        lower_borrowed_owned_with_chunks_plan(
             b,
             source,
-            Some((base, n, *elem, consumer)),
+            Some((base, n, *elem, chunks_plan(consumer))),
         )
     } else {
         lower_borrowed_owned(b, source)
@@ -6040,32 +6041,52 @@ fn lower_parallel_source(
     elem_in: Ty,
     allow_virtual_chunks: bool,
 ) -> Option<(Box<ParallelSource>, bool)> {
-    if allow_virtual_chunks
-        && let hir::ExprKind::ArrayChunks {
-            source: base,
-            n,
-            elem,
-        } = &source.kind
+    if let hir::ExprKind::ArrayChunks {
+        source: base,
+        n,
+        elem,
+    } = &source.kind
     {
-        let base = lower_chunks_source(b, base, *elem);
-        if !lowering_continues(b) {
-            return None;
+        let consumer = if allow_virtual_chunks {
+            ChunksConsumer::ParallelVirtual
+        } else {
+            ChunksConsumer::Parallel
+        };
+        match chunks_plan(consumer) {
+            ChunksPlan::VirtualRangeViews(decision) => {
+                let base = lower_chunks_source(b, base, *elem);
+                if !lowering_continues(b) {
+                    return None;
+                }
+                let width = lower_expr(b, n);
+                if !lowering_continues(b) {
+                    return None;
+                }
+                b.record_plan(source, decision);
+                return Some((
+                    Box::new(ParallelSource::VirtualChunks {
+                        base,
+                        width,
+                        elem: *elem,
+                    }),
+                    true,
+                ));
+            }
+            plan @ ChunksPlan::MaterializedHeaders(_) => {
+                let release_after =
+                    pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+                let materialized = lower_borrowed_owned_with_chunks_plan(
+                    b,
+                    source,
+                    Some((base, n, *elem, plan)),
+                );
+                return lowering_continues(b).then_some((
+                    Box::new(ParallelSource::Materialized(materialized)),
+                    release_after,
+                ));
+            }
+            ChunksPlan::VirtualCount(_) | ChunksPlan::VirtualIndex(_) => return None,
         }
-        let width = lower_expr(b, n);
-        if !lowering_continues(b) {
-            return None;
-        }
-        let plan = chunks_plan(ChunksConsumer::ParallelVirtual);
-        debug_assert!(matches!(plan, ChunksPlan::VirtualRangeViews(_)));
-        b.record_plan(source, plan.decision());
-        return Some((
-            Box::new(ParallelSource::VirtualChunks {
-                base,
-                width,
-                elem: *elem,
-            }),
-            true,
-        ));
     }
 
     let release_after = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
@@ -11781,7 +11802,26 @@ fn lower_chunks(
     consumer: ChunksConsumer,
     direct_index: Option<(&hir::Expr, Ty)>,
 ) -> Operand {
-    let plan = chunks_plan(consumer);
+    lower_chunks_with_plan(
+        b,
+        expression,
+        source,
+        n,
+        elem,
+        chunks_plan(consumer),
+        direct_index,
+    )
+}
+
+fn lower_chunks_with_plan(
+    b: &mut Builder,
+    expression: &hir::Expr,
+    source: &hir::Expr,
+    n: &hir::Expr,
+    elem: Ty,
+    plan: ChunksPlan,
+    direct_index: Option<(&hir::Expr, Ty)>,
+) -> Operand {
     let src = lower_chunks_source(b, source, elem);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -22953,6 +22993,10 @@ mod tests {
             "fn f(xs: slice<i64>) -> i64 = { return 0; xs }.chunks(2).len()\n",
             "fn f(xs: slice<i64>) -> i64 = xs.chunks({ return 0; 2 }).len()\n",
             "fn f(xs: slice<i64>) -> i64 = xs.chunks(2)[{ return 0; 0 }].len()\n",
+            "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f(xs: array<i64>) -> array<i64> = { return xs; xs }.chunks(2).par_map(chunk_sum)\n",
+            "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f(xs: array<i64>) -> array<i64> = xs.chunks({ return xs; 2 }).par_map(chunk_sum)\n",
+            "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f(xs: slice<i64>) -> i64 = { return 0; xs }.chunks(2).par_map(chunk_sum).sum()\n",
+            "fn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f(xs: slice<i64>) -> i64 = xs.chunks({ return 0; 2 }).par_map(chunk_sum).sum()\n",
             "fn dbl(x: i64) -> i64 = x * 2\nfn f(xs: array<i64>) -> array<i64> = { return xs; xs }.map(dbl).to_array()\n",
             "fn add(acc: i64, x: i64) -> i64 = acc + x\nfn f(xs: array<i64>) -> array<i64> = xs.scan({ return xs; 0 }, add)\n",
             "fn dbl(x: i64) -> i64 = x * 2\nfn f(xs: array<i64>) -> array<i64> = { return xs; xs }.par_map(dbl)\n",
@@ -22963,6 +23007,48 @@ mod tests {
                 program.plan_records.is_empty(),
                 "a terminating eager operand must publish no plan row: {source}\n{:?}",
                 program.plan_records
+            );
+        }
+
+        for (name, source) in [
+            (
+                "range-materialize-width",
+                "fn make() -> array<i64> = [1, 2].to_array()\nfn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f() -> array<i64> = make().chunks({ return [0].to_array(); 1 }).par_map(chunk_sum)\n",
+            ),
+            (
+                "range-reduce-width",
+                "fn make() -> array<i64> = [1, 2].to_array()\nfn chunk_sum(xs: slice<i64>) -> i64 = xs.sum()\nfn f() -> i64 = make().chunks({ return 0; 1 }).par_map(chunk_sum).sum()\n",
+            ),
+        ] {
+            let (program, _) = lower_current_plan(source);
+            assert!(
+                program.plan_records.iter().all(|record| {
+                    !matches!(record.kind, PlanKind::Chunks | PlanKind::ParMap)
+                }),
+                "{name} must publish no chunks/par-map plan before the terminating width returns: {:?}",
+                program.plan_records
+            );
+            assert!(
+                !any_rvalue(&program, |rvalue| matches!(
+                    rvalue,
+                    Rvalue::ParMapParallel { .. } | Rvalue::ParMapReduce { .. }
+                )),
+                "{name} must not publish a parallel call after width termination"
+            );
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == "f")
+                .expect("fresh width-termination fixture function");
+            let drops = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter(|statement| matches!(statement, Stmt::Drop(_)))
+                .count();
+            assert_eq!(
+                drops, 1,
+                "{name} must release the already-created base owner once"
             );
         }
     }

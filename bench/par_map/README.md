@@ -226,15 +226,16 @@ cost, consumer layout, and the ownership contract still need to be measured toge
 `chunks(width).par_map(...)` consumers. It verifies the checksums of both materialization and direct
 integer reduction over 1,048,579 `i64` elements at widths 1, 8, 64, and 1,024. The script validates
 the preserved C0 compiler/runtime hashes, compiles equal-length baseline and candidate export names,
-co-links both objects with one allocation-counting runtime, warms each arm, and records 21 paired
-AB/BA timing samples without deleting outliers. A separate fresh process measures one serialized
-call per arm after resetting the allocation counters; timing and resource observations never share a
-process. The exact thresholds and baseline identities are owned by
+co-links both objects with the ordinary production runtime, warms each arm, and records 21 paired
+AB/BA timing samples without deleting outliers. Only after timing completes does the script build
+the `alloc-count` runtime and link a separate resource binary for one serialized call per arm. Thus
+neither the counter atomics nor the requested-live mutex can bias the baseline's deliberately
+retained allocation. The exact thresholds and baseline identities are owned by
 `docs/impl/32-post-xml-consolidation-plan.md` §11.4.
 
 The adopted 2026-09-07 Linux x86-64 run passed every gate. Width-1 median
-candidate/baseline ratios were 0.3763 for materialization and 0.3284 for the
-primary reduction. The remaining medians ranged from 0.7710 to 0.9896, within
+candidate/baseline ratios were 0.3527 for materialization and 0.3081 for the
+primary reduction. The remaining medians ranged from 0.7695 to 0.9852, within
 the 1.05 guards. Every resource row removed exactly one allocation and one
 free, stayed balanced at zero requested-live bytes, and saved the exact
 16-byte header array. The candidate object grew from 3,176 to 3,624 bytes.
