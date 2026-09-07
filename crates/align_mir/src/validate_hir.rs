@@ -5440,7 +5440,7 @@ impl<'a> BodyValidator<'a> {
     /// A method may inspect a stable handle field without moving the field. The expression
     /// flow validator independently checks every field segment and its resolved type.
     fn handle_receiver_place(&self, expression: &hir::Expr, context: &BodyContext, ty: Ty) -> bool {
-        expression.ty == ty
+        self.body_ty_matches(expression.ty, ty)
             && (self.local_handle_place(context, expression, ty)
                 || matches!(&expression.kind, hir::ExprKind::Field { path, .. } if !path.is_empty()))
     }
