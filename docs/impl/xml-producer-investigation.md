@@ -542,6 +542,8 @@ performance promise or benchmark gate is introduced.
 this separate storage projection. `xml_call_arguments_valid` and
 `add_call_result` consume it with write/exclusive requirements. Parameter-entry
 facts require an unambiguous slot binding; duplicate Out/shared bindings fail.
+Out slots are ordinary allocas, so their authority must flow through an actual
+Arg store; only Borrow/BorrowMut slots implicitly alias incoming storage.
 The author-side matrix-to-diff pass retains ordinary typed producer checks,
 validation-only dependencies, and the total fixed-point solver. No storage fact
 feeds element READ or Move certification.
@@ -549,7 +551,8 @@ feeds element READ or Move certification.
 - `align_codegen_llvm::tests::producer_out_slices_authenticate_backing_without_reading_forwarded_elements`
   crosses fixed/dynamic backing with static alternatives, wrong header stores,
   raw element producers, seeded/unseeded cycles, opaque Copy returns, borrowed
-  descriptors, non-Out Copy parameters, and duplicate parameter bindings. All
+  descriptors, non-Out Copy parameters, duplicate parameter bindings, and
+  missing/self-cyclic Out slot initialization. All
   malformed cases are rejected at publication, emission validation, and ThinLTO
   partition validation. The existing `producer_` owners retain type/path,
   presence, sibling, and cycle coverage.
@@ -569,3 +572,13 @@ Opaque Copy-view parameters/results, indirect Out function-value ABI support,
 and target-relative closure joins remain the explicit boundaries above, not
 sources of inferred writable authority. No specification or interface record
 changes are required for this implementation of the existing source contract.
+
+The independent review of `cc2d8712` found one P2 initialization hole: an implicit
+Out parameter-slot seed accepted a missing or self-cyclic prologue store although
+LLVM initializes that alloca only through the explicit Store. The correction
+removes that seed and preserves the actual Arg-store edge; the parameterized Out
+owner rejects both malformed forms at all three certification boundaries. The
+same-class sweep checked every new seed: only Arg operands supply Out entry
+facts, while borrowed-slot aliasing and owning fixed backing retain their
+existing physical storage rules. This local initialization correction changes
+neither the reviewed proof strategy nor the capability boundary.

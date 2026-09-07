@@ -5665,8 +5665,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
             equation.invalid = true;
             return equation;
         };
+        // Only borrowed slots alias incoming storage in emit_fn. An Out header
+        // lives in an alloca and must be grounded by its explicit Arg store.
         if let Some(index) = parameter
-            && matches!(self.graph.function.param_modes.get(index), Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out))
+            && matches!(self.graph.function.param_modes.get(index), Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut))
             && let Ok(index) = u32::try_from(index)
         {
             let source = self.buffer_source(&Operand::Arg(index), Vec::new());
@@ -37055,7 +37057,7 @@ fn main() -> i32 = 0
                             }
                         }
                     }
-                    _ => unreachable!(),
+                    _ => panic!("unknown Out mutation: {mutation}"),
                 }
                 if mutation == "seeded" {
                     assert!(validate_mir_producers(&bad).is_ok(), "seeded {allocation}");
@@ -37080,6 +37082,27 @@ fn main() -> i32 = 0
             function.param_modes.push(align_ast::ParamMode::Borrow);
             assert!(validate_mir_producers(&duplicate).is_err());
             assert_xml_producer_rejected(&duplicate, "aliased Out and shared parameter slots");
+            for initialization in ["missing", "self-cycle"] {
+                let mut bad = base.clone();
+                let forward = xml_test_function(&bad, "forward");
+                let function = &mut bad.fns[forward];
+                let slot = function.params[0];
+                let load = function.blocks.iter().flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::Load(source)) if *source == slot => Some(*value),
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing forwarded Out load"));
+                for block in &mut function.blocks {
+                    block.stmts.retain(|statement| !matches!(statement, Stmt::Store(destination, _) if *destination == slot));
+                    if initialization == "self-cycle"
+                        && block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if *value == load))
+                    {
+                        block.stmts.push(Stmt::Store(slot, Operand::Value(load)));
+                    }
+                }
+                assert!(validate_mir_producers(&bad).is_err(), "Out initialization {initialization}");
+                assert_xml_producer_rejected(&bad, &format!("Out initialization {initialization}"));
+            }
         }
     }
 
