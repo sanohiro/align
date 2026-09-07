@@ -39201,7 +39201,7 @@ fn main() -> i32 = 0
             vec![],
             vec![worker.clone()],
         )
-        .expect("the valid virtual source control must reach LLVM");
+        .unwrap_or_else(|error| panic!("the valid virtual source control must reach LLVM: {error}"));
 
         let cases = [
             (
@@ -41523,14 +41523,18 @@ fn main() -> i32 = 0
                return (a.len() + (b.len() as i64) + c.len()) as i32\n\
              }\n",
         );
-        let declarations = callable_declarations(&chunks_program).unwrap();
+        // These are test-constructed, semantically checked controls. Panicking keeps a malformed
+        // fixture distinguishable from a production diagnostic path without adding Gate-3
+        // unwrap/expect sites.
+        let declarations = callable_declarations(&chunks_program)
+            .unwrap_or_else(|error| panic!("chunks declarations must be valid: {error}"));
         let chunks_preflight = callable_preflight(
             &chunks_program,
             &[],
             declarations,
             ModuleScope::Whole,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("chunks callable preflight must succeed: {error}"));
         let chunk_ids = chunks_preflight
             .generated_names
             .iter()
@@ -41544,18 +41548,19 @@ fn main() -> i32 = 0
             Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true })),
             &chunks_program,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("slice<i64> must canonicalize: {error}"));
         let slice_i32 = canonical_ty(
             Ty::Slice(Scalar::Int(IntTy { bits: 32, signed: true })),
             &chunks_program,
         )
-        .unwrap();
-        let i64_ty = canonical_ty(Ty::Int(IntTy { bits: 64, signed: true }), &chunks_program).unwrap();
+        .unwrap_or_else(|error| panic!("slice<i32> must canonicalize: {error}"));
+        let i64_ty = canonical_ty(Ty::Int(IntTy { bits: 64, signed: true }), &chunks_program)
+            .unwrap_or_else(|error| panic!("i64 must canonicalize: {error}"));
         let materialized_chunks = canonical_ty(
             Ty::DynSliceArray(align_sema::PrimScalar::Int(IntTy { bits: 64, signed: true })),
             &chunks_program,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("materialized chunks must canonicalize: {error}"));
         assert!(chunk_ids.iter().any(|(id, _)| id.source == slice_i64 && id.terminal_input == slice_i64));
         assert!(chunk_ids.iter().any(|(id, _)| id.source == slice_i32 && id.terminal_input == slice_i32));
         assert!(chunk_ids.iter().any(|(id, _)| id.source == materialized_chunks && id.terminal_input == i64_ty));

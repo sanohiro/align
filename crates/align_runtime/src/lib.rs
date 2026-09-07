@@ -34821,7 +34821,14 @@ mod tests {
     ) {
         let seed = i64::from(unsafe { input.read() });
         for index in start..end {
-            unsafe { output.cast::<i64>().add(index as usize).write(seed.wrapping_add(index)) };
+            let index_usize = usize::try_from(index)
+                .unwrap_or_else(|_| panic!("test range index must be nonnegative and representable"));
+            unsafe {
+                output
+                    .cast::<i64>()
+                    .add(index_usize)
+                    .write(seed.wrapping_add(index))
+            };
         }
     }
 
@@ -34974,7 +34981,9 @@ mod tests {
                 par_map_opaque_source,
             )
         };
-        let values = unsafe { std::slice::from_raw_parts(output.cast::<i64>(), COUNT as usize) };
+        let count = usize::try_from(COUNT)
+            .unwrap_or_else(|_| panic!("test count must be positive and representable"));
+        let values = unsafe { std::slice::from_raw_parts(output.cast::<i64>(), count) };
         assert_eq!(values.first(), Some(&7));
         assert_eq!(values.last(), Some(&(7 + COUNT - 1)));
         unsafe { align_rt_free(output) };

@@ -22976,7 +22976,7 @@ mod tests {
                 .fns
                 .iter()
                 .find(|function| function.name.as_str() == "f")
-                .expect("fresh-owner fixture function");
+                .unwrap_or_else(|| panic!("fresh-owner fixture function is missing"));
             let drops = function
                 .blocks
                 .iter()
@@ -23039,7 +23039,7 @@ mod tests {
                 .fns
                 .iter()
                 .find(|function| function.name.as_str() == "f")
-                .expect("fresh width-termination fixture function");
+                .unwrap_or_else(|| panic!("fresh width-termination fixture function is missing"));
             let drops = function
                 .blocks
                 .iter()
