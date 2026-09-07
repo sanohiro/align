@@ -1380,3 +1380,32 @@ owner failed producer-return certification in `pick`, without any JSON operation
 including with the preserved pre-repair release compiler. The separate canonical
 producer return type-identity closure in `xml-producer-investigation.md` owns
 that defect; it is not evidence against the encoder guard.
+
+## 14. Request 45 — nested consuming field closure
+
+The all-request audit at `b947b5d9` reproduces a nested owned string field
+accepted as a record initializer without the existing nested-move diagnostic.
+The eager operand path defers consumption until the enclosing action;
+`consume_completed_action_value` reaches `consume_match_result`, whose field
+arm handles only depth one. The ordinary consuming expression path already
+rejects deeper Move fields. This repair applies that same restriction at the
+completed action, without changing evaluation order or moving consumption
+earlier than successful construction.
+
+| Closure axis | Implementation and owner |
+|---|---|
+| Type formation, construction, move-in/out, source nulling | Existing typed field paths and Move classification remain authoritative. The completed-action consumer rejects depth-two-or-deeper Move fields before MIR. `owned_json_nested_consumers_reject_deep_moves` covers record construction for nested string, owned Option, array, and record payloads, and crosses string payloads with tuple/tagged/call construction. |
+| Borrow, Copy, depth-one transfer, replacement, Drop and return | `owned_json_nested_consumers_preserve_supported_uses` retains deep text borrowing, explicit cloning, Copy extraction, and depth-one transfer with executable cleanup. Whole nested-record moves retain their existing diagnostic. No new accepted transfer or cleanup representation is introduced. |
+| `if`, `match`, blocks, `else`, `?`, `map_err`, loop joins, early exits | The negative owner covers completed constructor operands and control-expression tails. Existing owned JSON result transfer/control-flow/replacement owner and eager snapshot/borrow-liveness owners cover unchanged evaluation, non-fallthrough, and join machinery. The fix does not re-evaluate operands or alter joins. |
+| Generic/imported and whole/per-unit | The negative owner uses imported generic roots and checks both compilation paths. Rejection precedes interface/MIR use; no serialized fact changes. |
+| Runtime provenance, allocation, ABI, malformed input | No runtime, ABI, IR shape, allocation, or pointer operation changes. Existing decoded-owner and malformed-input owners remain authoritative. The new guard only diagnoses an already-typed unsupported path. No performance claim. |
+
+This follows the existing nested-field restriction, not a new ownership strategy;
+the preflight review checks the matrix and implementation together. The entire
+completed-action field consumer is audited, not only JSON record literals.
+
+Author-side closure pass: the completed-action field arm and ordinary consuming
+field arm now enforce the same deferred-path restriction. The new negative
+owner fails with an empty diagnostic set when the guard is removed, proving it
+detects the original acceptance defect; the positive owner remains executable.
+No new review finding class or language surface is introduced.

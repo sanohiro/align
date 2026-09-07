@@ -1,9 +1,117 @@
-//! Requests 9, 13, and 52: recursive owned JSON and live encoder sources.
+//! Requests 9, 13, 45, and 52: recursive owned JSON and live encoder sources.
 
 mod common;
 use common::*;
 use std::fmt::Write as _;
 use std::process::{Command, Stdio};
+
+#[test]
+fn owned_json_nested_consumers_reject_deep_moves() {
+    for (payload, json) in [
+        ("string", "\"owned text\""),
+        ("Option<string>", "\"owned text\""),
+        ("array<i64>", "[1,2]"),
+        ("Leaf", "{\"text\":\"owned text\"}"),
+    ] {
+        let schema = format!(
+            "module schema\npub Leaf {{ text: string }}\npub Inner {{ value: {payload} }}\n\
+             pub Root<T> {{ node: T }}\npub Out {{ value: {payload} }}\n\
+             pub fn take(value: {payload}) {{}}\n"
+        );
+        for (index, action) in [
+            "out := schema.Out { value: row.node.value }",
+            "out := (row.node.value, 1)",
+            "out := Some(row.node.value)",
+            "out: Result<PAYLOAD, Error> := Ok(row.node.value)",
+            "schema.take(row.node.value)",
+            "out := schema.Out { value: { row.node.value } }",
+            "out := schema.Out { value: if flag { row.node.value } else { row.node.value } }",
+            "out := schema.Out { value: match Some(flag) { Some(choice) => row.node.value, None => row.node.value } }",
+        ].into_iter().enumerate() {
+            // String crosses every admitted constructor. Other Move payload classes exercise
+            // the common field consumer without introducing unsupported carrier combinations.
+            if payload != "string" && index != 0 {
+                continue;
+            }
+            let action = action.replace("PAYLOAD", payload);
+            let input = format!("{{\"node\":{{\"value\":{json}}}}}");
+            let source = format!(
+                "import core.json\nimport schema\n\
+                 fn inspect(flag: bool) -> Result<(), Error> {{\n\
+                 row: schema.Root<schema.Inner> := json.decode({input:?})?\n\
+                 {action}\nreturn Ok(())\n}}\n\
+                 fn main() -> Result<(), Error> = inspect(true)\n"
+            );
+            let checked = diff_check_multi(
+                "owned-json-nested-consumer",
+                &[("main.align", &source), ("schema.align", &schema)],
+                "main.align",
+            );
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(
+                    diagnostics.contains("moving an owned field out through a nested path"),
+                    "{payload} in {action} must reject the unsupported transfer:\n{diagnostics}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn owned_json_nested_consumers_preserve_supported_uses() {
+    let source = r#"
+import core.json
+Inner { text: string, count: i64 }
+Root { node: Inner }
+Out { text: string, count: i64 }
+fn inspect(text: str) { print(text) }
+fn main() -> Result<(), Error> {
+  row: Root := json.decode("{\"node\":{\"text\":\"owned text\",\"count\":7}}")?
+  inspect(row.node.text)
+  out := Out { text: row.node.text.clone(), count: row.node.count }
+  print(row.node.text)
+  taken := out.text
+  print(taken)
+  print(out.count)
+  return Ok(())
+}
+"#;
+    let checked = diff_check_multi(
+        "owned-json-nested-supported",
+        &[("main.align", source)],
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let rejected = source.replace("inspect(row.node.text)", "nested := row.node");
+    let checked = diff_check_multi(
+        "owned-json-nested-record-control",
+        &[("main.align", &rejected)],
+        "main.align",
+    );
+    for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+        assert!(
+            diagnostics.contains("moving a nested struct field out of a struct"),
+            "{diagnostics}"
+        );
+    }
+    if backend_available() {
+        let out = build_and_run("owned-json-nested-supported", source);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "owned text\nowned text\nowned text\n7\n"
+        );
+    }
+}
 
 #[test]
 fn owned_json_encoders_reject_moved_sources() {
