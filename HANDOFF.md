@@ -7,6 +7,16 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**Request audit (2026-09-07):** PR #975 completes the remaining Request 59
+copied-scalar aggregate producer repair; both registered modules now pass per-unit
+checking. The [all-60 request audit](docs/impl/align-llm-request-audit-2026-09-07.md)
+separates delivered work, consumer adoption, partial existing coverage, and
+remaining proposals. Next prioritize the reproduced Request 45 nested-field
+ownership defect, then investigate Request 39 replacement cleanup and the
+Request 42/43/49 checking boundary. Do not implement every proposed API merely
+to close the register. Earlier status paragraphs below are historical context;
+current Request 21 is `fs.open_ro`, while #892's old Request 21 is now Request 44.
+
 **XML investigation closure:** the owner requested one consolidated
 investigate-then-repair record instead of further piecemeal fix rounds. Read
 [`docs/impl/xml-producer-investigation.md`](docs/impl/xml-producer-investigation.md)
