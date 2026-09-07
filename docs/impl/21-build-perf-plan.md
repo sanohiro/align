@@ -2191,6 +2191,31 @@ a generic-named, marker-free helper edit remains in service scope by path.
 
 ## Item 2: lld linking on ELF
 
+### Request 54: support-library ordering closure
+
+The current source reproduces an unresolved `expf` when a user C static archive
+follows the automatic `-lm` under the system ELF linker. The shared
+`link_command_args` producer must emit the automatic support group after the
+runtime, optional PGO archive, and complete ordered capability/user library
+list. `order_link_libs` continues to own the libpq closure and user order.
+Mach-O's automatic support list remains empty. This changes no FFI signature,
+language syntax, ownership rule, runtime ABI, or library-selection policy.
+
+| Closure axis | Owner and acceptance |
+|---|---|
+| Ordinary, instrumented-PGO, whole/per-unit and watch links | All consume `LinkPlan` through `link_command_args`; `support_libraries_follow_all_archive_inputs` crosses one/multiple objects, optional profile archive, and both formats. The automatic ELF support group is the final argument suffix. |
+| Capability closure and caller order | `order_link_libs` is unchanged; the same owner retains arbitrary libraries before and after libpq and its repeated dependency closure. Existing capability/link-plan owners remain applicable. |
+| Native user archive | `user_static_archive_resolves_automatic_math_support` compiles a C archive containing a non-folded `expf` call, builds an imported Align caller with only `link("fixture")`, and requires result 2 under the system ELF linker. A fresh private directory and bounded child cleanup own every artifact and process. |
+| Object format and profile | Existing exact argv goldens retain ELF hygiene/strip and PGO-anchor ordering; Mach-O gains no automatic pthread/dl/m flags. Linker selection stays unchanged. |
+| Formation, generics, malformed names, control flow, moves, return, nulling, Drop, allocation and runtime provenance | Unchanged sema/MIR/ABI owners: this repair only reorders already-validated link inputs after code generation. No new ownership or control-flow path is formed. |
+| Artifact/cache identity | The ordinary final linker consumes the revised argv; object/interface formats and cached object contents are unchanged. No new cache, ambient input, artifact type, or performance promise is introduced. |
+
+The author-side matrix pass checks each link entrypoint against the shared
+producer and each ordered input against the exact argv owner. The one preflight
+review includes this boundary; no separate public-contract review is required.
+
+### Linker selection
+
 `alignc` links through the system C driver (`cc`). On ELF it now additionally
 tells that driver to run LLVM's `ld.lld`; on Mach-O nothing changed.
 

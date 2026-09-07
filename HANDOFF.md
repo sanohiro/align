@@ -80,13 +80,18 @@ Its implementation follows the exact safety/ownership matrix and adds no
 runtime ABI symbol. The preregistered semantic, allocation, object-size, and
 timing gates passed, so §11 records O0 as adopted in PR #967. V1's §12
 phase-close reassessment satisfies §9 and closes the post-XML wave. The next
-capability closes align-llm Request 52's reproduced owned-record Option
+completed capability closes align-llm Request 52's reproduced owned-record Option
 `match` followed by re-encoding defect: both owned JSON encoders now reject a
 wholly or partially moved root through the existing MoveCheck state. Borrowed
 inspection, Copy payloads, and reinitialized roots remain accepted. Section 13
-of `docs/impl/25-recursive-owned-json-plan.md` owns its closure. After delivery,
-the next investigation is Request 54's ELF static-library ordering report on
-current Align; align-llm consumer changes remain outside this work.
+of `docs/impl/25-recursive-owned-json-plan.md` owns its closure (PR #970).
+Request 54's ELF static-library link failure was also reproduced: automatic
+support libraries now follow every runtime, PGO, capability and user archive;
+the existing libpq closure and Mach-O support list are unchanged. Item 2 of
+`docs/impl/21-build-perf-plan.md` owns that repair. After delivery, investigate
+the existing `owned_tagged_payloads::origin_specific_generic_instances_share_one_tagged_llvm_type`
+producer-return certification failure recorded during Request 52 verification.
+align-llm consumer changes remain outside this work.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->

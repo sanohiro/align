@@ -28,6 +28,54 @@ use common::*;
 
 use align_driver::{link_command_args, order_link_libs, LinkPlan, Linker, ObjectFormat, Profile};
 
+#[test]
+fn support_libraries_follow_all_archive_inputs() {
+    use std::path::Path;
+    let objects = [Path::new("main.o"), Path::new("imported.o")];
+    let libraries = ["prefix", "crypto", "pq", "ssl", "zstd", "z", "fixture"].map(str::to_owned);
+    let ordered = order_link_libs(&libraries);
+    let expected = [
+        "prefix", "crypto", "pq", "ssl", "zstd", "z", "fixture", "pq", "ssl", "crypto", "zstd", "z",
+    ];
+    assert_eq!(ordered, expected);
+    for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
+        for count in [1, 2] {
+            for profile_rt in [None, Some(Path::new("profile.a"))] {
+                let args = link_command_args(&LinkPlan {
+                    objs: &objects[..count],
+                    exe: Path::new("program"),
+                    runtime: Path::new("runtime.a"),
+                    ordered_link_libs: &ordered,
+                    format,
+                    profile: Profile::Release,
+                    profile_rt,
+                    linker: &Linker::System,
+                });
+                let mut tail: Vec<std::ffi::OsString> = expected
+                    .iter()
+                    .map(|name| format!("-l{name}").into())
+                    .collect();
+                if format == ObjectFormat::Elf {
+                    tail.extend(["-lpthread", "-ldl", "-lm"].map(Into::into));
+                } else {
+                    for support in ["-lpthread", "-ldl", "-lm"] {
+                        assert!(!args.iter().any(|arg| arg == support));
+                    }
+                }
+                assert!(
+                    args.ends_with(&tail),
+                    "{format:?}, {count}, {profile_rt:?}: {args:?}"
+                );
+                if let Some(profile_rt) = profile_rt {
+                    let profile_index = args.iter().position(|arg| arg == profile_rt).unwrap();
+                    assert!(profile_index < args.len() - tail.len());
+                }
+                assert_eq!(&args[..count], &objects[..count]);
+            }
+        }
+    }
+}
+
 /// The gated libraries the program's MIR requests, as `-l<name>` bare names. Everything the driver
 /// links unconditionally (`pthread`/`dl`/`m`) is excluded — this is only the capability-gated set.
 fn gated_link_libs(name: &str, src: &str) -> Vec<String> {
