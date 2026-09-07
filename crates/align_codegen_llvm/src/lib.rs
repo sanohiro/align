@@ -31211,7 +31211,7 @@ mod tests {
                 // A malformed validation dependency must poison the copied result and its cycle.
                 let bad = XmlAccessNode::Value(1, vec![]);
                 equations.insert(bad.clone(), XmlAccessEquation { invalid: true, ..XmlAccessEquation::default() });
-                equations.get_mut(&copied).unwrap().checks.push((bad, OperandRequirement::READ));
+                equations.get_mut(&copied).unwrap_or_else(|| panic!("missing copied equation")).checks.push((bad, OperandRequirement::READ));
                 let (_, invalid) = solve_xml_access_equations(&equations);
                 assert!(invalid.contains(&copied) && invalid.contains(&storage));
             }
@@ -31243,7 +31243,7 @@ fn main() -> i32 = 0
                         .find_map(|stmt| match stmt {
                             Stmt::Let(value, rv @ Rvalue::SliceIndex { .. }) => Some((*value, rv.clone())),
                             _ => None,
-                        }).expect("indexed scalar producer");
+                        }).unwrap_or_else(|| panic!("missing indexed scalar producer"));
                     if axis == "wrong-type" { function.value_tys[value as usize] = Ty::Bool; }
                     else { function.blocks[0].stmts.push(Stmt::Let(value, definition)); }
                 }
@@ -31252,10 +31252,10 @@ fn main() -> i32 = 0
                         .find_map(|stmt| match stmt {
                             Stmt::StoreField(_, path, value) if path == &[1] => Some(value),
                             _ => None,
-                        }).expect("owned array field");
+                        }).unwrap_or_else(|| panic!("missing owned array field"));
                     *stored = Operand::Arg(0);
                 }
-                _ => unreachable!(),
+                _ => panic!("unknown mutation axis"),
             }
             assert!(validate_mir_producers(&malformed).is_err(), "publication: {axis}");
             assert_xml_producer_rejected(&malformed, axis);
