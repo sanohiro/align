@@ -804,7 +804,7 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn imported_interface_fallback() {
+    fn imported_interface_retention_parity() {
         let imported = [
             (
                 "shaper.align",
@@ -816,15 +816,28 @@ fn main() -> i32 {
             ),
         ];
         let checked = diff_check_multi(
-            "pkg-db-q6-imported-retention-fallback",
+            "pkg-db-q6-imported-retention-parity",
             &imported,
             "main.align",
         );
         assert!(
-            !checked.whole_errors && checked.per_unit_errors,
-            "an available same-program body is exact, while its interface-only call must fail closed:\nwhole={}\nper-unit={} ",
+            !checked.whole_errors && !checked.per_unit_errors,
+            "serialized retention must preserve the independent clone in both modes:\nwhole={}\nper-unit={} ",
             checked.whole_diags,
             checked.per_unit_diags,
+        );
+        let retaining_helper = imported[0].1.replace("source.clone_in(out)", "source");
+        let retaining = [("shaper.align", retaining_helper.as_str()), imported[1]];
+        let rejected = diff_check_multi(
+            "pkg-db-q6-imported-raw-retention",
+            &retaining,
+            "main.align",
+        );
+        assert!(
+            rejected.whole_errors && rejected.per_unit_errors,
+            "retaining the raw source must prevent owner replacement in both modes:\nwhole={}\nper-unit={}",
+            rejected.whole_diags,
+            rejected.per_unit_diags,
         );
     }
 
@@ -1112,8 +1125,8 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn imported_storage_fallback() {
-        let imported_storage_fallback = [
+    fn imported_storage_retention_parity() {
+        let imported_storage_retention_parity = [
             (
                 "shaper.align",
                 "module shaper\npub State { values: slice<i64> }\npub fn ignore(borrow mut state: State, borrow source: array<i64>) {}\n",
@@ -1124,19 +1137,39 @@ fn main() -> i32 {
             ),
         ];
         let imported_storage_checked = diff_check_multi(
-            "pkg-db-q6-imported-storage-fallback",
-            &imported_storage_fallback,
+            "pkg-db-q6-imported-storage-parity",
+            &imported_storage_retention_parity,
             "main.align",
         );
         assert!(
-            !imported_storage_checked.whole_errors
-                && imported_storage_checked
-                    .per_unit_diags
-                    .contains("cannot retain a shorter-lived view through this mutable borrow"),
-            "an interface-only call must conservatively retain owned argument storage:\nwhole={}\nper-unit={}",
+            !imported_storage_checked.whole_errors && !imported_storage_checked.per_unit_errors,
+            "serialized known-empty retention must accept ignored local storage in both modes:\nwhole={}\nper-unit={}",
             imported_storage_checked.whole_diags,
             imported_storage_checked.per_unit_diags,
         );
+        let retaining_helper = imported_storage_retention_parity[0]
+            .1
+            .replace("{}", "{ state.values = source[..] }");
+        let retaining = [
+            ("shaper.align", retaining_helper.as_str()),
+            imported_storage_retention_parity[1],
+        ];
+        let rejected = diff_check_multi(
+            "pkg-db-q6-imported-retained-storage",
+            &retaining,
+            "main.align",
+        );
+        for (mode, errors, diagnostics) in [
+            ("whole", rejected.whole_errors, &rejected.whole_diags),
+            ("per-unit", rejected.per_unit_errors, &rejected.per_unit_diags),
+        ] {
+            assert!(
+                errors && diagnostics.contains(
+                    "cannot retain a shorter-lived view through this mutable borrow"
+                ),
+                "{mode} must reject actual retention of local owned storage:\n{diagnostics}",
+            );
+        }
     }
 
     #[test]

@@ -2445,6 +2445,17 @@ change compiler behavior, or redesign the nightly suite. Required verification i
 `scripts/test-pr-workflow.sh`, the bounded gate, the local DB parity script because
 the shared runner is a DB boundary, and one fresh inspection-only review.
 
+The required local DB run exposed two stale Q6 assertions from before Request
+43/49's serialized mutable-retention records. They expected safe imported clone
+and no-op helpers to fail only per-unit checking. The dedicated imported owner
+had covered the new contract, but these service-suite expectations were outside
+that change's selected owners, and cancelled nightly runs supplied no closure.
+The scheduling batch corrects both expectations together, pairs each with actual
+retention that must reject in both modes, and updates the stale HIR matrix row.
+This changes no compiler behavior or DB execution policy. The focused two-case
+owner runs without a service; the complete fourteen-suite local DB run remains
+required for this shared-runner change.
+
 ### Item 2c qualification
 
 On `305926b4`, fixed runner snapshots executed the same 16 SHA-256-checked
