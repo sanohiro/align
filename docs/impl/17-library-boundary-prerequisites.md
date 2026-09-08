@@ -5219,3 +5219,36 @@ the reachability and same-generation-join findings before implementation.
 | Ownership, cleanup and allocation | No new move, source nulling, Drop or runtime allocation behavior. Complete `return_provenance` owners retain mixed owned break transfer, generation move/replacement, projected owned content, Out backing, call completion and allocation parity. Existing imported replacement/independent-output owners remain mandatory. |
 | Interfaces, cache and malformed input | Whole/per-unit checking must agree. `unit_cache::retained_buffer_view_rejects_after_cached_helper_edit_and_revert` checks cold/hit, a private helper edit that changes public retention, rejection with reuse enabled/disabled, and exact revert. Existing format-10 malformed interface and checked-HIR owners remain authoritative; no serialized authority is added. |
 | Delivery | Run all 21 frozen cases with a fresh matching compiler/runtime before code review and delivery. Report 06/11 as deferred rather than passing; negative fixtures are never executed. Archive the report and update the external request register without committing consumer changes. |
+
+### Reopened conditional-evaluation reachability axis
+
+The first code review found that eager traversal of a short-circuit RHS made
+canonical divergence disconnect its bypass path. `&&`, `||`, and `else` must
+share a conditional-child CFG builder: after the mandatory input completes,
+branch to both a bypass join and a conditional entry; join the conditional child
+only when it falls through. A diverging mandatory input leaves both successors
+unreachable. Nested conditional children compose these edges; strict operands
+retain sequential evaluation. No constant-folding authority is added.
+
+| Conditional-evaluation cell | Owner obligation |
+|---|---|
+| `&&` / `||` skipped RHS | `retained_views_preserve_short_circuit_bypass` rejects local-view retention after return, loop break, process exit, infinite loop and nested conditional RHS; caller-backed controls pass in whole/per-unit checking. |
+| RHS that falls through | The same owner checks conditional retained writes and later retention after a conditional local alias replacement; joining must preserve the shorter source. |
+| Mandatory input and strict operands | Existing `retained_loop_views_ignore_nonreturning_break_edges` retains strict divergence coverage; the new owner checks mandatory-LHS divergence does not synthesize a returning break. |
+| `else`, branches, loops and ownership | Reuse the existing conditional fallback structure without changing its semantics; existing complete return-provenance and imported retention owners remain required. |
+
+This is one CFG safety correction within the existing Escape capability, with
+no IR, ABI, cache or public contract change. Review this revised reachability
+boundary before implementation, then review the revised complete candidate after
+its owner checks and full frozen bundle. Preserve the original P1 finding and
+bind its resolution to this axis.
+
+
+The frozen CPU-reference build exposed the cost of the added conditional joins.
+Escape's solver keeps at most one pending queue entry per block: update the joined
+input immediately, enqueue only if absent, and clear the pending bit before
+processing so loop backedges can schedule a later iteration. Evaluate the
+conditional successor before its bypass join. This changes scheduling only; every
+changed input still reaches a fixed point and diagnostic replay uses final inputs.
+Existing loop/reachability owners and the unchanged frozen 180-second per-command
+budget are the acceptance owners; do not raise that budget to admit the change.

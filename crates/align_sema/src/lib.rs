@@ -18457,12 +18457,12 @@ enum EscapeWalkItem<'a> {
         branch: EscapeFlowBlockId,
         join: EscapeFlowBlockId,
     },
-    ElseAfterOpt {
-        fallback: &'a Expr,
+    ConditionalAfterInput {
+        conditional: &'a Expr,
         depth: u32,
     },
-    ElseDone {
-        fallback: &'a Expr,
+    ConditionalDone {
+        conditional: &'a Expr,
         join: EscapeFlowBlockId,
     },
 }
@@ -19044,10 +19044,13 @@ impl<'a> EscapeCheck<'a> {
         let mut inputs = vec![None; self.flow.blocks.len()];
         inputs[0] = Some(self.state.clone());
         let mut worklist = std::collections::VecDeque::from([0usize]);
+        let mut pending = vec![false; self.flow.blocks.len()];
+        pending[0] = true;
         let mut sink = Diagnostics::new();
         std::mem::swap(self.diags, &mut sink);
 
         while let Some(block) = worklist.pop_front() {
+            pending[block] = false;
             let Some(mut state) = inputs[block].clone() else {
                 continue;
             };
@@ -19063,7 +19066,10 @@ impl<'a> EscapeCheck<'a> {
                 };
                 if inputs[successor].as_ref() != Some(&next) {
                     inputs[successor] = Some(next);
-                    worklist.push_back(successor);
+                    if !pending[successor] {
+                        pending[successor] = true;
+                        worklist.push_back(successor);
+                    }
                 }
             }
         }
@@ -24689,13 +24695,18 @@ impl<'a> EscapeCheck<'a> {
                             ));
                             work.push(EscapeWalkItem::Expr(result, depth));
                         }
-                        ExprKind::ElseUnwrap { opt, fallback } => {
+                        ExprKind::Binary {
+                            op: BinOp::And | BinOp::Or,
+                            lhs: input,
+                            rhs: conditional,
+                        }
+                        | ExprKind::ElseUnwrap { opt: input, fallback: conditional } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
-                            work.push(EscapeWalkItem::ElseAfterOpt {
-                                fallback,
+                            work.push(EscapeWalkItem::ConditionalAfterInput {
+                                conditional,
                                 depth,
                             });
-                            work.push(EscapeWalkItem::Expr(opt, depth));
+                            work.push(EscapeWalkItem::Expr(input, depth));
                         }
                         _ => {
                             debug_assert!(!self.collecting_walk_children);
@@ -24995,18 +25006,19 @@ impl<'a> EscapeCheck<'a> {
                     }
                     self.flow_current = join;
                 }
-                EscapeWalkItem::ElseAfterOpt { fallback, depth } => {
+                EscapeWalkItem::ConditionalAfterInput { conditional, depth } => {
                     let branch = self.flow_current;
-                    let fallback_entry = self.flow.new_block();
+                    let conditional_entry = self.flow.new_block();
                     let join = self.flow.new_block();
+                    // Preserve the skipped-child path even when the evaluated child diverges.
+                    self.flow.add_edge(branch, conditional_entry);
                     self.flow.add_edge(branch, join);
-                    self.flow.add_edge(branch, fallback_entry);
-                    self.flow_current = fallback_entry;
-                    work.push(EscapeWalkItem::ElseDone { fallback, join });
-                    work.push(EscapeWalkItem::Expr(fallback, depth));
+                    self.flow_current = conditional_entry;
+                    work.push(EscapeWalkItem::ConditionalDone { conditional, join });
+                    work.push(EscapeWalkItem::Expr(conditional, depth));
                 }
-                EscapeWalkItem::ElseDone { fallback, join } => {
-                    if !hir_expr_diverges(fallback) {
+                EscapeWalkItem::ConditionalDone { conditional, join } => {
+                    if !hir_expr_diverges(conditional) {
                         self.flow.add_edge(self.flow_current, join);
                     }
                     self.flow_current = join;
@@ -27374,6 +27386,7 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Match { .. }
+            | ExprKind::Binary { op: BinOp::And | BinOp::Or, .. }
             | ExprKind::ResultMapErr { .. } => {
                 unreachable!("escape control expressions use explicit walk items");
             }

@@ -377,3 +377,45 @@ fn main() {{}}
             "{name}: {}\n{}", checked.whole_diags, checked.per_unit_diags);
     }
 }
+
+#[test]
+fn retained_views_preserve_short_circuit_bypass() {
+    let helper = "module helper\npub Holder { view: slice<u8> }\npub fn retain(borrow mut owner: Holder, bytes: slice<u8>) { owner.view = bytes }\n";
+    for operator in ["&&", "||"] {
+        for (name, body) in [
+            ("return", "_ := flag OP { return; true }; helper.retain(owner, data.bytes())"),
+            ("break", "loop { _ := flag OP { break; true }; helper.retain(owner, data.bytes()); break }"),
+            ("abort", "_ := flag OP { process.abort(); true }; helper.retain(owner, data.bytes())"),
+            ("infinite", "_ := flag OP { loop {}; true }; helper.retain(owner, data.bytes())"),
+            ("nested", "_ := flag OP (flag OP { return; true }); helper.retain(owner, data.bytes())"),
+            ("write", "_ := flag OP { helper.retain(owner, data.bytes()); true }"),
+            ("write-return", "_ := flag OP { helper.retain(owner, data.bytes()); return; true }"),
+            ("join", "mut bytes := data.bytes(); _ := flag OP { bytes = seed; true }; helper.retain(owner, bytes)"),
+        ] {
+            let main = format!("import helper\nimport std.process\nfn caller(borrow mut owner: helper.Holder, seed: slice<u8>, flag: bool) {{ mut data := buffer(1); {} }}\nfn main() {{}}\n", body.replace("OP", operator));
+            for valid in [false, true] {
+                let source = if valid { main.replace("data.bytes()", "seed") } else { main.clone() };
+                let checked = diff_check_multi(
+                    &format!("retained-short-circuit-{operator}-{name}-{valid}"),
+                    &[("helper.align", helper), ("main.align", &source)],
+                    "main.align",
+                );
+                assert_eq!(checked.whole_errors, !valid, "{operator} {name} {valid}: {}", checked.whole_diags);
+                assert_eq!(checked.per_unit_errors, !valid, "{operator} {name} {valid}: {}", checked.per_unit_diags);
+                if !valid {
+                    for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                        assert!(diagnostics.contains("shorter-lived"), "{operator} {name}: {diagnostics}");
+                    }
+                }
+            }
+        }
+        let main = format!("import helper\nfn caller(borrow mut owner: helper.Holder, seed: slice<u8>, flag: bool) {{ mut data := buffer(1); bytes := loop {{ if flag {{ break seed }}; _ := {{ return; true }} {operator} true; break data.bytes() }}; helper.retain(owner, bytes) }}\nfn main() {{}}\n");
+        let checked = diff_check_multi(
+            &format!("retained-short-circuit-mandatory-{operator}"),
+            &[("helper.align", helper), ("main.align", &main)],
+            "main.align",
+        );
+        assert!(!checked.whole_errors && !checked.per_unit_errors,
+            "{operator} mandatory divergence: {}\n{}", checked.whole_diags, checked.per_unit_diags);
+    }
+}
