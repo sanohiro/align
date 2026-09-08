@@ -24,8 +24,8 @@ authority separate. The subsequent [consumer-boundary investigation](docs/impl/c
 repairs derived-view sibling provenance, completed operand snapshots, indirect str
 retention lifetime and borrowed projected-read certification as one capability.
 The same-call scalar overlap remains a settled, non-blocking restriction; the
-investigation records other surveyed and deferred axes. After this batch, resume
-the release-cycle gate-concurrency measurement below.
+investigation records other surveyed and deferred axes. Remaining performance
+work follows the release-cycle timing handoff below.
 Do not implement every proposed API merely to close the register. Earlier status
 paragraphs below are historical context; current Request 21 is `fs.open_ro`, while
 #892's old Request 21 is now Request 44.
@@ -89,6 +89,13 @@ own the changed boundary. The first optimization investigation should measure:
 - failure recovery that reuses already verified immutable build artifacts for a
   post-build or publication retry, while still requiring a new version for an
   actual source/compiler defect.
+
+The bounded-gate scheduling investigation is complete: item 2c of
+`docs/impl/21-build-perf-plan.md` records the adopted two-binary default. On four
+fixed CPUs, the same 884 tests in identical binaries passed in 438.64s versus
+829.26s, with comparable CPU time and maximum child RSS. Explicit
+`ALIGN_GATE_JOBS`, local DB defaults and nightly scheduling remain unchanged.
+The other release-cycle investigations above remain separate work.
 
 Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning

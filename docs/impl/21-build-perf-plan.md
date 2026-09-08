@@ -2415,3 +2415,74 @@ invisible in every produced image — while both argv owners failed with the
 exact extra flag named. On macOS the same mutation did trip the `DT_NEEDED`
 tests, which is precisely the trap: the weaker layer looked sufficient on the
 platform it was written on.
+
+## Item 2c: bounded-gate worker balance
+
+The bounded gate's workload is uneven: `align_mir` owns several independent deep
+validation tests, while most other binaries finish quickly. One binary process
+per CPU gives each libtest process one test thread and leaves a long tail on one
+CPU after the short binaries finish. The selected capability changes only the
+gate's default scheduling, retaining the exact artifact/test inventory.
+
+On `8bdc0d54`, a four-CPU local comparison ran the same 876 tests in 16 binaries:
+4 processes with 1 test thread each took 700.52s; 2 processes with 2 threads each
+took 424.62s. User CPU was 828.52s versus 828.53s. Maximum child RSS was 759484 KiB
+versus 731288 KiB. Summed sampled process RSS includes shared pages and the runs
+had different build-cache warmth; it is not a physical-memory reduction claim.
+The execution-only comparison below rechecks the scheduling change on `305926b4`
+and qualifies the two-worker default.
+
+| Boundary | Rule and verification |
+|---|---|
+| Default bounded gate | At most two concurrent binaries, capped by available CPUs; each receives `max(1, floor(CPUs / binary_jobs))` libtest threads. One CPU therefore stays 1×1. The scheduling owner exercises 1, 2, 4 and 8 CPUs. |
+| Existing override | `ALIGN_GATE_JOBS` keeps its current precedence and normalization, including explicit values above CPU count, zero, invalid and empty values. The two-process default applies only when no nonempty override is supplied. No new environment setting is introduced. |
+| Shared runner consumers | `test-pr.sh` passes `--default-jobs 2` to `run-gate-binaries.sh`, whose optional positive-integer cap is subordinate to `ALIGN_GATE_JOBS`. The shared helper accepts that caller default. The whole-suite runner and unconfigured local DB runner supply no cap and retain their CPU-count defaults; CI DB's explicit two-worker configuration remains authoritative. |
+| Coverage and failure behavior | Keep all 16 gate binaries, all tests and stress depths, declared-set validation, failure/interruption handling, diagnostics and progress. No timeout increase: the gate's existing per-binary timeout remains disabled, and the nightly owner retains its separate cap. Existing workflow fixtures plus a real default-runner fixture close this boundary. |
+| Local performance decision | Compare the identical compiled test inventory on four fixed CPUs, recording per-binary results, wall/user CPU and maximum child RSS. Adopt when the two-worker run reduces wall time by at least 10%, user CPU stays within 10%, maximum child RSS stays within 125%, and verdicts/test counts agree. These are local selection criteria, not a universal hardware promise or a new CI benchmark gate. |
+
+This is one independently useful scheduling change. It does not remove tests,
+change compiler behavior, or redesign the nightly suite. Required verification is
+`scripts/test-pr-workflow.sh`, the bounded gate, the local DB parity script because
+the shared runner is a DB boundary, and one fresh inspection-only review.
+
+The required local DB run exposed two stale Q6 assertions from before Request
+43/49's serialized mutable-retention records. They expected safe imported clone
+and no-op helpers to fail only per-unit checking. The dedicated imported owner
+had covered the new contract, but these service-suite expectations were outside
+that change's selected owners, and cancelled nightly runs supplied no closure.
+The scheduling batch corrects both expectations together, pairs each with actual
+retention that must reject in both modes, and updates the stale HIR matrix row.
+This changes no compiler behavior or DB execution policy. The focused two-case
+owner runs without a service; the complete fourteen-suite local DB run remains
+required for this shared-runner change.
+
+### Item 2c qualification
+
+On `305926b4`, fixed runner snapshots executed the same 16 SHA-256-checked
+binaries on CPUs 0–3. Both runs passed the same 884 tests, with identical
+per-binary pass/fail/ignored/measured/filtered counts. Compilation is excluded
+from this comparison; the older build-and-run RSS figures above are not directly
+comparable to these execution-only values.
+
+| Local observation | 4 processes × 1 thread | 2 processes × 2 threads |
+|---|---:|---:|
+| Wall time | 829.26s | 438.64s |
+| `align_mir` wall time | 828s | 431s |
+| User CPU time | 953.12s | 933.31s |
+| Maximum child RSS | 228020 KiB | 228408 KiB |
+| Peak sampled sum of process RSS | 356016128 bytes | 380633088 bytes |
+
+The 47.1% wall reduction, 2.1% lower user CPU and 0.2% higher maximum child RSS
+meet the preregistered criteria. Summed process RSS rose 6.9%; shared pages prevent
+interpreting that sum as physical memory. These observations select the default
+on the measured workload, not a universal speed or memory guarantee.
+
+An earlier live-script baseline is excluded: editing its shell file while it
+ran shifted the continuation read position and the reporting wrapper exited 127.
+It supplied no final test verdict. The qualified pair instead uses immutable
+runner copies and saved Cargo artifacts; full logs, binary digests and outcomes
+are preserved under `/tmp/align-gate-worker-balance-305926b4/` on the author host.
+To reproduce the scheduling choice after a warm build, run `scripts/test-pr.sh`
+on the same four CPUs first with `ALIGN_GATE_JOBS=4`, then with that override
+unset; set `ALIGN_TB_VERBOSE=1` to retain individual binary results. Do not edit a
+running shell script or include differing compilation work in a runtime comparison.

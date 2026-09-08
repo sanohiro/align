@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the bounded gate's already-compiled test binaries concurrently.
 #
-#   usage: scripts/run-gate-binaries.sh ARTIFACT_JSON EXPECTED_NAME...
+#   usage: scripts/run-gate-binaries.sh [--default-jobs N] ARTIFACT_JSON EXPECTED_NAME...
 #
 # ARTIFACT_JSON is the stdout of a `cargo test --no-run --message-format=json*`
 # build; EXPECTED_NAME... is the exact set of binaries that build must have
@@ -14,10 +14,18 @@
 # script owns the gate's declared-set check and its failure-detail report.
 set -euo pipefail
 
-[ $# -ge 2 ] || {
-  echo "usage: scripts/run-gate-binaries.sh ARTIFACT_JSON EXPECTED_NAME..." >&2
+usage() {
+  echo "usage: scripts/run-gate-binaries.sh [--default-jobs N] ARTIFACT_JSON EXPECTED_NAME..." >&2
   exit 2
 }
+default_jobs=""
+if [ "${1:-}" = --default-jobs ]; then
+  [ $# -ge 4 ] || usage
+  default_jobs="$2"
+  case "$default_jobs" in '' | *[!0-9]* | 0) usage ;; esac
+  shift 2
+fi
+[ $# -ge 2 ] || usage
 artifacts="$1"
 shift
 # Deliberately unquoted below: the expected set is a whitespace-separated list
@@ -65,7 +73,13 @@ if [ "$found_names" != "$expected_names" ]; then
 fi
 
 align_tb_export_dylib_path "$artifacts"
-align_tb_configure_jobs
+# The bounded compiler gate selects a smaller default; DB and other callers
+# keep the CPU-count default unless they already supplied ALIGN_GATE_JOBS.
+if [ -n "$default_jobs" ]; then
+  align_tb_configure_jobs "$default_jobs"
+else
+  align_tb_configure_jobs
+fi
 
 printf 'gate: %s binaries, %s parallel, %s test thread(s) each\n' \
   "$(printf '%s\n' "$found_names" | wc -l | tr -d '[:space:]')" \

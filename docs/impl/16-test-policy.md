@@ -57,7 +57,9 @@ successful run emits phase and aggregate summaries only. On failure, it replays
 the complete captured output of every failing binary with its name, exit code,
 and duration. `ALIGN_TB_VERBOSE=1` restores per-binary start lines and
 successful output for an investigation. `ALIGN_GATE_JOBS` overrides the process
-count, which defaults to the host's CPU count.
+count. The bounded compiler gate defaults to at most two binary processes,
+capped by the host's CPU count; its caller supplies `--default-jobs 2` to the
+shared runner. Callers without that option retain the CPU-count default.
 
 By default, a run that remains active emits at most one bounded progress line
 per minute: completed and launched counts plus the
@@ -66,11 +68,11 @@ complete and partial logs before cleanup. Thus routine success stays small
 while a job timeout still identifies its last active work.
 
 Each binary runs with `RUST_TEST_THREADS` set to the CPU count divided by that
-process count — 1 by default — so N concurrent binaries cannot start N libtest
-threads apiece and multiply the runnable-thread count and peak memory by the
-core count. A crate whose own tests could have overlapped therefore pays its
-serial time, which is the trade the gate makes: its wall clock is the slowest
-single binary either way.
+process count, rounded down and clamped to at least one. On a four-CPU host the
+bounded gate therefore runs two processes with two test threads each; on one
+CPU it stays one process with one thread. Splitting the CPU budget between both
+levels lets a long compiler suite overlap independent tests after the short
+binaries finish. Test selection, stress depths and failure reporting are unchanged.
 
 CI additionally builds release compiler/runtime artifacts and compiles and runs
 `examples/hello.align` on Linux x86-64, Linux ARM64, and Apple Silicon. This is

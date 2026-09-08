@@ -103,9 +103,11 @@ align_tb_export_dylib_path() {
 # One process per binary, capped so a run does not oversubscribe a small CI
 # runner, and libtest's own thread pool divided by that cap: without this each
 # of N concurrent binaries would start N threads of its own, multiplying both
-# the runnable thread count and peak RSS by the core count.
+# the runnable thread count and peak RSS by the core count. A caller may pass a
+# smaller default process cap to share the CPU budget across a few long binaries.
+# An explicit ALIGN_GATE_JOBS still wins; other consumers keep the CPU-count default.
 align_tb_configure_jobs() {
-  local ncpu
+  local ncpu default_jobs
   case "$ALIGN_TB_VERBOSE" in
     0 | 1) ;;
     *)
@@ -124,7 +126,24 @@ align_tb_configure_jobs() {
     '' | *[!0-9]*) ncpu=4 ;;
   esac
   [ "$ncpu" -ge 1 ] || ncpu=1
-  ALIGN_TB_JOBS="${ALIGN_GATE_JOBS:-$ncpu}"
+  default_jobs="${1:-$ncpu}"
+  case "$default_jobs" in
+    '' | *[!0-9]* | 0)
+      echo "default binary process cap must be a positive whole number" >&2
+      return 2
+      ;;
+  esac
+  # Normalize the caller cap before arithmetic: decimal leading zeroes and a
+  # cap wider than the shell integer range still mean a bounded positive count.
+  default_jobs="$(printf '%s\n' "$default_jobs" | sed 's/^0*//')"
+  [ -n "$default_jobs" ] || {
+    echo "default binary process cap must be a positive whole number" >&2
+    return 2
+  }
+  if [ "${#default_jobs}" -gt "${#ncpu}" ] || [ "$default_jobs" -gt "$ncpu" ]; then
+    default_jobs="$ncpu"
+  fi
+  ALIGN_TB_JOBS="${ALIGN_GATE_JOBS:-$default_jobs}"
   case "$ALIGN_TB_JOBS" in
     '' | *[!0-9]*) ALIGN_TB_JOBS="$ncpu" ;;
   esac
