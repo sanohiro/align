@@ -45305,7 +45305,8 @@ impl<'a, 't> Checker<'a, 't> {
                     .flatten()
             };
             for (p, ty) in f.params.iter().zip(&param_tys) {
-                if let Ty::Struct(id) = *ty
+                if p.mode == ast::ParamMode::ByValue
+                    && let Ty::Struct(id) = *ty
                     && let Some((sz, name)) = huge(self.structs, id, &mut visiting)
                 {
                     self.diags.push(align_diag::Diagnostic::warning(
