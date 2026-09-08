@@ -459,6 +459,92 @@ fn borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases() {
 }
 
 #[test]
+fn grounded_out_slices_execute_across_call_forms_and_storage_joins() {
+    let files = [
+        ("views.align", r#"module views
+pub fn install(out dst: slice<str>, value: str) { dst[0] = value }
+pub fn forward(out dst: slice<str>, value: str) { install(dst, value) }
+pub fn generic<T>(out dst: slice<str>, ignored: T) { _ := ignored; install(dst, "generic") }
+pub fn label(out dst: slice<str>) -> string { install(dst, "label"); return "owned".clone() }
+pub fn replace(borrow mut dst: array<str>) { install(dst, "borrowed array") }
+pub fn ignore(out dst: slice<str>, selected: str, ignored: str) { dst[0] = selected }
+"#),
+        ("main.align", r#"import views
+View { values: slice<str> }
+fn joined(flag: bool) -> i32 {
+  mut left := ["left", "tail"]
+  mut right := ["right", "tail"]
+  mut selected: slice<str> := left
+  if flag { selected = right }
+  views.forward(selected, "joined")
+  if flag { if right[0] != "joined" { return 1 } } else { if left[0] != "joined" { return 2 } }
+  return 0
+}
+fn projected() -> i32 {
+  mut values := ["old", "tail"].to_array()
+  record := View { values: values }
+  mut selected := record.values
+  views.install(selected, "field")
+  if values[0] != "field" { return 3 }
+  return 0
+}
+fn wrapped() -> i32 {
+  mut pair := (["old", "tail"].to_array(), 7)
+  mut tuple_view: slice<str> := pair.0
+  views.install(tuple_view, "tuple")
+  if pair.0[0] != "tuple" { return 9 }
+  mut values := ["old", "tail"]
+  optional := Some(values[..])
+  mut optional_view := optional else { return 10 }
+  views.install(optional_view, "option")
+  if values[0] != "option" { return 11 }
+  result: Result<slice<str>, Error> := Ok(values[..])
+  mut result_view := result else { return 12 }
+  views.install(result_view, "result")
+  if values[0] != "result" { return 13 }
+  return 0
+}
+fn main() -> i32 {
+  mut fixed := ["old", "tail"]
+  views.forward(fixed, "forward")
+  if fixed[0] != "forward" { return 4 }
+  mut dynamic := ["old", "tail"].to_array()
+  views.install(dynamic, "direct")
+  if dynamic[0] != "direct" { return 5 }
+  views.generic(dynamic, 7)
+  if dynamic[0] != "generic" { return 6 }
+  owned := views.label(dynamic)
+  if owned != "owned" || dynamic[0] != "label" { return 7 }
+  views.replace(dynamic)
+  if dynamic[0] != "borrowed array" { return 14 }
+  mut tail := fixed[1..]
+  views.install(tail, "subslice")
+  if fixed[1] != "subslice" { return 8 }
+  arena {
+    n := 42
+    ignored := template "ignored={n}"
+    views.ignore(fixed, "ignored input", ignored)
+  }
+  if fixed[0] != "ignored input" { return 15 }
+  return joined(false) + joined(true) + projected() + wrapped()
+}
+"#),
+    ];
+    let checked = diff_check_multi("grounded-out-slices", &files, "main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}", checked.whole_diags, checked.per_unit_diags);
+    if backend_available() {
+        for output in [
+            build_and_run_multi("grounded-out-slices-whole", &files, "main.align"),
+            build_per_unit_multi("grounded-out-slices-units", &files, "main.align").link_and_run(),
+        ] {
+            assert!(output.status.success(), "status {:?}: {}", output.status.code(),
+                String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}
+
+#[test]
 fn indexed_str_store_accepts_frame_and_same_arena_storage() {
     let src = "\
 fn main() -> i32 {
@@ -1256,13 +1342,11 @@ fn main() -> i32 {
         "main.align",
     );
     assert!(
-        !exact_vs_fallback.whole_errors && exact_vs_fallback.per_unit_errors,
-        "semantic inference accepts the unused local view; the existing MIR call-argument certification boundary still rejects this slice<str> fixture:\nwhole:\n{}\nper-unit:\n{}",
+        !exact_vs_fallback.whole_errors && !exact_vs_fallback.per_unit_errors,
+        "the unused local view must pass semantic inference and grounded Out certification:\nwhole:\n{}\nper-unit:\n{}",
         exact_vs_fallback.whole_diags,
         exact_vs_fallback.per_unit_diags,
     );
-    assert!(exact_vs_fallback.per_unit_diags.contains("XML-capable call argument provenance mismatch"));
-    assert!(!exact_vs_fallback.per_unit_diags.contains("shorter-lived"));
 }
 
 #[test]

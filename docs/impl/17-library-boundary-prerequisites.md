@@ -5126,19 +5126,17 @@ No language specification or Japanese mirror changes are required because the
 source-level ownership contract is unchanged. Completion is Align delivery;
 align-llm source deduplication and pin/smoke adoption remain consumer-owned.
 
-Known separate producer-certification boundary: the existing
-`out_str_retention_matches_whole_and_per_unit_checking` temporary ignored-input
-fixture now passes mutable-retention analysis and reaches the pre-existing
-`XML-capable call argument provenance mismatch` rejection in MIR. This capability
-does not repair that independent MIR call-argument proof. Its owner pins the
-remaining diagnostic and absence of the obsolete shorter-lived-input refusal.
-The `borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases`,
-and `closure_target_joins_keep_capture_slots_target_relative` owner failures were
-independently reproduced on the unchanged Request 61 merge, `3fbb74fe`. They remain
-separate follow-up work; imported mutable-retention transport adds no MIR authority.
-The separately reproduced `storage_generation_interprocedural_allocation_parity_matrix`
-failure is closed by the materialized-chunks producer equation in
-`xml-producer-investigation.md`.
+The separate producer-certification failures in
+`out_str_retention_matches_whole_and_per_unit_checking` (temporary ignored input)
+and `borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases` are closed
+by the grounded Out buffer-storage projection in `xml-producer-investigation.md`.
+That proof distinguishes writable backing from header mutability and unreadable
+old elements without adding imported mutable-retention authority.
+The `closure_target_joins_keep_capture_slots_target_relative` failure, independently
+reproduced on the unchanged Request 61 merge `3fbb74fe`, remains separate follow-up
+work. The separately reproduced
+`storage_generation_interprocedural_allocation_parity_matrix` failure is closed
+by the materialized-chunks producer equation in the same investigation.
 
 ### Owner bindings
 

@@ -4313,6 +4313,8 @@ enum XmlAccessNode {
     Slot(Slot, Vec<XmlAccessPathSegment>),
     CaptureValue(ValueId, Vec<XmlAccessPathSegment>, u32),
     CaptureSlot(Slot, Vec<XmlAccessPathSegment>, u32),
+    BufferValue(ValueId, Vec<XmlAccessPathSegment>),
+    BufferSlot(Slot, Vec<XmlAccessPathSegment>),
 }
 
 #[derive(Clone, Debug)]
@@ -5505,6 +5507,185 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
+    /// Pointed-to buffer authority is distinct from both element access and header mutability.
+    /// An owning array proves its buffer; a Copy view needs a separate grounded projection.
+    fn buffer_node(&mut self, node: XmlAccessNode) -> XmlAccessSource {
+        let (root, path) = match &node {
+            XmlAccessNode::Value(value, path) => (self.graph.function.value_tys.get(*value as usize), path),
+            XmlAccessNode::Slot(slot, path) => (self.graph.function.slots.get(*slot as usize), path),
+            _ => return XmlAccessSource::Invalid,
+        };
+        match root.and_then(|root| xml_selected_ty(self.graph.program, *root, path)) {
+            Some(Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) => match node {
+                XmlAccessNode::Value(value, path) => self.queue(XmlAccessNode::BufferValue(value, path)),
+                XmlAccessNode::Slot(slot, path) => self.queue(XmlAccessNode::BufferSlot(slot, path)),
+                _ => XmlAccessSource::Invalid,
+            },
+            _ => XmlAccessSource::Invalid,
+        }
+    }
+
+    fn buffer_parameter(&self, slot: Slot) -> Result<Option<usize>, ()> {
+        let mut found = None;
+        for (index, parameter) in self.graph.function.params.iter().enumerate() {
+            if *parameter == slot && found.replace(index).is_some() { return Err(()); }
+        }
+        Ok(found)
+    }
+
+    fn buffer_source(&mut self, operand: &Operand, path: Vec<XmlAccessPathSegment>) -> XmlAccessSource {
+        if let Operand::Arg(index) = operand {
+            let Some(slot) = self.graph.function.params.get(*index as usize) else { return XmlAccessSource::Invalid; };
+            if self.buffer_parameter(*slot) != Ok(Some(*index as usize)) { return XmlAccessSource::Invalid; }
+        }
+        let Some(selected) = xml_operand_base_ty(self.graph.function, operand)
+            .and_then(|root| xml_selected_ty(self.graph.program, root, &path))
+        else { return XmlAccessSource::Invalid; };
+        match operand {
+            Operand::Value(value) => self.buffer_node(XmlAccessNode::Value(*value, path)),
+            Operand::Arg(index) if matches!(selected, Ty::Slice(_)) => {
+                // BorrowMut of a Copy slice authenticates its header, not its backing allocation.
+                let out = path.is_empty()
+                    && self.graph.function.param_modes.get(*index as usize) == Some(&align_ast::ParamMode::Out);
+                XmlAccessSource::Seed(if out { XmlAccessProvenance::Unreadable } else { XmlAccessProvenance::Shared })
+            }
+            Operand::Arg(index) if matches!(selected, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) => {
+                XmlAccessSource::Seed(xml_argument_access(self.graph.function, *index))
+            }
+            _ => XmlAccessSource::Invalid,
+        }
+    }
+
+    fn buffer_dependencies(&mut self, equation: &mut XmlAccessEquation) {
+        // A seed lost its operand identity in the ordinary equation. It cannot certify a buffer.
+        if equation.seed.is_some() { equation.seed = Some(XmlAccessProvenance::Shared); }
+        for node in std::mem::take(&mut equation.dependencies) {
+            let source = self.buffer_node(node);
+            Self::add_source(equation, source);
+        }
+    }
+
+    fn buffer_value_equation(&mut self, value: ValueId, path: Vec<XmlAccessPathSegment>) -> XmlAccessEquation {
+        let mut equation = self.value_equation(value, path.clone());
+        if equation.invalid || equation.absent { return equation; }
+        let selected = self.graph.function.value_tys.get(value as usize)
+            .and_then(|root| xml_selected_ty(self.graph.program, *root, &path));
+        if let Some(ty @ (Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))) = selected {
+            let Some(leaves) = xml_owned_leaf_paths(self.graph.program, ty) else {
+                equation.invalid = true;
+                return equation;
+            };
+            for (leaf, tail) in leaves {
+                let mut selected = path.clone();
+                selected.extend(tail);
+                let source = self.source(&Operand::Value(value), leaf, selected);
+                Self::add_required_source(&mut equation, source, OperandRequirement::READ);
+            }
+            return equation;
+        }
+        let Some(Some(definition)) = self.graph.value_definitions.get(value as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        match (*definition).clone() {
+            Rvalue::MakeSlice(slot, _) if path.is_empty() => {
+                // Keep the ordinary exact inline-layout and initialized-element checks.
+                let Ok(parameter) = self.buffer_parameter(slot) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                equation.seed = Some(match parameter {
+                    None => XmlAccessProvenance::Owned,
+                    Some(index) => match self.graph.function.param_modes.get(index) {
+                        Some(align_ast::ParamMode::ByValue) => XmlAccessProvenance::Owned,
+                        Some(align_ast::ParamMode::BorrowMut) => XmlAccessProvenance::Exclusive,
+                        Some(align_ast::ParamMode::Borrow) => XmlAccessProvenance::Shared,
+                        _ => { equation.invalid = true; XmlAccessProvenance::Mixed }
+                    },
+                });
+            }
+            Rvalue::Use(operand) | Rvalue::SubSlice { base: operand, .. } => {
+                equation.seed = None;
+                equation.dependencies.clear();
+                let source = self.buffer_source(&operand, path);
+                Self::add_source(&mut equation, source);
+            }
+            Rvalue::Select { a, b, .. } => {
+                equation.seed = None;
+                equation.dependencies.clear();
+                for operand in [&a, &b] {
+                    let source = self.buffer_source(operand, path.clone());
+                    Self::add_source(&mut equation, source);
+                }
+            }
+            Rvalue::Load(_) | Rvalue::Field(..) | Rvalue::TupleIndex { .. }
+            | Rvalue::MakeTuple { .. } | Rvalue::MakeEnum { .. } | Rvalue::EnumPayload { .. }
+            | Rvalue::OptionSome(_) | Rvalue::OptionNone | Rvalue::OptionUnwrap(_)
+            | Rvalue::ResultOk(_) | Rvalue::ResultErr(_)
+            | Rvalue::ResultUnwrapOk(_) | Rvalue::ResultUnwrapErr(_) => {
+                self.buffer_dependencies(&mut equation);
+            }
+            // A Copy return's lifetime roots do not exclude a static-return alternative.
+            // Neither a call nor an unrelated producer may mint writable backing here.
+            _ => equation.invalid = true,
+        }
+        equation
+    }
+
+    fn buffer_slot_equation(&mut self, slot: Slot, path: Vec<XmlAccessPathSegment>) -> XmlAccessEquation {
+        let selected = self.graph.function.slots.get(slot as usize)
+            .and_then(|root| xml_selected_ty(self.graph.program, *root, &path));
+        if matches!(selected, Some(Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))) {
+            return self.slot_equation(slot, path);
+        }
+        if !path.is_empty() {
+            let mut equation = self.slot_equation(slot, path);
+            self.buffer_dependencies(&mut equation);
+            return equation;
+        }
+        let mut equation = XmlAccessEquation::default();
+        let Some(ty @ Ty::Slice(_)) = self.graph.function.slots.get(slot as usize).copied() else {
+            equation.invalid = true;
+            return equation;
+        };
+        let stores = &self.graph.slot_stores;
+        let Some(roots) = stores.roots.get(slot as usize) else {
+            equation.invalid = true;
+            return equation;
+        };
+        // A slice slot stores a header. Inline element/field writers cannot initialize it.
+        let plain = stores.fields.get(slot as usize).is_some_and(Vec::is_empty)
+            && stores.elements.get(slot as usize).is_some_and(Vec::is_empty)
+            && stores.element_fields.get(slot as usize).is_some_and(Vec::is_empty)
+            && stores.constant_elements.get(slot as usize).is_some_and(Vec::is_empty)
+            && stores.producers.get(slot as usize).is_some_and(Vec::is_empty);
+        if !plain { equation.invalid = true; }
+        let roots = roots.iter().map(|operand| (*operand).clone()).collect::<Vec<_>>();
+        let Ok(parameter) = self.buffer_parameter(slot) else {
+            equation.invalid = true;
+            return equation;
+        };
+        // Only borrowed slots alias incoming storage in emit_fn. An Out header
+        // lives in an alloca and must be grounded by its explicit Arg store.
+        if let Some(index) = parameter
+            && matches!(self.graph.function.param_modes.get(index), Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut))
+            && let Ok(index) = u32::try_from(index)
+        {
+            let source = self.buffer_source(&Operand::Arg(index), Vec::new());
+            Self::add_source(&mut equation, source);
+        }
+        for operand in roots {
+            if xml_operand_base_ty(self.graph.function, &operand) != Some(ty) {
+                equation.invalid = true;
+                continue;
+            }
+            let source = self.buffer_source(&operand, Vec::new());
+            Self::add_source(&mut equation, source);
+        }
+        if equation.seed.is_none() && equation.dependencies.is_empty() { equation.invalid = true; }
+        equation
+    }
+
     fn add_source(equation: &mut XmlAccessEquation, source: XmlAccessSource) {
         match source {
             XmlAccessSource::Seed(access) => {
@@ -5950,7 +6131,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .and_then(|ty| xml_selected_ty(self.graph.program, *ty, path));
                 (selected, None, self.slot_equation(*slot, path.clone()))
             }
-            XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..) => {
+            XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..)
+                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
                 return XmlAccessEquation { invalid: true, ..XmlAccessEquation::default() };
             }
         };
@@ -5988,7 +6170,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 XmlAccessNode::Slot(slot, path) => {
                     self.queue(XmlAccessNode::CaptureSlot(slot, path, capture))
                 }
-                XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..) => {
+                XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..)
+                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
                     XmlAccessSource::Invalid
                 }
             };
@@ -6093,6 +6276,15 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         let mut copy_place_sources = HashMap::new();
         for (index, ((argument, expected), mode)) in args.iter().zip(&facts.params).zip(&facts.modes).enumerate() {
+            if *mode == align_ast::ParamMode::Out
+                && xml_owned_leaf_paths(self.graph.program, *expected).is_none_or(|leaves| !leaves.is_empty())
+            {
+                let source = self.buffer_source(argument, Vec::new());
+                Self::add_required_source(equation, source, OperandRequirement {
+                    write: true, exclusive: true, ..OperandRequirement::default()
+                });
+                continue;
+            }
             if let (Operand::BorrowedPlace(place), align_ast::ParamMode::ByValue) = (argument, mode) {
                 let sources = self.check_copy_place(equation, place, *expected);
                 copy_place_sources.insert(index, sources);
@@ -10071,6 +10263,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 XmlAccessNode::CaptureSlot(slot, path, capture) => {
                     self.capture_equation(XmlAccessNode::Slot(*slot, path.clone()), *capture)
                 }
+                XmlAccessNode::BufferValue(value, path) => self.buffer_value_equation(*value, path.clone()),
+                XmlAccessNode::BufferSlot(slot, path) => self.buffer_slot_equation(*slot, path.clone()),
             };
             self.equations.insert(node, equation);
         }
@@ -10964,6 +11158,17 @@ fn validate_resource_rvalues_component(
                             let Some(leaves) = xml_owned_leaf_paths(program, *expected) else {
                                 return false;
                             };
+                            if *mode == align_ast::ParamMode::Out && !leaves.is_empty() {
+                                if !matches!(expected, Ty::Slice(_))
+                                    || xml_operand_base_ty(function, operand) != Some(*expected)
+                                    || !matches!(operand, Operand::Value(_) | Operand::Arg(_))
+                                { return false; }
+                                let mut analysis = XmlAccessAnalyzer::new(&access_graph);
+                                let source = analysis.buffer_source(operand, Vec::new());
+                                return OperandRequirement {
+                                    write: true, exclusive: true, ..OperandRequirement::default()
+                                }.is_satisfied_by(analysis.build(source, None));
+                            }
                             let canonical_borrow = matches!(
                                 operand,
                                 Operand::BorrowedPlace(_)
@@ -36760,6 +36965,144 @@ fn main() -> i32 = 0
                 _ => panic!("out producer inventory changed shape"),
             }
             assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
+        }
+    }
+
+    #[test]
+    fn producer_out_slices_authenticate_backing_without_reading_forwarded_elements() {
+        for allocation in ["[\"old\", \"tail\"]", "[\"old\", \"tail\"].to_array()"] {
+            let base = mir(&format!(r#"
+TABLE := ["constant", "tail"]
+fn install(out dst: slice<str>, value: str) {{ dst[0] = value }}
+fn label(out dst: slice<str>) -> string {{ install(dst, "new"); return "label".clone() }}
+fn forward(out dst: slice<str>) -> string = label(dst)
+fn opaque(dst: slice<str>, choose: bool) -> slice<str> = if choose {{ dst }} else {{ TABLE }}
+fn make() -> string {{
+  mut values := {allocation}
+  mut view: slice<str> := values
+  return label(view)
+}}
+fn main() -> i32 = 0
+"#));
+            assert!(validate_mir_producers(&base).is_ok(), "{allocation}");
+            assert!(validate_resource_rvalues(&base).is_ok());
+            assert!(validate_thin_partition_program(&base, &[]).is_ok());
+            let make = xml_test_function(&base, "make");
+            for mutation in ["static", "bad-store", "raw-element", "unseeded", "seeded", "opaque", "descriptor"] {
+                let mut bad = base.clone();
+                let function = &mut bad.fns[make];
+                let input = function.blocks.iter().flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::CallWithCleanup(call)) if call.target.as_str() == "label" => call.args.first().cloned(),
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing owned result call"));
+                let Operand::Value(input) = input else { panic!("expected SSA Out input") };
+                let slot = function.blocks.iter().flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::Load(slot)) if *value == input => Some(*slot),
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing Out header load"));
+                let slice = Ty::Slice(Scalar::Str);
+                match mutation {
+                    "static" => {
+                        let value = xml_test_value(function, slice);
+                        function.blocks[0].stmts.extend([
+                            Stmt::Let(value, Rvalue::ConstArray { elems: vec![ConstElem::Str("static".into())], elem: Ty::Str }),
+                            Stmt::Store(slot, Operand::Value(value)),
+                        ]);
+                    }
+                    "bad-store" => function.blocks[0].stmts.push(Stmt::Store(slot, Operand::Const(Const::Bool(false)))),
+                    "raw-element" => {
+                        let producer = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                            .find_map(|statement| match statement {
+                                Stmt::Let(_, value @ Rvalue::StrLit(_)) => Some(value),
+                                _ => None,
+                            }).unwrap_or_else(|| panic!("missing initialized element"));
+                        *producer = Rvalue::RawNull;
+                    }
+                    "unseeded" => {
+                        for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                            if let Stmt::Store(destination, operand) = statement && *destination == slot {
+                                *operand = Operand::Value(input);
+                            }
+                        }
+                    }
+                    "seeded" => {
+                        let block = function.blocks.iter_mut().find(|block| block.stmts.iter().any(|statement| {
+                            matches!(statement, Stmt::Let(value, _) if *value == input)
+                        })).unwrap_or_else(|| panic!("missing header load block"));
+                        block.stmts.push(Stmt::Store(slot, Operand::Value(input)));
+                    }
+                    "opaque" => {
+                        let value = xml_test_value(function, slice);
+                        let (block, position) = function.blocks.iter().enumerate().find_map(|(index, block)| {
+                            block.stmts.iter().position(|statement| matches!(statement, Stmt::Store(destination, _) if *destination == slot))
+                                .map(|position| (index, position))
+                        })
+                            .unwrap_or_else(|| panic!("missing view initializer"));
+                        let statements = &mut function.blocks[block].stmts;
+                        let Stmt::Store(_, operand) = &mut statements[position] else { panic!("initializer changed") };
+                        let source = operand.clone();
+                        *operand = Operand::Value(value);
+                        statements.insert(position, Stmt::Let(value, Rvalue::Call(
+                            DirectCall::Program(program_call("opaque")), vec![source, Operand::Const(Const::Bool(true))],
+                        )));
+                    }
+                    "descriptor" => {
+                        for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                            if let Stmt::Let(_, Rvalue::CallWithCleanup(call)) = statement && call.target.as_str() == "label" {
+                                call.args[0] = Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+                                    slot, path: Vec::new(), ty: slice, cleanup: None,
+                                }));
+                            }
+                        }
+                    }
+                    _ => panic!("unknown Out mutation: {mutation}"),
+                }
+                if mutation == "seeded" {
+                    assert!(validate_mir_producers(&bad).is_ok(), "seeded {allocation}");
+                    assert!(validate_resource_rvalues(&bad).is_ok());
+                    assert!(validate_thin_partition_program(&bad, &[]).is_ok());
+                    continue;
+                }
+                assert!(validate_mir_producers(&bad).is_err(), "published {allocation}: {mutation}");
+                assert_xml_producer_rejected(&bad, &format!("{allocation}: {mutation}"));
+            }
+            for mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+                let mut opaque = base.clone();
+                let forward = xml_test_function(&opaque, "forward");
+                opaque.fns[forward].param_modes[0] = mode;
+                assert!(validate_mir_producers(&opaque).is_err(), "opaque Copy parameter {mode:?}");
+                assert_xml_producer_rejected(&opaque, &format!("opaque Copy parameter {mode:?}"));
+            }
+            let mut duplicate = base.clone();
+            let forward = xml_test_function(&duplicate, "forward");
+            let function = &mut duplicate.fns[forward];
+            function.params.push(function.params[0]);
+            function.param_modes.push(align_ast::ParamMode::Borrow);
+            assert!(validate_mir_producers(&duplicate).is_err());
+            assert_xml_producer_rejected(&duplicate, "aliased Out and shared parameter slots");
+            for initialization in ["missing", "self-cycle"] {
+                let mut bad = base.clone();
+                let forward = xml_test_function(&bad, "forward");
+                let function = &mut bad.fns[forward];
+                let slot = function.params[0];
+                let load = function.blocks.iter().flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(value, Rvalue::Load(source)) if *source == slot => Some(*value),
+                        _ => None,
+                    }).unwrap_or_else(|| panic!("missing forwarded Out load"));
+                for block in &mut function.blocks {
+                    block.stmts.retain(|statement| !matches!(statement, Stmt::Store(destination, _) if *destination == slot));
+                    if initialization == "self-cycle"
+                        && block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if *value == load))
+                    {
+                        block.stmts.push(Stmt::Store(slot, Operand::Value(load)));
+                    }
+                }
+                assert!(validate_mir_producers(&bad).is_err(), "Out initialization {initialization}");
+                assert_xml_producer_rejected(&bad, &format!("Out initialization {initialization}"));
+            }
         }
     }
 
