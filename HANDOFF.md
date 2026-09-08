@@ -20,9 +20,12 @@ The [dated all-60 audit](docs/impl/align-llm-request-audit-2026-09-07.md) is his
 selection evidence; its focused diagnostic candidates R23 and R51 are implemented
 in #988/#989. The consolidated G1 follow-up (#990) preserves retained-view source
 lifetimes through helpers and control flow while keeping writable destination
-authority separate. Its derived-view helper and same-call scalar precision cases
-remain explicitly deferred, non-blocking limitations. After this batch, resume the
-release-cycle gate-concurrency measurement below.
+authority separate. The subsequent [consumer-boundary investigation](docs/impl/consumer-boundary-investigation.md)
+repairs derived-view sibling provenance, completed operand snapshots, indirect str
+retention lifetime and borrowed projected-read certification as one capability.
+The same-call scalar overlap remains a settled, non-blocking restriction; the
+investigation records other surveyed and deferred axes. After this batch, resume
+the release-cycle gate-concurrency measurement below.
 Do not implement every proposed API merely to close the register. Earlier status
 paragraphs below are historical context; current Request 21 is `fs.open_ro`, while
 #892's old Request 21 is now Request 44.

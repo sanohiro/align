@@ -25449,6 +25449,12 @@ impl<'a> EscapeCheck<'a> {
             return snapshot.retained_storage_region;
         }
         let value_region = self.region_of(argument, depth);
+        if expand_tagged_ty(argument.ty, self.tagged_types) == Ty::Str {
+            // A str is a copied view: storage reachable through it is its selected bytes,
+            // never the local slot holding the pointer/length pair. Its value region already
+            // carries the selected owner's lifetime, including local owned-string elements.
+            return value_region;
+        }
         if argument.ty.is_array_builder() {
             // A builder's mutable storage belongs to its constructor-selected heap/region. The
             // local is only the linear header, so applying the ordinary local declaration cap
@@ -34856,7 +34862,9 @@ impl<'a> MoveCheck<'a> {
                     .collect::<Vec<_>>();
                 let headers = self.local_headers(*root).project_path(&projection);
                 if headers.leaves.is_empty() {
-                    roots.extend(self.local_storage_roots(*root));
+                    if !has_inline_handle_storage(e.ty, self.storage_type_context()) {
+                        roots.extend(self.local_storage_roots(*root));
+                    }
                 } else {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
                 }
@@ -39246,7 +39254,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_active_sum(*local, init);
                     self.assign_mutable_backing(*local, init);
                     clear_moved(moved, *local);
-                    self.clear_value_snapshot(Self::expr_key(init));
+                    self.clear_expression_value_snapshots(init);
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
                     let was_moved = whole_moved(moved, *local);
@@ -39274,7 +39282,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_active_sum(*local, value);
                     self.assign_mutable_backing(*local, value);
                     clear_moved(moved, *local);
-                    self.clear_value_snapshot(Self::expr_key(value));
+                    self.clear_expression_value_snapshots(value);
                 }
                 // `root.field = value` — writing a field is a use of `root` (an owned struct could
                 // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
@@ -39334,6 +39342,7 @@ impl<'a> MoveCheck<'a> {
                             value,
                         );
                     }
+                    self.clear_expression_value_snapshots(value);
                 }
                 // `base[index] = value` — AssignIndex admits only Copy scalars and borrowed `str`,
                 // so the index and value are read without consuming either.
@@ -39346,6 +39355,8 @@ impl<'a> MoveCheck<'a> {
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
                     self.update_mutable_collection_contents(*base, index, &[], value);
+                    self.clear_expression_value_snapshots(index);
+                    self.clear_expression_value_snapshots(value);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
@@ -39369,6 +39380,8 @@ impl<'a> MoveCheck<'a> {
                         self.invalidate_collection_content_owner(*base);
                     }
                     self.update_mutable_collection_contents(*base, index, path, value);
+                    self.clear_expression_value_snapshots(index);
+                    self.clear_expression_value_snapshots(value);
                 }
                 Stmt::AssignElem { base, index, value, .. } => {
                     self.check_borrow_use(*base, index.span);
@@ -39388,10 +39401,13 @@ impl<'a> MoveCheck<'a> {
                         self.invalidate_collection_content_owner(*base);
                     }
                     self.update_mutable_collection_contents(*base, index, &[], value);
+                    self.clear_expression_value_snapshots(index);
+                    self.clear_expression_value_snapshots(value);
                 }
                 Stmt::AssignVecLane { local, value, .. } => {
                     move_expr!(self, value, moved, false, false);
                     self.invalidate_mutable_place(*local, &[]);
+                    self.clear_expression_value_snapshots(value);
                 }
                 Stmt::Return(Some(e)) => {
                     move_expr!(self, e, moved, true, true);
@@ -39460,7 +39476,7 @@ impl<'a> MoveCheck<'a> {
                 Stmt::LetTuple { locals, init, .. } => {
                     move_expr!(self, init, moved, true, true);
                     self.install_tuple_bindings(locals, init, moved);
-                    self.clear_value_snapshot(Self::expr_key(init));
+                    self.clear_expression_value_snapshots(init);
                 }
             }
             falls_through =
@@ -39970,6 +39986,9 @@ impl<'a> MoveCheck<'a> {
                         values.push(false);
                         continue;
                     }
+                    if let ExprKind::If { cond, .. } = &expression.kind {
+                        self.clear_expression_value_snapshots(cond);
+                    }
                     let incoming_moved = moved.clone();
                     let incoming_borrows = self.borrows.clone();
                     self.begin_storage_advance_frame();
@@ -40248,6 +40267,7 @@ impl<'a> MoveCheck<'a> {
         enum Work<'e> {
             Eval(&'e Expr, bool, bool),
             AfterLhs {
+                lhs: &'e Expr,
                 rhs: &'e Expr,
             },
             AfterRhs {
@@ -40299,14 +40319,15 @@ impl<'a> MoveCheck<'a> {
                         value_snapshot,
                         completion_snapshot,
                     });
-                    work.push(Work::AfterLhs { rhs });
+                    work.push(Work::AfterLhs { lhs, rhs });
                     work.push(Work::Eval(lhs, false, false));
                 }
-                Work::AfterLhs { rhs } => {
+                Work::AfterLhs { lhs, rhs } => {
                     if !values.pop().expect("short-circuit lhs result") {
                         values.push(false);
                         continue;
                     }
+                    self.clear_expression_value_snapshots(lhs);
                     let lhs_moved = moved.clone();
                     let lhs_borrows = self.borrows.clone();
                     self.begin_storage_advance_frame();
@@ -41419,9 +41440,11 @@ impl<'a> MoveCheck<'a> {
             },
             BlockAssignVecLane {
                 local: LocalId,
+                value: &'e Expr,
             },
             BlockPairAfterIndex {
                 base: LocalId,
+                index: &'e Expr,
                 value: &'e Expr,
                 field_path: &'e [u32],
                 value_consuming: bool,
@@ -41602,6 +41625,7 @@ impl<'a> MoveCheck<'a> {
                                 false,
                                 Post::BlockPairAfterIndex {
                                     base: *base,
+                                    index,
                                     value,
                                     field_path: &[],
                                     value_consuming: false,
@@ -41677,6 +41701,7 @@ impl<'a> MoveCheck<'a> {
                                 false,
                                 Post::BlockPairAfterIndex {
                                     base,
+                                    index,
                                     value,
                                     field_path,
                                     value_consuming: true,
@@ -41777,7 +41802,7 @@ impl<'a> MoveCheck<'a> {
                             ),
                             false,
                             false,
-                            Post::BlockAssignVecLane { local: *local },
+                            Post::BlockAssignVecLane { local: *local, value },
                         )
                     }
                     ExprKind::Block(block)
@@ -42333,7 +42358,7 @@ impl<'a> MoveCheck<'a> {
                         self.assign_active_sum(local, init);
                         self.assign_mutable_backing(local, init);
                         clear_moved(moved, local);
-                        self.clear_value_snapshot(Self::expr_key(init));
+                        self.clear_expression_value_snapshots(init);
                     }
                     None
                 }
@@ -42364,7 +42389,7 @@ impl<'a> MoveCheck<'a> {
                         self.assign_active_sum(local, value);
                         self.assign_mutable_backing(local, value);
                         clear_moved(moved, local);
-                        self.clear_value_snapshot(Self::expr_key(value));
+                        self.clear_expression_value_snapshots(value);
                     }
                     None
                 }
@@ -42388,7 +42413,7 @@ impl<'a> MoveCheck<'a> {
                 Post::BlockLetTuple { locals, init } => {
                     if falls_through {
                         self.install_tuple_bindings(locals, init, moved);
-                        self.clear_value_snapshot(Self::expr_key(init));
+                        self.clear_expression_value_snapshots(init);
                     }
                     None
                 }
@@ -42467,17 +42492,20 @@ impl<'a> MoveCheck<'a> {
                                 value,
                             );
                         }
+                        self.clear_expression_value_snapshots(value);
                     }
                     None
                 }
-                Post::BlockAssignVecLane { local } => {
+                Post::BlockAssignVecLane { local, value } => {
                     if falls_through {
                         self.invalidate_mutable_place(local, &[]);
+                        self.clear_expression_value_snapshots(value);
                     }
                     None
                 }
                 Post::BlockPairAfterIndex {
                     base,
+                    index,
                     value,
                     field_path,
                     value_consuming,
@@ -42498,22 +42526,12 @@ impl<'a> MoveCheck<'a> {
                             }
                             self.update_mutable_collection_contents(
                                 base,
-                                match &wrapper.kind {
-                                    ExprKind::Block(block)
-                                    | ExprKind::Arena(block)
-                                    | ExprKind::NamedArena { block, .. }
-                                    | ExprKind::TaskGroup(block)
-                                    | ExprKind::Unsafe(block) => match &block.stmts[0] {
-                                        Stmt::AssignIndex { index, .. }
-                                        | Stmt::AssignElemField { index, .. }
-                                        | Stmt::AssignElem { index, .. } => index,
-                                        _ => unreachable!("array assignment post wrapper"),
-                                    },
-                                    _ => unreachable!("array assignment post wrapper"),
-                                },
+                                index,
                                 field_path,
                                 value,
                             );
+                            self.clear_expression_value_snapshots(index);
+                            self.clear_expression_value_snapshots(value);
                         }
                     }
                     None
@@ -42534,6 +42552,8 @@ impl<'a> MoveCheck<'a> {
                             self.invalidate_collection_content_owner(base);
                         }
                         self.update_mutable_collection_contents(base, index, field_path, value);
+                        self.clear_expression_value_snapshots(index);
+                        self.clear_expression_value_snapshots(value);
                     }
                     None
                 }
@@ -42869,6 +42889,8 @@ impl<'a> MoveCheck<'a> {
         if !self.expr(cond, moved, false, false) {
             return false;
         }
+        // The boolean discriminator has been copied; its operand reads are complete.
+        self.clear_expression_value_snapshots(cond);
         let incoming_borrows = self.borrows.clone();
         let mut then_moved = moved.clone();
         self.borrows = incoming_borrows.clone();
@@ -73374,6 +73396,82 @@ fn main() -> i32 = 0
             Scalar::RunBytes,
             Scalar::Enum(0),
         )));
+    }
+
+    #[test]
+    fn consumer_completed_action_frontiers_preserve_current_storage() {
+        let prefix = "H { flag: bool }\nfn filled() -> array<i64> { mut b: array_builder<i64> := array_builder(); b.push(0); return b.build() }\n";
+        for action in [
+            "if a[0] == 0 { a = filled() }",
+            "flag := a[0] == 0; if flag { a = filled() }",
+            "mut flag := false; flag = a[0] == 0; if flag { a = filled() }",
+            "mut h := H { flag: false }; h.flag = a[0] == 0; if h.flag { a = filled() }",
+            "mut h := [false]; h[0] = a[0] == 0; if h[0] { a = filled() }",
+            "if a[0] == 0 && true { a = filled() }",
+            "if false || a[0] == 0 { a = filled() }",
+            "(flag, n) := (a[0] == 0, 0); if flag { a = filled() }",
+            "loop { if a[0] == 0 { a = filled() }; break }",
+        ] {
+            for old_view in [false, true] {
+                let binding = if old_view { "view := a[0..1];" } else { "" };
+                let result = if old_view { "view[0]" } else { "a[0]" };
+                let source = format!("{prefix}fn main() {{ mut a := filled(); {binding} {action}; print({result}) }}");
+                let (_, diagnostics) = check(&source);
+                assert_eq!(diagnostics.has_errors(), old_view, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn consumer_opaque_field_roots_exclude_unselected_siblings() {
+        for sibling in ["name: str", "pending: Option<writer>"] {
+            for nested in [false, true] {
+                for indirect in [false, true] {
+                    let declarations = if nested { format!("Inner {{ data: buffer }}\nHolder {{ {sibling}, inner: Inner, count: i64 }}") } else { format!("Holder {{ {sibling}, data: buffer, count: i64 }}") };
+                    let field = if nested { "owner.inner.data" } else { "owner.data" };
+                    let call = if indirect { "f := put; f(bytes)" } else { "put(bytes)" };
+                    let source = format!("{declarations}\nfn put(borrow mut bytes: slice<u8>) {{ bytes[0] = 66 }}\nfn read(borrow owner: Holder) -> i64 = owner.count\nfn encode(borrow mut owner: Holder) -> i64 {{ mut bytes := {field}.bytes(); {call}; return read(owner) }}\nfn main() {{}}");
+                    let (_, diagnostics) = check(&source);
+                    assert!(!diagnostics.has_errors(), "{source}: {:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+                    let stale = source.replace("return read(owner)", "replace(owner); return bytes[0] as i64")
+                        + "\nfn replace(borrow mut owner: Holder) {}\n";
+                    assert!(check(&stale).1.has_errors(), "parent invalidation: {stale}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consumer_copy_arguments_preserve_settled_place_restrictions() {
+        for (ty, value) in [("i64", "1"), ("bool", "true"), ("f64", "1.5"), ("Option<i64>", "Some(1)")] {
+            let source = format!("H {{ value: {ty} }}\nfn set(borrow mut h: H, value: {ty}) {{ h.value = value }}\nfn main() {{ mut h := H {{ value: {value} }}; set(h, h.value) }}");
+            assert!(check(&source).1.has_errors(), "direct overlap remains specified: {source}");
+            let copied = source.replace("set(h, h.value)", "value := h.value; set(h, value)");
+            assert!(!check(&copied).1.has_errors(), "explicit independent value: {copied}");
+        }
+        for mode in ["borrow", "borrow mut"] {
+            let source = format!("H {{ value: i64 }}\nfn use(borrow mut h: H, {mode} value: i64) {{}}\nfn main() {{ mut h := H {{ value: 1 }}; use(h, h.value) }}");
+            assert!(check(&source).1.has_errors(), "{source}");
+        }
+        let source = "H { value: str }\nfn use(borrow mut h: H, value: str) {}\nfn main() { mut h := H { value: \"hello\" }; use(h, h.value) }";
+        assert!(check(source).1.has_errors());
+    }
+
+    #[test]
+    fn consumer_indirect_str_retention_uses_selected_byte_lifetime() {
+        for element in ["str", "string"] {
+            for indirect in [false, true] {
+                for local in [false, true] {
+                    let call = if indirect { "f := retain; f(values[0], output)" } else { "retain(values[0], output)" };
+                    let value = if element == "string" { "\"value\".clone()" } else { "\"value\"" };
+                    let setup = if local { format!("mut b: array_builder<{element}> := array_builder(); b.push({value}); values := b.build();") } else { String::new() };
+                    let parameter = if local { String::new() } else { format!("borrow values: array<{element}>, ") };
+                    let source = format!("View {{ text: str }}\nfn retain(value: str, borrow mut output: View) {{ output.text = value }}\nfn forward({parameter}borrow mut output: View) {{ {setup} {call} }}\nfn main() {{}}");
+                    let (_, diagnostics) = check(&source);
+                    assert_eq!(diagnostics.has_errors(), local, "{source}");
+                }
+            }
+        }
     }
 
     fn check(src: &str) -> (Program, Diagnostics) {

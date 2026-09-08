@@ -1632,3 +1632,22 @@ fn retained_buffer_view_rejects_after_cached_helper_edit_and_revert() {
     let reverted = project.build(UnitReuse::Allowed);
     assert!(hit(&reverted, "lib") && hit(&reverted, "main"));
 }
+
+#[test]
+fn borrowed_projection_reads_survive_private_edit_and_cache_restore() {
+    let _serial = serial();
+    let original = "module lib\nfn suffix() -> str = \"first\"\npub fn selected(borrow input: Option<array<string>>) -> str = match input { Some(items) => items[0], None => suffix() }\n";
+    let main = "import lib\nfn main() { input: Option<array<string>> := None; print(lib.selected(input)) }\n";
+    let project = Proj::new("borrowed-projection-restore", &[("lib.align", original), ("main.align", main)]);
+    let cold = project.build(UnitReuse::Allowed);
+    assert!(!hit(&cold, "lib") && !hit(&cold, "main"));
+    let hot = project.build(UnitReuse::Allowed);
+    assert!(hit(&hot, "lib") && hit(&hot, "main"));
+    project.write("lib.align", &original.replace("\"first\"", "\"second\""));
+    let edited = project.build(UnitReuse::Allowed);
+    assert!(!hit(&edited, "lib") && hit(&edited, "main"));
+    project.write("lib.align", original);
+    let restored = project.build(UnitReuse::Allowed);
+    assert!(hit(&restored, "lib") && hit(&restored, "main"));
+
+}

@@ -5799,39 +5799,82 @@ impl<'a> XmlAccessAnalyzer<'a> {
         Self::add_required_source(equation, source, OperandRequirement::READ);
     }
 
-    /// Authenticate a read through the ordinary SSA forms or an exact traversable borrowed
-    /// projection. Keep the projection on this worklist so later stores cannot be hidden by a
-    /// parameter-entry shortcut; the read itself never transfers storage ownership.
+    /// Authenticate a read without admitting borrowed descriptors as transferable SSA values.
+    /// Selected storage remains a dependency, including later stores and its cleanup flag.
+    fn read_source(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+        path: Vec<XmlAccessPathSegment>,
+    ) -> XmlAccessSource {
+        let Operand::BorrowedPlace(place) = operand else {
+            return self.source(operand, expected, path);
+        };
+        let projection = self.graph.function.slots.get(place.slot as usize)
+            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path));
+        let Some((stored, mut storage_path)) = projection else {
+            return XmlAccessSource::Invalid;
+        };
+        let selected = xml_selected_ty(self.graph.program, stored, &path);
+        if (stored != place.ty && !xml_borrowed_place_ty_is_view_retype(stored, place.ty))
+            || xml_selected_ty(self.graph.program, place.ty, &path) != Some(expected)
+            || !selected.is_some_and(|actual| {
+                xml_callable_flow_matches(self.graph.program, actual, expected)
+                    || xml_ty_is_view_retype(actual, expected)
+            })
+            || place.cleanup.is_some_and(|cleanup| {
+                self.graph.function.slots.get(cleanup as usize) != Some(&Ty::Bool)
+            })
+        {
+            return XmlAccessSource::Invalid;
+        }
+        if let Some(cleanup) = place.cleanup {
+            let cleanup = self.queue(XmlAccessNode::Slot(cleanup, Vec::new()));
+            Self::add_required_source(equation, cleanup, OperandRequirement::READ);
+        }
+        storage_path.extend(path);
+        self.queue(XmlAccessNode::Slot(place.slot, storage_path))
+    }
+
+    fn add_read_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+        path: Vec<XmlAccessPathSegment>,
+    ) {
+        let source = self.read_source(equation, operand, expected, path);
+        Self::add_source(equation, source);
+    }
+
     fn check_read_operand(
         &mut self,
         equation: &mut XmlAccessEquation,
         operand: &Operand,
         expected: Ty,
     ) {
-        let Operand::BorrowedPlace(place) = operand else {
-            self.check_operand(equation, operand, expected);
-            return;
-        };
-        let projection = self.graph.function.slots.get(place.slot as usize)
-            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path));
-        let Some((stored, path)) = projection else {
-            equation.invalid = true;
-            return;
-        };
-        if place.ty != expected
-            || (stored != expected && !xml_ty_is_view_retype(stored, expected))
-            || place.cleanup.is_some_and(|cleanup| {
-                self.graph.function.slots.get(cleanup as usize) != Some(&Ty::Bool)
-            })
-        {
-            equation.invalid = true;
-            return;
-        }
-        let source = self.queue(XmlAccessNode::Slot(place.slot, path));
+        let source = self.read_source(equation, operand, expected, Vec::new());
         Self::add_required_source(equation, source, OperandRequirement::READ);
-        if let Some(cleanup) = place.cleanup {
-            let cleanup = self.queue(XmlAccessNode::Slot(cleanup, Vec::new()));
-            Self::add_required_source(equation, cleanup, OperandRequirement::READ);
+    }
+
+    fn check_whole_read_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) {
+        let Some(leaves) = xml_owned_leaf_paths(self.graph.program, expected) else {
+            equation.invalid = true;
+            return;
+        };
+        if leaves.is_empty() {
+            self.check_read_operand(equation, operand, expected);
+        } else {
+            for (selected, path) in leaves {
+                let source = self.read_source(equation, operand, selected, path);
+                Self::add_required_source(equation, source, OperandRequirement::READ);
+            }
         }
     }
 
@@ -7060,9 +7103,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 }
-                self.check_whole_operand(&mut equation, &source, source_ty);
+                self.check_whole_read_operand(&mut equation, &source, source_ty);
                 self.check_operand(&mut equation, &index, i64_ty);
-                self.add_operand(
+                self.add_read_operand(
                     &mut equation,
                     &source,
                     source_selected,
@@ -7182,7 +7225,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 }
                 self.check_operand(&mut equation, &index, i64_ty);
-                self.add_operand(
+                self.add_read_operand(
                     &mut equation,
                     &base,
                     source_selected,
@@ -8676,7 +8719,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         return equation;
                     };
                     if path.is_empty() || source_selected == selected_ty {
-                        self.add_operand(
+                        self.add_read_operand(
                             &mut equation,
                             &base,
                             source_selected,
@@ -38777,6 +38820,60 @@ fn main() -> i32 = 0
                     .contains("resource operation contract mismatch"),
                 "unexpected diagnostic: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn consumer_projected_reads_authenticate_every_source_edge() {
+        for element in ["str", "string"] {
+            for (carrier, present, absent) in [("Option", "Some", "None"), ("Result", "Ok", "Err(_)")] {
+                for record in [false, true] {
+                    let declarations = if record { format!("Row {{ text: {element} }}\n") } else { String::new() };
+                    let item = if record { "Row" } else { element };
+                    let input = if carrier == "Option" { format!("Option<array<{item}>>") } else { format!("Result<array<{item}>, Error>") };
+                    let selected = if record { "items[0].text" } else { "items[0]" };
+                    for clone in [false, true] {
+                        let ret = if clone { "string" } else { "str" };
+                        let suffix = if clone { ".clone()" } else { "" };
+                        let source = format!("{declarations}fn selected(borrow input: {input}) -> {ret} = match input {{ {present}(items) => {selected}{suffix}, {absent} => \"\"{suffix} }}\nfn main() {{}}");
+                        let program = mir(&source);
+                        assert!(validate_mir_producers(&program).is_ok(), "{source}");
+                        assert!(validate_thin_partition_program(&program, &[]).is_ok(), "{source}");
+                    }
+                }
+            }
+        }
+        for element in ["str", "i64"] {
+            let source = format!("fn selected(borrow input: Option<array<{element}>>, fallback: slice<{element}>) -> slice<{element}> = match input {{ Some(items) => items[0..1], None => fallback }}\nfn main() {{}}\n");
+            let program = mir(&source);
+            assert!(validate_mir_producers(&program).is_ok(), "subview {source}");
+            assert!(validate_thin_partition_program(&program, &[]).is_ok(), "partition subview {source}");
+        }
+        let base = mir("fn selected(borrow input: Option<array<string>>) -> str = match input { Some(items) => items[0], None => \"\" }\nfn main() {}\n");
+        let owner = xml_test_function(&base, "selected");
+        for axis in ["missing-slot", "wrong-path", "wrong-type", "wrong-cleanup", "unreadable", "owned-result"] {
+            let mut malformed = base.clone();
+            let function = &mut malformed.fns[owner];
+            if axis == "unreadable" { function.param_modes[0] = align_ast::ParamMode::Out; }
+            let mut changed = false;
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    if let Stmt::Let(result, Rvalue::SliceIndex(Operand::BorrowedPlace(place), _)) = statement {
+                        match axis {
+                            "missing-slot" => place.slot = u32::MAX,
+                            "wrong-path" => place.path.clear(),
+                            "wrong-type" => place.ty = Ty::Raw,
+                            "wrong-cleanup" => place.cleanup = Some(place.slot),
+                            "owned-result" => function.value_tys[*result as usize] = Ty::String,
+                            _ => assert_eq!(axis, "unreadable", "known mutation axis"),
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            assert!(changed, "fixture must reach {axis}");
+            assert!(validate_mir_producers(&malformed).is_err(), "{axis}");
+            assert!(validate_thin_partition_program(&malformed, &[]).is_err(), "partition {axis}");
         }
     }
 
