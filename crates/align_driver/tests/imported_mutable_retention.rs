@@ -249,3 +249,131 @@ fn main() -> i32 = 0
         assert!(diagnostics.contains("shorter-lived"), "{diagnostics}");
     }
 }
+
+#[test]
+fn retained_local_views_reject_across_helper_boundaries() {
+    let sources = [
+        ("buffer", "data.bytes()"),
+        ("alias", "{ alias := data.bytes(); alias }"),
+        ("subslice", "data.bytes()[..]"),
+        ("if", "if flag { data.bytes() } else { seed }"),
+        ("if-reversed", "if flag { seed } else { data.bytes() }"),
+        ("match", "match Some(flag) { Some(_) => data.bytes(), None => seed }"),
+        ("loop", "loop { break data.bytes() }"),
+        ("nested-loop", "loop { break loop { break data.bytes() } }"),
+        ("loop-branch", "loop { if flag { break seed }; break data.bytes() }"),
+        ("loop-record", "{ record := loop { break helper.Holder { view: data.bytes() } }; record.view }"),
+        ("optional", "Some(data.bytes()) else seed"),
+        ("result", "{ result: Result<slice<u8>, Error> := Ok(data.bytes()); result else seed }"),
+        ("try", "{ result: Result<slice<u8>, Error> := Ok(data.bytes()); result? }"),
+        ("map-error", "{ result: Result<slice<u8>, Error> := Ok(data.bytes()); result.map_err(identity_error)? }"),
+        ("generic", "helper.identity(data.bytes())"),
+        ("string", "text.bytes()"),
+        ("record", "{ holder := helper.Holder { view: data.bytes() }; holder.view }"),
+    ];
+    for mode in ["", "borrow "] {
+        for (name, source) in sources {
+            let helper = format!(r#"module helper
+pub Holder {{ view: slice<u8> }}
+pub fn retain(borrow mut owner: Holder, {mode}bytes: slice<u8>) {{ owner.view = bytes }}
+pub fn identity<T>(value: T) -> T = value
+"#);
+            let main = format!(r#"import helper
+fn identity_error(error: Error) -> Error = error
+fn caller(borrow mut owner: helper.Holder, seed: slice<u8>, flag: bool) -> Result<(), Error> {{
+  mut data := buffer(1)
+  data.put_u8(65)
+  text := "local".clone()
+  bytes := {source}
+  helper.retain(owner, bytes)
+  return Ok(())
+}}
+fn main() {{}}
+"#);
+            let checked = diff_check_multi(
+                &format!("retained-view-{mode}-{name}"),
+                &[("helper.align", &helper), ("main.align", &main)],
+                "main.align",
+            );
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                let rejected = diagnostics.contains("shorter-lived")
+                    || name.contains("loop") && diagnostics.contains("cannot `break`");
+                assert!(rejected, "{mode}{name}: {diagnostics}");
+            }
+            let longer_lived = main.replace("data.bytes()", "seed").replace("text.bytes()", "seed");
+            let checked = diff_check_multi(
+                &format!("retained-view-control-{mode}-{name}"),
+                &[("helper.align", &helper), ("main.align", &longer_lived)],
+                "main.align",
+            );
+            assert!(!checked.whole_errors && !checked.per_unit_errors,
+                "{mode}{name} caller-backed control: {}\n{}", checked.whole_diags, checked.per_unit_diags);
+        }
+    }
+}
+
+#[test]
+fn retained_views_preserve_destination_and_argument_completion_lifetimes() {
+    let helper = r#"module helper
+pub fn put<T>(borrow mut dst: T, value: T) { dst = value }
+pub fn install(borrow mut dst: slice<u8>, value: slice<u8>, ignored: i64) { dst = value }
+pub fn buffer_view(borrow mut dst: slice<u8>, borrow data: buffer) { dst = data.bytes() }
+"#;
+    for (name, body, valid) in [
+        ("local-destination", "mut data := buffer(1); mut dst := seed; helper.put(dst, data.bytes())", true),
+        ("caller-destination", "mut data := buffer(1); helper.put(destination, data.bytes())", false),
+        ("borrowed-buffer", "mut data := buffer(1); helper.buffer_view(destination, data)", false),
+        ("borrowed-buffer-local", "mut data := buffer(1); mut dst := seed; helper.buffer_view(dst, data)", true),
+        ("arena", "arena { n := 42; text := template \"value={n}\"; helper.put(destination, text.bytes()) }", false),
+        ("completion", "mut data := buffer(1); mut bytes := data.bytes(); helper.install(destination, bytes, { bytes = seed; 0 })", false),
+        ("known-join", "values := [65 as u8].to_array(); bytes := if flag { values[..] } else { seed }; helper.put(destination, bytes)", false),
+        ("known-join-reversed", "values := [65 as u8].to_array(); bytes := if flag { seed } else { values[..] }; helper.put(destination, bytes)", false),
+        ("arena-join", "arena out { mut builder: array_builder<u8> := array_builder(out); builder.push(65 as u8); values := builder.build(); bytes := if flag { values[..] } else { seed }; helper.put(destination, bytes) }", false),
+        ("arena-join-reversed", "arena out { mut builder: array_builder<u8> := array_builder(out); builder.push(65 as u8); values := builder.build(); bytes := if flag { seed } else { values[..] }; helper.put(destination, bytes) }", false),
+        ("arena-destination", "arena out { mut builder: array_builder<u8> := array_builder(out); builder.push(65 as u8); values := builder.build(); bytes := if flag { values[..] } else { seed }; mut dst: slice<u8> := []; helper.put(dst, bytes) }", true),
+    ] {
+        let main = format!("import helper\nfn caller(borrow mut destination: slice<u8>, seed: slice<u8>, flag: bool) {{ {body} }}\nfn main() {{}}\n");
+        let checked = diff_check_multi(
+            &format!("retained-view-lifetime-{name}"),
+            &[("helper.align", helper), ("main.align", &main)],
+            "main.align",
+        );
+        assert_eq!(checked.whole_errors, !valid, "{name}: {}", checked.whole_diags);
+        assert_eq!(checked.per_unit_errors, !valid, "{name}: {}", checked.per_unit_diags);
+        if !valid {
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(diagnostics.contains("shorter-lived"), "{name}: {diagnostics}");
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_loop_views_ignore_nonreturning_break_edges() {
+    let helper = "module helper\npub Holder { view: slice<u8> }\npub fn retain(borrow mut owner: Holder, bytes: slice<u8>) { owner.view = bytes }\n";
+    for (name, source) in [
+        ("return", "loop { if flag { break seed }; return; break data.bytes() }"),
+        ("if", "loop { if flag { break seed } else { return }; break data.bytes() }"),
+        ("match", "loop { match Some(flag) { Some(_) => { break seed }, None => { return } }; break data.bytes() }"),
+        ("operand", "loop { if flag { break seed }; break { return; data.bytes() } }"),
+        ("nested", "loop { if flag { break loop { break seed } }; loop {}; break data.bytes() }"),
+        ("record", "{ value := loop { break helper.Holder { view: seed } }; value.view }"),
+        ("reevaluation", "loop { mut i := 0; loop { _ := loop { break seed }; i = i + 1; if i == 2 { break } }; break seed }"),
+    ] {
+        let main = format!(r#"import helper
+fn caller(borrow mut owner: helper.Holder, seed: slice<u8>, flag: bool) {{
+  mut data := buffer(1)
+  bytes := {source}
+  helper.retain(owner, bytes)
+}}
+fn main() {{}}
+"#);
+        let checked = diff_check_multi(
+            &format!("retained-loop-reachability-{name}"),
+            &[("helper.align", helper), ("main.align", &main)],
+            "main.align",
+        );
+        assert!(!checked.whole_errors && !checked.per_unit_errors,
+            "{name}: {}\n{}", checked.whole_diags, checked.per_unit_diags);
+    }
+}
