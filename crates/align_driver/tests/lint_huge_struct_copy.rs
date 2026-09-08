@@ -28,6 +28,41 @@ fn a_huge_struct_param_warns() {
 }
 
 #[test]
+fn huge_struct_parameter_warning_matches_the_passing_mode() {
+    // Exercise both source-analysis paths and every parameter mode. `out Big`
+    // remains illegal; it must report its type error without claiming a copy.
+    for (mode, copies, invalid) in [
+        ("", true, false),
+        ("borrow ", false, false),
+        ("borrow mut ", false, false),
+        ("out ", false, true),
+    ] {
+        let src = format!(
+            "{}fn inspect({mode}value: Big) {{}}\nfn main() -> i32 = 0\n",
+            big_struct(17),
+        );
+        for per_unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let diags = if per_unit {
+                align_driver::check_per_unit(&mut sm, "huge-mode.align", &src).diags
+            } else {
+                check(&mut sm, "huge-mode.align", &src).diags
+            };
+            let rendered = align_driver::format_diagnostics(&sm, &diags);
+            assert_eq!(diags.has_errors(), invalid, "{mode:?}, per_unit={per_unit}: {rendered}");
+            if invalid {
+                assert!(rendered.contains("an `out` parameter must be a slice"), "{rendered}");
+            }
+            assert_eq!(
+                rendered.matches("huge struct copy:").count(),
+                usize::from(copies),
+                "{mode:?}, per_unit={per_unit}: {rendered}",
+            );
+        }
+    }
+}
+
+#[test]
 fn a_huge_struct_return_warns() {
     let src = format!(
         "{}fn make() -> Big = Big {{ {} }}\nfn main() -> i32 = 0\n",
