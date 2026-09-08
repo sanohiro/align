@@ -16,6 +16,43 @@ alignc fmt   file.align --write # normalize formatting in place
 
 The edit loop is `check` and `run`. Multi-file builds compile one module per `.align` file, check imports against explicit interfaces, and link the reachable DAG. `check-per-unit` exposes that interface-based checker; `emit-interface` prints each unit's public surface and interface/implementation hashes.
 
+## What a clean check proves
+
+`check` analyzes the entry file and its reachable imports together. `check-per-unit`
+uses the same interface-based frontend walk as `build`, including checked-HIR
+validation, MIR lowering, and producer certification, but emits no executable.
+The commands cover these diagnostic classes:
+
+| Diagnostic class | `check` | `check-per-unit` | `build` |
+|---|---|---|---|
+| Source loading, syntax, names, types, lints, moves, borrows, regions, and effects | Whole-program analysis | Per-unit analysis | Per-unit analysis |
+| Imported interface contracts and consumer generic instantiation, including reconstructed borrow, region, mutable-retention, and cleanup facts | No separate interface boundary | Checked | Checked |
+| Checked-HIR validation, MIR lowering and producer certification, and interface descriptor formation | Deferred | Checked | Checked |
+| Emission-time callable/callback and parallel-kernel ABI validation, native layout, LLVM verification, optimization, and object emission | Deferred | Deferred | Checked when emitting code |
+| Build-only options and inputs, runtime/PGO artifacts, native libraries and symbol resolution, linking, and executable publication | Deferred | Deferred | Checked when applicable |
+
+Whole-program and per-unit analysis need not produce identical diagnostics: the
+latter checks calls against published module contracts. In particular, a clean
+`check` does not establish that the interface-based borrow/region analysis or
+MIR certification will accept the program. `check-per-unit` covers those phases;
+it does not cover the two native-build rows above. Build caches can reuse validated
+frontend results or object bytes instead of repeating those phases.
+
+For a compiling checkpoint, use the same entry file and dependency sources for
+both commands, and build with the intended target/profile/linker options:
+
+```text
+alignc check-per-unit path/to/main.align
+alignc build path/to/main.align
+```
+
+A clean check is not a promise that native code generation or linking succeeds.
+An internal checked-HIR/MIR or backend validation failure on a legal program is
+still a compiler defect to report; these phase boundaries do not add language
+restrictions or excuse inconsistent ownership checking.
+
+## Build caches
+
 Two content-addressed caches sit behind every build, both default-on and both silent unless asked. Codegen also runs parallel workers:
 
 ```text

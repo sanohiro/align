@@ -7,15 +7,20 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-**Request audit (2026-09-07):** PR #975 completes the remaining Request 59
-copied-scalar aggregate producer repair; both registered modules now pass per-unit
-checking. The [all-60 request audit](docs/impl/align-llm-request-audit-2026-09-07.md)
-separates delivered work, consumer adoption, partial existing coverage, and
-remaining proposals. Next prioritize the reproduced Request 45 nested-field
-ownership defect, then investigate Request 39 replacement cleanup and the
-Request 42/43/49 checking boundary. Do not implement every proposed API merely
-to close the register. Earlier status paragraphs below are historical context;
-current Request 21 is `fs.open_ro`, while #892's old Request 21 is now Request 44.
+**Request batch closure (2026-09-08):** the reproduced Request 45 nested-field
+ownership defect (#978), Request 39 replacement cleanup (#980), and Request 61
+borrowed buffer/writer projections (#982) are repaired. Requests 43/49's imported
+mutable-retention transport (#983) and the materialized chunks, Out storage, and
+closure-join producer repairs (#984–986) close the reproduced checking failures.
+Request 42's accepted documentation alternative is recorded in the English and
+Japanese [toolchain guide](docs/guide/16-toolchain.md): `check-per-unit` covers the
+build frontend, while native emission and linking remain build-only evidence.
+Consumer revision adoption and smoke verification remain align-llm-owned.
+The [dated all-60 audit](docs/impl/align-llm-request-audit-2026-09-07.md) is historical
+selection evidence; next inspect its focused diagnostic candidates R23 and R51.
+Do not implement every proposed API merely to close the register. Earlier status
+paragraphs below are historical context; current Request 21 is `fs.open_ro`, while
+#892's old Request 21 is now Request 44.
 
 **XML investigation closure:** the owner requested one consolidated
 investigate-then-repair record instead of further piecemeal fix rounds. Read
