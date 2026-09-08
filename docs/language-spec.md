@@ -1220,10 +1220,29 @@ syscall still maps to `Code(errno)`; `Timeout` is produced only where a deadline
 explicitly (a `command`'s `timeout_ns`, an `std.http`/`std.net` I/O timeout).
 (`draft.md` §18.2, M9.)
 
+
+The named wire-format extension uses UTC and the proleptic Gregorian calendar, with no locale,
+timezone database or leap-second timeline. The five formatters `rfc3339`, `rfc3339_ms`, `rfc1123`,
+`basic_iso`, `basic_date` take `ns: i64` and return `Result<string, Error>`; matching
+`parse_NAME(input: str)` functions return `Result<i64, Error>`. Formatters floor toward negative
+infinity at nanosecond, millisecond, second, second and day resolution respectively. An
+unrepresentable floored instant is `Error.Invalid` before allocation. Success returns an owned
+string whose matching parser recovers that instant. RFC3339 preserves a minimal nonzero fraction;
+RFC3339-ms prints exactly three fractional digits, RFC1123 prints English IMF-fixdate, and basic
+ISO/date print `YYYYMMDDTHHMMSSZ`/`YYYYMMDD`.
+
+Parsers borrow text only during the call, allocate nothing and reject malformed or out-of-range
+values as `Error.Invalid`. They consume the entire formatter grammar, with RFC3339-only
+compatibility for lowercase t/z and known numeric offsets. RFC3339 accepts absent or 1–9 fractional
+digits; RFC3339-ms requires exactly three. Unknown `-00:00`, leap seconds, invalid dates/weekdays,
+NUL, non-ASCII, whitespace and obsolete HTTP dates are rejected. All ten are pure transforms.
+The exact bounded grammar, endpoint, ABI and ownership contract is in `impl/std-design/time.md`.
+
 `std.encoding`: `base64`/`base64url`/`hex`/`percent` (RFC 3986 URI components — everything outside
 the unreserved set becomes `%XX`) / `form` (`application/x-www-form-urlencoded` — the same rule but
 space is `+`; encode one key or value at a time, the `=`/`&` joining them are structure) encode+decode,
-plus `html_escape` (encode-only: `& < > " '` become entities, making one output safe in both element
+plus `percent_encode_path` (encode-only; owned output, call-borrowed bytes/str/string,
+preserving `/` and unreserved bytes without decoding or normalization), and `html_escape` (encode-only: `& < > " '` become entities, making one output safe in both element
 text and a quoted attribute; reversing HTML needs a parser's full entity table, not a codec)
 (decode returns an owned `buffer` — no
 UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`

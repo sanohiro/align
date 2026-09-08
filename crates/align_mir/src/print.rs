@@ -967,6 +967,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::PathNormalize { path } => format!("path_normalize({})", operand_str(path)),
         Rvalue::EnvGet { name, out } => format!("env_get({}, -> _{out})", operand_str(name)),
         Rvalue::EnvSet { name, value } => format!("env_set({}, {})", operand_str(name), operand_str(value)),
+        Rvalue::TimeFormat { kind, ns, out } => format!("time_format({kind:?}, {}, s{out})", operand_str(ns)),
+        Rvalue::TimeParse { kind, input, out } => format!("time_parse({kind:?}, {}, s{out})", operand_str(input)),
         Rvalue::TimeNow => "time_now()".to_string(),
         Rvalue::ProcessCpuCount => "process_cpu_count()".to_string(),
         Rvalue::TimeInstant => "time_instant()".to_string(),

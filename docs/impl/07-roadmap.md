@@ -3885,10 +3885,11 @@ required by the plan.
 
 ## Post-pkg.db library waves (planned; each item gated independently)
 
-**Post-XML pause (2026-09-05):** the remaining library queue below resumes only
-after the bounded consolidation phase closes and the next consumer is selected.
-Finish the current `std.xml` PR and its owner's intended release first. Do not
-automatically start `std.time`, cloud packages, or additional transports.
+**Owner-resumed cloud lane (2026-09-08):** the bounded consolidation and subsequent
+consumer-boundary investigation are complete. The selected next consumer is
+`pkg.s3`/SigV4, beginning with the named time and path-encoding prerequisite in
+`std-design/time.md`. Merge each coherent capability before starting the next.
+Other transports and execution/storage items retain their own admission gates.
 
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
 An item without a status is not a committed contract: it becomes a gated design under
@@ -4094,7 +4095,8 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
   (XXE / billion-laughs closed by construction); lexical namespaces not expanded; inclusive depth
   and per-element attribute bounds 256; consumers S3 + Azure Blob. Exact public, grammar, ABI,
   allocation, and implementation closure ledger: `std-design/xml.md`.
-- **std.time formatters** — rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped
+- **std.time formatters — IMPLEMENTED 2026-09-08** — exact public contract and one-capability
+  closure matrix: `std-design/time.md`. Prerequisite consumer: S3/SigV4. rfc3339 / rfc3339_ms / rfc1123 / basic_iso / basic_date on the shipped
   i64-ns timeline; parse self-output + minimal compat; no strftime DSL, no locale/TZ (permanent
   non-goal). Plus `encoding.percent_encode_path`.
 - **std.crypto asymmetric — IMPLEMENTED 2026-08-30** — six distinct

@@ -2158,6 +2158,10 @@ pub enum Rvalue {
     TimeSleep {
         ns: Operand,
     },
+    /// Pure named formatting into an owned String slot; i32 errno status.
+    TimeFormat { kind: hir::TimeFormatKind, ns: Operand, out: Slot },
+    /// Pure call-borrowed parsing into an i64 slot; i32 errno status.
+    TimeParse { kind: hir::TimeFormatKind, input: Operand, out: Slot },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode the byte view `data`
     /// (`{ptr,len}`) into a freshly heap-allocated owned `string`, returned by value as a `{ptr,len}`
     /// (like `PathNormalize`). `kind` selects the alphabet. Pure.
@@ -8440,6 +8444,25 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_status_result(b, code, e.ty)
             }
             // `time.now()` / `time.instant()` → an `i64` returned by value.
+            hir::ExprKind::TimeFormat { kind, ns } => {
+                lower_required_binding!(b, input = lower_expr(b, ns), Operand::Const(Const::Unit));
+                let out = b.new_slot(Ty::String);
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::TimeFormat { kind: *kind, ns: input, out }));
+                let value = b.fresh_value(Ty::String);
+                b.push(Stmt::Let(value, Rvalue::Load(out)));
+                lower_status_value_result(b, code, Operand::Value(value), e.ty)
+            }
+            hir::ExprKind::TimeParse { kind, input } => {
+                lower_required_binding!(b, text = lower_expr(b, input), Operand::Const(Const::Unit));
+                let value_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let out = b.new_slot(value_ty);
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::TimeParse { kind: *kind, input: text, out }));
+                let value = b.fresh_value(value_ty);
+                b.push(Stmt::Let(value, Rvalue::Load(out)));
+                lower_status_value_result(b, code, Operand::Value(value), e.ty)
+            }
             hir::ExprKind::TimeNow => {
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::TimeNow));

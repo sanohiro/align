@@ -13,8 +13,8 @@ With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, private temporary-directory
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
-`pkg.csv`, `pkg.ws`, and `pkg.template`, there
-are 358 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+`pkg.csv`, `pkg.ws`, `pkg.template`, and named time/path wire formats, there
+are 361 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -27,7 +27,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 376 records. Request 12
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 379 records. Request 12
 adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose seven
@@ -40,10 +40,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 376 base records.
+The compiler-visible native registry is always exactly the 379 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 387.
+records extend only the verification-time maximum runtime-export table to 390.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -62,7 +62,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 358 keyed records, 376 base records, and 387 records in the maximum optional-probe export table.
+are 361 keyed records, 379 base records, and 390 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -111,7 +111,7 @@ production `process.command` continues to select its shipped runtime entries unc
 
 These declarations occupy A110 through A113. The implemented `std.log` design occupies A114 through
 A117, `core.codec` occupies A118 through A120, `pkg.frame` occupies A121/A122 below, and `pkg.csv`
-occupies A123. A124 is the next unreserved design shape. All
+occupies A123. Named time formatting/parsing occupies A124/A125; A126 is the next unreserved design shape. All
 four declarations carry the existing
 generated `nounwind` function attribute and no curated
 parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
@@ -1126,24 +1126,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 358 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 361 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 376 base native symbols against default-feature `align_runtime` exports,
+- the 379 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 383 `alloc-count` and 380 `par-map-probe` native symbols against
+- the 386 `alloc-count` and 383 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 387 maximum native symbols against `align_runtime` built with
+- the 390 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 376 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  376 exact registry function types through the production compatibility
+- all 379 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  379 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
@@ -1196,3 +1196,24 @@ validation and generated-body preflight occur before its address is installed in
 SQLite. Whole-program, per-unit, and ThinLTO emission must agree on the descriptor bytes, target
 symbol, physical generated name, C type, and attributes; a malformed checked program emits neither
 descriptor nor callback definition.
+
+## Named time wire-format extension
+
+`std-design/time.md` owns the exact five-by-two public contract and the following three
+additional keyed rows. Compiler selection, native implementations, interface replay and cache
+fingerprints activate together. Counts increase from 358/376/387 to 361 keyed, 379 base,
+386 alloc-count, 383 par-map-probe and 390 maximum probe records. No probe category is added.
+
+| Key | Shape | Exact declaration | Attributes |
+|---|---|---|---|
+| TimeFormat | A124 | `i32 @align_rt_time_format(ptr, i64, i32)` | nounwind; no parameter/return attributes |
+| TimeParse | A125 | `i32 @align_rt_time_parse(ptr, ptr, i64, i32)` | nounwind; no parameter/return attributes |
+| PercentEncodePath | A84 | `{ptr, i64} @align_rt_percent_encode_path(ptr, i64)` | existing A84 defaults |
+
+The runtime uses the existing C convention and errno-to-Error translation. Output pointer/span
+preflight precedes references; valid output is canonically zero even on failure. Closed native
+time-kind tags 0–4 select the reviewed algorithms; every other tag returns EINVAL. One exact
+owned-string allocation follows successful stack formatting. Parsing allocates nothing and
+retains no input. The public ledger supplies the complete length, overlap, ownership and error
+contract. A126 is the next unreserved shape. All earlier next-shape mentions describe their
+historical capability boundary, not the current allocation point.

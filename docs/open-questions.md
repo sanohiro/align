@@ -3051,6 +3051,28 @@ folded into the Settled/Open/Future entries above, and were also landed the same
 
 ### M9 std design (2026-07-03)
 
+The named wire-format extension uses UTC and the proleptic Gregorian calendar, with no locale,
+timezone database or leap-second timeline. The five formatters `rfc3339`, `rfc3339_ms`, `rfc1123`,
+`basic_iso`, `basic_date` take `ns: i64` and return `Result<string, Error>`; matching
+`parse_NAME(input: str)` functions return `Result<i64, Error>`. Formatters floor toward negative
+infinity at nanosecond, millisecond, second, second and day resolution respectively. An
+unrepresentable floored instant is `Error.Invalid` before allocation. Success returns an owned
+string whose matching parser recovers that instant. RFC3339 preserves a minimal nonzero fraction;
+RFC3339-ms prints exactly three fractional digits, RFC1123 prints English IMF-fixdate, and basic
+ISO/date print `YYYYMMDDTHHMMSSZ`/`YYYYMMDD`.
+
+Parsers borrow text only during the call, allocate nothing and reject malformed or out-of-range
+values as `Error.Invalid`. They consume the entire formatter grammar, with RFC3339-only
+compatibility for lowercase t/z and known numeric offsets. RFC3339 accepts absent or 1–9 fractional
+digits; RFC3339-ms requires exactly three. Unknown `-00:00`, leap seconds, invalid dates/weekdays,
+NUL, non-ASCII, whitespace and obsolete HTTP dates are rejected. All ten are pure transforms.
+The exact bounded grammar, endpoint, ABI and ownership contract is in `impl/std-design/time.md`.
+
+The cloud prerequisite was selected on 2026-09-08. Its encode-only `percent_encode_path` preserves
+unreserved bytes and slash without decoding or normalization; it uses the existing encoding
+input borrowing and owned-output contract. The family is implemented against that ledger.
+
+
 Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implementation
 (`impl/07-roadmap.md` M9; full API shape in `draft.md` §18.2):
 

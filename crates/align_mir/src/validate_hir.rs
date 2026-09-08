@@ -4628,6 +4628,8 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::RunBytesStdout { .. }
             | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::EncodingEncode { .. }
+            | hir::ExprKind::TimeFormat { .. }
+            | hir::ExprKind::TimeParse { .. }
             | hir::ExprKind::EncodingDecode { .. }
             | hir::ExprKind::Utf8Valid { .. }
             | hir::ExprKind::Compress { .. }
@@ -4880,12 +4882,14 @@ impl<'a> BodyValidator<'a> {
                 hir::CliFlagKind::Bool => default.is_none(),
                 hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
             },
-            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Html),
+            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. } => true,
             hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::Compress { .. }
             | hir::ExprKind::Decompress { .. }
             | hir::ExprKind::PathComponent { .. }
+            | hir::ExprKind::TimeFormat { .. }
+            | hir::ExprKind::TimeParse { .. }
             | hir::ExprKind::EncodingEncode { .. }
             | hir::ExprKind::CryptoHash { .. }
             | hir::ExprKind::CryptoAead { .. }
@@ -9093,6 +9097,12 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::TimeNow | hir::ExprKind::TimeInstant | hir::ExprKind::ProcessCpuCount => {
                 strict(i64, &[])
             }
+            hir::ExprKind::TimeFormat { ns, .. } => {
+                (ns.ty == i64).then(|| result(Ty::String, &[ns]))?
+            }
+            hir::ExprKind::TimeParse { input, .. } => {
+                (input.ty == Ty::Str).then(|| result(i64, &[input]))?
+            }
             hir::ExprKind::TimeSleep { ns } => {
                 (ns.ty == i64).then(|| strict(Ty::Unit, &[ns]))?
             }
@@ -9193,7 +9203,7 @@ impl<'a> BodyValidator<'a> {
                 (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
             }
             hir::ExprKind::EncodingDecode { input, kind } => {
-                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Html))
+                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath))
                     .then(|| result(Ty::Buffer, &[input]))?
             }
             hir::ExprKind::Utf8Valid { data } => {

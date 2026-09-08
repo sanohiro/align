@@ -5251,6 +5251,8 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::RegexSplit { out, .. }
         | Rvalue::RegexCaptures { out, .. }
         | Rvalue::CapturesGroup { out, .. }
+        | Rvalue::TimeFormat { out, .. }
+        | Rvalue::TimeParse { out, .. }
         | Rvalue::EncodingDecode { out, .. }
         | Rvalue::CompressCompress { out, .. }
         | Rvalue::CompressDecompress { out, .. }
@@ -5319,6 +5321,8 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::BytesAsStr { bytes: input, .. }
         | Rvalue::EnvGet { name: input, .. }
         | Rvalue::RegexCompile { pattern: input, .. }
+        | Rvalue::TimeFormat { ns: input, .. }
+        | Rvalue::TimeParse { input, .. }
         | Rvalue::EncodingDecode { input, .. }
         | Rvalue::CompressDecompress { data: input, .. }
         | Rvalue::CryptoPrivateKeyFromPem { pem: input, .. }
@@ -9549,6 +9553,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::RegexGroupCount { .. }
             | Rvalue::RegexGroupIndex { .. }
             | Rvalue::CapturesGroup { .. }
+            | Rvalue::TimeFormat { .. }
+            | Rvalue::TimeParse { .. }
             | Rvalue::EncodingDecode { .. }
             | Rvalue::CompressCompress { .. }
             | Rvalue::CompressDecompress { .. }
@@ -9942,6 +9948,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return;
                 }
                 self.check_operand(equation, input, Ty::Str);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::TimeFormat { ns, out, .. } => {
+                if slot_ty != Ty::String || xml_operand_base_ty(self.graph.function, ns) != Some(i64_ty) {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_read_operand(equation, ns, i64_ty);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::TimeParse { input, out, .. } => {
+                if slot_ty != i64_ty || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str) {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_read_operand(equation, input, Ty::Str);
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::EnvGet { name, out } => {
@@ -11509,6 +11531,15 @@ fn validate_resource_rvalues_component(
                     return Err(fail(function, "XML primary result definition is not unique"));
                 }
                 let valid = match rvalue {
+                    Rvalue::TimeFormat { out, .. } | Rvalue::TimeParse { out, .. } => {
+                        let output_ty = if matches!(rvalue, Rvalue::TimeFormat { .. }) { Ty::String } else { i64_ty };
+                        // Scalar parser outputs also require the complete native producer proof:
+                        // they do not otherwise reach the protected string/callable leaf walk.
+                        result == i32_ty && matches!(
+                            xml_slot_path_access(&access_graph, *out, output_ty, Vec::new()),
+                            XmlProducerState::Present(XmlAccessProvenance::Owned)
+                        )
+                    }
                     Rvalue::RawIsNull(pointer) => {
                         operand_ty(function, pointer) == Some(Ty::Raw) && result == Ty::Bool
                     }
@@ -23934,6 +23965,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Base64Url => RuntimeKey::Base64urlEncode,
                     align_sema::hir::EncodingKind::Hex => RuntimeKey::HexEncode,
                     align_sema::hir::EncodingKind::Percent => RuntimeKey::PercentEncode,
+                    align_sema::hir::EncodingKind::PercentPath => RuntimeKey::PercentEncodePath,
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormEncode,
                     align_sema::hir::EncodingKind::Html => RuntimeKey::HtmlEscape,
                 };
@@ -23952,7 +23984,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormDecode,
                     // `html_escape` is encode-only — sema maps no `*_decode` method to `Html`, so an
                     // `EncodingDecode` node can never carry it.
-                    align_sema::hir::EncodingKind::Html => unreachable!("html has no decode direction"),
+                    align_sema::hir::EncodingKind::Html | align_sema::hir::EncodingKind::PercentPath => {
+                        return Err(self.err("encode-only kind in decoder"));
+                    },
                 };
                 let out_ptr = self.slots[out];
                 self.builder
@@ -25215,6 +25249,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::EnvSet), &[np.into(), nl.into(), vp.into(), vl.into()], "envset")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("env_set returns i32")
+            }
+            Rvalue::TimeFormat { kind, ns, out } => {
+                let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing time formatter output slot"))?;
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let value = self.operand(ns)?;
+                let tag = self.ctx.i32_type().const_int(u64::try_from(kind.native_tag()).map_err(|e| self.err(e))?, false);
+                self.builder.build_call(self.runtime(RuntimeKey::TimeFormat), &[out_ptr.into(), value.into(), tag.into()], "timefmt")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("time format ABI result"))?
+            }
+            Rvalue::TimeParse { kind, input, out } => {
+                let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing time parser output slot"))?;
+                self.builder.build_store(out_ptr, self.ctx.i64_type().const_zero()).map_err(|e| self.err(e))?;
+                let (ptr, len) = self.split_str(input)?;
+                let tag = self.ctx.i32_type().const_int(u64::try_from(kind.native_tag()).map_err(|e| self.err(e))?, false);
+                self.builder.build_call(self.runtime(RuntimeKey::TimeParse), &[out_ptr.into(), ptr.into(), len.into(), tag.into()], "timeparse")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("time parse ABI result"))?
             }
             Rvalue::TimeNow => self
                 .builder
@@ -37028,6 +37078,12 @@ fn main() -> i32 = 0
             ),
         ];
 
+        let mut cases = cases.to_vec();
+        for kind in [hir::TimeFormatKind::Rfc3339, hir::TimeFormatKind::Rfc3339Ms,
+            hir::TimeFormatKind::Rfc1123, hir::TimeFormatKind::BasicIso, hir::TimeFormatKind::BasicDate] {
+            cases.push(("time.format", Rvalue::TimeFormat { kind, ns: Operand::Arg(0), out: 1 }, vec![i64_ty], Ty::String));
+            cases.push(("time.parse", Rvalue::TimeParse { kind, input: Operand::Arg(0), out: 1 }, vec![Ty::Str], i64_ty));
+        }
         for (name, rvalue, params, out_ty) in cases {
             let program = xml_out_producer_program(rvalue, params, out_ty);
             assert!(
@@ -37039,6 +37095,18 @@ fn main() -> i32 = 0
             bad_result.fns[0].value_tys[0] = Ty::Bool;
             assert_xml_producer_rejected(&bad_result, &format!("{name} result type"));
 
+            if name.starts_with("time.") {
+                let mut bad_input = program.clone();
+                bad_input.fns[0].slots[0] = Ty::Bool;
+                assert_xml_producer_rejected(&bad_input, &format!("{name} input type"));
+                let mut unreadable_input = program.clone();
+                unreadable_input.fns[0].param_modes[0] = align_ast::ParamMode::Out;
+                assert_xml_producer_rejected(&unreadable_input, &format!("{name} unreadable input"));
+                let mut bad_slot = program.clone();
+                bad_slot.fns[0].slots[1] = Ty::Bool;
+                assert_xml_producer_rejected(&bad_slot, &format!("{name} output type"));
+            }
+
             let mut detached = program.clone();
             let Stmt::Let(_, producer) = &mut detached.fns[0].blocks[0].stmts[0] else {
                 panic!("out producer fixture changed shape")
@@ -37048,6 +37116,8 @@ fn main() -> i32 = 0
                 | Rvalue::FsReadFile { out, .. }
                 | Rvalue::FsCreatePrivateTempDir { out, .. }
                 | Rvalue::FsReadDir { out, .. }
+                | Rvalue::TimeFormat { out, .. }
+                | Rvalue::TimeParse { out, .. }
                 | Rvalue::EnvGet { out, .. }
                 | Rvalue::JsonDocAsStr { out, .. }
                 | Rvalue::JsonDocKey { out, .. }

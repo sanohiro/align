@@ -11817,10 +11817,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // Request 56 adds two private-directory lifecycle operations; keep this count synchronized with
+        // Named time formatting/parsing add two operations; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        325,
+        327,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -12795,6 +12795,13 @@ fn hir_body_validator_native() {
         ("native_process_cpu_count", hir::ExprKind::ProcessCpuCount, i64_ty),
     ] {
         add!(name, body_test_expr(kind, ret), Vec::new(), ret);
+    }
+    for kind in [hir::TimeFormatKind::Rfc3339, hir::TimeFormatKind::Rfc3339Ms,
+        hir::TimeFormatKind::Rfc1123, hir::TimeFormatKind::BasicIso, hir::TimeFormatKind::BasicDate] {
+        let format_name = format!("native_time_format_{kind:?}");
+        let parse_name = format!("native_time_parse_{kind:?}");
+        add!(&format_name, body_test_expr(hir::ExprKind::TimeFormat { kind, ns: Box::new(native_i64()) }, native_result(Ty::String, error)), Vec::new(), native_result(Ty::String, error));
+        add!(&parse_name, body_test_expr(hir::ExprKind::TimeParse { kind, input: Box::new(native_str()) }, native_result(i64_ty, error)), Vec::new(), native_result(i64_ty, error));
     }
     add!(
         "native_time_sleep",
@@ -14380,6 +14387,30 @@ fn hir_body_validator_native() {
         "SSE next output buffer must be mutable"
     );
 
+    for kind in [hir::TimeFormatKind::Rfc3339, hir::TimeFormatKind::Rfc3339Ms,
+        hir::TimeFormatKind::Rfc1123, hir::TimeFormatKind::BasicIso, hir::TimeFormatKind::BasicDate] {
+        for (prefix, bad) in [("native_time_format_", native_str()), ("native_time_parse_", native_i64())] {
+            let mut reject = program.clone();
+            let expression = body_value_expression_mut(&mut reject, &format!("{prefix}{kind:?}"));
+            match &mut expression.kind {
+                hir::ExprKind::TimeFormat { ns, .. } => **ns = bad,
+                hir::ExprKind::TimeParse { input, .. } => **input = bad,
+                _ => panic!("time fixture shape"),
+            }
+            assert!(!body_core_metadata_is_valid(&reject), "{prefix}{kind:?} operand");
+            let mut reject = program.clone();
+            body_value_expression_mut(&mut reject, &format!("{prefix}{kind:?}")).ty = Ty::Bool;
+            assert!(!body_core_metadata_is_valid(&reject), "{prefix}{kind:?} result");
+        }
+    }
+    for kind in [hir::EncodingKind::Html, hir::EncodingKind::PercentPath] {
+        let mut reject = program.clone();
+        let expression = body_statement_expression_mut(&mut reject, "native_encoding_decode");
+        let hir::ExprKind::Try(expression) = &mut expression.kind else { panic!("decoder try fixture") };
+        let hir::ExprKind::EncodingDecode { kind: target, .. } = &mut expression.kind else { panic!("decoder fixture") };
+        *target = kind;
+        assert!(!body_core_metadata_is_valid(&reject), "encode-only {kind:?}");
+    }
     let mut exclusive = program.clone();
     let Some(function) = exclusive
         .fns

@@ -2083,3 +2083,13 @@ records preserve the producer result and pass the shared arity, root-order, inde
 and destination-mode validator before either body analysis or MIR header validation.
 Generic templates carry no record. Missing records preserve conservative handling.
 The fact is removed before MIR and adds no runtime ABI field.
+
+## Named time wire-format extension
+
+`std-design/time.md` owns the exact new TimeFormat/TimeParse and PercentPath contract. HIR validates
+exact operands/results and encode-only kinds. MIR producer certification validates readable
+operands, primary status equations and output slots before publishing fresh ownership. Existing
+Result/string lifecycle and generic source-template replay carry the extension; no new public type.
+The five-kind checked-HIR owner mutates operands and result types; encode-only HTML/PercentPath
+decoders reject. Native-envelope admission is explicit. The protected-leaf producer owner also
+requires the exact scalar parser status/output equation, even when no string leaf is returned.

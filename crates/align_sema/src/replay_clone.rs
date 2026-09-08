@@ -1261,6 +1261,8 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             kind: *kind,
             data: boxed!(data),
         },
+        ExprKind::TimeFormat { kind, ns } => ExprKind::TimeFormat { kind: *kind, ns: boxed!(ns) },
+        ExprKind::TimeParse { kind, input } => ExprKind::TimeParse { kind: *kind, input: boxed!(input) },
         ExprKind::EncodingDecode { kind, input } => ExprKind::EncodingDecode {
             kind: *kind,
             input: boxed!(input),
@@ -2716,6 +2718,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::RunBytesStdout { out: recv }
         | ExprKind::RunBytesStderr { out: recv }
         | ExprKind::EncodingEncode { data: recv, .. }
+        | ExprKind::TimeFormat { ns: recv, .. }
+        | ExprKind::TimeParse { input: recv, .. }
         | ExprKind::EncodingDecode { input: recv, .. }
         | ExprKind::Utf8Valid { data: recv }
         | ExprKind::Decompress { data: recv, .. }

@@ -267,6 +267,7 @@ key|PathJoin|path_join|declare { ptr, i64 } @align_rt_path_join(ptr, i64, ptr, i
 key|PathNormalize|path_normalize|declare { ptr, i64 } @align_rt_path_normalize(ptr, i64)
 key|PercentDecode|percent_decode|declare i32 @align_rt_percent_decode(ptr, i64, ptr)
 key|PercentEncode|percent_encode|declare { ptr, i64 } @align_rt_percent_encode(ptr, i64)
+key|PercentEncodePath|percent_encode_path|declare { ptr, i64 } @align_rt_percent_encode_path(ptr, i64)
 key|Print|print|declare void @align_rt_print_i64(i64)
 key|PrintBool|print_bool|declare void @align_rt_print_bool(i32)
 key|PrintChar|print_char|declare void @align_rt_print_char(i32)
@@ -339,8 +340,10 @@ key|TgBegin|tg_begin|declare noalias ptr @align_rt_tg_begin() #0
 key|TgEnd|tg_end|declare void @align_rt_tg_end(ptr)
 key|TgRegister|tg_register|declare void @align_rt_tg_register(ptr, ptr, ptr, ptr, ptr, ptr)
 key|TgWait|tg_wait|declare ptr @align_rt_tg_wait(ptr)
+key|TimeFormat|time_format|declare i32 @align_rt_time_format(ptr, i64, i32) #2
 key|TimeInstant|time_instant|declare i64 @align_rt_time_instant()
 key|TimeNow|time_now|declare i64 @align_rt_time_now()
+key|TimeParse|time_parse|declare i32 @align_rt_time_parse(ptr, ptr, i64, i32) #2
 key|TimeSleep|time_sleep|declare void @align_rt_time_sleep(i64)
 key|UdpBind|udp_bind|declare i32 @align_rt_udp_bind(ptr, i64, i64, ptr)
 key|UdpRecvFrom|udp_recv_from|declare i64 @align_rt_udp_recv_from(ptr, ptr)

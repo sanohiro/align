@@ -1,5 +1,12 @@
 # Align Design Notes
 
+The named UTC wire-format family (`impl/std-design/time.md`) shares the existing signed-nanosecond
+timeline and Error model. All five formatters are fallible under one representability rule:
+flooring precision may move the lower endpoint outside i64. Rejecting before allocation keeps
+every successful output parseable without clamping or introducing a second time type. Matching
+bounded parsers are pure, allocation-free call borrows; path encoding preserves raw object-key
+slashes and leaves URI canonicalization to the consumer.
+
 ## Why Align exists
 
 Align is not an attempt to invent new syntax.
