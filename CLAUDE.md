@@ -327,7 +327,13 @@ not.
 
 The PostgreSQL required check is lightweight on unrelated diffs. Its separate
 service job runs only when `scripts/db-ci-scope.sh` classifies the committed
-range as reaching the database boundary. Direct DB/gate, shared-owner, and
+range as reaching the database boundary. Root Cargo changes qualify except when
+both committed trees prove a consistent workspace release-version-only update,
+with unchanged member identities, dependencies and reviewed version consumers.
+The isolated inline TOML verifier fails closed on unavailable tools or unsupported
+metadata; all other changed paths still undergo normal classification. Item 2d of
+`docs/impl/21-build-perf-plan.md` owns the exact proof and its negative controls.
+Direct DB/gate, shared-owner, and
 dedicated DB-production paths qualify unconditionally; mixed compiler sources
 qualify when a zero-context changed hunk or its function header names the
 boundary. Deletions use those same path and changed-hunk rules, while

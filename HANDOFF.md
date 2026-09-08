@@ -95,7 +95,11 @@ The bounded-gate scheduling investigation is complete: item 2c of
 fixed CPUs, the same 884 tests in identical binaries passed in 438.64s versus
 829.26s, with comparable CPU time and maximum child RSS. Explicit
 `ALIGN_GATE_JOBS`, local DB defaults and nightly scheduling remain unchanged.
-The other release-cycle investigations above remain separate work.
+The release-metadata investigation also closes the unnecessary DB-service
+decision for a proven workspace-version-only Cargo transition; item 2d records
+its fail-closed identity and version-consumer checks. Corpus-only corrections
+already classify outside that boundary. Duplicate release qualification and
+publication recovery remain separate investigations.
 
 Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
