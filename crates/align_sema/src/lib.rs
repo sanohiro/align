@@ -12548,6 +12548,20 @@ fn infer_fn_value_return_provenance(
                 _ => None,
             }) {
                 match &expression.kind {
+                    ExprKind::Match { scrutinee, arms, .. } => {
+                        let Some(variants) = borrowed_match_variants(scrutinee.ty, program) else { continue };
+                        for arm in arms {
+                            let [variant] = arm.variants.as_slice() else { continue };
+                            let Some(payload) = variants.get(*variant as usize) else { continue };
+                            for (binding, source) in arm.bindings.iter().zip(payload) {
+                                let Scalar::Fn(source) = source else { continue };
+                                let Some(Ty::Fn(destination)) = function.locals.get(*binding as usize).map(|local| local.ty)
+                                    else { continue };
+                                let incoming = targets.get(*source as usize).cloned().unwrap_or_default();
+                                changed |= join_fn_type_targets(&mut targets, destination, &incoming);
+                            }
+                        }
+                    }
                     ExprKind::StructLit { struct_id, fields } => {
                         if let Some(definition) = program.structs.get(*struct_id as usize) {
                             for (field, value) in definition.fields.iter().zip(fields) {

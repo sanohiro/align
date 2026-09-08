@@ -3747,6 +3747,55 @@ fn main(args: array<str>) -> Result<(), Error> {
 }
 
 #[test]
+fn joined_callable_storage_executes_across_modules_and_projections() {
+    if !backend_available() { return; }
+    for (name, projection) in [
+        ("local", "result := f()"),
+        ("record", "holder := Holder { callback: f }\n  result := holder.callback()"),
+        ("variant", "choice := Choice.Run(f)\n  result := match choice { Run(callback) => callback(), Empty => \"empty\" }"),
+        ("loop", "mut again := true\n  loop { if !again { break }; again = false; f = f }\n  result := f()"),
+    ] {
+        let dependency = format!(r#"module views
+Holder {{ callback: fn() -> str }}
+Choice {{ Run(fn() -> str), Empty }}
+fn consume(value: string) -> i64 = value.len()
+pub fn run<T>(flag: i32, ignored_input: T) -> i64 {{ _ := ignored_input; return choose(flag) }}
+pub fn choose(flag: i32) -> i64 {{
+  left_owner := "left".clone()
+  ignored_owner := "ignored".clone()
+  right_owner := "right hand".clone()
+  left: str := left_owner
+  ignored: str := ignored_owner
+  right: str := right_owner
+  mut f := fn {{ left }}
+  if flag == 1 {{ f = fn {{ ignored.len(); right }} }}
+  if flag == 2 {{ f = fn {{ "static" }} }}
+  {projection}
+  length := result.len()
+  consume(ignored_owner)
+  return length
+}}
+"#);
+        let files = [("views.align", dependency.as_str()), ("main.align", r#"import views
+fn main() -> i32 {
+  if views.run(0, true) != 4 { return 1 }
+  if views.run(1, true) != 10 { return 2 }
+  if views.run(2, true) != 6 { return 3 }
+  return 0
+}
+"#)];
+        let label = format!("callable-storage-{name}");
+        let checked = diff_check_multi(&label, &files, "main.align");
+        assert!(!checked.whole_errors && !checked.per_unit_errors,
+            "{name}: whole {}\nper-unit {}", checked.whole_diags, checked.per_unit_diags);
+        let whole = build_and_run_multi(&label, &files, "main.align");
+        assert!(whole.status.success(), "{name}: {}", String::from_utf8_lossy(&whole.stderr));
+        let per_unit = build_per_unit_multi(&label, &files, "main.align").link_and_run();
+        assert!(per_unit.status.success(), "{name}: {}", String::from_utf8_lossy(&per_unit.stderr));
+    }
+}
+
+#[test]
 fn closure_target_join_keeps_every_selected_owner_live() {
     let files = &[(
         "main.align",
