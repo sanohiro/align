@@ -53,5 +53,7 @@ align_interface align_lexer align_mir align_parser align_sema align_span
 effect_fail_closed examples m0 summary
 "
 
+# Give the long compiler suites more than one libtest thread after the short
+# binaries finish. Explicit ALIGN_GATE_JOBS still overrides this caller default.
 # shellcheck disable=SC2086
-scripts/run-gate-binaries.sh "$artifacts" $gate_binaries
+scripts/run-gate-binaries.sh --default-jobs 2 "$artifacts" $gate_binaries

@@ -1513,7 +1513,7 @@ gate_binary() {
   chmod +x "$path"
   printf '%s\n' "$path"
 }
-gate_pass_one="$(gate_binary pass_one 'printf "cwd=%s\n" "$PWD"; exit 0')"
+gate_pass_one="$(gate_binary pass_one 'printf "cwd=%s\nthreads=%s\n" "$PWD" "$RUST_TEST_THREADS"; exit 0')"
 gate_pass_two="$(gate_binary pass_two 'exit 0')"
 gate_failing="$(gate_binary failing 'echo boom >&2; exit 3')"
 # Kills the subshell that launched it, so no result is ever recorded — the one
@@ -1574,6 +1574,98 @@ if grep -Fq 'not_a_test' "$gate_ok_out"; then
   cat "$gate_ok_out" >&2
   exit 1
 fi
+
+# Caller-selected defaults share one CPU budget without changing explicit
+# overrides or the whole-suite runner's CPU-count default. Mock discovery inside
+# each subshell so the owner runs identically on Linux and macOS/Bash 3.2.
+worker_configuration() (
+  local cpu="$1" cap="$2" override="$3" expected="$4" actual
+  unset ALIGN_GATE_JOBS
+  if [ "$override" != unset ]; then
+    ALIGN_GATE_JOBS="$override"
+  fi
+  sysctl() { printf '%s\n' "$cpu"; }
+  . "$repo_root/scripts/test-binaries-lib.sh"
+  if [ "$cap" = none ]; then
+    align_tb_configure_jobs
+  else
+    align_tb_configure_jobs "$cap"
+  fi
+  actual="$ALIGN_TB_JOBS:$ALIGN_TB_THREADS:$RUST_TEST_THREADS"
+  [ "$actual" = "$expected" ] || {
+    echo "worker configuration CPU=$cpu cap=$cap override=$override: $actual, expected $expected" >&2
+    exit 1
+  }
+)
+worker_configuration 1 2 unset 1:1:1
+worker_configuration 2 2 unset 2:1:1
+worker_configuration 4 2 unset 2:2:2
+worker_configuration 8 2 unset 2:4:4
+worker_configuration 4 2 '' 2:2:2
+worker_configuration 4 2 1 1:4:4
+worker_configuration 4 2 3 3:1:1
+worker_configuration 4 2 8 8:1:1
+worker_configuration 4 2 0 1:4:4
+worker_configuration 4 2 invalid 4:1:1
+worker_configuration 4 none unset 4:1:1
+worker_configuration 8 none 2 2:4:4
+worker_configuration 4 0002 unset 2:2:2
+worker_configuration 16 08 unset 8:2:2
+worker_configuration 4 999999999999999999999999999999999999 unset 4:1:1
+for invalid_cap in 0 00 invalid -1; do
+  invalid_cap_status=0
+  (
+    sysctl() { printf '4\n'; }
+    . "$repo_root/scripts/test-binaries-lib.sh"
+    align_tb_configure_jobs "$invalid_cap"
+  ) >"$tmp_dir/invalid-worker-cap" 2>&1 || invalid_cap_status=$?
+  [ "$invalid_cap_status" -eq 2 ] || {
+    echo "invalid default cap '$invalid_cap' was not diagnosed" >&2
+    exit 1
+  }
+done
+
+# Exercise the actual gate entrypoint and the environment seen by a launched
+# binary, not just the configuration helper. The private CPU tools never change
+# the developer's shell environment.
+mkdir -p "$gate_dir/cpu-bin"
+for cpu_tool in sysctl nproc; do
+  printf '#!/usr/bin/env bash\nprintf "4\\n"\n' >"$gate_dir/cpu-bin/$cpu_tool"
+  chmod +x "$gate_dir/cpu-bin/$cpu_tool"
+done
+gate_default_out="$tmp_dir/gate-default-out"
+(
+  unset ALIGN_GATE_JOBS
+  PATH="$gate_dir/cpu-bin:$PATH" ALIGN_TB_VERBOSE=1 \
+    "$gate_runner" --default-jobs 2 "$gate_ok_json" pass_one pass_two
+) >"$gate_default_out" 2>&1 || {
+  cat "$gate_default_out" >&2
+  exit 1
+}
+grep -Fq 'gate: 2 binaries, 2 parallel, 2 test thread(s) each' "$gate_default_out" &&
+  grep -Fq 'threads=2' "$gate_default_out" || {
+  echo "default gate did not share four CPUs between two libtest processes:" >&2
+  cat "$gate_default_out" >&2
+  exit 1
+}
+
+# A caller such as run-db-suites.sh that supplies no default option retains
+# the old CPU-count policy, including the environment observed by its tests.
+gate_uncapped_out="$tmp_dir/gate-uncapped-out"
+(
+  unset ALIGN_GATE_JOBS
+  PATH="$gate_dir/cpu-bin:$PATH" ALIGN_TB_VERBOSE=1 \
+    "$gate_runner" "$gate_ok_json" pass_one pass_two
+) >"$gate_uncapped_out" 2>&1 || {
+  cat "$gate_uncapped_out" >&2
+  exit 1
+}
+grep -Fq 'gate: 2 binaries, 4 parallel, 1 test thread(s) each' "$gate_uncapped_out" &&
+  grep -Fq 'threads=1' "$gate_uncapped_out" || {
+  echo "an uncapped caller lost the CPU-count default:" >&2
+  cat "$gate_uncapped_out" >&2
+  exit 1
+}
 
 # Verbose mode restores the detailed report used to inspect scheduling and
 # working-directory parity without making it the default CI transcript.
