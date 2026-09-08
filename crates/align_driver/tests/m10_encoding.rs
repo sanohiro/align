@@ -8,6 +8,34 @@
 mod common;
 use common::*;
 
+#[test]
+fn percent_path_preserves_structure_and_owns_output() {
+    if !backend_available() {
+        return;
+    }
+    let source = r#"
+import std.encoding
+fn from_owned() -> string {
+  value := "a//../b %2f/日本語?x=1#f".clone()
+  return encoding.percent_encode_path(value)
+}
+pub fn main() -> Result<(), Error> {
+  print(from_owned())
+  bytes := encoding.hex_decode("002fff")?
+  print(encoding.percent_encode_path(bytes.bytes()))
+  print(encoding.percent_encode_path(""))
+  print(encoding.percent_encode("/"))
+  restored := encoding.percent_decode(encoding.percent_encode_path(bytes.bytes()))?
+  print(encoding.hex_encode(restored.bytes()))
+  return Ok(())
+}
+"#;
+    let output = build_and_run("percent-path-ownership", source);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout),
+        "a//../b%20%252f/%E6%97%A5%E6%9C%AC%E8%AA%9E%3Fx%3D1%23f\n%00/%FF\n\n%2F\n002fff\n");
+}
+
 // --- known RFC 4648 vectors + the encode->decode->re-encode round trip -------------------------
 
 /// Standard Base64 encode matches the RFC 4648 vectors across every block boundary (empty, 1/2/3

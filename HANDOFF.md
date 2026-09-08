@@ -109,6 +109,12 @@ Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
 verification design, and change the workflow boundary first.
 
+**Normal capability work resumed (2026-09-08):** the owner requested continuing implementation ->
+PR -> merge -> next implementation. The selected consumer is `pkg.s3`/SigV4. Its named UTC
+formatting/parsing and slash-preserving percent-encoding prerequisite follows the exact public
+contract and closure matrix in `docs/impl/std-design/time.md`. Continue to the consumer after
+merging that prerequisite; other transports and S1–S6 retain their own evidence/design gates.
+
 **Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are
 complete. S0A is implemented in PR #955, S0B in PR #959, and the C0 chunks
 decision consolidation in PR #964. V1 replayed the fixed corpus and AI task set
@@ -143,9 +149,8 @@ changes remain outside this work.
 [`docs/impl/32-post-xml-consolidation-plan.md`](docs/impl/32-post-xml-consolidation-plan.md)
 owns the sequence: baseline qualification -> S0A/S0B exact design and observation
 -> one bounded consolidation -> an evidence-selected optimization if needed ->
-reassessment. `std.time` named formatters, cloud packages, additional
-transports, the remaining S1 consumers, and S2–S6 are paused; they are not a
-mandatory backlog.
+reassessment. The later owner-resumed cloud lane above supersedes the time/cloud pause. Additional
+transports, remaining S1 consumers, and S2–S6 remain individually gated.
 
 _Last updated: 2026-09-07._ `core.test` is implemented against the accepted
 `docs/impl/core-design/test.md` contract. The macOS preflight-restoration prerequisite is merged in

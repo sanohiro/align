@@ -16040,9 +16040,10 @@ impl EffectScan<'_> {
             ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 walk!(out);
             }
-            // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
+            // Encoding and named time transforms are pure computations; recurse into the input.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => walk!(data),
-            ExprKind::EncodingDecode { input, .. } => walk!(input),
+            ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::EncodingDecode { input, .. } => walk!(input),
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
@@ -23922,6 +23923,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RunOutputCode { .. }
             | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
+            | ExprKind::TimeFormat { .. }
+            | ExprKind::TimeParse { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
             | ExprKind::Compress { .. }
@@ -24383,6 +24386,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RunOutputStderr { .. }
             | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
+            | ExprKind::TimeFormat { .. }
+            | ExprKind::TimeParse { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
             | ExprKind::Compress { .. }
@@ -27754,7 +27759,8 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(out, depth)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
-            ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
+            ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
             // into the operands so any escape inside them is still checked.
             ExprKind::Compress { data, level, .. } => {
@@ -30236,6 +30242,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::RunOutputStderr { .. }
         | ExprKind::RunBytesCode { .. }
         | ExprKind::EncodingEncode { .. }
+        | ExprKind::TimeFormat { .. }
+        | ExprKind::TimeParse { .. }
         | ExprKind::EncodingDecode { .. }
         | ExprKind::Utf8Valid { .. }
         | ExprKind::Compress { .. }
@@ -37678,7 +37686,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
             | ExprKind::CommandRunBytes { .. }
             | ExprKind::RunOutputCode { .. } | ExprKind::RunBytesCode { .. } | ExprKind::EncodingEncode { .. }
-            | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
+            | ExprKind::TimeFormat { .. } | ExprKind::TimeParse { .. } | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
             | ExprKind::CliCommand { .. } | ExprKind::CliFlag { .. } | ExprKind::CliParse { .. }
@@ -44165,7 +44173,8 @@ impl<'a> MoveCheck<'a> {
             }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => move_expr!(self, data, moved, false, false),
-            ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
+            ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
             ExprKind::Compress { data, level, .. } => {
                 move_expr!(self, data, moved, false, false);
@@ -50314,8 +50323,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.env", &format!("env.{method}"), span);
                 return self.check_env_op(method, args, span);
             }
-            // `std.time` — `time.now()`/`time.instant()` -> i64 ns; `time.sleep(ns)`.
-            if module == "time" && matches!(method, "now" | "instant" | "sleep") {
+            // `std.time` — clocks/sleep and the closed named wire-format family.
+            if module == "time" && (matches!(method, "now" | "instant" | "sleep")
+                || hir::TimeFormatKind::from_name(method.strip_prefix("parse_").unwrap_or(method)).is_some()) {
                 self.require_import("std.time", &format!("time.{method}"), span);
                 return self.check_time_op(method, args, span);
             }
@@ -50365,7 +50375,7 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "encoding"
                 && matches!(
                     method,
-                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid"
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode_path" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid"
                 )
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
@@ -59278,6 +59288,32 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_time_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if let Some(kind) = hir::TimeFormatKind::from_name(method.strip_prefix("parse_").unwrap_or(method)) {
+            if args.len() != 1 {
+                self.diags.error(format!("'time.{method}' expects 1 argument, got {}", args.len()), span);
+                return err;
+            }
+            if method.starts_with("parse_") {
+                let input = self.check_str_init(&args[0]);
+                if input.ty == Ty::Error { return err; }
+                return Expr {
+                    kind: ExprKind::TimeParse { kind, input: Box::new(input) },
+                    ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)), span,
+                };
+            }
+            let ns = self.check_expr(&args[0], None);
+            match self.resolve(ns.ty) {
+                Ty::Error => return err,
+                Ty::Int(IntTy { bits: 64, signed: true }) => {},
+                Ty::IntVar(_) => self.constrain(ns.ty, Some(i64_ty), args[0].span),
+                other => {
+                    self.diags.error(format!("'time.{method}' expects i64 nanoseconds, got {}", ty_name(other)), args[0].span);
+                    return err;
+                }
+            }
+            return Expr { kind: ExprKind::TimeFormat { kind, ns: Box::new(ns) },
+                ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)), span };
+        }
         if method == "sleep" {
             if args.len() != 1 {
                 self.diags
@@ -59802,6 +59838,7 @@ impl<'a, 't> Checker<'a, 't> {
             "base64_encode" | "base64_decode" => hir::EncodingKind::Base64,
             "base64url_encode" | "base64url_decode" => hir::EncodingKind::Base64Url,
             "percent_encode" | "percent_decode" => hir::EncodingKind::Percent,
+            "percent_encode_path" => hir::EncodingKind::PercentPath,
             "form_encode" | "form_decode" => hir::EncodingKind::Form,
             "html_escape" => hir::EncodingKind::Html,
             _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
@@ -64927,7 +64964,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(out)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
-            ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
+            ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::Compress { data, level, .. } => {
                 self.finalize_expr(data);
                 self.finalize_expr(level);
@@ -71073,10 +71111,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // Request 56 adds two private-directory lifecycle operations. The wildcard-free policy
-        // above classifies them explicitly beside the existing package and core operations.
+        // Named time formatting/parsing add two pure, non-retaining result producers. The
+        // wildcard-free policy classifies both explicitly beside existing encoders.
         assert_eq!(
-            variants, 325,
+            variants, 327,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

@@ -1533,6 +1533,10 @@ pub enum ExprKind {
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
     /// Impure.
     TimeSleep { ns: Box<Expr> },
+    /// Pure named UTC formatting; fresh owned Result<string, Error>.
+    TimeFormat { kind: TimeFormatKind, ns: Box<Expr> },
+    /// Pure bounded timestamp parsing; call-only input, Result<i64, Error>.
+    TimeParse { kind: TimeFormatKind, input: Box<Expr> },
     /// `process.exit(code)` — run the current function's pending cleanup (Drops for live owned
     /// locals + arena ends + buffered-writer flushes, the exact emission a top-level `return` uses),
     /// THEN call libc `exit(code)`. The settled cleanup-then-exit semantics
@@ -2149,6 +2153,28 @@ pub enum CliFlagKind {
     I64,
 }
 
+/// Closed wire-format discriminator, shared by HIR and MIR; native tags are explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum TimeFormatKind { Rfc3339, Rfc3339Ms, Rfc1123, BasicIso, BasicDate }
+impl TimeFormatKind {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "rfc3339" => Some(Self::Rfc3339),
+            "rfc3339_ms" => Some(Self::Rfc3339Ms),
+            "rfc1123" => Some(Self::Rfc1123),
+            "basic_iso" => Some(Self::BasicIso),
+            "basic_date" => Some(Self::BasicDate),
+            _ => None,
+        }
+    }
+    pub fn native_tag(self) -> i32 {
+        match self {
+            Self::Rfc3339 => 0, Self::Rfc3339Ms => 1, Self::Rfc1123 => 2,
+            Self::BasicIso => 3, Self::BasicDate => 4,
+        }
+    }
+}
+
 /// Which `std.encoding` transform an [`ExprKind::EncodingEncode`] / [`ExprKind::EncodingDecode`]
 /// performs — the alphabet is the only axis of variation, so one node kind serves encode and
 /// decode alike (the direction is the node, the alphabet is this `kind`).
@@ -2165,6 +2191,8 @@ pub enum EncodingKind {
     /// Deliberately NOT the `application/x-www-form-urlencoded` variant — that one additionally maps
     /// `+` to space, a different codec that builds on this one.
     Percent,
+    /// Slash-preserving percent encoding; encode-only, no path normalization.
+    PercentPath,
     /// `application/x-www-form-urlencoded` (the HTML form / query-string payload rule): space is
     /// `+`, every other non-unreserved byte is `%XX`. One key or value at a time — the `=`/`&`
     /// joining them are structure, not data.

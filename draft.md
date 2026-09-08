@@ -3210,6 +3210,24 @@ time.sleep(ns: i64)
 
 One duration representation, an `i64` nanosecond count — there is no `Duration` type ("one way").
 
+The named wire-format extension uses UTC and the proleptic Gregorian calendar, with no locale,
+timezone database or leap-second timeline. The five formatters `rfc3339`, `rfc3339_ms`, `rfc1123`,
+`basic_iso`, `basic_date` take `ns: i64` and return `Result<string, Error>`; matching
+`parse_NAME(input: str)` functions return `Result<i64, Error>`. Formatters floor toward negative
+infinity at nanosecond, millisecond, second, second and day resolution respectively. An
+unrepresentable floored instant is `Error.Invalid` before allocation. Success returns an owned
+string whose matching parser recovers that instant. RFC3339 preserves a minimal nonzero fraction;
+RFC3339-ms prints exactly three fractional digits, RFC1123 prints English IMF-fixdate, and basic
+ISO/date print `YYYYMMDDTHHMMSSZ`/`YYYYMMDD`.
+
+Parsers borrow text only during the call, allocate nothing and reject malformed or out-of-range
+values as `Error.Invalid`. They consume the entire formatter grammar, with RFC3339-only
+compatibility for lowercase t/z and known numeric offsets. RFC3339 accepts absent or 1–9 fractional
+digits; RFC3339-ms requires exactly three. Unknown `-00:00`, leap seconds, invalid dates/weekdays,
+NUL, non-ASCII, whitespace and obsolete HTTP dates are rejected. All ten are pure transforms.
+The exact bounded grammar, endpoint, ABI and ownership contract is in `docs/impl/std-design/time.md`.
+
+
 ### std.net
 
 Low-level focused.
@@ -3331,6 +3349,7 @@ encoding.base64url_decode(s: str) -> Result<buffer, Error>
 encoding.hex_encode(data: bytes) -> string
 encoding.hex_decode(s: str) -> Result<buffer, Error>
 encoding.percent_encode(data: bytes) -> string          // RFC 3986 URI component; %XX, upper-case
+encoding.percent_encode_path(data: bytes) -> string     // same rule, preserving `/`
 encoding.percent_decode(s: str) -> Result<buffer, Error> // `%` not followed by 2 hex -> Error.Invalid
 encoding.form_encode(data: bytes) -> string             // x-www-form-urlencoded; space -> `+`
 encoding.form_decode(s: str) -> Result<buffer, Error>    // `+` -> space, %XX -> byte
@@ -3342,6 +3361,11 @@ Decode returns an owned `buffer` — `bytes` carries no UTF-8 invariant, so a de
 `str` — consistent with the sink/owned-return convention above. SIMD (Lemire's
 Base64-at-memcpy-speed) is an internal optimization; it does not change these signatures. Encode
 returns `string`; a builder-sink variant is a later addition once bulk-output demand appears.
+
+`percent_encode_path` preserves unreserved bytes and `/`, without decoding existing
+escapes or normalizing dot segments/slash runs. It accepts bytes, str or call-borrowed string and
+returns independently owned output. It is encode-only; the common percent decoder recovers bytes.
+Exact cloud-prerequisite contract: `docs/impl/std-design/time.md`.
 
 ### std.regex
 

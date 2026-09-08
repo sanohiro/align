@@ -1651,3 +1651,39 @@ fn borrowed_projection_reads_survive_private_edit_and_cache_restore() {
     assert!(hit(&restored, "lib") && hit(&restored, "main"));
 
 }
+
+#[test]
+fn named_time_generic_templates_survive_cache_change_and_restore() {
+    let _serial = serial();
+    let root = unique("named-time");
+    std::fs::create_dir(&root).expect("exclusively acquire time cache test directory");
+    let project = Proj { dir: root.join("proj"), cache: root.join("cache") };
+    std::fs::create_dir(&project.dir).expect("create owned project");
+    let source = "module lib\nimport std.time\nimport std.encoding\npub fn render<T>(marker: T, ns: i64) -> Result<string, Error> = time.rfc3339(ns)\npub fn parse(input: str) -> Result<i64, Error> = time.parse_rfc3339(input)\npub fn path(input: str) -> string = encoding.percent_encode_path(input)\n";
+    project.write("lib.align", source);
+    project.write("main.align", "import lib\npub fn main() -> Result<(), Error> {\n  text := lib.render(true, -1)?\n  print(lib.parse(text)?)\n  print(lib.path(text))\n  return Ok(())\n}\n");
+    let mut cold = project.build(UnitReuse::Allowed);
+    assert!(!hit(&cold, "lib") && !hit(&cold, "main"));
+    let cold_mir: Vec<_> = (0..cold.units.len()).map(|i| {
+        align_mir::print::program_to_string(cold.materialize(i).expect("cold time MIR"))
+    }).collect();
+    let mut warm = project.build(UnitReuse::Allowed);
+    assert!(hit(&warm, "lib") && hit(&warm, "main"));
+    for (i, expected) in cold_mir.iter().enumerate() {
+        assert_eq!(&align_mir::print::program_to_string(warm.materialize(i).expect("rehydrated time MIR")), expected);
+    }
+    let edited = source.replace("time.rfc3339(ns)", "time.rfc3339_ms(ns)");
+    project.write("lib.align", &edited);
+    let mut changed = project.build(UnitReuse::Allowed);
+    assert!(!hit(&changed, "lib") && !hit(&changed, "main"), "generic body is public interface content");
+    let changed_mir: Vec<_> = (0..changed.units.len()).map(|i| {
+        align_mir::print::program_to_string(changed.materialize(i).expect("changed time MIR"))
+    }).collect();
+    assert_ne!(changed_mir, cold_mir);
+    project.write("lib.align", source);
+    let mut restored = project.build(UnitReuse::Allowed);
+    assert!(hit(&restored, "lib") && hit(&restored, "main"));
+    for (i, expected) in cold_mir.iter().enumerate() {
+        assert_eq!(&align_mir::print::program_to_string(restored.materialize(i).expect("restored time MIR")), expected);
+    }
+}

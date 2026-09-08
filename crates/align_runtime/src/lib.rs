@@ -14,6 +14,8 @@
 // `docs/impl/07-roadmap.md`). ONE source of truth: this same file is compiled into the staticlib
 // here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
 // `align_rt_str_*` symbols.
+mod time_formats;
+pub use time_formats::*;
 mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;
@@ -13063,9 +13065,13 @@ fn is_unreserved(b: u8) -> bool {
 /// Encoded length of `data` under percent-encoding: 1 byte per unreserved byte, 3 (`%XX`) per other.
 /// `None` on overflow (the caller aborts before allocating).
 fn percent_encoded_len(data: &[u8]) -> Option<usize> {
+    percent_encoded_len_with_slash(data, false)
+}
+
+fn percent_encoded_len_with_slash(data: &[u8], preserve_slash: bool) -> Option<usize> {
     let mut n: usize = 0;
     for &b in data {
-        n = n.checked_add(if is_unreserved(b) { 1 } else { 3 })?;
+        n = n.checked_add(if is_unreserved(b) || (preserve_slash && b == b'/') { 1 } else { 3 })?;
     }
     Some(n)
 }
@@ -13073,11 +13079,15 @@ fn percent_encoded_len(data: &[u8]) -> Option<usize> {
 /// Write `data` percent-encoded into `out` (exactly [`percent_encoded_len`] bytes). Upper-case hex
 /// digits, which RFC 3986 §2.1 states producers SHOULD use.
 fn percent_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    percent_encode_into_with_slash(data, out, false);
+}
+
+fn percent_encode_into_with_slash(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>], preserve_slash: bool) {
     const HEX: [u8; 16] = *b"0123456789ABCDEF";
-    assert_eq!(percent_encoded_len(data), Some(out.len()), "percent destination length mismatch");
+    assert_eq!(percent_encoded_len_with_slash(data, preserve_slash), Some(out.len()), "percent destination length mismatch");
     let mut o = 0;
     for &b in data {
-        if is_unreserved(b) {
+        if is_unreserved(b) || (preserve_slash && b == b'/') {
             out[o].write(b);
             o += 1;
         } else {
@@ -13593,6 +13603,19 @@ pub unsafe extern "C" fn align_rt_percent_encode(ptr: *const u8, len: i64) -> Al
         align_rt_alloc_size_fail();
     };
     unsafe { owned_str_exact(out_len, |out| percent_encode_into(data, out)) }
+}
+
+/// Slash-preserving percent encoding. No decoding or path normalization.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call, as for percent_encode.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_percent_encode_path(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let Some(out_len) = percent_encoded_len_with_slash(data, true) else {
+        align_rt_alloc_size_fail();
+    };
+    unsafe { owned_str_exact(out_len, |out| percent_encode_into_with_slash(data, out, true)) }
 }
 
 /// `encoding.percent_decode(s)` — RFC 3986 percent-decoding; a `%` not followed by two hex digits is
@@ -27317,6 +27340,7 @@ mod tests {
         runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
         runtime.extend(function_symbols(include_str!("csv.rs")));
         runtime.extend(function_symbols(include_str!("xml.rs")));
+        runtime.extend(function_symbols(include_str!("time_formats.rs")));
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
@@ -27361,8 +27385,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 376);
-        assert_eq!(registry.len(), 376);
+        assert_eq!(runtime.len(), 379);
+        assert_eq!(registry.len(), 379);
         assert_eq!(runtime, registry);
     }
 
