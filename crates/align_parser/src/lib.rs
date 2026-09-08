@@ -71,6 +71,7 @@ pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
             diags,
             no_struct_literal: false,
             depth: 0,
+            rejected_identifiers: Vec::new(),
         };
         p.parse_file()
     };
@@ -398,6 +399,41 @@ fn cap_block_depth(b: &mut Block, depth: u32, diags: &mut Diagnostics) {
 /// 128-term expression).
 const MAX_EXPR_DEPTH: u32 = 128;
 
+/// The lexer's reserved words, excluding weak/contextual identifiers such as `borrow`.
+fn reserved_word(kind: &TokKind) -> Option<&'static str> {
+    Some(match kind {
+        TokKind::Fn => "fn",
+        TokKind::Return => "return",
+        TokKind::Mut => "mut",
+        TokKind::Pub => "pub",
+        TokKind::Module => "module",
+        TokKind::Import => "import",
+        TokKind::If => "if",
+        TokKind::Else => "else",
+        TokKind::True => "true",
+        TokKind::False => "false",
+        TokKind::Arena => "arena",
+        TokKind::TaskGroup => "task_group",
+        TokKind::Match => "match",
+        TokKind::Loop => "loop",
+        TokKind::Break => "break",
+        TokKind::Template => "template",
+        TokKind::Unsafe => "unsafe",
+        TokKind::Extern => "extern",
+        TokKind::As => "as",
+        TokKind::Int(_) | TokKind::Float(_) | TokKind::Char(_) | TokKind::Str(_)
+        | TokKind::Ident(_) | TokKind::ColonEq | TokKind::Eq | TokKind::Arrow
+        | TokKind::FatArrow | TokKind::LParen | TokKind::RParen | TokKind::LBrace
+        | TokKind::RBrace | TokKind::LBracket | TokKind::RBracket | TokKind::Comma
+        | TokKind::Colon | TokKind::Dot | TokKind::DotDot | TokKind::Plus
+        | TokKind::Minus | TokKind::Star | TokKind::Slash | TokKind::Percent
+        | TokKind::EqEq | TokKind::NotEq | TokKind::Lt | TokKind::Le | TokKind::Gt
+        | TokKind::Ge | TokKind::AndAnd | TokKind::OrOr | TokKind::Amp | TokKind::Pipe
+        | TokKind::Caret | TokKind::Tilde | TokKind::Bang | TokKind::Question
+        | TokKind::End | TokKind::Eof => return None,
+    })
+}
+
 struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
@@ -409,6 +445,9 @@ struct Parser<'a> {
     no_struct_literal: bool,
     /// Current expression-recursion depth (see [`MAX_EXPR_DEPTH`]).
     depth: u32,
+    /// Reserved spellings already diagnosed as identifiers. Only error recovery consults this
+    /// finite set; declarations always diagnose again, while dependent references need not.
+    rejected_identifiers: Vec<&'static str>,
 }
 
 impl<'a> Parser<'a> {
@@ -419,6 +458,11 @@ impl<'a> Parser<'a> {
     fn peek_at(&self, n: usize) -> &TokKind {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i].kind
+    }
+
+    fn identifier_at(&self, offset: usize) -> bool {
+        matches!(self.peek_at(offset), TokKind::Ident(_))
+            || reserved_word(self.peek_at(offset)).is_some()
     }
 
     fn span(&self) -> Span {
@@ -547,7 +591,7 @@ impl<'a> Parser<'a> {
         } else if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
         } else if matches!(self.peek(), TokKind::Ident(word) if word == "resource")
-            && matches!(self.peek_at(1), TokKind::Ident(_))
+            && self.identifier_at(1)
         {
             self.parse_resource(vis).map(Item::Resource)
         } else if self.at(&TokKind::Mut) {
@@ -853,16 +897,17 @@ impl<'a> Parser<'a> {
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
             // Parameter modes are weak keywords. Treat them as modes only when the complete
             // mode + name + `:` shape is present, so `out: region` and `borrow: T` remain valid
-            // by-value parameter declarations.
+            // by-value parameter declarations. Include a reserved token in the name slot so
+            // parse_ident diagnoses that word, not the preceding weak keyword or colon.
             let has_out_mode = matches!(self.peek(), TokKind::Ident(name) if name == "out")
-                && matches!(self.peek_at(1), TokKind::Ident(_))
+                && self.identifier_at(1)
                 && matches!(self.peek_at(2), TokKind::Colon);
             let has_borrow_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
-                && matches!(self.peek_at(1), TokKind::Ident(_))
+                && self.identifier_at(1)
                 && matches!(self.peek_at(2), TokKind::Colon);
             let has_borrow_mut_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
                 && matches!(self.peek_at(1), TokKind::Mut)
-                && matches!(self.peek_at(2), TokKind::Ident(_))
+                && self.identifier_at(2)
                 && matches!(self.peek_at(3), TokKind::Colon);
             let mode = if has_out_mode {
                 self.bump();
@@ -1062,7 +1107,7 @@ impl<'a> Parser<'a> {
             // A `let`: `mut ...`, `name := ...`, or a type-annotated `name: T := ...`.
             // `name :` unambiguously starts a typed binding (no other statement does).
             if self.at(&TokKind::Mut)
-                || (matches!(self.peek(), TokKind::Ident(_))
+                || (self.identifier_at(0)
                     && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon))
             {
                 let s = self.parse_let(None)?;
@@ -1134,7 +1179,7 @@ impl<'a> Parser<'a> {
             i += 1;
         }
         matches!(self.peek_at(i), TokKind::Mut)
-            || (matches!(self.peek_at(i), TokKind::Ident(_))
+            || (self.identifier_at(i)
                 && matches!(self.peek_at(i + 1), TokKind::ColonEq | TokKind::Colon))
     }
 
@@ -1147,7 +1192,7 @@ impl<'a> Parser<'a> {
         let mut i = 1;
         let mut count = 0;
         loop {
-            if !matches!(self.peek_at(i), TokKind::Ident(_)) {
+            if !self.identifier_at(i) {
                 return false;
             }
             count += 1;
@@ -1194,7 +1239,9 @@ impl<'a> Parser<'a> {
 
     /// `align` is an over-alignment prefix (`align(64) data := [...]`); `None` for a plain binding.
     fn parse_let(&mut self, align: Option<u32>) -> Option<Stmt> {
-        let is_mut = self.eat(&TokKind::Mut);
+        let is_mut = self.at(&TokKind::Mut)
+            && !matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon)
+            && self.eat(&TokKind::Mut);
         let name = self.parse_ident("variable name")?;
         let ty = if self.eat(&TokKind::Colon) {
             Some(self.parse_type()?)
@@ -1298,7 +1345,10 @@ impl<'a> Parser<'a> {
                 span: d.span.map(remap),
             });
         }
-        let mut sub = Parser { tokens, pos: 0, diags: self.diags, no_struct_literal: false, depth: 0 };
+        let mut sub = Parser {
+            tokens, pos: 0, diags: self.diags, no_struct_literal: false, depth: 0,
+            rejected_identifiers: self.rejected_identifiers.clone(),
+        };
         let expr = sub.parse_expr(0);
         // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
         // remaining tokens (e.g. `{x y}`): a hole must be exactly one expression.
@@ -1516,6 +1566,27 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let span = self.span();
+        if let Some(word) = reserved_word(self.peek())
+            && self.rejected_identifiers.contains(&word)
+            // Keep real keyword constructs ahead of dependent-name recovery. `if`/`match`
+            // may start their operand with grouping, an array, or unary minus; booleans are
+            // always literals. Recovery chooses a name only where that grammar cannot start.
+            && !matches!(self.peek(), TokKind::True | TokKind::False)
+            && !(matches!(self.peek(), TokKind::If | TokKind::Match)
+                && matches!(self.peek_at(1), TokKind::LParen | TokKind::LBracket | TokKind::Minus | TokKind::Dot))
+            && matches!(self.peek_at(1),
+                TokKind::LParen | TokKind::LBracket | TokKind::Lt | TokKind::Gt
+                | TokKind::Dot | TokKind::RParen | TokKind::RBracket | TokKind::RBrace
+                | TokKind::End | TokKind::Eof | TokKind::Comma | TokKind::Question
+                | TokKind::Eq | TokKind::Plus | TokKind::Minus | TokKind::Star
+                | TokKind::Slash | TokKind::Percent | TokKind::EqEq | TokKind::NotEq
+                | TokKind::Le | TokKind::Ge | TokKind::AndAnd | TokKind::OrOr
+                | TokKind::Amp | TokKind::Pipe | TokKind::Caret | TokKind::As)
+        {
+            self.bump();
+            let name = Ident { name: word.to_owned(), span };
+            return Some(Expr { kind: ExprKind::Path(Path { segments: vec![name], span }), span });
+        }
         match self.peek() {
             TokKind::Int(v) => {
                 let v = *v;
@@ -1582,10 +1653,10 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
-            TokKind::Dot if matches!(self.peek_at(1), TokKind::Ident(_)) => {
+            TokKind::Dot if self.identifier_at(1) => {
                 // `.field` element-field shorthand (pipeline stage argument).
                 self.bump();
-                let field = self.parse_ident("field name")?;
+                let field = self.parse_referenced_ident("field name")?;
                 let span = span.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::FieldShorthand(field), span })
             }
@@ -1644,7 +1715,7 @@ impl<'a> Parser<'a> {
             TokKind::Arena => {
                 let start = self.span();
                 self.bump();
-                let name = if matches!(self.peek(), TokKind::Ident(_)) {
+                let name = if self.identifier_at(0) {
                     self.parse_ident("arena binding")
                 } else {
                     None
@@ -1743,7 +1814,7 @@ impl<'a> Parser<'a> {
         }
         // Followed by `{ ident :` — the unambiguous struct-literal shape.
         if matches!(self.peek_at(i), TokKind::LBrace)
-            && matches!(self.peek_at(i + 1), TokKind::Ident(_))
+            && self.identifier_at(i + 1)
             && matches!(self.peek_at(i + 2), TokKind::Colon)
         {
             Some(segs)
@@ -1771,7 +1842,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let fstart = self.span();
-            let fname = self.parse_ident("field name")?;
+            let fname = self.parse_referenced_ident("field name")?;
             self.expect(&TokKind::Colon, "':'");
             let value = self.parse_delimited_expr(0)?;
             fields.push(FieldInit {
@@ -2012,17 +2083,37 @@ impl<'a> Parser<'a> {
         if let TokKind::Ident(_) = self.peek() {
             let TokKind::Ident(name) = self.bump().kind else { unreachable!() };
             Some(Ident { name, span })
+        } else if let Some(word) = reserved_word(self.peek()) {
+            self.diags.error(
+                format!("`{word}` is a reserved word and cannot be used as an identifier ({what})"), span,
+            );
+            if !self.rejected_identifiers.contains(&word) {
+                self.rejected_identifiers.push(word);
+            }
+            self.bump();
+            Some(Ident { name: word.to_owned(), span })
         } else {
             self.diags.error(format!("expected {what}"), span);
             None
         }
     }
 
+    fn parse_referenced_ident(&mut self, what: &str) -> Option<Ident> {
+        if let Some(word) = reserved_word(self.peek())
+            && self.rejected_identifiers.contains(&word)
+        {
+            let span = self.bump().span;
+            Some(Ident { name: word.to_owned(), span })
+        } else {
+            self.parse_ident(what)
+        }
+    }
+
     /// `template` remains a keyword at expression head but is the one contextual keyword admitted
-    /// after `.` so the canonical `pkg.template` package can be named without widening any bare
-    /// identifier position or another keyword.
+    /// after `.` so the canonical `pkg.template` package can be named. Other reserved tokens
+    /// are consumed for error recovery, but always require a prior or current diagnostic.
     fn noninitial_path_segment_at(&self, offset: usize) -> bool {
-        matches!(self.peek_at(offset), TokKind::Ident(_) | TokKind::Template)
+        self.identifier_at(offset)
     }
 
     fn parse_noninitial_path_segment(&mut self, what: &str) -> Option<Ident> {
@@ -2036,12 +2127,10 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
-            _ => {
-                self.diags.error(format!("expected {what}"), span);
-                None
-            }
+            _ => self.parse_referenced_ident(what),
         }
     }
+
 }
 
 #[cfg(test)]
@@ -2054,6 +2143,82 @@ mod tests {
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
         (f, d.has_errors())
+    }
+
+    #[test]
+    fn reserved_identifier_recovery_covers_keywords_and_parameter_modes() {
+        let words = [
+            "fn", "return", "mut", "pub", "module", "import", "if", "else", "true",
+            "false", "arena", "task_group", "match", "loop", "break", "template",
+            "unsafe", "extern", "as",
+        ];
+        for word in words {
+            for mode in ["", "borrow ", "borrow mut ", "out "] {
+                let src = format!("fn f({mode}{word}: slice<i64>) {{}}\nfn good() {{}}\n");
+                let mut diags = Diagnostics::new();
+                let tokens = tokenize(0, &src, &mut diags);
+                assert!(tokens.iter().any(|token| reserved_word(&token.kind) == Some(word)));
+                let file = parse_file(tokens, &mut diags);
+                assert_eq!(diags.error_count(), 1, "{src}: {:?}", diags.iter().collect::<Vec<_>>());
+                let diagnostic = diags.iter().next().expect("one error");
+                assert!(diagnostic.message.contains(&format!("`{word}` is a reserved word")), "{:?}", diags.iter().collect::<Vec<_>>());
+                let span = diagnostic.span.expect("word span");
+                assert_eq!(&src[span.lo as usize..span.hi as usize], word);
+                assert_eq!(span.lo as usize, "fn f(".len() + mode.len());
+                assert_eq!(file.items.len(), 2, "{src}: {file:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_identifier_recovery_keeps_normal_keyword_constructs() {
+        for src in [
+            "fn f(borrow arena: i64) { print(arena)\n arena pool {}\n arena {} }",
+            "fn f(borrow unsafe: i64) { print(unsafe)\n unsafe {} }",
+            "fn f(loop: i64) { print(loop)\n loop { break } }",
+            "fn f(task_group: i64) { print(task_group)\n task_group {} }",
+            "fn f(true: i64) { if true {} }",
+            "fn f(false: i64) { if false {} }",
+            "fn f(if: i64) { print(if)\n if -1 < 0 {}\n if (true) {} }",
+            "fn f(match: i64) { print(match)\n match -1 { _ => 0 } }",
+            "fn f(fn: i64) { print(fn)\n callback := fn x: i64 { x } }",
+            "fn f(template: i64) { print(template)\n text := template \"literal\" }",
+        ] {
+            let mut diags = Diagnostics::new();
+            let tokens = tokenize(0, src, &mut diags);
+            let file = parse_file(tokens, &mut diags);
+            assert_eq!(diags.error_count(), 1, "{src}: {:?}", diags.iter().collect::<Vec<_>>());
+            assert_eq!(file.items.len(), 1, "{src}: {file:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_identifier_recovery_covers_other_committed_name_slots() {
+        for src in [
+            "resource unsafe = drop_hook\nfn good() {}",
+            "fn f() { arena unsafe {} }\nfn good() {}",
+            "fn f() { xs.map(.unsafe) }\nfn good() {}",
+            "fn f() { align(16) unsafe := [1, 2] }\nfn good() {}",
+            r#"fn f() { arena := 3; text := template "{arena}" }
+fn good() {}"#,
+        ] {
+            let mut diags = Diagnostics::new();
+            let tokens = tokenize(0, src, &mut diags);
+            let file = parse_file(tokens, &mut diags);
+            assert_eq!(diags.error_count(), 1, "{src}: {:?}", diags.iter().collect::<Vec<_>>());
+            assert!(diags.iter().any(|diagnostic| diagnostic.message.contains("is a reserved word")));
+            assert_eq!(file.items.len(), 2, "{src}: {file:?}");
+        }
+    }
+
+    #[test]
+    fn independent_reserved_declarations_each_report_an_error() {
+        let src = "fn f(arena: i64) {}\nfn g(arena: i64) {}\nfn good() {}";
+        let mut diags = Diagnostics::new();
+        let tokens = tokenize(0, src, &mut diags);
+        let file = parse_file(tokens, &mut diags);
+        assert_eq!(diags.error_count(), 2, "{:?}", diags.iter().collect::<Vec<_>>());
+        assert_eq!(file.items.len(), 3);
     }
 
     #[test]
