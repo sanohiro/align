@@ -5165,3 +5165,90 @@ The matrix above is closed by these concrete owners:
   producer-certification failures above are excluded from this capability's
   focused bundle. `borrowed_replacement` supplies native cleanup/allocation
   parity. The normal bounded gate supplies HIR/MIR/ABI structural regressions.
+
+## G1 retained-view safety follow-up (issue #990)
+
+The frozen 21-case audit is one delivery batch. Against `8bdc0d54`, 17 rows meet
+expectations, including imported synchronous writes, independent outputs, the
+six-kind codec and observed Qwen/OLMoE native golden owner. Cases 08/09 wrongly
+accept retained local buffer views. Cases 06 (derived-view helper invalidation)
+and 11 (same-call scalar snapshot) remain explicitly deferred, non-blocking
+precision limitations. Consumer adoption and GPU qualification remain external.
+
+### Lifetime authority and capability boundary
+
+The retaining helper already publishes `Storage(1)` for its byte argument.
+`EscapeCheck` must preserve that source's lifetime independently from writable
+identity and destination lifetime. Directory `storage_region` keeps the longest
+possible destination lifetime; `retention_region` keeps the shortest source
+lifetime from formation through same-generation joins, renaming and installation.
+`EscapeResolvedStorage` preserves both projections. Completion snapshots retain
+`storage_region` for destination transitions and `retained_storage_region` for
+`Storage(source)` substitution. An exact lifetime-only view constrains source
+retention without acquiring writable identity. Individually released storage is
+frame-capped only when observed through a borrow; owned/fixed values moving as a
+unit retain their existing value-header exemption. Nested retained content uses
+the shorter source projection. Headerless owned storage, including `buffer`,
+cannot skip a selected Storage edge merely because its value contains no borrow.
+
+A loop exit is paired with its expression. Each accepted, reachable break copies
+both completed facts into that expression's existing snapshot keys before the
+exit edge. CFG state joins combine those facts; expression start clears stale
+keys on every evaluation, and loop completion consumes the selected facts without
+creating a new header. Missing value snapshots diagnose. Nested loops target only
+their own exit. After a return or canonical `hir_expr_diverges` expression, later
+syntax has a disconnected completion block; diagnostic branch scaffolding does
+not make unreachable breaks contribute results. Existing break-escape checks,
+generation ending and release ownership remain authoritative.
+
+`map_err` forwards the complete selected Ok fact, including lifetime-only regions
+and ended/unknown markers. Its mapped Err subtree keeps its separate producer.
+This capability changes no source syntax, HIR/interface record, cache format,
+runtime ABI, allocation or Drop rule, and makes no performance promise. The
+independent plan review and bounded source/destination-lattice continuation closed
+the reachability and same-generation-join findings before implementation.
+
+### Implementation closure matrix
+
+| Axis | Implementation and acceptance owner |
+|---|---|
+| Formation, storage and summaries | `retained_numeric_view_keeps_parameter_root` binds the existing exact Storage root; `storage_generation_joins_keep_source_and_destination_lifetimes_separate` crosses same-generation Caller/Frame/Arena joins in both orders with writable identity unchanged. Unknown/ended inputs remain fail-closed. |
+| Construction, assignment and forwarding | `imported_mutable_retention::retained_local_views_reject_across_helper_boundaries` crosses buffer/string views, aliases, sub-slices, record construction/projection and generic forwarding with borrowed/by-value inputs. Each negative has a caller-backed positive control. |
+| Returning and control paths | The same owner crosses `if` in both orders, `match`, `else`, typed Result, `?`, `map_err`, loop joins and nested/projected loop results. `retained_loop_views_ignore_nonreturning_break_edges` covers return, both-diverging branches, diverging operands, nested loops and reevaluation. Unsupported slice/record tuple element types are not widened; existing `return_provenance` owned-break tuple owners remain required. |
+| Destination and eager completion | `retained_views_preserve_destination_and_argument_completion_lifetimes` crosses caller/local/arena destinations, frame/arena views, known heap/arena joins in both orders, headerless buffer storage, and a later argument rebinding an already-captured source. Longer-lived/local-destination controls remain accepted. |
+| Ownership, cleanup and allocation | No new move, source nulling, Drop or runtime allocation behavior. Complete `return_provenance` owners retain mixed owned break transfer, generation move/replacement, projected owned content, Out backing, call completion and allocation parity. Existing imported replacement/independent-output owners remain mandatory. |
+| Interfaces, cache and malformed input | Whole/per-unit checking must agree. `unit_cache::retained_buffer_view_rejects_after_cached_helper_edit_and_revert` checks cold/hit, a private helper edit that changes public retention, rejection with reuse enabled/disabled, and exact revert. Existing format-10 malformed interface and checked-HIR owners remain authoritative; no serialized authority is added. |
+| Delivery | Run all 21 frozen cases with a fresh matching compiler/runtime before code review and delivery. Report 06/11 as deferred rather than passing; negative fixtures are never executed. Archive the report and update the external request register without committing consumer changes. |
+
+### Reopened conditional-evaluation reachability axis
+
+The first code review found that eager traversal of a short-circuit RHS made
+canonical divergence disconnect its bypass path. `&&`, `||`, and `else` must
+share a conditional-child CFG builder: after the mandatory input completes,
+branch to both a bypass join and a conditional entry; join the conditional child
+only when it falls through. A diverging mandatory input leaves both successors
+unreachable. Nested conditional children compose these edges; strict operands
+retain sequential evaluation. No constant-folding authority is added.
+
+| Conditional-evaluation cell | Owner obligation |
+|---|---|
+| `&&` / `||` skipped RHS | `retained_views_preserve_short_circuit_bypass` rejects local-view retention after return, loop break, process exit, infinite loop and nested conditional RHS; caller-backed controls pass in whole/per-unit checking. |
+| RHS that falls through | The same owner checks conditional retained writes and later retention after a conditional local alias replacement; joining must preserve the shorter source. |
+| Mandatory input and strict operands | Existing `retained_loop_views_ignore_nonreturning_break_edges` retains strict divergence coverage; the new owner checks mandatory-LHS divergence does not synthesize a returning break. |
+| `else`, branches, loops and ownership | Reuse the existing conditional fallback structure without changing its semantics; existing complete return-provenance and imported retention owners remain required. |
+
+This is one CFG safety correction within the existing Escape capability, with
+no IR, ABI, cache or public contract change. Review this revised reachability
+boundary before implementation, then review the revised complete candidate after
+its owner checks and full frozen bundle. Preserve the original P1 finding and
+bind its resolution to this axis.
+
+
+The frozen CPU-reference build exposed the cost of the added conditional joins.
+Escape's solver keeps at most one pending queue entry per block: update the joined
+input immediately, enqueue only if absent, and clear the pending bit before
+processing so loop backedges can schedule a later iteration. Evaluate the
+conditional successor before its bypass join. This changes scheduling only; every
+changed input still reaches a fixed point and diagnostic replay uses final inputs.
+Existing loop/reachability owners and the unchanged frozen 180-second per-command
+budget are the acceptance owners; do not raise that budget to admit the change.

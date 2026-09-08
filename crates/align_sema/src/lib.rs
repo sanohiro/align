@@ -16990,6 +16990,7 @@ struct EscapeArgumentSnapshot {
     content_region: Region,
     retained_contained_region: Region,
     storage_region: Region,
+    retained_storage_region: Region,
     mutable_backing: EscapeBackingStorage,
     /// Numeric and otherwise non-region-bearing slices still need the settled local-storage bit
     /// when a parent completion fact is formed after a later eager child mutated live state.
@@ -17007,6 +17008,7 @@ impl EscapeArgumentSnapshot {
             content_region: Region::Static,
             retained_contained_region: Region::Static,
             storage_region: Region::Static,
+            retained_storage_region: Region::Frame,
             mutable_backing: EscapeBackingStorage::unknown(),
             storage_is_local: true,
             individual: false,
@@ -17021,6 +17023,7 @@ impl EscapeArgumentSnapshot {
                 .retained_contained_region
                 .shorter(other.retained_contained_region),
             storage_region: self.storage_region.shorter(other.storage_region),
+            retained_storage_region: self.retained_storage_region.shorter(other.retained_storage_region),
             mutable_backing: self.mutable_backing.join(&other.mutable_backing),
             storage_is_local: self.storage_is_local || other.storage_is_local,
             individual: self.individual && other.individual,
@@ -17351,6 +17354,8 @@ enum EscapeReleasePlace {
 struct EscapeGenerationEntry {
     descriptor: Option<StorageHeaderDescriptor>,
     storage_region: Region,
+    /// Shortest source lifetime, kept before same-generation destination joins lose it.
+    retention_region: Region,
     allocation: EscapeAllocationMode,
     releases: std::collections::BTreeSet<EscapeReleasePlace>,
     ended: Option<BorrowEnd>,
@@ -17365,6 +17370,7 @@ impl EscapeGenerationEntry {
                 .then_some(self.descriptor)
                 .flatten(),
             storage_region: self.storage_region.longer(other.storage_region),
+            retention_region: self.retention_region.shorter(other.retention_region),
             allocation: self.allocation.join(other.allocation),
             releases,
             ended: match (self.ended, other.ended) {
@@ -17505,6 +17511,7 @@ struct EscapeResolvedStorage {
     /// Underlying generation shape. Nested content dependencies never rewrite this metadata.
     storage_descriptor: Option<StorageHeaderDescriptor>,
     storage_region: Option<Region>,
+    retention_region: Option<Region>,
     content: EscapeResolvedContent,
     dependencies: ProjectedHeaderFact,
     allocation: Option<EscapeAllocationMode>,
@@ -17520,6 +17527,7 @@ impl EscapeResolvedStorage {
             value_descriptor: None,
             storage_descriptor: None,
             storage_region: None,
+            retention_region: None,
             content: EscapeResolvedContent::default(),
             dependencies: ProjectedHeaderFact::default(),
             allocation: None,
@@ -17545,6 +17553,11 @@ impl EscapeResolvedStorage {
             },
             storage_region: match (self.storage_region, other.storage_region) {
                 (Some(left), Some(right)) => Some(left.longer(right)),
+                (Some(region), None) | (None, Some(region)) => Some(region),
+                (None, None) => None,
+            },
+            retention_region: match (self.retention_region, other.retention_region) {
+                (Some(left), Some(right)) => Some(left.shorter(right)),
                 (Some(region), None) | (None, Some(region)) => Some(region),
                 (None, None) => None,
             },
@@ -17799,7 +17812,7 @@ impl EscapeState {
             .value_descriptor
             .or(nested.storage_descriptor)
             .is_some_and(|descriptor| descriptor.kind != StorageHeaderKind::InlineFixed)
-            && let Some(region) = nested.storage_region
+            && let Some(region) = nested.retention_region
         {
             selected.regions = selected
                 .regions
@@ -17895,6 +17908,7 @@ impl EscapeState {
             BorrowRoot::ParamStorage(parameter) => {
                 let mut resolved = EscapeResolvedStorage::empty(false);
                 resolved.storage_region = Some(Region::Caller(parameter));
+                resolved.retention_region = Some(Region::Caller(parameter));
                 resolved
             }
             BorrowRoot::Local(local) => self.resolve_local_fallback(local, expected, visiting),
@@ -17962,6 +17976,7 @@ impl EscapeState {
         if let Some(directory) = directory {
             resolved.storage_descriptor = directory.descriptor;
             resolved.storage_region = Some(directory.storage_region);
+            resolved.retention_region = Some(directory.retention_region);
             resolved.allocation = Some(directory.allocation);
             resolved.releases = directory.releases.clone();
             resolved.ended = directory.ended;
@@ -18183,6 +18198,7 @@ fn seed_escape_parameter_storage(
                     } else {
                         Region::Frame
                     },
+                    retention_region: if caller_storage { Region::Caller(position) } else { Region::Frame },
                     allocation: EscapeAllocationMode {
                         individual: owns_dynamic,
                         may_individual: owns_dynamic,
@@ -18305,6 +18321,11 @@ enum EscapeFlowOp<'a> {
     ExpressionStart(usize),
     /// Publish the expression's four completion facts after every eager child and call action.
     ExpressionComplete(&'a Expr, u32),
+    /// Snapshot one accepted, reachable break before joining its enclosing loop's exit.
+    LoopBreakComplete {
+        expression: &'a Expr,
+        value: &'a Expr,
+    },
     /// Record heap-vs-arena provenance even when an owned expression is not assigned to a local.
     /// MIR needs this for synthetic owners of directly consumed temporaries.
     DropProvenance(&'a Expr, u32),
@@ -18436,12 +18457,12 @@ enum EscapeWalkItem<'a> {
         branch: EscapeFlowBlockId,
         join: EscapeFlowBlockId,
     },
-    ElseAfterOpt {
-        fallback: &'a Expr,
+    ConditionalAfterInput {
+        conditional: &'a Expr,
         depth: u32,
     },
-    ElseDone {
-        fallback: &'a Expr,
+    ConditionalDone {
+        conditional: &'a Expr,
         join: EscapeFlowBlockId,
     },
 }
@@ -18547,7 +18568,7 @@ struct EscapeCheck<'a> {
     /// Block currently receiving lowered escape operations.
     flow_current: EscapeFlowBlockId,
     /// CFG exit block for each active loop, innermost last.
-    loop_exit_blocks: Vec<EscapeFlowBlockId>,
+    loop_exit_blocks: Vec<(EscapeFlowBlockId, &'a Expr)>,
     /// Direct expression children collected by the exhaustive operand match. The outer walk drains
     /// them onto its explicit worklist; recursive-looking calls made while this flag is set only
     /// append here and return immediately.
@@ -19023,10 +19044,13 @@ impl<'a> EscapeCheck<'a> {
         let mut inputs = vec![None; self.flow.blocks.len()];
         inputs[0] = Some(self.state.clone());
         let mut worklist = std::collections::VecDeque::from([0usize]);
+        let mut pending = vec![false; self.flow.blocks.len()];
+        pending[0] = true;
         let mut sink = Diagnostics::new();
         std::mem::swap(self.diags, &mut sink);
 
         while let Some(block) = worklist.pop_front() {
+            pending[block] = false;
             let Some(mut state) = inputs[block].clone() else {
                 continue;
             };
@@ -19042,7 +19066,10 @@ impl<'a> EscapeCheck<'a> {
                 };
                 if inputs[successor].as_ref() != Some(&next) {
                     inputs[successor] = Some(next);
-                    worklist.push_back(successor);
+                    if !pending[successor] {
+                        pending[successor] = true;
+                        worklist.push_back(successor);
+                    }
                 }
             }
         }
@@ -19093,6 +19120,7 @@ impl<'a> EscapeCheck<'a> {
             content_region: self.region_of(expression, depth),
             retained_contained_region: self.retained_contained_region(expression, depth),
             storage_region: self.retained_storage_region(expression, depth),
+            retained_storage_region: self.retained_storage_region(expression, depth),
             mutable_backing: self.backing_storage_of_expr(expression, depth),
             storage_is_local: !canonical_empty_slice && self.slice_is_local(expression),
             individual,
@@ -19212,12 +19240,14 @@ impl<'a> EscapeCheck<'a> {
                     content_region
                 },
                 storage_region: baseline.storage_region.shorter(content_region),
+                retained_storage_region: baseline.retained_storage_region.shorter(content_region),
                 ..baseline
             };
         }
 
         let mut retained_contained_region = Region::Static;
         let mut storage_region = Region::Static;
+        let mut retained_storage_region = Region::Static;
         let mut storage_is_local = false;
         let mut backing_roots = std::collections::BTreeSet::new();
         for (snapshot, cap) in storage_selected {
@@ -19225,6 +19255,7 @@ impl<'a> EscapeCheck<'a> {
             retained_contained_region = retained_contained_region
                 .shorter(cap_region(snapshot.retained_contained_region));
             storage_region = storage_region.shorter(cap_region(snapshot.storage_region));
+            retained_storage_region = retained_storage_region.shorter(cap_region(snapshot.retained_storage_region));
             storage_is_local |= snapshot.storage_is_local
                 || cap.is_some_and(|cap| !cap.is_returnable());
             backing_roots.extend(snapshot.mutable_backing.roots);
@@ -19239,6 +19270,7 @@ impl<'a> EscapeCheck<'a> {
             content_region,
             retained_contained_region,
             storage_region,
+            retained_storage_region: retained_storage_region.shorter(content_region),
             mutable_backing,
             storage_is_local,
             individual: baseline.individual,
@@ -19412,6 +19444,7 @@ impl<'a> EscapeCheck<'a> {
             .unwrap_or(Region::Static);
         let mut retained_region = content_region;
         let mut storage_region: Option<Region> = None;
+        let mut retained_storage_region: Option<Region> = None;
         let mut storage_is_local = if value.headers.leaves.is_empty() {
             baseline.storage_is_local
         } else {
@@ -19438,6 +19471,19 @@ impl<'a> EscapeCheck<'a> {
                     .shortest_region()
                     .is_some();
             exact &= leaf.known && resolved.identity_known;
+            if !leaf.known
+                && leaf.descriptor.is_some_and(|descriptor| {
+                    descriptor.kind == StorageHeaderKind::View
+                })
+                && let Some(lifetime) = value.non_storage.project_path(path).shortest_region()
+            {
+                // Unknown identity may coexist with an exact lifetime (buffer/string views),
+                // or join such a view with a known caller-backed alternative. Retention needs
+                // the shortest possible source lifetime, unlike writable destination backing.
+                retained_storage_region = Some(retained_storage_region.map_or(lifetime, |current| {
+                    current.shorter(lifetime)
+                }));
+            }
             if let Some(region) = resolved.content.regions.shortest_region() {
                 content_region = content_region.shorter(region);
                 retained_region = retained_region.shorter(region);
@@ -19452,6 +19498,10 @@ impl<'a> EscapeCheck<'a> {
                 storage_region = Some(storage_region.map_or(region, |current| {
                     current.shorter(region)
                 }));
+                let source_region = resolved.retention_region.unwrap_or(region);
+                retained_storage_region = Some(retained_storage_region.map_or(source_region, |current| {
+                    current.shorter(source_region)
+                }));
                 let is_value_header = value_headers.headers.iter().any(|header| {
                     header.path == *path
                         && leaf.descriptor.is_some_and(|descriptor| {
@@ -19463,9 +19513,9 @@ impl<'a> EscapeCheck<'a> {
                         .descriptor
                         .is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::View)
                 {
-                    retained_region = retained_region.shorter(region);
-                    content_region = content_region.shorter(region);
-                    storage_is_local |= !region.is_returnable();
+                    retained_region = retained_region.shorter(source_region);
+                    content_region = content_region.shorter(source_region);
+                    storage_is_local |= !source_region.is_returnable();
                 }
                 if leaf.descriptor.is_some_and(|descriptor| {
                     matches!(
@@ -19494,8 +19544,8 @@ impl<'a> EscapeCheck<'a> {
                     // Region-owned dynamic storage cannot transfer out of its caller/arena even
                     // though an individually released heap result can. Retain that allocation
                     // region in the value lifetime without conflating heap storage with contents.
-                    retained_region = retained_region.shorter(region);
-                    content_region = content_region.shorter(region);
+                    retained_region = retained_region.shorter(source_region);
+                    content_region = content_region.shorter(source_region);
                 }
             }
             if leaf
@@ -19509,6 +19559,7 @@ impl<'a> EscapeCheck<'a> {
                 // directory's strict region joins toward the longer-lived alternative for writes,
                 // so preserve the independent may-individual bit for escape rejection.
                 storage_is_local = true;
+                retained_storage_region = Some(retained_storage_region.unwrap_or(Region::Frame).shorter(Region::Frame));
             }
             if let Some(mode) = resolved.allocation
                 && leaf
@@ -19529,6 +19580,7 @@ impl<'a> EscapeCheck<'a> {
         baseline.content_region = content_region;
         baseline.retained_contained_region = retained_region;
         baseline.storage_region = storage_region.unwrap_or(Region::Static);
+        baseline.retained_storage_region = retained_storage_region.unwrap_or(baseline.retained_storage_region);
         baseline.storage_is_local = storage_is_local;
         if let Some(mut backing) = resolved_backing {
             backing.known &= exact;
@@ -19780,7 +19832,7 @@ impl<'a> EscapeCheck<'a> {
                     recv_ty,
                     fields,
                     result_ty,
-                ) && let Some(region) = resolved.storage_region
+                ) && let Some(region) = resolved.retention_region
                 {
                     non_storage = non_storage.join(&EscapeRegionFact::from_direct(region));
                 }
@@ -20643,23 +20695,14 @@ impl<'a> EscapeCheck<'a> {
         let err_active = active
             .as_ref()
             .is_none_or(|active| active.contains(&BorrowProjection::ResultErr));
-        let baseline = self.legacy_escape_value(expression);
-        let mut value = EscapeValueFact {
-            non_storage: baseline.non_storage,
-            headers: if ok_active {
-                self.completed_escape_value(result)
-                    .project_path(&[BorrowProjection::ResultOk])
-                    .headers
-                    .prefixed(BorrowProjection::ResultOk)
-            } else {
-                ProjectedHeaderFact::default()
-            },
-            content_ended: baseline.content_ended,
-            content_unknown: baseline.content_unknown,
-            storage_is_local: baseline.storage_is_local,
-            individual: baseline.individual,
-            may_individual: baseline.may_individual,
-        };
+        let mut value = self.legacy_escape_value(expression);
+        if ok_active {
+            // A forwarded Ok view can carry exact lifetime evidence without a known header
+            // generation. Forward the complete selected fact, not just its header identity.
+            value = value.join(&self.completed_escape_value(result)
+                .project_path(&[BorrowProjection::ResultOk])
+                .prefixed(BorrowProjection::ResultOk));
+        }
         if !err_active {
             return value;
         }
@@ -20740,6 +20783,7 @@ impl<'a> EscapeCheck<'a> {
                 directory: Some(EscapeGenerationEntry {
                     descriptor: Some(descriptor),
                     storage_region: snapshot.storage_region,
+                    retention_region: snapshot.retained_storage_region,
                     allocation: EscapeAllocationMode {
                         individual: snapshot.individual,
                         may_individual: snapshot.may_individual,
@@ -20885,6 +20929,7 @@ impl<'a> EscapeCheck<'a> {
                                 directory: Some(EscapeGenerationEntry {
                                     descriptor: Some(descriptor),
                                     storage_region,
+                                    retention_region: storage_region,
                                     allocation: EscapeAllocationMode {
                                         individual: false,
                                         may_individual: false,
@@ -20972,6 +21017,7 @@ impl<'a> EscapeCheck<'a> {
                         directory: Some(EscapeGenerationEntry {
                             descriptor: Some(descriptor),
                             storage_region,
+                            retention_region: if opaque { Region::Frame } else { snapshot.retained_storage_region },
                             allocation: EscapeAllocationMode {
                                 individual: opaque || snapshot.individual,
                                 may_individual: opaque || snapshot.may_individual,
@@ -21072,17 +21118,29 @@ impl<'a> EscapeCheck<'a> {
             }
             EscapeFlowOp::ExpressionComplete(expression, depth) => {
                 let key = Self::expr_key(expression);
-                self.state.completed_expressions.remove(&key);
-                self.state.storage_completed_expressions.remove(&key);
-                let snapshot = self.call_completion_snapshot(expression, depth);
-                self.state
-                    .completed_expressions
-                    .insert(key, snapshot.clone());
-                let storage = self.form_escape_storage_completion(
-                    expression,
-                    depth,
-                    storage_provenance,
-                );
+                let completed = self.state.completed_expressions.remove(&key);
+                let stored = self.state.storage_completed_expressions.remove(&key);
+                let (snapshot, storage) = if matches!(expression.kind, ExprKind::Loop { .. }) {
+                    if expression.ty != Ty::Unit && (completed.is_none() || stored.is_none()) {
+                        self.diags.error(
+                            "loop value did not produce a completion snapshot".to_string(),
+                            expression.span,
+                        );
+                    }
+                    // Break edges already selected the value and its generation. Reclassification
+                    // would invent an unknown view and lose the selected caller/storage lifetime.
+                    (
+                        completed.unwrap_or_else(EscapeArgumentSnapshot::fail_closed),
+                        stored.unwrap_or_else(|| self.fail_closed_escape_value(expression.ty, depth)),
+                    )
+                } else {
+                    let snapshot = self.call_completion_snapshot(expression, depth);
+                    self.state.completed_expressions.insert(key, snapshot.clone());
+                    let storage = self.form_escape_storage_completion(
+                        expression, depth, storage_provenance,
+                    );
+                    (snapshot, storage)
+                };
                 let snapshot =
                     self.storage_escape_snapshot(expression.ty, &storage, snapshot);
                 self.state.completed_expressions.insert(key, snapshot);
@@ -21105,6 +21163,22 @@ impl<'a> EscapeCheck<'a> {
                     self.state.callable_capture_snapshots.remove(&key);
                     self.state.storage_callable_snapshots.remove(&key);
                 }
+            }
+            EscapeFlowOp::LoopBreakComplete { expression, value } => {
+                let key = Self::expr_key(expression);
+                if !self.state.completed_expressions.contains_key(&Self::expr_key(value))
+                    || !self.state.storage_completed_expressions.contains_key(&Self::expr_key(value))
+                {
+                    self.diags.error(
+                        "break value did not produce a completion snapshot".to_string(),
+                        value.span,
+                    );
+                }
+                let snapshot = self.state.completed_expressions.get(&Self::expr_key(value))
+                    .cloned().unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+                let storage = self.completed_escape_value(value);
+                self.state.completed_expressions.insert(key, snapshot);
+                self.state.storage_completed_expressions.insert(key, storage);
             }
             EscapeFlowOp::DropProvenance(expr, depth) => {
                 if self.aggregate_contains_mixed_ownership(expr, depth) {
@@ -24459,7 +24533,7 @@ impl<'a> EscapeCheck<'a> {
                             let exit = self.flow.new_block();
                             self.flow.add_edge(before, head);
                             self.flow_current = head;
-                            self.loop_exit_blocks.push(exit);
+                            self.loop_exit_blocks.push((exit, expression));
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
                             work.push(EscapeWalkItem::LoopDone { body, head, exit });
                             work.push(EscapeWalkItem::Block(body, depth));
@@ -24621,13 +24695,18 @@ impl<'a> EscapeCheck<'a> {
                             ));
                             work.push(EscapeWalkItem::Expr(result, depth));
                         }
-                        ExprKind::ElseUnwrap { opt, fallback } => {
+                        ExprKind::Binary {
+                            op: BinOp::And | BinOp::Or,
+                            lhs: input,
+                            rhs: conditional,
+                        }
+                        | ExprKind::ElseUnwrap { opt: input, fallback: conditional } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
-                            work.push(EscapeWalkItem::ElseAfterOpt {
-                                fallback,
+                            work.push(EscapeWalkItem::ConditionalAfterInput {
+                                conditional,
                                 depth,
                             });
-                            work.push(EscapeWalkItem::Expr(opt, depth));
+                            work.push(EscapeWalkItem::Expr(input, depth));
                         }
                         _ => {
                             debug_assert!(!self.collecting_walk_children);
@@ -24716,6 +24795,9 @@ impl<'a> EscapeCheck<'a> {
                             depth,
                         ));
                     }
+                    if hir_expr_diverges(expression) {
+                        self.flow_current = self.flow.new_block();
+                    }
                 }
                 EscapeWalkItem::Block(block, depth) => {
                     if let Some(value) = block.value.as_deref() {
@@ -24764,16 +24846,24 @@ impl<'a> EscapeCheck<'a> {
                 }
                 EscapeWalkItem::StmtExit(statement, depth) => {
                     self.push_flow_op(EscapeFlowOp::Stmt(statement, depth));
-                    if let Stmt::Break { accepted, .. } = statement {
+                    if let Stmt::Break { accepted, value } = statement {
                         let break_block = self.flow_current;
                         if *accepted
-                            && let Some(exit) =
+                            && let Some((exit, expression)) =
                                 self.loop_exit_blocks.last().copied()
                         {
+                            if let Some(value) = value {
+                                self.push_flow_op(EscapeFlowOp::LoopBreakComplete {
+                                    expression,
+                                    value,
+                                });
+                            }
                             self.flow.add_edge(break_block, exit);
                         }
                         // Retain unreachable syntax for diagnostics without letting it mutate the
                         // accepted break edge's state.
+                        self.flow_current = self.flow.new_block();
+                    } else if matches!(statement, Stmt::Return(_)) {
                         self.flow_current = self.flow.new_block();
                     }
                 }
@@ -24916,18 +25006,19 @@ impl<'a> EscapeCheck<'a> {
                     }
                     self.flow_current = join;
                 }
-                EscapeWalkItem::ElseAfterOpt { fallback, depth } => {
+                EscapeWalkItem::ConditionalAfterInput { conditional, depth } => {
                     let branch = self.flow_current;
-                    let fallback_entry = self.flow.new_block();
+                    let conditional_entry = self.flow.new_block();
                     let join = self.flow.new_block();
+                    // Preserve the skipped-child path even when the evaluated child diverges.
+                    self.flow.add_edge(branch, conditional_entry);
                     self.flow.add_edge(branch, join);
-                    self.flow.add_edge(branch, fallback_entry);
-                    self.flow_current = fallback_entry;
-                    work.push(EscapeWalkItem::ElseDone { fallback, join });
-                    work.push(EscapeWalkItem::Expr(fallback, depth));
+                    self.flow_current = conditional_entry;
+                    work.push(EscapeWalkItem::ConditionalDone { conditional, join });
+                    work.push(EscapeWalkItem::Expr(conditional, depth));
                 }
-                EscapeWalkItem::ElseDone { fallback, join } => {
-                    if !hir_expr_diverges(fallback) {
+                EscapeWalkItem::ConditionalDone { conditional, join } => {
+                    if !hir_expr_diverges(conditional) {
                         self.flow.add_edge(self.flow_current, join);
                     }
                     self.flow_current = join;
@@ -25355,7 +25446,7 @@ impl<'a> EscapeCheck<'a> {
             .completed_expressions
             .get(&Self::expr_key(argument))
         {
-            return snapshot.storage_region;
+            return snapshot.retained_storage_region;
         }
         let value_region = self.region_of(argument, depth);
         if argument.ty.is_array_builder() {
@@ -25474,6 +25565,7 @@ impl<'a> EscapeCheck<'a> {
                         content_region: Region::Static,
                         retained_contained_region: region,
                         storage_region: region,
+                        retained_storage_region: region,
                         mutable_backing: EscapeBackingStorage::known(region),
                         storage_is_local: !region.is_returnable(),
                         individual: false,
@@ -25502,6 +25594,7 @@ impl<'a> EscapeCheck<'a> {
             replacement.content_region = Region::Static;
             replacement.retained_contained_region = Region::Static;
             replacement.storage_region = lexical;
+            replacement.retained_storage_region = lexical;
             replacement.mutable_backing = EscapeBackingStorage::known(lexical).rooted(root);
             replacement.storage_is_local = true;
             replacement.individual = true;
@@ -25527,6 +25620,13 @@ impl<'a> EscapeCheck<'a> {
                 lexical.shorter(selected_storage)
             } else {
                 selected_storage
+            };
+            replacement.retained_storage_region = if replacement.individual {
+                lexical
+            } else if replacement.may_individual {
+                lexical.shorter(replacement.retained_storage_region)
+            } else {
+                replacement.retained_storage_region
             };
             replacement.storage_is_local |= replacement.may_individual
                 || !replacement.mutable_backing.known
@@ -25683,6 +25783,7 @@ impl<'a> EscapeCheck<'a> {
                     EscapeGenerationEntry {
                         descriptor: Some(descriptor),
                         storage_region: post.storage_region,
+                        retention_region: post.retained_storage_region,
                         allocation: EscapeAllocationMode {
                             individual: post.individual,
                             may_individual: post.may_individual,
@@ -25818,7 +25919,12 @@ impl<'a> EscapeCheck<'a> {
                 .filter_map(|&source| {
                     let index = source.index();
                     let argument = args.get(index)?;
-                    if !self.region_bearing(argument.ty) {
+                    if !self.region_bearing(argument.ty)
+                        && !(matches!(source, BorrowMutRetentionSource::Storage(_))
+                            && (self.indexed_backing_type(argument.ty)
+                                || needs_drop_flag(argument.ty, self.structs, self.tuples,
+                                    self.enums, self.tagged_types)))
+                    {
                         return None;
                     }
                     let captured = argument_snapshots.get(index).and_then(Option::as_ref);
@@ -25836,7 +25942,7 @@ impl<'a> EscapeCheck<'a> {
                         BorrowMutRetentionSource::Contained(_) => {
                             snapshot.retained_contained_region
                         }
-                        BorrowMutRetentionSource::Storage(_) => snapshot.storage_region,
+                        BorrowMutRetentionSource::Storage(_) => snapshot.retained_storage_region,
                     });
                     Some((index, region, captured.is_some()))
                 })
@@ -26016,6 +26122,7 @@ impl<'a> EscapeCheck<'a> {
                     post.content_region = retained;
                     post.retained_contained_region = retained;
                     post.storage_region = post.storage_region.shorter(retained);
+                    post.retained_storage_region = post.retained_storage_region.shorter(retained);
                     post
                 }
                 ast::ParamMode::Out => {
@@ -26024,6 +26131,7 @@ impl<'a> EscapeCheck<'a> {
                     post.retained_contained_region =
                         post.retained_contained_region.shorter(retained);
                     post.storage_region = post.storage_region.shorter(retained);
+                    post.retained_storage_region = post.retained_storage_region.shorter(retained);
                     post
                 }
                 ast::ParamMode::ByValue | ast::ParamMode::Borrow => {
@@ -26302,6 +26410,7 @@ impl<'a> EscapeCheck<'a> {
                         kind: header.kind,
                     }),
                     storage_region: self.mutable_root_storage_region(local, depth),
+                    retention_region: self.mutable_root_storage_region(local, depth),
                     allocation: EscapeAllocationMode {
                         individual: installed.individual,
                         may_individual: installed.may_individual,
@@ -26395,6 +26504,13 @@ impl<'a> EscapeCheck<'a> {
                         entry.storage_region.longer(lexical)
                     } else {
                         entry.storage_region
+                    };
+                    entry.retention_region = if entry.allocation.individual {
+                        lexical
+                    } else if entry.allocation.may_individual {
+                        entry.retention_region.shorter(lexical)
+                    } else {
+                        entry.retention_region
                     };
                     let mut path = destination_prefix.to_vec();
                     path.extend(&header.path);
@@ -27270,6 +27386,7 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Match { .. }
+            | ExprKind::Binary { op: BinOp::And | BinOp::Or, .. }
             | ExprKind::ResultMapErr { .. } => {
                 unreachable!("escape control expressions use explicit walk items");
             }
@@ -72377,6 +72494,7 @@ fn main() -> i32 = 0
         let entry = |descriptor, region, local, ended| EscapeGenerationEntry {
             descriptor: Some(descriptor),
             storage_region: region,
+            retention_region: region,
             allocation: EscapeAllocationMode {
                 individual: true,
                 may_individual: true,
@@ -73264,6 +73382,64 @@ fn main() -> i32 = 0
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn retained_numeric_view_keeps_parameter_root() {
+        let (program, diagnostics) = check(r#"Holder { view: slice<u8> }
+fn retain(borrow mut owner: Holder, borrow bytes: slice<u8>) { owner.view = bytes }
+fn main() {}
+"#);
+        assert!(!diagnostics.has_errors());
+        let function = program.fns.iter().find(|function| function.name == "retain").unwrap();
+        assert_eq!(function.mutable_retention,
+            Some(vec![vec![hir::MutableRetentionRoot::Storage(1)], vec![]]));
+    }
+
+    #[test]
+    fn storage_generation_joins_keep_source_and_destination_lifetimes_separate() {
+        let descriptor = StorageHeaderDescriptor {
+            ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+            kind: StorageHeaderKind::View,
+        };
+        let generation = StorageGeneration::caller_storage(0, &[]);
+        for shorter in [Region::Frame, Region::Arena(1), Region::Arena(2)] {
+            let entry = |region| EscapeGenerationEntry {
+                descriptor: Some(descriptor),
+                storage_region: region,
+                retention_region: region,
+                allocation: EscapeAllocationMode { individual: false, may_individual: false },
+                releases: Default::default(),
+                ended: None,
+            };
+            for (left, right) in [(Region::Caller(0), shorter), (shorter, Region::Caller(0))] {
+                let mut state = EscapeState::default();
+                state.storage.directory.entries.insert(generation.clone(), entry(left).join(&entry(right)));
+                state.storage.contents.entries.insert(generation.clone(), EscapeGenerationContent::default());
+                let resolved = state.resolve_storage_leaf(
+                    &StorageHeaderLeaf::known_typed(generation.clone(), descriptor), &mut Vec::new(),
+                );
+                assert_eq!(resolved.storage_region, Some(Region::Caller(0)));
+                assert_eq!(resolved.retention_region, Some(shorter));
+                assert!(resolved.identity_known);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_local_buffer_view_rejects() {
+        let (_, diagnostics) = check(r#"Holder { view: slice<u8> }
+fn retain(borrow mut owner: Holder, borrow bytes: slice<u8>) { owner.view = bytes }
+fn caller(borrow mut owner: Holder) {
+  mut data := buffer(1)
+  data.put_u8(65)
+  bytes := data.bytes()
+  retain(owner, bytes)
+}
+fn main() {}
+"#);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message.contains("shorter-lived")),
+            "a retained buffer view must not outlive its owner");
     }
 
     fn check_modules(sources: &[(&str, &str, bool)]) -> (CheckedProgram, Diagnostics) {

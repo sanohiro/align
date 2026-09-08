@@ -1612,3 +1612,23 @@ fn a_cold_build_and_an_all_hit_build_produce_the_same_executable() {
     assert_eq!(String::from_utf8_lossy(&cold_run.stdout).trim(), "42");
     drop(second);
 }
+
+#[test]
+fn retained_buffer_view_rejects_after_cached_helper_edit_and_revert() {
+    let _serial = serial();
+    let original = "module lib\npub Holder { view: slice<u8> }\nfn inner(borrow mut owner: Holder, borrow bytes: slice<u8>) {}\npub fn emit(borrow mut owner: Holder, borrow bytes: slice<u8>) { inner(owner, bytes) }\n";
+    let main = "import lib\nfn caller(borrow mut owner: lib.Holder) {\n mut data := buffer(1)\n data.put_u8(65)\n bytes := data.bytes()\n lib.emit(owner, bytes)\n}\nfn main() {}\n";
+    let project = Proj::new("retained-buffer-edit", &[("lib.align", original), ("main.align", main)]);
+    let cold = project.build(UnitReuse::Allowed);
+    assert!(!hit(&cold, "lib") && !hit(&cold, "main"));
+    let hot = project.build(UnitReuse::Allowed);
+    assert!(hit(&hot, "lib") && hit(&hot, "main"));
+    project.write("lib.align", &original.replace("slice<u8>) {}", "slice<u8>) { owner.view = bytes }"));
+    for reuse in [UnitReuse::Allowed, UnitReuse::Forbidden] {
+        let (rejected, diagnostics) = project.build_dirty(reuse);
+        assert!(rejected.diags.has_errors() && diagnostics.contains("shorter-lived"), "{diagnostics}");
+    }
+    project.write("lib.align", original);
+    let reverted = project.build(UnitReuse::Allowed);
+    assert!(hit(&reverted, "lib") && hit(&reverted, "main"));
+}
