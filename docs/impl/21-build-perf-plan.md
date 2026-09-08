@@ -2536,3 +2536,44 @@ identities already present on both sides, exact TOML scalar kinds and hostile
 imports. Existing changed-hunk, deletion, trusted-copy and four-shard workflow
 owners remain active. The three historical ranges above now classify outside
 the DB boundary; no compiler, dependency, owner suite or timeout is changed.
+
+## Item 2e: qualification and recovery investigation
+
+The release-cycle follow-up inspected the current local/hosted gates,
+`.github/workflows/release.yml`, and the shared prebuilt-cache producer, layout
+verifier and measurement scripts. It selected no further gate removal: the
+remaining repetitions supply different evidence.
+
+| Execution | Evidence that another execution does not replace |
+|---|---|
+| Local preflight and hosted CI | Author verification before publication, then trusted native platform/service execution. A local attestation is not the hosted compiler/runtime artifact or another operating system. |
+| Instrumented PGO training and final dist build | Training profiles come from instrumented artifacts and are consumed by a different final compiler; neither is a duplicate test of identical binaries. |
+| Cache producer and package-layout verifier | The producer warms the final compiler's exact inventory. The verifier observes default hits, hits after cache clear, custom-root misses, absent-source rejection and unchanged compiler/cache bytes. |
+| Package and installed Homebrew layouts | Real formula installation exercises discovery after cleanup and relocation; the installed compiler hash is compared with the packaged compiler. |
+| Cache layout and cache measurement | Hit/miss inventory does not establish cache-off/hit diagnostics, object, executable and stdout equality. The measurement script checks those equivalences before its alternating timing pairs. |
+
+Corpus preparation is already shared after the v0.7.2 correction. This inspection
+found no additional independent corpus definition in these producer, layout and
+measurement owners. It did not benchmark a new candidate or claim that every
+validation path in the repository has been minimized.
+
+The current recovery boundary is also narrower than a general checkpoint system.
+Successful native build jobs upload qualified archives and measurement reports
+at their end; `publish` depends on all builds and downloads the same run's
+artifacts. A transient publish-job failure can therefore reuse successful build
+outputs through a failed-job retry. GitHub documents rerunning failed jobs and
+their dependents while retaining the original event SHA/ref in its
+[rerun documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs).
+This observation assumes the source/tag still matches that run, the expected
+artifacts remain available, and any partial external publication is inspected.
+Starting a fresh manual workflow is a different execution.
+
+A failure inside a native build job before its final upload has no independently
+uploaded, qualified checkpoint in the current workflow. Reusing that job's
+intermediate build directory is unimplemented and deferred: it would need an
+exact source/compiler/runtime/PGO/native-artifact identity and a record of the
+qualification still unfinished. No such reuse or publication retry was executed
+in this investigation. The v0.7.0 compiler defect and v0.7.1 corpus correction
+changed inputs and versions; they do not demonstrate a failure to reuse
+unchanged artifacts after a publish-only transient error. Actual source/compiler
+defects continue to require a new version and its appropriate qualification.

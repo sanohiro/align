@@ -76,7 +76,7 @@ per-PR journal.
 The 30-minute timeout is a hard kill, not a success target. A normal mandatory
 validation or release run should target **15 minutes or less**. Before adding or
 lengthening another gate, audit the existing cost and remove work that does not
-own the changed boundary. The first optimization investigation should measure:
+own the changed boundary. The first optimization investigation covered:
 
 - why release-metadata and prebuilt-corpus corrections run all four PostgreSQL
   shards, and whether the scope classifier can exclude them without weakening a
@@ -98,8 +98,12 @@ fixed CPUs, the same 884 tests in identical binaries passed in 438.64s versus
 The release-metadata investigation also closes the unnecessary DB-service
 decision for a proven workspace-version-only Cargo transition; item 2d records
 its fail-closed identity and version-consumer checks. Corpus-only corrections
-already classify outside that boundary. Duplicate release qualification and
-publication recovery remain separate investigations.
+already classify outside that boundary. Item 2e closes the remaining inspection:
+PGO, package/installed-layout and byte-equivalence checks supply distinct evidence,
+so no additional gate removal was selected. Same-run publish retries can reuse
+successful build artifacts; intermediate checkpoints before a failed build's
+upload remain unimplemented. No new optimization or paused library capability
+is selected by this closure.
 
 Do not respond to another failure with the same full rerun and another narrow
 patch. Stop, identify which evidence is genuinely required, reopen the owning
