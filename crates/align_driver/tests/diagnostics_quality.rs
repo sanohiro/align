@@ -68,3 +68,53 @@ fn a_rejected_operand_does_not_propagate_a_borrowing_type() {
         );
     }
 }
+
+#[test]
+fn reserved_identifiers_report_the_word_without_dependent_cascades() {
+    for (word, src) in [
+        ("arena", "fn total(borrow arena: slice<u8>) -> i64 {\n return arena.len()\n}\nfn main() {\n data: buffer := buffer(8)\n view := data.bytes()\n print(total(view))\n}\n"),
+        ("arena", "fn main() {\n arena := 3\n print(arena)\n}\n"),
+        ("unsafe", "fn total(borrow unsafe: i64) -> i64 { return unsafe }\nfn main() { value := 3\n print(total(value)) }\n"),
+        ("arena", "fn main() { mut arena: i64 := 3\n print(arena) }"),
+        ("mut", "fn main() { mut := 3\n print(mut) }"),
+        ("arena", "fn main() { (arena, value) := (3, 4)\n print(arena + value) }"),
+        ("unsafe", "Data { unsafe: i64 }\nfn main() { value := Data { unsafe: 3 }\n print(value.unsafe) }"),
+        ("unsafe", "fn unsafe() -> i64 = 3\nfn main() { print(unsafe()) }"),
+    ] {
+        for per_unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let diags = if per_unit {
+                align_driver::check_per_unit(&mut sm, "reserved.align", src).diags
+            } else {
+                check(&mut sm, "reserved.align", src).diags
+            };
+            let rendered = align_driver::format_diagnostics(&sm, &diags);
+            assert_eq!(diags.error_count(), 1, "per_unit={per_unit}: {src}\n{rendered}");
+            let error = diags.iter().find(|d| d.severity == align_diag::Severity::Error)
+                .expect("one error");
+            assert!(error.message.contains(&format!("`{word}` is a reserved word")), "{rendered}");
+            let span = error.span.expect("word span");
+            assert_eq!(&src[span.lo as usize..span.hi as usize], word, "{rendered}");
+            assert_eq!(Some(span.lo as usize), src.find(word), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn reserved_identifier_recovery_does_not_hide_an_independent_borrow_error() {
+    // Request 51's original parameter repro also passes a temporary to a Borrow parameter.
+    // Preserve that independent error; a named-view control is covered above.
+    let src = "fn total(borrow arena: slice<u8>) -> i64 { return arena.len() }\nfn main() { data: buffer := buffer(8)\n print(total(data.bytes())) }";
+    for per_unit in [false, true] {
+        let mut sm = SourceMap::new();
+        let diags = if per_unit {
+            align_driver::check_per_unit(&mut sm, "reserved-borrow.align", src).diags
+        } else {
+            check(&mut sm, "reserved-borrow.align", src).diags
+        };
+        let rendered = align_driver::format_diagnostics(&sm, &diags);
+        assert_eq!(diags.error_count(), 2, "per_unit={per_unit}: {rendered}");
+        assert!(rendered.contains("`arena` is a reserved word"), "{rendered}");
+        assert!(rendered.contains("must be a stable named local or field"), "{rendered}");
+    }
+}
