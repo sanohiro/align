@@ -193,6 +193,166 @@ chmod +x "$trusted_copy"
 output="$(DB_CI_REPO_ROOT="$fixture" "$trusted_copy" "$base" "$unrelated")"
 printf '%s\n' "$output" | grep -Fxq 'required=false'
 
+# Exercise the whole metadata proof through an extracted trusted classifier.
+# The fixture uses real version-reference lines so that production drift also
+# closes the exception; no Cargo resolution, compiler build or service is needed.
+python3 -I - "$repo_root" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+repository = Path(sys.argv[1])
+with tempfile.TemporaryDirectory(prefix="align-db-metadata-") as owned:
+    owned = Path(owned)
+    root = owned / "repo"
+    root.mkdir()
+    trusted = owned / "trusted-classifier.sh"
+    shutil.copyfile(repository / "scripts/db-ci-scope.sh", trusted)
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.PIPE).decode().strip()
+
+    def write(path, value):
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(value)
+
+    def replace(path, before, after):
+        target = root / path
+        content = target.read_text()
+        assert before in content, (path, before)
+        target.write_text(content.replace(before, after))
+
+    def commit():
+        git("add", "-A")
+        git("commit", "-qm", "fixture")
+        return git("rev-parse", "HEAD")
+
+    git("init", "-q")
+    git("config", "user.name", "metadata-owner")
+    git("config", "user.email", "metadata-owner@example.invalid")
+    write("Cargo.toml", '[workspace]\nmembers = ["crates/*"]\n[workspace.package]\nversion = "0.1.0"\n[profile.release]\nopt-level = 1\n')
+    names = ["demo", "align_driver", "align_repl"]
+    for name in names:
+        write(f"crates/{name}/Cargo.toml", f'[package]\nname = "{name}"\nversion.workspace = true\n')
+    for path in ["crates/align_driver/src/main.rs", "crates/align_driver/src/cache.rs",
+                 "crates/align_repl/src/main.rs", "crates/align_driver/tests/version.rs"]:
+        write(path, (repository / path).read_text())
+    write("Cargo.lock", 'version = 4\n' + ''.join(
+        f'\n[[package]]\nname = "{name}"\nversion = "0.1.0"\ndependencies = ["external"]\n'
+        for name in names
+    ) + '\n[[package]]\nname = "external"\nversion = "1.2.3"\nsource = "registry+https://example.invalid/index"\nchecksum = "fixed-checksum"\n')
+    baseline = commit()
+
+    def bump():
+        replace("Cargo.toml", 'version = "0.1.0"', 'version = "0.2.0"')
+        replace("Cargo.lock", 'version = "0.1.0"', 'version = "0.2.0"')
+
+    def check(label, expected, change=lambda: None, *, do_bump=True, extra_env=None, preparation=None):
+        git("checkout", "-qf", baseline)
+        case_base = baseline
+        if preparation is not None:
+            preparation()
+            case_base = commit()
+        if do_bump:
+            bump()
+        change()
+        head = commit()
+        env = dict(os.environ, DB_CI_REPO_ROOT=str(root))
+        env.update(extra_env or {})
+        output = subprocess.check_output(
+            ["bash", str(trusted), case_base, head], cwd=root, env=env, stderr=subprocess.PIPE
+        ).decode()
+        assert output.splitlines() == [f"required={str(expected).lower()}",
+                                      "reason=database-boundary" if expected else "reason=no-database-boundary"], (label, output)
+        print(f"metadata scope: {label}: ok")
+
+    check("consistent-bump", False)
+    check("metadata-with-prose", False, lambda: write("RELEASE_NOTES.md", "release\n"))
+    check("metadata-with-corpus-script", False, lambda: write("scripts/prepare-prebuilt-cache-project.sh", "# corpus\n"))
+    check("profile-change", True, lambda: replace("Cargo.toml", "opt-level = 1", "opt-level = 2"))
+    check("toml-scalar-kind", True, lambda: replace("Cargo.toml", "opt-level = 1", "opt-level = true"))
+    check("workspace-dependency", True, lambda: write("Cargo.toml", (root / "Cargo.toml").read_text() + '\n[workspace.dependencies]\nexternal = "2"\n'))
+    check("dependency-version", True, lambda: replace("Cargo.lock", 'version = "1.2.3"', 'version = "1.2.4"'))
+    check("dependency-checksum", True, lambda: replace("Cargo.lock", "fixed-checksum", "different-checksum"))
+    check("dependency-source", True, lambda: replace("Cargo.lock", "registry+https://example.invalid/index", "git+https://example.invalid/repo#abc"))
+    check("dependency-edge", True, lambda: replace("Cargo.lock", 'dependencies = ["external"]', "dependencies = []"))
+    check("lock-format", True, lambda: replace("Cargo.lock", "version = 4", "version = 3"))
+    check("partial-local-bump", True, lambda: replace("Cargo.lock", 'name = "demo"\nversion = "0.2.0"', 'name = "demo"\nversion = "0.1.0"'))
+    check("root-only-bump", True, lambda: replace("Cargo.lock", 'version = "0.2.0"', 'version = "0.1.0"'))
+    check("lock-only-bump", True, lambda: replace("Cargo.toml", 'version = "0.2.0"', 'version = "0.1.0"'))
+    check("comment-only-root", True, lambda: write("Cargo.toml", (root / "Cargo.toml").read_text() + "\n# comment\n"), do_bump=False)
+    check("unsupported-version", True, lambda: [replace(path, '"0.2.0"', '"0.2.0-rc.1"') for path in ["Cargo.toml", "Cargo.lock"]])
+    check("missing-local-record", True, lambda: replace("Cargo.lock", '\n[[package]]\nname = "demo"\nversion = "0.2.0"\ndependencies = ["external"]\n', ""))
+    check("extra-local-record", True, lambda: write("Cargo.lock", (root / "Cargo.lock").read_text() + '\n[[package]]\nname = "unowned"\nversion = "0.2.0"\n'))
+    check("duplicate-lock-record", True, lambda: write("Cargo.lock", (root / "Cargo.lock").read_text() + '\n[[package]]\nname = "demo"\nversion = "0.2.0"\n'))
+    check("local-checksum", True, lambda: replace("Cargo.lock", 'name = "demo"', 'name = "demo"\nchecksum = "unexpected"'))
+    check("member-manifest-change", True, lambda: write("crates/demo/Cargo.toml", (root / "crates/demo/Cargo.toml").read_text() + 'edition = "2024"\n'))
+    check("non-inherited-version", True, lambda: replace("crates/demo/Cargo.toml", "version.workspace = true", 'version = "0.2.0"'))
+    check("duplicate-member-name", True, lambda: replace("crates/demo/Cargo.toml", 'name = "demo"', 'name = "align_driver"'))
+    check("workspace-membership", True, lambda: replace("Cargo.toml", '["crates/*"]', '["crates/demo"]'))
+    check("workspace-exclusion", True, lambda: replace("Cargo.toml", "[workspace]\n", '[workspace]\nexclude = ["crates/demo"]\n'))
+    check("missing-manifest", True, lambda: (root / "crates/demo/Cargo.toml").unlink())
+    check("missing-lock", True, lambda: (root / "Cargo.lock").unlink())
+    check("invalid-toml", True, lambda: write("Cargo.lock", "not valid = ["))
+    check("root-mode-change", True, lambda: (root / "Cargo.toml").chmod(0o755))
+    check("member-mode-change", True, lambda: (root / "crates/demo/Cargo.toml").chmod(0o755))
+    check("member-symlink", True, lambda: ((root / "crates/demo/Cargo.toml").unlink(), (root / "crates/demo/Cargo.toml").symlink_to("../align_driver/Cargo.toml")))
+    check("root-symlink", True, lambda: ((root / "Cargo.toml").unlink(), (root / "Cargo.toml").symlink_to("crates/demo/Cargo.toml")))
+    check("non-tree-member", True, lambda: write("crates/extra", "not a directory"))
+    check("new-version-consumer", True, lambda: write("crates/demo/src/version.rs", 'const VERSION: &str = env!("CARGO_PKG_VERSION");\n'))
+    check("changed-version-consumer", True, lambda: replace("crates/align_driver/src/main.rs", 'println!("alignc {}", env!("CARGO_PKG_VERSION"));', 'print!("alignc {}", env!("CARGO_PKG_VERSION"));'))
+    # The metadata exception must not terminate the rest of the path scan.
+    for label, path in [("db-source", "crates/demo/src/db_native.rs"),
+                        ("db-owner", "crates/align_driver/tests/pkg_db_new.rs"),
+                        ("shared-owner", "crates/demo/tests/common/new.rs"),
+                        ("gate-script", "scripts/run-db-suites.sh"),
+                        ("workflow", ".github/workflows/ci.yml")]:
+        check(label, True, lambda path=path: write(path, "boundary change\n"))
+
+    # Invalid identities already present on both sides must fail the metadata
+    # proof itself, without relying on the later changed-member path rule.
+    for label, prepare in [
+        ("existing-invalid-lock-name", lambda: replace("Cargo.lock", 'name = "external"', 'name = false')),
+        ("existing-invalid-lock-edge", lambda: replace("Cargo.lock", 'dependencies = ["external"]', 'dependencies = true')),
+        ("existing-duplicate-name", lambda: replace("crates/demo/Cargo.toml", 'name = "demo"', 'name = "align_driver"')),
+        ("existing-invalid-inheritance", lambda: replace("crates/demo/Cargo.toml", "version.workspace = true", "version.workspace = 1")),
+        ("existing-missing-manifest", lambda: (root / "crates/demo/Cargo.toml").unlink()),
+        ("existing-non-tree-member", lambda: write("crates/extra", "not a directory")),
+        ("existing-version-consumer", lambda: write("crates/demo/src/version.rs", 'const VERSION: &str = env!("CARGO_PKG_VERSION");\n')),
+        ("existing-exclusion", lambda: replace("Cargo.toml", "[workspace]\n", '[workspace]\nexclude = ["crates/demo"]\n')),
+    ]:
+        check(label, True, preparation=prepare)
+
+    # A hostile checkout or PYTHONPATH module must neither run nor forge a
+    # successful verifier exit, including when metadata really changes a dependency.
+    marker = owned / "shadow-imported"
+    shadow = owned / "shadow"
+    shadow.mkdir()
+    payload = f'from pathlib import Path\nPath({str(marker)!r}).touch()\nraise SystemExit(0)\n'
+    for module in ["tomllib.py", "sitecustomize.py"]:
+        (shadow / module).write_text(payload)
+    for invalid in [False, True]:
+        def hostile(invalid=invalid):
+            for module in ["tomllib.py", "sitecustomize.py"]:
+                write(module, payload)
+            if invalid:
+                replace("Cargo.lock", 'version = "1.2.3"', 'version = "1.2.4"')
+        check(f"isolated-shadow-{invalid}", invalid, hostile, extra_env={"PYTHONPATH": str(shadow)})
+        assert not marker.exists(), "untrusted Python module executed"
+
+    blocked_tools = owned / "tools"
+    blocked_tools.mkdir()
+    unavailable = blocked_tools / "python3"
+    for status in [1, 127]:
+        unavailable.write_text(f'#!/usr/bin/env bash\nexit {status}\n')
+        unavailable.chmod(0o755)
+        check(f"parser-unavailable-{status}", True, extra_env={"PATH": f"{blocked_tools}:{os.environ['PATH']}"})
+PY
+
 ci_workflow="$repo_root/.github/workflows/ci.yml"
 test "$(grep -Fc 'name: PostgreSQL integration (required)' "$ci_workflow")" -eq 1
 grep -Fq "if: needs.db-scope.outputs.required == 'true'" "$ci_workflow"

@@ -2168,7 +2168,8 @@ matrix job, so one cancelled, failed, missing, or timed-out shard is red.
 
 ## Item 2b: DB CI changed-function scope
 
-The database scope classifier keeps dependency, workflow, shared harness,
+The database scope classifier keeps dependency (except the proven release
+metadata transition in item 2d), workflow, shared harness,
 `apps/db`, `pkg_db_*` owners, `db_*` production modules, and the dedicated
 static-artifact/input/runtime/query-metadata modules unconditional. For mixed
 compiler source files it inspects only the zero-context changed hunks,
@@ -2486,3 +2487,52 @@ To reproduce the scheduling choice after a warm build, run `scripts/test-pr.sh`
 on the same four CPUs first with `ALIGN_GATE_JOBS=4`, then with that override
 unset; set `ALIGN_TB_VERBOSE=1` to retain individual binary results. Do not edit a
 running shell script or include differing compilation work in a runtime comparison.
+
+## Item 2d: release metadata and DB service scope
+
+The release-cycle investigation reproduces the distinction on committed history:
+`81787549^..81787549` changes only shared prebuilt-cache corpus machinery and
+already classifies outside the DB boundary. `30a715f2^..30a715f2` changes the
+workspace release version and its local lock records, and currently provisions
+all four service shards because both root Cargo files are unconditional. The
+combined v0.7.2 correction (`b19ebb57`) inherits the same metadata cost.
+
+The capability narrows only that dependency-path decision. It does
+not waive compiler/platform, cache-layout, release-artifact, or version owners.
+Changing the displayed compiler version still changes executable bytes and hence
+compiler cache identity. A PR title, commit message, tag, or claimed release role
+is never evidence for this exception. No release is initiated by this work.
+
+### Item 2d implementation closure matrix
+
+| Axis | Exact decision and owner |
+|---|---|
+| Inputs and authority | Read both exact committed trees supplied to `db-ci-scope.sh`; retain its output protocol. Keep the verifier inline in this script so CI's trusted-base extraction never loads a PR-owned companion. Run Python with `-I` to exclude checkout, `PYTHONPATH` and user-site imports. The trusted-copy fixture exercises the metadata path with hostile shadow modules in both checkout and `PYTHONPATH`; neither may execute. |
+| Admitted metadata | Both root `Cargo.toml` and `Cargo.lock` are regular blobs with unchanged modes. The only semantic root-manifest change is `workspace.package.version`, from one canonical numeric `major.minor.patch` string to a different one. After removing that one field, the complete parsed manifests agree. Unsupported version syntax conservatively provisions the service. |
+| Workspace identity | Admit only the existing `members = ["crates/*"]` layout with no exclusions, overrides of workspace membership, or root package. Enumerate immediate committed `crates/` children as trees; require one regular member manifest per child. The exact member paths, modes and bytes agree between revisions. Each has a unique package name and `version.workspace = true`. Symlinks, gitlinks, missing manifests, duplicate names and non-inherited versions provision the service. |
+| Lock identity | Both parsed lockfiles use integer format 4 and have the same complete record topology. Exactly one source-less, checksum-less package record corresponds to every validated member, with its old/new version equal to the matching workspace version. Normalize only those member version fields and require the complete lock structures to agree. Registry/git packages, dependency edges, checksums, source identities, missing/extra/duplicate local records, partial bumps and ambiguous entries are never normalized away. |
+| Version consumers | Before exempting a bump, compare committed `CARGO_PKG_VERSION` references under `crates/` to the current four reviewed lines: compiler and REPL version display, the version owner, and the cache owner's banned historical fallback value. Any additional or changed reference conservatively requires DB verification. The owner adds a version-sensitive consumer to prove this tripwire; it does not claim a general Rust semantic-equivalence proof. |
+| Other changes | Even after proving metadata-only Cargo changes, continue the ordinary path/hunk classifier over the entire range. DB source, owner, harness, workflow, toolchain, member manifest and gate changes still provision the service. Root profiles, dependencies, membership and every other semantic manifest field retain their existing dependency classification. |
+| Failure behavior | Missing Python or its standard TOML parser, invalid TOML, unreadable objects, unsupported tree/record shapes and any verifier error return to the existing required-service path. No fallback textual version stripping, network fetch, Cargo resolution, or working-tree content participates. |
+| Controls and historical reproduction | The focused `test-db-ci-scope.sh` owner covers consistent metadata acceptance and paired dependency/profile/source/checksum/edge/membership/version/malformed/parser-failure controls, plus a valid bump combined with DB source. Historical v0.7.2 metadata and corpus-only ranges classify outside the boundary; a real dependency edit remains inside. |
+| Verification and integration | One fresh independent boundary review precedes implementation. After author closure, one full-diff inspection runs alongside focused classifier/workflow owners and local DB parity; the final SHA receives normal preflight and all required CI. No timing claim requires a new benchmark: this removes only a proven unnecessary service decision, without changing any suite or timeout. |
+
+One PR owns this classifier decision, its parameterized controls and the matching
+repository policy. It is independent of worker scheduling: it changes whether
+services are needed, while the preceding capability changes how an unchanged
+compiler test set uses CPUs. Keeping the decisions separate permits independent
+verification and reversal without coupling scheduling to dependency exemptions.
+
+The independent pre-implementation review found one authority gap: ordinary
+stdin Python could import a checkout-owned `tomllib.py`. The matrix now requires
+isolated interpreter imports and hostile-shadow-module controls. The author-side
+extension also checks the current Cargo version consumers so a future new use
+cannot silently inherit this exception. Both constraints belong to the same
+fail-closed metadata proof and were fixed before implementation.
+
+Author closure: the parameterized scope owner rejects the old classifier on its
+consistent-bump control and passes the implemented proof, including invalid
+identities already present on both sides, exact TOML scalar kinds and hostile
+imports. Existing changed-hunk, deletion, trusted-copy and four-shard workflow
+owners remain active. The three historical ranges above now classify outside
+the DB boundary; no compiler, dependency, owner suite or timeout is changed.
