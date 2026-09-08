@@ -5132,9 +5132,10 @@ and `borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases` are clos
 by the grounded Out buffer-storage projection in `xml-producer-investigation.md`.
 That proof distinguishes writable backing from header mutability and unreadable
 old elements without adding imported mutable-retention authority.
-The `closure_target_joins_keep_capture_slots_target_relative` failure, independently
-reproduced on the unchanged Request 61 merge `3fbb74fe`, remains separate follow-up
-work. The separately reproduced
+The separately reproduced
+`closure_target_joins_keep_capture_slots_target_relative` failure is closed by
+the target-relative callable storage repair in the same investigation; the
+complete return-provenance owner target now runs without exclusions. The separately reproduced
 `storage_generation_interprocedural_allocation_parity_matrix` failure is closed
 by the materialized-chunks producer equation in the same investigation.
 

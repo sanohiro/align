@@ -8881,7 +8881,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 if let Some(place) = b.borrowed_bindings.get(id) {
                     return Operand::BorrowedPlace(Box::new(place.clone()));
                 }
-                let v = b.fresh_value(e.ty);
+                // Mutable callable storage accumulates origins after an earlier Local
+                // expression was typed. Preserve that storage contract on the MIR read.
+                let ty = match (e.ty, b.slots.get(*id as usize).copied()) {
+                    (Ty::Fn(origin), Some(ty @ Ty::Fn(_)))
+                        if b.ctx.fn_types.get(origin as usize).is_some() => ty,
+                    _ => e.ty,
+                };
+                let v = b.fresh_value(ty);
                 b.push(Stmt::Let(v, Rvalue::Load(*id)));
                 Operand::Value(v)
             }
@@ -10696,7 +10703,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    let Some(signature) = fn_signature_facts(b, callee.ty) else {
+    let Some(signature) = operand_fn_signature_facts(b, &c) else {
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
     };
@@ -10966,6 +10973,14 @@ fn fn_signature_facts(b: &Builder, ty: Ty) -> Option<FnSignatureFacts> {
         return_region: signature.return_region.clone(),
         return_cleanup: signature.return_cleanup,
     })
+}
+
+fn operand_fn_signature_facts(b: &Builder, operand: &Operand) -> Option<FnSignatureFacts> {
+    let ty = match operand {
+        Operand::Value(value) => *b.value_tys.get(*value as usize)?,
+        _ => return None,
+    };
+    fn_signature_facts(b, ty)
 }
 
 /// Emit a named call and return its source-language value. Align represents Unit as an ordinary
@@ -22013,7 +22028,7 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    let Some(mapper_signature) = fn_signature_facts(b, f.ty) else {
+    let Some(mapper_signature) = operand_fn_signature_facts(b, &fv) else {
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
     };

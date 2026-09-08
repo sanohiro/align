@@ -566,7 +566,8 @@ feeds element READ or Move certification.
   and `out_str_retention_matches_whole_and_per_unit_checking` now pass unchanged
   storage behavior and exact retention requirements. The latter still rejects
   actually retained short-lived elements. The full return-provenance target
-  excludes only the separately tracked target-relative closure-join defect.
+  had excluded the target-relative closure-join defect; the subsequent repair
+  below restores that owner to the complete target.
 
 Opaque Copy-view parameters/results, indirect Out function-value ABI support,
 and target-relative closure joins remain the explicit boundaries above, not
@@ -582,3 +583,104 @@ same-class sweep checked every new seed: only Arg operands supply Out entry
 facts, while borrowed-slot aliasing and owning fixed backing retain their
 existing physical storage rules. This local initialization correction changes
 neither the reviewed proof strategy nor the capability boundary.
+
+## Target-relative callable storage joins
+
+Status: target-relative callable storage proof implemented. The unchanged
+`closure_target_joins_keep_capture_slots_target_relative` owner failed on
+`dcb90381`: a mutable slot has a joined function type with capture roots `{0,1}`,
+its earlier HIR Local expression retains the first origin's `{0}` type, and MIR
+loads that stale type. One closure returns capture 0 from a one-field environment;
+the other returns capture 1 from a two-field environment. These are compatible
+source callables, but their environment ordinals cannot be applied to each other.
+
+The repair preserves concrete closure identities and introduces no serialized
+record or runtime representation. MIR reads the current callable storage type
+for a local load and snapshots the indirect call facts from the resulting MIR
+operand, before evaluating later arguments. Codegen permits a callable value to
+flow into a storage contract only when its exact parameter modes, canonical
+parameter/result types, and cleanup ABI agree, and each source return-borrow and
+return-region root set is contained in the destination set. This directional
+relation does not replace canonical type identity or concrete closure validation.
+It may widen a may-union, never erase a source root. Every concrete closure still
+matches its lifted body's exact signature and capture inventory.
+
+Captured-result projection follows the same validated producer graph but selects
+all returned captures from each concrete producer's own signature. It does not
+broadcast a merged bare ordinal to every producer. A validated target with no
+returned captures supplies no environment dependency; parameter-return roots
+remain checked separately by the indirect call's conservative parameter union.
+Opaque incoming callable environments remain unavailable where the current
+producer contract cannot authenticate them. Ordinary callable checks, every
+reaching store, selected-path checks, guarded absence, and fixed-point cycle
+validation remain mandatory. No buffer-storage fact participates in this proof.
+
+| Axis | Implementation closure and owner |
+|---|---|
+| Formation and identity | Preserve HIR source-function equality, inferred effects, and concrete origin types. Seed match-bound callable locals from the selected variant payload type during existing callable-target inference, so freshly isolated local records retain their producer roots. Derive MIR local callable loads from their actual slots; derive indirect facts from completed operands. No FnAddr/Closure signature relaxation. Exact source/destination parameter modes, canonical types, and cleanup agree before root containment. Malformed owner mutates signature, roots, type, target and capture count. |
+| Construction, move, replacement, Drop | Callables remain Copy environment handles with existing allocation/lifetime behavior. Replacement unions all reaching producers but does not alter closure construction, environment layout, source nulling, or Drop. Existing closure lifetime negatives retain every selected owner and permit an ignored owner to be consumed after the call. |
+| Source paths and joins | Root locals, record fields, admitted sum-type payloads and existing transparent storage edges preserve selected callable facts. Capturing tuple/Option/Result wrapper formation retains its existing source rejection; no wrapper admission is inferred from a MIR projection arm. Cross if/match and seeded loop joins, both runtime targets, and callee completion before later argument mutation. Existing return-provenance callable owners plus a parameterized whole/per-unit execution owner cover the admitted paths; no new function-value shape is introduced. |
+| Calls and exits | Direct/imported target identities remain exact. Indirect calls and Result.map_err share operand-derived fact selection; early exits never emit a call after a terminating argument. Generic instantiation and per-unit reconstruction use existing function tables. Owners cross imported/generic call sites and existing map_err/terminating-argument cases. |
+| Capture projection | Each concrete closure's authenticated signature selects its own environment fields, preserving their exact types and producer checks; no selected captures means no environment dependency. Different ordinals and environment lengths, captureless alternatives, and captures also used as non-returned inputs are crossed by the owner. Ordinary argument roots remain separately validated. |
+| Malformed graphs | Reject wrong lifted signatures/capture fields, root narrowing, wrong modes/cleanup/types, raw or missing producers, duplicate definitions, and ungrounded storage cycles at publication, emission and ThinLTO boundaries. Parameterized producer mutations retain same-class coverage; no accepted static seed may hide a missing environment or storage initializer. |
+| Publication and limits | No HIR/MIR serialized field, interface schema, native ABI, or public source contract changes. Existing canonical exact identity remains authoritative outside the explicit callable-flow relation. Opaque incoming callable environments and indirect Out function-value support retain existing limits. No performance promise or benchmark gate. |
+
+This is one useful producer-to-consumer capability: correcting only the load type
+leaves callable stores rejected, and allowing stores without target-relative
+capture projection misinterprets an environment. The same boundary repairs both
+without a dormant intermediate PR. Author extraction and owner bindings precede
+independent plan review; implementation follows only after the strategy is closed.
+
+Implementation discovery confirms one existing formation edge needed by the same
+storage contract: `prepare_local_fn_types` isolates match-bound callable locals,
+but callable-target inference did not copy the selected enum payload's targets
+into that fresh record. The closure matrix includes that edge before editing
+sema. Its owner is the admitted Run(callback) variant case in the whole/per-unit
+execution matrix; a matched returned view must also retain its selected owner.
+Generic bodies retain their existing no-lambda restriction; the generic owner is
+a forwarding template calling the public non-generic closure-bearing function.
+Aggregate liveness may conservatively retain non-returned captures; improving
+that separate sema precision is not part of this producer-certification repair.
+The original local target-relative owner still checks consumption of an ignored
+owner before using the returned view.
+
+### Callable implementation closure and owner bindings
+
+The author-side matrix-to-diff pass maps formation to
+`infer_fn_value_return_provenance`'s match-binding target transfer and MIR Local
+lowering. `operand_fn_signature_facts` is shared by ordinary indirect calls and
+`map_err`, after the callee completes and before later argument evaluation.
+`xml_callable_flow_matches` owns exact signature/cleanup and directional root
+containment; `xml_value_flow_matches` applies it to existing typed value-flow
+edges. Canonical identity and exact FnAddr/Closure authentication are unchanged.
+`CaptureValue`/`CaptureSlot` now project each producer's returned captures as a
+set through the existing worklist, retaining ordinary callable validation and
+all sibling checks. Buffer nodes and the fixed-point solver are unchanged.
+
+- `producer_callable_joins_preserve_target_relative_captures_and_root_containment`
+  rejects malformed captures, forged copied facts, raw producers, root narrowing,
+  stale loads, missing initializers and ungrounded cycles, while accepting seeded
+  cycles and a captureless alternative. A second parameterized matrix proves
+  tuple/enum/Option/Result extraction cannot narrow roots even when every copied
+  call fact is changed consistently; exact extraction passes all three producer
+  boundaries. These handcrafted MIR carriers do not widen source type formation.
+- `joined_callable_storage_executes_across_modules_and_projections` checks and
+  executes all three runtime alternatives through local, record, variant and
+  loop storage in whole/per-unit builds, reached by an imported generic forwarder.
+  The original `closure_target_joins_keep_capture_slots_target_relative` owner
+  executes both selected environments and consumes the ignored owner before the
+  returned view is used.
+- The complete `return_provenance`, `fn_values`, and `fn_variant_payload` targets
+  retain source lifetime/effect/ABI/early-exit coverage, including selected-owner
+  rejection, callee snapshots, captured record lifetime, and function-value sum
+  payloads across imports. No return-provenance owner remains excluded.
+- The complete codegen `producer_` owners retain missing/duplicate producer,
+  malformed callable signature, captured layout, guarded presence, and cycle
+  checks. `align_mir::tests::malformed_hir_continuation_metadata_fails_closed`
+  preserves the internal malformed-metadata continuation refusal.
+
+No allocation, FFI, native ABI, schema version, or public language contract was
+changed; no benchmark gate is required. The remaining Request 42 work is the
+explicit diagnostic-phase contract, not these repaired source-reachable producer
+refusals. Broader aggregate liveness precision and opaque incoming callable
+capture authentication remain outside this capability.

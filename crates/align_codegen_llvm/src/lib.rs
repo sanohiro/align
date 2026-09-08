@@ -4311,8 +4311,8 @@ enum XmlAccessPathSegment {
 enum XmlAccessNode {
     Value(ValueId, Vec<XmlAccessPathSegment>),
     Slot(Slot, Vec<XmlAccessPathSegment>),
-    CaptureValue(ValueId, Vec<XmlAccessPathSegment>, u32),
-    CaptureSlot(Slot, Vec<XmlAccessPathSegment>, u32),
+    CaptureValue(ValueId, Vec<XmlAccessPathSegment>),
+    CaptureSlot(Slot, Vec<XmlAccessPathSegment>),
     BufferValue(ValueId, Vec<XmlAccessPathSegment>),
     BufferSlot(Slot, Vec<XmlAccessPathSegment>),
 }
@@ -4620,6 +4620,38 @@ fn xml_signature_matches_facts(
         && signature.return_cleanup == facts.cleanup
 }
 
+/// Callable storage may join origins, but cannot forget a returned owner root.
+/// Concrete callable construction and canonical ABI identity remain exact.
+fn xml_callable_flow_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
+    if actual == expected { return true; }
+    let (Ty::Fn(actual), Ty::Fn(expected)) = (actual, expected) else { return false; };
+    if canonical_ty(Ty::Fn(actual), program).is_err()
+        || canonical_ty(Ty::Fn(expected), program).is_err()
+    { return false; }
+    let (Some(actual), Some(expected)) = (xml_fn_type_facts(program, actual), xml_fn_type_facts(program, expected))
+        else { return false; };
+    let roots_fit = |ap: &[u32], ac: &[u32], ep: &[u32], ec: &[u32]| {
+        ap.iter().all(|root| ep.binary_search(root).is_ok())
+            && ac.iter().all(|root| ec.binary_search(root).is_ok())
+    };
+    let borrow_fits = match (&actual.borrow, &expected.borrow) {
+        (hir::ReturnBorrowSummary::None, _) => true,
+        (hir::ReturnBorrowSummary::Roots { params: ap, captures: ac },
+         hir::ReturnBorrowSummary::Roots { params: ep, captures: ec }) => roots_fit(ap, ac, ep, ec),
+        _ => false,
+    };
+    let region_fits = match (&actual.region, &expected.region) {
+        (hir::ReturnRegionSummary::None, _) => true,
+        (hir::ReturnRegionSummary::Roots { params: ap, captures: ac },
+         hir::ReturnRegionSummary::Roots { params: ep, captures: ec }) => roots_fit(ap, ac, ep, ec),
+        _ => false,
+    };
+    actual.modes == expected.modes && actual.cleanup == expected.cleanup
+        && source_tys_match(&actual.params, &expected.params, program).unwrap_or(false)
+        && source_ty_matches(actual.ret, expected.ret, program).unwrap_or(false)
+        && borrow_fits && region_fits
+}
+
 fn xml_closure_borrow_summary(
     summary: &hir::ReturnBorrowSummary,
     explicit: u32,
@@ -4761,6 +4793,12 @@ fn xml_ty_matches_tagged_body(program: &Program, actual: Ty, expected: Ty) -> bo
     actual == expected
         || matches!(expected, Ty::Tagged(id) if tagged_matches(program, id, actual))
         || matches!(actual, Ty::Tagged(id) if tagged_matches(program, id, expected))
+}
+
+fn xml_value_flow_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
+    xml_ty_matches_tagged_body(program, actual, expected)
+        || (matches!((actual, expected), (Ty::Fn(_), Ty::Fn(_)))
+            && xml_callable_flow_matches(program, actual, expected))
 }
 
 fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
@@ -5477,7 +5515,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let Some(base) = xml_operand_base_ty(self.graph.function, operand) else {
             return XmlAccessSource::Invalid;
         };
-        if xml_selected_ty(self.graph.program, base, &path) != Some(expected) {
+        if !xml_selected_ty(self.graph.program, base, &path)
+            .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, expected)) {
             return XmlAccessSource::Invalid;
         }
         match operand {
@@ -6102,13 +6141,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
     }
 
     /// Follow exactly the ordinary callable producer edges, with the same shape and sibling
-    /// checks, until the selected capture reaches its validated closure environment. Keeping the
-    /// projection on the existing worklist also closes copied, stored, and control-joined callees
+    /// checks, then select returned captures from each producer's own validated environment.
+    /// Keeping the projection on the worklist closes copied, stored, and control-joined callees
     /// without recursively walking cyclic callable/slot graphs.
     fn capture_equation(
         &mut self,
         node: XmlAccessNode,
-        capture: u32,
     ) -> XmlAccessEquation {
         let (selected, captured, mut equation) = match &node {
             XmlAccessNode::Value(value, path) => {
@@ -6116,11 +6154,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     .and_then(|ty| xml_selected_ty(self.graph.program, *ty, path));
                 let captured = if path.is_empty() {
                     match self.graph.value_definitions.get(*value as usize) {
-                        Some(Some(Rvalue::Closure { captures, capture_tys, .. })) => {
-                            Some(captures.get(capture as usize)
-                                .zip(capture_tys.get(capture as usize))
-                                .map(|(operand, ty)| (operand.clone(), *ty)))
+                        Some(Some(Rvalue::Closure { captures, capture_tys, signature, .. })) => {
+                            let (_, roots) = Self::call_roots(&signature.return_borrow, &signature.return_region);
+                            Some(roots.into_iter().map(|capture| {
+                                captures.get(capture as usize).zip(capture_tys.get(capture as usize))
+                                    .map(|(operand, ty)| (operand.clone(), *ty))
+                            }).collect::<Option<Vec<_>>>())
                         }
+                        Some(Some(Rvalue::FnAddr { .. })) => Some(Some(Vec::new())),
                         _ => None,
                     }
                 } else { None };
@@ -6149,15 +6190,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if let Some(captured) = captured {
             equation.seed = None;
             equation.dependencies.clear();
-            if let Some((operand, ty)) = captured {
-                self.add_operand(&mut equation, &operand, ty, Vec::new());
+            if let Some(captured) = captured {
+                if captured.is_empty() { equation.seed = Some(XmlAccessProvenance::Owned); }
+                for (operand, ty) in captured {
+                    self.add_operand(&mut equation, &operand, ty, Vec::new());
+                }
             } else {
                 equation.invalid = true;
             }
             return equation;
         }
-        // A function address or parameter capability alone does not authenticate an environment.
-        // Every reaching producer must expose the requested capture, not just one joined branch.
+        // An opaque parameter capability does not authenticate an environment.
+        // Every reaching producer must validate its own returned captures.
         if equation.seed.is_some() || (equation.dependencies.is_empty() && !equation.absent) {
             equation.invalid = true;
         }
@@ -6165,10 +6209,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
         for dependency in std::mem::take(&mut equation.dependencies) {
             let source = match dependency {
                 XmlAccessNode::Value(value, path) => {
-                    self.queue(XmlAccessNode::CaptureValue(value, path, capture))
+                    self.queue(XmlAccessNode::CaptureValue(value, path))
                 }
                 XmlAccessNode::Slot(slot, path) => {
-                    self.queue(XmlAccessNode::CaptureSlot(slot, path, capture))
+                    self.queue(XmlAccessNode::CaptureSlot(slot, path))
                 }
                 XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..)
                 | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
@@ -6306,10 +6350,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
         }
         let mut captured_sources = Vec::new();
-        for capture in captures {
+        if !captures.is_empty() {
             let source = match callee {
                 Some(Operand::Value(value)) => {
-                    self.queue(XmlAccessNode::CaptureValue(*value, Vec::new(), capture))
+                    self.queue(XmlAccessNode::CaptureValue(*value, Vec::new()))
                 }
                 _ => XmlAccessSource::Invalid,
             };
@@ -6674,7 +6718,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(self.graph.program, source_ty, result_ty)
+                if !xml_value_flow_matches(self.graph.program, source_ty, result_ty)
                     && !xml_ty_is_view_retype(source_ty, result_ty)
                 {
                     equation.invalid = true;
@@ -6687,7 +6731,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
                         source_selected,
                         selected_ty,
@@ -6829,7 +6873,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
             }
             Rvalue::Load(slot) => {
-                if self.graph.function.slots.get(slot as usize) != Some(&result_ty) {
+                if !self.graph.function.slots.get(slot as usize)
+                    .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, *actual, result_ty)) {
                     equation.invalid = true;
                 } else {
                     Self::add_source(
@@ -7126,7 +7171,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 if !result_matches
                     || xml_operand_base_ty(self.graph.function, &base) != Some(base_ty)
-                    || (!xml_ty_matches_tagged_body(
+                    || (!xml_value_flow_matches(
                         self.graph.program,
                         source_selected,
                         selected_ty,
@@ -7591,8 +7636,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         path.is_empty() && condition_ty == Some(Ty::Mask(element, lanes))
                     });
                 if !condition_matches
-                    || xml_operand_base_ty(self.graph.function, &a) != Some(result_ty)
-                    || xml_operand_base_ty(self.graph.function, &b) != Some(result_ty)
+                    || !xml_operand_base_ty(self.graph.function, &a)
+                        .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, result_ty))
+                    || !xml_operand_base_ty(self.graph.function, &b)
+                        .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, result_ty))
                 {
                     equation.invalid = true;
                 } else {
@@ -7620,7 +7667,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     || elems.len() != tuple.elems.len()
                     || operand_tys.as_ref().is_none_or(|actual| {
                         actual.iter().zip(&tuple.elems).any(|(actual, expected)| {
-                            !xml_ty_matches_tagged_body(
+                            !xml_value_flow_matches(
                                 self.graph.program,
                                 *actual,
                                 scalar_to_ty(*expected),
@@ -7672,7 +7719,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(
+                if !xml_value_flow_matches(
                     self.graph.program,
                     actual_selected,
                     selected_ty,
@@ -7708,7 +7755,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(self.graph.program, result_ty, payload_ty) {
+                if !xml_value_flow_matches(self.graph.program, payload_ty, result_ty) {
                     equation.invalid = true;
                 } else {
                     let mut selected_path = vec![XmlAccessPathSegment::TupleElement(index)];
@@ -7719,7 +7766,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
                         source_selected,
                         selected_ty,
@@ -7761,7 +7808,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             .iter()
                             .zip(&definition.payload)
                             .any(|(actual, expected)| {
-                                !xml_ty_matches_tagged_body(
+                                !xml_value_flow_matches(
                                     self.graph.program,
                                     *actual,
                                     scalar_to_ty(*expected),
@@ -7831,7 +7878,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(
+                if !xml_value_flow_matches(
                     self.graph.program,
                     actual_selected,
                     selected_ty,
@@ -7866,10 +7913,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 if xml_operand_base_ty(self.graph.function, &operand) != Some(Ty::Enum(enum_id))
-                    || !xml_ty_matches_tagged_body(
+                    || !xml_value_flow_matches(
                         self.graph.program,
-                        result_ty,
                         payload_ty,
+                        result_ty,
                     )
                 {
                     equation.invalid = true;
@@ -7891,7 +7938,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
                         source_selected,
                         selected_ty,
@@ -7918,7 +7965,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(
+                if !xml_value_flow_matches(
                     self.graph.program,
                     actual_payload_ty,
                     payload_ty,
@@ -7946,7 +7993,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(
+                if !xml_value_flow_matches(
                     self.graph.program,
                     actual_selected,
                     selected_ty,
@@ -7979,7 +8026,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 let payload_matches = xml_option_payload(self.graph.program, option_ty)
                     .is_some_and(|payload| {
-                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                        xml_value_flow_matches(self.graph.program, payload, result_ty)
                     });
                 if !payload_matches {
                     equation.invalid = true;
@@ -7995,10 +8042,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
-                        selected_ty,
                         source_selected,
+                        selected_ty,
                     ) {
                         equation.invalid = true;
                     } else {
@@ -8045,7 +8092,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_ty_matches_tagged_body(
+                if !xml_value_flow_matches(
                     self.graph.program,
                     actual_payload_ty,
                     payload_ty,
@@ -8088,7 +8135,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
                         actual_selected,
                         selected_ty,
@@ -8112,7 +8159,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 let payload_matches = xml_result_payload(self.graph.program, wrapper_ty, ok)
                     .is_some_and(|payload| {
-                        xml_ty_matches_tagged_body(self.graph.program, result_ty, payload)
+                        xml_value_flow_matches(self.graph.program, payload, result_ty)
                     });
                 if !payload_matches {
                     equation.invalid = true;
@@ -8132,10 +8179,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    if !xml_ty_matches_tagged_body(
+                    if !xml_value_flow_matches(
                         self.graph.program,
-                        selected_ty,
                         source_selected,
+                        selected_ty,
                     ) {
                         equation.invalid = true;
                     } else {
@@ -10077,7 +10124,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
             );
         }
         for operand in root_stores {
-            if xml_operand_base_ty(self.graph.function, &operand) != Some(slot_ty) {
+            if !xml_operand_base_ty(self.graph.function, &operand)
+                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, slot_ty)) {
                 equation.invalid = true;
             } else {
                 self.check_whole_operand(&mut equation, &operand, slot_ty);
@@ -10095,7 +10143,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 continue;
             };
             if fields.is_empty()
-                || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
+                || !xml_operand_base_ty(self.graph.function, &operand)
+                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, stored_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -10125,7 +10174,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 continue;
             };
             if xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
-                || xml_operand_base_ty(self.graph.function, &operand) != Some(element_ty)
+                || !xml_operand_base_ty(self.graph.function, &operand)
+                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, element_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -10167,7 +10217,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
             if fields.is_empty()
                 || !matches!(slot_ty, Ty::StructArray(..))
                 || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
-                || xml_operand_base_ty(self.graph.function, &operand) != Some(stored_ty)
+                || !xml_operand_base_ty(self.graph.function, &operand)
+                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, stored_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -10257,11 +10308,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation
                 },
                 XmlAccessNode::Slot(slot, path) => self.slot_equation(*slot, path.clone()),
-                XmlAccessNode::CaptureValue(value, path, capture) => {
-                    self.capture_equation(XmlAccessNode::Value(*value, path.clone()), *capture)
+                XmlAccessNode::CaptureValue(value, path) => {
+                    self.capture_equation(XmlAccessNode::Value(*value, path.clone()))
                 }
-                XmlAccessNode::CaptureSlot(slot, path, capture) => {
-                    self.capture_equation(XmlAccessNode::Slot(*slot, path.clone()), *capture)
+                XmlAccessNode::CaptureSlot(slot, path) => {
+                    self.capture_equation(XmlAccessNode::Slot(*slot, path.clone()))
                 }
                 XmlAccessNode::BufferValue(value, path) => self.buffer_value_equation(*value, path.clone()),
                 XmlAccessNode::BufferSlot(slot, path) => self.buffer_slot_equation(*slot, path.clone()),
@@ -36965,6 +37016,169 @@ fn main() -> i32 = 0
                 _ => panic!("out producer inventory changed shape"),
             }
             assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
+        }
+    }
+
+    #[test]
+    fn producer_callable_joins_preserve_target_relative_captures_and_root_containment() {
+        let base = mir(r#"
+fn run(flag: i32) -> i64 {
+  left := "left"
+  ignored := "ignored"
+  right := "right hand"
+  mut f := fn { left }
+  if flag == 1 { f = fn { ignored.len(); right } }
+  if flag == 2 { f = fn { "static" } }
+  return f().len()
+}
+fn main() -> i32 = 0
+"#);
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(validate_resource_rvalues(&base).is_ok());
+        assert!(validate_thin_partition_program(&base, &[]).is_ok());
+        let run = xml_test_function(&base, "run");
+        for mutation in ["raw-capture", "missing-capture", "forged-root", "raw-callable",
+            "narrow-slot", "stale-load", "forged-call", "missing-store", "self-cycle", "seeded-cycle"] {
+            let mut bad = base.clone();
+            let function = &mut bad.fns[run];
+            let callee = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+                match statement {
+                    Stmt::Let(_, Rvalue::CallIndirect { callee: Operand::Value(value), .. }) => Some(*value),
+                    _ => None,
+                }
+            }).unwrap_or_else(|| panic!("missing indirect callee"));
+            let slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+                match statement {
+                    Stmt::Let(value, Rvalue::Load(slot)) if *value == callee => Some(*slot),
+                    _ => None,
+                }
+            }).unwrap_or_else(|| panic!("missing callee storage"));
+            let first = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+                match statement {
+                    Stmt::Let(value, Rvalue::Closure { captures, .. }) if captures.len() == 1 => Some(*value),
+                    _ => None,
+                }
+            }).unwrap_or_else(|| panic!("missing one-capture origin"));
+            match mutation {
+                "narrow-slot" => function.slots[slot as usize] = function.value_tys[first as usize],
+                "stale-load" => function.value_tys[callee as usize] = function.value_tys[first as usize],
+                "missing-store" | "self-cycle" | "seeded-cycle" => {
+                    for block in &mut function.blocks {
+                        if mutation != "seeded-cycle" {
+                            block.stmts.retain(|statement| !matches!(statement, Stmt::Store(target, _) if *target == slot));
+                        }
+                        if mutation != "missing-store"
+                            && block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if *value == callee))
+                        { block.stmts.push(Stmt::Store(slot, Operand::Value(callee))); }
+                    }
+                }
+                "forged-call" => {
+                    for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                        if let Stmt::Let(_, Rvalue::CallIndirect { signature, .. }) = statement {
+                            signature.return_borrow = hir::ReturnBorrowSummary::None;
+                            signature.return_region = hir::ReturnRegionSummary::None;
+                        }
+                    }
+                }
+                _ => {
+                    let raw = if mutation == "raw-capture" {
+                        let raw = xml_test_value(function, Ty::Str);
+                        function.blocks[0].stmts.push(Stmt::Let(raw, Rvalue::RawNull));
+                        raw
+                    } else { first };
+                    let producer = function.blocks.iter_mut().flat_map(|block| &mut block.stmts).find_map(|statement| {
+                        match statement { Stmt::Let(value, producer) if *value == first => Some(producer), _ => None }
+                    }).unwrap_or_else(|| panic!("missing origin definition"));
+                    if mutation == "raw-callable" { *producer = Rvalue::RawNull; }
+                    else if let Rvalue::Closure { captures, signature, .. } = producer {
+                        match mutation {
+                            "raw-capture" => captures[0] = Operand::Value(raw),
+                            "missing-capture" => captures.clear(),
+                            "forged-root" => {
+                                signature.return_borrow = hir::ReturnBorrowSummary::Roots { params: vec![], captures: vec![1] };
+                                signature.return_region = hir::ReturnRegionSummary::Roots { params: vec![], captures: vec![1] };
+                            }
+                            _ => panic!("unknown callable mutation {mutation}"),
+                        }
+                    } else { panic!("origin is not a closure"); }
+                }
+            }
+            if mutation == "seeded-cycle" {
+                assert!(validate_mir_producers(&bad).is_ok());
+                assert!(validate_resource_rvalues(&bad).is_ok());
+                assert!(validate_thin_partition_program(&bad, &[]).is_ok());
+            } else {
+                assert!(validate_mir_producers(&bad).is_err(), "published {mutation}");
+                assert_xml_producer_rejected(&bad, mutation);
+            }
+        }
+        // Extraction has the opposite direction from construction: a wrapper may
+        // widen its payload contract, but an extracted callable cannot narrow it.
+        for wrapper in ["tuple", "enum", "option", "result"] {
+            for narrow in [false, true] {
+                let mut program = base.clone();
+                let function = &program.fns[run];
+                let callee = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+                    match statement { Stmt::Let(_, Rvalue::CallIndirect { callee: Operand::Value(value), .. }) => Some(*value), _ => None }
+                }).unwrap_or_else(|| panic!("missing callee"));
+                let origin_ty = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+                    match statement {
+                        Stmt::Let(value, Rvalue::Closure { captures, .. }) if captures.len() == 1 => Some(function.value_tys[*value as usize]),
+                        _ => None,
+                    }
+                }).unwrap_or_else(|| panic!("missing origin"));
+                let Ty::Fn(joined) = function.value_tys[callee as usize] else { panic!("callee type") };
+                let selected = if narrow { origin_ty } else { Ty::Fn(joined) };
+                let Ty::Fn(selected_id) = selected else { panic!("selected callable type") };
+                let facts = xml_fn_type_facts(&program, selected_id).unwrap_or_else(|| panic!("call facts"));
+                let scalar = Scalar::Fn(joined);
+                let (ty, make) = match wrapper {
+                    "tuple" => {
+                        let id = u32::try_from(program.tuples.len()).unwrap_or_else(|_| panic!("tuple inventory"));
+                        program.tuples.push(hir::TupleDef { elems: vec![scalar] });
+                        (Ty::Tuple(id), Rvalue::MakeTuple { tuple_id: id, elems: vec![Operand::Value(callee)] })
+                    }
+                    "enum" => {
+                        let id = u32::try_from(program.enums.len()).unwrap_or_else(|_| panic!("enum inventory"));
+                        program.enums.push(hir::EnumDef {
+                            name: "CallableProjection".into(), source_name: "CallableProjection".into(),
+                            variants: vec![hir::EnumVariant { name: "Value".into(), payload: vec![scalar], field_base: 1 }],
+                        });
+                        (Ty::Enum(id), Rvalue::MakeEnum { enum_id: id, variant: 0, payload: vec![Operand::Value(callee)] })
+                    }
+                    "option" => (Ty::Option(scalar), Rvalue::OptionSome(Operand::Value(callee))),
+                    "result" => (Ty::Result(scalar, Scalar::Bool), Rvalue::ResultOk(Operand::Value(callee))),
+                    _ => panic!("unknown wrapper"),
+                };
+                let function = &mut program.fns[run];
+                let container = xml_test_value(function, ty);
+                let extracted = xml_test_value(function, selected);
+                let value = Operand::Value(container);
+                let extract = match ty {
+                    Ty::Tuple(_) => Rvalue::TupleIndex { tuple: value, index: 0 },
+                    Ty::Enum(enum_id) => Rvalue::EnumPayload { enum_id, variant: 0, slot: 0, operand: value },
+                    Ty::Option(_) => Rvalue::OptionUnwrap(value),
+                    Ty::Result(_, _) => Rvalue::ResultUnwrapOk(value),
+                    _ => panic!("unknown wrapper type"),
+                };
+                let block = function.blocks.iter_mut().find(|block| block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(_, Rvalue::CallIndirect { .. }))))
+                    .unwrap_or_else(|| panic!("missing call block"));
+                let position = block.stmts.iter().position(|statement| matches!(statement, Stmt::Let(_, Rvalue::CallIndirect { .. })))
+                    .unwrap_or_else(|| panic!("missing call position"));
+                let Stmt::Let(_, Rvalue::CallIndirect { callee, signature, .. }) = &mut block.stmts[position] else { panic!("call changed") };
+                *callee = Operand::Value(extracted);
+                signature.return_borrow = facts.borrow;
+                signature.return_region = facts.region;
+                block.stmts.splice(position..position, [Stmt::Let(container, make), Stmt::Let(extracted, extract)]);
+                if narrow {
+                    assert!(validate_mir_producers(&program).is_err(), "narrowed {wrapper}");
+                    assert_xml_producer_rejected(&program, wrapper);
+                } else {
+                    assert!(validate_mir_producers(&program).is_ok(), "valid {wrapper}");
+                    assert!(validate_resource_rvalues(&program).is_ok());
+                    assert!(validate_thin_partition_program(&program, &[]).is_ok());
+                }
+            }
         }
     }
 
