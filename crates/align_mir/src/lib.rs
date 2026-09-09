@@ -5663,9 +5663,9 @@ fn field_path_leaf_ty(structs: &[hir::StructDef], struct_id: u32, path: &[u32]) 
 /// so its exit [`Stmt::Drop`] becomes a no-op `free(null)` and the buffer is freed once — by
 /// the new owner. The moved expression is a bare `Local` (null its slot) or a value-carrying scope
 /// whose trailing value is the move (recurse into the tail). Other shapes (fresh temporaries like
-/// `make()` / `.to_array()`) own no slot, and sema rejects moving a bound owned local out
-/// through an `if`/`else` arm, so no other case reaches here. Restricted to free-standing owned
-/// slots (`DynArray`, owned `string`) — `box<T>` is arena-regioned and never free-standing-dropped.
+/// `make()` / `.to_array()`) own no slot. Control-flow results clear their selected source at
+/// their own join store, so this walk must not re-enter their arms. The canonical cleanup predicate
+/// covers every free-standing owner; arena-regioned `box<T>` has no individual Drop.
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
@@ -6441,11 +6441,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             drop_old,
             drop_new,
         } => {
-            // Compute the new value first (the RHS may read the old). Sema's `drop_old` excludes
-            // an old value moved out by the RHS. The cleanup flag distinguishes individually owned
-            // old values from arena-owned, moved, or uninitialised paths.
+            // Capture the replacement and its ownership bit before clearing its source. Whether
+            // the old destination survived RHS evaluation is a path-local cleanup-bit decision.
             let op = lower_required!(b, lower_expr(b, value), ());
             let inherited_flag = lowered_drop_flag(b, value, &op);
+            // Clear before dropping the old destination: x = x preserves its captured payload,
+            // and x = if c { x } else { y } drops old x only on the unselected-x path.
+            null_moved_source(b, value);
             // Mutable borrowed slots carry the caller's cleanup bit even though they are absent
             // from this function's exit-cleanup list. Replacement must drop their old value too.
             let has_cleanup = usize::try_from(*local)
@@ -6455,11 +6457,6 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if drop_old.get() && has_cleanup {
                 b.emit_drop_if_live(*local);
             }
-            // Clear a moved RHS source while its value is already captured in `op`, then install
-            // the replacement and its path-specific ownership bit. Doing this before the store
-            // also makes the degenerate `s = s` preserve the captured value rather than nulling the
-            // just-written destination.
-            null_moved_source(b, value);
             b.push(Stmt::Store(*local, op));
             match inherited_flag {
                 Some(flag) => b.set_drop_flag_operand(*local, flag),

@@ -352,7 +352,9 @@ trusting the stored bits:
    order; it never serializes the map or trusts a separately supplied fact.
 5. Recompute every `Cell<bool>` statement flag after its children:
    `Assign.drop_old`, `Assign.drop_new`, and the corresponding indexed/field
-   replacement behavior must equal the MoveCheck/EscapeCheck decision.
+   replacement behavior must equal the MoveCheck/EscapeCheck decision. Whole-local
+   `Assign.drop_old` is the canonical destination Move classification; MIR tests the
+   path-local live bit after capturing and clearing the selected RHS source.
 6. A Copy expression has no individual-ownership entry. A recursively Move
    expression has exactly the entry produced by this traversal. Borrowed views
    never gain ownership merely because their source is individually owned.

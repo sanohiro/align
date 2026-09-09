@@ -881,20 +881,12 @@ The table is exhaustive for value-carrying control syntax except `task_group`, w
 transfer is specified in the ownership-bit paragraph below and in §11. Adding another form requires
 choosing both columns and adding the corresponding regression cells.
 
-**One restriction applies to the `if` row today.** A value-carrying `if`/`else` **expression** cannot
-move an already-bound owned local out of an arm:
-
-```align
-a := "hello".clone()
-c := if n > 2 { a } else { "hi".clone() }   // compile error
-```
-
-The rejection belongs to the `if`-expression arm, not to the consumer: the binding above, an
-argument position (`f(if n > 2 { a } else { … })`), and `return if n > 2 { a } else { … }` are all
-rejected identically, with `cannot move owned value '<name>' out through a conditional expression
-yet`. Every sibling form moves a bound owned local normally — a `match` arm, an `else`-unwrap
-fallback, a block tail, and a statement-form `if` + `return` — and an `if` expression whose arms
-build fresh temporaries is fine. Use one of those, or bind the arms' shared value before the `if`.
+A consuming `if` result may move an already-bound owned local from either arm.
+Only the selected source is cleared; the unselected source retains its ordinary cleanup.
+A later use after a possible move is rejected. Replacement evaluates and captures the
+new value first, clears its selected source, then drops the still-live old destination
+before installing the new value. This preserves conditional and direct self-assignment.
+A borrowed `if` result does not consume either bound source.
 
 A by-value function argument is an ownership transfer for a Move type. Only a free-standing owned
 value may cross that boundary: the callee owns and drops it. An arena-owned value remains tied to

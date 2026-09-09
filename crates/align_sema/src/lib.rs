@@ -39255,10 +39255,8 @@ impl<'a> MoveCheck<'a> {
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context;
-    /// `tail_direct` = whether that consuming position is a "direct" move site (a statement /
-    /// return / the function tail) rather than nested inside a branching expression (`if`).
-    /// MIR nulls a moved owned local's slot only at direct sites, so a move of a *bound* owned
-    /// local through an `if`/`else` arm is rejected here (deferred — bind it to a local first).
+    /// `tail_direct` = whether the consuming context owns source clearing. Conditional result
+    /// joins are direct sites too: MIR clears the selected source in its continuing arm.
     fn block(
         &mut self,
         b: &'a Block,
@@ -39282,16 +39280,10 @@ impl<'a> MoveCheck<'a> {
                     self.clear_expression_value_snapshots(init);
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
-                    let was_moved = whole_moved(moved, *local);
                     move_expr!(self, value, moved, true, true);
-                    // The RHS consumed the old value iff it just transitioned the local live→moved
-                    // (it appeared in a consuming position). If so, ownership of the old buffer
-                    // transferred away — MIR must NOT drop it here (double-free). Otherwise the
-                    // overwritten owned value must be dropped before the store (else its buffer
-                    // leaks); a no-op `free(null)` if the slot was already moved/null. Non-owned
-                    // locals never drop. (`s = make(s.len())` borrows, not moves → still drops.)
-                    let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
-                    drop_old.set(self.is_move(*local) && !consumed_by_rhs);
+                    // A may-moved join cannot decide whether the old destination is live on this
+                    // path. MIR captures and clears the RHS source before testing its cleanup bit.
+                    drop_old.set(self.is_move(*local));
                     if !matches!(value.kind, ExprKind::Local(source) if source == *local) {
                         self.mark_borrow_mut_modified(*local);
                         self.invalidate_mutable_place(*local, &[]);
@@ -40025,7 +40017,7 @@ impl<'a> MoveCheck<'a> {
                         incoming_moved,
                         incoming_borrows,
                     });
-                    work.push(Work::Eval(then_value, consuming, false));
+                    work.push(Work::Eval(then_value, consuming, true));
                 }
                 Work::AfterThen {
                     expression,
@@ -40055,7 +40047,7 @@ impl<'a> MoveCheck<'a> {
                         then_edge,
                         incoming_borrows,
                     });
-                    work.push(Work::Eval(else_value, consuming, false));
+                    work.push(Work::Eval(else_value, consuming, true));
                 }
                 Work::AfterElse {
                     expression,
@@ -41446,7 +41438,6 @@ impl<'a> MoveCheck<'a> {
                 local: LocalId,
                 value: &'e Expr,
                 drop_old: &'e std::cell::Cell<bool>,
-                was_moved: bool,
             },
             BlockReturn(&'e Expr),
             BlockLetTuple {
@@ -41957,7 +41948,6 @@ impl<'a> MoveCheck<'a> {
                                 local: *local,
                                 value,
                                 drop_old,
-                                was_moved: whole_moved(moved, *local),
                             },
                         )
                     }
@@ -42391,14 +42381,9 @@ impl<'a> MoveCheck<'a> {
                     local,
                     value,
                     drop_old,
-                    was_moved,
                 } => {
                     if falls_through {
-                        let consumed_by_rhs =
-                            whole_moved(moved, local) && !was_moved;
-                        drop_old.set(
-                            self.is_move(local) && !consumed_by_rhs,
-                        );
+                        drop_old.set(self.is_move(local));
                         if !matches!(value.kind, ExprKind::Local(source) if source == local) {
                             self.mark_borrow_mut_modified(local);
                             self.invalidate_mutable_place(local, &[]);
@@ -42920,7 +42905,7 @@ impl<'a> MoveCheck<'a> {
         let mut then_moved = moved.clone();
         self.borrows = incoming_borrows.clone();
         self.begin_storage_advance_frame();
-        let then_falls_through = self.block(then, &mut then_moved, consuming, false);
+        let then_falls_through = self.block(then, &mut then_moved, consuming, true);
         let then_advances = self.finish_storage_advance_frame();
         let then_edge = then_falls_through.then(|| MoveControlEdge {
             moved: then_moved,
@@ -42934,7 +42919,7 @@ impl<'a> MoveCheck<'a> {
         let mut else_moved = moved.clone();
         self.borrows = incoming_borrows.clone();
         self.begin_storage_advance_frame();
-        let else_falls_through = self.block(els, &mut else_moved, consuming, false);
+        let else_falls_through = self.block(els, &mut else_moved, consuming, true);
         let else_advances = self.finish_storage_advance_frame();
         let else_edge = else_falls_through.then(|| MoveControlEdge {
             moved: else_moved,
@@ -77898,12 +77883,10 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
-    fn move_owned_local_through_if_arm_rejected() {
-        // MMv2 slice 4.5: moving a *bound* owned array out through an `if`/`else` arm is a
-        // deferred-feature error (codegen only nulls slots at direct move sites). A fresh
-        // temporary through an `if` is fine — there is no bound slot to double-free.
+    fn move_owned_local_through_if_arm_checks() {
+        // Conditional joins transfer the selected bound source before branch-local cleanup.
         let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn pick(c: bool) -> array<i32> {\n  ys := [1, 2, 3].map(double).to_array()\n  zs := [4, 5, 6].map(double).to_array()\n  return if c { ys } else { zs }\n}\nfn main() -> i32 = 0\n");
-        assert!(d.has_errors(), "moving a bound owned local out through an if/else arm must error");
+        assert!(!d.has_errors(), "bound if-result transfers must check");
     }
 
     #[test]

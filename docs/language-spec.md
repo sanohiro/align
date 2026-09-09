@@ -362,11 +362,10 @@ those actions. The element remains caller-owned, and returned or mutably
 retained views retain the array's generation and contained region roots. By-value and mutable
 element forms remain unsupported.
 
-One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
-already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are
-the argument and `return` positions). `match`, `else`-unwrap, a block tail, and a statement-form
-`if` + `return` all move a bound owned local normally, and an `if` expression whose arms produce
-fresh temporaries is fine.
+A consuming `if` result can move a bound owned local from either arm. Only the selected
+source is cleared; later use after a possible move is rejected. Replacement captures the
+new value and clears its selected source before dropping the still-live old destination,
+preserving conditional and direct self-assignment. Borrowed results retain their sources.
 
 A Move argument passed by value transfers ownership to the callee, which becomes responsible for
 its drop. Only free-standing owned values may cross a call boundary. Arena-owned values must stay
