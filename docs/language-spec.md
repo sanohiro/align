@@ -1389,6 +1389,16 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
+The next designed package, `pkg.s3`, prepares a signed S3 request through
+`request(...) -> Result<http_request, Error>` using explicit credentials, origin,
+region, method, unencoded path, query/header fields, body and Unix nanoseconds.
+The exact borrowed `Credentials`, `Endpoint` and `Field` records, validation,
+signature bytes and ownership are in `impl/pkg-design/s3.md`; implementation is
+pending. The result owns all request data and uses the caller's ordinary HTTP
+client. The capability also preserves explicit body presence in HTTP:
+`.body(empty)` and `post(url, empty)` emit `Content-Length: 0`; unset bodies omit it.
+No ambient authentication, clock, endpoint discovery or package retry is added.
+
 The implemented first-party packages in this repository are exactly seven vendorable subtrees:
 
 ```text

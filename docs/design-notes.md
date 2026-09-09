@@ -1,5 +1,14 @@
 # Align Design Notes
 
+The designed `pkg.s3` boundary (`impl/pkg-design/s3.md`) assembles one signed
+`http_request` from explicit inputs. Canonicalization and actual HTTP bytes stay
+under one package operation, while existing client/response owners preserve
+pooling and streaming composition. A second client or signing-key owner is
+unnecessary. Explicit empty-body framing closes a general HTTP gap exposed by
+S3 PUT: source `.body(empty)` means a present zero-byte body, so Content-Length
+is zero. Unset bodies remain absent; this decision is independent of provider,
+method or signature headers.
+
 The named UTC wire-format family (`impl/std-design/time.md`) shares the existing signed-nanosecond
 timeline and Error model. All five formatters are fallible under one representability rule:
 flooring precision may move the lower endpoint outside i64. Rejecting before allocation keeps

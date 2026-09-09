@@ -22,6 +22,13 @@ post-`pkg.db` convergence item である client streaming receive は **2026-08-
 
 ## Signatures
 
+S3 機能の [H1 台帳](../../pkg-design/ja/s3.md) は明示 body framing を設計する。
+fresh request は body 未設定、`.body(data)` と `post(url, body)` は空でも設定済み。
+設定済み body には `0` を含め Content-Length を出し、未設定時だけ省略する。
+replacement 後も設定済みを保持し、owner/view の private bool は ABI/allocation を増やさない。
+実装は pending。以下の過去 slice は従来の非空時のみ出す規則を記録している。
+H1 と S3 wire owner が同一機能で移行を閉じる。
+
 v1 案として、Fable が確定させた形式:
 
 ```text
